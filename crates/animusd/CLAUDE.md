@@ -1755,9 +1755,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   `DataRole::backup_store`, PR② → PR③'s own promised follow-up): the
   capture driver (`backup_capture.rs`) `put`s chunked data objects and the
   completion aggregator (`backup_completion.rs`) `put`s the manifest
-  object — see both modules' own entries below. `get`/`delete`/`list_local`
-  stay individually `#[allow(dead_code)]`-marked (Train 2's restore, and
-  the not-yet-built retention janitor, are their first real readers).
+  object — see both modules' own entries below. **`list_local`/`delete_local`
+  consumed since Train 1 PR④** by the backup janitor's own local-only
+  reclaim sweep (`backup_janitor.rs`'s own entry below has the full
+  design/residual). `get`/`delete` (the explicit-`replicas` pair) stay
+  individually `#[allow(dead_code)]`-marked — Train 2's restore is `get`'s
+  first real reader, and `delete` (unlike the janitor's own `delete_local`)
+  has no caller yet since no backup object carries a recorded `replicas`
+  list to call it with (see `backup_janitor.rs`'s doc for why).
   `data --config`/`data --seed`/`control`/`join`/`--cluster-control`+
   `--cluster-data` all default to `BackupStoreConfig::Cluster` internally —
   no CLI flag reaches any of them, the identical documented gap
@@ -1810,6 +1815,34 @@ route below the edge through the same `ClientCtx` CP primitives.
   provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
   and control-only nodes (never data-only, which never becomes control
   leader at all).
+- **`backup_janitor.rs`** (ADR 0059 §3, Train 1 PR④) — the on-demand
+  backup **janitor**: a control-plane-**leader**-only background loop
+  (`backup_janitor_loop`), the identical self-gating shape as
+  `segment_janitor.rs`/`backup_completion.rs`. For every `Expired` (a wire
+  `DeleteBackup` call's own mark, `dynamo::delete_backup` → `MetaCommand::
+  MarkBackupDeleted`) or `Failed` (the completion aggregator's own stuck-
+  timeout) row: reclaims objects, then finalizes with the pre-existing,
+  unmodified `MetaCommand::DeleteBackup` (row-plus-progress removal, PR①).
+  **Reclaim is local-only** — a deliberate Train 1 simplification, unlike
+  the segment janitor's own cataloged-`replicas` reclaim: no backup object
+  carries a recorded replica list (`backup_capture.rs`/`backup_
+  completion.rs` both discard `BackupStoreHandle::put`'s own returned
+  replica set) and a tablet's completion record carries no chunk count
+  either, so there is no way to enumerate a backup's own object ids without
+  asking the store — `SegmentStore::list()`, scoped to `backup/{backup_id}/`
+  on this node's own local directory (`BackupStoreHandle::list_local`/
+  `delete_local`, no longer `#[allow(dead_code)]` as of this PR), exactly
+  the tool ADR 0059 §3 licenses for this. **Named residual**: on a cluster
+  larger than `ClusterSegmentStore::DEFAULT_K` (3) a leader that never holds
+  a copy of a given backup's objects finalizes (removes the row) on its very
+  first tick, before a node that does hold a copy ever sweeps its own —
+  those copies become permanent, uncataloged orphans. See the module's own
+  doc, the ADR's 2026-08-27 as-built amendment, and `docs/engineering-
+  lessons.md` for the full note. **Inherits the identical control-only-
+  leader scope gap** `segment_janitor.rs`/`backup_completion.rs` already
+  document (object reclaim needs a `BackupStoreHandle`, which no
+  control-only node provisions) — spawned on combined and control-only
+  nodes, never data-only.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
@@ -2126,7 +2159,17 @@ immediate-visibility-then-eventual-reap contract, the future/wrong-type/
 5-year-safety-window never-expire cases, the conditional-delete outcome,
 and the stream `userIdentity`; its own follower-relay regression for
 `UpdateTimeToLive` lives beside the rest of `schema_ddl_relay.rs`'s DDL
-suite, not in `dynamo_ttl.rs` itself), restart/durability across every
+suite, not in `dynamo_ttl.rs` itself), the ADR 0059 Train 1 PR④ on-demand
+backup wire surface end to end (`dynamo_backup.rs` — `CreateBackup`/
+`DescribeBackup`/`ListBackups`/`DeleteBackup`, the wire round trip through
+`AVAILABLE`, `DescribeBackup`/`ListBackups(TableName)` still working after
+the source table is dropped with the frozen `BackupSizeBytes` unchanged, the
+janitor's own row-removal convergence, `ListBackups` pagination, and the
+`TableNotFoundException`/`BackupNotFoundException`/`BackupInUseException`
+error shapes; its own follower-relay regression for `DeleteBackup`
+(`MetaCommand::MarkBackupDeleted` on the `is_relayable_command` allowlist)
+lives beside the rest of `schema_ddl_relay.rs`'s DDL suite, mirroring
+`UpdateTimeToLive`'s own precedent exactly), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,

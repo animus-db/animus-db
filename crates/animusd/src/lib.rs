@@ -44,6 +44,7 @@ pub use animus_control::{
 mod admin;
 mod backup_capture;
 mod backup_completion;
+mod backup_janitor;
 mod console;
 mod control_handle;
 mod dashboard;
@@ -2508,6 +2509,18 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // "no seed answered" — see `tests/seed_join_allocated.rs`'s
             // follower-connected-seed case.
             | MetaCommand::RegisterNode { .. }
+            // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
+            // an operator's `CreateBackup` call may land on any node, exactly
+            // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
+            // (`animusd::dynamo::create_backup`'s own propose) to the control
+            // leader is the same schema-catalog-class need every DDL-shaped
+            // wire mutation above already has. Missing this arm is the exact
+            // bimodal per-process flake the root `CLAUDE.md` warns about: a
+            // `CreateBackup` that happens to land on a follower-connected
+            // node would hang for `SCHEMA_COMMIT_TIMEOUT` instead of relaying
+            // — see `tests/schema_ddl_relay.rs`'s
+            // `create_backup_on_a_follower_is_relayed_to_the_leader`.
+            | MetaCommand::BeginBackup { .. }
             // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
             // a tablet leader's own "I finished capturing my share of this
             // backup" proposal, from wherever that leader actually runs —
@@ -2521,6 +2534,19 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // own doc states above — no wire surface exists yet for either
             // (Train 1 PR④'s concern) to need a relay path of its own.
             | MetaCommand::RecordBackupTabletComplete { .. }
+            // `DeleteBackup` wire operation (ADR 0059 §3, Train 1 PR④): an
+            // operator's `DeleteBackup` call may land on any node, exactly
+            // like `CreateTable`/`UpdateTimeToLive` — relaying
+            // `MarkBackupDeleted` (the two-phase janitor's own **mark**
+            // step) to the control leader is the same schema-catalog-class
+            // need every DDL-shaped wire mutation above already has.
+            // `DeleteBackup` (the existing, unmodified **finalizing**
+            // command) is deliberately NOT added here — its only intended
+            // caller is the backup janitor (`animusd::backup_janitor`), a
+            // control-plane-leader-only background loop that already holds
+            // a live `RaftNode` handle, the identical `ExpireStreamShards`
+            // precedent this function's own doc states above.
+            | MetaCommand::MarkBackupDeleted { .. }
     )
 }
 
@@ -4756,6 +4782,16 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): two-phase
+        // reclaim of a `DeleteBackup`-marked (or stuck-`Failed`) backup's
+        // store objects, then the row itself. Control-plane-leader-only
+        // (self-gated every tick, `backup_janitor.rs`'s own doc) — spawned
+        // unconditionally here, exactly like the segment janitor/backfill/
+        // backup-completion aggregators above.
+        tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
+            ctx.clone(),
+        )));
+
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
         // it leads once it exceeds **either** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
@@ -5502,6 +5538,20 @@ impl BoundControlNode {
         // fully-captured backup ready but cannot itself flip it to
         // `Available`, until a data-capable node takes the lead instead).
         tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
+            ctx.clone(),
+        )));
+
+        // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): a
+        // control-only node can genuinely become the control-plane leader
+        // (ADR 0035 split deployment), so it needs this loop too — the
+        // *mark* half (a wire `DeleteBackup` proposing `MarkBackupDeleted`)
+        // needs only `Metadata`, but the actual object reclaim needs a
+        // `BackupStoreHandle`, which no control-only node provisions — see
+        // `backup_janitor.rs`'s own doc for the documented gap this leaves
+        // (identical shape to the segment janitor's own, above): rows
+        // accumulate marked-but-unreclaimed until a data-capable node takes
+        // the lead instead.
+        tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
         )));
 
@@ -6599,15 +6649,30 @@ impl BackupStoreHandle {
     /// backup directory — mirrors [`SegmentStoreHandle::list_local`]'s exact
     /// contract (debug/sweep only, never load-bearing for correctness: the
     /// replicated backup catalog, ADR 0059 §3, is the sole authority for
-    /// what backup data exists). **Unused until a debug/sweep admin surface
-    /// or the retention janitor's orphan sweep needs it** (a later train) —
-    /// left in rather than stubbed, per this type's own module-level doc.
-    #[allow(dead_code)]
+    /// what backup data exists). **Consumed since Train 1 PR④** by the
+    /// backup janitor's own reclaim sweep (`backup_janitor.rs`) — see that
+    /// module's own doc for why a *local-only* sweep is this train's
+    /// deliberate, documented simplification for backup object reclaim
+    /// specifically (unlike the segment janitor's own cataloged-row phase,
+    /// a backup object carries no recorded per-object `replicas` list to
+    /// reclaim against directly).
     pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         use animus_env::SegmentStore;
         match self {
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+        }
+    }
+
+    /// Delete `id` from **this node's own local** backup directory only —
+    /// the backup janitor's own reclaim step (`backup_janitor.rs`), mirroring
+    /// [`SegmentStoreHandle::delete_local`]'s identical "no recorded
+    /// `replicas` to consult" shape and its own doc's reasoning.
+    pub(crate) async fn delete_local(&self, id: &str) -> std::io::Result<()> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
+            BackupStoreHandle::Fs(fs) => fs.delete(id).await,
         }
     }
 }

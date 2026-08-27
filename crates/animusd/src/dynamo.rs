@@ -21,7 +21,12 @@
 //!
 //! Supported: `CreateTable`, `PutItem`, `GetItem`, `DeleteItem`, `Query`,
 //! `Scan`, `UpdateItem`, `BatchWriteItem`, `TransactWriteItems`,
-//! `TransactGetItems`. The data-plane key for an item is `escape(table) ||
+//! `TransactGetItems`, and — ADR 0059, Train 1 PR④ — the on-demand backup
+//! surface `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup` (see
+//! [`create_backup`]/[`describe_backup`]/[`list_backups`]/[`delete_backup`]'s
+//! own doc comments; capture itself is `animusd::backup_capture`/
+//! `backup_completion`, and reclaim is `animusd::backup_janitor` — this
+//! module only owns the wire surface). The data-plane key for an item is `escape(table) ||
 //! escape(pk) || sk` (so tables share one keyspace without colliding). The data
 //! plane has no native delete, so `DeleteItem` writes a tombstone value that
 //! `GetItem` reads back as absent. `UpdateItem` is a read-modify-write
@@ -172,7 +177,7 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, Metric};
+use animus_env::{Clock, Env, Metric, Rng};
 use animus_tablet::{TOKEN_BYTES, TabletId, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -1017,6 +1022,27 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             enabled,
         } => update_time_to_live(ctx, &table, &attribute_name, enabled).await,
         Operation::DescribeTimeToLive { table } => describe_time_to_live(ctx, meta, &table),
+        Operation::CreateBackup { table, backup_name } => {
+            create_backup(ctx, &table, &backup_name).await
+        }
+        Operation::DescribeBackup { backup_arn } => describe_backup(meta, &backup_arn),
+        Operation::ListBackups {
+            table,
+            limit,
+            exclusive_start_backup_arn,
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        } => list_backups(
+            meta,
+            table.as_deref(),
+            limit,
+            exclusive_start_backup_arn.as_deref(),
+            time_range_lower_bound_ms,
+            time_range_upper_bound_ms,
+            backup_type,
+        ),
+        Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
     }
 }
 
@@ -1101,6 +1127,308 @@ fn describe_time_to_live(
         attribute_name: ttl.map(|t| t.attribute_name.clone()),
     };
     Ok(wire::describe_time_to_live_response(&desc))
+}
+
+// --- Backups (ADR 0059 §3/§4, Train 1 PR④) ---------------------------------
+
+/// How many times [`create_backup`] mints a fresh backup id and retries
+/// after an (astronomically unlikely — a 64-bit random draw) collision with
+/// an existing catalog row, mirroring `NodeId::mint`'s own bounded
+/// registration-CAS retry (`animusd/CLAUDE.md`'s "Self-minted member ids"
+/// entry) rather than failing outright on the first collision.
+const CREATE_BACKUP_ID_ATTEMPTS: u32 = 3;
+
+/// `CreateBackup` (ADR 0059 §3/§4, Train 1 PR④): begin an on-demand backup
+/// of `table`, named `backup_name`. Validates the table exists
+/// (`TableNotFoundException` — AWS's own error for this specific call,
+/// distinct from the generic `ResourceNotFoundException` most other
+/// operations use) and mints a fresh opaque backup identity as an ARN
+/// (`wire::backup_arn`, ADR 0059 §3's own "an ARN-shaped string at the
+/// wire" convention — the ARN itself **is** the catalog's `BackupId` key,
+/// so nothing here or anywhere else in this adapter ever parses one back
+/// apart), stamped with `env.wall_now()` (ADR 0051's discipline: the pure
+/// state machine has no clock), then proposes `MetaCommand::BeginBackup`
+/// and commit-waits only for the **row to appear** — **never** for
+/// `AVAILABLE`. Capture proceeds asynchronously from here via the capture
+/// driver (`animusd::backup_capture`) and the completion aggregator
+/// (`animusd::backup_completion`).
+async fn create_backup(
+    ctx: &ClientCtx,
+    table: &str,
+    backup_name: &str,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err =
+        internal("CreateBackup did not commit to the control plane in time (no leader reachable?)");
+    for _ in 0..CREATE_BACKUP_ID_ATTEMPTS {
+        let backup_arn = wire::backup_arn(table, &format!("{:016x}", ctx.env.next_u64()));
+        ctx.propose_schema(&MetaCommand::BeginBackup {
+            backup_id: backup_arn.clone(),
+            table: table.to_owned(),
+            created_wall_ms,
+            backup_name: backup_name.to_owned(),
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.backup(&backup_arn) {
+                return Ok(wire::create_backup_response(&wire::BackupDetails {
+                    backup_arn,
+                    backup_name: backup_name.to_owned(),
+                    status: "CREATING",
+                    creation_wall_ms: row.manifest.created_wall_ms,
+                    size_bytes: 0,
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Either a (vanishingly unlikely) id collision rejected this
+                // attempt outright, or the propose itself never reached a
+                // leader — either way, mint a fresh id and retry rather than
+                // trying to distinguish the two (`propose_schema`'s own
+                // return means "reached a log somewhere," never "the state
+                // machine accepted it").
+                break;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// A backup catalog row's own AWS-faithful wire status (ADR 0059, Train 1
+/// PR④): `CREATING`/`AVAILABLE` map directly; `Expired`/`Failed` both map to
+/// `DELETED` — this adapter's internal two-phase-reclaim states have no
+/// analogue in AWS's own three-value on-demand `BackupStatus` enum, and both
+/// are, from a client's point of view, simply "this backup is gone" (the
+/// janitor, `animusd::backup_janitor`, is physically reclaiming either
+/// asynchronously). No wildcard arm: a future `BackupStatus` variant fails
+/// to compile here until this mapping is a deliberate decision.
+fn backup_wire_status(status: &animus_control::BackupStatus) -> &'static str {
+    match status {
+        animus_control::BackupStatus::Creating => "CREATING",
+        animus_control::BackupStatus::Available => "AVAILABLE",
+        animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. } => {
+            "DELETED"
+        }
+    }
+}
+
+/// A backup row visible at the wire — `Expired`/`Failed` are treated as
+/// already gone (`BackupNotFoundException`, AWS's own contract that a
+/// deleted backup's ARN is immediately invalid, real DynamoDB's `DeleteBackup`
+/// takes effect from the caller's point of view the instant it returns even
+/// though this adapter's own physical reclaim is asynchronous) — shared by
+/// [`describe_backup`]/[`delete_backup`]/[`list_backups`]'s own filter.
+fn visible_backup<'a>(
+    meta: &'a Metadata,
+    backup_arn: &str,
+) -> Result<&'a animus_control::BackupRow, WireError> {
+    match meta.backup(backup_arn) {
+        Some(row)
+            if !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            ) =>
+        {
+            Ok(row)
+        }
+        _ => Err(WireError {
+            code: "BackupNotFoundException",
+            message: format!("backup `{backup_arn}` does not exist"),
+            reasons: None,
+        }),
+    }
+}
+
+/// `DescribeBackup` (ADR 0059 §2/§3/§4, Train 1 PR④): a pure read of one
+/// backup's catalog row by its ARN. **Works even after the source table has
+/// been dropped** — every field this renders comes from the manifest's own
+/// captured `TableSchema`/stream/TTL snapshot (ADR 0059 §2), never a live
+/// `Metadata::table_schema`/`table_stream`/`table_ttl` lookup, and the
+/// reported size is the row's own frozen `total_bytes` (`MetaCommand::
+/// CompleteBackup`'s apply-time freeze, `BackupRow::total_bytes`'s own doc)
+/// rather than a live re-derivation — both are exactly what makes a backup
+/// outlive its source table meaningful at the wire (ADR 0024's explicit
+/// carve-out, ADR 0059 §3).
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_backup(meta: &Metadata, backup_arn: &str) -> Result<String, WireError> {
+    let row = visible_backup(meta, backup_arn)?;
+    Ok(backup_description_json(
+        backup_arn,
+        row,
+        backup_wire_status(&row.status),
+    ))
+}
+
+/// Build the `DescribeBackup`/`DeleteBackup`-shared `BackupDescription` JSON
+/// body from one catalog row — see [`describe_backup`]'s doc for why every
+/// field comes from the manifest's own captured snapshot, never a live
+/// catalog lookup. `status` is a separate parameter, not derived from
+/// `row.status` internally, because [`delete_backup`] must be able to render
+/// `"DELETED"` from a row it captured **before** proposing the mark (see
+/// that function's own doc for why re-reading the row back after proposing
+/// is unsound — the janitor can race ahead and remove it entirely before the
+/// caller's own next read).
+fn backup_description_json(
+    backup_arn: &str,
+    row: &animus_control::BackupRow,
+    status: &'static str,
+) -> String {
+    let details = wire::BackupDetails {
+        backup_arn: backup_arn.to_owned(),
+        backup_name: row.backup_name.clone(),
+        status,
+        creation_wall_ms: row.manifest.created_wall_ms,
+        size_bytes: row.total_bytes,
+    };
+    let dynamo_schema = schema_bridge::to_dynamo(&row.manifest.schema);
+    let indexes = schema_bridge::indexes_to_dynamo(&row.manifest.schema.indexes);
+    let stream_desc = row.manifest.schema.stream.as_ref().map(stream_description);
+    let ttl_desc = row
+        .manifest
+        .schema
+        .ttl
+        .as_ref()
+        .map(|t| wire::TtlDescription {
+            enabled: true,
+            attribute_name: Some(t.attribute_name.clone()),
+        });
+    wire::backup_description_response(
+        &details,
+        &row.table,
+        &dynamo_schema,
+        &indexes,
+        stream_desc.as_ref(),
+        ttl_desc.as_ref(),
+    )
+}
+
+/// `ListBackups` (ADR 0059 §3, Train 1 PR④): paginated backup summaries in
+/// ascending-ARN order — `Metadata::backups`' own `BTreeMap<BackupId, _>`
+/// iteration order, which is exactly the order [`wire::
+/// paginate_backup_summaries`] relies on, since a `BackupId` **is** its own
+/// ARN (ADR 0059 §3, [`wire::backup_arn`]'s doc). `Expired`/`Failed` rows
+/// are excluded before pagination (the identical "already gone" filter
+/// [`visible_backup`] applies to a single lookup, generalized to a scan).
+#[allow(clippy::too_many_arguments)] // mirrors `run_operation`'s own thin unpack-and-forward shape
+fn list_backups(
+    meta: &Metadata,
+    table: Option<&str>,
+    limit: Option<usize>,
+    exclusive_start_backup_arn: Option<&str>,
+    time_range_lower_bound_ms: Option<u64>,
+    time_range_upper_bound_ms: Option<u64>,
+    backup_type: wire::BackupTypeFilter,
+) -> Result<String, WireError> {
+    if !backup_type.matches_user_backup() {
+        // This adapter has never produced a `SYSTEM`/`AWS_BACKUP` backup —
+        // an honest empty page, not an error (matching AWS: an unusual but
+        // legal filter that simply never has anything to return here).
+        return Ok(wire::list_backups_response(&[], None));
+    }
+    let candidates: Vec<wire::BackupSummary> = meta
+        .backups
+        .iter()
+        .filter(|(_, row)| {
+            !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            )
+        })
+        .filter(|(_, row)| table.is_none_or(|t| row.table == t))
+        .filter(|(_, row)| {
+            time_range_lower_bound_ms.is_none_or(|lo| row.manifest.created_wall_ms >= lo)
+        })
+        .filter(|(_, row)| {
+            time_range_upper_bound_ms.is_none_or(|hi| row.manifest.created_wall_ms <= hi)
+        })
+        .map(|(backup_id, row)| wire::BackupSummary {
+            table: row.table.clone(),
+            details: wire::BackupDetails {
+                backup_arn: backup_id.clone(),
+                backup_name: row.backup_name.clone(),
+                status: backup_wire_status(&row.status),
+                creation_wall_ms: row.manifest.created_wall_ms,
+                size_bytes: row.total_bytes,
+            },
+        })
+        .collect();
+    let (page, last_evaluated) =
+        wire::paginate_backup_summaries(&candidates, exclusive_start_backup_arn, limit);
+    Ok(wire::list_backups_response(
+        &page,
+        last_evaluated.as_deref(),
+    ))
+}
+
+/// `DeleteBackup` (ADR 0059 §3, Train 1 PR④): mark a backup for reclaim by
+/// its ARN. Rejects an unknown/already-gone backup (`BackupNotFoundException`)
+/// and one still `CREATING` (`BackupInUseException`, AWS-faithful — a
+/// backup capture in progress cannot be deleted); otherwise proposes
+/// `MetaCommand::MarkBackupDeleted` (the two-phase janitor's own **mark**
+/// step, `animusd::backup_janitor`) and commit-waits for the row to reflect
+/// it, then returns the same `BackupDescription` shape [`describe_backup`]
+/// does — with `BackupStatus: DELETED`, matching real DynamoDB's own
+/// (synchronous, from the caller's point of view) `DeleteBackup` contract.
+/// **Actual object reclaim is the janitor's own async job** — this call
+/// never waits for it.
+///
+/// **The response body is built from the row captured up front, before ever
+/// proposing** — never from a post-propose re-read. The backup janitor
+/// (`animusd::backup_janitor`) polls on its own fast, independent tick
+/// (200ms): on a lightly loaded single/small cluster it can observe the
+/// mark, reclaim every object, and finalize (physically remove the row) all
+/// before this function's *own* post-propose poll ever gets a look — a
+/// post-propose re-read finding the row already gone must be treated as
+/// exactly as much a success as finding it `Expired` (both mean the mark
+/// landed), and once gone there is nothing left to re-read the manifest
+/// from anyway. Found live via a genuinely fast-reclaiming single-node test.
+async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    let row = visible_backup(&meta, backup_arn)?.clone();
+    if matches!(row.status, animus_control::BackupStatus::Creating) {
+        return Err(WireError {
+            code: "BackupInUseException",
+            message: format!("backup `{backup_arn}` is still being created"),
+            reasons: None,
+        });
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::MarkBackupDeleted {
+            backup_id: backup_arn.to_owned(),
+        })
+        .await;
+        match metadata_fresh(ctx).await.backup(backup_arn) {
+            Some(fresh_row)
+                if matches!(fresh_row.status, animus_control::BackupStatus::Expired) =>
+            {
+                return Ok(backup_description_json(backup_arn, fresh_row, "DELETED"));
+            }
+            None => {
+                // The janitor already reclaimed and removed the row — the
+                // mark unambiguously landed (nothing removes a row except
+                // the janitor's own finalize step, which only ever follows
+                // a successful mark). Render from the pre-propose snapshot.
+                return Ok(backup_description_json(backup_arn, &row, "DELETED"));
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "DeleteBackup did not commit to the control plane in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
 }
 
 /// Propose `table`'s key schema **and each declared secondary-index definition**
@@ -6456,5 +6784,242 @@ mod segment_tests {
         let (from, bound) = scan_bounds(None, inside.clone());
         assert_eq!(from, inside);
         assert_eq!(bound, None);
+    }
+}
+
+/// `list_backups`'s own filter logic (ADR 0059, Train 1 PR④) — table,
+/// time-range, and `BackupType` filtering over a hand-`.apply()`-driven
+/// `Metadata`, no live node needed at all (this crate's own lightest-harness
+/// idiom, mirroring `segment_janitor.rs`'s `orphan_reap_tests` in
+/// `animusd` proper). Pagination itself (`Limit`/`ExclusiveStartBackupArn`)
+/// is `wire::paginate_backup_summaries`'s own unit-tested contract
+/// (`animus-dynamo`'s `wire` test module) — not re-proven here.
+#[cfg(test)]
+mod list_backups_tests {
+    use animus_control::{ApplyOutcome, ColumnType, MetaCommand, TableSchema};
+    use animus_tablet::{KeyRange, TabletId};
+
+    use super::*;
+
+    /// One table + one completed, `Available` backup of it, stamped with
+    /// `created_wall_ms`. `tablet` must be distinct across every table this
+    /// test builds (a bare `Metadata`, no allocator to dedupe for it).
+    fn add_backup(
+        meta: &mut Metadata,
+        table: &str,
+        tablet: TabletId,
+        backup_arn: &str,
+        created_wall_ms: u64,
+    ) {
+        if !meta.has_table_schema(table) {
+            assert_eq!(
+                meta.apply(&MetaCommand::CreateTableSchema {
+                    table: table.to_owned(),
+                    schema: TableSchema::simple("id", ColumnType::String),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        // A table gets exactly one tablet from `CreateTablet` (a second
+        // real tablet only ever comes from a split) — reuse the table's
+        // existing one for a second backup of the same table rather than
+        // trying to mint a colliding second whole-range tablet.
+        if meta.tablets_for_table(table).next().is_none() {
+            assert_eq!(
+                meta.apply(&MetaCommand::CreateTablet {
+                    tablet,
+                    table: Some(table.to_owned()),
+                    range: KeyRange::whole(),
+                    replicas: Vec::new(),
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        let tablet = meta
+            .tablets_for_table(table)
+            .next()
+            .map(|(&id, _)| id)
+            .expect("just created above");
+        assert_eq!(
+            meta.apply(&MetaCommand::BeginBackup {
+                backup_id: backup_arn.to_owned(),
+                table: table.to_owned(),
+                created_wall_ms,
+                backup_name: "b".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            meta.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: backup_arn.to_owned(),
+                tablet,
+                cut_version: 1,
+                bytes: 10,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            meta.apply(&MetaCommand::CompleteBackup {
+                backup_id: backup_arn.to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    fn arns(body: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        v["BackupSummaries"]
+            .as_array()
+            .expect("BackupSummaries array")
+            .iter()
+            .map(|s| s["BackupArn"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// A fixture with three `Available` backups (two of `orders`, one of
+    /// `users`, at three different creation times) plus one `Expired`
+    /// `orders` backup — every scenario below asserts the `Expired` one
+    /// never appears, regardless of which other filter is applied.
+    fn fixture() -> Metadata {
+        let mut meta = Metadata::default();
+        add_backup(&mut meta, "orders", TabletId(1), "arn-a", 1_000);
+        add_backup(&mut meta, "orders", TabletId(2), "arn-b", 2_000);
+        add_backup(&mut meta, "users", TabletId(3), "arn-c", 1_500);
+        add_backup(&mut meta, "orders", TabletId(4), "arn-d-expired", 1_800);
+        assert_eq!(
+            meta.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "arn-d-expired".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        meta
+    }
+
+    #[test]
+    fn no_filters_lists_every_non_expired_backup_in_arn_order() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
+    }
+
+    #[test]
+    fn table_filter_narrows_to_the_named_table_only() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            Some("orders"),
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b"]);
+    }
+
+    #[test]
+    fn table_filter_on_an_unknown_table_is_an_empty_page_not_an_error() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            Some("ghost"),
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert!(arns(&body).is_empty());
+    }
+
+    #[test]
+    fn time_range_lower_bound_excludes_earlier_backups() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            Some(1_600),
+            None,
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-b"]);
+    }
+
+    #[test]
+    fn time_range_upper_bound_excludes_later_backups() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            Some(1_600),
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-c"]);
+    }
+
+    #[test]
+    fn a_time_range_window_intersects_both_bounds() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            Some(1_200),
+            Some(1_900),
+            wire::BackupTypeFilter::User,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-c"]);
+    }
+
+    #[test]
+    fn a_non_user_backup_type_is_an_empty_page() {
+        let meta = fixture();
+        for backup_type in [
+            wire::BackupTypeFilter::System,
+            wire::BackupTypeFilter::AwsBackup,
+        ] {
+            let body = list_backups(&meta, None, None, None, None, None, backup_type)
+                .expect("list_backups");
+            assert!(
+                arns(&body).is_empty(),
+                "this adapter has never produced a {backup_type:?} backup"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_type_all_includes_every_user_backup() {
+        let meta = fixture();
+        let body = list_backups(
+            &meta,
+            None,
+            None,
+            None,
+            None,
+            None,
+            wire::BackupTypeFilter::All,
+        )
+        .expect("list_backups");
+        assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
     }
 }

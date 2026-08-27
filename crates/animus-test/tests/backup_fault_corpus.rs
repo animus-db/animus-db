@@ -561,6 +561,7 @@ fn begin_backup(meta: &mut Metadata, backup_id: &str, wall_ms: u64) {
             backup_id: backup_id.to_owned(),
             table: TABLE.into(),
             created_wall_ms: wall_ms,
+            backup_name: "backup".to_string(),
         }),
         ApplyOutcome::Applied
     );

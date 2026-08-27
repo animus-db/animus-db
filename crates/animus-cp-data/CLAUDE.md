@@ -61,7 +61,13 @@ amendment — the shape predates and outlives it.)
   aggregator (`backup_completion.rs`, assembling + writing the manifest
   object) — see `animusd`'s `CLAUDE.md` for both, and its
   `BackupStoreConfig`/`BackupStoreHandle` for the store-handle half of PR②.
-  Still no janitor/wire surface (later trains).
+  **Train 1 PR④** adds the wire surface (`CreateBackup`/`DescribeBackup`/
+  `ListBackups`/`DeleteBackup`, `animusd::dynamo`) and the backup janitor
+  (`animusd::backup_janitor`) — the janitor's own reclaim sweep reuses
+  [`backup_prefix`] to scope a local `SegmentStore::list()`/`delete()` sweep
+  per backup id (this module contributes only the naming convention; no
+  code here changed for PR④). This module itself is otherwise unchanged by
+  PR④ — no restore reader yet either (Train 2).
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
   replication of an immutable segment over `E`'s `Network` seam. The

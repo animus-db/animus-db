@@ -366,7 +366,8 @@
             <tr><td><code>BatchGetItem</code></td><td><span class="pill yes">Yes</span></td><td>Per-request atomicity, DynamoDB-faithful</td></tr>
             <tr><td><code>DeleteTable</code> · <code>ListTables</code></td><td><span class="pill yes">Yes</span></td><td>On the DynamoDB endpoint; also through the admin API and the consoles</td></tr>
             <tr><td>Authentication (SigV4)</td><td><span class="pill opt">Opt-in</span></td><td>Off by default. Without it, any caller that can reach the port is trusted</td></tr>
-            <tr><td>Backups, global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
+            <tr><td><code>CreateBackup</code> · <code>DescribeBackup</code> · <code>ListBackups</code> · <code>DeleteBackup</code></td><td><span class="pill yes">Yes</span></td><td>On-demand backups. A backup outlives a dropped source table; restoring one (<code>RestoreTableFromBackup</code>) and continuous backups (PITR) are next</td></tr>
+            <tr><td>Global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
           </tbody>
         </table>
       </div>
@@ -549,7 +550,10 @@
           client DynamoDB port. Every other endpoint assumes a trusted network.</li>
         <li><strong>No format compatibility between revisions.</strong> Upgrading means recreating
           the cluster.</li>
-        <li><strong>No backup or restore</strong> tooling.</li>
+        <li><strong>On-demand backups exist; restore doesn't yet.</strong>
+          <code>CreateBackup</code>/<code>DescribeBackup</code>/<code>ListBackups</code>/<code>DeleteBackup</code>
+          work and a backup outlives a dropped source table, but there is no
+          <code>RestoreTableFromBackup</code> and no continuous backups (PITR) yet.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
         <li><strong>No Kubernetes operator</strong> yet, though the port layout is built for one.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a

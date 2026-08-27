@@ -420,6 +420,34 @@ per-tablet CP data plane (`animus-cp-data`).
   why this needed one canonical accessor rather than a per-consumer
   re-derivation.
 
+  **Train 1 PR④ (wire surface + janitor) additions**: one new command,
+  `MetaCommand::MarkBackupDeleted { backup_id }` — the two-phase janitor's
+  own **mark** step (`Available`/`Failed` → `Expired`, idempotent once
+  `Expired`, rejects `Creating` as an apply-time seatbelt behind the wire
+  edge's own `BackupInUseException` check), proposed by the `DeleteBackup`
+  wire operation (`animusd::dynamo::delete_backup`) — never by the janitor
+  itself. The pre-existing `MetaCommand::DeleteBackup` (PR①'s own row-plus-
+  progress removal) is unchanged and becomes the janitor's own
+  **finalizing** command instead, proposed only once every one of a marked
+  backup's objects has been reclaimed (`animusd::backup_janitor`); no new
+  `BackupStatus` variant was needed (`Expired` already existed for exactly
+  this). Two new `BackupRow` fields: `backup_name: String` (the client's
+  `CreateBackup` request field, threaded through a new `MetaCommand::
+  BeginBackup.backup_name` field — recorded verbatim, never interpreted,
+  never part of this row's own identity) and `total_bytes: u64` (frozen
+  **once**, by `CompleteBackup`'s own apply arm, from `Metadata::
+  backup_total_bytes` at the moment every pinned tablet's live descendant is
+  still resolvable — **not** re-derived live by the wire surface, which
+  would silently collapse to zero the instant the source table is dropped;
+  see `docs/engineering-lessons.md`'s entry on this). `backup_name` being a
+  new required `MetaCommand::BeginBackup` field meant updating every
+  existing `BeginBackup{..}` construction site across this crate's own
+  tests, `animus-test`, and `animusd`'s tests — compiler-enumerated, the
+  same "grep every site" fan-out root `CLAUDE.md`'s engineering-practices
+  log already documents for this class of change; `total_bytes` needed no
+  such fan-out (it is derived and stored only inside `Metadata::apply`'s own
+  `BeginBackup`/`CompleteBackup` arms, never constructed by a caller).
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

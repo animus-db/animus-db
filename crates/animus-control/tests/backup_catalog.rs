@@ -104,6 +104,7 @@ fn run(seed: u64) {
             backup_id: "backup-1".into(),
             table: "orders".into(),
             created_wall_ms: 1_000,
+            backup_name: "backup".to_string(),
         },
         "BeginBackup",
         seed,
@@ -262,6 +263,7 @@ fn backup_catalog_is_reproducible_from_seed() {
             backup_id: "backup-1".into(),
             table: "orders".into(),
             created_wall_ms: 1_000,
+            backup_name: "backup".to_string(),
         });
         sim.run_for(Duration::from_secs(1));
         sim.crash(nid(leader as u64));
@@ -323,6 +325,7 @@ fn backup_catalog_survives_node_restart() {
             backup_id: "backup-1".into(),
             table: "orders".into(),
             created_wall_ms: 1_000,
+            backup_name: "backup".to_string(),
         },
         "BeginBackup",
         seed,
