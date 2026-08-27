@@ -544,12 +544,27 @@ pub enum Metric {
     /// that one transaction, e.g. because its record's tablet retired
     /// mid-recovery.
     CpTxnUnresolvedDecidedStuck,
+    // --- `ClientRequestToken` idempotency, issue #298 "deep shape A"
+    // amendment --- Appended after the unresolved-decided-stuck variant;
+    // every earlier variant's slot and the text-export order stay stable, so
+    // the snapshot remains byte-reproducible. Recorded by
+    // `animusd::dynamo::run_transact`.
+    /// A `TransactWriteItems` request's own `cp_txn` call stayed ambiguous
+    /// (`TxnAbortReason::is_ambiguous`) through every internal retry within
+    /// `CLIENT_TIMEOUT` — this coordinator could not confirm whether the
+    /// transaction committed or not. Deliberately **not** counted as
+    /// [`Self::DynamoTransactWritesCanceled`]: a `ClientRequestToken`'s
+    /// idempotency record is left `PENDING` rather than falsely marked
+    /// `CANCELLED` (see `run_transact`'s own doc) — this counter is purely a
+    /// liveness signal for an operator, since correctness never depends on
+    /// it firing.
+    DynamoTransactWritesAmbiguous,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 76] = [
+    pub const ALL: [Metric; 77] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -626,6 +641,7 @@ impl Metric {
         Metric::CpTxnRecoveryVerifyInconclusive,
         Metric::CpTxnRecoveryStuckInconclusive,
         Metric::CpTxnUnresolvedDecidedStuck,
+        Metric::DynamoTransactWritesAmbiguous,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -709,6 +725,7 @@ impl Metric {
             Metric::CpTxnRecoveryVerifyInconclusive => "cp_txn_recovery_verify_inconclusive",
             Metric::CpTxnRecoveryStuckInconclusive => "cp_txn_recovery_stuck_inconclusive",
             Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
+            Metric::DynamoTransactWritesAmbiguous => "dynamo_transact_writes_ambiguous",
         }
     }
 

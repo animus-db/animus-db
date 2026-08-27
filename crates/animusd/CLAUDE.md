@@ -1001,6 +1001,45 @@ built on, not just the first one found. Regression:
 "served" contract) and the mirrored fix in `animus-test/tests/
 txn_serializable.rs`'s own `push`/`resolver_tick`.
 
+**`ClientRequestToken` idempotency for `TransactWriteItems` (ADR 0018's
+2026-08-24 amendment; the 2026-08-27 amendment closing issue #298's "deep
+shape A" residual)**: `dynamo.rs::run_transact` preflights a token against a
+durable `token → (fingerprint, outcome)` record on a reserved internal
+table (`animus_dynamo::internal_tables::TXN_IDEMPOTENCY_TABLE`) — a
+conditional claim `Put` guarantees the transaction itself executes **at
+most once** per token, independent of anything the outcome bookkeeping
+records. The 2026-08-27 amendment fixed the bookkeeping's own remaining bug:
+`run_transact`'s `cp_txn` call site used to record `TXN_IDEMPOTENCY_
+CANCELLED` for **every** `cp_txn` failure, including a genuinely **ambiguous**
+one (`TxnAbortReason::is_ambiguous` — a `"; retry"`-suffixed `Other`, e.g. a
+leader move mid stage or a `StageOutcome::Fenced` naming a concurrent
+in-doubt-recovery decision) where the transaction may in fact have committed
+via a path this exact call never observed — the false-negative half of the
+"an unconfirmed outcome is UNKNOWN" defect class this section's issue #298
+entry above already fixed twice in `txn_recover`'s own queries, now fixed a
+third time in the `ClientRequestToken` outcome cache. Fixed: `run_transact`
+now retries `cp_txn` internally (bounded by `CLIENT_TIMEOUT`, a fresh `TxnId`
+each attempt) ONLY for the narrow, **allowlisted** subset of ambiguous
+reasons proven to occur before any propose for this transaction could have
+applied (`TxnAbortReason::is_safe_to_retry_fresh` — a frozen-tablet
+refusal, no route reachable, a leader-side read failure, `Fenced`'s
+stage-time structural causes); every other ambiguous reason (including
+every DECIDE-phase confirmation loss — a leader move during anchor commit/
+abort/resolve) is never retried, since a confirmed decide, unlike a
+confirmed stage, fully materializes the write. Either way, if the outcome
+stays ambiguous, the idempotency record is left `PENDING` (self-healing via
+the ADR 0051 TTL reaper) rather than ever recording a possibly-wrong
+`CANCELLED`; the client gets a genuine, SDK-tolerated
+`TransactionInProgressException`, never a false `TransactionCanceledException`.
+**The allowlist shape is load-bearing, not a style choice**: an earlier
+denylist-shaped version of this fix (excluding only the two known
+stage-time messages) missed the decide-phase messages entirely and
+reproduced the exact duplicate-delivery bug live in this amendment's own
+proof-soak — see ADR 0018's 2026-08-27 amendment for the full account
+(including why this didn't need the alternative "derive `TxnId` from the
+token" design) and `animus-dynamo/CLAUDE.md`'s own entry for the
+wire-level mechanism.
+
 **A wire-reachable panic found (and fixed) while testing this**:
 `RaftKvNode::txn_stage`'s anchor-key-length assert (ADR 0022, `TOKEN_BYTES`)
 was a sound "caller invariant" before `ClientRequest::Txn` existed — no

@@ -235,6 +235,87 @@ impl TxnAbortReason {
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_else(|| TxnAbortReason::Other(raw.to_owned()))
     }
+
+    /// Whether this reason means "this coordinator could not confirm the
+    /// transaction committed" (a `"; retry"`-suffixed `Other` — the same
+    /// house-wide retryability convention [`read_should_retry`]
+    /// (`Self::read_should_retry`) already tests) as opposed to "this
+    /// coordinator definitively knows the transaction did not commit"
+    /// (`ConditionFailed`/`TransactionConflict`, or an `Other` whose message
+    /// does not end in `"; retry"`).
+    ///
+    /// **Load-bearing for `ClientRequestToken` idempotency** (ADR 0018's
+    /// issue #298 "deep shape A" amendment): recording an ambiguous outcome
+    /// as `CANCELLED` in the idempotency table would tell a future
+    /// same-token retry (and the client) the write definitely never
+    /// happened, when it may already have — `dynamo::run_transact` uses this
+    /// predicate to leave the idempotency record `PENDING` instead of
+    /// writing a possibly wrong `CANCELLED`, the same "an unconfirmed
+    /// outcome is UNKNOWN, never evidence of a specific result" discipline
+    /// `docs/engineering-lessons.md`'s issue #298 shape B/shape A amendments
+    /// already applied to `txn_recover`'s own queries.
+    ///
+    /// **This is a superset of [`Self::is_safe_to_retry_fresh`]** — see that
+    /// method's own doc for the narrower, retry-eligible subset and why the
+    /// distinction matters. Every ambiguous reason still gets the same
+    /// "never record `CANCELLED`" treatment; only the narrow allowlisted
+    /// subset is eligible to be retried with a fresh `TxnId`.
+    pub(crate) fn is_ambiguous(&self) -> bool {
+        matches!(self, TxnAbortReason::Other(msg) if msg.ends_with("; retry"))
+    }
+
+    /// The narrow, **allowlisted** subset of [`Self::is_ambiguous`] where the
+    /// failure is PROVABLY a no-op for this entire transaction attempt —
+    /// occurring before any Raft propose for it was ever attempted (a
+    /// frozen-tablet refusal, no route reachable, a leader-side read
+    /// failure) or as a stage-time STRUCTURAL rejection that never wrote
+    /// anything (`StageOutcome::Fenced`'s stale-route/out-of-fence causes —
+    /// see below for why its rarer third cause is still safe here). Safe to
+    /// retry with a fresh `TxnId` regardless of which hop failed or whether
+    /// an earlier hop (e.g. the anchor) already staged, because 2PC's own
+    /// atomicity guarantee means an anchor staged without every participant
+    /// confirming can only ever be recovered as `Abort`
+    /// (`ClientCtx::txn_recover`'s `all_staged` check requires a genuinely-
+    /// verified `Ok(true)` from every participant to decide `Commit`) — it
+    /// can never spuriously commit later.
+    ///
+    /// **Deliberately an ALLOWLIST, not a denylist** — the inverse of this
+    /// crate's own first attempt at this predicate, which named the known-
+    /// dangerous messages and treated everything else as safe. That
+    /// approach missed the DECIDE-phase confirmation-loss messages entirely
+    /// ("CP group leader moved during anchor commit/abort", "after decide",
+    /// "during orphan abort" — `resolve_all`'s own `.ok_or` sites) — a
+    /// confirmed DECIDE (unlike a confirmed STAGE) fully materializes every
+    /// participant's derived writes, so retrying one of these with a fresh
+    /// `TxnId` is exactly the double-materialize race this amendment
+    /// exists to close, and doing so reproduced the literal
+    /// `delivered=146/144` duplicate-pair signature live during this
+    /// amendment's own proof-soak. An allowlist fails safe against every
+    /// message this file does not yet know about (a future call site's own
+    /// new `"; retry"` wording included) by construction — a denylist fails
+    /// unsafe against exactly that.
+    ///
+    /// **On `StageOutcome::Fenced`**: its own message text names three
+    /// possible causes ("a stale route, an already-sealed/out-of-fence
+    /// range, or a concurrent in-doubt-recovery decision") with no way to
+    /// tell which fired. Tracing `animus_cp_data::lib.rs`'s apply arm
+    /// (`already_decided`, the only source of the third cause) shows it
+    /// requires the STORED record's `txn_id` to equal the CURRENT stage
+    /// attempt's own — i.e. it can only ever fire for a stage sharing an
+    /// identity with a record that already exists, never for a freshly-
+    /// minted, never-before-seen `TxnId` (what every retry in this file
+    /// mints). A fresh retry hitting `Fenced` is therefore, in practice,
+    /// always one of the other two structural causes — provably a no-op.
+    pub(crate) fn is_safe_to_retry_fresh(&self) -> bool {
+        matches!(self, TxnAbortReason::Other(msg) if
+        msg.as_str() == FROZEN_REFUSAL
+            || msg.contains("no CP group leader reachable for txn prepare")
+            || msg.starts_with("txn prepare: leader-side evaluation failed:")
+            || msg.contains(
+                "was rejected (a stale route, an already-sealed/out-of-fence range, \
+                 or a concurrent in-doubt-recovery decision)",
+            ))
+    }
 }
 
 impl std::fmt::Display for TxnAbortReason {
@@ -298,6 +379,132 @@ mod txn_abort_reason_tests {
     fn a_marked_but_undecodable_payload_degrades_to_other() {
         let raw = format!("{}not valid json", TxnAbortReason::MARK);
         assert_eq!(TxnAbortReason::decode(&raw), TxnAbortReason::Other(raw));
+    }
+
+    /// [`TxnAbortReason::is_ambiguous`] (ADR 0018's issue #298 "deep shape A"
+    /// amendment): the two typed variants are always definite (a condition
+    /// genuinely evaluated false, or an intent genuinely still blocked past
+    /// every retry) regardless of their own message text; an `Other` is
+    /// ambiguous exactly when — and only when — it carries the house-wide
+    /// `"; retry"` retryability suffix (`Self::read_should_retry` tests the
+    /// identical shape for the unrelated CP-read retry loop).
+    #[test]
+    fn is_ambiguous_classifies_by_the_house_retry_suffix() {
+        assert!(
+            !TxnAbortReason::ConditionFailed {
+                table: "t".into(),
+                key: vec![1],
+            }
+            .is_ambiguous()
+        );
+        assert!(
+            !TxnAbortReason::TransactionConflict {
+                table: "t".into(),
+                key: vec![1],
+            }
+            .is_ambiguous()
+        );
+        assert!(
+            TxnAbortReason::Other("CP group leader moved during participant stage; retry".into())
+                .is_ambiguous()
+        );
+        assert!(
+            TxnAbortReason::Other("no CP group leader reachable for txn prepare; retry".into())
+                .is_ambiguous()
+        );
+        assert!(
+            !TxnAbortReason::Other("txn prepare: writes must be non-empty".into()).is_ambiguous()
+        );
+        assert!(
+            !TxnAbortReason::Other("unexpected reply to forwarded TxnPrepare: Value(None)".into())
+                .is_ambiguous()
+        );
+    }
+
+    /// [`TxnAbortReason::is_safe_to_retry_fresh`] (ADR 0018's issue #298
+    /// "deep shape A" amendment, the allowlist correction): only the
+    /// provably-pre-propose reasons are retry-eligible; every DECIDE-phase
+    /// confirmation loss (which can follow a fully-materialized commit) and
+    /// the stage-time leader-moved case (a propose was actually attempted)
+    /// must answer `false`, even though both are `is_ambiguous() == true`.
+    #[test]
+    fn is_safe_to_retry_fresh_is_a_narrow_allowlist_not_a_denylist() {
+        // Allowlisted: provably nothing was proposed for this transaction.
+        assert!(TxnAbortReason::Other(super::FROZEN_REFUSAL.into()).is_safe_to_retry_fresh());
+        assert!(
+            TxnAbortReason::Other("no CP group leader reachable for txn prepare; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            TxnAbortReason::Other(
+                "txn prepare: leader-side evaluation failed: InternalServerError: leader-side \
+                 old-image read failed: CP group leader moved; retry"
+                    .into()
+            )
+            .is_safe_to_retry_fresh()
+        );
+        assert!(
+            TxnAbortReason::Other(
+                "txn prepare: stage on table `t` was rejected (a stale route, an \
+                 already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
+                 decision); retry"
+                    .into()
+            )
+            .is_safe_to_retry_fresh()
+        );
+
+        // NOT allowlisted: a propose was actually attempted (stage-time) or
+        // a decision may have actually applied (decide-time) — retrying
+        // fresh here is exactly the double-materialize race this amendment
+        // closes.
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during anchor stage; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during participant stage; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during anchor commit; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during anchor abort; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during orphan abort; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved after decide; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during anchor decide; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::Other("CP group leader moved during resolve; retry".into())
+                .is_safe_to_retry_fresh()
+        );
+
+        // The two typed variants are never retry-eligible either way.
+        assert!(
+            !TxnAbortReason::ConditionFailed {
+                table: "t".into(),
+                key: vec![1],
+            }
+            .is_safe_to_retry_fresh()
+        );
+        assert!(
+            !TxnAbortReason::TransactionConflict {
+                table: "t".into(),
+                key: vec![1],
+            }
+            .is_safe_to_retry_fresh()
+        );
     }
 }
 
@@ -8536,8 +8743,17 @@ impl ClientCtx {
                     ))),
                 }
             }
+            // `"; retry"`-suffixed (the house retryability convention,
+            // `Self::read_should_retry`/`TxnAbortReason::is_ambiguous`): no
+            // leader being reachable RIGHT NOW is a transient routing/
+            // election-window fact, not evidence the transaction did or
+            // will not commit — the same reasoning `cp_read`'s own
+            // `CpRoute::None` arm documents, applied here so a
+            // `ClientRequestToken`'s idempotency record is never recorded
+            // `CANCELLED` off this alone (ADR 0018's issue #298 "deep shape
+            // A" amendment).
             CpRoute::None => Err(TxnAbortReason::Other(
-                "no CP group leader reachable for txn prepare".into(),
+                "no CP group leader reachable for txn prepare; retry".into(),
             )),
         }
     }

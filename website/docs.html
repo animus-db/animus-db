@@ -360,7 +360,7 @@
             <tr><td><code>Query</code></td><td><span class="pill yes">Yes</span></td><td>Key conditions, filters, index queries, pagination</td></tr>
             <tr><td><code>Scan</code></td><td><span class="pill yes">Yes</span></td><td>Filters and pagination; ordered by token</td></tr>
             <tr><td><code>BatchWriteItem</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
-            <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Yes</span></td><td>Put, Update, Delete and ConditionCheck actions</td></tr>
+            <tr><td><code>TransactWriteItems</code> · <code>TransactGetItems</code></td><td><span class="pill yes">Yes</span></td><td>Put, Update, Delete and ConditionCheck actions; <code>ClientRequestToken</code> idempotency on writes</td></tr>
             <tr><td><code>UpdateTimeToLive</code> · <code>DescribeTimeToLive</code></td><td><span class="pill yes">Yes</span></td><td>—</td></tr>
             <tr><td>Streams: <code>ListStreams</code>, <code>DescribeStream</code>, <code>GetShardIterator</code>, <code>GetRecords</code></td><td><span class="pill yes">Yes</span></td><td>Served on the same endpoint under the streams target prefix</td></tr>
             <tr><td><code>BatchGetItem</code></td><td><span class="pill yes">Yes</span></td><td>Per-request atomicity, DynamoDB-faithful</td></tr>

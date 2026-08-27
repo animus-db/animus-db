@@ -317,6 +317,17 @@ comment for its full type/method inventory.
   nothing to deduplicate. See the ADR amendment and `animusd::dynamo::
   run_transact`'s own doc for the full protocol (including the deliberate
   `PENDING`→`TransactionInProgressException` conservative narrowing).
+  **The 2026-08-27 amendment closed issue #298's "deep shape A" residual**
+  (a client-level retry of an un-tokened `TransactWriteItems` racing its own
+  already-committed first attempt): the conditional-claim `Put` already
+  guaranteed at-most-once *execution*, but `run_transact` used to record a
+  possibly-wrong `CANCELLED` outcome for a genuinely ambiguous `cp_txn`
+  failure (a leader move mid stage, or similar — nothing this crate's own
+  wire layer sees or needs to change for). `animusd/CLAUDE.md`'s Multi-
+  participant transactions section has the fix; nothing here changed beyond
+  what this bullet already describes — the bug lived entirely in
+  `animusd`'s outcome bookkeeping, not in this crate's decode/fingerprint
+  layer.
 - **`TransactionCanceledException` carries AWS's real per-action
   `CancellationReasons` array** (ADR 0018's 2026-08-24 `CancellationReasons`
   amendment, issue #374 C2, shipped as C2a then C2b): `WireError.reasons`

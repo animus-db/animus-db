@@ -494,6 +494,23 @@ async fn dynamo_retrying(addr: SocketAddr, target: &str, body: &str, what: &str)
 /// server's to absorb — so this loop, bounded by
 /// [`RETRYABLE_BLIP_DEADLINE`], is the only thing standing between a slow
 /// cutover and a spurious failure on the transact path.
+///
+/// **`body` must carry a `ClientRequestToken` (ADR 0018's 2026-08-24
+/// amendment) — this is the production-faithful client behavior issue #298's
+/// "deep shape A" residual exists to force**: `body` is byte-identical
+/// across every attempt in this loop (unlike a real ad-hoc retry that might
+/// re-derive its own request), so reusing it verbatim IS reusing the same
+/// token — a client-level retry of an UN-tokened `TransactWriteItems` racing
+/// its own already-committed first attempt is exactly the race that used to
+/// let this soak lose or double-deliver an acked write; the token makes a
+/// same-body retry a safe no-op against the durable idempotency record
+/// instead. `TransactionInProgressException` (the wire status for a
+/// same-token retry racing its own still-ambiguous original, or exhausting
+/// `run_transact`'s own bounded internal retry while the outcome stayed
+/// unconfirmed — see that function's own doc) is retried identically to the
+/// pre-existing `"; retry"`-suffixed `TransactionCanceledException` shape:
+/// both are the server telling this exact caller "try again," never "this
+/// definitely didn't happen."
 async fn dynamo_retrying_transact(addr: SocketAddr, body: &str, what: &str) -> String {
     let deadline = tokio::time::Instant::now() + RETRYABLE_BLIP_DEADLINE;
     loop {
@@ -503,8 +520,8 @@ async fn dynamo_retrying_transact(addr: SocketAddr, body: &str, what: &str) -> S
         }
         let retryable = status == 500
             || (status == 400
-                && resp.contains("TransactionCanceledException")
-                && resp.contains("retry"));
+                && ((resp.contains("TransactionCanceledException") && resp.contains("retry"))
+                    || resp.contains("TransactionInProgressException")));
         if retryable && tokio::time::Instant::now() < deadline {
             sleep(Duration::from_millis(150)).await;
             continue;
@@ -2644,10 +2661,21 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
             ids.push(id);
             if i % 10 == 9 {
                 let (a, b) = (format!("x{i:04}a"), format!("x{i:04}b"));
+                // `ClientRequestToken` (ADR 0018's 2026-08-24 amendment): the
+                // production-faithful client behavior issue #298's "deep
+                // shape A" residual exists to force — a real client reuses
+                // one token across every retry of the SAME logical request,
+                // so a retry after a timeout/ambiguous error is a safe
+                // no-op against the durable idempotency record instead of a
+                // second, independent transaction racing the first's own
+                // already-committed write. `dynamo_retrying_transact` sends
+                // this exact `body` (token included) unchanged on every
+                // retry attempt — see that function's own doc.
+                let token = format!("soak-txn-{i:04}");
                 dynamo_retrying_transact(
                     issuer.dynamo_addr(),
                     &format!(
-                        r#"{{"TransactItems":[
+                        r#"{{"ClientRequestToken":"{token}","TransactItems":[
                             {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{a}"}},"tag":{{"S":"t0"}}}}}}}},
                             {{"Put":{{"TableName":"soak","Item":{{"id":{{"S":"{b}"}},"tag":{{"S":"t1"}}}}}}}}]}}"#
                     ),
