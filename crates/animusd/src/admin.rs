@@ -1087,6 +1087,14 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
             None => json!(key_str(id)),
         };
     }
+    if kind == syskv::EntityKind::PitrSegment {
+        // A composite (tablet, epoch) id (ADR 0059 §9, Train 3) — the
+        // identical shape `StreamShard` just above renders.
+        return match syskv::decode_pitr_segment_id(id) {
+            Some((tablet, epoch)) => json!(format!("{}-{epoch}", tablet.0)),
+            None => json!(key_str(id)),
+        };
+    }
     if kind == syskv::EntityKind::IndexBackfill {
         // A composite (tablet, index name) id (ADR 0045 §4) — same "not a
         // single numeric field, not cleanly a UTF-8 string either" shape as
@@ -1160,6 +1168,14 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // A `RestoreRow` (ADR 0059 §7, Train 2) — same JSON passthrough
         // convention as `Backup`/etc. above.
         syskv::EntityKind::Restore => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
+        // A `PitrSegmentRow` (ADR 0059 §9, Train 3) — same JSON passthrough
+        // convention as `StreamShard`/etc. above.
+        syskv::EntityKind::PitrSegment => {
+            serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
+        }
+        // Presence-only (ADR 0059 §9: the value is always empty — the tag
+        // row's existence is the fact), same convention as `IndexBackfill`.
+        syskv::EntityKind::PitrBaseBackup => Value::Null,
     }
 }
 

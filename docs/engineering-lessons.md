@@ -10588,6 +10588,74 @@ person to see it red doesn't waste time bisecting a change that isn't the
 cause; worth its own tracked issue alongside #406/#298's own flake family. A
 real fix likely widens the timeout or asserts on the *janitor's own*
 tick cadence rather than wall-clock margin.
+
+## A shared test-harness "fresh engines map" must genuinely be fresh per tablet, not per scenario (ADR 0059 §9, Train 3 PITR corpus)
+
+Building `pitr_fault_corpus.rs`'s split scenario (a parent tablet cutting
+over to two children, each sealing its own PITR segment independently), the
+very first run failed with every group's own decoded content showing
+exactly double the records it should have. Root cause: the scenario created
+**one** `engines()` map (`BTreeMap<NodeId, MemoryEngine>`) and passed it to
+`start_group` for the parent AND both children — since `MemoryEngine::
+clone()` is a cheap handle clone (shared underlying state, not a deep copy),
+all three "sibling" tablets ended up sharing the identical physical engine
+per node. A child's own `pending_changes()` scan then legitimately saw the
+parent's pre-split records too (nothing in the harness partitions by
+tablet — that separation is what a *real* per-tablet-private engine, ADR
+0050 rung 1/2, provides in production, and what `StorageScope`'s declared
+range narrows only the *logical* key space within, not the physical engine
+instance). `stream_lineage_corpus.rs`'s own `copy_split_children_born_
+empty` scenario already gets this right — three separate `engines()` calls
+(`parent_engines`/`left_engines`/`right_engines`) — but this file's first
+draft, written by close analogy rather than by copying that scenario's
+exact structure line-for-line, missed it.
+
+**The generalizable lesson**: when a sim-test harness models "sibling
+tablets" (a split, or any other multi-group scenario), a fresh engines map
+is required **per group**, not per scenario — reusing one `engines()` call
+across more than one `start_group` call silently reintroduces exactly the
+shared-physical-storage hazard the production tablet-privacy design (ADR
+0050) exists to prevent, and the resulting corruption (double-counted
+records, not a crash) is easy to misattribute to the mechanism actually
+under test rather than the harness. When copying a multi-group scenario's
+shape from a sibling corpus, copy the engine-provisioning lines exactly,
+don't just replicate the general pattern from memory.
+
+## `BeginBackup` is missing from `is_relayable_command` — a pre-existing Train 1 gap, found but out of scope (ADR 0059 §9, Train 3)
+
+While auditing the relay allowlist for the new PITR `MetaCommand`s
+(`UpdateContinuousBackups`/`SealPitrSegment`/`MarkBackupPitrBase`, all
+added to `is_relayable_command`), a grep for every existing `MetaCommand::
+BeginBackup` construction site turned up that `MetaCommand::BeginBackup`
+itself is **not** on the allowlist, despite `dynamo.rs::create_backup`
+calling `ctx.propose_schema(&MetaCommand::BeginBackup { .. })` — the exact
+same "may run on any node, must relay to the control leader" shape every
+other DDL-class command (`SetTableTtl`, `SetTableStream`, etc.) already has
+an allowlist entry for. `ClientCtx::propose_schema` relays via
+`ClientRequest::ProposeSchema` whenever the local node has no live control
+leader handle of its own; the receiving node's `is_relayable_command` gate
+would reject `BeginBackup` outright, and `create_backup`'s own commit-wait
+loop would then exhaust `CREATE_BACKUP_ID_ATTEMPTS` retries (minting a
+fresh id each time, since it can't distinguish "rejected" from "never
+reached a leader") and finally return a timeout error — meaning
+`CreateBackup` issued against a **follower-connected** node in a real
+multi-node deployment likely fails today, every time, until a data-role
+node happens to become the control leader.
+
+Not fixed here: this is a genuine, real bug, but it predates this PR
+(Train 1 PR④), is unrelated to PITR's own mechanism, and root `CLAUDE.md`'s
+own engineering practices are explicit that "an incidental pre-existing bug
+discovered during a task gets its own separate PR ... never a drive-by fix
+folded into an unrelated diff." Recorded here so it isn't silently
+rediscovered later: the fix is one line (`MetaCommand::BeginBackup { .. }`
+added to `is_relayable_command`'s allowlist) plus a
+`schema_ddl_relay.rs`-style regression test mirroring `update_time_to_live_
+on_a_follower_is_relayed_to_the_leader`. **Generalizable lesson**: when a
+new wire operation's `MetaCommand` gets a relay-allowlist entry, grep for
+every *sibling* command proposed the same way (same wire-handler shape,
+same `ctx.propose_schema` call) while you're in the allowlist anyway — a
+gap next to the one you're fixing is exactly the kind of thing a narrowly-
+scoped PR walks right past.
 ### Amendment (2026-08-26, later the same day): shape B confirmed and fixed; a second, sibling conflation found and fixed alongside it
 
 A follow-up round re-instrumented both candidate sites from the entry above
