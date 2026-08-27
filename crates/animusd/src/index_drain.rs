@@ -210,6 +210,7 @@ use std::time::Duration;
 use animus_control::Metadata;
 use animus_control::ProposeResult;
 use animus_control::schema::{IndexDef, IndexKind};
+use animus_cp_data::backup as backup_codec;
 use animus_cp_data::cursor;
 use animus_cp_data::hlc::{self, HlcTimestamp};
 use animus_cp_data::segment;
@@ -325,6 +326,11 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // task (this loop is the only writer/reader, one instance per node), so
     // no lock is needed.
     let mut first_hot_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
+    // ADR 0059 §9, Train 3: the PITR seal arm's own independent age-trigger
+    // fallback memo, tracked separately from `first_hot_seen` (a table's
+    // stream and its PITR coverage are independent consumers with
+    // independent enable/disable histories — see `pitr_tick`'s own doc).
+    let mut first_pitr_hot_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
     // Driver-local memo of each marker tablet's `KIND_CHANGE` byte estimate
     // as of the previous tick — the marker branch's busy detector (a backlog
     // that *changed* since last tick means writes are actively arriving; see
@@ -345,6 +351,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // (or moved off this node permanently) doesn't leak an entry
         // forever.
         first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
+        first_pitr_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
         marker_bytes_seen.retain(|t, _| meta.tablets.contains_key(t));
         // A build entry lives exactly as long as its parent is `Splitting`
         // (cutover removes the parent from the map entirely, fork F6).
@@ -500,6 +507,18 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // `disable_final_seal_then_reenable_continues_the_epoch_chain`
             // test, which failed intermittently before this fix).
             let ever_streamed = meta.stream_shard_watermark(tablet).is_some();
+            // ADR 0059 §9, Train 3: PITR is a fifth, independent consumer of
+            // the identical change log — a table can have PITR enabled with
+            // no stream, a stream with no PITR, both, or neither, and the
+            // two must never gate each other. `pitr_enabled`/`ever_pitr_
+            // sealed` join `stream_enabled`/`ever_streamed` in every gate
+            // below for exactly the same two reasons those two exist: the
+            // idle marker-only fast path must not swallow a PITR-only
+            // table's own real seal obligation, and a disabled-but-
+            // draining PITR generation's un-reaped rows must keep this
+            // tablet visited until its own final seal + trim.
+            let pitr_enabled = meta.table_pitr(&table).is_some();
+            let ever_pitr_sealed = meta.pitr_segment_watermark(tablet).is_some();
             // ADR 0049 §4 (Train A rung 4): a table with no GSI and no
             // enabled/ever-enabled stream is still visited — every write
             // leaves an image-less marker record (`ChangeRecord::marker`)
@@ -541,7 +560,12 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             //   derives **zero expected terms** and its existing
             //   trim-everything rule (F10/F12-b) deletes every marker in
             //   declared range — the same rule, not a second deleter.
-            if gsis.is_empty() && !stream_enabled && !ever_streamed {
+            if gsis.is_empty()
+                && !stream_enabled
+                && !ever_streamed
+                && !pitr_enabled
+                && !ever_pitr_sealed
+            {
                 if splitting {
                     // Trim held for the build (the split driver above holds
                     // the veto and consumes the markers as its tail feed).
@@ -566,7 +590,8 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                 if !pending {
                     continue;
                 }
-                if let Err(e) = trim_janitor(&ctx, &meta, &table, tablet, &group, &[], false).await
+                if let Err(e) =
+                    trim_janitor(&ctx, &meta, &table, tablet, &group, &[], false, false).await
                 {
                     tracing::debug!(tablet = tablet.0, table, error = %e, "marker trim: tick failed");
                 }
@@ -652,9 +677,38 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "seal arm: tick failed");
             }
+            // The PITR seal arm (ADR 0059 §9, Train 3) — same `!splitting`
+            // exclusion guard and the same reasoning as the stream seal arm
+            // just above (issue #298's dueling-seal race applies identically
+            // to a PITR generation's own epoch chain; the split endgame's
+            // own frozen-tablet final seal, below, owns this tablet's
+            // terminal PITR coverage exclusively while splitting).
             if !splitting
-                && let Err(e) =
-                    trim_janitor(&ctx, &meta, &table, tablet, &group, &gsis, stream_enabled).await
+                && pitr_enabled
+                && let Err(e) = pitr_tick(
+                    &ctx,
+                    &meta,
+                    &table,
+                    tablet,
+                    &group,
+                    &mut first_pitr_hot_seen,
+                )
+                .await
+            {
+                tracing::debug!(tablet = tablet.0, table, error = %e, "PITR seal arm: tick failed");
+            }
+            if !splitting
+                && let Err(e) = trim_janitor(
+                    &ctx,
+                    &meta,
+                    &table,
+                    tablet,
+                    &group,
+                    &gsis,
+                    stream_enabled,
+                    pitr_enabled,
+                )
+                .await
             {
                 tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: trim janitor tick failed");
             }
@@ -1002,6 +1056,15 @@ async fn split_driver_tick(
         build.phase = "final-seal";
         while seal_now(ctx, &table, tablet, group).await?.is_some() {}
     }
+    // 2b. PITR final seal (ADR 0059 §9, Train 3) — the identical exhaustion
+    // loop, independently, for a currently-PITR-enabled table (mirrors the
+    // "splitting tablet's exclusion guard" the ADR 0059 §9 task calls for:
+    // `change_consumer_loop`'s own per-tick PITR seal arm is excluded for a
+    // `Splitting` tablet, so this endgame step is PITR's ONLY chance to
+    // cover the frozen parent's final backlog before cutover retires it).
+    if !table.is_empty() && meta.table_pitr(&table).is_some() {
+        while pitr_seal_now(ctx, &table, tablet, group).await?.is_some() {}
+    }
 
     // 3a. GSI-drain veto (stage 3): the drain must have consumed the
     //     parent's change log (its cursor at or past the highest pending
@@ -1156,6 +1219,12 @@ async fn inplace_split_driver_tick(
     // in-place branch).
     if !table.is_empty() && meta.table_stream(&table).is_some() {
         while seal_now(ctx, &table, tablet, group).await?.is_some() {}
+    }
+    // PITR final seal (ADR 0059 §9, Train 3), anchored at the fork position
+    // — the identical exhaustion loop, independently, for a currently
+    // PITR-enabled table.
+    if !table.is_empty() && meta.table_pitr(&table).is_some() {
+        while pitr_seal_now(ctx, &table, tablet, group).await?.is_some() {}
     }
 
     // GSI-drain veto, accelerated exactly like the copy-based frozen
@@ -2331,6 +2400,252 @@ async fn seal_tick(
     seal_now(ctx, table, tablet, group).await.map(|_| ())
 }
 
+/// The **PITR seal arm** (ADR 0059 §9, Train 3) — the fifth consumer arm,
+/// alongside the GSI drain, the stream seal arm, the backfill seeder, and
+/// the hot-trim arm. Identical trigger shape to [`seal_tick`] (same
+/// `ctx.data().stream_seal_knobs` size/age thresholds — a deliberate Train 3
+/// simplification, not a separate PITR-specific knob; both consumers watch
+/// the identical `KIND_CHANGE` scope, so sharing the trigger threshold costs
+/// nothing correctness-wise and avoids a second CLI surface for this PR),
+/// but against the table's **PITR generation** rather than a stream label,
+/// and with its own independent `first_pitr_hot_seen` fallback memo (a table
+/// can have PITR enabled with no stream, or a stream with no PITR, or both
+/// independently — ADR 0059 §9's "never gate each other" rule means each
+/// consumer's own age-trigger basis must be tracked separately).
+async fn pitr_tick(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    tablet: TabletId,
+    group: &CpGroup,
+    first_pitr_hot_seen: &mut BTreeMap<TabletId, u64>,
+) -> Result<(), String> {
+    let approx_bytes = group.approx_bytes_kind(KIND_CHANGE).await;
+    if approx_bytes == 0 {
+        first_pitr_hot_seen.remove(&tablet);
+        return Ok(());
+    }
+
+    // `env.wall_now()`, matching `pitr_seal_now`'s own fix (see that
+    // function's doc) — both sides of this arm's `backlog_ms` delta must
+    // read the same clock, and `last_pitr_seal_wall_ms` is now a real
+    // wall-clock stamp.
+    let now_ms = ctx.env.wall_now().0;
+    let last_seal_ms = match meta.last_pitr_seal_wall_ms(tablet) {
+        Some(ms) => {
+            first_pitr_hot_seen.remove(&tablet);
+            ms
+        }
+        None => match first_pitr_hot_seen.get(&tablet).copied() {
+            Some(ms) => ms,
+            None => {
+                // Deliberately NOT `seal_tick`'s own "true oldest pending
+                // record's HLC" fallback: that basis is `ts.wall_ms`, a
+                // component of the packed HLC — monotonic-since-process-
+                // start (`Hlc::mint(env.now())`), never wall-clock — which
+                // stopped being comparable to this arm's own `now_ms` the
+                // moment it became a real `env.wall_now()` reading (see
+                // this function's own doc on `pitr_seal_now`'s twin fix).
+                // Mixing the two here would manufacture a backlog of
+                // "now minus a monotonic-since-start millisecond count," an
+                // enormous bogus age that fires `age_hot` on this tablet's
+                // very first tick regardless of true backlog age. Seeding
+                // at `now_ms` instead reintroduces `seal_tick`'s own
+                // documented (narrow, stream-only) split-child
+                // underestimate for PITR's arm too — accepted here: it only
+                // delays a never-yet-sealed tablet's own first seal by at
+                // most one `--stream-seal-age` interval, never a
+                // correctness issue (the `size_hot` trigger is unaffected,
+                // and a delayed first seal still seals the FULL backlog
+                // once it fires).
+                first_pitr_hot_seen.insert(tablet, now_ms);
+                now_ms
+            }
+        },
+    };
+    let backlog_ms = now_ms.saturating_sub(last_seal_ms);
+
+    let size_hot = approx_bytes > ctx.data().stream_seal_knobs.seal_bytes;
+    let age_hot = Duration::from_millis(backlog_ms) > ctx.data().stream_seal_knobs.seal_age;
+    if !size_hot && !age_hot {
+        return Ok(());
+    }
+    pitr_seal_now(ctx, table, tablet, group).await.map(|_| ())
+}
+
+/// **The PITR seal sequence** (ADR 0059 §9, Train 3) — the PITR twin of
+/// [`seal_now`], sharing its exact sequence/recovery discipline (unconditional:
+/// seals whatever is currently pending past the tablet's own effective PITR
+/// watermark; never seals an empty segment; the identical ledger-named-object
+/// recovery argument for a crash between the store `put` and the catalog
+/// commit) but writing to the **backup store**
+/// (`crate::BackupStoreHandle`, not [`crate::SegmentStoreHandle`]) under
+/// [`animus_cp_data::backup::pitr_segment_object_id`]'s own namespace, and
+/// cataloging into the separate [`animus_control::Metadata::pitr_segments`]
+/// via [`animus_control::MetaCommand::SealPitrSegment`] rather than
+/// `SealStreamShard`. See [`seal_now`]'s own doc for the full "why" behind
+/// every piece of this shape — duplicated here (not shared as one generic
+/// function) because the two write to genuinely different stores and
+/// catalog collections, and forcing them through one parameterized function
+/// would obscure that distinction more than it would save.
+///
+/// Returns `Ok(Some(epoch))` on a genuine seal, `Ok(None)` if there was
+/// nothing past the watermark to seal.
+pub(crate) async fn pitr_seal_now(
+    ctx: &ClientCtx,
+    table: &str,
+    tablet: TabletId,
+    group: &CpGroup,
+) -> Result<Option<u64>, String> {
+    // `metadata_fresh()`, not `effective_metadata()` — identical
+    // "permanent decision, never retried against a corrected view" argument
+    // `seal_now`'s own doc gives for the stream sealer.
+    let meta = ctx.metadata_fresh().await;
+    let generation = meta.table_pitr(table).map(|s| s.generation).or_else(|| {
+        meta.pitr_generations_with_rows(table)
+            .into_iter()
+            .next_back()
+    });
+    let Some(generation) = generation else {
+        return Ok(None);
+    };
+
+    let watermark = meta.pitr_segment_watermark(tablet);
+    let mut records: Vec<segment::SegmentRecord> = group
+        .pending_changes()
+        .await
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let ts = record_hlc(&key)?;
+            let packed = hlc::pack(ts);
+            if watermark.is_some_and(|w| packed <= w) {
+                return None;
+            }
+            Some(segment::SegmentRecord {
+                source_key: key,
+                packed_hlc: packed,
+                change_record: value,
+            })
+        })
+        .collect();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    records.sort_by_key(|r| r.packed_hlc);
+
+    let start_exclusive = watermark.unwrap_or(0);
+    let end_inclusive = records.last().expect("just checked non-empty").packed_hlc;
+    let next_epoch = meta
+        .pitr_segments
+        .range((tablet, 0)..=(tablet, u64::MAX))
+        .next_back()
+        .map_or(0, |((_, e), _)| e + 1);
+    // A PITR segment's own lineage chain is a purely structural
+    // tablet/epoch/`split_lineage` derivation — the identical helper the
+    // stream sealer uses, reused verbatim (it has no stream-specific
+    // content at all).
+    let parent_shard_id = meta.stream_shard_parent_id(tablet, next_epoch);
+    // ADR 0059 §10 (Train 3 PR②) bug fix: this used to be `ctx.env.now().0
+    // / 1_000_000` — the monotonic-since-process-start clock, mirroring the
+    // stream sealer's own `seal_now` (whose `seal_wall_ms` is genuinely
+    // observability-only, never compared against a real calendar
+    // timestamp). PITR's own `seal_wall_ms` is different: `Metadata::
+    // last_pitr_seal_wall_ms` feeds directly into `EarliestRestorableDateTime`/
+    // `LatestRestorableDateTime` (`dynamo::pitr_description`) and — as of
+    // this PR — `RestoreTableToPointInTime`'s own window/segment-selection
+    // math, both of which compare it against `PitrSpec::enabled_wall_ms`
+    // (a genuine `env.wall_now()` epoch-millisecond stamp, ADR 0051
+    // discipline). Left as `env.now()`, a PITR-enabled table's
+    // `LatestRestorableDateTime` silently collapsed to `EarliestRestorableDateTime`
+    // forever the instant any tablet sealed even once (the tiny
+    // monotonic-ms value always lost to the `.max(earliest_ms)` clamp) —
+    // found while implementing this PR's own restore validation gate, not
+    // by a failing test (the existing `dynamo_pitr.rs` lifecycle test
+    // happened not to assert `latest` ever *exceeds* `earliest`). See
+    // `docs/engineering-lessons.md` for the general lesson.
+    let seal_wall_ms = ctx.env.wall_now().0;
+    let header = segment::new_header(
+        table.to_owned(),
+        format!("gen{generation}"),
+        tablet.0,
+        next_epoch,
+        parent_shard_id,
+        (start_exclusive, end_inclusive),
+        seal_wall_ms,
+    );
+    let count = records.len() as u64;
+    let bytes = segment::encode(&header, &records);
+    let seg_id = backup_codec::pitr_segment_object_id(
+        table,
+        generation,
+        tablet.0,
+        next_epoch,
+        ctx.env.node_id().as_str(),
+        group.term(),
+        ctx.env.next_u64(),
+    );
+
+    let replicas = match ctx.data().backup_store.put(&seg_id, &bytes).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!("backup store put of {seg_id:?} failed: {e}"));
+        }
+    };
+
+    let cmd = MetaCommand::SealPitrSegment {
+        table: table.to_owned(),
+        generation,
+        tablet,
+        epoch: next_epoch,
+        hlc_range: (start_exclusive, end_inclusive),
+        count,
+        seal_wall_ms,
+        replicas,
+        object_id: seg_id,
+    };
+    // Commit-wait poll, identical shape (and identical dueling-seal
+    // reasoning) to `seal_now`'s own.
+    let deadline = tokio::time::Instant::now() + SEAL_COMMIT_TIMEOUT;
+    let mut next_propose_at = tokio::time::Instant::now();
+    loop {
+        match ctx
+            .metadata_fresh()
+            .await
+            .pitr_segments
+            .get(&(tablet, next_epoch))
+        {
+            Some(row) if row.hlc_range.1 >= end_inclusive => {
+                return Ok(Some(next_epoch));
+            }
+            Some(row) => {
+                return Err(format!(
+                    "SealPitrSegment({}, {next_epoch}) lost to a concurrent seal covering only \
+                     up to {}, short of our own {end_inclusive}; retry",
+                    tablet.0, row.hlc_range.1
+                ));
+            }
+            None => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "SealPitrSegment({}, {next_epoch}) did not commit in time",
+                tablet.0
+            ));
+        }
+        if now >= next_propose_at {
+            let sent = ctx.propose_schema(&cmd).await;
+            next_propose_at = now
+                + if sent {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// **The seal sequence** (ADR 0043 §A3, "Sequence"/"Recovery") — the one
 /// mechanism both the periodic seal arm ([`seal_tick`]) and the
 /// disable-triggered final seal (F12-b, `ClientCtx::force_seal_tablet` via
@@ -2695,6 +3010,7 @@ pub(crate) async fn hot_read(
 ///   accumulating forever (`change_consumer_loop`'s marker branch calls
 ///   this arm with `gsis` empty and `stream_enabled` false, precisely to
 ///   land here). One trim rule, both shapes; never a second deleter.
+#[allow(clippy::too_many_arguments)] // mirrors `seal_now`/`pitr_seal_now`'s own precedent for this shape
 async fn trim_janitor(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -2703,6 +3019,7 @@ async fn trim_janitor(
     group: &CpGroup,
     gsis: &[IndexDef],
     stream_enabled: bool,
+    pitr_enabled: bool,
 ) -> Result<(), String> {
     let mut trim_point: Option<u64> = None;
     let mut blocked = false;
@@ -2714,6 +3031,21 @@ async fn trim_janitor(
     }
     if !blocked && stream_enabled {
         match meta.stream_shard_watermark(tablet) {
+            Some(w) => trim_point = Some(trim_point.map_or(w, |t| t.min(w))),
+            None => blocked = true,
+        }
+    }
+    // ADR 0059 §9's own F10/F12-b-mirroring trim-bound rule: the PITR term
+    // applies only while `pitr_enabled` is true (the table's *current*
+    // schema names an active generation) — never merely because the table
+    // has draining catalog rows left over from a disabled one. A disabled
+    // PITR's own final seal (wired through `dynamo.rs`'s
+    // `update_continuous_backups`, mirroring `disable_stream`'s
+    // `force_seal_tablet` call exactly) has already moved every record into
+    // a committed segment before the disable itself ever committed, so this
+    // is safe for the identical reason `stream_enabled`'s own gating is.
+    if !blocked && pitr_enabled {
+        match meta.pitr_segment_watermark(tablet) {
             Some(w) => trim_point = Some(trim_point.map_or(w, |t| t.min(w))),
             None => blocked = true,
         }
@@ -3761,6 +4093,8 @@ mod stream_sealer_tests {
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 None,
                 crate::config::SplitMode::default(),
+                crate::BackupStoreConfig::default(),
+                crate::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )
             .await
             .expect("bring up single node with streams + quiescence");
@@ -3808,6 +4142,33 @@ mod stream_sealer_tests {
         )
         .await;
         assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    /// A table with a single-attribute key and no stream (ADR 0059 §9,
+    /// Train 3's own bring-up: PITR is exercised against an otherwise-plain
+    /// base table, proving the fifth consumer arm needs no stream at all).
+    async fn create_base_table(addr: SocketAddr, table: &str) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            &format!(r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+    }
+
+    /// `UpdateContinuousBackups` over the real HTTP wire (ADR 0059 §9,
+    /// Train 3).
+    async fn set_pitr(addr: SocketAddr, table: &str, enabled: bool) {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.UpdateContinuousBackups",
+            &format!(
+                r#"{{"TableName":"{table}","PointInTimeRecoverySpecification":{{"PointInTimeRecoveryEnabled":{enabled}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "UpdateContinuousBackups failed: {body}");
     }
 
     /// `PutItem` with a `"val"` attribute of `pad_len` filler bytes (a
@@ -3917,6 +4278,132 @@ mod stream_sealer_tests {
             let decoded = animus_cp_data::segment::decode(&bytes).expect("decode segment");
             assert_eq!(decoded.header.count, row.count);
             assert_eq!(decoded.header.hlc_range, row.hlc_range);
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
+    /// **PITR seal happy path** (ADR 0059 §9, Train 3): the fifth consumer
+    /// arm fires against an otherwise-plain, unstreamed base table — proving
+    /// PITR needs no stream at all — lands a `PitrSegmentRow` (a distinct
+    /// catalog collection from `stream_shards`, at a distinct backup-store
+    /// object namespace), trims the hot tail once sealed, and a
+    /// disable-then-re-enable mints a fresh generation while continuing the
+    /// SAME tablet's own epoch chain (mirroring
+    /// `disable_final_seal_then_reenable_continues_the_epoch_chain`'s own
+    /// property for streams).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pitr_seal_happy_path_and_disable_reenable_continues_epoch_chain() {
+        timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 200,
+                    seal_age: Duration::from_secs(3600),
+                },
+            )
+            .await;
+            let table = "orders";
+            create_base_table(node.dynamo_addr(), table).await;
+            set_pitr(node.dynamo_addr(), table, true).await;
+            assert_eq!(
+                node.metadata().table_pitr(table).map(|s| s.generation),
+                Some(1)
+            );
+
+            for i in 0..10u32 {
+                put_item_padded(node.dynamo_addr(), table, &format!("o{i}"), 50).await;
+            }
+
+            let tablet = only_tablet(&node, table);
+            await_true(20, "a PITR seal commits a catalog row", || {
+                node.metadata().pitr_segments.contains_key(&(tablet, 0))
+            })
+            .await;
+            let row = node.metadata().pitr_segments[&(tablet, 0)].clone();
+            assert_eq!(row.table, table);
+            assert_eq!(row.generation, 1);
+            assert!(row.count >= 1, "the seal covered at least one record");
+            assert!(!row.replicas.is_empty());
+            // No stream is enabled on this table — the ordinary stream
+            // catalog must stay completely untouched (ADR 0059 §9: two
+            // independent consumers of the identical log, never gating or
+            // interfering with each other).
+            assert!(node.metadata().stream_shards.is_empty());
+
+            let group = node
+                .edge
+                .local_cp(tablet)
+                .expect("this node hosts the tablet");
+            await_true(20, "hot tail trims to empty after the PITR seal", || {
+                futures::executor::block_on(group.pending_changes()).is_empty()
+            })
+            .await;
+
+            // The segment object landed at the PITR-specific backup-store
+            // namespace, not the streams `SegmentStoreHandle`'s.
+            let store = animus_env::FsSegmentStore::new(dir.path().join("node-0").join("backups"));
+            let bytes = store
+                .get(&row.object_id)
+                .await
+                .expect("backup store read")
+                .expect("the PITR segment object must exist after a committed seal");
+            let decoded = animus_cp_data::segment::decode(&bytes).expect("decode segment");
+            assert_eq!(decoded.header.count, row.count);
+            assert_eq!(decoded.header.hlc_range, row.hlc_range);
+            assert!(row.object_id.starts_with("backup/pitr/"));
+
+            // The initial burst's own records now carry full images (this
+            // table's PITR enablement puts it on `table_change_records_
+            // carry_images`'s gate), which are large enough that the burst
+            // can legitimately cross `seal_bytes` more than once — so more
+            // than epoch 0 may already exist by this point. The epoch-
+            // continuity property under test only needs "whatever the
+            // chain's own current tip is," never a hardcoded epoch number.
+            let (epoch_before_disable, last_pre_disable_row) = node
+                .metadata()
+                .pitr_segments
+                .range((tablet, 0)..=(tablet, u64::MAX))
+                .next_back()
+                .map(|(&(_, epoch), row)| (epoch, row.clone()))
+                .expect("at least epoch 0 sealed by now");
+
+            // Disable: the final seal runs before the disable itself
+            // commits, so the hot tail is fully covered the instant PITR
+            // reports disabled.
+            set_pitr(node.dynamo_addr(), table, false).await;
+            assert!(node.metadata().table_pitr(table).is_none());
+            await_true(
+                20,
+                "hot tail stays empty after disable's final seal",
+                || futures::executor::block_on(group.pending_changes()).is_empty(),
+            )
+            .await;
+
+            // Re-enable: a fresh generation (2, never reusing 1), and the
+            // SAME tablet's epoch chain continues from wherever it left off
+            // (never resets to 0) — the identical property streams already
+            // guarantee across a disable/re-enable cycle.
+            set_pitr(node.dynamo_addr(), table, true).await;
+            assert_eq!(
+                node.metadata().table_pitr(table).map(|s| s.generation),
+                Some(2)
+            );
+            put_item_padded(node.dynamo_addr(), table, "o-after-reenable", 250).await;
+            let next_epoch = epoch_before_disable + 1;
+            await_true(20, "a second-generation PITR seal commits", || {
+                node.metadata()
+                    .pitr_segments
+                    .contains_key(&(tablet, next_epoch))
+            })
+            .await;
+            let row2 = node.metadata().pitr_segments[&(tablet, next_epoch)].clone();
+            assert_eq!(row2.generation, 2, "the new generation, not the old one");
+            assert!(
+                row2.hlc_range.0 >= last_pre_disable_row.hlc_range.1,
+                "the new epoch starts exactly where the chain's prior tip left off"
+            );
         })
         .await
         .expect("did not converge in time");
