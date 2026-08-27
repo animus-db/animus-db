@@ -3122,3 +3122,47 @@ already-committed value with a fresh `txn_id`, producing the literal
 either the seatbelt `KvCommand::TxnStage` gained in the sibling shape A fix
 or this amendment's own recovery-side fix. See `docs/engineering-
 lessons.md`'s issue #298 shape A amendment for the full account.
+
+## Amendment (2026-08-26, issue #298 shape A: `TxnStage` must not resurrect an already-resolved key)
+
+`KvCommand::TxnStage`'s apply-time writer-push-intents guard (§2/PR6 task
+#16, "Writers push intents, never overwrite one") rejects a stage whose
+target key already holds a *different* transaction's unresolved `Intent` —
+but had no check at all for a key that is already `Envelope::Committed`
+(or restored-post-abort). A stale or duplicate `TxnStage` propose for the
+SAME `txn_id`, landing after that transaction's own resolve already ran,
+was therefore never rejected: it silently resurrected the key back into
+`Intent`, and a later resolve (the ordinary flow, the resolver-loop safety
+net, or a recovery push) re-materialized its derived change-log record a
+second time, at a fresh HLC — the literal "shape 5" two-sequence-numbers-
+for-one-write signature. Caught live during the same `SplitMode::InPlace`
+soak that caught this file's shape B amendment: `delivered=146/144`, one
+member of a transactional write pair duplicated under a single sealed
+shard.
+
+**Fix**: a new bounded, best-effort per-group tracker,
+`TxnTracker::recently_resolved` (`physical_key -> txn_id`), populated at
+every `TxnResolve` apply (commit or abort restore alike — both leave
+nothing of that `txn_id` at the key). `TxnStage`'s apply arm now checks
+every write key against it **by `(key, txn_id)` identity**, never presence
+alone (the same discipline the `KindBatchOutcome` false-ack fix
+established): a match folds into the same `Fenced` outcome bucket as the
+existing `already_decided` check. A *different*, genuinely later
+transaction reusing the same physical key — the ordinary write path for
+any key that isn't brand new — is unaffected; only same-identity
+resurrection is rejected. Deliberately not rebuilt at group start (unlike
+`pending`/`unresolved_decided`): its whole job is catching a stale re-stage
+that arrives shortly after its own resolve within the same process uptime,
+so starting empty after a restart is exactly as safe as any other
+eviction. Regression (red/green proven): `pr5_orphan_and_resurrection_
+tests::a_resolved_key_rejects_a_same_txn_restage_issue_298_shape_a`.
+
+**This fix closes a real, independently-worth-fixing structural gap, but
+tracing the captured trace's own `txn_id`s showed it is NOT what produced
+the live duplicate delivery** — the resurrecting stage there used a
+genuinely different, freshly-minted `txn_id` (a client-level retry racing
+its own already-committed first attempt; see this file's shape B amendment
+§6 and `docs/engineering-lessons.md`'s matching entry for the full
+account of that deeper, still-open mechanism). Both fixes ship together
+because each is independently correct and worth having regardless of which
+one the next live trace turns out to hit.
