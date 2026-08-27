@@ -3,10 +3,15 @@
 - **Status:** Accepted — implemented (PR1-PR7 + corpus-found fixes + the
   apply-time write-key conditions follow-up + the 2026-08-24
   `ClientRequestToken` idempotency amendment + the 2026-08-27 amendment
-  closing issue #298's "deep shape A" double-materialize mechanism (a new,
-  distinct residual surfaced by the same proof-soak — `SplitMode::InPlace`
-  stays pinned to `Copy`, see the amendment's §7); CQL transactional surface,
-  CancellationReasons fidelity, and manual txn-resolution admin actions
+  closing issue #298's "deep shape A" double-materialize mechanism + a
+  second 2026-08-27 amendment confirming and closing that round's own
+  genuine-`TransactionConflict` residual (plus two sibling bugs found the
+  same way) — `SplitMode::InPlace` **still** stays pinned to `Copy`, a NEW,
+  more severe "acked write lost with no error anywhere" residual found
+  during that round's own 30-run gate blocks the un-pin (see that
+  amendment's §4/§6); CQL transactional surface, CancellationReasons
+  fidelity, manual txn-resolution admin actions, and a `KvCommand::
+  TxnResolve` outcome channel (named, not built — that amendment's §3)
   deferred). PR1: HLC + sim clock skew; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal
   design; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
@@ -3415,3 +3420,226 @@ materialize; this is a spurious-failure cost, not a data-safety one). Per
 the mandate's own "any failure keeps the pin" instruction, `SplitMode::
 InPlace` stays **not** un-pinned — see `docs/engineering-lessons.md`'s
 matching entry for the full tally, hypothesis, and un-pin decision.
+
+## Amendment (2026-08-27, issue #298 "genuine `TransactionConflict`" residual: confirmed and fixed, but the un-pin stays blocked on a NEW residual)
+
+This round picked up the §7 residual immediately above: the one genuine
+(non-ambiguous) `TransactionConflict` the prior amendment's own proof-soak
+surfaced but did not confirm live. Diagnostics (`txn_diag_298`-targeted
+`tracing` lines, removed before this amendment's own fixes landed) were
+added to `cp_txn`/`txn_prepare_pushing`/`run_transact`, and the un-pinned
+soak was re-run until captured.
+
+### 1. The hypothesis, confirmed live — plus two siblings found the same way
+
+The captured trace matched the hypothesis exactly: a fresh-`TxnId` retry's
+own anchor stage hit `StageOutcome::IntentBlocked` naming, as the blocker,
+**the coordinator's own immediately-prior attempt** at the identical
+logical write (`is_safe_to_retry_fresh`'s own fresh-`TxnId` retry, ADR
+0018's 2026-08-27 amendment above). Tracing *why* that prior attempt's
+intent was still live despite its own transaction having already decided
+found the precise mechanism: `resolve_all`'s own resolve of the aborted
+first attempt's anchor key returned `Ok(())` (`ClientCtx::
+txn_resolve_participant`'s `CpRoute::Local` branch discards
+`RaftKvNode::txn_resolve`'s own `Option<HlcTimestamp>` signal), but the
+underlying `KvCommand::TxnResolve` entry had, in fact, silently no-op'd —
+**its own `fence` check rejected it** because the target tablet's range had
+shifted (a concurrent split) between the coordinator's `cp_route` lookup
+and the entry's actual apply. Unlike `KvCommand::TxnStage`, `TxnResolve`
+has no per-attempt outcome channel (`StageOutcome`'s own doc explains why
+that distinction matters) — its only signal is "did this entry apply,"
+which a fenced no-op satisfies exactly as well as a genuine resolve. The
+proposer therefore had no way to learn its own resolve never took effect.
+
+Confirming this live surfaced two further, independently real defects
+along the way — not the originally-hypothesized mechanism, but each a
+concrete cause of a spurious cancellation under the same un-pinned soak,
+found and fixed in the same round per this repo's own "capture, don't
+guess" discipline:
+
+- **A wrapping `format!` silently downgraded an already-classified
+  message** (`ClientCtx::txn_prepare_pushing`'s exhaustion arm for a
+  retryable-shaped `Other` that never even reached its own propose, issue
+  #412's own mechanism): the pre-existing code nested the last such message
+  inside new sentence text ending in a bare `")"`, moving the house `"; retry"`
+  suffix `TxnAbortReason::is_ambiguous` keys on to *before* the closing
+  paren — and, independently, moving the message out from under
+  `is_safe_to_retry_fresh`'s `starts_with("txn prepare: leader-side
+  evaluation failed:")` check. A message that was — before wrapping —
+  *already* proven safe to retry with a fresh `TxnId` (this exact stage
+  never reached its own propose) was silently reclassified as a **definite**
+  failure, recorded `CANCELLED` on the very first `cp_txn` attempt. **Fix**:
+  stopped synthesizing a new sentence around `msg` at all —
+  `Err(TxnAbortReason::Other(msg))`, passed through byte-for-byte, so this
+  arm can never accidentally alter a classification the underlying reason
+  already earned. See `docs/engineering-lessons.md`'s matching entry for
+  the general "a wrapping `format!` around a classified message is itself a
+  classification bug" lesson this generalizes to.
+- **A decide-time `FROZEN_REFUSAL` is not safe to retry with a fresh
+  `TxnId` once every participant has already staged** — `cp_txn`'s
+  "everyone staged, decide commit" branch propagated a hard `txn_decide_
+  anchor` failure (most commonly the identical `FROZEN_REFUSAL` string a
+  stage-time freeze also produces) straight through `is_safe_to_retry_
+  fresh`'s allowlist via `?`. `is_safe_to_retry_fresh`'s own safety
+  argument ("an anchor staged without every participant confirming can
+  only ever be recovered as Abort") does not hold here: by construction of
+  reaching this branch, **every** participant DID stage, so `ClientCtx::
+  txn_recover`'s own independent `all_staged`-driven decision can
+  legitimately **commit** the original `txn_id` at any moment — a fresh
+  retry racing that is exactly the double-materialize hazard the
+  2026-08-24/2026-08-27 amendments exist to close, confirmed live via the
+  soak's own `delivered=146/144` signature (both keys of one transactional
+  pair delivered twice — the original attempt's own eventual recovery-driven
+  commit, and the fresh retry's independent one). **Fix**: `ClientCtx::
+  txn_decide_anchor_retrying` — retries `txn_decide_anchor` with the SAME
+  `txn_id` (never a fresh one) while its own attempt fails outright,
+  bounded by `CLIENT_TIMEOUT`, mirroring `cp_kind_write_item`'s issue #288
+  freeze-refusal retry shape (routing already re-resolves fresh every
+  attempt via `txn_decide_anchor`'s own `cp_route` call). Retrying the SAME
+  decision is always safe — a repeat `TxnCommit`/`TxnAbort` propose for an
+  already-decided record is a logged no-op (§4's first-applied-wins
+  doctrine) — and never abandons already-staged work. All three of
+  `cp_txn`'s own decide call sites (the ordinary commit path and both abort
+  paths) now go through this wrapper; the two abort paths' own error-wrap
+  messages were fixed to preserve the `"; retry"` suffix at the same time
+  (the identical bug class as the first fix above, caught by the same
+  audit).
+
+### 2. The confirmed mechanism's own fix: push, don't just back off
+
+`StageOutcome::IntentBlocked` gained two fields — `record_key`/
+`record_table`, copied straight from the blocking `Envelope::Intent` (ADR
+0018 §2/PR4's own `record_key`/`record_table` fields, already carried by
+every intent so a foreign READ can chase it — see `IntentInfo`'s doc) — so
+a WRITE-side pusher can reach the blocker's own decision with no second
+read. `ClientCtx::push_resolution_if_decided` is the write-side sibling of
+the foreign-intent READ path's `confirm_or_push`/`resolve_intent_given_
+status`: on `IntentBlocked`, before backing off and retrying,
+`txn_prepare_pushing` now queries the blocker's own decision
+(`ClientCtx::txn_status`) and, if it is already `Committed`/`Aborted`,
+actively pushes its resolution (`txn_resolve_participant`, which
+re-resolves `cp_route` fresh — the exact thing that sidesteps the ORIGINAL
+resolve's stale-fence race, since by now routing correctly reaches
+whatever tablet the key belongs to) before the next stage attempt. A
+still-`Pending`/unconfirmable blocker is left alone — never pushed via
+`txn_recover` (that risks aborting a genuinely live coordinator before
+`RECOVERY_GRACE`) — so GENUINE, still-in-flight cross-transaction
+contention is completely unaffected: it still only ever resolves via the
+existing backoff-and-retry, `txn_resolver_loop`'s passive sweep, or the
+blocking coordinator's own eventual decision, exactly as before.
+
+**Deliberately does not fix `TxnResolve`'s own missing outcome channel** —
+the deeper structural gap this incident traces back to (§3 below) — since
+the write-side push closes the actual reachable symptom (a stage blocked on
+a blocker that is CONFIRMED decided) without needing to touch `KvCommand::
+TxnResolve`'s apply arm, the fence gate, or the resolve proposer's return
+type at all. A future round is free to add a `ResolveOutcome` channel
+mirroring `StageOutcome`'s if a reason to do so beyond this incident
+surfaces; this fix does not foreclose it and does not depend on it.
+
+### 3. Named, not fixed: `KvCommand::TxnResolve` has no outcome channel
+
+The root structural gap this whole investigation traces back to:
+`RaftKvNode::txn_resolve`'s only signal is `wait_applied(index).await.
+then_some(ts)` — "did this entry apply," never "did it actually resolve
+anything." A fence-miss no-op and a genuine resolve are indistinguishable
+to the caller. `KvCommand::TxnStage` solved the identical problem with
+`StageOutcome` (§2's own amendment); `TxnResolve` never got the same
+treatment. This amendment's fix (§2) closes the one reachable consequence
+(a stage blocked on a confirmed-decided blocker) without needing this
+larger change, but the gap itself remains: any OTHER caller that assumes
+`txn_resolve`'s `Some(ts)` means "resolved" rather than "applied" inherits
+the identical hazard. Left for a future round.
+
+### 4. Found, NOT fixed, and still blocking the un-pin: an acked write lost with no error anywhere
+
+Chasing the residual above through further soak runs surfaced a fourth,
+independent, and more severe failure: a `TransactWriteItems` call returned
+`Ok` (no retry, no ambiguous status, `cp_txn`'s own `txn_decide_anchor_
+retrying` call succeeding on its very first attempt) for a two-key
+transaction, and a later `ConsistentRead: true` `GetItem` for one of its
+own keys came back **completely absent** — not a chased-and-served
+still-`Pending` intent, not a `TransactionInProgressException`, just an
+empty read, the identical "acked write silently and permanently lost"
+signature the 2026-08-26 shape B amendment closed one mechanism of.
+
+**Not this round's shape B mechanism recurring** — no `txn_recover`/
+`txn_verify` inconclusive-query activity appears anywhere in the captured
+trace for this transaction; it staged, decided `Committed`, and (since
+`soak`'s a stream+GSI table) entered the awaited `resolve_all_parallel`
+path with no logged failure. **Leading hypothesis, not confirmed**: the
+identical `TxnResolve`-has-no-outcome-channel gap named in §3 above,
+compounding — under the un-pinned soak's own cascading-split cadence, a
+committed transaction's OWN resolve can hit the identical stale-fence
+no-op §1 describes, and if EVERY subsequent resolution attempt (the
+awaited `resolve_all_parallel` call, and `txn_resolver_loop`'s own passive
+per-second sweep afterward) keeps racing a FRESH split before it applies,
+the write's own intent could in principle never actually resolve on any
+tablet that ever holds it, while every attempt keeps reporting apparent
+success — a genuine, deeper consequence of §3's gap this round's own
+targeted fix does not reach, since `push_resolution_if_decided` only fires
+at STAGE time (when a fresh attempt collides with a live foreign intent),
+never on the ORIGINAL committer's own resolve path. **Not root-caused
+live**: this round's diagnostics (instrumented as far as `resolve_all_
+parallel`) captured occasional individual resolve failures/timeouts
+elsewhere in the same soak (always non-fatal, absorbed by the passive
+resolver loop within the test's own verification window) but never caught
+this exact transaction's own resolve attempt in the act. Recorded here per
+this file's own "capture the raw shape, don't re-derive it" instruction so
+the next round starts from a real, narrowed hypothesis instead of zero.
+
+### 5. Tests
+
+`ClientCtx::push_resolution_if_decided`'s own regression
+(`crates/animusd/src/lib.rs`'s in-crate `issue_298_conflict_tests` module,
+`a_fresh_stage_pushes_a_decided_blockers_resolution_instead_of_conflicting`):
+constructs the confirmed end state directly (stages a transaction, decides
+it `Aborted`, deliberately never resolves it — the same state a stale-fence
+no-op leaves, without needing to reproduce the fence race itself), calls
+`txn_prepare`(a single, unretried attempt) to observe the real
+`IntentBlocked`, invokes the fix under test directly, then calls
+`txn_prepare` again and asserts `Staged`. Deliberately avoids
+`txn_prepare_pushing`'s own sleep-based retry loop and completes in well
+under a second specifically so it can never be coincidentally saved by
+`txn_resolver_loop`'s independent one-second passive sweep — an earlier
+version of this test, built around the full retrying entry point, passed
+identically whether the fix was present or `return`-stubbed out, because
+local single-voter leader election alone (~750ms) left just enough real
+time before the test's own assertions for the background sweep to
+occasionally win the race instead; red/green was only genuinely proven
+once the test called the fix directly. Verified both ways (temporarily
+disabling `push_resolution_if_decided` reproduces the identical
+`IntentBlocked` on the second `txn_prepare` call the fix exists to clear).
+`animus-cp-data/tests/txn_conditions.rs`'s pre-existing `StageOutcome::
+IntentBlocked` pattern match was updated for the two new fields (`..`,
+unaffected by them). No dedicated regression for the `txn_decide_anchor_
+retrying` fix or the message-wrapping fix beyond the soak's own capture —
+both are `animusd`-level fixes over real routing/timing races
+(`animusd` has no `animus-sim` dependency, the same standing, named gap
+the 2026-08-24 amendment's own animusd-level fix noted) — confirmed via
+the captured live trace matching the predicted symptom exactly, both
+before (the failure) and after (30 consecutive soak runs attempted; see
+§6).
+
+### 6. Soak result and un-pin decision: NOT taken
+
+With all three fixes in place, the mandated 30-run un-pinned `SplitMode::
+InPlace` soak was attempted. The genuine `TransactionConflict` residual
+this amendment set out to close did not recur once across every run. The
+message-wrapping/decide-retry residuals (§1's two siblings) also did not
+recur. **§4's newly-found "acked write lost, no error anywhere" residual
+did recur** during the attempted 30-run batch, alongside occasional
+recurrences of the pre-existing lineage-delivery-timeout residual (ADR
+0058's G5 row) — both verified in isolation per this file's own standing
+"a timing-sensitive failure needs an isolated rerun before being treated as
+real" discipline, and both genuinely reproduce (not host-contention
+artifacts of this investigation's own back-to-back local runs).
+
+Per the mandate's own "any failure keeps the pin" instruction: `SplitMode::
+InPlace` stays **not** un-pinned. This round closes three confirmed, real
+bugs and materially narrows what's left, but §4's residual is a genuine,
+unresolved data-loss-shaped hazard under the un-pinned soak's own cadence
+— shipping the un-pin without root-causing it would trade a known, narrow,
+already-tracked gap (ADR 0050 rung 8's own copy-workflow acceptance soak
+staying pinned) for an unknown one. See `docs/engineering-lessons.md`'s
+matching entry for the full tally and the next round's starting point.

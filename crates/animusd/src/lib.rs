@@ -9265,15 +9265,17 @@ impl ClientCtx {
     /// (the apply path already knows definitively whether — and why — this
     /// exact stage no-op'd, so a second read to re-derive the same fact was
     /// redundant once the apply arm started reporting it). `Staged` returns
-    /// success; `IntentBlocked` retries the whole stage after a short
-    /// backoff — bounded (`TXN_STAGE_PUSH_ATTEMPTS`), mirroring the bounded
-    /// retry a *read* already does against a foreign pending intent (the
-    /// backoff alone, not an explicit push of the blocker — that gives the
-    /// blocking transaction room to clear on its own: its own coordinator
-    /// finishing, or `txn_resolver_loop`'s passive per-second sweep pushing
-    /// it once past `RECOVERY_GRACE`); `ConditionFailed`/`Fenced` are both
-    /// **final** — retrying an identical stage changes nothing, so these
-    /// return a client-facing error immediately, never looping.
+    /// success; `IntentBlocked` first tries [`push_resolution_if_decided`]
+    /// (ADR 0018 §2 issue #298 residual fix — see that method's own doc)
+    /// and then retries the whole stage after a short backoff — bounded
+    /// (`TXN_STAGE_PUSH_ATTEMPTS`), mirroring the bounded retry a *read*
+    /// already does against a foreign pending intent, giving a genuinely
+    /// still-live blocking transaction room to clear on its own otherwise
+    /// (its own coordinator finishing, or `txn_resolver_loop`'s passive
+    /// per-second sweep pushing it once past `RECOVERY_GRACE`);
+    /// `ConditionFailed`/`Fenced` are both **final** — retrying an
+    /// identical stage changes nothing, so these return a client-facing
+    /// error immediately, never looping.
     ///
     /// **Issue #412: a stage attempt that never even applied also gets this
     /// same bounded retry, when its own failure is retryable-shaped.**
@@ -9300,6 +9302,78 @@ impl ClientCtx {
     /// `TransactionConflict` and a non-retryable `Other` (no CP group
     /// leader reachable, a malformed request) still propagate immediately,
     /// unchanged.
+    ///
+    /// **`push_resolution_if_decided`** (ADR 0018 §2 issue #298 residual
+    /// fix, confirmed live under the un-pinned `SplitMode::InPlace` proof
+    /// soak): the write-side sibling of the foreign-intent READ path's
+    /// `confirm_or_push`/`resolve_intent_given_status`. A blocker found at
+    /// stage time may already be DECIDED — most commonly this exact
+    /// coordinator's own immediately-prior attempt (a fresh `TxnId` retry,
+    /// `TxnAbortReason::is_safe_to_retry_fresh`, racing its own
+    /// already-aborted first try's still-live intent, because that
+    /// attempt's own `resolve_all` resolve landed as a silent no-op:
+    /// `KvCommand::TxnResolve`'s `fence` check can reject a resolve whose
+    /// routing went stale between `cp_route` and the entry's actual apply —
+    /// e.g. the target tablet split in between — and unlike `TxnStage`,
+    /// `TxnResolve` has no outcome channel to report that, so the resolve's
+    /// own proposer sees `Some(ts)` "success" regardless; the resolve
+    /// outcome-channel gap itself is named as a separate, deferred issue in
+    /// `docs/adr/0018-cross-tablet-transactions.md`'s matching amendment).
+    /// Querying the blocker's own decision and, if it already decided,
+    /// actively pushing its resolution with FRESH routing — this call's own
+    /// fresh `cp_route` (inside `txn_resolve_participant`) is what correctly
+    /// reaches whatever tablet the key belongs to NOW, sidestepping the
+    /// stale-fence race the ORIGINAL resolve hit — converges well inside
+    /// [`txn_prepare_pushing`](Self::txn_prepare_pushing)'s own short retry
+    /// budget instead of exhausting it into a spurious `TransactionConflict`.
+    /// A still-`Pending`/unconfirmable blocker is left alone (never pushed
+    /// via `txn_recover` — that risks aborting a genuinely live coordinator
+    /// before `RECOVERY_GRACE`); the caller's own existing backoff-and-retry
+    /// is exactly the right, unchanged behavior for GENUINE still-in-flight
+    /// cross-transaction contention. Regression:
+    /// `issue_298_conflict_tests::a_fresh_stage_pushes_a_decided_blockers_
+    /// resolution_instead_of_conflicting`.
+    async fn push_resolution_if_decided(
+        &self,
+        table: &str,
+        blocked_key: &[u8],
+        blocker: TxnId,
+        blocker_record_table: String,
+        blocker_record_key: Vec<u8>,
+        attempt: u32,
+    ) {
+        let decided_outcome = match self
+            .txn_status(&blocker_record_table, &blocker_record_key)
+            .await
+        {
+            Ok(TxnDecisionStatus::Committed { commit_ts }) => {
+                Some(TxnOutcome::Committed { commit_ts })
+            }
+            Ok(TxnDecisionStatus::Aborted) => Some(TxnOutcome::Aborted),
+            Ok(TxnDecisionStatus::Pending) | Err(_) => None,
+        };
+        if let Some(outcome) = decided_outcome {
+            tracing::debug!(
+                table,
+                ?blocked_key,
+                blocking_txn = ?blocker,
+                ?outcome,
+                attempt,
+                "txn prepare: blocker already decided — pushing its resolution before \
+                 retrying the stage"
+            );
+            let _ = self
+                .txn_resolve_participant(
+                    table,
+                    blocker,
+                    blocker_record_key,
+                    vec![blocked_key.to_vec()],
+                    outcome,
+                )
+                .await;
+        }
+    }
+
     async fn txn_prepare_pushing(
         &self,
         table: &str,
@@ -9354,6 +9428,8 @@ impl ClientCtx {
                 StageOutcome::IntentBlocked {
                     key,
                     txn_id: blocker,
+                    record_key: blocker_record_key,
+                    record_table: blocker_record_table,
                 } => {
                     tracing::debug!(
                         table,
@@ -9363,6 +9439,15 @@ impl ClientCtx {
                         "txn prepare: stage blocked by another transaction's unresolved intent; \
                          retrying"
                     );
+                    self.push_resolution_if_decided(
+                        table,
+                        &key,
+                        blocker,
+                        blocker_record_table,
+                        blocker_record_key,
+                        attempt,
+                    )
+                    .await;
                     last_blocked = Some(key);
                 }
                 StageOutcome::ConditionFailed { key } => {
@@ -9390,13 +9475,45 @@ impl ClientCtx {
             }),
             // Every attempt failed at `txn_prepare` itself with a
             // retryable-shaped `Other` (issue #412) and none ever reached
-            // `IntentBlocked` — report the last such failure rather than
-            // the generic exhaustion text below, since it names the actual
-            // recurring condition.
-            (None, Some(msg)) => Err(TxnAbortReason::Other(format!(
-                "txn prepare: stage on table `{table}` did not converge after \
-                 {TXN_STAGE_PUSH_ATTEMPTS} attempts (last transient failure: {msg})"
-            ))),
+            // `IntentBlocked` — report the last such failure **verbatim**
+            // rather than wrapping it in exhaustion prose.
+            //
+            // **The wrap used to silently reclassify an already-safe
+            // message** (issue #298 residual, confirmed live 2026-08-27):
+            // every `msg` reaching this arm already carries the house `";
+            // retry"` suffix (it is only ever caught by the loop above's own
+            // `msg.ends_with("; retry")` guard) — for a message shaped like
+            // `TxnAbortReason::is_safe_to_retry_fresh`'s own
+            // `"txn prepare: leader-side evaluation failed:"` allowlist
+            // entry, `msg` was *already* both `is_ambiguous()` **and**
+            // `is_safe_to_retry_fresh()` before reaching this arm. A prior
+            // version of this arm nested `msg` inside a new sentence
+            // (`"txn prepare: stage on table \`{table}\` did not converge
+            // after N attempts (last transient failure: {msg})"`), which
+            // broke classification **twice over**: the nesting parenthesis
+            // moved `"; retry"` before the closing `")"` (failing
+            // `is_ambiguous`'s suffix check outright), and even once that
+            // was patched to re-append `"; retry"` at the very end, the new
+            // sentence's own leading text meant the whole message no longer
+            // **starts with** `"txn prepare: leader-side evaluation
+            // failed:"` (failing `is_safe_to_retry_fresh`'s prefix check
+            // specifically) — silently downgrading a message that was
+            // PROVABLY safe to retry with a fresh `TxnId` (this stage never
+            // even reached its own propose) into one `run_transact` could
+            // only leave stuck `PENDING` for the full ADR 0051 TTL window
+            // (600s) — far past any real client's retry budget (this soak's
+            // own `RETRYABLE_BLIP_DEADLINE`, 90s, included). Passing `msg`
+            // through unchanged means this arm can never accidentally
+            // downgrade a classification the underlying reason already
+            // earned — exhausting `TXN_STAGE_PUSH_ATTEMPTS` on an identical
+            // recurring reason doesn't change how safe that reason is to
+            // retry, so there is nothing to re-derive here. See
+            // `docs/engineering-lessons.md`'s matching issue #298 entry for
+            // the full incident (a live capture under the un-pinned
+            // `SplitMode::InPlace` soak) and the general "a wrapping
+            // `format!` around a classified message is itself a
+            // classification bug" lesson.
+            (None, Some(msg)) => Err(TxnAbortReason::Other(msg)),
             // Every `TXN_STAGE_PUSH_ATTEMPTS` attempt returning `Ok` with an
             // outcome other than `Staged`/`IntentBlocked`/`ConditionFailed`/
             // `Fenced` is unreachable (`StageOutcome` is exhaustively
@@ -9497,6 +9614,78 @@ impl ClientCtx {
                 }
             }
             CpRoute::None => Err("no CP group leader reachable for txn decide".into()),
+        }
+    }
+
+    /// Retry [`txn_decide_anchor`](Self::txn_decide_anchor) — with the SAME
+    /// `txn_id`, never a fresh one — while its own attempt fails outright
+    /// (a `"; retry"`-suffixed error, never even reaching a decision),
+    /// bounded by [`CLIENT_TIMEOUT`]. Mirrors [`cp_kind_write_item`](Self::cp_kind_write_item)'s
+    /// issue #288 freeze-refusal retry shape: `txn_decide_anchor`'s own
+    /// `cp_route` call already re-resolves routing fresh every attempt
+    /// (essential — after a cutover the record routes to a child tablet,
+    /// not the frozen parent), so this wrapper only needs to supply the
+    /// backoff-and-loop.
+    ///
+    /// **Load-bearing, not a style choice** (ADR 0018 §2 issue #298
+    /// residual fix): [`cp_txn`](Self::cp_txn) only ever calls this from a
+    /// point where it already knows whether every participant staged. When
+    /// they all did (the ordinary commit path — the abort paths only ever
+    /// reach here because *some* participant did NOT stage), a decide-step
+    /// failure that is safe to retry with a FRESH `TxnId` per
+    /// `TxnAbortReason::is_safe_to_retry_fresh`'s own allowlist (most
+    /// commonly `FROZEN_REFUSAL`, shared byte-for-byte between a stage-time
+    /// and a decide-time freeze) is, in fact, NOT safe here: every
+    /// participant's intent is already durably staged, so
+    /// `ClientCtx::txn_recover`'s own independent `all_staged`-driven
+    /// decision can legitimately COMMIT this exact (original) `txn_id` at
+    /// any moment — a fresh retry racing that is precisely the
+    /// double-materialize hazard this whole amendment exists to close
+    /// (confirmed live: `multi_split_soak_streamed_gsi_table_under_mixed_
+    /// load`'s own `delivered=146/144` signature, both `x…a`/`x…b` keys of
+    /// one transactional pair delivered twice — once via this exact race).
+    /// Retrying the SAME decision instead is always safe: a repeat
+    /// `TxnCommit`/`TxnAbort` propose for an already-decided record is a
+    /// logged no-op (`animus-cp-data`'s own first-applied-wins doctrine),
+    /// and it never abandons already-staged work the way minting a fresh
+    /// `TxnId` would. See `docs/adr/0018-cross-tablet-transactions.md`'s
+    /// matching amendment for the full incident.
+    async fn txn_decide_anchor_retrying(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+        min_commit_ts: HlcTimestamp,
+    ) -> Result<TxnOutcome, String> {
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        loop {
+            match self
+                .txn_decide_anchor(
+                    table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    commit,
+                    min_commit_ts,
+                    None,
+                )
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) if Self::read_should_retry(&e) && tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(
+                        table,
+                        ?txn_id,
+                        commit,
+                        %e,
+                        "txn decide: anchor decide attempt itself failed with a retryable \
+                         routing/leadership/freeze race; retrying the SAME decision (never a \
+                         fresh TxnId — every participant may already be staged)"
+                    );
+                    tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -10441,13 +10630,12 @@ impl ClientCtx {
             // record's **actual** outcome, never assume the abort we asked
             // for is what happened.
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     false,
                     candidate,
-                    None,
                 )
                 .await
             {
@@ -10466,7 +10654,8 @@ impl ClientCtx {
                     Ok(commit_ts)
                 }
                 Err(e) => Err(TxnAbortReason::Other(format!(
-                    "transaction aborted: {reason} (and abort itself failed: {e})"
+                    "transaction aborted: {reason} (and abort itself failed after retrying: {e}); \
+                     retry"
                 ))),
             }
         } else if !preconditions.is_empty()
@@ -10479,13 +10668,12 @@ impl ClientCtx {
             // Precondition check #2 (pre-commit refresh — see this method's own
             // doc for why this is a value re-check, not the ADR's ts-based one).
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     false,
                     candidate,
-                    None,
                 )
                 .await
             {
@@ -10501,22 +10689,25 @@ impl ClientCtx {
                 }
                 Err(e) => Err(TxnAbortReason::Other(format!(
                     "transaction aborted: a precondition changed between prepare and commit \
-                     (and abort itself failed: {e})"
+                     (and abort itself failed after retrying: {e}); retry"
                 ))),
             }
         } else {
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     true,
                     candidate,
-                    None,
                 )
                 .await
-                .map_err(TxnAbortReason::Other)?
-            {
+                .map_err(|e| {
+                    TxnAbortReason::Other(format!(
+                        "txn decide: anchor commit failed after every participant staged, even \
+                         after retrying the same decision ({e}); retry"
+                    ))
+                })? {
                 TxnOutcome::Committed { commit_ts } => {
                     // ADR 0018 §2/PR5: the deviation PR4 flagged, lifted —
                     // the anchor's commit is already durable and IS the
@@ -18498,6 +18689,261 @@ mod issue_412_tests {
         .expect(
             "a retryable leader-moved read failure inside the stage-time evaluator must be \
              retried to success, never a terminal whole-txn cancel",
+        );
+
+        node.shutdown();
+    }
+}
+
+/// Regression for the issue #298 residual confirmed live under the
+/// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
+/// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
+/// another transaction's unresolved intent must actively push that
+/// transaction's resolution once it is confirmed **decided**, rather than
+/// only backing off and hoping a passive sweep clears it first.
+///
+/// **Constructs the confirmed mechanism directly, without needing a real
+/// split race**: stages transaction A on a key, decides it `Aborted`, and
+/// deliberately never resolves it — exactly what the live capture showed
+/// (`KvCommand::TxnResolve`'s own fence check can reject a resolve whose
+/// routing went stale between `cp_route` and the entry's actual apply,
+/// e.g. because the target tablet split in between, and — unlike
+/// `TxnStage` — `TxnResolve` has no outcome channel to report that no-op,
+/// so its proposer sees `Some(ts)` "success" regardless; skipping the
+/// resolve call entirely reproduces the same end state — a decided
+/// transaction's intent left live on its key — without needing to
+/// reproduce the fence race itself). A fresh transaction B then stages the
+/// SAME key: pre-fix, `ClientCtx::txn_prepare_pushing` only backed off and
+/// retried the identical stage, exhausting `TXN_STAGE_PUSH_ATTEMPTS`
+/// (~750ms) long before anything else cleared A's stale intent, into a
+/// genuine (non-ambiguous) `TransactionConflict` — even though A's own
+/// blocking intent belonged to an ALREADY-DECIDED transaction the whole
+/// time. Post-fix, hitting `StageOutcome::IntentBlocked` queries the
+/// blocker's own decision (`ClientCtx::txn_status`) and, finding it
+/// `Aborted`, pushes the resolution itself (fresh routing, sidestepping
+/// the stale-fence race) before retrying — converging well inside the
+/// existing retry budget.
+#[cfg(test)]
+mod issue_298_conflict_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_cp_data::{StageOutcome, TxnOutcome, TxnWrite};
+    use animus_dynamo::AttributeValue;
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::dynamo;
+    use crate::{ClientCtx, ClusterConfig, Node, RoleAddrs, run_node};
+
+    // Small fixtures duplicated per test module rather than shared — this
+    // crate's own stated convention (see `issue_412_tests`'s identical set).
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
+            }],
+            dynamo_auth: None,
+        }
+    }
+
+    /// Same bounded fresh-config retry every in-crate bring-up in this
+    /// crate uses (`docs/engineering-lessons.md`) against the port-TOCTOU
+    /// race under `cargo test --workspace` contention.
+    async fn single_node(dir: &Path) -> Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Provisions `table`'s first tablet and waits for its single-voter
+    /// group to actually elect locally — `provision_tablet` alone does not
+    /// wait for that (`confirm_futility_tests`'s identical polling doc).
+    async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
+        ctx.provision_tablet(table)
+            .await
+            .expect("provisioning table");
+        let tablet = *node
+            .metadata()
+            .tablets_for_table(table)
+            .next()
+            .expect("provisioning created a tablet")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this single node hosts the tablet");
+        timeout(Duration::from_secs(10), async {
+            while !group.is_leader() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tablet group did not elect a local leader in time");
+    }
+
+    /// **Red before this fix, green after** (verified both ways during this
+    /// investigation): asserts a fresh transaction's stage on a key
+    /// blocked by an ALREADY-DECIDED-but-unresolved intent converges to
+    /// success, never a spurious `TransactionConflict`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_stage_pushes_a_decided_blockers_resolution_instead_of_conflicting() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+        provision_and_await_leader(&node, &ctx, "issue298_conflict").await;
+
+        let key = dynamo::item_key(&AttributeValue::S("k1".to_string()), None);
+
+        // Transaction A stages cleanly, then is decided `Aborted` (standing
+        // in for a participant elsewhere having failed) — but its own
+        // resolve is deliberately never called, leaving `key` an
+        // unresolved `Intent(txn_a)` even though A's record is already a
+        // final, durable decision.
+        let (txn_a, record_a, table_a, ts_a) = ctx
+            .txn_prepare_pushing(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-a".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("transaction A stages cleanly");
+        let decided_a = ctx
+            .txn_decide_anchor(&table_a, txn_a.clone(), record_a.clone(), false, ts_a, None)
+            .await
+            .expect("deciding A never fails outright in this single-node setup");
+        assert!(
+            matches!(decided_a, TxnOutcome::Aborted),
+            "A must decide Aborted: {decided_a:?}"
+        );
+        // No `txn_resolve_participant` call here — the intentional gap.
+
+        // A single, direct `txn_prepare` attempt for B (never
+        // `txn_prepare_pushing`'s own retry loop — this test asserts what
+        // ONE push accomplishes, deterministically, with no dependency on
+        // `txn_resolver_loop`'s independent per-second passive sweep also
+        // being capable of clearing this given enough wall-clock time).
+        let (_, _, _, _, outcome) = ctx
+            .txn_prepare(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-b".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("B's stage entry itself applies (as a no-op, per the guard)");
+        let (blocker, blocker_record_table, blocker_record_key) = match outcome {
+            StageOutcome::IntentBlocked {
+                txn_id,
+                record_table,
+                record_key,
+                ..
+            } => (txn_id, record_table, record_key),
+            other => panic!("expected IntentBlocked on A's still-live intent, got {other:?}"),
+        };
+        assert_eq!(blocker, txn_a, "the blocker must be A's own txn_id");
+
+        // The fix under test, called directly and in isolation — no sleep,
+        // no loop, so nothing here can be coincidentally saved by
+        // `txn_resolver_loop`'s own background sweep.
+        ctx.push_resolution_if_decided(
+            "issue298_conflict",
+            &key,
+            blocker,
+            blocker_record_table,
+            blocker_record_key,
+            0,
+        )
+        .await;
+
+        // Pre-fix (`push_resolution_if_decided` a no-op stub), this second
+        // attempt hits the identical still-live `Intent(txn_a)` and reports
+        // `IntentBlocked` again — never `Staged`. Post-fix, the push above
+        // already resolved A's intent, so this attempt stages cleanly.
+        let (txn_b, record_b, table_b, ts_b, outcome_b) = ctx
+            .txn_prepare(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-b".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("B's second stage attempt itself applies");
+        assert!(
+            matches!(outcome_b, StageOutcome::Staged),
+            "B must stage cleanly once A's already-decided blocker has been pushed — never a \
+             repeat IntentBlocked (which is what a spurious TransactionConflict is built from): \
+             {outcome_b:?}"
+        );
+
+        // Decide and resolve B, then confirm the key holds EXACTLY B's
+        // value — never A's (which must stay discarded, since A aborted)
+        // and never a torn/duplicated state.
+        let decided_b = ctx
+            .txn_decide_anchor(&table_b, txn_b.clone(), record_b.clone(), true, ts_b, None)
+            .await
+            .expect("deciding B never fails outright in this single-node setup");
+        assert!(
+            matches!(decided_b, TxnOutcome::Committed { .. }),
+            "B must decide Committed: {decided_b:?}"
+        );
+        ctx.txn_resolve_participant(&table_b, txn_b, record_b, vec![key.clone()], decided_b)
+            .await
+            .expect("resolving B succeeds");
+
+        let tablet = *node
+            .metadata()
+            .tablets_for_table("issue298_conflict")
+            .next()
+            .expect("tablet exists")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this single node hosts the tablet");
+        let value = group
+            .linearizable_get_served(&key)
+            .await
+            .expect("this replica leads the group")
+            .expect("B's committed write must be readable, never lost");
+        assert_eq!(
+            value,
+            b"from-b".to_vec(),
+            "the key must hold exactly B's value — A's aborted write must never resurface"
         );
 
         node.shutdown();
