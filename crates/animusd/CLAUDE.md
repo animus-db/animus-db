@@ -780,6 +780,16 @@ the old id's `Member` entry lingers `Down`/address-less forever (never
 reused, prunable via the existing `RemoveMember`/decommission path). `--id
 NAME`'s durable, restart-stable identity is unaffected.
 
+**`main.rs` now handles SIGTERM, not just Ctrl-C/SIGINT** (`unix`-only
+`wait_for_ctrl_c`, `tokio::signal::unix::signal(SignalKind::terminate())`
+raced via `select!` against `tokio::signal::ctrl_c()`) — a Kubernetes pod's
+`preStop`/termination path sends SIGTERM, and without this every call
+site's `shutdown_graceful()` was unreachable on pod eviction. A failure to
+install the SIGTERM handler only logs a warning (Ctrl-C alone still works);
+the non-`unix` build keeps the old Ctrl-C-only fallback, since this
+workspace is linux-first (root `CLAUDE.md`'s env note) and SIGTERM has no
+portable non-unix equivalent.
+
 ## Deployment shapes (ADR 0035)
 
 Three shapes (combined/control-only/data-only), all built from the same

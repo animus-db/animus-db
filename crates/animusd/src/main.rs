@@ -1189,6 +1189,40 @@ async fn run_in_process_split_cluster(
     Ok(())
 }
 
+/// Waits for either Ctrl-C (SIGINT, an interactive stop) or SIGTERM (a
+/// Kubernetes pod's `preStop`/termination signal) before every call site runs
+/// its own `shutdown_graceful()`. Without the SIGTERM half, a pod eviction
+/// never reaches graceful shutdown at all — Kubernetes sends SIGTERM, not
+/// SIGINT, on pod termination.
+#[cfg(unix)]
+async fn wait_for_ctrl_c() {
+    use tokio::signal::unix::{SignalKind, signal};
+    // A failure to install the SIGTERM handler is not fatal — Ctrl-C alone
+    // still works — but is worth a loud warning since it silently drops the
+    // pod-termination path this exists for.
+    let mut sigterm = signal(SignalKind::terminate())
+        .inspect_err(|e| tracing::warn!(?e, "failed to install a SIGTERM handler"))
+        .ok();
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            if let Err(e) = res {
+                tracing::warn!(?e, "failed to listen for Ctrl-C");
+            }
+        }
+        _ = async {
+            match &mut sigterm {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
+    println!("animusd: shutting down");
+}
+
+/// Non-unix fallback: SIGTERM has no portable equivalent outside unix, so
+/// this waits on Ctrl-C alone (this workspace is linux-first — see the crate
+/// guide — this branch exists only so the crate still builds elsewhere).
+#[cfg(not(unix))]
 async fn wait_for_ctrl_c() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::warn!(?e, "failed to listen for Ctrl-C");
