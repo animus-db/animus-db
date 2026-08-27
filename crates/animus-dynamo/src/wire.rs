@@ -21,7 +21,11 @@
 //! `TransactWriteItems` (atomic, ADR 0018 §2/PR7), `TransactGetItems` (a
 //! consistent multi-key read, ADR 0018 §2/PR7), `UpdateTimeToLive` /
 //! `DescribeTimeToLive` (ADR 0051 — decode/encode only; the expiry predicate
-//! itself is [`crate::ttl`], and the background reaper is `animusd`'s).
+//! itself is [`crate::ttl`], and the background reaper is `animusd`'s),
+//! `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup` (ADR 0059,
+//! Train 1 PR④ — on-demand backups; decode/encode + the ARN convention only,
+//! this crate never touches the replicated backup catalog or the backup
+//! store — `animusd::dynamo` and `animusd::backup_janitor` own those).
 //!
 //! AttributeValue types: the scalars `S` (string), `N` (number, carried
 //! as text), `B` (binary, base64), `BOOL`, `NULL`; the document types `M` (map)
@@ -804,6 +808,86 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `CreateBackup` (ADR 0059, Train 1 PR④): begin an on-demand backup of
+    /// `table`, named `backup_name`. `animusd` validates the table exists
+    /// (`TableNotFoundException`), mints a fresh opaque backup identity, and
+    /// proposes the catalog row — capture then proceeds **asynchronously**
+    /// (this call never waits for `AVAILABLE`).
+    CreateBackup {
+        /// The source table to back up.
+        table: String,
+        /// The client-supplied backup name (echoed back, never interpreted).
+        backup_name: String,
+    },
+    /// `DescribeBackup` (ADR 0059, Train 1 PR④): a pure read of one backup's
+    /// catalog row by its ARN — works even after the source table has been
+    /// dropped (the manifest is a captured snapshot, ADR 0059 §2/§3).
+    DescribeBackup {
+        /// The backup's ARN (this adapter's own opaque catalog identity,
+        /// ADR 0059 §3 — never parsed, only looked up).
+        backup_arn: String,
+    },
+    /// `ListBackups` (ADR 0059, Train 1 PR④): paginated backup summaries in
+    /// ascending-ARN order (the replicated catalog's own `BTreeMap` order),
+    /// optionally filtered by source table name, creation-time range, and
+    /// backup type.
+    ListBackups {
+        /// Filter to backups of this source table only, if given.
+        table: Option<String>,
+        /// Max summaries to return this page (`None` = the default of 100;
+        /// any value is capped at 100, matching real DynamoDB).
+        limit: Option<usize>,
+        /// Pagination cursor: list only backups whose ARN sorts strictly
+        /// after this one.
+        exclusive_start_backup_arn: Option<String>,
+        /// Only backups created at or after this epoch-millisecond instant,
+        /// if given (`TimeRangeLowerBound`, an AWS `Timestamp` — epoch
+        /// seconds on the wire, decoded to milliseconds here to match
+        /// `BackupManifest::created_wall_ms`'s own unit).
+        time_range_lower_bound_ms: Option<u64>,
+        /// Only backups created at or before this epoch-millisecond instant,
+        /// if given (`TimeRangeUpperBound`).
+        time_range_upper_bound_ms: Option<u64>,
+        /// `BackupType` filter (default `USER` — AWS's own default, and the
+        /// only type this adapter ever produces in Train 1).
+        backup_type: BackupTypeFilter,
+    },
+    /// `DeleteBackup` (ADR 0059, Train 1 PR④): mark a backup (by ARN) for
+    /// reclaim. Rejected while still `CREATING` (`BackupInUseException`,
+    /// AWS-faithful); actual object reclaim is the backup janitor's own
+    /// async job (`animusd::backup_janitor`).
+    DeleteBackup {
+        /// The backup's ARN.
+        backup_arn: String,
+    },
+}
+
+/// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
+/// `AWS_BACKUP`/`ALL` vocabulary (ADR 0059, Train 1 PR④). This adapter only
+/// ever produces `User` (on-demand) backups today: `System` (PITR base
+/// snapshots) is Train 3's concern, and `AwsBackup` (AWS Backup service
+/// integration) is never produced at all — so a `System`/`AwsBackup` filter
+/// always yields an empty page, honestly, rather than being rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackupTypeFilter {
+    /// On-demand backups (`CreateBackup`) — AWS's own default when
+    /// `BackupType` is omitted.
+    #[default]
+    User,
+    /// PITR base snapshots (Train 3) — never produced yet.
+    System,
+    /// AWS Backup service integration — never produced by this adapter.
+    AwsBackup,
+    /// Every type.
+    All,
+}
+
+impl BackupTypeFilter {
+    /// Whether an on-demand (`User`-type) backup passes this filter.
+    #[must_use]
+    pub fn matches_user_backup(self) -> bool {
+        matches!(self, BackupTypeFilter::User | BackupTypeFilter::All)
+    }
 }
 
 impl Operation {
@@ -825,12 +909,21 @@ impl Operation {
             | Operation::Scan { table, .. }
             | Operation::UpdateItem { table, .. }
             | Operation::UpdateTimeToLive { table, .. }
-            | Operation::DescribeTimeToLive { table, .. } => Some(table),
+            | Operation::DescribeTimeToLive { table, .. }
+            | Operation::CreateBackup { table, .. } => Some(table),
             Operation::BatchWriteItem { .. }
             | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
             | Operation::TransactGetItems { .. }
-            | Operation::ListTables { .. } => None,
+            | Operation::ListTables { .. }
+            // `DescribeBackup`/`DeleteBackup` address a backup by ARN, not a
+            // table name (ADR 0059 §3's own "keyed by backup identity, never
+            // by table name" scar); `ListBackups`' `TableName` is an
+            // optional filter, not a single target, mirroring `ListTables`'
+            // own "no single table" shape.
+            | Operation::DescribeBackup { .. }
+            | Operation::ListBackups { .. }
+            | Operation::DeleteBackup { .. } => None,
         }
     }
 }
@@ -1196,7 +1289,119 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DescribeTimeToLive" => Ok(Operation::DescribeTimeToLive {
             table: table_name(obj)?,
         }),
+        "CreateBackup" => decode_create_backup(obj),
+        "DescribeBackup" => Ok(Operation::DescribeBackup {
+            backup_arn: backup_arn_field(obj)?,
+        }),
+        "ListBackups" => decode_list_backups(obj),
+        "DeleteBackup" => Ok(Operation::DeleteBackup {
+            backup_arn: backup_arn_field(obj)?,
+        }),
         _ => Err(WireError::unknown_operation(target)),
+    }
+}
+
+/// Decode a `CreateBackup` body: `TableName` plus `BackupName` (validated
+/// against AWS's own shape — 3..=255 characters of `[a-zA-Z0-9_.-]`).
+fn decode_create_backup(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = table_name(obj)?;
+    let backup_name = obj
+        .get("BackupName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `BackupName`"))?;
+    validate_backup_name(backup_name)?;
+    Ok(Operation::CreateBackup {
+        table,
+        backup_name: backup_name.to_owned(),
+    })
+}
+
+/// AWS's own `BackupName` shape: 3..=255 characters, `[a-zA-Z0-9_.-]` only.
+fn validate_backup_name(name: &str) -> Result<(), WireError> {
+    let len_ok = (3..=255).contains(&name.len());
+    let chars_ok = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if len_ok && chars_ok {
+        Ok(())
+    } else {
+        Err(WireError::validation(
+            "`BackupName` must be 3-255 characters of [a-zA-Z0-9_.-]",
+        ))
+    }
+}
+
+fn backup_arn_field(obj: &Map<String, Value>) -> Result<String, WireError> {
+    obj.get("BackupArn")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| WireError::validation("missing string field `BackupArn`"))
+}
+
+/// Decode a `ListBackups` body: an optional `TableName` filter, the shared
+/// `Limit` contract ([`decode_limit`]), `ExclusiveStartBackupArn`, an
+/// optional `TimeRangeLowerBound`/`TimeRangeUpperBound` pair (AWS
+/// `Timestamp`s — epoch seconds on the wire, decoded to milliseconds to
+/// match `BackupManifest::created_wall_ms`'s own unit), and `BackupType`.
+fn decode_list_backups(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = obj
+        .get("TableName")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = decode_limit(obj)?;
+    let exclusive_start_backup_arn = match obj.get("ExclusiveStartBackupArn") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`ExclusiveStartBackupArn` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    let time_range_lower_bound_ms = decode_backup_timestamp_ms(obj, "TimeRangeLowerBound")?;
+    let time_range_upper_bound_ms = decode_backup_timestamp_ms(obj, "TimeRangeUpperBound")?;
+    let backup_type = match obj.get("BackupType") {
+        None | Some(Value::Null) => BackupTypeFilter::default(),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| WireError::validation("`BackupType` must be a string"))?;
+            match s {
+                "USER" => BackupTypeFilter::User,
+                "SYSTEM" => BackupTypeFilter::System,
+                "AWS_BACKUP" => BackupTypeFilter::AwsBackup,
+                "ALL" => BackupTypeFilter::All,
+                other => {
+                    return Err(WireError::validation(format!(
+                        "unknown `BackupType` `{other}`"
+                    )));
+                }
+            }
+        }
+    };
+    Ok(Operation::ListBackups {
+        table,
+        limit,
+        exclusive_start_backup_arn,
+        time_range_lower_bound_ms,
+        time_range_upper_bound_ms,
+        backup_type,
+    })
+}
+
+/// Decode a `Timestamp` field (a JSON number — epoch seconds, possibly
+/// fractional, AWS's own wire shape) into epoch **milliseconds**.
+fn decode_backup_timestamp_ms(
+    obj: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, WireError> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let secs = v
+                .as_f64()
+                .ok_or_else(|| WireError::validation(format!("`{field}` must be a number")))?;
+            Ok(Some((secs * 1000.0).max(0.0) as u64))
+        }
     }
 }
 
@@ -3702,6 +3907,20 @@ pub fn stream_arn(table: &str, label: &str) -> String {
     format!("arn:aws:dynamodb:animus:0:table/{table}/stream/{label}")
 }
 
+/// The synthetic ARN this adapter surfaces for a backup (ADR 0059, Train 1
+/// PR④): `arn:aws:dynamodb:animus:0:table/<table>/backup/<backup_id>` —
+/// [`stream_arn`]'s identical placeholder region/account convention, with
+/// AWS's own `.../backup/<id>` suffix in place of `.../stream/<label>`.
+/// `backup_id` is minted by the caller (`animusd::dynamo::create_backup`,
+/// a fresh random suffix) — **this whole string, not just `backup_id`, is
+/// the catalog's own opaque [`animus_control::BackupId`] key** (ADR 0059
+/// §3: "an ARN-shaped string at the wire"), so a backup is looked up
+/// directly by this value with no ARN parsing anywhere in this adapter.
+#[must_use]
+pub fn backup_arn(table: &str, backup_id: &str) -> String {
+    format!("arn:aws:dynamodb:animus:0:table/{table}/backup/{backup_id}")
+}
+
 /// Build the shared `TableDescription`/`Table` object both
 /// [`create_table_response`] and [`describe_table_response`] wrap: name, key
 /// schema, `ACTIVE` status, any secondary indexes — each carrying its own
@@ -3920,6 +4139,244 @@ pub fn paginate_table_names(
     let page = remaining[..remaining.len().min(limit)].to_vec();
     let last_evaluated = truncated.then(|| page.last().cloned()).flatten();
     (page, last_evaluated)
+}
+
+// --- Backups (ADR 0059, Train 1 PR④) ---------------------------------------
+
+/// A backup's `BackupDetails` (ADR 0059, Train 1 PR④) — DynamoDB's shared
+/// shape for `CreateBackup`'s response and as one field of `DescribeBackup`'s
+/// `BackupDescription` / an entry of `ListBackups`' `BackupSummaries`. Built
+/// by `animusd::dynamo` from the replicated catalog (`animus_control::
+/// BackupRow`), which this pure crate never reads directly.
+///
+/// `status` is always one of AWS's own three on-demand values (`"CREATING"`,
+/// `"AVAILABLE"`, `"DELETED"`) — this adapter's internal `Failed`/`Expired`
+/// catalog states are mapped to `"DELETED"` by the caller before this struct
+/// is ever built (a backup a client can still see either exists or it
+/// doesn't; AWS's own wire vocabulary has no third state to report either
+/// failure as).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupDetails {
+    /// This backup's ARN — also the catalog's own opaque identity
+    /// ([`backup_arn`]'s doc).
+    pub backup_arn: String,
+    /// The client-supplied `BackupName`.
+    pub backup_name: String,
+    /// `"CREATING"` | `"AVAILABLE"` | `"DELETED"`.
+    pub status: &'static str,
+    /// Wall-clock creation time in epoch **milliseconds**
+    /// (`BackupManifest::created_wall_ms`, ADR 0051's `env.wall_now()`
+    /// discipline).
+    pub creation_wall_ms: u64,
+    /// Total captured bytes so far (`Metadata::backup_total_bytes`) — `0`
+    /// while still `CREATING` and nothing has landed yet.
+    pub size_bytes: u64,
+}
+
+fn backup_details_object(d: &BackupDetails) -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("BackupArn".into(), Value::String(d.backup_arn.clone()));
+    obj.insert("BackupName".into(), Value::String(d.backup_name.clone()));
+    obj.insert("BackupStatus".into(), Value::String(d.status.into()));
+    // Every backup this adapter produces today is on-demand (Train 1) —
+    // PITR's `SYSTEM` base snapshots are Train 3, `AWS_BACKUP` is never
+    // produced.
+    obj.insert("BackupType".into(), Value::String("USER".into()));
+    obj.insert(
+        "BackupCreationDateTime".into(),
+        wall_ms_timestamp(d.creation_wall_ms),
+    );
+    obj.insert(
+        "BackupSizeBytes".into(),
+        Value::Number(serde_json::Number::from(d.size_bytes)),
+    );
+    obj
+}
+
+/// Render a wall-clock millisecond instant as an AWS `Timestamp` (a JSON
+/// number of epoch seconds, possibly fractional) — the identical shape
+/// `streams_wire::stream_record_json`'s `ApproximateCreationDateTime` uses.
+fn wall_ms_timestamp(wall_ms: u64) -> Value {
+    Value::Number(
+        serde_json::Number::from_f64((wall_ms as f64) / 1000.0)
+            .unwrap_or_else(|| serde_json::Number::from(0)),
+    )
+}
+
+/// The JSON body for a successful `CreateBackup`: `{"BackupDetails": {..}}`.
+#[must_use]
+pub fn create_backup_response(details: &BackupDetails) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "BackupDetails".into(),
+        Value::Object(backup_details_object(details)),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("create-backup response serializes")
+}
+
+/// One index entry inside `SourceTableFeatureDetails` — name + key schema
+/// only (unlike [`index_desc`], AWS's real `SourceTableFeatureDetails` index
+/// entries carry no `IndexStatus`/`Backfilling` at all).
+fn source_table_index_entry(name: &str, key_schema: Vec<Value>) -> Value {
+    let mut e = Map::new();
+    e.insert("IndexName".into(), Value::String(name.to_owned()));
+    e.insert("KeySchema".into(), Value::Array(key_schema));
+    Value::Object(e)
+}
+
+/// The JSON body for a successful `DescribeBackup` **or** `DeleteBackup`
+/// (ADR 0059, Train 1 PR④) — both respond with the identical
+/// `BackupDescription` shape (`DeleteBackup`'s own `details.status` is
+/// `"DELETED"`, set by the caller before this is called):
+/// `{"BackupDescription": {"BackupDetails": .., "SourceTableDetails": ..,
+/// "SourceTableFeatureDetails": ..}}`. Built from the manifest's own
+/// captured `TableSchema`/index/stream/TTL snapshot (a plain owned clone,
+/// ADR 0059 §2 — never a live catalog lookup, so this works even after the
+/// source table has been dropped), via the same `animus_dynamo::schema`
+/// bridge `describe_table_response` uses for the *live* catalog.
+#[must_use]
+pub fn backup_description_response(
+    details: &BackupDetails,
+    table: &str,
+    schema: &TableSchema,
+    indexes: &[SecondaryIndex],
+    stream: Option<&StreamDescription>,
+    ttl: Option<&TtlDescription>,
+) -> String {
+    let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
+    if let Some(sk) = &schema.sort_key {
+        key_schema.push(key_schema_entry(sk, "RANGE"));
+    }
+    let mut source_table = Map::new();
+    source_table.insert("TableName".into(), Value::String(table.to_owned()));
+    source_table.insert("KeySchema".into(), Value::Array(key_schema));
+
+    let mut features = Map::new();
+    let mut gsis = Vec::new();
+    let mut lsis = Vec::new();
+    for index in indexes {
+        match index {
+            SecondaryIndex::Global(g) => {
+                let mut ks = vec![key_schema_entry(&g.key_attribute, "HASH")];
+                if let Some(sort) = &g.sort_attribute {
+                    ks.push(key_schema_entry(sort, "RANGE"));
+                }
+                gsis.push(source_table_index_entry(&g.name, ks));
+            }
+            SecondaryIndex::Local(l) => {
+                let ks = vec![
+                    key_schema_entry(&schema.partition_key, "HASH"),
+                    key_schema_entry(&l.sort_attribute, "RANGE"),
+                ];
+                lsis.push(source_table_index_entry(&l.name, ks));
+            }
+        }
+    }
+    if !gsis.is_empty() {
+        features.insert("GlobalSecondaryIndexes".into(), Value::Array(gsis));
+    }
+    if !lsis.is_empty() {
+        features.insert("LocalSecondaryIndexes".into(), Value::Array(lsis));
+    }
+    if let Some(s) = stream {
+        let mut spec = Map::new();
+        spec.insert(
+            "StreamViewType".into(),
+            Value::String(stream_view_type_str(s.view_type).into()),
+        );
+        spec.insert("StreamEnabled".into(), Value::Bool(true));
+        features.insert("StreamDescription".into(), Value::Object(spec));
+    }
+    if let Some(t) = ttl
+        && t.enabled
+    {
+        let mut tspec = Map::new();
+        tspec.insert("TimeToLiveStatus".into(), Value::String("ENABLED".into()));
+        if let Some(name) = &t.attribute_name {
+            tspec.insert("AttributeName".into(), Value::String(name.clone()));
+        }
+        features.insert("TimeToLiveDescription".into(), Value::Object(tspec));
+    }
+
+    let mut desc = Map::new();
+    desc.insert(
+        "BackupDetails".into(),
+        Value::Object(backup_details_object(details)),
+    );
+    desc.insert("SourceTableDetails".into(), Value::Object(source_table));
+    desc.insert("SourceTableFeatureDetails".into(), Value::Object(features));
+    let mut obj = Map::new();
+    obj.insert("BackupDescription".into(), Value::Object(desc));
+    serde_json::to_string(&Value::Object(obj)).expect("backup-description response serializes")
+}
+
+/// One `ListBackups` candidate: a backup's own [`BackupDetails`] plus its
+/// source table name (AWS's real `BackupSummary` is a flat object carrying
+/// both). `animusd::dynamo` builds this list from the replicated catalog
+/// (`Metadata::backups`, whose `BTreeMap<BackupId, _>` iteration order is
+/// already the ARN-lexicographic order [`paginate_backup_summaries`] relies
+/// on) before calling it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupSummary {
+    /// The source table this backup was taken from.
+    pub table: String,
+    /// This backup's own details.
+    pub details: BackupDetails,
+}
+
+/// The default and cap for `ListBackups`'s `Limit`, matching real DynamoDB.
+pub const LIST_BACKUPS_MAX_LIMIT: usize = 100;
+
+/// Paginate an already-ARN-sorted candidate list per `ListBackups`'s
+/// contract — [`paginate_table_names`]'s identical shape, generalized to a
+/// keyed struct.
+#[must_use]
+pub fn paginate_backup_summaries(
+    summaries: &[BackupSummary],
+    exclusive_start_backup_arn: Option<&str>,
+    limit: Option<usize>,
+) -> (Vec<BackupSummary>, Option<String>) {
+    let limit = limit
+        .unwrap_or(LIST_BACKUPS_MAX_LIMIT)
+        .clamp(1, LIST_BACKUPS_MAX_LIMIT);
+    let start = exclusive_start_backup_arn
+        .map(|arn| summaries.partition_point(|s| s.details.backup_arn.as_str() <= arn))
+        .unwrap_or(0);
+    let remaining = &summaries[start..];
+    let truncated = remaining.len() > limit;
+    let page = remaining[..remaining.len().min(limit)].to_vec();
+    let last_evaluated = truncated
+        .then(|| page.last().map(|s| s.details.backup_arn.clone()))
+        .flatten();
+    (page, last_evaluated)
+}
+
+/// The JSON body for a successful `ListBackups`: `{"BackupSummaries": [...],
+/// "LastEvaluatedBackupArn": ".."}` (the latter present only when the
+/// listing was truncated, matching [`list_tables_response`]'s own
+/// convention).
+#[must_use]
+pub fn list_backups_response(
+    page: &[BackupSummary],
+    last_evaluated_backup_arn: Option<&str>,
+) -> String {
+    let summaries: Vec<Value> = page
+        .iter()
+        .map(|s| {
+            let mut e = backup_details_object(&s.details);
+            e.insert("TableName".into(), Value::String(s.table.clone()));
+            Value::Object(e)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("BackupSummaries".into(), Value::Array(summaries));
+    if let Some(arn) = last_evaluated_backup_arn {
+        obj.insert(
+            "LastEvaluatedBackupArn".into(),
+            Value::String(arn.to_owned()),
+        );
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("list-backups response serializes")
 }
 
 /// The JSON body for a successful `ListTables`: `{"TableNames": [...]}`,
@@ -6478,6 +6935,355 @@ mod tests {
         let body = describe_time_to_live_response(&desc);
         assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
         assert!(!body.contains("AttributeName"));
+    }
+
+    // --- Backups (ADR 0059, Train 1 PR④) -----------------------------------
+
+    #[test]
+    fn decodes_create_backup() {
+        let body = br#"{"TableName":"orders","BackupName":"my-backup-1"}"#;
+        match decode_request("DynamoDB_20120810.CreateBackup", body).unwrap() {
+            Operation::CreateBackup { table, backup_name } => {
+                assert_eq!(table, "orders");
+                assert_eq!(backup_name, "my-backup-1");
+            }
+            other => panic!("expected CreateBackup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_backup_rejects_missing_table_name() {
+        let body = br#"{"BackupName":"my-backup-1"}"#;
+        let err = decode_request("DynamoDB_20120810.CreateBackup", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn create_backup_rejects_missing_backup_name() {
+        let body = br#"{"TableName":"orders"}"#;
+        let err = decode_request("DynamoDB_20120810.CreateBackup", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn create_backup_rejects_a_too_short_backup_name() {
+        let body = br#"{"TableName":"orders","BackupName":"ab"}"#;
+        let err = decode_request("DynamoDB_20120810.CreateBackup", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn create_backup_rejects_an_illegal_character_in_backup_name() {
+        let body = br#"{"TableName":"orders","BackupName":"bad name!"}"#;
+        let err = decode_request("DynamoDB_20120810.CreateBackup", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn create_backup_accepts_the_boundary_backup_name_lengths() {
+        for len in [3, 255] {
+            let name = "a".repeat(len);
+            let body = format!(r#"{{"TableName":"orders","BackupName":"{name}"}}"#);
+            decode_request("DynamoDB_20120810.CreateBackup", body.as_bytes())
+                .unwrap_or_else(|e| panic!("length {len} should be legal: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn decodes_describe_backup() {
+        let body = br#"{"BackupArn":"arn:aws:dynamodb:animus:0:table/orders/backup/abc"}"#;
+        match decode_request("DynamoDB_20120810.DescribeBackup", body).unwrap() {
+            Operation::DescribeBackup { backup_arn } => {
+                assert_eq!(
+                    backup_arn,
+                    "arn:aws:dynamodb:animus:0:table/orders/backup/abc"
+                );
+            }
+            other => panic!("expected DescribeBackup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_backup_rejects_missing_arn() {
+        let err = decode_request("DynamoDB_20120810.DescribeBackup", b"{}").unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_delete_backup() {
+        let body = br#"{"BackupArn":"arn:aws:dynamodb:animus:0:table/orders/backup/abc"}"#;
+        match decode_request("DynamoDB_20120810.DeleteBackup", body).unwrap() {
+            Operation::DeleteBackup { backup_arn } => {
+                assert_eq!(
+                    backup_arn,
+                    "arn:aws:dynamodb:animus:0:table/orders/backup/abc"
+                );
+            }
+            other => panic!("expected DeleteBackup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_backup_rejects_missing_arn() {
+        let err = decode_request("DynamoDB_20120810.DeleteBackup", b"{}").unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_list_backups_with_every_field() {
+        let body = br#"{
+            "TableName":"orders",
+            "Limit":5,
+            "ExclusiveStartBackupArn":"arn:aws:dynamodb:animus:0:table/orders/backup/prev",
+            "TimeRangeLowerBound":1000.5,
+            "TimeRangeUpperBound":2000.0,
+            "BackupType":"ALL"
+        }"#;
+        match decode_request("DynamoDB_20120810.ListBackups", body).unwrap() {
+            Operation::ListBackups {
+                table,
+                limit,
+                exclusive_start_backup_arn,
+                time_range_lower_bound_ms,
+                time_range_upper_bound_ms,
+                backup_type,
+            } => {
+                assert_eq!(table.as_deref(), Some("orders"));
+                assert_eq!(limit, Some(5));
+                assert_eq!(
+                    exclusive_start_backup_arn.as_deref(),
+                    Some("arn:aws:dynamodb:animus:0:table/orders/backup/prev")
+                );
+                assert_eq!(time_range_lower_bound_ms, Some(1_000_500));
+                assert_eq!(time_range_upper_bound_ms, Some(2_000_000));
+                assert_eq!(backup_type, BackupTypeFilter::All);
+            }
+            other => panic!("expected ListBackups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_backups_with_no_fields_defaults_to_user_type() {
+        match decode_request("DynamoDB_20120810.ListBackups", b"{}").unwrap() {
+            Operation::ListBackups {
+                table,
+                limit,
+                exclusive_start_backup_arn,
+                time_range_lower_bound_ms,
+                time_range_upper_bound_ms,
+                backup_type,
+            } => {
+                assert_eq!(table, None);
+                assert_eq!(limit, None);
+                assert_eq!(exclusive_start_backup_arn, None);
+                assert_eq!(time_range_lower_bound_ms, None);
+                assert_eq!(time_range_upper_bound_ms, None);
+                assert_eq!(backup_type, BackupTypeFilter::User);
+            }
+            other => panic!("expected ListBackups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_backups_rejects_an_unknown_backup_type() {
+        let body = br#"{"BackupType":"NOT_A_TYPE"}"#;
+        let err = decode_request("DynamoDB_20120810.ListBackups", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn backup_type_filter_matches_user_backup() {
+        assert!(BackupTypeFilter::User.matches_user_backup());
+        assert!(BackupTypeFilter::All.matches_user_backup());
+        assert!(!BackupTypeFilter::System.matches_user_backup());
+        assert!(!BackupTypeFilter::AwsBackup.matches_user_backup());
+    }
+
+    #[test]
+    fn backup_arn_shape() {
+        assert_eq!(
+            backup_arn("orders", "abc123"),
+            "arn:aws:dynamodb:animus:0:table/orders/backup/abc123"
+        );
+    }
+
+    fn sample_backup_details() -> BackupDetails {
+        BackupDetails {
+            backup_arn: "arn:aws:dynamodb:animus:0:table/orders/backup/abc".into(),
+            backup_name: "my-backup".into(),
+            status: "AVAILABLE",
+            creation_wall_ms: 1_723_000_000_500,
+            size_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn create_backup_response_shape() {
+        let body = create_backup_response(&sample_backup_details());
+        assert!(body.contains("\"BackupDetails\""));
+        assert!(
+            body.contains("\"BackupArn\":\"arn:aws:dynamodb:animus:0:table/orders/backup/abc\"")
+        );
+        assert!(body.contains("\"BackupName\":\"my-backup\""));
+        assert!(body.contains("\"BackupStatus\":\"AVAILABLE\""));
+        assert!(body.contains("\"BackupType\":\"USER\""));
+        assert!(body.contains("\"BackupSizeBytes\":4096"));
+        assert!(body.contains("\"BackupCreationDateTime\":1723000000.5"));
+    }
+
+    #[test]
+    fn backup_description_response_shape_with_indexes_stream_and_ttl() {
+        let schema = TableSchema {
+            partition_key: "pk".into(),
+            sort_key: Some("sk".into()),
+        };
+        let indexes = vec![
+            SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "gsi1".into(),
+                key_attribute: "gpk".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            }),
+            SecondaryIndex::Local(LocalSecondaryIndex {
+                name: "lsi1".into(),
+                sort_attribute: "alt_sk".into(),
+                projection: IndexProjection::All,
+            }),
+        ];
+        let stream = StreamDescription {
+            view_type: StreamViewType::NewAndOldImages,
+            label: "L1".into(),
+        };
+        let ttl = TtlDescription {
+            enabled: true,
+            attribute_name: Some("expiresAt".into()),
+        };
+        let details = sample_backup_details();
+        let body = backup_description_response(
+            &details,
+            "orders",
+            &schema,
+            &indexes,
+            Some(&stream),
+            Some(&ttl),
+        );
+        assert!(body.contains("\"BackupDescription\""));
+        assert!(body.contains("\"SourceTableDetails\""));
+        assert!(body.contains("\"TableName\":\"orders\""));
+        assert!(body.contains("\"SourceTableFeatureDetails\""));
+        assert!(body.contains("\"GlobalSecondaryIndexes\""));
+        assert!(body.contains("\"IndexName\":\"gsi1\""));
+        assert!(body.contains("\"LocalSecondaryIndexes\""));
+        assert!(body.contains("\"IndexName\":\"lsi1\""));
+        assert!(body.contains("\"StreamDescription\""));
+        assert!(body.contains("\"StreamViewType\":\"NEW_AND_OLD_IMAGES\""));
+        assert!(body.contains("\"TimeToLiveDescription\""));
+        assert!(body.contains("\"TimeToLiveStatus\":\"ENABLED\""));
+        assert!(body.contains("\"AttributeName\":\"expiresAt\""));
+        // No IndexStatus/Backfilling — SourceTableFeatureDetails' own index
+        // entries carry neither, unlike an ordinary TableDescription's.
+        assert!(!body.contains("IndexStatus"));
+        assert!(!body.contains("Backfilling"));
+    }
+
+    #[test]
+    fn backup_description_response_with_no_stream_or_ttl_omits_both() {
+        let schema = TableSchema {
+            partition_key: "pk".into(),
+            sort_key: None,
+        };
+        let details = sample_backup_details();
+        let body = backup_description_response(&details, "orders", &schema, &[], None, None);
+        assert!(!body.contains("StreamDescription"));
+        assert!(!body.contains("TimeToLiveDescription"));
+        assert!(!body.contains("GlobalSecondaryIndexes"));
+        assert!(!body.contains("LocalSecondaryIndexes"));
+    }
+
+    #[test]
+    fn backup_description_response_ttl_disabled_omits_ttl_description() {
+        let schema = TableSchema {
+            partition_key: "pk".into(),
+            sort_key: None,
+        };
+        let ttl = TtlDescription {
+            enabled: false,
+            attribute_name: Some("expiresAt".into()),
+        };
+        let details = sample_backup_details();
+        let body = backup_description_response(&details, "orders", &schema, &[], None, Some(&ttl));
+        assert!(!body.contains("TimeToLiveDescription"));
+    }
+
+    fn summary(arn: &str) -> BackupSummary {
+        BackupSummary {
+            table: "orders".into(),
+            details: BackupDetails {
+                backup_arn: arn.into(),
+                ..sample_backup_details()
+            },
+        }
+    }
+
+    #[test]
+    fn paginate_backup_summaries_respects_limit_and_cursor() {
+        let all: Vec<BackupSummary> = (0..5)
+            .map(|i| {
+                summary(&format!(
+                    "arn:aws:dynamodb:animus:0:table/orders/backup/{i}"
+                ))
+            })
+            .collect();
+        let (page, last) = paginate_backup_summaries(&all, None, Some(2));
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].details.backup_arn, all[0].details.backup_arn);
+        assert_eq!(page[1].details.backup_arn, all[1].details.backup_arn);
+        assert_eq!(last.as_deref(), Some(all[1].details.backup_arn.as_str()));
+
+        let (page2, last2) = paginate_backup_summaries(&all, last.as_deref(), Some(2));
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].details.backup_arn, all[2].details.backup_arn);
+        assert_eq!(page2[1].details.backup_arn, all[3].details.backup_arn);
+        assert!(last2.is_some());
+
+        let (page3, last3) = paginate_backup_summaries(&all, last2.as_deref(), Some(2));
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].details.backup_arn, all[4].details.backup_arn);
+        assert_eq!(last3, None, "an untruncated final page carries no cursor");
+    }
+
+    #[test]
+    fn paginate_backup_summaries_caps_limit_at_the_default() {
+        let all: Vec<BackupSummary> = (0..3)
+            .map(|i| {
+                summary(&format!(
+                    "arn:aws:dynamodb:animus:0:table/orders/backup/{i}"
+                ))
+            })
+            .collect();
+        let (page, last) = paginate_backup_summaries(&all, None, None);
+        assert_eq!(page.len(), 3);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn list_backups_response_shape() {
+        let all = vec![summary("arn:aws:dynamodb:animus:0:table/orders/backup/1")];
+        let body = list_backups_response(
+            &all,
+            Some("arn:aws:dynamodb:animus:0:table/orders/backup/1"),
+        );
+        assert!(body.contains("\"BackupSummaries\""));
+        assert!(body.contains("\"TableName\":\"orders\""));
+        assert!(body.contains(
+            "\"LastEvaluatedBackupArn\":\"arn:aws:dynamodb:animus:0:table/orders/backup/1\""
+        ));
+    }
+
+    #[test]
+    fn list_backups_response_omits_cursor_when_untruncated() {
+        let body = list_backups_response(&[], None);
+        assert!(!body.contains("LastEvaluatedBackupArn"));
     }
 
     /// `Select` is inferred when absent: a projection implies

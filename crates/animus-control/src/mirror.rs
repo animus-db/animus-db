@@ -404,6 +404,12 @@ pub fn apply_and_derive_mirror(
                 writes.push(KeyWrite::Delete(syskv::backup_progress_key(id, *tablet)));
             }
         }
+        MetaCommand::MarkBackupDeleted { backup_id } => {
+            writes.push(put_json(
+                syskv::backup_key(backup_id),
+                &meta.backups[backup_id],
+            ));
+        }
     }
     (outcome, writes)
 }
@@ -1410,6 +1416,7 @@ mod tests {
             backup_id: "backup-1".to_string(),
             table: "orders".to_string(),
             created_wall_ms: 1000,
+            backup_name: "backup".to_string(),
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -1455,6 +1462,7 @@ mod tests {
                 backup_id: "backup-1".to_string(),
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             },
         );
 
@@ -1506,6 +1514,7 @@ mod tests {
                 backup_id: "backup-1".to_string(),
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             },
         );
         let _ = apply_and_derive_mirror(
@@ -1556,6 +1565,7 @@ mod tests {
                 backup_id: "backup-1".to_string(),
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             },
         );
         let (outcome, writes) = apply_and_derive_mirror(
@@ -1602,6 +1612,7 @@ mod tests {
                 backup_id: "backup-1".to_string(),
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             },
         );
         let _ = apply_and_derive_mirror(
@@ -1640,6 +1651,80 @@ mod tests {
         assert!(writes.is_empty());
     }
 
+    /// `MarkBackupDeleted` (ADR 0059 §3, Train 1 PR④) mirrors as one `Put`
+    /// of the row's now-`Expired` status — the row itself is untouched
+    /// (still present, `DeleteBackup` is the removal command).
+    #[test]
+    fn mark_backup_deleted_writes_the_updated_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("orders".to_string()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_string(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::backup_key("backup-1"),
+                &meta.backups["backup-1"]
+            )]
+        );
+        assert!(meta.backup("backup-1").is_some(), "the row itself survives");
+
+        // Idempotent once `Expired`.
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::NoOp);
+        assert!(writes.is_empty());
+    }
+
     /// The incremental-delta consumer path (`apply_key_write`) for
     /// `DeleteBackup`'s derived deletes reaches the identical state a direct
     /// `Metadata::apply` does — exercises `apply_delete`'s `Backup`/
@@ -1662,6 +1747,7 @@ mod tests {
             backup_id: "backup-1".to_string(),
             table: "orders".to_string(),
             created_wall_ms: 1000,
+            backup_name: "backup".to_string(),
         });
         base.apply(&MetaCommand::RecordBackupTabletComplete {
             backup_id: "backup-1".to_string(),
@@ -1737,6 +1823,7 @@ mod tests {
                 backup_id: "backup-1".to_string(),
                 table: "t".to_string(),
                 created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
             },
             MetaCommand::RecordBackupTabletComplete {
                 backup_id: "backup-1".to_string(),

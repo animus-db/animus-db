@@ -10316,3 +10316,85 @@ still only a well-argued candidate, not a captured fact — a durable,
 committed diagnostic (gated by an env var or `#[cfg(test)]`, never firing
 in production) is the natural next step before the next investigation round
 attempts a fix.
+
+## A post-propose confirm-poll must accept "the effect already fully happened" as success, not just "the intermediate state I expected" (ADR 0059 §3, Train 1 PR④, `DeleteBackup`)
+
+`animusd::dynamo::delete_backup` proposed `MetaCommand::MarkBackupDeleted`
+(the two-phase janitor's own mark step) and then polled
+`metadata_fresh(ctx).await.backup(backup_arn)` waiting to observe
+`BackupStatus::Expired` before building its response. On a lightly loaded
+single-node test cluster this flaked intermittently: the backup janitor
+(`animusd::backup_janitor`, a 200ms tick) sometimes observed the mark,
+reclaimed every object, and proposed the finalizing `MetaCommand::
+DeleteBackup` (removing the row entirely) **before** `delete_backup`'s own
+next poll ever ran — so the poll found `meta.backup(backup_arn) == None`
+forever after, never `Some(Expired)`, and spun until `SCHEMA_COMMIT_TIMEOUT`
+(5s) before returning a bogus `InternalServerError` ("did not commit... no
+leader reachable?") for an operation that had, in fact, already fully
+succeeded moments earlier.
+
+The general shape: **when a proposer's own confirm-poll checks for one
+named intermediate state of a value that a second, independent, faster
+process can advance PAST that state (here: past `Expired` all the way to
+"row removed"), the poll must treat every state at-or-beyond the expected
+one as success — not just an exact match.** Checking only for `Expired` was
+implicitly assuming this caller would always be the fastest reader, which
+held in every manual/low-concurrency test run but not under the specific
+timing this bug needed (a fast local reclaim + a slightly-delayed next
+poll). The fix: capture the row's own data **before** proposing (needed for
+the response body regardless, since a client-visible `DescribeBackup`-shaped
+reply must describe *some* row state), then treat `None` on the post-propose
+read as an equally valid success signal — "gone" only ever follows a
+successful mark in this design (nothing else removes a row), so it can never
+be confused with "never happened."
+
+This generalizes past this one call site: any commit-wait loop watching for
+one named state on a value that a background convergent process can advance
+past that state (a retention janitor, a compaction sweep, an aggregator)
+needs to ask "has it been reached or superseded?", not "does the value
+currently equal exactly this?" — the same class of bug as polling for
+`status == Creating -> Active`
+transitions while ignoring that a stuck-timeout path can skip straight to
+`Failed`+reclaimed+gone without ever stopping at an intermediate value the
+poll was watching for. Caught by a real flake under `cargo test`, not by
+design review — the codebase's own "a flaky `ProdEnv` test is a real bug"
+rule held exactly as advertised. See `crates/animusd/src/dynamo.rs`'s
+`delete_backup` for the fix in place.
+
+## A live-derived accessor scoped to "currently resolvable" state silently drops to a degenerate value once its inputs are torn down — freeze the figure while it's still derivable (ADR 0059 §3, Train 1 PR④, `BackupRow::total_bytes`)
+
+`Metadata::backup_total_bytes` sums a backup's captured bytes via
+`backup_manifest_tablet_progress`, which resolves each pinned tablet to its
+**currently live** `split_lineage` descendant(s) (`live_split_descendants`)
+— deliberately, so a tablet that split mid-capture is credited via whichever
+descendant actually reported, never double-counted against a stale,
+split-superseded ancestor's own orphan report. That "live" scoping is
+exactly right while the source table still exists. The moment the whole
+table is dropped, every one of the backup's tablets vanishes from
+`Metadata::tablets` at once, `live_split_descendants` returns nothing for
+every pinned tablet (its own fallback path only returns `[ancestor]` when
+`self.tablets.contains_key(&ancestor)`), and `backup_total_bytes` silently
+collapses to `0` — even though the catalog row and its per-tablet progress
+records are untouched (ADR 0024's own explicit carve-out is working exactly
+as designed for *those*). Nothing in `backup_total_bytes`'s own signature or
+doc comment flags this: it reads as an ordinary accessor, and it answers
+`0` — a legitimate-looking value, not an error or a panic — so a caller has
+no signal that the answer just became meaningless.
+
+This was caught by re-reading the accessor's own implementation against ADR
+0059 §3's "a backup outlives its source table" promise while wiring
+`DescribeBackup`'s size field, not by a failing test (none existed yet that
+dropped a table between capture-complete and describe — added afterward,
+`dynamo_backup.rs`'s `create_backup_round_trip_survives_table_drop_and_
+janitor_reclaims`, asserting the reported size is byte-identical before and
+after the drop). The fix generalizes: **any accessor whose answer depends on
+resolving through currently-live state (a tablet map, a membership set, a
+liveness check) must have its result frozen into durable storage at the one
+point in the object's lifecycle where that resolution is still meaningful,
+if any later consumer needs the answer to survive the inputs going away.**
+Re-deriving on every read is only safe for the lifetime of whatever the
+derivation depends on; past that lifetime it isn't "stale," it's simply
+answering a different, degenerate question that happens to typecheck.
+`BackupRow::total_bytes` is exactly this freeze, written once by
+`MetaCommand::CompleteBackup`'s own apply arm at the last moment the live
+accessor is still authoritative.

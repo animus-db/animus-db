@@ -1,6 +1,8 @@
 # ADR 0059 — Backup and restore: on-demand backups + point-in-time recovery
 
-- **Status:** Proposed.
+- **Status:** Accepted — Train 1 (catalog, backup-store plumbing, capture
+  driver, wire surface, janitor) implemented; Train 2 (restore) and Train 3
+  (PITR) pending.
 - **Date:** 2026-08-26
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (a table's manifest
   records its schema shape — partition/clustering keys, columns, GSI/LSI
@@ -661,3 +663,77 @@ reader to discover by diffing prose against code:
   one-for-one, `BackupManifestTabletEntry` will need a `range` field added
   first. Left for that train's own design pass rather than pre-emptively
   widened here with no consumer.
+
+## As-built amendment (2026-08-27, Train 1 PR④ — wire surface + janitor)
+
+Four deviations/additions from this ADR's own text, found building
+`CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup` and the backup
+janitor, recorded here rather than left for a reader to discover by diffing
+prose against code:
+
+- **A new `MetaCommand::MarkBackupDeleted`, not a widened `DeleteBackup`.**
+  §3's text describes `DeleteBackup { backup_id }` as "an operator/retention
+  action" without separating a mark step from a finalize step. As built, the
+  wire `DeleteBackup` operation (`animusd::dynamo::delete_backup`) proposes
+  the new `MarkBackupDeleted { backup_id }` — transitioning `Available`/
+  `Failed` to `Expired` (idempotent once `Expired`; rejects a still-`Creating`
+  row as a defense-in-depth seatbelt behind the wire edge's own
+  `BackupInUseException` check) — and the **existing, unmodified**
+  `MetaCommand::DeleteBackup` (PR①'s own row-plus-progress removal) becomes
+  the janitor's own **finalizing** command, proposed only once every one of
+  a marked backup's objects has been reclaimed. `BackupStatus::Expired`
+  already existed for exactly this purpose (PR①'s own doc: "no `MetaCommand`
+  in this PR ever transitions a row into this state... so a later PR's
+  janitor-mark command doesn't need to widen this enum") — no enum change
+  was needed, only the one new command to drive the transition.
+- **`BackupRow` gained two fields the wire surface needs and PR①/PR③ never
+  carried: `backup_name: String` and `total_bytes: u64`.** `BackupName` is a
+  client-supplied, AWS-remembered attribute `CreateBackup`/`DescribeBackup`/
+  `ListBackups` must echo back identically — recorded verbatim on
+  `MetaCommand::BeginBackup` (a new field, threaded through every existing
+  construction site) and stored on the row, never interpreted. `total_bytes`
+  is **frozen exactly once**, by `CompleteBackup`'s own apply arm, from
+  `Metadata::backup_total_bytes` at the moment every pinned tablet's live
+  descendant is still resolvable — **not** re-derived live by
+  `DescribeBackup`/`ListBackups`, which would silently collapse to zero the
+  instant this backup's source table (and with it every one of its tablets)
+  is ever dropped, breaking this ADR's own §3 "outlives the source table"
+  promise for the *reported size* specifically, even though the row and its
+  progress records themselves already survived the drop correctly. Found by
+  reasoning through `backup_total_bytes`'s own doc (a live re-derivation
+  over `Metadata::tablets`) against the "works after the source table is
+  dropped" requirement below, not by a failing test — `docs/engineering-
+  lessons.md` records the general lesson.
+- **The wire ARN *is* the catalog's `BackupId`, not a separate wrapper.**
+  §3's "an ARN-shaped string at the wire" is realized literally:
+  `animusd::dynamo::create_backup` mints `wire::backup_arn(table,
+  random_suffix)` and proposes it as `BeginBackup`'s own `backup_id` — so
+  every lookup (`DescribeBackup`/`DeleteBackup`/`ListBackups`'s pagination
+  cursor) is a direct `Metadata::backups` key lookup, with no ARN-parsing
+  function anywhere in this adapter (none was needed once the ARN and the
+  key are the same string).
+- **Reclaim is local-only — a deliberate, named Train 1 simplification, not
+  the cataloged-replica reclaim §3 might suggest by analogy to the segment
+  janitor.** No backup object carries a recorded `replicas` list the way a
+  `StreamShardRow` does (`backup_capture.rs`/`backup_completion.rs` both
+  discard `BackupStoreHandle::put`'s own returned replica set), and a
+  tablet's completion record carries total bytes, not a chunk count, so
+  there is no way to enumerate a backup's own object ids without asking the
+  store. The janitor (`animusd::backup_janitor`) therefore does what §3
+  explicitly licenses for exactly this situation — `SegmentStore::list()`
+  as a debug/sweep tool, scoped to `backup/{backup_id}/`, on **this node's
+  own local** backup directory only — the identical shape the segment
+  janitor's own orphan sweep already uses, generalized here from "extra,
+  uncataloged objects" to "this backup's objects" outright. **Named
+  residual**: on a `Cluster`-backed store whose control-plane leader never
+  happens to be one of the `K` (`ClusterSegmentStore::DEFAULT_K` = 3) nodes
+  actually holding a given backup's objects, this loop's local sweep finds
+  nothing and finalizes (removes the row) on the very first tick it
+  observes the mark, before a node that *does* hold a copy ever gets to
+  sweep its own — those copies become permanent, uncataloged orphans. Below
+  or at `DEFAULT_K` cluster size (every node is always a target) the gap
+  does not manifest; above it, closing it needs either a per-object
+  `replicas` list or a cluster-wide list primitive for `ClusterSegmentStore`
+  (neither exists today), both out of this PR's scope. See
+  `backup_janitor.rs`'s own module doc and `docs/engineering-lessons.md`
+  for the fuller note.

@@ -33,7 +33,7 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
-//! - `GET  /admin/backups`             — the replicated backup catalog: id, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — no wire API yet)
+//! - `GET  /admin/backups`             — the replicated backup catalog: id, name, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — the DynamoDB wire surface, `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`, is Train 1 PR④, `animusd::dynamo`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -1241,12 +1241,27 @@ fn backups_view(ctx: &ClientCtx) -> Value {
                 }
                 animus_control::BackupStatus::Expired => json!({"state": "EXPIRED"}),
             };
+            // While `Creating`, the live re-derivation is genuinely more
+            // useful (real-time progress an operator is watching); once
+            // terminal, the row's own frozen `total_bytes` (ADR 0059 Train 1
+            // PR④, `MetaCommand::CompleteBackup`'s apply-time freeze) is the
+            // one that survives a later drop of the source table —
+            // `Metadata::backup_total_bytes`'s own live re-derivation would
+            // otherwise silently report `0` here the moment every one of
+            // this backup's tablets is gone, exactly the regression
+            // `docs/engineering-lessons.md`'s matching entry records.
+            let total_bytes = if matches!(row.status, animus_control::BackupStatus::Creating) {
+                meta.backup_total_bytes(backup_id)
+            } else {
+                row.total_bytes
+            };
             json!({
                 "backup_id": backup_id,
+                "backup_name": row.backup_name,
                 "table": row.table,
                 "status": status,
                 "created_wall_ms": row.manifest.created_wall_ms,
-                "total_bytes": meta.backup_total_bytes(backup_id),
+                "total_bytes": total_bytes,
                 "tablets": tablets,
             })
         })

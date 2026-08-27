@@ -687,10 +687,37 @@ pub struct BackupRow {
     /// catalog is keyed by [`BackupId`], never by this name, ADR 0059 §3's
     /// scar).
     pub table: TableName,
+    /// The client-supplied `BackupName` (ADR 0059 Train 1 PR④, DynamoDB's
+    /// `CreateBackup` request field) — recorded verbatim, echoed by
+    /// `DescribeBackup`/`ListBackups`, never interpreted and never part of
+    /// this row's own identity (`BackupId` alone is, per this catalog's
+    /// "scar" — see [`Metadata::backups`]'s doc). `#[serde(default)]` is an
+    /// implementation convenience for a pre-existing snapshot/fixture that
+    /// predates this field (root `CLAUDE.md`: no real migration guarantee is
+    /// implied).
+    #[serde(default)]
+    pub backup_name: String,
     /// This row's lifecycle status.
     pub status: BackupStatus,
     /// The manifest stub (ADR 0059 §2), derived once at `BeginBackup` time.
     pub manifest: BackupManifest,
+    /// The backup's total captured bytes (ADR 0059 §2's "total object
+    /// sizes, for `DescribeBackup`"), frozen exactly **once**, by
+    /// [`MetaCommand::CompleteBackup`]'s own apply arm, from
+    /// [`Metadata::backup_total_bytes`] at the moment every pinned tablet's
+    /// live descendant is still resolvable. `0` while
+    /// [`Creating`](BackupStatus::Creating)/[`Failed`](BackupStatus::Failed)
+    /// (Train 1 PR④, DynamoDB's own on-demand backup contract reports no
+    /// size until `AVAILABLE` either) — **never** re-derived from
+    /// [`Metadata::backup_manifest_tablet_progress`] after the fact, which
+    /// would silently collapse to zero the moment this backup's source
+    /// table (and with it every one of its tablets) is ever dropped,
+    /// breaking ADR 0059 §3's own "a backup outlives its source table"
+    /// promise for `DescribeBackup`'s reported size specifically.
+    /// `#[serde(default)]` is an implementation convenience for a
+    /// pre-existing snapshot/fixture that predates this field.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -1169,14 +1196,15 @@ pub enum MetaCommand {
     /// [`BackupStatus::Creating`] catalog row at `backup_id`. The manifest
     /// stub (schema snapshot + pinned tablet list) is derived **entirely
     /// from already-agreed `Metadata`** at apply time — never from anything
-    /// the proposer carries beyond `backup_id`/`table`/`created_wall_ms` —
-    /// so every replica computes an identical stub. Rejected if `backup_id`
-    /// already names a row (a fresh id is minted per request, so there is
-    /// nothing to CAS against — first-committer-wins on a brand-new
-    /// identity, mirroring [`CreateTablet`](Self::CreateTablet)'s own
-    /// shape) or if `table` has no schema.
+    /// the proposer carries beyond `backup_id`/`table`/`created_wall_ms`/
+    /// `backup_name` — so every replica computes an identical stub. Rejected
+    /// if `backup_id` already names a row (a fresh id is minted per request,
+    /// so there is nothing to CAS against — first-committer-wins on a
+    /// brand-new identity, mirroring [`CreateTablet`](Self::CreateTablet)'s
+    /// own shape) or if `table` has no schema.
     BeginBackup {
-        /// The freshly-minted, never-reused backup identity.
+        /// The freshly-minted, never-reused backup identity (an ARN-shaped
+        /// string at the wire, ADR 0059 §3).
         backup_id: BackupId,
         /// The source table to back up.
         table: TableName,
@@ -1184,6 +1212,13 @@ pub enum MetaCommand {
         /// (`env.wall_now()`, ADR 0051's discipline) — the pure state
         /// machine has no clock.
         created_wall_ms: u64,
+        /// The client-supplied `BackupName` (ADR 0059 Train 1 PR④, DynamoDB's
+        /// `CreateBackup` request field) — recorded verbatim in
+        /// [`BackupRow::backup_name`] purely for later `DescribeBackup`/
+        /// `ListBackups` echo; never interpreted, never part of the backup's
+        /// own identity (that's `backup_id` alone, per this catalog's own
+        /// "scar," [`Metadata::backups`]'s doc).
+        backup_name: String,
     },
     /// One pinned tablet's capture-completion report (ADR 0059 §3/§4) —
     /// mirroring [`MarkIndexBackfilled`](Self::MarkIndexBackfilled)'s
@@ -1243,6 +1278,29 @@ pub enum MetaCommand {
     /// table.
     DeleteBackup {
         /// The backup to remove.
+        backup_id: BackupId,
+    },
+    /// Mark a backup for reclaim (ADR 0059 §3, Train 1 PR④) — the two-phase
+    /// retention janitor's own **mark** step (ADR 0043 §A9's mold, reused
+    /// verbatim), driven here by the `DeleteBackup` wire operation
+    /// (`animusd::dynamo`) rather than by any retention clock (on-demand
+    /// backups never auto-expire): flips [`Available`](BackupStatus::Available)
+    /// or [`Failed`](BackupStatus::Failed) to
+    /// [`Expired`](BackupStatus::Expired), the same terminal-reclaim state
+    /// [`BackupStatus::Expired`]'s own doc already reserved for exactly this
+    /// purpose. The row itself is **not** removed here — [`DeleteBackup`]
+    /// (Self::DeleteBackup) is the existing, unmodified **finalizing**
+    /// command the backup janitor (`animusd::backup_janitor`) proposes once
+    /// it has reclaimed every object this backup's manifest/data occupy in
+    /// the backup store. Idempotent: a no-op if the row is already `Expired`
+    /// (the janitor's own crash-resume, or a repeated `DeleteBackup` wire
+    /// call, must never re-mark). Rejected if `backup_id` is unknown, or if
+    /// the row is still [`Creating`](BackupStatus::Creating) — the wire
+    /// edge's own `BackupInUseException` check happens first in the common
+    /// case, but this is the apply-time seatbelt for any other caller,
+    /// mirroring every other command's defense-in-depth precondition.
+    MarkBackupDeleted {
+        /// The backup to mark for reclaim.
         backup_id: BackupId,
     },
 }
@@ -1921,6 +1979,7 @@ impl Metadata {
                 backup_id,
                 table,
                 created_wall_ms,
+                backup_name,
             } => {
                 if self.backups.contains_key(backup_id) {
                     return ApplyOutcome::Rejected("backup id already exists");
@@ -1944,12 +2003,14 @@ impl Metadata {
                     backup_id.clone(),
                     BackupRow {
                         table: table.clone(),
+                        backup_name: backup_name.clone(),
                         status: BackupStatus::Creating,
                         manifest: BackupManifest {
                             schema: schema.clone(),
                             pinned_tablets,
                             created_wall_ms: *created_wall_ms,
                         },
+                        total_bytes: 0,
                     },
                 );
                 ApplyOutcome::Applied
@@ -2011,10 +2072,25 @@ impl Metadata {
                         "not every pinned tablet has reported completion",
                     );
                 }
-                self.backups
+                // Freeze the final byte total NOW, while every pinned
+                // tablet's live descendant is still resolvable
+                // (`backup_total_bytes`'s own doc: it sums only the
+                // *currently authoritative* reporter per pinned tablet,
+                // never a stale split-superseded orphan) — `DescribeBackup`/
+                // `ListBackups` (Train 1 PR④) read this frozen field
+                // directly rather than re-deriving it, since a live
+                // re-derivation goes to exactly zero the moment the source
+                // table (and with it every one of this backup's tablets) is
+                // ever dropped (ADR 0059 §3's own "outlives the source
+                // table" promise would otherwise silently break the size
+                // this row reports, not just the table lookup).
+                let total_bytes = self.backup_total_bytes(backup_id);
+                let row = self
+                    .backups
                     .get_mut(backup_id)
-                    .expect("checked present above")
-                    .status = BackupStatus::Available;
+                    .expect("checked present above");
+                row.status = BackupStatus::Available;
+                row.total_bytes = total_bytes;
                 ApplyOutcome::Applied
             }
             MetaCommand::FailBackup { backup_id, reason } => {
@@ -2043,6 +2119,21 @@ impl Metadata {
                 self.backup_tablet_progress
                     .retain(|(id, _), _| id != backup_id);
                 ApplyOutcome::Applied
+            }
+            MetaCommand::MarkBackupDeleted { backup_id } => {
+                let Some(row) = self.backups.get_mut(backup_id) else {
+                    return ApplyOutcome::Rejected("no such backup");
+                };
+                match &row.status {
+                    BackupStatus::Expired => ApplyOutcome::NoOp,
+                    BackupStatus::Creating => {
+                        ApplyOutcome::Rejected("backup is not in a deletable state")
+                    }
+                    BackupStatus::Available | BackupStatus::Failed { .. } => {
+                        row.status = BackupStatus::Expired;
+                        ApplyOutcome::Applied
+                    }
+                }
             }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -3283,6 +3374,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "ghost".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Rejected("no such table schema")
         );
@@ -3293,6 +3385,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3316,6 +3409,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "orders".to_owned(),
                 created_wall_ms: 2000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Rejected("backup id already exists")
         );
@@ -3336,6 +3430,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3433,6 +3528,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3470,6 +3566,11 @@ mod tests {
         assert_eq!(
             m.backup("backup-1").unwrap().status,
             BackupStatus::Available
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().total_bytes,
+            100,
+            "CompleteBackup freezes the final byte total onto the row"
         );
 
         // Already `Available`: a second `CompleteBackup` is rejected, not
@@ -3532,6 +3633,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3588,6 +3690,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3647,6 +3750,7 @@ mod tests {
                 backup_id: "backup-2".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3685,6 +3789,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3723,6 +3828,111 @@ mod tests {
         );
     }
 
+    /// `MarkBackupDeleted` (ADR 0059 §3, Train 1 PR④): the janitor's own
+    /// two-phase **mark** step, driven by the `DeleteBackup` wire operation —
+    /// rejects an unknown id or a still-`Creating` backup, transitions
+    /// `Available`/`Failed` to `Expired`, and is idempotent once `Expired`.
+    /// The row itself survives this command (only the existing, unmodified
+    /// `DeleteBackup` command removes it).
+    #[test]
+    fn mark_backup_deleted_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+
+        // Still `Creating` — rejected (the wire edge's own
+        // `BackupInUseException` check happens first in practice; this is
+        // the apply-time seatbelt).
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is not in a deletable state")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backup("backup-1").unwrap().status, BackupStatus::Expired);
+
+        // Idempotent once `Expired`.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A `Failed` backup is markable too (the janitor treats `Failed`
+        // identically to `Expired` for reclaim purposes).
+        let mut failed = Metadata::default();
+        table_with_one_tablet(&mut failed, "users", TabletId(1));
+        assert_eq!(
+            failed.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-2".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-2".to_owned(),
+                reason: "timeout".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.backup("backup-2").unwrap().status,
+            BackupStatus::Expired
+        );
+    }
+
     /// ADR 0024/ADR 0059 §3's explicit carve-out: `DropTableSchema`/
     /// `DropTableTablets` must NOT touch the backup catalog — a backup row
     /// (and its progress records) survives a drop of its source table.
@@ -3735,6 +3945,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3784,6 +3995,19 @@ mod tests {
                 bytes: 100,
             })
         );
+        // `total_bytes` was frozen at `CompleteBackup` time and survives the
+        // drop unchanged — `backup_total_bytes`'s own live re-derivation
+        // would instead report 0 here (every one of this backup's tablets
+        // is gone from `Metadata::tablets`), which is exactly the silent
+        // regression `BackupRow::total_bytes` exists to avoid.
+        assert_eq!(row.total_bytes, 100);
+        assert_eq!(
+            m.backup_total_bytes("backup-1"),
+            0,
+            "the live accessor legitimately goes to zero post-drop — it is \
+             not what DescribeBackup/ListBackups read from, `BackupRow::\
+             total_bytes` is"
+        );
     }
 
     /// ADR 0059 §6: a pinned tablet that splits mid-capture re-plans onto
@@ -3799,6 +4023,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3934,6 +4159,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3992,6 +4218,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -4024,6 +4251,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
