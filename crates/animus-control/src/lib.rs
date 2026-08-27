@@ -43,13 +43,13 @@ pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{
     ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow, BackupStatus,
-    BackupTabletProgress, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, RestoreId,
-    RestoreRow, RestoreStatus, StreamShardRow,
+    BackupTabletProgress, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, PitrSegmentRow,
+    RestoreId, RestoreRow, RestoreStatus, StreamShardRow,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
-    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, SchemaCatalog,
-    SchemaError, StreamSpec, StreamViewType, TableName, TableSchema, TtlSpec,
+    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, PitrSpec,
+    SchemaCatalog, SchemaError, StreamSpec, StreamViewType, TableName, TableSchema, TtlSpec,
 };
 // Re-exported so downstream assemblers (e.g. `animusd`) can set a tablet's
 // placement policy via `SetTabletPolicy` without taking a direct

@@ -171,6 +171,36 @@ pub struct TtlSpec {
     pub attribute_name: String,
 }
 
+/// A table's replicated **point-in-time recovery (PITR)** configuration (ADR
+/// 0059 §9), when enabled via `UpdateContinuousBackups { Enabled: true }`.
+///
+/// Unlike [`StreamSpec`]'s `label` (a fresh string minted per enable) this
+/// carries a monotonic [`generation`](Self::generation) — a small integer,
+/// never reused even across a disable/re-enable cycle or a drop-and-recreate
+/// of the table under the same name (`Metadata::pitr_generation`'s own
+/// never-rewound counter is the allocator; see that field's doc). A PITR
+/// sealing consumer licenses its `SealPitrSegment` proposals against the
+/// table's *current* generation (or an existing catalog row's own
+/// generation, for a disable-triggered final seal — mirroring
+/// `SealStreamShard`'s label-licensing rule exactly), so two non-overlapping
+/// "coverage epochs" of one table's PITR history can never be confused with
+/// each other the way a bare boolean flag would risk.
+///
+/// `enabled_wall_ms` is this generation's own start of window — the ADR's
+/// "enable starts the clock at now" rule — stamped at propose time by the
+/// wire-serving node (`env.wall_now()`, the same ADR 0051 discipline every
+/// other wall-clock-stamped command field in this catalog already follows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrSpec {
+    /// This enable's own generation number (ADR 0059 §9's "disable then
+    /// re-enable resets the window" — a fresh generation, never reused).
+    pub generation: u64,
+    /// Wall-clock time this generation was enabled, `env.wall_now()`-stamped
+    /// at propose time — the basis `DescribeContinuousBackups`'
+    /// `EarliestRestorableDateTime` floors against (never earlier than this).
+    pub enabled_wall_ms: u64,
+}
+
 /// The lifecycle status of a secondary index (ADR 0045): whether it is still
 /// being backfilled, fully materialized and queryable, or being torn down.
 ///
@@ -298,6 +328,13 @@ pub struct TableSchema {
     /// what the control plane does and does not do with it.
     #[serde(default)]
     pub ttl: Option<TtlSpec>,
+    /// This table's **point-in-time recovery (PITR)** configuration (ADR
+    /// 0059 §9), if enabled. `None` for a table with no PITR (the common
+    /// case, and every schema persisted before this field existed —
+    /// `#[serde(default)]`, additive like `stream`/`ttl`). Mutated only
+    /// through `MetaCommand::UpdateContinuousBackups` (so it replicates).
+    #[serde(default)]
+    pub pitr: Option<PitrSpec>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -334,6 +371,7 @@ impl TableSchema {
             indexes: Vec::new(),
             stream: None,
             ttl: None,
+            pitr: None,
         }
     }
 
@@ -358,6 +396,7 @@ impl TableSchema {
             indexes: Vec::new(),
             stream: None,
             ttl: None,
+            pitr: None,
         }
     }
 
@@ -378,6 +417,7 @@ impl TableSchema {
             indexes: Vec::new(),
             stream: None,
             ttl: None,
+            pitr: None,
         }
     }
 

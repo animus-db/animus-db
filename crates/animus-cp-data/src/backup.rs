@@ -129,6 +129,62 @@ pub fn backup_data_object_id(backup_id: &str, tablet: u64, chunk: u64) -> String
     format!("{}{tablet}/{chunk}", backup_prefix(backup_id))
 }
 
+/// The PITR sealing consumer's own object-id prefix (ADR 0059 §9, Train 3) —
+/// `backup/pitr/`, a namespace under [`BACKUP_NAMESPACE`] the on-demand
+/// capture path never writes (its own objects always follow immediately
+/// with `backup_id`, and `"pitr"` is not a value `CreateBackup`'s ARN minter
+/// (`animusd::dynamo::create_backup`'s `wire::backup_arn`) can ever produce
+/// verbatim as a whole path segment — the same accepted-edge-case caveat
+/// [`backup_prefix`]'s own doc already states for a table literally named
+/// `backup`). Handy for a future debug/sweep `SegmentStore::list` call,
+/// never load-bearing (the replicated `Metadata::pitr_segments` catalog is
+/// the sole authority for what PITR segment data exists, mirroring
+/// [`backup_prefix`]'s own ADR 0059 §3 rule).
+#[must_use]
+pub fn pitr_prefix() -> String {
+    format!("{BACKUP_NAMESPACE}/pitr/")
+}
+
+/// A sealed PITR segment's object id (ADR 0059 §9, Train 3):
+/// `backup/pitr/{table}/{tablet}/{epoch}/{proposer}-{term}-{nonce}` — shares
+/// [`segment::segment_object_id`]'s own ledger-named-object scheme
+/// unchanged (a fresh, attempt-unique id every call, the identical recovery
+/// argument that function's own doc gives for the stream sealer), just
+/// namespaced under [`pitr_prefix`] instead of the stream sealer's bare
+/// `{table}/{label}/...` shape — the two consumers' objects can never
+/// collide even when they happen to share a `SegmentStore` instance
+/// (they don't, by construction: PITR uses the backup store, streams use
+/// the segment store — this namespacing is belt-and-suspenders on top of
+/// that separation, mirroring [`backup_manifest_object_id`]'s own
+/// discipline). `generation` stands in for `segment_object_id`'s `label`
+/// parameter — PITR's own coverage-epoch identity
+/// ([`animus_control::PitrSpec::generation`]) plays the identical role a
+/// stream's label does.
+#[must_use]
+pub fn pitr_segment_object_id(
+    table: &str,
+    generation: u64,
+    tablet: u64,
+    epoch: u64,
+    proposer: &str,
+    term: u64,
+    nonce: u64,
+) -> String {
+    format!(
+        "{}{}",
+        pitr_prefix(),
+        crate::segment::segment_object_id(
+            table,
+            &format!("gen{generation}"),
+            tablet,
+            epoch,
+            proposer,
+            term,
+            nonce,
+        )
+    )
+}
+
 /// Re-wrap a captured data-object value in the engine's committed envelope
 /// (tag `0`) before feeding it to `KvCommand::SeedBatch` (ADR 0059 §7,
 /// Train 2's restore driver). **Load-bearing, not cosmetic**: capture reads
@@ -427,6 +483,32 @@ mod tests {
         let b = backup_data_object_id("bkp-1", 7, 1);
         let c = backup_data_object_id("bkp-1", 8, 0);
         let d = backup_data_object_id("bkp-2", 7, 0);
+        let ids = [a, b, c, d];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "{:?} vs {:?}", ids[i], ids[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn pitr_segment_object_ids_live_under_the_pitr_prefix_disjoint_from_on_demand_objects() {
+        let seg = pitr_segment_object_id("orders", 1, 7, 0, "n1", 3, 42);
+        assert!(seg.starts_with(&pitr_prefix()));
+        assert!(!seg.starts_with(&backup_prefix("orders")));
+        // Different attempts (proposer/term/nonce) for the identical
+        // (table, generation, tablet, epoch) never collide — the same
+        // ledger-named-object guarantee the stream sealer's own segments get.
+        let retry = pitr_segment_object_id("orders", 1, 7, 0, "n1", 3, 43);
+        assert_ne!(seg, retry);
+    }
+
+    #[test]
+    fn pitr_segment_object_ids_are_disjoint_across_generation_tablet_and_epoch() {
+        let a = pitr_segment_object_id("orders", 1, 7, 0, "n1", 1, 1);
+        let b = pitr_segment_object_id("orders", 2, 7, 0, "n1", 1, 1);
+        let c = pitr_segment_object_id("orders", 1, 8, 0, "n1", 1, 1);
+        let d = pitr_segment_object_id("orders", 1, 7, 1, "n1", 1, 1);
         let ids = [a, b, c, d];
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
