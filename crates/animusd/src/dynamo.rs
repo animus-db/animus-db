@@ -141,9 +141,13 @@
 //!   not a bug: the drain provisions the hidden table lazily, on its first tick
 //!   with records to apply.
 //! - An **LSI** `Query` ([`run_lsi_query`]) scans the *base table's own tablet*
-//!   over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`, a linearizable
-//!   ReadIndex scan, ADR 0041 §3/§5) — strongly consistent, since LSI rows
-//!   commit in the same Raft entry as the base row they derive from.
+//!   over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`, ADR 0041 §3/§5).
+//!   Since ADR 0055, `ConsistentRead` selects a real read path here too:
+//!   `true` is a linearizable ReadIndex scan; `false` (the wire default) is
+//!   the cheap, eventual, replica-local one — an LSI row commits in the same
+//!   Raft entry as the base row it derives from, but a lagging replica can
+//!   still legitimately serve a stale LSI read, same as any other eventual
+//!   read.
 //!
 //! A sort condition narrows the scan (an `Equals` GSI condition) or filters the
 //! decoded rows by recovering the sort segment from the row's own key
@@ -4282,10 +4286,11 @@ async fn run_base_query(
 /// (`IndexSortMismatch`) before either path runs. `ConsistentRead: true`
 /// against a **global** index is rejected here too, matching DynamoDB exactly
 /// (§5: "`ConsistentRead=true` against a GSI is an error… against an LSI it is
-/// honoured and already true") — an LSI is strongly consistent by
-/// construction (written atomically with the base row), so `consistent_read`
-/// is simply dropped on that branch, same as a base `Query`/`Scan`/`GetItem`.
-/// A non-`Active` index (`Creating`/`Deleting`, ADR 0045 §6) is rejected too,
+/// honoured"). Since ADR 0055, `consistent_read` is **not** dropped on the LSI
+/// branch: `true` runs a linearizable ReadIndex scan, `false` (the default)
+/// the cheap eventual, replica-local one — same real-path selection a base
+/// `Query`/`Scan`/`GetItem` gets. A non-`Active` index (`Creating`/`Deleting`,
+/// ADR 0045 §6) is rejected too,
 /// beside that same `ConsistentRead` check.
 #[allow(clippy::too_many_arguments)] // mirrors `run_query`'s own full decoded shape
 async fn run_index_query(
@@ -4539,12 +4544,16 @@ async fn run_gsi_query(
     ))
 }
 
-/// An **LSI** `Query` (ADR 0041 §5): a **linearizable** range scan of the
-/// *base table's own tablet*, over its `KIND_LSI` scope
-/// (`ClientCtx::cp_scan_kind`) — strongly consistent, since LSI rows commit in
-/// the same Raft entry as the base row they derive from (ADR 0041 §2). Scans
-/// the partition's whole LSI-index sub-range (`lsi_index_prefix`) and filters
-/// by any sort condition on the recovered alt-sort segment
+/// An **LSI** `Query` (ADR 0041 §5): a range scan of the *base table's own
+/// tablet*, over its `KIND_LSI` scope (`ClientCtx::cp_scan_kind`). Since ADR
+/// 0055, `consistency` selects the real read path: `ConsistentRead: true` is
+/// a linearizable ReadIndex scan; `false` (the default) is the cheap,
+/// eventual, replica-local one. LSI rows commit in the same Raft entry as the
+/// base row they derive from (ADR 0041 §2), but that only makes the *strong*
+/// path immediately fresh — the eventual default can still observe a lagging
+/// replica. Scans the partition's whole LSI-index sub-range
+/// (`lsi_index_prefix`) and filters by any sort condition on the recovered
+/// alt-sort segment
 /// (`parse_lsi_row_key`) — LSI rows also store the projected item (see
 /// `kind_writes_for_item`), so this decodes them directly.
 ///
@@ -4946,18 +4955,20 @@ async fn run_gsi_scan(
     ))
 }
 
-/// An **LSI** `Scan` (ADR 0041 §5): a **table-wide** linearizable fan-out over
-/// the base table's `KIND_LSI` scope (`ClientCtx::cp_scan_kind_table`) — unlike
-/// an LSI `Query`, which is scoped to one base partition and hence one tablet,
-/// a table-wide `Scan` sweeps every tablet of `table`'s own ring. One
+/// An **LSI** `Scan` (ADR 0041 §5): a **table-wide** fan-out over the base
+/// table's `KIND_LSI` scope (`ClientCtx::cp_scan_kind_table`) — unlike an LSI
+/// `Query`, which is scoped to one base partition and hence one tablet, a
+/// table-wide `Scan` sweeps every tablet of `table`'s own ring. One
 /// partition's LSI rows across *every* declared index interleave within that
 /// scope ([`animus_dynamo::index::lsi_index_prefix`]'s layout — sorted by
 /// index name ahead of the alt-sort value), so [`paginated_kind_examine`]'s
 /// `keep` closure filters each raw row to the requested index by its own key
 /// (`parse_lsi_row_key`) — a row of a *different* index is skipped without
 /// consuming a `Limit` slot, exactly like a tombstone in the base scan.
-/// `ConsistentRead: true` is accepted (already true — an LSI row commits
-/// atomically with its base row).
+/// `ConsistentRead: true` is accepted, same as an LSI `Query` (unlike a GSI
+/// `Scan`, which rejects it): since ADR 0055, `consistency` picks the real
+/// per-tablet read path, linearizable ReadIndex when `true`, the cheap
+/// eventual replica-local one by default.
 #[allow(clippy::too_many_arguments)] // mirrors `run_lsi_query`'s own full decoded shape
 async fn run_lsi_scan(
     ctx: &ClientCtx,

@@ -48,11 +48,18 @@ async fn put_retry(addr: SocketAddr, key: &[u8], value: &[u8]) -> ClientResponse
     }
 }
 
+/// Wait until every node has elected a control leader *and* has converged on
+/// the full membership set, or panic. Membership registration is
+/// asynchronous (each node joins the control group one at a time), so
+/// polling for "some members" rather than "all `nodes.len()` members" would
+/// let a caller observe a partially-registered cluster.
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
             if nodes.iter().any(Node::is_control_leader)
-                && nodes.iter().all(|n| !n.metadata().members.is_empty())
+                && nodes
+                    .iter()
+                    .all(|n| n.metadata().members.len() == nodes.len())
             {
                 return;
             }
