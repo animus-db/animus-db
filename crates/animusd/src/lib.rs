@@ -42,6 +42,8 @@ pub use animus_control::{
 };
 
 mod admin;
+mod backup_capture;
+mod backup_completion;
 mod console;
 mod control_handle;
 mod dashboard;
@@ -539,6 +541,38 @@ impl CpGroup {
         match self {
             CpGroup::Lsm(n) => n.cursor_min_watermark(consumer).await,
             CpGroup::Mem(n) => n.cursor_min_watermark(consumer).await,
+        }
+    }
+
+    /// This replica's current engine watermark — the backup capture
+    /// driver's own snapshot-pin primitive (ADR 0059 §4). See
+    /// [`RaftKvNode::engine_latest_version`].
+    pub(crate) fn engine_latest_version(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.engine_latest_version(),
+            CpGroup::Mem(n) => n.engine_latest_version(),
+        }
+    }
+
+    /// A snapshot-pinned, intent-resolved, resumable-cursor sweep of a kind
+    /// scope — the backup capture driver's own read primitive (ADR 0059
+    /// §4/§5). See [`RaftKvNode::local_scan_kind_snapshot`].
+    pub(crate) async fn local_scan_kind_snapshot(
+        &self,
+        kind: u8,
+        start: &[u8],
+        version_ceiling: u64,
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>, u64)>, Option<Vec<u8>>) {
+        match self {
+            CpGroup::Lsm(n) => {
+                n.local_scan_kind_snapshot(kind, start, version_ceiling, limit)
+                    .await
+            }
+            CpGroup::Mem(n) => {
+                n.local_scan_kind_snapshot(kind, start, version_ceiling, limit)
+                    .await
+            }
         }
     }
 
@@ -2474,6 +2508,19 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // "no seed answered" — see `tests/seed_join_allocated.rs`'s
             // follower-connected-seed case.
             | MetaCommand::RegisterNode { .. }
+            // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
+            // a tablet leader's own "I finished capturing my share of this
+            // backup" proposal, from wherever that leader actually runs —
+            // the identical relay reasoning as `MarkIndexBackfilled`/
+            // `SealStreamShard` just above. `CompleteBackup`/`FailBackup`
+            // are deliberately NOT included here: their only intended
+            // production caller (the completion aggregator, a
+            // control-plane-leader-only background loop, this crate) already
+            // proposes them directly off its own live `RaftNode` handle,
+            // exactly the same `ExpireStreamShards` precedent this function's
+            // own doc states above — no wire surface exists yet for either
+            // (Train 1 PR④'s concern) to need a relay path of its own.
+            | MetaCommand::RecordBackupTabletComplete { .. }
     )
 }
 
@@ -4670,6 +4717,14 @@ impl BoundNode {
             ttl_sweep_interval,
         )));
 
+        // The on-demand backup capture driver (ADR 0059 §4/§5/§6, Train 1
+        // PR③): sweeps a `Creating` backup's pinned/re-planned tablets into
+        // chunked backup-store objects. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the GSI drain/TTL reaper above.
+        tasks.push(tokio::spawn(backup_capture::backup_capture_loop(
+            ctx.clone(),
+        )));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -4688,6 +4743,16 @@ impl BoundNode {
         // `index_backfill.rs`'s own doc) — spawned unconditionally here,
         // exactly like the segment janitor just above.
         tasks.push(tokio::spawn(index_backfill::index_backfill_loop(
+            ctx.clone(),
+        )));
+
+        // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
+        // 1 PR③): completes/fails a `Creating` backup once every pinned (or
+        // re-planned) tablet has reported, or a stuck-timeout elapses.
+        // Control-plane-leader-only (self-gated every tick,
+        // `backup_completion.rs`'s own doc) — spawned unconditionally here,
+        // exactly like the segment janitor/backfill aggregator above.
+        tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
             ctx.clone(),
         )));
 
@@ -5426,6 +5491,20 @@ impl BoundControlNode {
             ctx.clone(),
         )));
 
+        // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
+        // 1 PR③): a control-only node can genuinely become the control-plane
+        // leader (ADR 0035 split deployment), so it needs this loop too —
+        // *failing* a stuck backup needs only `Metadata`, but *completing*
+        // one needs a `BackupStoreHandle` to durably `put` the manifest,
+        // which no control-only node provisions — see
+        // `backup_completion.rs`'s own doc for the documented gap this
+        // leaves (a pure split deployment's control-only leader marks a
+        // fully-captured backup ready but cannot itself flip it to
+        // `Available`, until a data-capable node takes the lead instead).
+        tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
+            ctx.clone(),
+        )));
+
         Ok(Node {
             raft: ControlHandle::Local(raft),
             envs,
@@ -5859,6 +5938,19 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
             ctx.clone(),
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        )));
+
+        // The on-demand backup capture driver (ADR 0059 §4/§5/§6, Train 1
+        // PR③) — same shape as the GSI drain/TTL reaper just above. No
+        // completion aggregator on this data-only path: a data-only node's
+        // control handle is `ControlHandle::Remote` (never a genuine
+        // control-plane leader), so `backup_completion_loop`'s own
+        // `ctx.edge.leader_handle()` self-gate would always be `None` here
+        // — spawning it would be pure dead weight, the same reasoning
+        // `index_backfill_loop`/`segment_janitor_loop` already apply by
+        // their own absence from this spawn site.
+        tasks.push(tokio::spawn(backup_capture::backup_capture_loop(
+            ctx.clone(),
         )));
 
         if auto_split_threshold.is_some()
@@ -6443,20 +6535,17 @@ fn build_segment_store(
 /// configured, and will evolve independently (ADR 0059 §1's own
 /// `fs:PATH`-durability-tradeoff note is a backup-specific operational
 /// concern the streams knob doesn't share).
-// `#[allow(dead_code)]` on the enum and its impl below: ADR 0059 Train 1 PR②
-// ships this handle with no reader at all — the capture driver that will
-// actually `put`/`get`/`delete`/`list_local` through it is a later PR. Left
-// in (rather than stubbed to a unit-shaped placeholder) so that PR's diff is
-// "wire in a caller," not "also invent this type" — see the module-level
-// doc above for the full rationale.
-#[allow(dead_code)]
+///
+/// **Consumed since ADR 0059 Train 1 PR③**: the per-tablet capture driver
+/// (`backup_capture.rs`) `put`s chunked data objects through this handle,
+/// and the completion aggregator (`backup_completion.rs`) `put`s the
+/// manifest object — see each module's own doc.
 #[derive(Clone)]
 pub(crate) enum BackupStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
 }
 
-#[allow(dead_code)]
 impl BackupStoreHandle {
     /// Push a backup object's bytes durably to this store, returning the
     /// replica set a later PR's catalog bookkeeping would record — mirrors
@@ -6476,7 +6565,10 @@ impl BackupStoreHandle {
 
     /// Fetch a backup object's bytes — mirrors
     /// [`SegmentStoreHandle::get_sealed`]'s exact contract (`replicas`
-    /// ignored for the single-directory `Fs` opt-in).
+    /// ignored for the single-directory `Fs` opt-in). **Unused until
+    /// Train 2** (`RestoreTableFromBackup` is this method's first reader) —
+    /// left in rather than stubbed, per this type's own module-level doc.
+    #[allow(dead_code)]
     pub(crate) async fn get(
         &self,
         replicas: &[NodeId],
@@ -6490,7 +6582,11 @@ impl BackupStoreHandle {
     }
 
     /// Delete a backup object at every one of `replicas` — mirrors
-    /// [`SegmentStoreHandle::delete_sealed`]'s exact contract.
+    /// [`SegmentStoreHandle::delete_sealed`]'s exact contract. **Unused
+    /// until the retention janitor's reclaim phase** (ADR 0059 §3/§9, a
+    /// later train) — left in rather than stubbed, per this type's own
+    /// module-level doc.
+    #[allow(dead_code)]
     pub(crate) async fn delete(&self, replicas: &[NodeId], id: &str) -> std::io::Result<()> {
         use animus_env::SegmentStore;
         match self {
@@ -6503,7 +6599,10 @@ impl BackupStoreHandle {
     /// backup directory — mirrors [`SegmentStoreHandle::list_local`]'s exact
     /// contract (debug/sweep only, never load-bearing for correctness: the
     /// replicated backup catalog, ADR 0059 §3, is the sole authority for
-    /// what backup data exists).
+    /// what backup data exists). **Unused until a debug/sweep admin surface
+    /// or the retention janitor's orphan sweep needs it** (a later train) —
+    /// left in rather than stubbed, per this type's own module-level doc.
+    #[allow(dead_code)]
     pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         use animus_env::SegmentStore;
         match self {
@@ -6715,11 +6814,9 @@ struct DataRole {
     pub(crate) segment_store: SegmentStoreHandle,
     /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — a
     /// second, backup-dedicated store handle alongside `segment_store`
-    /// above, built from its own `--backup-store` CLI knob. **Unused today**
-    /// (ADR 0059 Train 1 PR②, plumbing only): no capture driver, janitor, or
-    /// wire surface reads or writes through it yet — a later PR's capture
-    /// driver is this field's first real consumer.
-    #[allow(dead_code)]
+    /// above, built from its own `--backup-store` CLI knob. Consumed by the
+    /// per-tablet capture driver (`backup_capture.rs`) and the completion
+    /// aggregator (`backup_completion.rs`) since ADR 0059 Train 1 PR③.
     pub(crate) backup_store: BackupStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,

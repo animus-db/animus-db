@@ -44,6 +44,10 @@ on:
         description: "Seeds per scenario (ANIMUS_INPLACE_SPLIT_SEEDS, ADR 0058 Train 2 rung 3 in-place split corpus)"
         required: false
         default: "40"
+      backup_seeds:
+        description: "Seeds per scenario (ANIMUS_BACKUP_SEEDS, ADR 0059 Train 1 backup-capture fault corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -140,3 +144,14 @@ jobs:
         env:
           ANIMUS_INPLACE_SPLIT_SEEDS: ${{ github.event.inputs.inplace_split_seeds || '40' }}
         run: cargo test -p animus-cp-data --test inplace_split_reconciler -- --nocapture
+
+      # ADR 0059 Train 1's on-demand backup capture driver + completion
+      # aggregator: concurrent writes, leader kills, a capture-driver
+      # restart, a split racing capture (§6 re-planning), and backup-store
+      # fault injection, scaled to depth. Each scenario is a pure function
+      # of its seed, so a failure names one scenario + seed and is
+      # replayable.
+      - name: deep backup capture corpus (ADR 0059 Train 1)
+        env:
+          ANIMUS_BACKUP_SEEDS: ${{ github.event.inputs.backup_seeds || '40' }}
+        run: cargo test -p animus-test --test backup_fault_corpus -- --nocapture

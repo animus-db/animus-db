@@ -617,3 +617,47 @@ as its own stacked series (root `CLAUDE.md`'s stacked-PR default):
   a trait-swap this ADR designs for (§1) but does not implement, gated on
   the Kubernetes-operator egress exception being an explicit, reviewed
   decision rather than an incidental widening.
+
+## As-built amendment (2026-08-26, Train 1 PR③ — capture driver)
+
+Two deviations from this ADR's own text, found building the capture
+driver and completion aggregator, recorded here rather than left for a
+reader to discover by diffing prose against code:
+
+- **§4's chunking is row-count-capped, not byte-budgeted.** The text calls
+  for "the split driver's own `SEED_CHUNK_BYTES`-budget convention" —
+  `animusd::backup_capture::CHUNK_ROWS` instead caps each data-chunk object
+  at a fixed row count (200). `SEED_CHUNK_BYTES` is a `const` private to
+  `index_drain.rs`'s own module (not this ADR's concern — a Rust module-
+  privacy fact, not a deliberate divergence), and porting the split
+  driver's byte-accounting helper into a second module for one PR was
+  judged not worth the duplication risk at Train 1's correctness-first
+  scope. A row cap still bounds object size well under any real DynamoDB
+  item's ~400 KB limit in practice. Matching the byte-budgeted convention
+  exactly (or sharing one implementation) is a named follow-up, not a
+  correctness gap.
+- **§6/§7's "re-planned pinned-tablet-and-range list" is `tablet_progress`,
+  not a rewritten `pinned_tablets`.** §7 step 3 describes restore reading
+  "the manifest's pinned-tablet-and-range list (already re-planned onto
+  live descendants... §6)" as if `BackupManifest::pinned_tablets` itself
+  gets updated when a split re-plans a tablet's capture. As built,
+  `pinned_tablets` is a **frozen historical stub**, written once at
+  `BeginBackup` and never rewritten (PR①'s own explicit design, kept
+  unchanged by PR③) — the re-planning instead surfaces through
+  `Metadata::backup_manifest_tablet_progress`, whose entries name whichever
+  tablets are **currently authoritative** (a live descendant, when a split
+  raced capture) and are what the completion aggregator actually writes
+  into `BackupManifestObject::tablet_progress`. That list carries each
+  tablet's `(cut_version, bytes)` but **no key range** — unlike
+  `BackupPinnedTablet`, `BackupManifestTabletEntry` has no `range` field.
+  This is a real, open question for Train 2: `RestoreTableFromBackup` does
+  not strictly need each historical reporting tablet's own range to
+  reconstruct the table correctly (`propose_seed_batch` merges each row by
+  its own logical key regardless of which tablet the restore driver mints
+  to receive it, so restore is free to choose an entirely fresh tablet
+  layout for the whole table — e.g. one tablet per the placement engine's
+  own preference — rather than mirroring the capture-time split topology),
+  but if Train 2's design instead wants to reproduce that topology
+  one-for-one, `BackupManifestTabletEntry` will need a `range` field added
+  first. Left for that train's own design pass rather than pre-emptively
+  widened here with no consumer.

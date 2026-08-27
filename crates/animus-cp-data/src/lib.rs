@@ -4302,6 +4302,120 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         pairs
     }
 
+    /// This tablet's own current engine watermark — the highest committed
+    /// MVCC version this replica's engine holds, or `0` if empty
+    /// (`StorageEngine::latest_version`). A cheap, synchronous, purely local
+    /// read: no barrier, no leadership requirement.
+    ///
+    /// The on-demand backup capture driver's own snapshot-pin primitive
+    /// (`animusd`, ADR 0059 §4): pinned **once**, at a tablet's own capture
+    /// start, and never re-derived on a later tick or across a leader
+    /// change — every subsequent
+    /// [`local_scan_kind_snapshot`](Self::local_scan_kind_snapshot) call for
+    /// that capture replays the identical `version_ceiling`, which is what
+    /// makes a retried chunk (a crash between a store `put` and its own
+    /// cursor-advance commit) re-derive byte-identical content rather than a
+    /// fresh, wider slice a re-pinned watermark would produce.
+    #[must_use]
+    pub fn engine_latest_version(&self) -> u64 {
+        self.storage.latest_version()
+    }
+
+    /// A **snapshot-pinned**, intent-resolved sweep of a kind scope, chunked
+    /// via a caller-supplied resumable cursor (ADR 0059 §4/§5) — the
+    /// on-demand backup capture driver's core read primitive (`animusd`, a
+    /// later PR).
+    ///
+    /// Unlike [`local_scan_kind`](Self::local_scan_kind) (always "latest"),
+    /// every row is read **as of `version_ceiling`**
+    /// (`StorageEngine::scan_at`, the same snapshot primitive
+    /// [`scan_at`](Self::scan_at) reads a live transaction against) — a
+    /// fixed watermark the caller pins once at capture start
+    /// ([`engine_latest_version`](Self::engine_latest_version)) and replays
+    /// on every later tick, so a capture spanning many ticks — and, across a
+    /// leader change, many different replicas — always resolves the
+    /// identical row set (every correctly-caught-up replica applies the
+    /// same Raft log in the same order, so "state as of version V" is the
+    /// same logical snapshot everywhere). Unlike the whole-tablet
+    /// snapshot-transfer primitive this crate builds for split-build
+    /// (ADR 0050's `engine_image`), every value is resolved through the
+    /// ordinary intent-resolution discipline
+    /// ([`resolve_once_step`](Self::resolve_once_step) — the same
+    /// non-blocking, silently-omit-a-still-`Pending`-row behavior
+    /// [`resolve_scan_rows`](Self::resolve_scan_rows) already gives every
+    /// ordinary scan) rather than copied as a raw envelope-tagged byte
+    /// string: ADR 0059 §5's "a backup holds only committed values, never a
+    /// raw intent envelope" rule, satisfied by construction here rather than
+    /// by a caller-side filter.
+    ///
+    /// Returns up to `limit` `(logical_key, value, version)` triples
+    /// starting at `start` (inclusive), plus a resumable cursor:
+    /// `Some(next_start)` when more rows remain past what was returned (pass
+    /// it back as the next call's own `start`), `None` once this kind
+    /// scope's own physical end is reached. An unknown `kind` scans as
+    /// empty, mirroring `local_scan_kind`.
+    ///
+    /// **Cost model, matching [`local_scan_kind`](Self::local_scan_kind)/
+    /// `animusd`'s TTL-reaper `local_scan_kind_capped` (the identical
+    /// trade-off, `animusd/CLAUDE.md`'s `ttl_reaper.rs` entry)**: `limit`
+    /// bounds the *returned* rows, not engine I/O — this still reads the
+    /// whole `[start, end)` sub-range at `version_ceiling` off the engine
+    /// per call, so a caller sweeping a large scope to completion in small
+    /// chunks pays a re-scan of the remaining range on every chunk. A known,
+    /// documented follow-up optimization (the split-build driver's own
+    /// "three full engine scans... the named next win" precedent,
+    /// `animusd/CLAUDE.md`), not a correctness gap.
+    pub async fn local_scan_kind_snapshot(
+        &self,
+        kind: u8,
+        start: &[u8],
+        version_ceiling: u64,
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>, u64)>, Option<Vec<u8>>) {
+        let Some(scope) = self.kind_scopes.get(kind as usize) else {
+            return (Vec::new(), None);
+        };
+        let Some(physical_end) = scope.physical_bounds().1 else {
+            return (Vec::new(), None);
+        };
+        let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = self
+            .storage
+            .scan_at(&scope.physical(start), &physical_end, version_ceiling)
+            .await
+            .ok()
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut out = Vec::new();
+        let mut next = None;
+        for (physical_key, vv) in raw {
+            let Some(logical) = scope.strip_in_range(&physical_key) else {
+                continue;
+            };
+            // A transaction-record marker key (`txn::is_record_key`) is
+            // this crate's own internal bookkeeping, never user data —
+            // `resolve_scan_rows` drops it for the identical reason on
+            // every ordinary scan. Checked here, before the `limit` gate,
+            // so a marker interleaved in the range never silently consumes
+            // one of the caller's requested chunk slots.
+            if txn::is_record_key(logical) {
+                continue;
+            }
+            if out.len() >= limit {
+                next = Some(logical.to_vec());
+                break;
+            }
+            let logical = logical.to_vec();
+            let version = vv.version;
+            if let ResolveStep::Value(Some(v)) =
+                self.resolve_once_step(&physical_key, vv, None).await
+            {
+                out.push((logical, v, version));
+            }
+        }
+        (out, next)
+    }
+
     /// This tablet's own consumer-cursor watermark for `consumer` (ADR
     /// 0042/0043, `KIND_CURSOR` — see [`cursor`]'s module doc), keyed by this
     /// group's own *current* [`scope_range`](Self::scope_range) start. A

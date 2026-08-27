@@ -1750,16 +1750,66 @@ route below the edge through the same `ClientCtx` CP primitives.
   control-only (`BoundControlNode::start_control_with` takes no such
   parameter at all), the identical "no data role, no `SegmentStoreHandle`-
   shaped handle" gap the streams segment janitor already documents for ADR
-  0043 §A9, inherited rather than fixed here. **Plumbing only as of this
-  PR**: `#[allow(dead_code)]` on `BackupStoreHandle`/its impl/`DataRole::
-  backup_store` is deliberate and temporary — no capture driver, janitor, or
-  wire surface calls any of it yet; a later PR's capture driver is the first
-  real consumer, and removing those allows is part of that PR's own diff,
-  not something to "clean up" here. `data --config`/`data --seed`/`control`/
-  `join`/`--cluster-control`+`--cluster-data` all default to
-  `BackupStoreConfig::Cluster` internally — no CLI flag reaches any of them,
-  the identical documented gap `--segment-store` already has on those same
-  entry points.
+  0043 §A9, inherited rather than fixed here. **Consumed since Train 1
+  PR③** (`#[allow(dead_code)]` removed from `BackupStoreHandle`/its impl/
+  `DataRole::backup_store`, PR② → PR③'s own promised follow-up): the
+  capture driver (`backup_capture.rs`) `put`s chunked data objects and the
+  completion aggregator (`backup_completion.rs`) `put`s the manifest
+  object — see both modules' own entries below. `get`/`delete`/`list_local`
+  stay individually `#[allow(dead_code)]`-marked (Train 2's restore, and
+  the not-yet-built retention janitor, are their first real readers).
+  `data --config`/`data --seed`/`control`/`join`/`--cluster-control`+
+  `--cluster-data` all default to `BackupStoreConfig::Cluster` internally —
+  no CLI flag reaches any of them, the identical documented gap
+  `--segment-store` already has on those same entry points.
+- **`backup_capture.rs`** (ADR 0059 §4/§5/§6, Train 1 PR③) — the on-demand
+  backup **capture driver**: a per-tablet, leader-side, event-driven loop
+  (`backup_capture_loop`, the same "run everywhere, self-gate per tablet on
+  `group.is_leader()`" shape as the GSI drain/TTL reaper) that sweeps a
+  `Creating` backup's `KIND_BASE`/`KIND_LSI`/`KIND_FOOTPRINT` rows into
+  chunked backup-store objects (`animus_cp_data::backup::
+  backup_data_object_id`/`encode_data_chunk`) via `animus_cp_data::
+  RaftKvNode::local_scan_kind_snapshot`, then reports completion through
+  `MetaCommand::RecordBackupTabletComplete` (on the `is_relayable_command`
+  allowlist — a tablet's own leader need not be, and on a split deployment
+  may not even be control-connected to, the control-plane leader).
+  **Targeting is real production code, not reimplemented here**:
+  `animus_control::Metadata::backup_capture_target` (directly pinned, or a
+  live `split_lineage` descendant of a retired pinned tablet, ADR 0059 §6)
+  is the one predicate this driver, the completion aggregator, and the
+  `ANIMUS_BACKUP_SEEDS` corpus all share. The module's own doc has the full
+  object-identity write-once argument (a durable `CaptureCursor`
+  — `KIND_CURSOR` row, tag `format!("backup:{backup_id}")`, registered in
+  `animus_cp_data::cursor::classify_tag` as
+  `SplitPolicy::RestartFromScratch` — pins `cut_version` **once**, at a
+  tablet's first tick for a given backup, and never re-derives it, which is
+  what keeps a retried chunk's content byte-identical across a leader
+  change) and the deliberately minimal quiescence posture (wakes only
+  immediately before a tick that actually proposes something, mirroring
+  `ttl_reaper.rs`'s "read for free, wake only to write" discipline — never
+  a standing veto like the split-build driver's). Spawned on combined and
+  data-only nodes only (a control-only node hosts no CP-data tablet).
+- **`backup_completion.rs`** (ADR 0059 §3/§4, Train 1 PR③) — the on-demand
+  backup **completion aggregator**: a control-plane-**leader**-only
+  background loop (`backup_completion_loop`), the identical self-gating
+  shape as `index_backfill.rs`/`segment_janitor.rs`. For every `Creating`
+  backup: once `Metadata::backup_ready_to_complete` (§6-aware — every
+  pinned tablet's own current live capture frontier has reported) answers
+  true, assembles the manifest object from `Metadata::
+  backup_manifest_tablet_progress` (never a blanket scan of every
+  `backup_tablet_progress` row — that accessor's own doc, and
+  `docs/engineering-lessons.md`'s entry on it, explain why a
+  split-superseded stale report must never double-count into the
+  manifest), `put`s it **before** proposing `MetaCommand::CompleteBackup`
+  (durable-before-visible, ADR 0059 §4) — or, past a driver-local
+  `STUCK_CREATING_TIMEOUT` (10 minutes, no CLI knob yet) with zero observed
+  report-count growth, proposes `MetaCommand::FailBackup`. **Inherits the
+  identical control-only-leader scope gap `segment_janitor.rs` already
+  documents**: failing needs only `Metadata` (a control-only leader can do
+  it); completing needs a `BackupStoreHandle`, which no control-only node
+  provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
+  and control-only nodes (never data-only, which never becomes control
+  leader at all).
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
