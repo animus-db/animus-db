@@ -145,6 +145,25 @@ reusing the captured config is the point of the test.
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
   sealed-vs-open serve split, `StreamHotRead`) is in
   `docs/streams-notes.md` — this entry is just the module pointer.
+- **`pitr_janitor.rs`** (ADR 0059 §9, Train 3) — PITR's two control-plane-
+  leader-only background loops, mirroring `segment_janitor.rs`/
+  `backup_janitor.rs`'s own shape: `pitr_snapshot_loop` (periodic
+  internally-triggered `BeginBackup` for a PITR-enabled table, reusing
+  Train 1's capture driver/aggregator completely unmodified, then tagging
+  the row via `MetaCommand::MarkBackupPitrBase` with a self-healing sweep
+  for a dropped tag ack) and `pitr_janitor_loop` (two-phase mark/reclaim
+  over `Metadata::pitr_segments`, subject to the identical epoch-derivation
+  guard `segment_janitor.rs` established for streams, plus a base-snapshot
+  keep-anchor mark step that leaves the actual reclaim to the *existing*
+  `backup_janitor_loop`, which already reclaims any `Expired`/`Failed`
+  `BackupRow` regardless of a PITR tag). `DEFAULT_PITR_RETENTION`
+  (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h) are hardcoded production
+  defaults — no CLI knob yet, the identical documented gap `ttl_reaper.rs`'s
+  own sweep interval has. The module's own doc has the full design
+  including the self-healing-tag residual and the control-only-leader
+  scope gap. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
+  lives in `index_drain.rs`, alongside the stream seal arm it mirrors — see
+  that module's doc.
 - **`segment_janitor.rs`** (ADR 0043 §A9) — the **segment janitor**: a
   control-plane-**leader**-only background loop (`segment_janitor_loop`)
   doing two-phase retention reclaim + replica repair over the whole
@@ -177,11 +196,29 @@ reusing the captured config is the point of the test.
   blocking the flip until it too reports, and the control-only-leader
   regression.
 - **`index_drain.rs`** (ADR 0041 §4, ADR 0042/0043 cursor/seal/
-  hot-trim rework, ADR 0045 §2 backfill seeder) — the per-node
-  **change-consumer loop** (`change_consumer_loop`, renamed from
-  `index_drain_loop` since it is no longer GSI-specific), four arms per
-  tick per led tablet: the GSI drain, the seal arm, the **backfill
-  seeder**, and the hot-trim arm. The backfill seeder runs once per index
+  hot-trim rework, ADR 0045 §2 backfill seeder, ADR 0059 §9 PITR seal arm) —
+  the per-node **change-consumer loop** (`change_consumer_loop`, renamed
+  from `index_drain_loop` since it is no longer GSI-specific), **five**
+  arms per tick per led tablet: the GSI drain, the stream seal arm, the
+  **PITR seal arm** (`pitr_tick`/`pitr_seal_now`, ADR 0059 §9 Train 3 —
+  the stream seal arm's twin: same trigger knobs
+  (`ctx.data().stream_seal_knobs`), same ledger-named-object recovery
+  argument, same `!splitting` exclusion guard mirrored into both
+  `split_driver_tick`/`inplace_split_driver_tick`'s own frozen-endgame
+  final seal, but writing to `crate::BackupStoreHandle`/`Metadata::
+  pitr_segments` under `animus_cp_data::backup::pitr_segment_object_id`'s
+  namespace rather than the streams `SegmentStoreHandle`/`stream_shards` —
+  a table can have a stream, PITR, both, or neither, independently, and the
+  marker-only idle fast path's own gate widens to `!pitr_enabled &&
+  !ever_pitr_sealed` so a PITR-only table still gets real sealing rather
+  than falling into the trim-everything marker branch), the **backfill
+  seeder**, and the hot-trim arm (`trim_janitor` gained a `pitr_enabled`
+  parameter alongside `stream_enabled`, folding in `Metadata::
+  pitr_segment_watermark` as a third possible trim-blocking term). The
+  disable-triggered final seal (`ClientRequest::ForcePitrSeal`/
+  `ClientCtx::force_pitr_seal_tablet`, called from `dynamo.rs::
+  update_continuous_backups`'s disable path) mirrors `ForceSeal`/
+  `force_seal_tablet` exactly. The backfill seeder runs once per index
   currently `Creating` on a led tablet's table: it sweeps that tablet's own
   `KIND_BASE` scope forward from a per-index backfill cursor (a
   `KIND_CURSOR` row, tag `backfill:{index_name}`, storing a raw last-seeded

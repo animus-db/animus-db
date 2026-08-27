@@ -66,8 +66,14 @@ amendment — the shape predates and outlives it.)
   (`animusd::backup_janitor`) — the janitor's own reclaim sweep reuses
   [`backup_prefix`] to scope a local `SegmentStore::list()`/`delete()` sweep
   per backup id (this module contributes only the naming convention; no
-  code here changed for PR④). This module itself is otherwise unchanged by
-  PR④ — no restore reader yet either (Train 2).
+  code here changed for PR④). Restore consumed it in Train 2 (`animusd::
+  backup_restore`, `encode_restored_value`); **Train 3 (ADR 0059 §9)** adds
+  `pitr_prefix`/`pitr_segment_object_id` — the PITR sealing consumer's own
+  object namespace (`backup/pitr/...`), sharing `segment.rs`'s codec
+  (`segment::new_header`/`encode`/`decode_and_slice`) rather than this
+  module's own data-chunk codec, since a PITR segment IS a sealed-shard-
+  shaped object over the change log, just written to the backup store
+  instead of the streams `SegmentStoreHandle`.
 - **`cluster_segment_store.rs`** (ADR 0043 §A7b) — `ClusterSegmentStore<E,
   S>`: the **default** `SegmentStore` for the stream-shard subsystem, K-way
   replication of an immutable segment over `E`'s `Network` seam. The

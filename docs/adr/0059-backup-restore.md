@@ -1,8 +1,10 @@
 # ADR 0059 — Backup and restore: on-demand backups + point-in-time recovery
 
 - **Status:** Accepted — Train 1 (catalog, backup-store plumbing, capture
-  driver, wire surface, janitor) and Train 2 (restore) implemented; Train 3
-  (PITR) pending.
+  driver, wire surface, janitor), Train 2 (restore), and Train 3 PR① (PITR
+  mechanism: the fifth consumer arm, periodic base snapshots, retention,
+  `UpdateContinuousBackups`/`DescribeContinuousBackups`) implemented.
+  Train 3 PR② (`RestoreTableToPointInTime`) pending.
 - **Date:** 2026-08-26
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (a table's manifest
   records its schema shape — partition/clustering keys, columns, GSI/LSI
@@ -881,3 +883,154 @@ same `encode_restored_value` envelope re-wrap — very likely yes, since its
 output is described as "exactly the same `(kind, logical_key, value,
 version)` shape an on-demand backup's data objects carry," which is the
 exact shape this train found needed the wrap.
+
+## As-built amendment (2026-08-27, Train 3 PR① — PITR mechanism)
+
+Nine deviations/decisions from this ADR's own text, found building the
+fifth consumer arm, periodic base snapshots, the retention janitor's PITR
+phase, and the `UpdateContinuousBackups`/`DescribeContinuousBackups` wire
+surface, recorded here rather than left for a reader to discover by
+diffing prose against code.
+
+- **A `PitrSpec.generation: u64` counter, not a bare boolean, and a
+  separate never-rewound `Metadata::pitr_generation: BTreeMap<TableName,
+  u64>` allocator** — mirroring `StreamSpec.label`'s own identity role
+  (§9's text doesn't specify PITR's own coverage-epoch identity mechanism
+  beyond "a fresh window"). `SealPitrSegment`'s generation-licensing rule
+  mirrors `SealStreamShard`'s label rule verbatim (licensed by the table's
+  *current* generation, or an existing catalog row's own, for the
+  disable-triggered final seal). The allocator survives `DropTableSchema`
+  and a same-named table's later recreation, closing the identical
+  "convergent per-name state a delete-then-recreate can poison" scar §3
+  already names for `BackupId` — applied here to a per-table counter
+  instead of an opaque identity, since a `(table, generation)` pair is
+  already enough to disambiguate two eras of a same-named table's PITR
+  history without needing a wholly opaque id.
+- **`MetaCommand::MarkBackupPitrBase { backup_id }`, a side-tag command, not
+  a `BackupRow.pitr_base`/`BeginBackup.pitr_base` field.** Widening
+  `BeginBackup`'s own signature would have touched every one of its ~30
+  existing construction sites across `animus-control`, `animus-test`, and
+  `animusd` (the exact compiler-enumerated fan-out class root `CLAUDE.md`'s
+  engineering-practices log already documents for `backup_name`'s own
+  addition) for a fact only the PITR janitor and `DescribeContinuousBackups`
+  ever need. `Metadata::pitr_base_backups: BTreeSet<BackupId>` is populated
+  by a second proposal (`pitr_janitor::pitr_snapshot_loop`) immediately
+  after its own `BeginBackup` is observed to land, with a **self-healing
+  sweep** (matching any untagged row whose `backup_name` carries a
+  recognizable internal marker prefix) closing the gap left by a dropped
+  ack between the two proposals on every subsequent tick — a named,
+  accepted residual (a vanishingly brief window where an internal snapshot
+  looks like an ordinary on-demand one), not a defended two-phase-commit
+  property. `DeleteBackup`'s existing apply arm prunes the tag alongside
+  the row it tags.
+- **A PITR base snapshot is a `SYSTEM`-type backup for `ListBackups`
+  purposes**, realizing `wire::BackupTypeFilter::System`'s own doc comment
+  from Train 1 PR④ ("PITR base snapshots — never produced yet") literally:
+  the default (`USER`) filter excludes `pitr_base_backups`-tagged rows;
+  `SYSTEM`/`ALL` include them. `DescribeBackup`/`DeleteBackup` by ARN are
+  unchanged (a caller already holding the specific ARN is not filtered by
+  type, matching real DynamoDB) — a client can still delete a PITR base
+  snapshot directly if it discovers the ARN via `ListBackups(SYSTEM)`; this
+  is not specially guarded (a narrow, accepted residual: doing so can
+  orphan a still-needed replay base for segments sealed after it, the same
+  class of self-inflicted narrowing a user deleting any relevant backup
+  already risks). The JSON body's own `BackupType` field still always
+  renders `"USER"` (cosmetic; threading the real value through
+  `wire::BackupDetails` end to end is a named follow-up, not a correctness
+  gap for the mechanism this PR builds).
+- **The disable-triggered final seal is wired identically to F12-b's own
+  stream precedent**: a new `ClientRequest::ForcePitrSeal` RPC and
+  `ClientCtx::force_pitr_seal_tablet`, mirroring `ForceSeal`/
+  `force_seal_tablet` exactly, called for every one of a table's tablets by
+  `dynamo.rs::update_continuous_backups`'s disable path **before** it
+  proposes `MetaCommand::UpdateContinuousBackups { enabled: false, .. }` —
+  so `trim_janitor`'s PITR term (which, mirroring the stream term, applies
+  only while `pitr_enabled` is currently true) never has an unprotected
+  window the instant the flag flips.
+- **PITR shares the stream sealer's own `seal_bytes`/`seal_age` trigger
+  knobs (`ctx.data().stream_seal_knobs`) — no separate PITR-specific
+  threshold, and no CLI-configurable retention/snapshot-cadence knob at
+  all yet.** Both are deliberate Train 3 PR① simplifications, not gaps
+  discovered after the fact: `DEFAULT_PITR_RETENTION` (35 days) and
+  `DEFAULT_PITR_SNAPSHOT_CADENCE` (6 hours) are hardcoded production
+  defaults at every spawn site, the identical "no CLI flag exists yet"
+  shape `ttl_reaper.rs`'s own sweep interval already carries in this
+  codebase. Both loops' own functions take the relevant `Duration` as a
+  parameter (so a test passes a tiny value directly), and threading a real
+  `--pitr-retention-days`/reusing `--stream-seal-bytes`-shaped knobs is a
+  named follow-up — `start_with_growth`'s parameter list already carries
+  enough same-shaped `Duration`s that adding another was judged not worth
+  the ~40-call-site mechanical fan-out under this PR's own time budget.
+- **No replica-repair phase for PITR segments** — a deliberate, named Train
+  3 simplification mirroring Train 1 PR④'s own "reclaim is local-only"
+  acceptance for on-demand backups: `pitr_janitor`'s retention phase marks,
+  deletes via the cataloged `replicas` list (unlike Train 1 PR④'s backup
+  janitor, a PITR segment *does* carry a real `replicas` list, mirroring
+  `StreamShardRow`'s own, so reclaim already uses `BackupStoreHandle::
+  delete` against it rather than a local-only sweep), and removes — but
+  never re-replicates a segment that has lost a copy to cluster churn the
+  way `segment_janitor.rs`'s own phase 2 does for streams. A future train
+  can add it by copying that phase verbatim.
+- **`EarliestRestorableDateTime`/`LatestRestorableDateTime` derivation**:
+  `Earliest = max(retention floor, this generation's own enabled_wall_ms)`;
+  `Latest = min, over every one of the table's CURRENT tablets, of that
+  tablet's own last-PITR-seal wall time (or `enabled_wall_ms` for a tablet
+  that has never sealed yet)` — the minimum, not the maximum, since a
+  client's own restore-to-a-second request must be coherent across every
+  tablet, and reporting later than the slowest tablet's own actual coverage
+  would claim a restore this adapter cannot yet reconstruct for that
+  tablet's range. Both read `ctx.env.wall_now()` directly at serve time
+  (a pure read handler, not a proposed command, so there is no propose-time
+  stamping site to ride) — consistent with the "wall clock enters through
+  one seam" discipline, just at a read rather than a write.
+- **The split endgame's PITR final seal is a straight second copy of the
+  streams final-seal step, not a shared helper** — `split_driver_tick`/
+  `inplace_split_driver_tick` each gained one more `while pitr_seal_now(..)
+  .is_some() {}` loop, gated on `meta.table_pitr(&table).is_some()`,
+  immediately after the existing streams one. Not factored into one
+  parameterized function: the two write to different stores and catalog
+  collections (`crate::SegmentStoreHandle`+`stream_shards` vs.
+  `crate::BackupStoreHandle`+`pitr_segments`), and forcing them through a
+  shared abstraction was judged more likely to obscure that distinction
+  than to save the ~10 lines of duplication.
+- **Corpus scoping**: `ANIMUS_PITR_SEEDS` (`animus-test/tests/
+  pitr_fault_corpus.rs`) reimplements `pitr_seal_now` directly (the
+  `stream_lineage_corpus.rs` precedent) but deliberately does **not**
+  re-simulate the periodic-base-snapshot loop or the janitor's full tick —
+  both reuse Train 1 machinery `backup_fault_corpus.rs` already proves at
+  depth, so this corpus instead proves the janitor's own **new** logic (the
+  keep-anchor retention predicate) as a pure function under randomized
+  interleavings. See `crates/animus-test/CLAUDE.md`'s own corpus section
+  for the full scenario list and the split-scenario engine-sharing bug this
+  corpus's own first run found in its test harness (not production code).
+
+**Open questions carried into Train 3 PR② (`RestoreTableToPointInTime`)**:
+
+- §10's per-tablet cutoff replay needs to walk a PITR segment chain the
+  same way `DescribeStream`/`GetRecords` walks a stream shard chain
+  (`Metadata::pitr_segments`, ascending epoch, `segment::decode_and_slice`)
+  — no new primitive, but the replay driver itself (locate the newest base
+  snapshot at-or-before `T`, then replay each tablet's own segments/hot
+  tail up to the packed-HLC position nearest `T`) is unwritten.
+  `encode_restored_value`'s envelope re-wrap (Train 2's own as-built note)
+  very likely applies unchanged, per that note's own prediction.
+- The single-fresh-tablet restore layout decision (Train 2's own as-built
+  note) is inherited unchanged; PITR's replay produces the identical
+  `SeedRow` shape an on-demand backup's data objects carry, so
+  `propose_seed_batch` doesn't know or care whether its input came from a
+  snapshot alone or a snapshot-plus-replay.
+- **Not yet decided**: how `RestoreTableToPointInTime` selects which base
+  snapshot is "newest at or before `T`" when a table has both PITR base
+  snapshots (tagged `pitr_base_backups`) and unrelated on-demand backups a
+  client separately created via `CreateBackup` — the ADR's own §10 text
+  implies only PITR's own base-snapshot history is eligible, which
+  `Metadata::pitr_base_backups_for_table` already scopes correctly; PR②
+  should use that accessor directly rather than scanning `Metadata::
+  backups` by table name alone.
+- **Not yet decided**: whether a restore-to-a-second request against a
+  table whose PITR was disabled-then-re-enabled (crossing a generation
+  boundary) should be rejected outright for any `T` inside the gap, or
+  simply find no coverage there and fail with whatever "no restorable data
+  at this point" error DynamoDB itself defines — this ADR's §9 text
+  establishes that the gap is real and uncovered, but doesn't specify the
+  wire-facing error shape PR② should surface for it.
