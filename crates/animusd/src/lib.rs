@@ -12875,6 +12875,28 @@ const RECOVERY_STUCK_GRACE: Duration = Duration::from_secs(30);
 /// ([`RaftKvNode::unresolved_decided`]). Errors are logged and swallowed —
 /// this is a best-effort background sweep; the next tick retries.
 async fn txn_resolver_loop(ctx: ClientCtx) {
+    // Driver-local grace tracker for `unresolved_decided()` entries whose
+    // `txn_record_view` lookup fails (issue #298 residuals) — same
+    // ownership/bounding discipline as `index_drain::change_consumer_loop`'s
+    // `first_hot_seen`/`marker_bytes_seen`: per-driver, in-memory only,
+    // pruned every tick against whatever `unresolved_decided()` actually
+    // reported this tick (never against a fixed universe, since a stuck
+    // entry's own tablet may itself retire while it's being tracked — the
+    // exact shape this exists for). Keyed by `TxnId` rather than
+    // `(tablet, TxnId)`: `unresolved_decided()` is already scoped to one
+    // `group`/tablet per call, and a `TxnId` never legitimately appears
+    // `Pending`/decided-unresolved on two different tablets' anchors at
+    // once, so the flat key is unambiguous and survives a same-node
+    // re-host under a different tablet id across a split with no special
+    // case. `first_seen` is milliseconds off whichever led group's own
+    // `Env::now()` first observed the failure — not wall-clock-comparable
+    // across nodes, but this map never leaves this node, so that's fine.
+    let mut unresolved_first_seen: BTreeMap<TxnId, u64> = BTreeMap::new();
+    // Entries already past grace for which this loop has already logged +
+    // metered the "giving up on background resolution for now" signal —
+    // separate from `unresolved_first_seen` so that signal fires exactly
+    // once per stuck episode instead of every tick thereafter.
+    let mut unresolved_stuck_warned: BTreeSet<TxnId> = BTreeSet::new();
     // Stuck-recovery grace tracker (issue #298 shape B fix): `txn_id`s this
     // loop has already logged+metered as stuck past `RECOVERY_STUCK_GRACE`
     // — mirrors the driver-local, tick-pruned memo discipline
@@ -12888,6 +12910,10 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
     let mut stuck_recovery_warned: BTreeSet<TxnId> = BTreeSet::new();
     loop {
         tokio::time::sleep(TXN_RESOLVER_INTERVAL).await;
+        // Every `TxnId` `unresolved_decided()` reports this tick, across
+        // every hosted group — the live set the two maps above are pruned
+        // against once the tick's tablet loop below finishes.
+        let mut unresolved_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
         let mut pending_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
@@ -12983,13 +13009,69 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 }
             }
             for (txn_id, (record_key, outcome)) in group.unresolved_decided() {
+                unresolved_seen_this_tick.insert(txn_id.clone());
                 // `unresolved_decided` only carries `(record_key, outcome)`
                 // — re-read the record's own `intent_spans` (every
                 // participant table this transaction touched) rather than
                 // guess it.
                 let Ok(Some(view)) = ctx.txn_record_view(&table, &record_key).await else {
-                    continue; // transient (or genuinely gone) — retried next tick
+                    // Lookup-failure fallback (issue #298 residuals): unlike
+                    // `pending_txns`'s orphan path above, there is no
+                    // decision left to make here — `outcome` is already
+                    // known (`Committed`/`Aborted`); a failed
+                    // `txn_record_view` only means `intent_spans` (which
+                    // keys/tables to actually resolve) is unreachable right
+                    // now, e.g. because the record's own tablet retired
+                    // mid-recovery (the same class of split-clone/trim
+                    // hazard `pending_txns`'s own comment names — a txn
+                    // record is an ordinary logical key of its anchor
+                    // tablet, so it rides the identical path every other
+                    // row does). Retrying forever on a permanent case would
+                    // burn a tick's work on every hosted group forever with
+                    // no bound and no signal — the exact silent-stall shape
+                    // this issue is about. So: track first-seen per
+                    // `txn_id`, keep quietly retrying (a transient failure —
+                    // a route flap, a not-yet-caught-up follower — should
+                    // still self-heal next tick), and once
+                    // `RECOVERY_GRACE` has passed with no success, log +
+                    // meter it once and move on. This never fabricates an
+                    // `intent_spans` list to resolve against, so it is
+                    // conservative by construction — it can only ever make
+                    // this loop STOP claiming background progress it isn't
+                    // making; it cannot mis-resolve anything. Correctness
+                    // for the stuck transaction's participants still comes
+                    // from the independent on-demand foreign-intent
+                    // read-path push (ADR 0018 §2/PR5 §3): any reader that
+                    // later hits one of its intents directly resolves it
+                    // right then, regardless of what this background loop
+                    // has given up on.
+                    let now_ms = group.env().now().0 / 1_000_000;
+                    let first_seen = *unresolved_first_seen
+                        .entry(txn_id.clone())
+                        .or_insert(now_ms);
+                    if now_ms.saturating_sub(first_seen)
+                        >= animus_cp_data::RECOVERY_GRACE.as_millis() as u64
+                        && unresolved_stuck_warned.insert(txn_id.clone())
+                    {
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            ?txn_id,
+                            "txn_resolver_loop: unresolved_decided record has \
+                             been unreachable past RECOVERY_GRACE — giving up \
+                             on background resolution for now (no readable \
+                             intent_spans to act on); correctness is still \
+                             covered by the on-demand foreign-intent read-path \
+                             push (ADR 0018 §2/PR5 §3)"
+                        );
+                        if let Some(data) = ctx.data.as_ref() {
+                            data.raftkv_metrics
+                                .incr(Metric::CpTxnUnresolvedDecidedStuck);
+                        }
+                    }
+                    continue; // transient-or-parked — retried next tick regardless
                 };
+                unresolved_first_seen.remove(&txn_id);
+                unresolved_stuck_warned.remove(&txn_id);
                 ctx.recovery_resolve(
                     txn_id,
                     record_key,
@@ -12999,6 +13081,8 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
                 .await;
             }
         }
+        unresolved_first_seen.retain(|id, _| unresolved_seen_this_tick.contains(id));
+        unresolved_stuck_warned.retain(|id| unresolved_seen_this_tick.contains(id));
         stuck_recovery_warned.retain(|id| pending_seen_this_tick.contains(id));
         if let Some(data) = ctx.data.as_ref() {
             data.raftkv_metrics.incr(Metric::CpTxnResolverRuns);

@@ -530,12 +530,26 @@ pub enum Metric {
     /// decided) and resolve the moment `txn_verify` can actually confirm
     /// their state again.
     CpTxnRecoveryStuckInconclusive,
+    // --- `unresolved_decided` background-resolution gap (issue #298
+    // residuals) --- Appended after the trim-total variant; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd`'s `txn_resolver_loop`.
+    /// An `unresolved_decided` entry's `txn_record_view` lookup kept failing
+    /// for at least `animus_cp_data::RECOVERY_GRACE` — this loop has given up
+    /// background-resolving it *for now* (there is no `intent_spans` to act
+    /// on without a readable record). Correctness is unaffected: a straggling
+    /// unresolved remote intent is still resolved on demand the moment any
+    /// reader hits it (the foreign-intent read-path push, ADR 0018 §2/PR5
+    /// §3) — this counter only signals reduced background promptness for
+    /// that one transaction, e.g. because its record's tablet retired
+    /// mid-recovery.
+    CpTxnUnresolvedDecidedStuck,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 75] = [
+    pub const ALL: [Metric; 76] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -611,6 +625,7 @@ impl Metric {
         Metric::ChangeLogTrimmedTotal,
         Metric::CpTxnRecoveryVerifyInconclusive,
         Metric::CpTxnRecoveryStuckInconclusive,
+        Metric::CpTxnUnresolvedDecidedStuck,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -693,6 +708,7 @@ impl Metric {
             Metric::ChangeLogTrimmedTotal => "change_log_trimmed_total",
             Metric::CpTxnRecoveryVerifyInconclusive => "cp_txn_recovery_verify_inconclusive",
             Metric::CpTxnRecoveryStuckInconclusive => "cp_txn_recovery_stuck_inconclusive",
+            Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
         }
     }
 
