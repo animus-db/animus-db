@@ -850,6 +850,7 @@ fn begin_restore(
             tablet,
             replicas: NODES.iter().copied().map(nid).collect(),
             gsi_defs: Vec::new(),
+            pitr: None,
         }),
         ApplyOutcome::Applied
     );

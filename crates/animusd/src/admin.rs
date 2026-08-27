@@ -1323,6 +1323,13 @@ fn restores_view(ctx: &ClientCtx) -> Value {
                 "tablet": row.tablet.0.to_string(),
                 "tablet_state": tablet_state,
                 "gsi_names": row.gsi_defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>(),
+                // ADR 0059 §10, Train 3 PR②: which wire op started this
+                // restore — `RestoreTableFromBackup` (an ordinary backup)
+                // or `RestoreTableToPointInTime` (`row.pitr` carries the
+                // resolved segment-replay plan only in the latter case).
+                "source": if row.pitr.is_some() { "POINT_IN_TIME" } else { "BACKUP" },
+                "pitr_target_wall_ms": row.pitr.as_ref().map(|p| p.target_wall_ms),
+                "pitr_segments_planned": row.pitr.as_ref().map(|p| p.segments.len()),
             })
         })
         .collect();

@@ -2147,6 +2147,7 @@ mod tests {
             tablet: TabletId(1),
             replicas: vec![nid(1)],
             gsi_defs: Vec::new(),
+            pitr: None,
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -2189,6 +2190,7 @@ mod tests {
                 tablet: TabletId(1),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             },
         );
 
@@ -2224,6 +2226,7 @@ mod tests {
                 tablet: TabletId(2),
                 replicas: vec![nid(1)],
                 gsi_defs: Vec::new(),
+                pitr: None,
             },
         );
         let (outcome, writes) = apply_and_derive_mirror(
@@ -2260,6 +2263,7 @@ mod tests {
             tablet: TabletId(1),
             replicas: vec![nid(1)],
             gsi_defs: Vec::new(),
+            pitr: None,
         });
         base.apply(&MetaCommand::CompleteRestore {
             restore_id: "restore-1".to_string(),

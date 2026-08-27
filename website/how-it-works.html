@@ -92,7 +92,7 @@
       </div>
     </div>
     <p class="body-text">Tables of items addressed by a partition key and an optional sort key, with schemaless attributes — the model you already design for. <strong>Working today:</strong> <code>PutItem</code>, <code>GetItem</code>, <code>UpdateItem</code>, <code>DeleteItem</code> with condition and update expressions; <code>Query</code> and <code>Scan</code> with filters, pagination and index queries; the batch operations; transactions; secondary indexes added and dropped online with backfill; streams; TTL.</p>
-    <p class="body-text"><strong>Four differences worth knowing before you assume a drop-in:</strong> scans are ordered by token rather than partition-key value; there is no capacity metering, so no RCUs and no throttling responses; credentials are verified only when the opt-in SigV4 check is switched on — by default any caller that can reach the port is trusted; and the AWS-side integrations — Lambda triggers, PITR, DAX, CloudWatch — have no equivalent.</p>
+    <p class="body-text"><strong>Four differences worth knowing before you assume a drop-in:</strong> scans are ordered by token rather than partition-key value; there is no capacity metering, so no RCUs and no throttling responses; credentials are verified only when the opt-in SigV4 check is switched on — by default any caller that can reach the port is trusted; and the AWS-side integrations — Lambda triggers, DAX, CloudWatch — have no equivalent.</p>
     <a class="ctalink" href="compatibility.html">Operation by operation, with notes →</a>
   </div>
 </section>
@@ -201,10 +201,10 @@
         <li>Shrinking: <code>drain</code>, <code>drain-status</code>, <code>decommission</code></li>
         <li>Node failure: replicas re-created automatically, no operator action</li>
         <li>On-demand backup and restore to a new table (DynamoDB's own <code>CreateBackup</code>/<code>RestoreTableFromBackup</code>)</li>
+        <li>Continuous backups (point-in-time recovery to any second, <code>UpdateContinuousBackups</code>/<code>RestoreTableToPointInTime</code>)</li>
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
-        <li>Continuous backups (point-in-time recovery)</li>
         <li>Upgrades — formats change between revisions, so upgrading means recreating the cluster</li>
         <li>TLS — absent on every port; authentication — opt-in SigV4 on the client port only</li>
       </ul></div>

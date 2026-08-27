@@ -1,10 +1,11 @@
 # ADR 0059 — Backup and restore: on-demand backups + point-in-time recovery
 
 - **Status:** Accepted — Train 1 (catalog, backup-store plumbing, capture
-  driver, wire surface, janitor), Train 2 (restore), and Train 3 PR① (PITR
+  driver, wire surface, janitor), Train 2 (restore), Train 3 PR① (PITR
   mechanism: the fifth consumer arm, periodic base snapshots, retention,
-  `UpdateContinuousBackups`/`DescribeContinuousBackups`) implemented.
-  Train 3 PR② (`RestoreTableToPointInTime`) pending.
+  `UpdateContinuousBackups`/`DescribeContinuousBackups`), and Train 3 PR②
+  (`RestoreTableToPointInTime`) all implemented. The backup/restore/PITR
+  feature train is complete.
 - **Date:** 2026-08-26
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (a table's manifest
   records its schema shape — partition/clustering keys, columns, GSI/LSI
@@ -1034,3 +1035,141 @@ diffing prose against code.
   at this point" error DynamoDB itself defines — this ADR's §9 text
   establishes that the gap is real and uncovered, but doesn't specify the
   wire-facing error shape PR② should surface for it.
+
+## As-built amendment (2026-08-27, Train 3 PR② — `RestoreTableToPointInTime`)
+
+Resolves the three open questions above and records five deviations/bugs
+found while building the point-in-time restore path — the final PR of the
+backup/restore/PITR train.
+
+- **Base-snapshot selection answers the first open question directly**:
+  `restore_table_to_point_in_time` (`animusd::dynamo`) calls
+  `Metadata::pitr_base_backups_for_table` — never a bare scan of
+  `Metadata::backups` by table name — and picks the newest `Available` row
+  at or before the resolved cutoff. An unrelated on-demand backup a client
+  created via plain `CreateBackup` is structurally invisible to this path
+  regardless of its own timestamp, exactly as §10's text implies.
+- **The generation-gap question answers "reject, with `InvalidRestoreTimeException`,
+  the same code the ADR already names for an out-of-window `T`"** — no new
+  error shape. `Metadata::pitr_restore_window` (built in the PR① follow-on
+  commit) scopes `Earliest`/`Latest` to the table's *current* generation
+  only, so a `T` that falls inside an earlier generation's own window (a
+  disable/re-enable gap, or before the current generation's own enable) is
+  simply outside `[earliest_floor_ms, latest_ms]` and rejected by the same
+  bounds check as any other out-of-range request — the corpus's
+  `pitr_restore_window_scopes_to_the_latest_generation_under_random_cycles`
+  cell proves this holds under randomized disable/re-enable cycling, not
+  just the hand-picked case.
+- **Replay-integration shape: extend Train 2's own restore driver, not a
+  parallel one** — `backup_restore.rs`'s existing per-tablet, leader-side,
+  event-driven `backup_restore_loop`/`restore_tick` gained one more phase:
+  after the pre-existing base-manifest chunk sweep, a `Seeding` restore
+  carrying a `PitrRestorePlan` runs `replay_pitr_segments`, which walks the
+  plan's own resolved `PitrReplaySegmentRef`s (already epoch-ordered by
+  construction), fetches + decodes each segment
+  (`animus_cp_data::segment::decode_and_slice`), decodes every
+  `ChangeRecord`, skips `consumer_hidden()` ones (markers/seeded/staged —
+  never real content), and re-derives `KIND_BASE`/`KIND_LSI` writes via
+  `dynamo::kind_writes_for_item` — the *same* pure function a live write's
+  own leader-side evaluation already uses, so LSI-derivation logic is never
+  duplicated. `KIND_CHANGE`/`KIND_FOOTPRINT` are never replayed (a
+  footprint is rebuilt fresh by the post-activation GSI backfill
+  regardless of how base content arrived, exactly like an on-demand
+  restore's own seeded rows). This reuses `BeginRestore` → the existing
+  activation → GSI-declare sequence verbatim; `PitrRestorePlan` is carried
+  on `RestoreRow`/`MetaCommand::BeginRestore` exactly like `gsi_defs`
+  already is, so nothing downstream of `BeginRestore` needed to learn a new
+  restore "kind" exists.
+- **Confirmed: replayed values need the identical `encode_restored_value`
+  re-wrap Train 2's own seeds do** — Train 2's as-built note had predicted
+  this "very likely" without proving it; this PR's own first end-to-end run
+  proved it the hard way (a raw resolved value merged via `SeedBatch`
+  without the envelope corrupts the engine's later reads, identical to the
+  Train 2 incident). `replay_pitr_segments` re-wraps every derived value
+  before batching it into a `SeedRow`.
+- **A real, previously-shipped bug found and fixed ahead of this PR's own
+  validation gate being meaningful**: `pitr_seal_now`/`pitr_tick`
+  (`index_drain.rs`) stamped `seal_wall_ms` from `ctx.env.now()`
+  (monotonic-since-process-start `Nanos`), not `ctx.env.wall_now()` (real
+  epoch milliseconds, ADR 0051's one calendar-time seam) — since
+  `PitrSpec::enabled_wall_ms` is genuinely wall-clock,
+  `LatestRestorableDateTime` silently collapsed to
+  `EarliestRestorableDateTime` forever the instant any tablet ever sealed,
+  making every non-trivial restore window empty. Fixed to `wall_now()`; the
+  never-sealed age-trigger bootstrap fallback (which used to scan for the
+  true oldest pending record's own packed-HLC `wall_ms`) switched to
+  seeding at the now-`wall_now()`-based `now_ms` directly, since a packed
+  HLC's `wall_ms` component is monotonic-since-start and no longer
+  comparable to it. A second, narrower gate had the same class of bug:
+  `table_change_records_carry_images` didn't account for PITR at all — a
+  table with PITR enabled but no GSI/LSI/stream wrote only image-less
+  markers, which PITR replay cannot reconstruct row content from. PITR now
+  joins the same `!indexes.is_empty() || stream.is_some()` gate a stream or
+  index already trips.
+- **A real bug in this PR's own new code, found by its own first
+  end-to-end test, not by review**: the first `Metadata::
+  pitr_replay_segments` was built on `live_split_descendants` (ADR 0059
+  §6's on-demand-capture re-planning accessor), which answers "this
+  pinned tablet's currently-*live* descendants" and returns **empty** for
+  a tablet retired by an ordinary `DropTableTablets` — no `split_lineage`
+  entry exists for a drop, only for a split — so a deleted-table PITR
+  restore silently replayed nothing. Rewritten as a direct forward DFS
+  over the `split_lineage` tree, starting from each of the base snapshot's
+  own pinned tablets: every tablet visited (root or descendant) contributes
+  its own `pitr_segments` rows regardless of current liveness, since a
+  table drop never touches `split_lineage` or `pitr_segments` at all —
+  they are ADR 0024 carve-outs exactly like the backup catalog itself. The
+  root's own floor is the base snapshot's recorded cut version (never
+  replay below what the snapshot already covers); a descendant's floor is
+  0 (its own change log starts empty at birth, ADR 0050's copy-based split
+  design). Regression:
+  `pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`
+  (`animus-control`'s own unit tests) plus the corpus's
+  `deleted_table_pitr_restore_matches_the_model` cell.
+- **A second production fix the same end-to-end run found**:
+  `RestoreDateTime` is truncated to the second (§10's own contract), but
+  `pitr_restore_window`'s `earliest_ms` is millisecond-precise (derived
+  from `PitrSpec::enabled_wall_ms`, a real wall-clock timestamp with no
+  reason to land on a whole second), so a `T` naming the very same
+  wall-clock second PITR was enabled in could be rejected purely because
+  enabling didn't happen to land on that second's own first millisecond.
+  Fixed by flooring `earliest_ms` to its own second
+  (`earliest_floor_ms = (earliest_ms / 1000) * 1000`) before the bounds
+  comparison — the comparison itself still stays in whole milliseconds
+  internally; only the floor moved.
+- **Testing technique worth keeping**: the e2e suite
+  (`animusd/tests/dynamo_pitr_restore.rs`) does not race the real wall
+  clock to decide when a write is "definitely covered by the next seal" —
+  polling `LatestRestorableDateTime` for "≥ target second" doesn't
+  guarantee the target write is *included*, since Latest can advance past
+  the target second before the segment covering it is actually sealed.
+  Instead it reads the sealed segment's own `seal_wall_ms` directly off
+  `node.metadata()` (`await_next_pitr_seal`), so the test always restores
+  to a second the harness *knows* the relevant write landed in, not one it
+  merely observed the clock reach.
+- **`admin.rs`'s `/admin/restores` view** gained a `source` field
+  (`"POINT_IN_TIME"` vs. `"BACKUP"`, keyed on `RestoreRow.pitr.is_some()`)
+  plus `pitr_target_wall_ms`/`pitr_segments_planned`, for operator
+  visibility into which restores are PITR-driven and how large their
+  resolved replay plan is — no wire-facing consequence, purely
+  observability.
+- **Residuals carried forward, none blocking**: the "not yet decided"
+  ARN-scoped-delete-of-a-PITR-base-snapshot residual from PR①'s own
+  amendment is unchanged by this PR (restore never touches deletion); no
+  replica-repair phase exists for PITR segments (PR①'s own named gap,
+  unaffected by adding a reader of those segments); and — as with every
+  restore in this train — a restored table's stream/TTL config is never
+  re-enabled from the source's own history, matching Train 2's identical
+  choice for `RestoreTableFromBackup`. Corpus:
+  `crates/animus-test/tests/pitr_fault_corpus.rs`, `ANIMUS_PITR_SEEDS`
+  (held green at 300 in ~8s), covering restore-to-a-random-second against
+  mixed load with a leader kill, the same property across a split's
+  independently-sealing children, the generation-gap scoping property,
+  the deleted-table regression, and `UseLatestRestorableTime` reproducing
+  the full model. E2e: `animusd/tests/dynamo_pitr_restore.rs` — a full
+  enable → timed writes → restore-to-a-mid-point-second round trip
+  (verifying exactly the rows as of `T`, via both `RestoreDateTime` and
+  `UseLatestRestorableTime`), a deleted-table PITR restore within the
+  window, and the `TableNotFoundException`/
+  `PointInTimeRecoveryUnavailableException`/`InvalidRestoreTimeException`
+  error shapes.

@@ -62,6 +62,7 @@ said. When a capability lands or a gap closes, the pages that name it are:
 The known-limits list (`architecture.html#limits`) is the load-bearing one: it
 currently states no TLS on any port, no authentication beyond opt-in SigV4 on
 the client DynamoDB port (ADR 0057), no format compatibility between
-revisions, no backup/restore, no tablet merge, and no Kubernetes operator.
-`BatchGetItem`, `DeleteTable` and `ListTables` are implemented — don't
-reintroduce them as gaps without checking the code first.
+revisions, no tablet merge, and no Kubernetes operator.
+`BatchGetItem`, `DeleteTable`, `ListTables`, on-demand backup/restore, and
+continuous backups (PITR, ADR 0059) are all implemented — don't reintroduce
+any of them as gaps without checking the code first.

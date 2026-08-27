@@ -1888,7 +1888,7 @@ route below the edge through the same `ClientCtx` CP primitives.
   document (object reclaim needs a `BackupStoreHandle`, which no
   control-only node provisions) — spawned on combined and control-only
   nodes, never data-only.
-- **`backup_restore.rs`** (ADR 0059 §7, Train 2) — the **restore driver**:
+- **`backup_restore.rs`** (ADR 0059 §7, Train 2; §10, Train 3 PR②) — the **restore driver**:
   a per-tablet, leader-side, event-driven loop (`backup_restore_loop`, the
   identical "run everywhere, self-gate per tablet on `group.is_leader()`"
   shape as `backup_capture.rs`/the GSI drain/TTL reaper) that seeds a
@@ -1919,6 +1919,27 @@ route below the edge through the same `ClientCtx` CP primitives.
   is load-bearing, not incidental. Spawned on combined and data-only nodes
   only (mirrors `backup_capture.rs`'s own scope — a control-only node hosts
   no CP-data tablet).
+
+  **PITR replay (Train 3 PR②) is one more phase of this same
+  `restore_tick`, not a parallel driver** — a `Seeding` restore whose
+  `RestoreRow.pitr` carries a `PitrRestorePlan` runs `replay_pitr_segments`
+  after the ordinary base-manifest chunk sweep above: for each of the
+  plan's own (already-resolved, epoch-ordered) `PitrReplaySegmentRef`s, it
+  fetches + decodes the segment (`animus_cp_data::segment::
+  decode_and_slice`), decodes every `ChangeRecord`, skips
+  `consumer_hidden()` ones (markers/seeded/staged records — never real
+  content), and re-derives `KIND_BASE`/`KIND_LSI` writes via
+  `dynamo::kind_writes_for_item` — the same pure function a live write's
+  own leader-side evaluation already uses, so PITR replay needs no second
+  implementation of LSI derivation. `KIND_CHANGE`/`KIND_FOOTPRINT` are
+  never replayed (a footprint is rebuilt fresh by the post-activation GSI
+  backfill regardless of how base content arrived). Every derived value
+  goes through the identical `encode_restored_value` re-wrap the base-chunk
+  sweep already uses — confirmed load-bearing here too by this PR's own
+  first end-to-end run, exactly as Train 2's own as-built note had
+  predicted. Everything downstream (`complete_restore`'s activation +
+  GSI-declare sequence) is unmodified: a PITR restore looks identical to an
+  on-demand one from that point on.
 - **`dynamo.rs`'s `restore_table_from_backup` (ADR 0059 §7, Train 2)** —
   `RestoreTableFromBackup`'s wire handler: validates the backup
   (`BackupNotFoundException`/`BackupInUseException`, `visible_backup`'s own
@@ -1945,6 +1966,30 @@ route below the edge through the same `ClientCtx` CP primitives.
   once the base table activates and `CreateTableIndex` actually declares
   them (see the ADR's Train 2 amendment for the full reasoning and the
   wire-layer-only follow-up that would close this gap).
+- **`dynamo.rs`'s `restore_table_to_point_in_time` (ADR 0059 §10, Train 3
+  PR②)** — `RestoreTableToPointInTime`'s wire handler, sharing
+  `provision_restore_target`/`finish_restore_kickoff` (factored out of
+  `restore_table_from_backup` for this purpose) for the schema/LSI/GSI-plan
+  resolution and `BeginRestore`-kickoff steps: only the *source selection
+  and validation* half is new. Resolves `T` (`RestoreDateTime`, truncated
+  to the second, or `UseLatestRestorableTime`) against
+  `Metadata::pitr_restore_window(source_table_name)` — `None` there means
+  either the source table has no PITR history at all
+  (`TableNotFoundException`) or PITR was never enabled
+  (`PointInTimeRecoveryUnavailableException`, distinguished by whether
+  `Metadata::pitr_generation` has ever seen this table name); `T` outside
+  `[earliest_floor_ms, latest_ms]` (the whole-second floor fix — see the
+  ADR's own as-built amendment) is `InvalidRestoreTimeException`, the same
+  code AWS uses for this case. Once validated, picks the newest `Available`
+  row from `Metadata::pitr_base_backups_for_table` at or before the cutoff
+  (`t_ms + 999` for a literal `T`, or `latest_ms` for
+  `UseLatestRestorableTime`), fetches and decodes that backup's own
+  manifest to build `base_tablet_progress`, and calls `Metadata::
+  pitr_replay_segments` (never re-derived here) to build the
+  `PitrRestorePlan` handed to `finish_restore_kickoff`. Same asynchronous-
+  kickoff contract as `restore_table_from_backup`: returns as soon as
+  `BeginRestore` commits, with `backup_restore.rs`'s driver doing the
+  actual seed/replay/activate/GSI-declare sequence in the background.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
@@ -2279,7 +2324,17 @@ queryable, converged GSI; restore-after-source-drop; and the
 `BackupNotFoundException`/`BackupInUseException`/`ResourceInUseException`
 error shapes; its own follower-relay regression for `BeginRestore`/
 `CompleteRestore` lives beside the rest of `schema_ddl_relay.rs`'s DDL
-suite, the same precedent again), restart/durability across every
+suite, the same precedent again), the ADR 0059 Train 3 PR② PITR restore
+surface end to end (`dynamo_pitr_restore.rs` — enable PITR → timed writes,
+each confirmed sealed via the sealed segment's own `seal_wall_ms` read off
+`node.metadata()` rather than a wall-clock race → `RestoreTableToPointInTime`
+to a mid-point second → exactly the rows as of `T`, both via a literal
+`RestoreDateTime` and `UseLatestRestorableTime`; a deleted-table PITR
+restore within the window; and the `TableNotFoundException`/
+`PointInTimeRecoveryUnavailableException`/`InvalidRestoreTimeException`
+error shapes — using `run_node_with_streams_and_pitr_snapshot_cadence` to
+shrink the periodic base-snapshot cadence from its 6-hour production
+default to a test-sized interval), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
