@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
@@ -122,6 +122,29 @@
 //! flag list above). When set, every request on the dynamo port — item API
 //! and Streams alike — must carry a valid `Authorization: AWS4-HMAC-SHA256
 //! ...` header (`GET /metrics` stays unauthenticated, matching ADR 0057).
+//!
+//! `--backup-store cluster|fs:PATH` (ADR 0059 §1) selects the on-demand
+//! backup subsystem's own `SegmentStore` handle — a second, independently
+//! configured store alongside `--segment-store`'s streams one, sharing the
+//! same two backends (`cluster`, the default K-replicated
+//! `ClusterSegmentStore`; `fs:PATH`, a bare single-directory
+//! `FsSegmentStore`) but never the same object namespace
+//! (`animus_cp_data::backup`'s `backup/{backup_id}/...` ids). **Plumbing
+//! only as of ADR 0059 Train 1 PR②** — no capture driver, janitor, or wire
+//! surface reads or writes through it yet, so this flag has no observable
+//! effect beyond validating and threading the knob down to where a later
+//! PR's capture driver will read it. Same scope as `--segment-store`
+//! (`--config`/`--node` and `--cluster N` only) and the same documented
+//! `--backup-store`-less gap on `--cluster-control`/`--cluster-data` and the
+//! standalone `control`/`data`/`join` subcommands — **and, unlike
+//! `--segment-store`, this asymmetry additionally means a control-only node
+//! never provisions a backup store at all**, matching the ADR 0043 §A9 gap
+//! the streams segment janitor already has for the identical reason (no
+//! data role, no `SegmentStoreHandle`-shaped handle of any kind).
+//! **Unlike `--segment-store dir:PATH`, `--backup-store` also accepts the
+//! literal keyword `cluster`** (spelled out because ADR 0059 §1 states the
+//! knob as `cluster|fs:PATH` rather than "omit for cluster") — omitting the
+//! flag and passing `--backup-store cluster` are equivalent.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -186,8 +209,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
@@ -292,6 +315,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     // cluster mounts at the identical path. See `SegmentStoreConfig`'s own
     // doc for the durability trade-off this opt-in accepts.
     let mut segment_store: Option<String> = None;
+    // `--backup-store cluster|fs:PATH` (ADR 0059 §1): selects the backup
+    // subsystem's own, independently-configured `SegmentStore` handle — see
+    // this file's own module doc for the full knob description and
+    // `animusd::BackupStoreConfig`'s doc for the durability trade-off.
+    let mut backup_store: Option<String> = None;
     // `--quiesce-after SECS` (ADR 0044 phase-1 PR7): opts every data-plane CP
     // group into quiescence once it has had no local activity for this long
     // — `0` disables it entirely. Defaults ON (`DEFAULT_QUIESCE_AFTER_SECS`)
@@ -360,6 +388,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--segment-store" => {
                 segment_store = Some(parse_next(&mut it, "--segment-store")?);
             }
+            "--backup-store" => {
+                backup_store = Some(parse_next(&mut it, "--backup-store")?);
+            }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
@@ -377,6 +408,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     let stream_retention =
         stream_retention_secs.map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
     let segment_store_config = parse_segment_store(segment_store.as_deref())?;
+    let backup_store_config = parse_backup_store(backup_store.as_deref())?;
     let quiesce_after = quiesce_after_duration(quiesce_after);
     // See `animusd::MIN_QUIESCE_AFTER`'s own doc (issue #302 fix): a nonzero
     // `--quiesce-after` shorter than `change_consumer_loop`'s own sweep
@@ -439,6 +471,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 quiesce_after,
                 split_mode.unwrap_or_default(),
                 dynamo_auth_flag,
+                backup_store_config,
             )
             .await
         }
@@ -458,6 +491,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 quiesce_after,
                 split_mode.unwrap_or_default(),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
+                backup_store_config,
             )
             .await
         }
@@ -536,6 +570,26 @@ fn parse_segment_store(value: Option<&str>) -> Result<animusd::SegmentStoreConfi
     }
 }
 
+/// [`animusd::BackupStoreConfig`] from the optional `--backup-store` CLI
+/// value (ADR 0059 §1): absent or the literal `cluster` selects the default
+/// K-replicated `ClusterSegmentStore`; `fs:PATH` opts into a bare
+/// `FsSegmentStore` at `PATH` instead — the same two forms
+/// [`parse_segment_store`] accepts, plus the explicit `cluster` keyword the
+/// ADR itself spells the knob with (`--segment-store` has no such keyword —
+/// omitting it is that store's only way to select the default).
+fn parse_backup_store(value: Option<&str>) -> Result<animusd::BackupStoreConfig, String> {
+    match value {
+        None => Ok(animusd::BackupStoreConfig::default()),
+        Some("cluster") => Ok(animusd::BackupStoreConfig::Cluster),
+        Some(v) => match v.strip_prefix("fs:") {
+            Some(path) if !path.is_empty() => Ok(animusd::BackupStoreConfig::Fs(path.into())),
+            _ => Err(format!(
+                "--backup-store {v:?}: only `cluster` or `fs:PATH` is recognized"
+            )),
+        },
+    }
+}
+
 /// Load a `--dynamo-auth PATH` file (ADR 0057): the same JSON shape as a
 /// [`ClusterConfig`]'s own `dynamo_auth` section
 /// (`{"credentials": {"AKID": "secret", ...}}`), validated the same way
@@ -578,6 +632,9 @@ fn apply_dynamo_auth_flag(
 /// specifying credentials **both** ways (the flag **and** the config file's
 /// own `dynamo_auth` section) is a hard startup error, not a silent
 /// precedence rule.
+///
+/// `backup_store_config` (ADR 0059 §1) is `--backup-store cluster|fs:PATH`,
+/// already parsed. Plumbing only (ADR 0059 Train 1 PR②).
 #[allow(clippy::too_many_arguments)]
 async fn run_single(
     path: &str,
@@ -591,6 +648,7 @@ async fn run_single(
     quiesce_after: Duration,
     split_mode: animusd::SplitMode,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
+    backup_store_config: animusd::BackupStoreConfig,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
@@ -608,6 +666,7 @@ async fn run_single(
         stream_retention,
         quiesce_after,
         split_mode,
+        backup_store_config,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -981,6 +1040,7 @@ async fn run_in_process_cluster(
     quiesce_after: Duration,
     split_mode: animusd::SplitMode,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
+    backup_store_config: animusd::BackupStoreConfig,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -1002,6 +1062,7 @@ async fn run_in_process_cluster(
         quiesce_after,
         dynamo_auth,
         split_mode,
+        backup_store_config,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -1153,4 +1214,108 @@ fn orphan_sweep_after_duration(secs: Option<u64>) -> Duration {
         animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
         Duration::from_secs,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- `--backup-store` (ADR 0059 §1) ---------------------------------
+
+    #[test]
+    fn backup_store_omitted_defaults_to_cluster() {
+        assert_eq!(
+            parse_backup_store(None).expect("parses"),
+            animusd::BackupStoreConfig::Cluster
+        );
+    }
+
+    #[test]
+    fn backup_store_accepts_the_literal_cluster_keyword() {
+        assert_eq!(
+            parse_backup_store(Some("cluster")).expect("parses"),
+            animusd::BackupStoreConfig::Cluster
+        );
+    }
+
+    #[test]
+    fn backup_store_accepts_fs_path() {
+        assert_eq!(
+            parse_backup_store(Some("fs:/var/lib/animus/backups")).expect("parses"),
+            animusd::BackupStoreConfig::Fs("/var/lib/animus/backups".into())
+        );
+    }
+
+    #[test]
+    fn backup_store_rejects_an_empty_fs_path() {
+        let err = parse_backup_store(Some("fs:")).expect_err("an empty path must be rejected");
+        assert!(err.contains("--backup-store"), "{err}");
+    }
+
+    #[test]
+    fn backup_store_rejects_garbage() {
+        let err = parse_backup_store(Some("nonsense"))
+            .expect_err("an unrecognized form must be rejected");
+        assert!(err.contains("--backup-store"), "{err}");
+        assert!(err.contains("nonsense"), "{err}");
+    }
+
+    #[test]
+    fn backup_store_rejects_the_segment_store_dir_spelling() {
+        // `--segment-store` spells its `Fs` form `dir:PATH`; `--backup-store`
+        // deliberately spells it `fs:PATH` instead (and additionally accepts
+        // the literal `cluster` keyword `--segment-store` has no equivalent
+        // for) — the two knobs are NOT interchangeable syntax, even though
+        // `BackupStoreConfig`/`SegmentStoreConfig` are shaped identically.
+        let err = parse_backup_store(Some("dir:/tmp/x"))
+            .expect_err("the streams knob's own `dir:PATH` spelling must not be accepted here");
+        assert!(err.contains("--backup-store"), "{err}");
+    }
+
+    // --- `--segment-store` (ADR 0043 §A7b) — no prior direct coverage,
+    // added alongside its new `--backup-store` sibling above so both knobs'
+    // parsing has the same test shape.
+
+    #[test]
+    fn segment_store_omitted_defaults_to_cluster() {
+        // `SegmentStoreConfig` derives no `PartialEq` (pre-existing, not
+        // grown here) — `matches!` instead of `assert_eq!`.
+        assert!(matches!(
+            parse_segment_store(None).expect("parses"),
+            animusd::SegmentStoreConfig::Cluster
+        ));
+    }
+
+    #[test]
+    fn segment_store_accepts_dir_path() {
+        match parse_segment_store(Some("dir:/var/lib/animus/segments")).expect("parses") {
+            animusd::SegmentStoreConfig::Fs(path) => {
+                assert_eq!(path, std::path::PathBuf::from("/var/lib/animus/segments"));
+            }
+            other => panic!("expected Fs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_store_rejects_an_empty_dir_path() {
+        let err = parse_segment_store(Some("dir:")).expect_err("an empty path must be rejected");
+        assert!(err.contains("--segment-store"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_rejects_garbage() {
+        let err = parse_segment_store(Some("nonsense"))
+            .expect_err("an unrecognized form must be rejected");
+        assert!(err.contains("--segment-store"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_rejects_the_backup_store_cluster_keyword() {
+        // The converse of `backup_store_rejects_the_segment_store_dir_
+        // spelling` above: `--segment-store` has no `cluster` keyword at
+        // all (omitting the flag is its only way to select the default).
+        let err = parse_segment_store(Some("cluster"))
+            .expect_err("`--segment-store` has no `cluster` keyword");
+        assert!(err.contains("--segment-store"), "{err}");
+    }
 }

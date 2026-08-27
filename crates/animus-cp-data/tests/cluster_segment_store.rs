@@ -22,7 +22,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_cp_data::cluster_segment_store::{ClusterSegmentStore, StaticPlacementView};
+use animus_cp_data::backup::BACKUP_SEGMENT_STREAM;
+use animus_cp_data::cluster_segment_store::{
+    ClusterSegmentStore, SEGMENT_STREAM, StaticPlacementView,
+};
 use animus_env::test_support::assert_segment_store_contract;
 use animus_env::{Clock, EnvExt, NodeId, SegmentStore, nid};
 use animus_sim::{NetConfig, SegmentFaultConfig, SimEnv, SimSegmentStore, Simulator};
@@ -60,6 +63,7 @@ fn build_cluster(sim: &Simulator, ids: &[u64], k: usize) -> Vec<ClusterStore> {
                 sim.env(self_id.clone()),
                 SimSegmentStore::new(sim.env(self_id)),
                 view,
+                SEGMENT_STREAM,
                 k,
             )
         })
@@ -142,6 +146,83 @@ fn satisfies_the_segment_store_contract() {
         let ids = [0u64, 1, 2];
         let stores = build_cluster(&sim, &ids, 3);
         assert_segment_store_contract(&stores[0]).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Two independent stores on one node (ADR 0059 §1)
+// ---------------------------------------------------------------------------
+
+/// Two independent `ClusterSegmentStore` instances sharing the same three
+/// nodes — one on [`SEGMENT_STREAM`] (the streams subsystem's shape) and one
+/// on [`BACKUP_SEGMENT_STREAM`] (the on-demand-backup store's) — never
+/// interfere with each other, even when a put to the identical object id
+/// races between them from the same node at the same virtual instant.
+/// Regression for a real bug found wiring `animusd::build_backup_store`
+/// (ADR 0059 Train 1 PR②): before `stream` became an explicit constructor
+/// parameter, both stores rode the identical hardcoded `SEGMENT_STREAM`, and
+/// `(node, stream)`'s single-consumer contract (ADR 0026) meant their two
+/// serving tasks raced for one inbox, silently stealing each other's
+/// requests/replies — the wire-level cause of an intermittent
+/// `dynamo_streams`/`streams_e2e` flake this test would have caught (see
+/// `SEGMENT_STREAM`'s own doc and `docs/engineering-lessons.md` for the full
+/// incident).
+#[test]
+fn two_cluster_segment_stores_on_the_same_node_stay_isolated_by_stream() {
+    run(13, |sim| async move {
+        let ids = [70u64, 71, 72];
+        let node_ids: Vec<NodeId> = ids.iter().copied().map(nid).collect();
+        let build = |stream: u64| -> Vec<ClusterStore> {
+            ids.iter()
+                .map(|&id| {
+                    let self_id = nid(id);
+                    let view =
+                        Arc::new(StaticPlacementView::new(self_id.clone(), node_ids.clone()));
+                    ClusterSegmentStore::start_with_k(
+                        sim.env(self_id.clone()),
+                        SimSegmentStore::new(sim.env(self_id)),
+                        view,
+                        stream,
+                        3,
+                    )
+                })
+                .collect()
+        };
+        let streams_store = build(SEGMENT_STREAM);
+        let backup_store = build(BACKUP_SEGMENT_STREAM);
+
+        // Same object id, same originating node, one virtual instant apart —
+        // the shape that would race the two serving tasks' shared inbox
+        // under the pre-fix hardcoded-stream design.
+        let (streams_result, backup_result) = futures::future::join(
+            streams_store[0].put_replicated("same/id", b"streams-payload"),
+            backup_store[0].put_replicated("same/id", b"backup-payload"),
+        )
+        .await;
+        streams_result.expect("streams-store put must succeed independently");
+        backup_result.expect("backup-store put must succeed independently");
+
+        for i in 0..ids.len() {
+            let id = ids[i];
+            assert_eq!(
+                streams_store[i]
+                    .local()
+                    .get("same/id")
+                    .await
+                    .expect("local get"),
+                Some(b"streams-payload".to_vec()),
+                "node {id}'s streams-shaped store must hold its own payload, not the backup one"
+            );
+            assert_eq!(
+                backup_store[i]
+                    .local()
+                    .get("same/id")
+                    .await
+                    .expect("local get"),
+                Some(b"backup-payload".to_vec()),
+                "node {id}'s backup-shaped store must hold its own payload, not the streams one"
+            );
+        }
     });
 }
 

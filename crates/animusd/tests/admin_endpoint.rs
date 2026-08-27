@@ -111,6 +111,7 @@ async fn bring_up_with_split_mode(
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
                 split_mode,
+                animusd::BackupStoreConfig::default(),
             )
             .await
             {

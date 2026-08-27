@@ -72,6 +72,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
                 animusd::SplitMode::Copy,
+                animusd::BackupStoreConfig::default(),
             )
             .await
             {
