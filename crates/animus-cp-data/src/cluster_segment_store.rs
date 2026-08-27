@@ -25,11 +25,17 @@
 //!
 //! **Wire shape (ADR 0026).** Each node that constructs a
 //! [`ClusterSegmentStore`] and calls [`ClusterSegmentStore::start`] runs
-//! exactly one serving task, listening (and replying) on the single
-//! reserved [`SEGMENT_STREAM`] — the same "one dedicated stream, one
+//! exactly one serving task, listening (and replying) on that instance's own
+//! **caller-chosen** reserved `stream` — the same "one dedicated stream, one
 //! single-consumer serving task" shape `RaftKvNode`'s own per-tablet driver
 //! loop uses on its `stream` (`lib.rs`'s `drive`), generalized to a
-//! cluster-wide (not per-tablet) responsibility. [`SegmentWire`] is this
+//! cluster-wide (not per-tablet) responsibility. The stream is a
+//! constructor parameter, not a value this module hardcodes, precisely
+//! because more than one cluster-wide `ClusterSegmentStore` consumer can
+//! exist on one node (ADR 0059's on-demand backups is the first) and
+//! `(node, stream)` is single-consumer — see [`SEGMENT_STREAM`]'s own doc for
+//! the incident this generalization fixes and the "mint your own constant"
+//! rule for a new consumer. [`SegmentWire`] is this
 //! module's own enum, `serde_json`'d over the `Network`'s `Vec<u8>`
 //! payloads — the same "define and (de)serialize your own message type"
 //! convention the DynamoDB wire edge (`animus-dynamo`) already uses, not
@@ -91,13 +97,27 @@ use animus_env::{Env, EnvExt, NodeId, SegmentStore};
 use animus_placement::{Candidate, PlacementPolicy, select_replicas};
 use serde::{Deserialize, Serialize};
 
-/// The one reserved `(node, stream)` address (ADR 0026) every
-/// `ClusterSegmentStore` serving task listens and replies on. Chosen at the
-/// far end of the `u64` space, deliberately outside any range a `TabletId`
-/// (`animus_tablet::TabletId`, `u64`, monotonic from 1, never reused) could
-/// plausibly reach — a reserved, well-known stream for a cluster-wide infra
-/// responsibility, the same "reserved constant" shape [`PRIMARY_STREAM`]
-/// itself uses for the control plane.
+/// The reserved `(node, stream)` address (ADR 0026) the DynamoDB Streams
+/// subsystem's `ClusterSegmentStore` serving task listens and replies on.
+/// Chosen at the far end of the `u64` space, deliberately outside any range a
+/// `TabletId` (`animus_tablet::TabletId`, `u64`, monotonic from 1, never
+/// reused) could plausibly reach — a reserved, well-known stream for a
+/// cluster-wide infra responsibility, the same "reserved constant" shape
+/// [`PRIMARY_STREAM`] itself uses for the control plane.
+///
+/// **Not implicit inside `ClusterSegmentStore` (ADR 0059 §1 amendment)** —
+/// every constructor takes its serving task's stream as an explicit `stream:
+/// u64` parameter instead of hardcoding this constant, because `(node,
+/// stream)` is single-consumer (ADR 0026): **two** `ClusterSegmentStore`
+/// instances on the same node, both bound to the same stream, race for the
+/// same inbox and silently steal each other's requests/replies — exactly the
+/// bug ADR 0059's on-demand-backup store hit when it first reused this
+/// constant for a second, independent instance (`animusd::backup_store`,
+/// alongside the pre-existing streams one). A second cluster-wide consumer
+/// must mint and use its **own** distinct reserved constant — see
+/// `animus_cp_data::backup::BACKUP_SEGMENT_STREAM` for the backup store's —
+/// never this one. This constant is `SEGMENT_STREAM` in name only now; it is
+/// the streams subsystem's own address, not "the" address.
 ///
 /// [`PRIMARY_STREAM`]: animus_env::PRIMARY_STREAM
 pub const SEGMENT_STREAM: u64 = u64::MAX;
@@ -182,7 +202,10 @@ impl PlacementView for StaticPlacementView {
 }
 
 /// This module's own wire enum (ADR 0026/ADR 0043 §A7b): `serde_json`'d over
-/// the `Network`'s `Vec<u8>` payloads, carried on [`SEGMENT_STREAM`]. Every
+/// the `Network`'s `Vec<u8>` payloads, carried on whichever reserved stream
+/// the sending/receiving `ClusterSegmentStore` instance was constructed with
+/// ([`SEGMENT_STREAM`] for the streams subsystem — see that constant's own
+/// doc). Every
 /// request variant is answered by its matching reply variant, correlated by
 /// `req_id` (a per-store, monotonically increasing counter — see
 /// `Pending::next_req_id`) — the same shape `RaftKvNode`'s own
@@ -313,6 +336,15 @@ pub struct ClusterSegmentStore<E: Env, S: SegmentStore + Clone + Send + Sync + '
     local: S,
     placement: Arc<dyn PlacementView>,
     default_k: usize,
+    /// The reserved `(node, stream)` address this instance's serving task
+    /// listens/replies on — a **caller-chosen** constructor parameter, not
+    /// [`SEGMENT_STREAM`] hardcoded, precisely so two independent
+    /// cluster-wide `ClusterSegmentStore` consumers on one node (e.g. ADR
+    /// 0059's backup store alongside the streams one) each ride their own
+    /// stream instead of racing for the same single-consumer inbox. See
+    /// [`SEGMENT_STREAM`]'s own doc for the incident this field exists to
+    /// prevent a repeat of.
+    stream: u64,
     pending: Arc<Mutex<Pending>>,
 }
 
@@ -323,6 +355,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> Clone for ClusterS
             local: self.local.clone(),
             placement: Arc::clone(&self.placement),
             default_k: self.default_k,
+            stream: self.stream,
             pending: Arc::clone(&self.pending),
         }
     }
@@ -335,10 +368,13 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
     /// "construction never implicitly spawns anything you didn't ask for"
     /// discipline, and lets a test hold a handle to a store on a node whose
     /// serving task it wants to start (or crash/restart) on its own
-    /// schedule.
+    /// schedule. `stream` is this instance's own reserved `(node, stream)`
+    /// address (see the [`stream`](ClusterSegmentStore) field's own doc) —
+    /// the streams subsystem passes [`SEGMENT_STREAM`], a second consumer
+    /// must pass its own distinct reserved constant.
     #[must_use]
-    pub fn new(env: E, local: S, placement: Arc<dyn PlacementView>) -> Self {
-        Self::with_k(env, local, placement, DEFAULT_K)
+    pub fn new(env: E, local: S, placement: Arc<dyn PlacementView>, stream: u64) -> Self {
+        Self::with_k(env, local, placement, stream, DEFAULT_K)
     }
 
     /// Like [`new`](Self::new), with an explicit replication factor instead
@@ -346,12 +382,19 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
     /// degraded path deliberately rather than relying on a small candidate
     /// pool to trigger it incidentally.
     #[must_use]
-    pub fn with_k(env: E, local: S, placement: Arc<dyn PlacementView>, default_k: usize) -> Self {
+    pub fn with_k(
+        env: E,
+        local: S,
+        placement: Arc<dyn PlacementView>,
+        stream: u64,
+        default_k: usize,
+    ) -> Self {
         ClusterSegmentStore {
             env,
             local,
             placement,
             default_k,
+            stream,
             pending: Arc::new(Mutex::new(Pending {
                 next_req_id: 0,
                 slots: BTreeMap::new(),
@@ -360,14 +403,16 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
     }
 
     /// Build the store at [`DEFAULT_K`] and spawn its serving task
-    /// (`env.spawn_task`, ADR 0026: listens/replies on [`SEGMENT_STREAM`]).
-    /// Exactly one `ClusterSegmentStore` per node may ever call `start`
-    /// (or [`start_with_k`](Self::start_with_k)) — `(node, stream)` is
-    /// single-consumer (ADR 0026), and this is the one task that consumes
-    /// this node's [`SEGMENT_STREAM`] inbox.
+    /// (`env.spawn_task`, ADR 0026: listens/replies on this instance's own
+    /// `stream`). Exactly one `ClusterSegmentStore` **per `(node, stream)`**
+    /// may ever call `start` (or [`start_with_k`](Self::start_with_k)) —
+    /// `(node, stream)` is single-consumer (ADR 0026), and this is the one
+    /// task that consumes that inbox; a second, independent cluster-wide
+    /// consumer on the same node is fine as long as it passes its own
+    /// distinct `stream` (see [`SEGMENT_STREAM`]'s own doc).
     #[must_use]
-    pub fn start(env: E, local: S, placement: Arc<dyn PlacementView>) -> Self {
-        Self::start_with_k(env, local, placement, DEFAULT_K)
+    pub fn start(env: E, local: S, placement: Arc<dyn PlacementView>, stream: u64) -> Self {
+        Self::start_with_k(env, local, placement, stream, DEFAULT_K)
     }
 
     /// Like [`start`](Self::start), with an explicit replication factor —
@@ -377,9 +422,10 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
         env: E,
         local: S,
         placement: Arc<dyn PlacementView>,
+        stream: u64,
         default_k: usize,
     ) -> Self {
-        let store = Self::with_k(env, local, placement, default_k);
+        let store = Self::with_k(env, local, placement, stream, default_k);
         store.spawn_serving_task();
         store
     }
@@ -388,7 +434,8 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
         let env = self.env.clone();
         let local = self.local.clone();
         let pending = Arc::clone(&self.pending);
-        self.env.spawn_task(serve_loop(env, local, pending));
+        let stream = self.stream;
+        self.env.spawn_task(serve_loop(env, local, pending, stream));
     }
 
     /// This store's own inner local segment store — for test introspection
@@ -490,9 +537,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
                     id: id.to_string(),
                     bytes: bytes.to_vec(),
                 });
-                self.env
-                    .send_stream(t.clone(), SEGMENT_STREAM, payload)
-                    .await;
+                self.env.send_stream(t.clone(), self.stream, payload).await;
             }
         }
 
@@ -638,7 +683,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
                 id: id.to_string(),
             });
             self.env
-                .send_stream(target.clone(), SEGMENT_STREAM, payload)
+                .send_stream(target.clone(), self.stream, payload)
                 .await;
 
             let deadline = self.env.now().saturating_add(FETCH_ATTEMPT_TIMEOUT);
@@ -706,9 +751,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> ClusterSegmentStor
                     req_id: *req_id,
                     id: id.to_string(),
                 });
-                self.env
-                    .send_stream(r.clone(), SEGMENT_STREAM, payload)
-                    .await;
+                self.env.send_stream(r.clone(), self.stream, payload).await;
             }
         }
 
@@ -802,9 +845,7 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> SegmentStore
                 req_id,
                 id: id.to_string(),
             });
-            self.env
-                .send_stream(candidate, SEGMENT_STREAM, payload)
-                .await;
+            self.env.send_stream(candidate, self.stream, payload).await;
         }
         local_result
     }
@@ -819,8 +860,11 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> SegmentStore
 }
 
 /// The one serving task a [`ClusterSegmentStore::start`] spawns per node:
-/// the single consumer of this node's [`SEGMENT_STREAM`] inbox (ADR 0026).
-/// Dispatches on the decoded [`SegmentWire`] variant — a *request* variant
+/// the single consumer of this node's `stream` inbox (ADR 0026) — the same
+/// `stream` [`ClusterSegmentStore::start`] was called with, **not**
+/// necessarily [`SEGMENT_STREAM`] (see that constant's own doc for why this
+/// is a parameter rather than a hardcoded constant). Dispatches on the
+/// decoded [`SegmentWire`] variant — a *request* variant
 /// (`Store`/`Fetch`/`Delete`) is served against `local` and answered with
 /// its matching reply, addressed back to `envelope.from` on the same
 /// stream; a *reply* variant is stashed into `pending` for whichever
@@ -829,9 +873,14 @@ impl<E: Env, S: SegmentStore + Clone + Send + Sync + 'static> SegmentStore
 /// mirroring `RaftKvNode`'s consensus loop, which the same codebase's
 /// shutdown story handles by tearing down the whole node, not by
 /// signalling individual background tasks).
-async fn serve_loop<E: Env, S: SegmentStore>(env: E, local: S, pending: Arc<Mutex<Pending>>) {
+async fn serve_loop<E: Env, S: SegmentStore>(
+    env: E,
+    local: S,
+    pending: Arc<Mutex<Pending>>,
+    stream: u64,
+) {
     loop {
-        let envelope = env.recv_stream(SEGMENT_STREAM).await;
+        let envelope = env.recv_stream(stream).await;
         let msg = match serde_json::from_slice::<SegmentWire>(&envelope.payload) {
             Ok(msg) => msg,
             Err(err) => {
@@ -846,7 +895,7 @@ async fn serve_loop<E: Env, S: SegmentStore>(env: E, local: S, pending: Arc<Mute
                     Err(e) => WireResult::Err(e.to_string()),
                 };
                 let reply = encode(&SegmentWire::StoreAck { req_id, result });
-                env.send_stream(envelope.from, SEGMENT_STREAM, reply).await;
+                env.send_stream(envelope.from, stream, reply).await;
             }
             SegmentWire::Fetch { req_id, id } => {
                 let result = match local.get(&id).await {
@@ -855,7 +904,7 @@ async fn serve_loop<E: Env, S: SegmentStore>(env: E, local: S, pending: Arc<Mute
                     Err(e) => WireOptResult::Err(e.to_string()),
                 };
                 let reply = encode(&SegmentWire::FetchReply { req_id, result });
-                env.send_stream(envelope.from, SEGMENT_STREAM, reply).await;
+                env.send_stream(envelope.from, stream, reply).await;
             }
             SegmentWire::Delete { req_id, id } => {
                 let result = match local.delete(&id).await {
@@ -863,7 +912,7 @@ async fn serve_loop<E: Env, S: SegmentStore>(env: E, local: S, pending: Arc<Mute
                     Err(e) => WireResult::Err(e.to_string()),
                 };
                 let reply = encode(&SegmentWire::DeleteAck { req_id, result });
-                env.send_stream(envelope.from, SEGMENT_STREAM, reply).await;
+                env.send_stream(envelope.from, stream, reply).await;
             }
             SegmentWire::StoreAck { req_id, result } => {
                 stash_reply(&pending, req_id, PendingReply::Store(result));
