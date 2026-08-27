@@ -448,6 +448,44 @@ per-tablet CP data plane (`animus-cp-data`).
   such fan-out (it is derived and stored only inside `Metadata::apply`'s own
   `BeginBackup`/`CompleteBackup` arms, never constructed by a caller).
 
+- **The restore catalog (ADR 0059 §7, Train 2): `BeginRestore`/
+  `CompleteRestore`/`FailRestore`.** `Metadata::restores: BTreeMap<RestoreId,
+  RestoreRow>` (`RestoreId = String`, an opaque internally-minted identity —
+  never wire-visible, unlike `BackupId`, since `RestoreTableFromBackup` has
+  no AWS-defined "restore id" to echo back). `BeginRestore` mints exactly
+  **one** `Building` tablet over the whole ring for the target table
+  (`Tablet::with_table` + `state = Building`, the identical monotonic-
+  allocator-floor seatbelt `CreateTablet`/`BeginSplit` already enforce) plus
+  the `Seeding` row — the ADR's own as-built decision to mint a *fresh*
+  single-tablet layout rather than mirror the backup's historical
+  multi-tablet topology (see the ADR's Train 2 amendment for the full
+  reasoning: this needs no `range` field anywhere, since a single
+  destination tablet needs no per-row key routing at all). `CompleteRestore`
+  activates that tablet (`Building` → `Active`, epoch bumped — mirroring
+  `CutoverSplit`'s own activation, minus the "retire a parent" half) and
+  flips the row `Done`; `FailRestore` mirrors `FailBackup`'s own idempotent-
+  on-identical-repeat, rejects-a-terminal-contradiction shape, deliberately
+  leaving the tablet `Building` forever (never routable, never half-serving
+  — an ordinary `DeleteTable` cleans it up exactly like any other tablet,
+  state-agnostic). `RestoreRow::gsi_defs: Vec<IndexDef>` carries the
+  restore's own resolved GSI plan (the wire caller's
+  `GlobalSecondaryIndexOverride`, or the backup manifest's own captured
+  GSIs, forced to `IndexStatus::Creating` regardless of the source's status)
+  from propose time to the restore driver (`animusd::backup_restore`),
+  which declares them via `CreateTableIndex` only **after** `CompleteRestore`
+  — declaring them earlier would let the backfill seeder observe an empty/
+  `Building` tablet and mark it backfilled before any row is ever seeded,
+  silently losing every restored row's GSI entry forever (see the ADR's own
+  amendment for the full incident this ordering avoids). No new `syskv`
+  companion progress kind exists for restore the way `Backup`/
+  `BackupProgress` pair up — a restore mints exactly one destination tablet,
+  so `RestoreRow` alone carries everything a restore has to say;
+  `syskv::EntityKind::Restore` mirrors `Backup`'s own plain-string-key
+  convention. **Deliberately no restore reclaim/delete command** yet (a
+  named Train 2 residual, not a correctness gap — rows are small, bounded
+  one-per-`RestoreTableFromBackup`-call, and never referenced again once
+  terminal).
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

@@ -410,6 +410,40 @@ pub fn apply_and_derive_mirror(
                 &meta.backups[backup_id],
             ));
         }
+        MetaCommand::BeginRestore {
+            restore_id,
+            tablet,
+            ..
+        } => {
+            // ADR 0059 §7, Train 2: the freshly-minted `Building` tablet, the
+            // advanced allocator counter (same shape as `CreateTablet`/
+            // `BeginSplit`), and the new restore row.
+            writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
+            writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
+            writes.push(put_json(
+                syskv::restore_key(restore_id),
+                &meta.restores[restore_id],
+            ));
+        }
+        MetaCommand::CompleteRestore { restore_id } => {
+            // The tablet re-mirrors (state → Active, epoch bumped) alongside
+            // the row's own Done transition.
+            let tablet = meta.restores[restore_id].tablet;
+            writes.push(put_json(syskv::tablet_key(tablet), &meta.tablets[&tablet]));
+            writes.push(put_json(
+                syskv::restore_key(restore_id),
+                &meta.restores[restore_id],
+            ));
+        }
+        MetaCommand::FailRestore { restore_id, .. } => {
+            // The tablet is untouched (deliberately left `Building`, see
+            // `RestoreStatus::Failed`'s own doc) — only the row's status
+            // changes.
+            writes.push(put_json(
+                syskv::restore_key(restore_id),
+                &meta.restores[restore_id],
+            ));
+        }
     }
     (outcome, writes)
 }
@@ -597,6 +631,12 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                     .insert((backup_id, tablet), progress);
             }
         }
+        EntityKind::Restore => {
+            let restore_id = String::from_utf8(id).expect("restore id is UTF-8");
+            let row: crate::meta::RestoreRow =
+                serde_json::from_slice(value).expect("mirrored restore value decodes");
+            meta.restores.insert(restore_id, row);
+        }
     }
 }
 
@@ -665,6 +705,13 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             if let Some((tablet, backup_id)) = syskv::decode_backup_progress_id(&id) {
                 meta.backup_tablet_progress.remove(&(backup_id, tablet));
             }
+        }
+        EntityKind::Restore => {
+            // Never deleted in practice (ADR 0059 §7, Train 2: no restore
+            // reclaim command exists yet — see `Metadata::restores`' own
+            // doc) — listed for match exhaustiveness.
+            let restore_id = String::from_utf8(id).expect("restore id is UTF-8");
+            meta.restores.remove(&restore_id);
         }
     }
 }
@@ -1723,6 +1770,162 @@ mod tests {
         );
         assert_eq!(outcome, ApplyOutcome::NoOp);
         assert!(writes.is_empty());
+    }
+
+    /// `BeginRestore` (ADR 0059 §7, Train 2) mirrors as the freshly-minted
+    /// `Building` tablet, the advanced allocator counter, and the new
+    /// restore row.
+    #[test]
+    fn begin_restore_writes_the_tablet_and_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "restored".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let command = MetaCommand::BeginRestore {
+            restore_id: "restore-1".to_string(),
+            backup_id: "backup-1".to_string(),
+            source_table: "orders".to_string(),
+            target_table: "restored".to_string(),
+            tablet: TabletId(1),
+            replicas: vec![nid(1)],
+            gsi_defs: Vec::new(),
+        };
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![
+                put_json(syskv::tablet_key(TabletId(1)), &meta.tablets[&TabletId(1)]),
+                put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id),
+                put_json(syskv::restore_key("restore-1"), &meta.restores["restore-1"]),
+            ]
+        );
+
+        // A duplicate restore id is rejected outright — no writes derived.
+        let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
+        assert_eq!(outcome, ApplyOutcome::Rejected("restore id already exists"));
+        assert!(writes.is_empty());
+    }
+
+    /// `CompleteRestore`/`FailRestore` (ADR 0059 §7, Train 2) mirror
+    /// exactly the fields their own apply arms touch: completion re-mirrors
+    /// the now-`Active` tablet alongside the `Done` row; failure touches
+    /// only the row (the tablet stays `Building`, untouched).
+    #[test]
+    fn complete_and_fail_restore_write_the_expected_rows() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "restored".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_string(),
+                backup_id: "backup-1".to_string(),
+                source_table: "orders".to_string(),
+                target_table: "restored".to_string(),
+                tablet: TabletId(1),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            },
+        );
+
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![
+                put_json(syskv::tablet_key(TabletId(1)), &meta.tablets[&TabletId(1)]),
+                put_json(syskv::restore_key("restore-1"), &meta.restores["restore-1"]),
+            ]
+        );
+
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "restored2".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_string(),
+                backup_id: "backup-2".to_string(),
+                source_table: "orders".to_string(),
+                target_table: "restored2".to_string(),
+                tablet: TabletId(2),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+            },
+        );
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::FailRestore {
+                restore_id: "restore-2".to_string(),
+                reason: "stuck".to_string(),
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(
+                syskv::restore_key("restore-2"),
+                &meta.restores["restore-2"]
+            )]
+        );
+    }
+
+    /// The incremental-delta consumer path (`apply_key_write`) for a
+    /// restore reaches the identical state a direct `Metadata::apply` does.
+    #[test]
+    fn incremental_delta_apply_matches_direct_apply_for_restores() {
+        let mut base = Metadata::default();
+        base.apply(&MetaCommand::CreateTableSchema {
+            table: "restored".to_string(),
+            schema: schema("id"),
+        });
+        base.apply(&MetaCommand::BeginRestore {
+            restore_id: "restore-1".to_string(),
+            backup_id: "backup-1".to_string(),
+            source_table: "orders".to_string(),
+            target_table: "restored".to_string(),
+            tablet: TabletId(1),
+            replicas: vec![nid(1)],
+            gsi_defs: Vec::new(),
+        });
+        base.apply(&MetaCommand::CompleteRestore {
+            restore_id: "restore-1".to_string(),
+        });
+
+        let mut via_engine = Metadata::default();
+        apply_key_write(
+            &mut via_engine,
+            &put_json(syskv::schema_key("restored"), &schema("id")),
+        );
+        apply_key_write(
+            &mut via_engine,
+            &put_json(syskv::tablet_key(TabletId(1)), &base.tablets[&TabletId(1)]),
+        );
+        apply_key_write(
+            &mut via_engine,
+            &put_json(syskv::restore_key("restore-1"), &base.restores["restore-1"]),
+        );
+        assert_eq!(via_engine.restores, base.restores);
+        assert_eq!(via_engine.tablets, base.tablets);
     }
 
     /// The incremental-delta consumer path (`apply_key_write`) for

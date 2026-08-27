@@ -43,7 +43,8 @@ pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{
     ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow, BackupStatus,
-    BackupTabletProgress, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, StreamShardRow,
+    BackupTabletProgress, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, RestoreId,
+    RestoreRow, RestoreStatus, StreamShardRow,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
