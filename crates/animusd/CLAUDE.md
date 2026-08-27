@@ -1594,9 +1594,9 @@ route below the edge through the same `ClientCtx` CP primitives.
   `Query`/`Scan` scans the index's own hidden table (`index_table_name`)
   directly, fanned across its tablets by ordinary `cp_scan` (its own
   GSI-shaped pagination cursor, since the hidden table's engine key isn't
-  the base table's key). An LSI `Query` is a **linearizable** scan of the
-  *base table's own tablet* over its `KIND_LSI` scope (scoped to one base
-  partition/tablet); an LSI `Scan` is table-wide, via `ClientCtx::
+  the base table's key). An LSI `Query` is a scan of the *base table's own
+  tablet* over its `KIND_LSI` scope (scoped to one base partition/tablet);
+  an LSI `Scan` is table-wide, via `ClientCtx::
   cp_scan_kind_table` (`cp_scan`'s kind-scoped sibling, fanning a
   `KindScan` per overlapping tablet — its tail tablet needs a genuinely
   unbounded-above scan, since no finite byte string can bound an LSI row's
@@ -1604,9 +1604,10 @@ route below the edge through the same `ClientCtx` CP primitives.
   physical prefix). `ClientRequest::KindScan` is the LSI path's forwarding
   payload — **internal-only, refused bare**, the read-side dual of
   `KindWrite`. A hidden table with no tablet yet reads as **empty**, the
-  same gate `ClientCtx::cp_get` uses. A **GSI** query/scan is eventually
-  consistent (DynamoDB's own contract — the drain materializes
-  asynchronously); an **LSI** one stays strongly consistent.
+  same gate `ClientCtx::cp_get` uses. A **GSI** query/scan is always
+  eventually consistent (DynamoDB's own contract — the drain materializes
+  asynchronously); an **LSI** one is strong iff `ConsistentRead: true` —
+  eventual by default, same as a base read (ADR 0055; see below).
   `ConsistentRead: true` is accepted everywhere except a GSI `Query`/`Scan`,
   which rejects it (`ValidationException` — only `animusd`, with `Metadata`
   in hand, knows an index's kind). **Since ADR 0055 the flag selects a real
