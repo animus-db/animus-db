@@ -160,6 +160,7 @@ async fn join_control_nonvoter(
             admin: raw[3],
             intra: raw[4],
             console: raw[5],
+            advertise_host: None,
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),

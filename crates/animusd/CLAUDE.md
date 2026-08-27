@@ -553,6 +553,49 @@ precedence rule. Not accepted by `join`/`control` (a control-only node never
 binds the dynamo listener). Omitted (the default), auth stays disabled —
 byte-identical to pre-ADR-0057 behavior.
 
+**`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
+node's own stable dial name, when its bind address isn't itself something a
+peer can dial reliably (a Kubernetes pod's wildcard/pod-IP bind, whose IP
+changes on every reschedule but whose own DNS name doesn't). Threads
+`RoleAddrs::advertise_host: Option<String>` (`#[serde(default)]`, so an
+absent/`None` config entry is byte-identical to pre-ADR-0060 behavior —
+every self-registered address is the bind address itself, stringified via
+`advertised_addr`) down to every place a bind `SocketAddr` becomes the
+`host:port` string a peer actually dials: each `Bound{Node,ControlNode,
+DataNode}`'s own `NodeAddrs` self-registration, its own peer-book entry
+(`peer_entries`/`peer_entry`), and the **static** `ClusterConfig`-derived
+seed (`ClusterConfig::peer_book`, and the `client_route`/`intra_route`
+builders in `run_node_with`/`run_node_control`/`run_node_data`/
+`run_node_growth`) — not just each node's own self-registered `NodeAddrs`,
+since a fresh cluster's very first Raft dial happens before anything has
+replicated once. One shared host for every port a `RoleAddrs` entry binds
+(a real deployment advertises one pod identity, not six); bind addresses
+themselves stay numeric and untouched everywhere. Accepted by `run`
+(`--config`/`--node` — applied as an override onto that one node's own
+config entry via `apply_advertise_host_flag`, the same both-ways-is-an-
+error shape `--dynamo-auth` uses; `--cluster N` — applied uniformly to
+every generated node, each still binding its own distinct ephemeral port so
+`{host}:{port}` stays unique per node via
+`bind_cluster_with_advertise_host`), `join`, and `data --seed`
+(`run_data_join`). **Not accepted by `--cluster-control`/`--cluster-data`**
+(`run_in_process_split_cluster` has no per-node-advertise-host wrapper to
+call) or the standalone `control`/`data --config` subcommand paths beyond
+what's listed — documented gaps, the same shape several other flags already
+have on those entry points. `--seed`/`--advertise-host` together is what
+lets a hostname (not just a numeric address) name a join target — see
+`animus-env/CLAUDE.md`'s `ProdEnv` peer-book entry for the matching
+production-seam half (`set_peers`/`merge_peer` are string-keyed end to end;
+resolution happens only on the connect path). Tests: `tests/
+advertise_host.rs` — a mixed-address two-node bootstrap proving a plain
+node dials an advertising peer purely by its advertised name, a same-
+identity restart on a different bind IP (`127.0.0.2`) that keeps
+`Metadata.node_addrs` byte-identical because the advertised string never
+changed (using a real, test-owned `/etc/hosts` entry to simulate the DNS
+re-point a rescheduled pod would get — see `docs/engineering-lessons.md`
+for why a static alias like `localhost` can't stand in for that), and a
+3-node cluster whose every entry shares one advertised host, proving the
+static config-derived peer book (not just self-registration) prefers it.
+
 **The split-build driver** (ADR 0050 Train B rung 4) is a
 `change_consumer_loop` arm: for a `Splitting` parent this node leads, it
 wakes the group, holds the quiesce veto, **holds trim** (metadata-derived —

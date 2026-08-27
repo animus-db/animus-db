@@ -53,6 +53,7 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
         admin: addrs[3],
         intra: addrs[4],
         console: addrs[5],
+        advertise_host: None,
     };
     let config = animusd::ClusterConfig {
         nodes: vec![node_cfg],

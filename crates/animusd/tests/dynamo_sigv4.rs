@@ -60,6 +60,7 @@ async fn start_single_node_with_auth(
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),

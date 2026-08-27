@@ -3173,6 +3173,7 @@ mod gsi_drain_cursor_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }
@@ -3967,6 +3968,7 @@ mod stream_sealer_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }

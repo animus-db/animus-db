@@ -2916,7 +2916,7 @@ pub enum ClientResponse {
     /// 0032 PR1), and every known admin address (the dashboard fan-out seed).
     JoinInfo {
         control_ids: Vec<NodeId>,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         client_route: BTreeMap<NodeId, String>,
         /// The answering node's live intra-cluster routing table (ADR 0047),
         /// paralleling `client_route` — the joining node seeds its own
@@ -3095,12 +3095,52 @@ pub struct RoleAddrs {
     /// matching `intra`'s own no-default convention — no live deployments to
     /// keep back-compat with).
     pub console: SocketAddr,
+    /// This node's advertised hostname (ADR 0060's advertise/dial split),
+    /// shared across every role/port this entry binds — `None` (every
+    /// existing config, `#[serde(default)]`) means today's behavior
+    /// unchanged: every `NodeAddrs` field this node self-registers is
+    /// derived straight from the bind address itself
+    /// (`bind_addr.to_string()`). `Some(host)` means self-registration
+    /// instead advertises `format!("{host}:{port}")` per port — the bind
+    /// address a listener actually opens on stays numeric and untouched
+    /// (e.g. `0.0.0.0:P`, the shape a Kubernetes pod binds), only what
+    /// this node tells the rest of the cluster to *dial* it at changes.
+    /// This is what lets a pod that binds a wildcard/pod-IP address still
+    /// be reached by its own stable DNS name after a reschedule (the IP
+    /// changes; the name doesn't) — see the `--advertise-host` CLI flag
+    /// and the `RoleAddrs -> NodeAddrs` self-registration call sites
+    /// (`BoundNode`/`BoundControlNode`/`BoundDataNode::start_*`) for where
+    /// this actually gets used. One shared host for every role/port this
+    /// entry binds, deliberately not per-port — a real deployment
+    /// advertises one pod identity, not six.
+    #[serde(default)]
+    pub advertise_host: Option<String>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
 /// port on the loopback (the real port is learned after bind).
 fn default_ephemeral_addr() -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+}
+
+/// This node's own advertised `host:port` for one of its bound addresses
+/// (ADR 0060's advertise/dial split, [`RoleAddrs::advertise_host`]'s own
+/// doc): `Some(host)` means `format!("{host}:{port}")`, `bind_addr`'s own
+/// port with the advertised host in place of the bind address itself;
+/// `None` (every existing config) is byte-identical to before this ADR —
+/// `bind_addr.to_string()`, unchanged. Every self-registration call site
+/// (`NodeAddrs` construction in `BoundNode`/`BoundControlNode`/
+/// `BoundDataNode::start_*`, the join chain's own `mine: NodeAddrs`, a
+/// node's own peer-book entry) and every `ClusterConfig`-derived static
+/// route/peer-book seed (`ClusterConfig::peer_book`/the `client_route`/
+/// `intra_route` builders in `run_node_with`/`run_node_control`/
+/// `run_node_data`/`run_node_growth`) goes through this — the one place a
+/// bind address becomes the string a peer actually dials.
+pub(crate) fn advertised_addr(advertise_host: Option<&str>, bind_addr: SocketAddr) -> String {
+    match advertise_host {
+        Some(host) => format!("{host}:{}", bind_addr.port()),
+        None => bind_addr.to_string(),
+    }
 }
 
 /// A node whose listeners are bound but whose protocols are not yet started.
@@ -3133,6 +3173,10 @@ pub struct BoundNode {
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
     console_addr: SocketAddr,
+    /// This node's advertised hostname (ADR 0060), from the [`RoleAddrs`]
+    /// [`Node::bind`] was given — see [`advertised_addr`] and
+    /// [`RoleAddrs::advertise_host`]'s own doc.
+    advertise_host: Option<String>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -3158,10 +3202,6 @@ pub(crate) struct AdminInfo {
     /// there, ADR 0035 PR3).
     pub(crate) dynamo_addr: Option<SocketAddr>,
     pub(crate) admin_addr: SocketAddr,
-    /// This node's own intra-cluster RPC address (ADR 0047) — used to
-    /// self-skip in `propose_schema`'s broadcast fallback (the intra-flavored
-    /// dual of the old `client_addr` self-skip check).
-    pub(crate) intra_addr: SocketAddr,
     /// This node's own deployment role (ADR 0035; ADR 0040 PR1 — no longer
     /// inferred from `control_id`/`raftkv_id` presence, since there is only
     /// one id now): `"control"`/`"data"`/`"combined"`, stamped literally by
@@ -3171,7 +3211,7 @@ pub(crate) struct AdminInfo {
     /// The control-plane Raft group (all control ids).
     pub(crate) control_ids: Vec<NodeId>,
     /// The static peer address book this node was started with.
-    pub(crate) peers: BTreeMap<NodeId, SocketAddr>,
+    pub(crate) peers: BTreeMap<NodeId, String>,
     /// Every node's **admin** address — the seed list the web dashboard (ADR 0021)
     /// fans out to. Each process knows the whole cluster's addresses (its
     /// `ClusterConfig` per-process, or the in-process bring-up). Falls back to just
@@ -4333,8 +4373,13 @@ fn spawn_common_tail(
 impl BoundNode {
     /// `(id, addr)` — the one entry this node contributes to the cluster peer
     /// book (ADR 0040 PR1: one identity, one internal `ProdEnv`, per node).
-    pub fn peer_entries(&self) -> [(NodeId, SocketAddr); 1] {
-        [(self.id.clone(), self.internal_addr)]
+    /// `addr` is this node's own advertised `host:port` (ADR 0060) — see
+    /// [`advertised_addr`].
+    pub fn peer_entries(&self) -> [(NodeId, String); 1] {
+        [(
+            self.id.clone(),
+            advertised_addr(self.advertise_host.as_deref(), self.internal_addr),
+        )]
     }
 
     /// The address clients connect to.
@@ -4370,7 +4415,7 @@ impl BoundNode {
     /// Propagates a failure to open the CP group's on-disk engine.
     pub async fn start(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
     ) -> std::io::Result<Node> {
         let admin_addr = self.admin_addr;
@@ -4417,7 +4462,7 @@ impl BoundNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
@@ -4470,7 +4515,7 @@ impl BoundNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_streams(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
@@ -4564,7 +4609,7 @@ impl BoundNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
@@ -4634,7 +4679,6 @@ impl BoundNode {
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
             admin_addr: self.admin_addr,
-            intra_addr: self.intra_addr,
             role: "combined",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -4803,10 +4847,10 @@ impl BoundNode {
             (
                 my_id.clone(),
                 NodeAddrs {
-                    internal: my_addr.to_string(),
-                    client: my_client_addr.to_string(),
-                    admin: my_admin_addr.to_string(),
-                    intra: my_intra_addr.to_string(),
+                    internal: advertised_addr(self.advertise_host.as_deref(), my_addr),
+                    client: advertised_addr(self.advertise_host.as_deref(), my_client_addr),
+                    admin: advertised_addr(self.advertise_host.as_deref(), my_admin_addr),
+                    intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "combined".to_string(),
                 },
             ),
@@ -5231,6 +5275,7 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            advertise_host: addrs.advertise_host,
         })
     }
 
@@ -5267,6 +5312,7 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            advertise_host: addrs.advertise_host,
         })
     }
 
@@ -5313,6 +5359,7 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            advertise_host: addrs.advertise_host,
         })
     }
 
@@ -5595,6 +5642,8 @@ pub struct BoundControlNode {
     admin_addr: SocketAddr,
     intra_listener: TcpListener,
     intra_addr: SocketAddr,
+    /// See [`BoundNode::advertise_host`]'s doc.
+    advertise_host: Option<String>,
 }
 
 impl BoundControlNode {
@@ -5618,9 +5667,14 @@ impl BoundControlNode {
         self.intra_addr
     }
 
-    /// `(id, addr)` — this node's entry in the cluster's peer book.
-    pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id.clone(), self.internal_addr)
+    /// `(id, addr)` — this node's entry in the cluster's peer book. `addr`
+    /// is this node's own advertised `host:port` (ADR 0060) — see
+    /// [`advertised_addr`].
+    pub fn peer_entry(&self) -> (NodeId, String) {
+        (
+            self.id.clone(),
+            advertised_addr(self.advertise_host.as_deref(), self.internal_addr),
+        )
     }
 
     /// Wire the peer address book into the control env and start the control
@@ -5676,7 +5730,7 @@ impl BoundControlNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_control_with(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
@@ -5703,7 +5757,6 @@ impl BoundControlNode {
             client_addr: self.client_addr,
             dynamo_addr: None,
             admin_addr: self.admin_addr,
-            intra_addr: self.intra_addr,
             role: "control",
             control_ids: control_ids.clone(),
             peers: peers.clone(),
@@ -5780,10 +5833,10 @@ impl BoundControlNode {
             (
                 self.id,
                 NodeAddrs {
-                    internal: self.internal_addr.to_string(),
-                    client: self.client_addr.to_string(),
-                    admin: self.admin_addr.to_string(),
-                    intra: self.intra_addr.to_string(),
+                    internal: advertised_addr(self.advertise_host.as_deref(), self.internal_addr),
+                    client: advertised_addr(self.advertise_host.as_deref(), self.client_addr),
+                    admin: advertised_addr(self.advertise_host.as_deref(), self.admin_addr),
+                    intra: advertised_addr(self.advertise_host.as_deref(), self.intra_addr),
                     role: "control".to_string(),
                 },
             ),
@@ -5925,6 +5978,8 @@ pub struct BoundDataNode {
     /// [`console`](crate::console)'s module doc.
     console_listener: TcpListener,
     console_addr: SocketAddr,
+    /// See [`BoundNode::advertise_host`]'s doc.
+    advertise_host: Option<String>,
 }
 
 impl BoundDataNode {
@@ -5955,9 +6010,13 @@ impl BoundDataNode {
 
     /// `(id, addr)` — this node's entry in the cluster's *raftkv* peer
     /// book (the [`BoundNode::peer_entries`] dual, minus the `control` entry
-    /// a data-only node has none of).
-    pub fn peer_entry(&self) -> (NodeId, SocketAddr) {
-        (self.id.clone(), self.internal_addr)
+    /// a data-only node has none of). `addr` is this node's own advertised
+    /// `host:port` (ADR 0060) — see [`advertised_addr`].
+    pub fn peer_entry(&self) -> (NodeId, String) {
+        (
+            self.id.clone(),
+            advertised_addr(self.advertise_host.as_deref(), self.internal_addr),
+        )
     }
 
     /// Wire the peer address book into the `raftkv` env and start the data
@@ -5999,7 +6058,7 @@ impl BoundDataNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         control_seeds: Vec<String>,
         backend: StorageBackend,
@@ -6034,7 +6093,7 @@ impl BoundDataNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_streams(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         control_seeds: Vec<String>,
         backend: StorageBackend,
@@ -6091,7 +6150,7 @@ impl BoundDataNode {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
-        peers: BTreeMap<NodeId, SocketAddr>,
+        peers: BTreeMap<NodeId, String>,
         control_ids: Vec<NodeId>,
         control_seeds: Vec<String>,
         backend: StorageBackend,
@@ -6136,7 +6195,6 @@ impl BoundDataNode {
             client_addr: self.client_addr,
             dynamo_addr: Some(self.dynamo_addr),
             admin_addr: self.admin_addr,
-            intra_addr: self.intra_addr,
             role: "data",
             control_ids: control_ids.clone(),
             peers: static_peers.clone(),
@@ -6208,10 +6266,10 @@ impl BoundDataNode {
             (
                 my_id.clone(),
                 NodeAddrs {
-                    internal: my_addr.to_string(),
-                    client: my_client_addr.to_string(),
-                    admin: my_admin_addr.to_string(),
-                    intra: my_intra_addr.to_string(),
+                    internal: advertised_addr(self.advertise_host.as_deref(), my_addr),
+                    client: advertised_addr(self.advertise_host.as_deref(), my_client_addr),
+                    admin: advertised_addr(self.advertise_host.as_deref(), my_admin_addr),
+                    intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "data".to_string(),
                 },
             ),
@@ -11435,8 +11493,14 @@ impl ClientCtx {
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
-        for addr in self.intra_route_snapshot().into_values() {
-            if addr == self.admin.intra_addr.to_string() {
+        for (id, addr) in self.intra_route_snapshot() {
+            // Self-skip by id, not by address string: this node's own
+            // `intra_route` entry is `advertised_addr(self)`, which a bind
+            // address comparison would never match once `advertise_host`
+            // (ADR 0060) is set — the id is the one identity that's always
+            // comparable regardless of how this node's own address is
+            // spelled.
+            if Some(&id) == self.admin.node_id.as_ref() {
                 continue;
             }
             if !matches!(
@@ -15625,7 +15689,10 @@ impl ClientCtx {
 }
 
 /// Bind an `n`-node cluster on `ip` with ephemeral ports and the conventional
-/// ids (node `i`, ADR 0040 PR1), each under `dir/node-i`.
+/// ids (node `i`, ADR 0040 PR1), each under `dir/node-i`. Every node's
+/// `advertise_host` is unset — see
+/// [`bind_cluster_with_advertise_host`] for the dev-`--cluster N` variant
+/// that sets one.
 ///
 /// # Errors
 /// Propagates any bind failure.
@@ -15633,6 +15700,23 @@ pub async fn bind_cluster(
     n: usize,
     ip: std::net::IpAddr,
     dir: impl Into<PathBuf>,
+) -> std::io::Result<Vec<BoundNode>> {
+    bind_cluster_with_advertise_host(n, ip, dir, None).await
+}
+
+/// [`bind_cluster`], with every node's [`RoleAddrs::advertise_host`] set to
+/// `advertise_host` (ADR 0060) — the same shared host for every node in the
+/// in-process cluster; each still binds its own distinct ephemeral port on
+/// `ip`, so `{advertise_host}:{that node's own port}` remains a unique,
+/// dialable identity per node. `None` is byte-identical to [`bind_cluster`].
+///
+/// # Errors
+/// Propagates any bind failure.
+pub async fn bind_cluster_with_advertise_host(
+    n: usize,
+    ip: std::net::IpAddr,
+    dir: impl Into<PathBuf>,
+    advertise_host: Option<String>,
 ) -> std::io::Result<Vec<BoundNode>> {
     let dir = dir.into();
     let mut nodes = Vec::with_capacity(n);
@@ -15647,6 +15731,7 @@ pub async fn bind_cluster(
             admin: addr(),
             intra: addr(),
             console: addr(),
+            advertise_host: advertise_host.clone(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -16014,8 +16099,7 @@ async fn start_cluster_inner(
     // correct even if a future caller's `bound` isn't a contiguous `0..n`
     // index range.
     let data_ids: Vec<NodeId> = bound.iter().map(|b| b.id.clone()).collect();
-    let peers: BTreeMap<NodeId, SocketAddr> =
-        bound.iter().flat_map(BoundNode::peer_entries).collect();
+    let peers: BTreeMap<NodeId, String> = bound.iter().flat_map(BoundNode::peer_entries).collect();
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map each node's one id to
     // that node's client API address, so an op landing on a node that isn't
     // the relevant leader forwards to the leader's node — identical to the
@@ -16031,13 +16115,23 @@ async fn start_cluster_inner(
     // from every original node.
     let client_route: BTreeMap<NodeId, String> = bound
         .iter()
-        .map(|b| (b.id.clone(), b.client_addr.to_string()))
+        .map(|b| {
+            (
+                b.id.clone(),
+                advertised_addr(b.advertise_host.as_deref(), b.client_addr),
+            )
+        })
         .collect();
     // The `intra_route` sibling (ADR 0047) — identical static-seed shape,
     // sourced from each bound node's intra address instead of its client one.
     let intra_route: BTreeMap<NodeId, String> = bound
         .iter()
-        .map(|b| (b.id.clone(), b.intra_addr().to_string()))
+        .map(|b| {
+            (
+                b.id.clone(),
+                advertised_addr(b.advertise_host.as_deref(), b.intra_addr()),
+            )
+        })
         .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
@@ -16202,6 +16296,7 @@ pub async fn start_split_cluster_with_growth(
             admin: ephemeral(),
             intra: ephemeral(),
             console: ephemeral(),
+            advertise_host: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -16218,6 +16313,7 @@ pub async fn start_split_cluster_with_growth(
             admin: ephemeral(),
             intra: ephemeral(),
             console: ephemeral(),
+            advertise_host: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -16228,13 +16324,23 @@ pub async fn start_split_cluster_with_growth(
     // Each role's own internal peer book, plus the union a data node's single
     // internal env needs (its `heartbeat_loop` targets the control ids over
     // that same env).
-    let control_peer_book: BTreeMap<NodeId, SocketAddr> = control_bound
+    let control_peer_book: BTreeMap<NodeId, String> = control_bound
         .iter()
-        .map(|b| (b.id.clone(), b.internal_addr))
+        .map(|b| {
+            (
+                b.id.clone(),
+                advertised_addr(b.advertise_host.as_deref(), b.internal_addr),
+            )
+        })
         .collect();
-    let raftkv_peer_book: BTreeMap<NodeId, SocketAddr> = data_bound
+    let raftkv_peer_book: BTreeMap<NodeId, String> = data_bound
         .iter()
-        .map(|b| (b.id.clone(), b.internal_addr))
+        .map(|b| {
+            (
+                b.id.clone(),
+                advertised_addr(b.advertise_host.as_deref(), b.internal_addr),
+            )
+        })
         .collect();
     let mut data_env_peers = raftkv_peer_book;
     data_env_peers.extend(control_peer_book.clone());
@@ -16266,7 +16372,7 @@ pub async fn start_split_cluster_with_growth(
     // address).
     let control_intra_addrs: Vec<String> = control_bound
         .iter()
-        .map(|b| b.intra_addr.to_string())
+        .map(|b| advertised_addr(b.advertise_host.as_deref(), b.intra_addr))
         .collect();
 
     // Every node's admin address, so each node's dashboard (ADR 0021) fans
@@ -16589,13 +16695,19 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // the relevant leader forwards to the leader's node.
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), addrs.client.to_string());
+        client_route.insert(
+            config::node_id(i),
+            advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+        );
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
     let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), addrs.intra.to_string());
+        intra_route.insert(
+            config::node_id(i),
+            advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+        );
     }
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
@@ -16741,13 +16853,19 @@ pub async fn run_node_control_with_orphan_sweep_after(
     // `run_node_with` builds.
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), a.client.to_string());
+        client_route.insert(
+            config::node_id(i),
+            advertised_addr(a.advertise_host.as_deref(), a.client),
+        );
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
     let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), a.intra.to_string());
+        intra_route.insert(
+            config::node_id(i),
+            advertised_addr(a.advertise_host.as_deref(), a.intra),
+        );
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard (ADR 0021) can fan out to the whole cluster (control and data
@@ -16829,20 +16947,26 @@ pub async fn run_node_data(
         .nodes
         .iter()
         .filter(|a| a.role.has_control())
-        .map(|a| a.intra.to_string())
+        .map(|a| advertised_addr(a.advertise_host.as_deref(), a.intra))
         .collect();
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address — the same shape `run_node_control` builds.
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), a.client.to_string());
+        client_route.insert(
+            config::node_id(i),
+            advertised_addr(a.advertise_host.as_deref(), a.client),
+        );
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
     let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), a.intra.to_string());
+        intra_route.insert(
+            config::node_id(i),
+            advertised_addr(a.advertise_host.as_deref(), a.intra),
+        );
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
@@ -16940,7 +17064,10 @@ pub async fn run_node_growth(
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), addrs.client.to_string());
+        client_route.insert(
+            config::node_id(i),
+            advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+        );
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`; this is what makes the growth-node mirror's own
@@ -16948,7 +17075,10 @@ pub async fn run_node_growth(
     // correctly from this node's very first tick.
     let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), addrs.intra.to_string());
+        intra_route.insert(
+            config::node_id(i),
+            advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+        );
     }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     // `bootstrap` must never auto-register this growth node itself (it
@@ -17097,10 +17227,10 @@ pub async fn run_node_join(
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
-        internal: addrs.internal.to_string(),
-        client: addrs.client.to_string(),
-        admin: addrs.admin.to_string(),
-        intra: addrs.intra.to_string(),
+        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
         role: "combined".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
@@ -17146,7 +17276,7 @@ async fn finish_combined_join(
     my_admin_addr: SocketAddr,
     my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
-    mut peers: BTreeMap<NodeId, SocketAddr>,
+    mut peers: BTreeMap<NodeId, String>,
     mut client_route: BTreeMap<NodeId, String>,
     mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
@@ -17155,10 +17285,16 @@ async fn finish_combined_join(
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_id.clone(), my_client_addr.to_string());
+    client_route.insert(
+        my_id.clone(),
+        advertised_addr(bound.advertise_host.as_deref(), my_client_addr),
+    );
     // The `intra_route` sibling (ADR 0047) — see `ClientResponse::JoinInfo`'s
     // own field doc for why this must be a real, discovered seed, not empty.
-    intra_route.insert(my_id, my_intra_addr.to_string());
+    intra_route.insert(
+        my_id,
+        advertised_addr(bound.advertise_host.as_deref(), my_intra_addr),
+    );
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -17190,7 +17326,7 @@ async fn discover_join_info(
     seeds: &[String],
 ) -> std::io::Result<(
     Vec<NodeId>,
-    BTreeMap<NodeId, SocketAddr>,
+    BTreeMap<NodeId, String>,
     BTreeMap<NodeId, String>,
     BTreeMap<NodeId, String>,
     Vec<SocketAddr>,
@@ -17351,10 +17487,10 @@ pub async fn run_node_data_join(
         discover_join_info(&seeds).await?;
 
     let mine = NodeAddrs {
-        internal: addrs.internal.to_string(),
-        client: addrs.client.to_string(),
-        admin: addrs.admin.to_string(),
-        intra: addrs.intra.to_string(),
+        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
         role: "data".to_string(),
     };
     let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
@@ -17392,7 +17528,7 @@ async fn finish_data_join(
     my_admin_addr: SocketAddr,
     my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
-    mut peers: BTreeMap<NodeId, SocketAddr>,
+    mut peers: BTreeMap<NodeId, String>,
     mut client_route: BTreeMap<NodeId, String>,
     mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
@@ -17403,10 +17539,16 @@ async fn finish_data_join(
     // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_id.clone(), my_client_addr.to_string());
+    client_route.insert(
+        my_id.clone(),
+        advertised_addr(bound.advertise_host.as_deref(), my_client_addr),
+    );
     // The `intra_route` sibling (ADR 0047) — see `finish_combined_join`'s
     // identical treatment.
-    intra_route.insert(my_id, my_intra_addr.to_string());
+    intra_route.insert(
+        my_id,
+        advertised_addr(bound.advertise_host.as_deref(), my_intra_addr),
+    );
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -17680,6 +17822,7 @@ mod confirm_futility_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }
@@ -18064,6 +18207,7 @@ mod halted_shutdown_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }
@@ -18405,6 +18549,7 @@ mod issue_412_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }

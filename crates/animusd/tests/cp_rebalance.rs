@@ -148,6 +148,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
                     admin: a[6 * i + 3],
                     intra: a[6 * i + 4],
                     console: a[6 * i + 5],
+                    advertise_host: None,
                 })
                 .collect(),
             dynamo_auth: None,

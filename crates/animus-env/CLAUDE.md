@@ -99,6 +99,22 @@ the production implementation; the deterministic implementation lives in
   warning).
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
+- **`ProdEnv`'s peer book is keyed by `host:port` string, not `SocketAddr`
+  (ADR 0060's advertise/dial split)** — `set_peers`/`merge_peer` both take
+  `String`, and `Network::send`'s dial path resolves it (numeric parse or a
+  real async DNS lookup, via `TcpStream::connect`'s own `ToSocketAddrs` impl
+  for `&str`) only when it needs a fresh connection; an already-cached live
+  stream is reused with zero resolution cost, and a write failure drops the
+  stale cache entry and reconnects once, re-resolving fresh — the mechanism
+  that lets a peer registered by a stable hostname (a Kubernetes pod's own
+  DNS name) recover after moving to a new address, which a `SocketAddr`-
+  keyed book could never express. Every caller building this crate's own
+  peer/route maps from a bind address still has a plain `SocketAddr` in hand
+  and stringifies it at the boundary (`animusd`'s own `advertised_addr`
+  helper is the one place that decides whether that string is the bind
+  address itself or an operator-supplied advertised host) — this seam
+  itself has no opinion on *which* string it's handed, only that it's a
+  dialable one.
 - **`ProdEnv::merge_peer(id, addr)` (ADR 0037 PR3) adds/replaces a single peer
   entry without disturbing the rest of the book** — the incremental dual of
   `set_peers`'s full replace, with no `get_peers` to read-modify-write around

@@ -226,6 +226,7 @@ impl ClusterConfig {
                     admin: p(3),
                     intra: p(4),
                     console: p(5),
+                    advertise_host: None,
                 }
             })
             .collect();
@@ -260,6 +261,7 @@ impl ClusterConfig {
                     admin: p(3),
                     intra: p(4),
                     console: p(5),
+                    advertise_host: None,
                 }
             })
             .collect();
@@ -336,10 +338,15 @@ impl ClusterConfig {
     /// every role needs the internal env (control Raft, per-tablet Raft
     /// groups, and failure-detection heartbeats all ride it).
     #[must_use]
-    pub fn peer_book(&self) -> BTreeMap<NodeId, SocketAddr> {
+    pub fn peer_book(&self) -> BTreeMap<NodeId, String> {
         self.nodes
             .iter()
-            .map(|a| (a.id.clone(), a.internal))
+            .map(|a| {
+                (
+                    a.id.clone(),
+                    crate::advertised_addr(a.advertise_host.as_deref(), a.internal),
+                )
+            })
             .collect()
     }
 
@@ -410,17 +417,20 @@ mod tests {
         let cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
         let book = cfg.peer_book();
         assert_eq!(book.len(), 3, "3 nodes, one identity/address each");
-        assert_eq!(book[&node_id(1)].port(), 7006);
-        assert_eq!(book[&node_id(0)].port(), 7000);
-        assert_eq!(book[&node_id(2)].port(), 7012);
+        // No `advertise_host` set (`generate` never sets one) — every entry
+        // is the bind address's own `host:port` string.
+        let port = |s: &str| s.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        assert_eq!(port(&book[&node_id(1)]), 7006);
+        assert_eq!(port(&book[&node_id(0)]), 7000);
+        assert_eq!(port(&book[&node_id(2)]), 7012);
         // Client / dynamo / admin / intra / console addresses are
         // intentionally absent from the internal book (external client
         // channels, not the network).
-        assert!(!book.values().any(|a| a.port() == 7001)); // client (node 0)
-        assert!(!book.values().any(|a| a.port() == 7002)); // dynamo (node 0)
-        assert!(!book.values().any(|a| a.port() == 7003)); // admin (node 0)
-        assert!(!book.values().any(|a| a.port() == 7004)); // intra (node 0)
-        assert!(!book.values().any(|a| a.port() == 7005)); // console (node 0)
+        assert!(!book.values().any(|a| port(a) == 7001)); // client (node 0)
+        assert!(!book.values().any(|a| port(a) == 7002)); // dynamo (node 0)
+        assert!(!book.values().any(|a| port(a) == 7003)); // admin (node 0)
+        assert!(!book.values().any(|a| port(a) == 7004)); // intra (node 0)
+        assert!(!book.values().any(|a| port(a) == 7005)); // console (node 0)
     }
 
     #[test]
