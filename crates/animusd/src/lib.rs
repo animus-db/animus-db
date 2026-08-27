@@ -8569,6 +8569,32 @@ impl ClientCtx {
     /// it once past `RECOVERY_GRACE`); `ConditionFailed`/`Fenced` are both
     /// **final** — retrying an identical stage changes nothing, so these
     /// return a client-facing error immediately, never looping.
+    ///
+    /// **Issue #412: a stage attempt that never even applied also gets this
+    /// same bounded retry, when its own failure is retryable-shaped.**
+    /// `txn_prepare` can fail outright — a leader-moved race in
+    /// `dynamo::eval_kind_txn_write`'s leader-side old-image read
+    /// (`txn_stage_local`'s stage-time kind-write evaluation), or the
+    /// identical race in `txn_stage`/`txn_stage_participant` returning
+    /// `None` (the propose itself never got accepted) — carrying the house
+    /// `"; retry"` shape (`dynamo::leader_read_failure`'s doc). Pre-fix,
+    /// that `Err` escaped this loop immediately via `?`, on the very first
+    /// attempt, and surfaced through `cp_txn`/`dynamo::run_transact` as a
+    /// terminal `TransactionCanceledException` for a condition the very
+    /// next attempt would routinely clear — the same class of bug
+    /// `dynamo::kind_write_item_at_leader`'s ordinary (non-transactional)
+    /// twin never had, since `ClientCtx::cp_kind_write_item`'s own retry
+    /// loop already re-resolves routing on this exact shape. Retrying here
+    /// is safe: a `txn_prepare` that failed this way never reached its own
+    /// propose (the read/evaluate happens strictly before
+    /// `leader.txn_stage`/`txn_stage_participant`), so nothing was proposed
+    /// to double up on, and re-invoking `txn_prepare` re-resolves
+    /// `cp_route` fresh — the identical "safe to retry, re-route every
+    /// attempt" discipline the ordinary write path already has. Only a
+    /// retryable-shaped `Other` is caught here — `ConditionFailed`/
+    /// `TransactionConflict` and a non-retryable `Other` (no CP group
+    /// leader reachable, a malformed request) still propagate immediately,
+    /// unchanged.
     async fn txn_prepare_pushing(
         &self,
         table: &str,
@@ -8584,8 +8610,13 @@ impl ClientCtx {
         // `TransactionConflict`, never `ConditionFailed` (a lost race, not a
         // permanent condition failure).
         let mut last_blocked: Option<Vec<u8>> = None;
+        // Issue #412: the last-seen retryable-shaped `Other` message from a
+        // stage attempt that never even applied, so exhausting every retry
+        // attempt can still report what kept recurring instead of the
+        // generic "did not converge" text.
+        let mut last_retryable: Option<String> = None;
         for attempt in 0..TXN_STAGE_PUSH_ATTEMPTS {
-            let (txn_id, record_key, record_table, ts, outcome) = self
+            let (txn_id, record_key, record_table, ts, outcome) = match self
                 .txn_prepare(
                     table,
                     anchor.clone(),
@@ -8594,7 +8625,25 @@ impl ClientCtx {
                     participant_spans.clone(),
                     pending_kind_writes.clone(),
                 )
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(TxnAbortReason::Other(msg)) if msg.ends_with("; retry") => {
+                    tracing::debug!(
+                        table,
+                        attempt,
+                        %msg,
+                        "txn prepare: stage attempt itself failed with a retryable routing/\
+                         leadership race; retrying"
+                    );
+                    last_retryable = Some(msg);
+                    if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
+                        tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match outcome {
                 StageOutcome::Staged => return Ok((txn_id, record_key, record_table, ts)),
                 StageOutcome::IntentBlocked {
@@ -8629,18 +8678,27 @@ impl ClientCtx {
                 tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
             }
         }
-        match last_blocked {
-            Some(key) => Err(TxnAbortReason::TransactionConflict {
+        match (last_blocked, last_retryable) {
+            (Some(key), _) => Err(TxnAbortReason::TransactionConflict {
                 table: table.to_owned(),
                 key,
             }),
+            // Every attempt failed at `txn_prepare` itself with a
+            // retryable-shaped `Other` (issue #412) and none ever reached
+            // `IntentBlocked` — report the last such failure rather than
+            // the generic exhaustion text below, since it names the actual
+            // recurring condition.
+            (None, Some(msg)) => Err(TxnAbortReason::Other(format!(
+                "txn prepare: stage on table `{table}` did not converge after \
+                 {TXN_STAGE_PUSH_ATTEMPTS} attempts (last transient failure: {msg})"
+            ))),
             // Every `TXN_STAGE_PUSH_ATTEMPTS` attempt returning `Ok` with an
             // outcome other than `Staged`/`IntentBlocked`/`ConditionFailed`/
             // `Fenced` is unreachable (`StageOutcome` is exhaustively
             // matched above) — kept as a typed fallback rather than an
             // `unreachable!()` so a future `StageOutcome` variant fails soft
             // here instead of panicking a live node.
-            None => Err(TxnAbortReason::Other(format!(
+            (None, None) => Err(TxnAbortReason::Other(format!(
                 "txn prepare: stage on table `{table}` did not converge after \
                  {TXN_STAGE_PUSH_ATTEMPTS} attempts"
             ))),
@@ -17403,5 +17461,184 @@ mod status_wire_compat_tests {
             }
             other => panic!("expected a Status reply, got {other:?}"),
         }
+    }
+}
+
+/// Issue #412 regression: a leader-side old-image read failure with the
+/// house `"; retry"` shape (a leader-moved/no-longer-leader condition) must
+/// never surface as a terminal error while retries remain, for either the
+/// ordinary evaluate-at-leader write path (`dynamo::
+/// kind_write_item_at_leader` via `ClientCtx::cp_kind_write_item`) or its
+/// transactional twin (`dynamo::eval_kind_txn_write` via `ClientCtx::
+/// txn_prepare_pushing`). Uses `dynamo::leader_read_failure_gate` to inject
+/// the failure deterministically rather than orchestrating a real
+/// leadership change — same idiom as `dynamo::rmw285_confirm_gate`.
+#[cfg(test)]
+mod issue_412_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::dynamo::{self, leader_read_failure_gate};
+    use crate::{ClientCtx, ClusterConfig, KindWriteOp, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
+            }],
+            dynamo_auth: None,
+        }
+    }
+
+    /// Same bounded fresh-config retry every in-crate bring-up in this
+    /// crate uses (`docs/engineering-lessons.md`) against the port-TOCTOU
+    /// race under `cargo test --workspace` contention.
+    async fn single_node(dir: &Path) -> Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Provisions `table`'s first tablet and waits for its single-voter
+    /// group to actually elect locally — `provision_tablet` alone does not
+    /// wait for that (`confirm_futility_tests`'s identical polling doc).
+    async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
+        ctx.provision_tablet(table)
+            .await
+            .expect("provisioning table");
+        let tablet = *node
+            .metadata()
+            .tablets_for_table(table)
+            .next()
+            .expect("provisioning created a tablet")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this single node hosts the tablet");
+        timeout(Duration::from_secs(10), async {
+            while !group.is_leader() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tablet group did not elect a local leader in time");
+    }
+
+    /// The ordinary (non-transactional) evaluate-at-leader write path
+    /// retries a leader-moved-shaped read failure to success —
+    /// `ClientCtx::cp_kind_write_item`'s issue #288 retry loop already
+    /// re-resolves routing on this exact `"; retry"` shape (confirming this
+    /// half of #412 was already sound; the txn-side twin below is the
+    /// actual fix).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kind_write_item_retries_a_leader_moved_read_failure_to_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+        provision_and_await_leader(&node, &ctx, "issue412_plain").await;
+        let meta = node.metadata();
+
+        leader_read_failure_gate::arm("issue412_plain", 2);
+
+        let mut item = animus_dynamo::Item::new();
+        item.insert(
+            "pk".to_string(),
+            animus_dynamo::AttributeValue::S("k1".to_string()),
+        );
+        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
+        let outcome = ctx
+            .cp_kind_write_item(
+                &meta,
+                "issue412_plain",
+                &pk,
+                None,
+                KindWriteOp::Put(item),
+                None,
+            )
+            .await
+            .expect(
+                "a retryable leader-moved read failure must be retried to success, \
+                 never surfaced as a terminal error",
+            );
+        assert!(matches!(outcome, dynamo::KindWriteOutcome::Ok { .. }));
+
+        node.shutdown();
+    }
+
+    /// Issue #412's actual fix: the transactional stage-time evaluator
+    /// (`dynamo::eval_kind_txn_write`, reached via `TransactWriteItems`)
+    /// hits the identical leader-moved read failure — pre-fix, it escaped
+    /// `ClientCtx::txn_prepare_pushing`'s bounded retry loop via `?` on the
+    /// very first attempt and would have surfaced as a terminal whole-txn
+    /// cancel. Calls `txn_prepare_pushing` directly (the function whose
+    /// retry loop this fixes) with a single anchor-only pending kind write,
+    /// so a failure here can only mean that loop itself didn't retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn txn_prepare_pushing_retries_a_leader_moved_read_failure_to_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+        provision_and_await_leader(&node, &ctx, "issue412_txn").await;
+
+        leader_read_failure_gate::arm("issue412_txn", 2);
+
+        let mut item = animus_dynamo::Item::new();
+        item.insert(
+            "pk".to_string(),
+            animus_dynamo::AttributeValue::S("k1".to_string()),
+        );
+        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
+        let pending = crate::PendingKindWrite {
+            pk,
+            sk: None,
+            op: KindWriteOp::Put(item),
+            condition: None,
+        };
+        ctx.txn_prepare_pushing(
+            "issue412_txn",
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![pending],
+        )
+        .await
+        .expect(
+            "a retryable leader-moved read failure inside the stage-time evaluator must be \
+             retried to success, never a terminal whole-txn cancel",
+        );
+
+        node.shutdown();
     }
 }
