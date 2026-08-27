@@ -1268,6 +1268,66 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+    /// `physical_key -> txn_id`: the transaction whose intent at this key
+    /// was most recently resolved (`TxnResolve`, commit or abort alike) on
+    /// THIS group — populated for every participant that applies a
+    /// resolve, anchor or not, unlike `pending`/`unresolved_decided` above
+    /// (which are anchor-only by construction). A **defensive seatbelt**
+    /// against issue #298 shape A: `KvCommand::TxnStage`'s own `blocked_by`
+    /// check only ever rejects overwriting a *different* transaction's
+    /// still-live `Intent` — it has no way to reject a stage that arrives
+    /// for a key AFTER this exact transaction's own resolve already ran,
+    /// since by then the key is a plain `Committed`/restored value, not an
+    /// `Intent` at all. `KvCommand::TxnStage`'s apply arm checks this map
+    /// by **(key, txn_id) identity**, never presence alone — the same
+    /// discipline `KindBatchOutcome`'s own false-ack fix established for
+    /// "never trust an outcome without confirming it names the SAME
+    /// thing." Bounded (`record_resolution`'s own `RETAIN`), like
+    /// `KindBatchOutcomes`/`StageOutcomes`: purely a best-effort catch, not
+    /// a source of truth — an evicted (or, after a restart, simply never
+    /// rebuilt) entry only means this ONE seatbelt doesn't catch a given
+    /// resurrection attempt, never that a wrong decision gets made from a
+    /// stale one. **Deliberately not rebuilt at group start**
+    /// (`rebuild_txn_tracker`, below) — unlike `pending`/`unresolved_
+    /// decided`, which restore real transaction-lifecycle facts a restart
+    /// must not lose, this map's whole job is catching a stale stage that
+    /// arrives shortly after its own resolve within the SAME uptime window;
+    /// starting it empty after a restart is exactly as safe as any other
+    /// eviction.
+    recently_resolved: BTreeMap<Vec<u8>, TxnId>,
+    /// Insertion order for `recently_resolved`'s bounded FIFO eviction —
+    /// see `record_resolution`.
+    recently_resolved_order: std::collections::VecDeque<(Vec<u8>, TxnId)>,
+}
+
+impl TxnTracker {
+    /// Entries retained behind the newest, mirroring `KindBatchOutcomes::
+    /// RETAIN`'s own "generous next to the realistic poll/retry window,
+    /// while keeping the map small enough to be free" reasoning — a stale
+    /// re-stage this seatbelt exists to catch arrives within a bounded
+    /// retry/timeout window (seconds), never after thousands of intervening
+    /// resolves on the same busy tablet.
+    const RECENTLY_RESOLVED_RETAIN: usize = 4096;
+
+    /// Record that `txn_id`'s intent at `physical_key` was just resolved on
+    /// this group — see `recently_resolved`'s own doc.
+    fn record_resolution(&mut self, physical_key: Vec<u8>, txn_id: TxnId) {
+        self.recently_resolved
+            .insert(physical_key.clone(), txn_id.clone());
+        self.recently_resolved_order
+            .push_back((physical_key, txn_id));
+        while self.recently_resolved_order.len() > Self::RECENTLY_RESOLVED_RETAIN {
+            let Some((old_key, old_txn_id)) = self.recently_resolved_order.pop_front() else {
+                break;
+            };
+            // Only remove if it's still THIS eviction's own entry — a
+            // later resolution of the same key (a different, newer
+            // txn_id) must never be evicted by an older entry's turn.
+            if self.recently_resolved.get(&old_key) == Some(&old_txn_id) {
+                self.recently_resolved.remove(&old_key);
+            }
+        }
+    }
 }
 
 /// Rebuild a [`TxnTracker`] from `storage`'s own durable records within
@@ -1393,7 +1453,7 @@ pub struct IntentInfo {
 /// [`RaftKvNode::txn_record_view`], carrying everything
 /// `animusd::ClientCtx::txn_recover` needs to drive the push protocol
 /// without this crate exposing its internal record representation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxnRecordView {
     pub status: TxnDecisionStatus,
     /// Every key this transaction staged anywhere, as `(table, span)` pairs
@@ -3037,20 +3097,40 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// §2/PR5): like [`txn_status_local`](Self::txn_status_local), but also
     /// returns `intent_spans`/`created_ts` — everything a recovery pusher
     /// needs to verify every participant and, once decided, resolve every
-    /// one of them (see [`TxnRecordView`]'s doc). Same ReadIndex barrier +
-    /// `None` contract as `txn_status_local`.
-    pub async fn txn_record_view(&self, record_key: &[u8]) -> Option<TxnRecordView> {
+    /// one of them (see [`TxnRecordView`]'s doc).
+    ///
+    /// **`Option<Option<..>>`, the `stale_get_served`/`linearizable_get_
+    /// served` "served" discipline (ADR 0018 §2, issue #298 shape B fix)** —
+    /// unlike [`txn_status_local`](Self::txn_status_local)'s plain `Option`,
+    /// which conflated "not served" (barrier failed) with "genuinely no
+    /// record" into the same bare `None` until this fix, this method's
+    /// caller (`ClientCtx::txn_recover`'s orphan-record branch) makes a
+    /// **decision** (whether to synthesize an abort tombstone) directly off
+    /// "no record exists" — an outcome that must never be confused with "I
+    /// couldn't tell right now" (e.g. this replica losing its own read
+    /// barrier mid-fork/cutover, exactly what a high split cadence
+    /// produces routinely). Outer `None` = **not served**, caller must
+    /// decline/retry, never decide anything from it; `Some(None)` =
+    /// definitively no record at this key; `Some(Some(view))` = found.
+    pub async fn txn_record_view(&self, record_key: &[u8]) -> Option<Option<TxnRecordView>> {
         if !self.read_barrier().await {
             return None;
         }
         let physical = self.scope.physical(record_key);
-        let vv = self.storage.get(&physical).await.ok().flatten()?;
-        let record = txn::decode_record(&vv.value)?;
-        Some(TxnRecordView {
+        let Ok(found) = self.storage.get(&physical).await else {
+            return None;
+        };
+        let Some(vv) = found else {
+            return Some(None);
+        };
+        let Some(record) = txn::decode_record(&vv.value) else {
+            return Some(None);
+        };
+        Some(Some(TxnRecordView {
             status: record.status.to_public(),
             intent_spans: record.intent_spans,
             created_ts: record.created_ts,
-        })
+        }))
     }
 
     /// **Recovery primitive** (ADR 0018 §2/PR5): does this tablet currently
@@ -6488,6 +6568,33 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     }
                     None
                 };
+                // ADR 0018 §2/PR6 seatbelt (issue #298 shape A): reject a
+                // stage that targets a key THIS EXACT transaction already
+                // resolved on this group — `blocked_by` above only ever
+                // catches a *different* transaction's still-live `Intent`,
+                // never a same-txn resurrection of an already-`Committed`/
+                // restored value (see `TxnTracker::recently_resolved`'s
+                // doc for the full argument and why checking (key, txn_id)
+                // IDENTITY, not mere presence, is load-bearing here — a
+                // *different*, genuinely later transaction reusing the same
+                // physical key is the ordinary, unrelated write path and
+                // must stage normally).
+                let resurrection_attempt = {
+                    let t = txn_tracker.lock().expect("txn tracker poisoned");
+                    writes
+                        .iter()
+                        .any(|w| t.recently_resolved.get(&scope.physical(&w.key)) == Some(&txn_id))
+                };
+                if resurrection_attempt {
+                    tracing::warn!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage rejected — at least one target key was already \
+                         resolved by this exact transaction on this group (a stale/duplicate \
+                         stage arriving after its own resolve; issue #298 shape A seatbelt) — \
+                         no-op"
+                    );
+                }
                 if let Some((blocked_key, blocker)) = &blocked_by {
                     tracing::warn!(
                         ?txn_id,
@@ -6523,6 +6630,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         && change_log_token_valid(&w.key, w.change_log.as_ref())
                 });
                 let all_in_fence = !already_decided
+                    && !resurrection_attempt
                     && blocked_by.is_none()
                     && kind_tokens_ok
                     && writes.iter().all(|w| !is_sealed(sealed, &w.key))
@@ -6672,11 +6780,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // record *why*, not just whether, this stage no-op'd — see
                 // `StageOutcome`'s doc for the coordinator-facing meaning of
                 // each variant. Priority mirrors the gates above: a
-                // structural fence/seal-miss or already-decided race
-                // (`Fenced`) and a foreign-intent block (`IntentBlocked`)
-                // both pre-empt ever evaluating this stage's own
-                // conditions, so they take priority over `ConditionFailed`
-                // here too.
+                // structural fence/seal-miss, already-decided race, or
+                // resurrection attempt (all three fold into `Fenced` — the
+                // `resurrection_attempt` case flows through the `!all_in_
+                // fence` branch below) and a foreign-intent block
+                // (`IntentBlocked`) both pre-empt ever evaluating this
+                // stage's own conditions, so they take priority over
+                // `ConditionFailed` here too.
                 let outcome = if already_decided {
                     txn::StageOutcome::Fenced
                 } else if let Some((blocked_key, blocker)) = blocked_by {
@@ -7284,6 +7394,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 }
                             }
                         }
+                        // ADR 0018 §2/PR6 seatbelt (issue #298 shape A):
+                        // record that THIS exact transaction's intent at
+                        // this key has now been resolved here (commit or
+                        // abort — both leave nothing of `txn_id`'s own at
+                        // this key), so a stale/duplicate `TxnStage`
+                        // re-arriving for the identical `(key, txn_id)`
+                        // afterward is rejected instead of silently
+                        // resurrecting it — see `TxnTracker::recently_
+                        // resolved`'s doc and `KvCommand::TxnStage`'s own
+                        // resurrection-guard read of this map.
+                        txn_tracker
+                            .lock()
+                            .expect("txn tracker poisoned")
+                            .record_resolution(physical_key, txn_id.clone());
                     }
                 }
             }
@@ -8771,6 +8895,167 @@ mod pr5_orphan_and_resurrection_tests {
             wall_ms: 1_000,
             logical: 0,
         }
+    }
+
+    /// **Issue #298 shape A seatbelt**: `KvCommand::TxnStage`'s apply arm
+    /// must reject a stage that targets a key THIS EXACT transaction
+    /// already resolved on this group — `blocked_by`'s own foreign-intent
+    /// check can never catch this (the key holds a plain `Committed`
+    /// envelope by then, not an `Intent`). The live #298 trigger this
+    /// guards (found while investigating a captured soak trace): a
+    /// client-level retry of the same logical write races its own
+    /// already-committed first attempt with a fresh `txn_id`, which stages
+    /// (and later resolves) cleanly since it is a genuinely different
+    /// transaction — this seatbelt instead covers the narrower but real
+    /// same-txn case (a duplicate/stale re-propose of the identical
+    /// `TxnStage` command), the shape the original candidate mechanism
+    /// named. Pre-fix, this test's own re-stage attempt would overwrite
+    /// `kb`'s committed value with a fresh `Intent` (`StageOutcome::
+    /// Staged`); post-fix it is rejected (`StageOutcome::Fenced`) and the
+    /// committed value is untouched.
+    #[test]
+    fn a_resolved_key_rejects_a_same_txn_restage_issue_298_shape_a() {
+        let seed = 0xA5B1_0002u64;
+        let mut sim = Simulator::new(seed);
+        let id_b = nid(9021);
+        let node_b: KvNode = RaftKvNode::start_scoped(
+            sim.env(id_b.clone()),
+            vec![id_b.clone()],
+            MemoryEngine::new(),
+            StorageScope::whole(),
+        );
+        sim.run_for(Duration::from_secs(2)); // elect (single voter)
+
+        let kb = key(2, b":balance");
+        // `record_key` only needs to be a structurally valid txn record key
+        // here — this group never holds it locally (a pure-participant
+        // stage, `is_anchor: false`, exactly like the live trace's own
+        // participant-side resurrection).
+        let anchor_token = &kb[..animus_tablet::TOKEN_BYTES];
+        let txn_id = TxnId {
+            ts: HlcTimestamp {
+                wall_ms: 1_000,
+                logical: 0,
+            },
+            node: id_b.clone(),
+        };
+        let record_key = txn::record_key(anchor_token, &txn_id);
+
+        // Stage the participant's own key for real.
+        let n = node_b.clone();
+        let (txn_id_1, record_key_1, kb_1) = (txn_id.clone(), record_key.clone(), kb.clone());
+        let staged = drive(
+            &mut sim,
+            node_b.env(),
+            Duration::from_millis(300),
+            async move {
+                n.txn_stage_participant(
+                    txn_id_1,
+                    record_key_1,
+                    "orders".to_string(),
+                    vec![txn::TxnWrite::plain(kb_1, Some(b"v1".to_vec()))],
+                    Vec::new(),
+                )
+                .await
+            },
+        )
+        .flatten();
+        assert_eq!(
+            staged.as_ref().map(|(_, outcome)| outcome.clone()),
+            Some(StageOutcome::Staged),
+            "initial stage should succeed (seed={seed})"
+        );
+
+        // Resolve it: Committed.
+        let n = node_b.clone();
+        let (txn_id_2, record_key_2, kb_2) = (txn_id.clone(), record_key.clone(), kb.clone());
+        let commit_ts = txn_id.ts;
+        let resolve_ts = drive(
+            &mut sim,
+            node_b.env(),
+            Duration::from_millis(300),
+            async move {
+                n.txn_resolve(
+                    txn_id_2,
+                    record_key_2,
+                    vec![kb_2],
+                    txn::TxnOutcome::Committed { commit_ts },
+                )
+                .await
+            },
+        );
+        assert!(
+            resolve_ts.flatten().is_some(),
+            "resolve should apply (seed={seed})"
+        );
+
+        let committed_value = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let kb = kb.clone();
+            async move { n.local_get(&kb).await }
+        })
+        .flatten();
+        assert_eq!(
+            committed_value,
+            Some(b"v1".to_vec()),
+            "the resolved value must be visible before the re-stage attempt (seed={seed})"
+        );
+
+        // A stale/duplicate stage for the SAME (txn_id, key) arrives —
+        // built by hand exactly like the sibling resurrection test above,
+        // since `txn_stage_participant` always mints a fresh entry `ts`
+        // but this scenario needs the identical `txn_id` to reuse the
+        // already-resolved one.
+        let restage_writes = vec![txn::TxnWrite::plain(
+            kb.clone(),
+            Some(b"v2-should-never-land".to_vec()),
+        )];
+        let (result, restage_ts) = node_b.propose_ordered_aux(|term| {
+            let ts = node_b.mint_pushed(term, std::slice::from_ref(&kb));
+            let cmd = KvCommand::TxnStage {
+                txn_id: txn_id.clone(),
+                record_key: record_key.clone(),
+                record_table: "orders".to_string(),
+                is_anchor: false,
+                writes: restage_writes.clone(),
+                spans: Vec::new(),
+                conditions: Vec::new(),
+                ts,
+            };
+            (cmd, ts)
+        });
+        let restage_index = match result {
+            ProposeResult::Accepted { index, .. } => index,
+            other => panic!("restage proposal rejected: {other:?} (seed={seed})"),
+        };
+        let applied = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            async move { n.wait_applied(restage_index).await }
+        });
+        assert_eq!(
+            applied,
+            Some(true),
+            "the restage entry itself must still apply (as a rejected no-op) \
+             (seed={seed}, ts={restage_ts:?})"
+        );
+        assert_eq!(
+            node_b.stage_outcome(restage_index),
+            Some(StageOutcome::Fenced),
+            "the seatbelt must reject the restage as Fenced, never silently stage it \
+             (seed={seed})"
+        );
+
+        let value_after_restage = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
+            let n = node_b.clone();
+            let kb = kb.clone();
+            async move { n.local_get(&kb).await }
+        })
+        .flatten();
+        assert_eq!(
+            value_after_restage,
+            Some(b"v1".to_vec()),
+            "the committed value must be untouched — no resurrection into Intent (seed={seed})"
+        );
     }
 }
 
