@@ -780,6 +780,19 @@ the old id's `Member` entry lingers `Down`/address-less forever (never
 reused, prunable via the existing `RemoveMember`/decommission path). `--id
 NAME`'s durable, restart-stable identity is unaffected.
 
+**`--seed`'s entries accept a hostname, not just a literal socket address**
+— motivated directly by the Kubernetes operator deployment target (root
+`CLAUDE.md`'s architecture map): a seed Service's DNS name, not a pod IP,
+is the honest address to hand a joining pod. Seed entries flow through the
+join chain as `host:port` strings (`main.rs::parse_seed_arg` →
+`run_node_join`/`run_node_data_join`) and resolve at dial time via
+`TcpStream::connect`'s own `ToSocketAddrs` handling — there is no
+pre-resolution step to go stale, and a not-yet-propagating DNS record
+behaves like an unreachable seed under the existing
+`JOIN_RETRY_INTERVAL`/`JOIN_DISCOVERY_BUDGET` retry cadence. Regression:
+`tests/seed_join_hostname.rs` (a real `localhost:<port>` seed, proven
+through the same `run_node_join` entry point every other join test uses).
+
 **`main.rs` now handles SIGTERM, not just Ctrl-C/SIGINT** (`unix`-only
 `wait_for_ctrl_c`, `tokio::signal::unix::signal(SignalKind::terminate())`
 raced via `select!` against `tokio::signal::ctrl_c()`) — a Kubernetes pod's

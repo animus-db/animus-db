@@ -22,7 +22,6 @@
 //! every `Remote` degrade below against real staleness/liveness traffic.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use animus_control::mirror::{self, KeyWrite};
@@ -94,7 +93,7 @@ pub(crate) enum ControlHandle {
 ///
 /// **Leader-hint lifecycle (ADR 0035 §1).** Every `ClientRequest::Status`
 /// reply now carries the answering node's own `self.control.leader()` +
-/// `route_addr(leader_id)` as `leader_hint: Option<(NodeId, SocketAddr)>`
+/// `route_addr(leader_id)` as `leader_hint: Option<(NodeId, String)>`
 /// (`#[serde(default)]`, so an old reply without the field still parses as
 /// `None`). This handle keeps the most recent one it has seen — updated by
 /// the periodic sync loop *and* by [`metadata_fresh`](Self::metadata_fresh)'s
@@ -131,7 +130,7 @@ pub(crate) struct RemoteControlClient {
     /// `metadata_fresh`, unchanged — `Status` is served on both surfaces, so
     /// mixing hint flavors in one candidate list is harmless, just not worth
     /// the extra plumbing to make uniform).
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<String>,
     /// The last `Metadata` observed from any control node's `Status` reply.
     /// `None` until the very first sync — the readiness signal
     /// [`has_synced`](Self::has_synced) exposes for the tablet-host
@@ -140,7 +139,7 @@ pub(crate) struct RemoteControlClient {
     mirror: Arc<Mutex<Option<Metadata>>>,
     /// The last-known control-plane leader `(id, client address)` — see the
     /// type doc's "leader-hint lifecycle" section.
-    leader_hint: Arc<Mutex<Option<(NodeId, SocketAddr)>>>,
+    leader_hint: Arc<Mutex<Option<(NodeId, String)>>>,
     /// The **intra-cluster** dual of `leader_hint` (ADR 0047) — the same
     /// lifecycle, populated from the identical `Status`/`WatchMetadata`
     /// reply's `intra_leader_hint` field, but resolved through the
@@ -150,7 +149,7 @@ pub(crate) struct RemoteControlClient {
     /// `remote_metadata_watch_loop` — never a human-facing message; see the
     /// root `CLAUDE.md`'s hint-field-conflation lesson for why they must
     /// stay separate fields).
-    intra_leader_hint: Arc<Mutex<Option<(NodeId, SocketAddr)>>>,
+    intra_leader_hint: Arc<Mutex<Option<(NodeId, String)>>>,
     /// This handle's own applied-index watch (ADR 0035 PR5) — see the type
     /// doc's "applied-index watch" section. Bumped only by
     /// [`observe`](Self::observe); handed out (cloned) via
@@ -177,7 +176,7 @@ pub(crate) struct RemoteControlClient {
 }
 
 impl RemoteControlClient {
-    pub(crate) fn new(seeds: Vec<SocketAddr>) -> Self {
+    pub(crate) fn new(seeds: Vec<String>) -> Self {
         Self::with_mirror(seeds, Arc::new(Mutex::new(None)))
     }
 
@@ -196,10 +195,7 @@ impl RemoteControlClient {
     /// sharing `ClientCtx.remote_metadata` directly as its `mirror` so every
     /// existing reader of that field (`effective_metadata()`) keeps working
     /// unchanged, with no separate copy of the mirror to keep in sync.
-    pub(crate) fn with_mirror(
-        seeds: Vec<SocketAddr>,
-        mirror: Arc<Mutex<Option<Metadata>>>,
-    ) -> Self {
+    pub(crate) fn with_mirror(seeds: Vec<String>, mirror: Arc<Mutex<Option<Metadata>>>) -> Self {
         Self {
             seeds,
             mirror,
@@ -238,23 +234,23 @@ impl RemoteControlClient {
             .map(|(id, _)| id.clone())
     }
 
-    pub(crate) fn leader_addr_hint(&self) -> Option<SocketAddr> {
+    pub(crate) fn leader_addr_hint(&self) -> Option<String> {
         self.leader_hint
             .lock()
             .expect("leader hint poisoned")
             .as_ref()
-            .map(|(_, addr)| *addr)
+            .map(|(_, addr)| addr.clone())
     }
 
     /// The intra-cluster dual of [`leader_addr_hint`](Self::leader_addr_hint)
     /// (ADR 0047) — see `intra_leader_hint`'s own field doc for why this is a
     /// parallel field, not a repoint.
-    pub(crate) fn intra_leader_addr_hint(&self) -> Option<SocketAddr> {
+    pub(crate) fn intra_leader_addr_hint(&self) -> Option<String> {
         self.intra_leader_hint
             .lock()
             .expect("intra leader hint poisoned")
             .as_ref()
-            .map(|(_, addr)| *addr)
+            .map(|(_, addr)| addr.clone())
     }
 
     /// This handle's own applied-index watch (ADR 0035 PR5) — see the type
@@ -303,8 +299,8 @@ impl RemoteControlClient {
     pub(crate) fn observe(
         &self,
         metadata: Metadata,
-        leader_hint: Option<(NodeId, SocketAddr)>,
-        intra_leader_hint: Option<(NodeId, SocketAddr)>,
+        leader_hint: Option<(NodeId, String)>,
+        intra_leader_hint: Option<(NodeId, String)>,
         watermark: u64,
         control_voters: BTreeSet<NodeId>,
     ) {
@@ -358,8 +354,8 @@ impl RemoteControlClient {
         &self,
         last_seen: u64,
         writes: &[KeyWrite],
-        leader_hint: Option<(NodeId, SocketAddr)>,
-        intra_leader_hint: Option<(NodeId, SocketAddr)>,
+        leader_hint: Option<(NodeId, String)>,
+        intra_leader_hint: Option<(NodeId, String)>,
         watermark: u64,
         control_voters: BTreeSet<NodeId>,
     ) -> bool {
@@ -415,7 +411,7 @@ impl RemoteControlClient {
         if let Some(addr) = self.leader_addr_hint() {
             candidates.push(addr);
         }
-        candidates.extend(self.seeds.iter().copied());
+        candidates.extend(self.seeds.iter().cloned());
         for addr in candidates {
             if let ClientResponse::Status {
                 metadata,
@@ -505,7 +501,7 @@ impl ControlHandle {
     /// node, since it comes straight off the same `Status` reply that filled
     /// the mirror, whereas `route_addr` needs the leader's address to have
     /// separately synced into the replicated node-address book.
-    pub(crate) fn leader_addr_hint(&self) -> Option<SocketAddr> {
+    pub(crate) fn leader_addr_hint(&self) -> Option<String> {
         match self {
             Self::Local(_) => None,
             Self::Remote(remote) => remote.leader_addr_hint(),
@@ -517,7 +513,7 @@ impl ControlHandle {
     /// `remote_metadata_watch_loop`'s dial candidates), never surfaced to a
     /// human. Always `None` for `Local`, same reasoning as
     /// `leader_addr_hint`.
-    pub(crate) fn intra_leader_addr_hint(&self) -> Option<SocketAddr> {
+    pub(crate) fn intra_leader_addr_hint(&self) -> Option<String> {
         match self {
             Self::Local(_) => None,
             Self::Remote(remote) => remote.intra_leader_addr_hint(),

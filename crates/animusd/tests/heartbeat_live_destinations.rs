@@ -174,15 +174,15 @@ async fn join_control_nonvoter(
                 continue;
             }
         };
-        let mut client_route: std::collections::BTreeMap<animus_env::NodeId, SocketAddr> =
+        let mut client_route: std::collections::BTreeMap<animus_env::NodeId, String> =
             std::collections::BTreeMap::new();
         for (i, a) in config.nodes.iter().enumerate() {
-            client_route.insert(animusd::config::node_id(i), a.client);
+            client_route.insert(animusd::config::node_id(i), a.client.to_string());
         }
-        let mut intra_route: std::collections::BTreeMap<animus_env::NodeId, SocketAddr> =
+        let mut intra_route: std::collections::BTreeMap<animus_env::NodeId, String> =
             std::collections::BTreeMap::new();
         for (i, a) in config.nodes.iter().enumerate() {
-            intra_route.insert(animusd::config::node_id(i), a.intra);
+            intra_route.insert(animusd::config::node_id(i), a.intra.to_string());
         }
         let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
         let node = bound

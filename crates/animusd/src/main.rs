@@ -555,6 +555,32 @@ fn stream_seal_knobs(bytes: Option<u64>, age_secs: Option<u64>) -> animusd::Stre
     }
 }
 
+/// Parse a `--seed ADDR[,ADDR...]` CLI value into the `host:port` strings
+/// `run_node_join`/`run_node_data_join` dial (ADR 0060's advertise/dial
+/// split): each comma-separated entry is carried through as-is rather than
+/// `.parse::<SocketAddr>()`'d — a seed may name a hostname (a Kubernetes
+/// pod's stable DNS name) as well as a numeric address, and the only place
+/// that ever needs to resolve one is the actual connect call
+/// (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`). Still
+/// rejects an entry with no `:port` at all — a cheap shape check that names
+/// an obviously-wrong value at the CLI boundary rather than as an opaque
+/// connect failure deep in the join retry loop.
+fn parse_seed_arg(seed_arg: &str) -> Result<Vec<String>, String> {
+    seed_arg
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            if s.contains(':') {
+                Ok(s.to_string())
+            } else {
+                Err(format!(
+                    "invalid --seed address `{s}`: expected a `host:port` string"
+                ))
+            }
+        })
+        .collect()
+}
+
 /// [`animusd::SegmentStoreConfig`] from the optional `--segment-store` CLI
 /// value: absent selects the default `ClusterSegmentStore`; `dir:PATH` (the
 /// only recognized form) opts into a bare `FsSegmentStore` at `PATH`.
@@ -873,14 +899,7 @@ async fn run_data_join(
     backend: animusd::StorageBackend,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
 ) -> Result<(), String> {
-    let seeds: Vec<SocketAddr> = seed_arg
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<SocketAddr>()
-                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
+    let seeds: Vec<String> = parse_seed_arg(seed_arg)?;
     if seeds.is_empty() {
         return Err("data --seed requires at least one address".into());
     }
@@ -967,14 +986,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     }
 
     let seed_arg = seed_arg.ok_or("join requires --seed ADDR[,ADDR...]")?;
-    let seeds: Vec<SocketAddr> = seed_arg
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<SocketAddr>()
-                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
+    let seeds: Vec<String> = parse_seed_arg(&seed_arg)?;
     if seeds.is_empty() {
         return Err("join requires at least one --seed address".into());
     }

@@ -23,8 +23,6 @@
 //! entries for why that used to matter. The CP-route resolution below still
 //! must never forward to a non-leader while a local replica is still forming.
 
-use std::net::SocketAddr;
-
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
@@ -53,12 +51,12 @@ pub(crate) fn tablet_for_key<'a>(
 /// `ClientCtx::resolve_cp_route`): serve **locally**, **forward** to a known
 /// address, or **wait** for the local group to settle. Never forwards a CP op to
 /// a node that may not host the leader yet — see [`decide_cp_route`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteDecision {
     /// This node hosts the tablet's current leader — serve from it directly.
     Local,
     /// Forward to the leader's node at this client-API address.
-    Forward(SocketAddr),
+    Forward(String),
     /// No leader reachable yet (no local leader, no route, election did not
     /// settle) — wait and retry, never forward blindly.
     Wait,
@@ -93,10 +91,10 @@ pub(crate) enum RouteDecision {
 /// node's address.
 pub(crate) fn decide_cp_route(
     has_local_leader: bool,
-    forward_hint: Option<SocketAddr>,
+    forward_hint: Option<String>,
     has_local_replica: bool,
     is_replica: bool,
-    fallback_forward: Option<SocketAddr>,
+    fallback_forward: Option<String>,
 ) -> RouteDecision {
     if has_local_leader {
         return RouteDecision::Local;
@@ -137,7 +135,7 @@ const NOT_LEADER_REFUSAL_PREFIX: &str = "forwarded CP op: not the leader here";
 /// interoperate: an older receiver's bare refusal still parses (via
 /// [`parse_not_leader_refusal`]) as "no hint", and a non-`animusd` client
 /// just sees a slightly more detailed message.
-pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, SocketAddr)>) -> String {
+pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, String)>) -> String {
     match hint {
         Some((id, addr)) => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint={id}@{addr}"),
         None => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint=none"),
@@ -156,7 +154,7 @@ pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, SocketAddr)>) -> S
 /// known prefix that doesn't parse as either recognized shape falls back to
 /// "no hint" rather than panicking or, worse, silently routing a retry to a
 /// bogus address.
-pub(crate) fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, SocketAddr)>> {
+pub(crate) fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, String)>> {
     let suffix = msg.strip_prefix(NOT_LEADER_REFUSAL_PREFIX)?;
     let Some(hint_str) = suffix.strip_prefix("; leader_hint=") else {
         // Predates hinted refusals, or an unrecognized suffix shape — still a
@@ -167,13 +165,17 @@ pub(crate) fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, Sock
         return Some(None);
     }
     match hint_str.split_once('@') {
-        Some((id_str, addr_str)) => {
-            match (id_str.parse::<NodeId>(), addr_str.parse::<SocketAddr>()) {
-                (Ok(id), Ok(addr)) => Some(Some((id, addr))),
-                _ => Some(None),
-            }
-        }
-        None => Some(None),
+        // `addr_str` is a `host:port` string (numeric or a hostname, ADR
+        // 0060's advertise/dial split) — not a `SocketAddr` to parse
+        // anymore, just carried through verbatim. Still require a `:port`
+        // suffix as a cheap shape check: a garbled hint (no port at all)
+        // falls back to "no hint" rather than being carried through as an
+        // unusable dial target.
+        Some((id_str, addr_str)) if addr_str.contains(':') => match id_str.parse::<NodeId>() {
+            Ok(id) => Some(Some((id, addr_str.to_string()))),
+            Err(_) => Some(None),
+        },
+        _ => Some(None),
     }
 }
 
@@ -250,8 +252,8 @@ mod tests {
 
     // --- decide_cp_route -------------------------------------------------------
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
+    fn addr(port: u16) -> String {
+        format!("127.0.0.1:{port}")
     }
 
     #[test]

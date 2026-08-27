@@ -275,7 +275,7 @@ pub async fn join_fresh_deadline(
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
         match animusd::run_node_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             Some(id),
             addrs.clone(),
             &node_dir,
@@ -324,7 +324,7 @@ pub async fn join_data_fresh_deadline(
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             Some(id),
             addrs,
             &node_dir,
@@ -379,7 +379,7 @@ pub async fn join_allocated_fresh_deadline(
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             None,
             addrs.clone(),
             &node_dir,
@@ -427,7 +427,7 @@ pub async fn join_data_allocated_fresh_deadline(
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
         match animusd::run_node_data_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             None,
             addrs,
             &node_dir,

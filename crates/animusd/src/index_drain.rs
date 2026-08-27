@@ -4069,9 +4069,12 @@ mod stream_sealer_tests {
             )
         });
         let mut client_route = std::collections::BTreeMap::new();
-        client_route.insert(crate::config::node_id(0), config.nodes[0].client);
+        client_route.insert(
+            crate::config::node_id(0),
+            config.nodes[0].client.to_string(),
+        );
         let mut intra_route = std::collections::BTreeMap::new();
-        intra_route.insert(crate::config::node_id(0), config.nodes[0].intra);
+        intra_route.insert(crate::config::node_id(0), config.nodes[0].intra.to_string());
         let node = bound
             .start_with_growth(
                 config.peer_book(),

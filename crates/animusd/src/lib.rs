@@ -1595,7 +1595,7 @@ enum CpRoute {
     /// This node hosts the current leader — serve from `leader` directly.
     Local(CpGroup),
     /// Forward to the leader's node at this client-API address (ADR 0017 #3b).
-    Forward(SocketAddr),
+    Forward(String),
     /// No leader reachable (no local leader, no route, election did not settle).
     None,
 }
@@ -2848,13 +2848,13 @@ pub enum ClientResponse {
     Status {
         metadata: Metadata,
         #[serde(default)]
-        leader_hint: Option<(NodeId, SocketAddr)>,
+        leader_hint: Option<(NodeId, String)>,
         /// The intra-cluster dual of `leader_hint` (ADR 0047) — machine-
         /// relay-only, never surfaced to a human (see the root `CLAUDE.md`'s
         /// hint-field-conflation lesson). `#[serde(default)]`, same
         /// robustness pattern as `leader_hint`.
         #[serde(default)]
-        intra_leader_hint: Option<(NodeId, SocketAddr)>,
+        intra_leader_hint: Option<(NodeId, String)>,
         #[serde(default)]
         watermark: u64,
         #[serde(default)]
@@ -2917,7 +2917,7 @@ pub enum ClientResponse {
     JoinInfo {
         control_ids: Vec<NodeId>,
         peers: BTreeMap<NodeId, SocketAddr>,
-        client_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
         /// The answering node's live intra-cluster routing table (ADR 0047),
         /// paralleling `client_route` — the joining node seeds its own
         /// `ctx.intra_route` from this, load-bearing for the exact same
@@ -2925,7 +2925,7 @@ pub enum ClientResponse {
         /// `BoundNode::start_with_streams` resolves `ctx.intra_addr(id)`
         /// synchronously, before this node's own `intra_route_sync_loop` has
         /// had a chance to tick.
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        intra_route: BTreeMap<NodeId, String>,
         admin_addrs: Vec<SocketAddr>,
     },
     /// **Incremental long-poll reply to
@@ -2956,11 +2956,11 @@ pub enum ClientResponse {
     MetadataDelta {
         writes: Vec<animus_control::mirror::KeyWrite>,
         watermark: u64,
-        leader_hint: Option<(NodeId, SocketAddr)>,
+        leader_hint: Option<(NodeId, String)>,
         /// The intra-cluster dual of `leader_hint` (ADR 0047) — see
         /// `Status`'s own field doc.
         #[serde(default)]
-        intra_leader_hint: Option<(NodeId, SocketAddr)>,
+        intra_leader_hint: Option<(NodeId, String)>,
         control_voters: BTreeSet<NodeId>,
     },
     /// Reply to [`Txn`](ClientRequest::Txn): the transaction committed at
@@ -4206,8 +4206,8 @@ fn spawn_common_tail(
     edge: ClusterEdgeState,
     data: Option<DataRole>,
     admin_info: Arc<AdminInfo>,
-    client_route: BTreeMap<NodeId, SocketAddr>,
-    intra_route: BTreeMap<NodeId, SocketAddr>,
+    client_route: BTreeMap<NodeId, String>,
+    intra_route: BTreeMap<NodeId, String>,
     self_addrs: (NodeId, NodeAddrs),
     client_listener: TcpListener,
     admin_listener: TcpListener,
@@ -4422,8 +4422,8 @@ impl BoundNode {
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -4475,8 +4475,8 @@ impl BoundNode {
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -4569,8 +4569,8 @@ impl BoundNode {
         data_ids: Vec<NodeId>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -4908,7 +4908,10 @@ impl BoundNode {
         tasks.push(tokio::spawn(peer_sync_loop(
             ctx.clone(),
             sync_env,
-            static_peers.clone(),
+            static_peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
         )));
 
         // **Control-plane-follower-less growth node mirror** (ADR 0030): this
@@ -4931,7 +4934,7 @@ impl BoundNode {
         // read via `effective_metadata()`. A no-op (empty seed list, loop
         // returns immediately) for every other node.
         if !control_ids.contains(&self.id) {
-            let seeds: Vec<SocketAddr> = control_ids
+            let seeds: Vec<String> = control_ids
                 .iter()
                 .filter_map(|id| ctx.intra_addr(id.clone()))
                 .collect();
@@ -5675,8 +5678,8 @@ impl BoundControlNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
@@ -5799,7 +5802,14 @@ impl BoundControlNode {
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
         // exactly as much as a combined node does, to reach a runtime-added
         // control voter's address.
-        tasks.push(tokio::spawn(peer_sync_loop(ctx.clone(), sync_env, peers)));
+        tasks.push(tokio::spawn(peer_sync_loop(
+            ctx.clone(),
+            sync_env,
+            peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
+        )));
 
         // The segment janitor (ADR 0043 §A9, round-3 PR7): a control-only
         // node can genuinely become the control-plane leader (ADR 0035
@@ -5991,11 +6001,11 @@ impl BoundDataNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
-        control_seeds: Vec<SocketAddr>,
+        control_seeds: Vec<String>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -6026,11 +6036,11 @@ impl BoundDataNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
-        control_seeds: Vec<SocketAddr>,
+        control_seeds: Vec<String>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -6083,11 +6093,11 @@ impl BoundDataNode {
         self,
         peers: BTreeMap<NodeId, SocketAddr>,
         control_ids: Vec<NodeId>,
-        control_seeds: Vec<SocketAddr>,
+        control_seeds: Vec<String>,
         backend: StorageBackend,
         edge: ClusterEdgeState,
-        client_route: BTreeMap<NodeId, SocketAddr>,
-        intra_route: BTreeMap<NodeId, SocketAddr>,
+        client_route: BTreeMap<NodeId, String>,
+        intra_route: BTreeMap<NodeId, String>,
         auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
@@ -6260,7 +6270,10 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(peer_sync_loop(
             ctx.clone(),
             sync_env,
-            static_peers.clone(),
+            static_peers
+                .iter()
+                .map(|(id, addr)| (id.clone(), addr.to_string()))
+                .collect(),
         )));
 
         // The generalized mirror + leader-hint sync loop (ADR 0035 §4) —
@@ -7294,7 +7307,7 @@ pub(crate) struct ClientCtx {
     /// connection) observes the update; read via [`route_addr`](Self::route_addr)
     /// / [`route_snapshot`](Self::route_snapshot), never locked across an
     /// `.await`.
-    client_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
+    client_route: Arc<Mutex<BTreeMap<NodeId, String>>>,
     /// **Intra-cluster routing table (ADR 0047)** — the exact `client_route`
     /// shape above, mirrored for the intra port: each CP group member id →
     /// the **intra** address of its hosting node. Kept live by
@@ -7308,7 +7321,7 @@ pub(crate) struct ClientCtx {
     /// Human-facing consumers (`not_leader_error`, the admin dashboard's
     /// `leader_hint` display) keep reading `client_route`/`leader_addr_hint`
     /// unchanged — see the root `CLAUDE.md`'s hint-field-conflation lesson.
-    intra_route: Arc<Mutex<BTreeMap<NodeId, SocketAddr>>>,
+    intra_route: Arc<Mutex<BTreeMap<NodeId, String>>>,
     /// This node's identity + bound addresses for the admin `/admin/config` view
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
@@ -7530,19 +7543,19 @@ impl ClientCtx {
     /// PR1) — a single lookup into the live [`client_route`](Self::client_route)
     /// map, kept fresh by [`route_sync_loop`]. Never holds the lock across an
     /// `.await`.
-    fn route_addr(&self, id: NodeId) -> Option<SocketAddr> {
+    fn route_addr(&self, id: NodeId) -> Option<String> {
         self.client_route
             .lock()
             .expect("client route poisoned")
             .get(&id)
-            .copied()
+            .cloned()
     }
 
     /// A clone of the whole live `client_route` map (ADR 0032 PR1), for a
     /// caller that needs to search/iterate it — cloning out under the lock
     /// keeps every subsequent lookup lock-free (and safe to hold across an
     /// `.await`).
-    fn route_snapshot(&self) -> BTreeMap<NodeId, SocketAddr> {
+    fn route_snapshot(&self) -> BTreeMap<NodeId, String> {
         self.client_route
             .lock()
             .expect("client route poisoned")
@@ -7556,7 +7569,7 @@ impl ClientCtx {
     /// the *answering* side. `None` if this node doesn't currently know a
     /// leader (mid-election, or — for this node itself, if it's a growth/data
     /// node — no leader signal at all).
-    fn control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
+    fn control_leader_hint(&self) -> Option<(NodeId, String)> {
         let id = self.control.leader()?;
         let addr = self.route_addr(id.clone())?;
         Some((id, addr))
@@ -7569,17 +7582,17 @@ impl ClientCtx {
     /// `route_addr`, since the receiving end (`cp_serve_forwarded`, the
     /// relayed `ProposeSchema`) is only ever reachable on the intra listener.
     /// Kept fresh by [`intra_route_sync_loop`].
-    fn intra_addr(&self, id: NodeId) -> Option<SocketAddr> {
+    fn intra_addr(&self, id: NodeId) -> Option<String> {
         self.intra_route
             .lock()
             .expect("intra route poisoned")
             .get(&id)
-            .copied()
+            .cloned()
     }
 
     /// The [`route_snapshot`](Self::route_snapshot) sibling for the intra
     /// routing table (ADR 0047).
-    fn intra_route_snapshot(&self) -> BTreeMap<NodeId, SocketAddr> {
+    fn intra_route_snapshot(&self) -> BTreeMap<NodeId, String> {
         self.intra_route
             .lock()
             .expect("intra route poisoned")
@@ -7594,7 +7607,7 @@ impl ClientCtx {
     /// relay-only — never surfaced to a human (see the root `CLAUDE.md`'s
     /// hint-field-conflation lesson: anything a human reads keeps using
     /// `control_leader_hint`/`leader_hint`).
-    fn intra_control_leader_hint(&self) -> Option<(NodeId, SocketAddr)> {
+    fn intra_control_leader_hint(&self) -> Option<(NodeId, String)> {
         let id = self.control.leader()?;
         let addr = self.intra_addr(id.clone())?;
         Some((id, addr))
@@ -7749,8 +7762,8 @@ impl ClientCtx {
             let fallback = replicas
                 .into_iter()
                 .flatten()
-                .find_map(|id| route.get(id).copied())
-                .or_else(|| route.values().next().copied());
+                .find_map(|id| route.get(id).cloned())
+                .or_else(|| route.values().next().cloned());
             (is_replica, fallback)
         };
         // `has_local_leader: false` and `forward_hint: None` here are exactly the
@@ -7845,7 +7858,7 @@ impl ClientCtx {
     /// different nodes, each answering locally, not from a coordinator fanning
     /// out. A replica-picking policy (latency, load) is a later question and a
     /// bigger one; this returns a correct, stable answer until it is asked.
-    fn cp_stale_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+    fn cp_stale_forward_target(&self, tablet: TabletId) -> Option<String> {
         let meta = self.effective_metadata();
         let replicas = &meta.tablets.get(&tablet)?.replicas;
         let me = self.data.as_ref().map(|d| &d.base_id);
@@ -7853,7 +7866,7 @@ impl ClientCtx {
         replicas
             .iter()
             .filter(|id| Some(*id) != me)
-            .find_map(|id| route.get(id).copied())
+            .find_map(|id| route.get(id).cloned())
     }
 
     /// One-shot `Forwarded` relay for an eventually-consistent read (ADR
@@ -7866,7 +7879,7 @@ impl ClientCtx {
     /// "not cheaply, then", which is a fallback signal, not something to
     /// retry. One connection, one reply, [`STALE_READ_FORWARD_TIMEOUT`],
     /// no retries, no waiting out an election.
-    async fn relay_stale_read(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
+    async fn relay_stale_read(&self, addr: String, request: ClientRequest) -> ClientResponse {
         relay_request_with_timeout(
             addr,
             &ClientRequest::Forwarded {
@@ -11167,7 +11180,7 @@ impl ClientCtx {
     /// forwarded op always hosts *some* local replica of the tablet (that's
     /// why it was targeted), so its own knowledge of the group's leader is
     /// exactly the hint a forwarder chasing a wrong first guess needs.
-    fn cp_leader_hint(&self, tablet: TabletId) -> Option<(NodeId, SocketAddr)> {
+    fn cp_leader_hint(&self, tablet: TabletId) -> Option<(NodeId, String)> {
         // Since ADR 0026 Stage B a tablet's CP group member id **is** simply the
         // base `raftkv` id, so the local replica's leader hint is already an
         // `intra_route` key — no more base<->member translation needed.
@@ -11182,7 +11195,7 @@ impl ClientCtx {
     /// [`cp_leader_hint`](Self::cp_leader_hint) (the caller waits rather than
     /// guessing when there is no hint yet, so it never forwards a CP op to a
     /// non-leader, including itself).
-    fn cp_forward_target(&self, tablet: TabletId) -> Option<SocketAddr> {
+    fn cp_forward_target(&self, tablet: TabletId) -> Option<String> {
         self.cp_leader_hint(tablet).map(|(_, addr)| addr)
     }
 
@@ -11206,8 +11219,8 @@ impl ClientCtx {
     fn other_tablet_replica_addr(
         &self,
         tablet: TabletId,
-        tried: &BTreeSet<SocketAddr>,
-    ) -> Option<SocketAddr> {
+        tried: &BTreeSet<String>,
+    ) -> Option<String> {
         let meta = self.effective_metadata();
         let replicas = meta.tablets.get(&tablet)?.replicas.clone();
         // Intra-flavored (ADR 0047): this is a forwarding fallback, same as
@@ -11215,7 +11228,7 @@ impl ClientCtx {
         let route = self.intra_route_snapshot();
         replicas
             .into_iter()
-            .find_map(|id| route.get(&id).copied().filter(|a| !tried.contains(a)))
+            .find_map(|id| route.get(&id).cloned().filter(|a| !tried.contains(a)))
     }
 
     /// Forward a CP op for `(table, key)` to `addr` (wrapped so the receiver
@@ -11261,7 +11274,7 @@ impl ClientCtx {
         &self,
         table: &str,
         key: &[u8],
-        addr: SocketAddr,
+        addr: String,
         request: ClientRequest,
     ) -> ClientResponse {
         let tablet = self.tablet_for(table, key);
@@ -11292,17 +11305,17 @@ impl ClientCtx {
     async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
-        addr: SocketAddr,
+        addr: String,
         request: ClientRequest,
     ) -> ClientResponse {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
-        let mut tried: BTreeSet<SocketAddr> = BTreeSet::new();
+        let mut tried: BTreeSet<String> = BTreeSet::new();
         let mut next = addr;
         loop {
-            tried.insert(next);
+            tried.insert(next.clone());
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let resp = relay_request_with_timeout(
-                next,
+                next.clone(),
                 &ClientRequest::Forwarded {
                     request: Box::new(request.clone()),
                     traceparent: crate::otel::current_traceparent(),
@@ -11350,7 +11363,7 @@ impl ClientCtx {
     /// wrapper over the free [`relay_request`] (ADR 0035 PR4 — extracted so
     /// [`control_handle::RemoteControlClient`], which has no `ClientCtx` of
     /// its own, can use the identical wire primitive).
-    async fn relay(&self, addr: SocketAddr, request: ClientRequest) -> ClientResponse {
+    async fn relay(&self, addr: String, request: ClientRequest) -> ClientResponse {
         relay_request(addr, &request).await
     }
 
@@ -11423,7 +11436,7 @@ impl ClientCtx {
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
         for addr in self.intra_route_snapshot().into_values() {
-            if addr == self.admin.intra_addr {
+            if addr == self.admin.intra_addr.to_string() {
                 continue;
             }
             if !matches!(
@@ -12973,28 +12986,21 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// of the real cluster's `cp_member_addrs`/`node_addrs` — instead of its own
 /// never-replicated local raft; every other node is unaffected (`effective_metadata`
 /// passes through to `raft.metadata()` there).
-async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<NodeId, SocketAddr>) {
+async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_peers.clone();
         let meta = ctx.effective_metadata();
+        // `Metadata`'s own address book is already `host:port` strings —
+        // ProdEnv's peer book is too (the advertise/dial split groundwork),
+        // so both overlays are now straight inserts, no parse/re-stringify
+        // boundary crossing at every tick.
         for (id, addr) in meta.cp_member_addrs {
-            if let Ok(sa) = addr.parse::<SocketAddr>() {
-                book.insert(id, sa);
-            }
+            book.insert(id, addr);
         }
         for (id, addrs) in meta.node_addrs {
-            if let Ok(sa) = addrs.internal.parse::<SocketAddr>() {
-                book.insert(id, sa);
-            }
+            book.insert(id, addrs.internal);
         }
-        // ProdEnv's own peer book is now string-keyed (advertise/dial split
-        // groundwork) — convert at this boundary until a later change moves
-        // this loop's `book` itself onto strings.
-        env.set_peers(
-            book.iter()
-                .map(|(id, addr)| (id.clone(), addr.to_string()))
-                .collect(),
-        );
+        env.set_peers(book);
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
     }
 }
@@ -13009,15 +13015,14 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
 /// same static-base-∪-replicated-overlay shape, reads
 /// [`ClientCtx::effective_metadata`] so a control-plane-follower-less growth
 /// node (ADR 0030) syncs off its own remote mirror instead of its
-/// never-replicated local raft. A `node_addrs` entry whose `client` address
-/// fails to parse is skipped.
-async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAddr>) {
+/// never-replicated local raft. `client_route`'s value is now the same
+/// `host:port` string `Metadata.node_addrs[*].client` already carries — no
+/// parse/re-stringify boundary crossing left at this join point.
+async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_route.clone();
         for (id, addrs) in ctx.effective_metadata().node_addrs {
-            if let Ok(sa) = addrs.client.parse::<SocketAddr>() {
-                book.insert(id, sa);
-            }
+            book.insert(id, addrs.client);
         }
         *ctx.client_route.lock().expect("client route poisoned") = book;
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
@@ -13038,13 +13043,11 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAd
 /// node's very first mirror-poll attempt see zero addresses and never
 /// recover (this loop's *next* tick can't help, since `remote_metadata_sync_
 /// loop` captures its `seeds` argument once, at spawn time).
-async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, SocketAddr>) {
+async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_route.clone();
         for (id, addrs) in ctx.effective_metadata().node_addrs {
-            if let Ok(sa) = addrs.intra.parse::<SocketAddr>() {
-                book.insert(id, sa);
-            }
+            book.insert(id, addrs.intra);
         }
         *ctx.intra_route.lock().expect("intra route poisoned") = book;
         tokio::time::sleep(PEER_SYNC_INTERVAL).await;
@@ -13139,7 +13142,7 @@ const REMOTE_WATCH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// `seeds` is empty — the case for every node that *is* a real control-group
 /// voter, since `effective_metadata` then passes straight through to
 /// `self.control.metadata_cached()` and nothing needs mirroring.
-async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
+async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     if seeds.is_empty() {
         return;
     }
@@ -13173,7 +13176,7 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<SocketAddr>) {
 /// transport level, a plain `Status` poll plus [`REMOTE_WATCH_RETRY_BACKOFF`]
 /// always separates consecutive attempts — there is no code path that retries
 /// immediately in a tight loop.
-async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<SocketAddr>) {
+async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<String>) {
     loop {
         let last_seen = remote.metadata_watch().latest();
         let mut candidates = Vec::with_capacity(seeds.len() + 1);
@@ -13185,7 +13188,7 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
         if let Some(addr) = remote.intra_leader_addr_hint() {
             candidates.push(addr);
         }
-        candidates.extend(seeds.iter().copied());
+        candidates.extend(seeds.iter().cloned());
 
         let mut synced = false;
         for addr in candidates {
@@ -13251,14 +13254,14 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Sock
         // `ClientCtx::watch_metadata`'s doc). Fall back to a plain `Status`
         // poll before retrying, rather than hammering unreachable seeds in a
         // tight loop.
-        for &addr in &seeds {
+        for addr in &seeds {
             if let ClientResponse::Status {
                 metadata,
                 leader_hint,
                 intra_leader_hint,
                 watermark,
                 control_voters,
-            } = relay_request(addr, &ClientRequest::Status).await
+            } = relay_request(addr.clone(), &ClientRequest::Status).await
             {
                 remote.observe(
                     metadata,
@@ -16026,15 +16029,15 @@ async fn start_cluster_inner(
     // it live thereafter by overlaying `Metadata.node_addrs[*].client` (ADR
     // 0032 PR1) — so a node grown into the cluster later is still reachable
     // from every original node.
-    let client_route: BTreeMap<NodeId, SocketAddr> = bound
+    let client_route: BTreeMap<NodeId, String> = bound
         .iter()
-        .map(|b| (b.id.clone(), b.client_addr))
+        .map(|b| (b.id.clone(), b.client_addr.to_string()))
         .collect();
     // The `intra_route` sibling (ADR 0047) — identical static-seed shape,
     // sourced from each bound node's intra address instead of its client one.
-    let intra_route: BTreeMap<NodeId, SocketAddr> = bound
+    let intra_route: BTreeMap<NodeId, String> = bound
         .iter()
-        .map(|b| (b.id.clone(), b.intra_addr()))
+        .map(|b| (b.id.clone(), b.intra_addr().to_string()))
         .collect();
     // Every node's admin address, so each node's dashboard (ADR 0021) can fan out
     // to the whole in-process cluster.
@@ -16239,29 +16242,32 @@ pub async fn start_split_cluster_with_growth(
     // Cross-node routing (ADR 0017 #3b / ADR 0013): every node's id resolves
     // to its node's client API address, exactly like
     // `run_node_control`/`run_node_data`'s per-process assembly.
-    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for b in &control_bound {
-        client_route.insert(b.id.clone(), b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr.to_string());
     }
     for b in &data_bound {
-        client_route.insert(b.id.clone(), b.client_addr);
+        client_route.insert(b.id.clone(), b.client_addr.to_string());
     }
 
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra_addr`
     // instead of `.client_addr`.
-    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for b in &control_bound {
-        intra_route.insert(b.id.clone(), b.intra_addr);
+        intra_route.insert(b.id.clone(), b.intra_addr.to_string());
     }
     for b in &data_bound {
-        intra_route.insert(b.id.clone(), b.intra_addr);
+        intra_route.insert(b.id.clone(), b.intra_addr.to_string());
     }
 
     // The control deployment's **intra** addresses (ADR 0047) — the
     // discovery root each data node's `ControlHandle::Remote` mirrors from
     // (`WatchMetadata` is intra-only, so this must not be the client
     // address).
-    let control_intra_addrs: Vec<SocketAddr> = control_bound.iter().map(|b| b.intra_addr).collect();
+    let control_intra_addrs: Vec<String> = control_bound
+        .iter()
+        .map(|b| b.intra_addr.to_string())
+        .collect();
 
     // Every node's admin address, so each node's dashboard (ADR 0021) fans
     // out to the whole split deployment.
@@ -16581,15 +16587,15 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // Cross-process routing (ADR 0017 #3b): map each node's one id to that
     // node's **client API** address, so an op landing on a node that isn't
     // the relevant leader forwards to the leader's node.
-    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), addrs.client);
+        client_route.insert(config::node_id(i), addrs.client.to_string());
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
-    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), addrs.intra);
+        intra_route.insert(config::node_id(i), addrs.intra.to_string());
     }
     // Every node's admin address from the shared config, so this node's dashboard
     // (ADR 0021) can fan out to the whole cluster.
@@ -16733,15 +16739,15 @@ pub async fn run_node_control_with_orphan_sweep_after(
     // its client API address, so a data op or a schema-DDL relay landing on
     // this control node forwards to the right node — the same shape
     // `run_node_with` builds.
-    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), a.client);
+        client_route.insert(config::node_id(i), a.client.to_string());
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
-    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), a.intra);
+        intra_route.insert(config::node_id(i), a.intra.to_string());
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard (ADR 0021) can fan out to the whole cluster (control and data
@@ -16819,24 +16825,24 @@ pub async fn run_node_data(
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
     // intra-only, so this must be the intra address, not the client one), a
     // wholly different address axis from the internal env peer book below.
-    let control_intra_addrs: Vec<SocketAddr> = config
+    let control_intra_addrs: Vec<String> = config
         .nodes
         .iter()
         .filter(|a| a.role.has_control())
-        .map(|a| a.intra)
+        .map(|a| a.intra.to_string())
         .collect();
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address — the same shape `run_node_control` builds.
-    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), a.client);
+        client_route.insert(config::node_id(i), a.client.to_string());
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`.
-    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, a) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), a.intra);
+        intra_route.insert(config::node_id(i), a.intra.to_string());
     }
     // Every node's admin address from the shared config, so this node's
     // dashboard fan-out (ADR 0021) covers the whole split deployment.
@@ -16932,17 +16938,17 @@ pub async fn run_node_growth(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
     let bound = Node::bind(config::node_id(index), addrs, dir).await?;
-    let mut client_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        client_route.insert(config::node_id(i), addrs.client);
+        client_route.insert(config::node_id(i), addrs.client.to_string());
     }
     // The `intra_route` sibling (ADR 0047) — identical shape, `.intra`
     // instead of `.client`; this is what makes the growth-node mirror's own
     // seed-building (`start_with_streams`'s `ctx.intra_addr(id)` call) resolve
     // correctly from this node's very first tick.
-    let mut intra_route: BTreeMap<NodeId, SocketAddr> = BTreeMap::new();
+    let mut intra_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
-        intra_route.insert(config::node_id(i), addrs.intra);
+        intra_route.insert(config::node_id(i), addrs.intra.to_string());
     }
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
     // `bootstrap` must never auto-register this growth node itself (it
@@ -16986,10 +16992,10 @@ const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
 /// first non-[`Error`](ClientResponse::Error) reply. Standalone (not a
 /// [`ClientCtx`] method) because a joining node has no context yet — this is
 /// exactly what it's discovering.
-async fn join_request(seeds: &[SocketAddr], request: &ClientRequest) -> Option<ClientResponse> {
-    for &addr in seeds {
+async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<ClientResponse> {
+    for addr in seeds {
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
-            let mut stream = TcpStream::connect(addr).await.ok()?;
+            let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
             write_frame(&mut stream, request).await.ok()?;
             read_frame::<ClientResponse>(&mut stream).await.ok()?
         })
@@ -17009,7 +17015,7 @@ async fn join_request(seeds: &[SocketAddr], request: &ClientRequest) -> Option<C
 /// # Errors
 /// A `TimedOut` error if no seed answers within `budget`.
 async fn poll_seeds_for(
-    seeds: &[SocketAddr],
+    seeds: &[String],
     request: &ClientRequest,
     budget: Duration,
 ) -> std::io::Result<ClientResponse> {
@@ -17074,7 +17080,7 @@ async fn poll_seeds_for(
 /// with a different existing registration, or (as [`run_node_growth`]) a
 /// bind / engine-open failure.
 pub async fn run_node_join(
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<String>,
     id: Option<NodeId>,
     addrs: RoleAddrs,
     dir: &Path,
@@ -17141,18 +17147,18 @@ async fn finish_combined_join(
     my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
-    mut client_route: BTreeMap<NodeId, SocketAddr>,
-    mut intra_route: BTreeMap<NodeId, SocketAddr>,
+    mut client_route: BTreeMap<NodeId, String>,
+    mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
     for (id, addr) in bound.peer_entries() {
         peers.insert(id, addr);
     }
-    client_route.insert(my_id.clone(), my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr.to_string());
     // The `intra_route` sibling (ADR 0047) — see `ClientResponse::JoinInfo`'s
     // own field doc for why this must be a real, discovered seed, not empty.
-    intra_route.insert(my_id, my_intra_addr);
+    intra_route.insert(my_id, my_intra_addr.to_string());
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -17181,12 +17187,12 @@ async fn finish_combined_join(
 /// polls `seeds` for a [`ClientResponse::JoinInfo`] reply within
 /// [`JOIN_DISCOVERY_BUDGET`].
 async fn discover_join_info(
-    seeds: &[SocketAddr],
+    seeds: &[String],
 ) -> std::io::Result<(
     Vec<NodeId>,
     BTreeMap<NodeId, SocketAddr>,
-    BTreeMap<NodeId, SocketAddr>,
-    BTreeMap<NodeId, SocketAddr>,
+    BTreeMap<NodeId, String>,
+    BTreeMap<NodeId, String>,
     Vec<SocketAddr>,
 )> {
     match poll_seeds_for(seeds, &ClientRequest::JoinInfo, JOIN_DISCOVERY_BUDGET).await? {
@@ -17219,7 +17225,7 @@ const MAX_JOIN_MINT_ATTEMPTS: u32 = MAX_MINT_ATTEMPTS;
 /// outcome `register_node` confirms — `Registered` once it holds exactly
 /// `addrs`, `Collision` once it visibly holds something else.
 async fn register_node_over_wire(
-    seeds: &[SocketAddr],
+    seeds: &[String],
     node: &NodeId,
     addrs: &NodeAddrs,
     labels: &BTreeMap<String, String>,
@@ -17267,7 +17273,7 @@ async fn register_node_over_wire(
 /// needed — a 128-bit mint colliding once is already vanishing, so this
 /// bound only guards against a genuine bug looping forever).
 async fn claim_join_identity(
-    seeds: &[SocketAddr],
+    seeds: &[String],
     explicit_id: Option<NodeId>,
     addrs: &NodeAddrs,
     labels: &BTreeMap<String, String>,
@@ -17327,7 +17333,7 @@ async fn claim_join_identity(
 /// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if an explicit `--id` collides
 /// with a different existing registration, or a bind / engine-open failure.
 pub async fn run_node_data_join(
-    seeds: Vec<SocketAddr>,
+    seeds: Vec<String>,
     id: Option<NodeId>,
     addrs: RoleAddrs,
     dir: &Path,
@@ -17387,8 +17393,8 @@ async fn finish_data_join(
     my_intra_addr: SocketAddr,
     original_control_ids: Vec<NodeId>,
     mut peers: BTreeMap<NodeId, SocketAddr>,
-    mut client_route: BTreeMap<NodeId, SocketAddr>,
-    mut intra_route: BTreeMap<NodeId, SocketAddr>,
+    mut client_route: BTreeMap<NodeId, String>,
+    mut intra_route: BTreeMap<NodeId, String>,
     mut admin_addrs: Vec<SocketAddr>,
     backend: StorageBackend,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
@@ -17397,10 +17403,10 @@ async fn finish_data_join(
     // peer entry, no control id of its own to add).
     let (peer_id, peer_addr) = bound.peer_entry();
     peers.insert(peer_id, peer_addr);
-    client_route.insert(my_id.clone(), my_client_addr);
+    client_route.insert(my_id.clone(), my_client_addr.to_string());
     // The `intra_route` sibling (ADR 0047) — see `finish_combined_join`'s
     // identical treatment.
-    intra_route.insert(my_id, my_intra_addr);
+    intra_route.insert(my_id, my_intra_addr.to_string());
     if !admin_addrs.contains(&my_admin_addr) {
         admin_addrs.push(my_admin_addr);
     }
@@ -17409,9 +17415,9 @@ async fn finish_data_join(
     // is intra-only) — the same derivation `run_node_data` does from a static
     // `ClusterConfig`, here from the merged, discovery-built `intra_route`
     // instead.
-    let control_seeds: Vec<SocketAddr> = original_control_ids
+    let control_seeds: Vec<String> = original_control_ids
         .iter()
-        .filter_map(|id| intra_route.get(id).copied())
+        .filter_map(|id| intra_route.get(id).cloned())
         .collect();
 
     // Calls `start_data_with_growth` directly (skipping the layered wrapper
@@ -17466,7 +17472,7 @@ pub const MAX_FRAME_LEN: usize = 64 << 20;
 /// of its own to reach through, but needs the exact same wire primitive every
 /// other cross-node relay in this crate uses — [`ClientCtx::relay`] is now a
 /// thin wrapper over this.
-pub(crate) async fn relay_request(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
+pub(crate) async fn relay_request(addr: String, request: &ClientRequest) -> ClientResponse {
     relay_request_with_timeout(addr, request, CLIENT_TIMEOUT).await
 }
 
@@ -17477,12 +17483,12 @@ pub(crate) async fn relay_request(addr: SocketAddr, request: &ClientRequest) -> 
 /// [`WATCH_METADATA_SERVER_TIMEOUT`] bound by a comfortable margin; reusing
 /// the generic [`CLIENT_TIMEOUT`] here would race the server's own reply.
 async fn relay_request_with_timeout(
-    addr: SocketAddr,
+    addr: String,
     request: &ClientRequest,
     timeout: Duration,
 ) -> ClientResponse {
     match tokio::time::timeout(timeout, async {
-        let mut stream = TcpStream::connect(addr).await.ok()?;
+        let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
         write_frame(&mut stream, request).await.ok()?;
         read_frame::<ClientResponse>(&mut stream).await.ok()?
     })
