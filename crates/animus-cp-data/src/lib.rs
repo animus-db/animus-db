@@ -1392,7 +1392,7 @@ pub struct IntentInfo {
 /// [`RaftKvNode::txn_record_view`], carrying everything
 /// `animusd::ClientCtx::txn_recover` needs to drive the push protocol
 /// without this crate exposing its internal record representation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxnRecordView {
     pub status: TxnDecisionStatus,
     /// Every key this transaction staged anywhere, as `(table, span)` pairs
@@ -3036,20 +3036,40 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// §2/PR5): like [`txn_status_local`](Self::txn_status_local), but also
     /// returns `intent_spans`/`created_ts` — everything a recovery pusher
     /// needs to verify every participant and, once decided, resolve every
-    /// one of them (see [`TxnRecordView`]'s doc). Same ReadIndex barrier +
-    /// `None` contract as `txn_status_local`.
-    pub async fn txn_record_view(&self, record_key: &[u8]) -> Option<TxnRecordView> {
+    /// one of them (see [`TxnRecordView`]'s doc).
+    ///
+    /// **`Option<Option<..>>`, the `stale_get_served`/`linearizable_get_
+    /// served` "served" discipline (ADR 0018 §2, issue #298 shape B fix)** —
+    /// unlike [`txn_status_local`](Self::txn_status_local)'s plain `Option`,
+    /// which conflated "not served" (barrier failed) with "genuinely no
+    /// record" into the same bare `None` until this fix, this method's
+    /// caller (`ClientCtx::txn_recover`'s orphan-record branch) makes a
+    /// **decision** (whether to synthesize an abort tombstone) directly off
+    /// "no record exists" — an outcome that must never be confused with "I
+    /// couldn't tell right now" (e.g. this replica losing its own read
+    /// barrier mid-fork/cutover, exactly what a high split cadence
+    /// produces routinely). Outer `None` = **not served**, caller must
+    /// decline/retry, never decide anything from it; `Some(None)` =
+    /// definitively no record at this key; `Some(Some(view))` = found.
+    pub async fn txn_record_view(&self, record_key: &[u8]) -> Option<Option<TxnRecordView>> {
         if !self.read_barrier().await {
             return None;
         }
         let physical = self.scope.physical(record_key);
-        let vv = self.storage.get(&physical).await.ok().flatten()?;
-        let record = txn::decode_record(&vv.value)?;
-        Some(TxnRecordView {
+        let Ok(found) = self.storage.get(&physical).await else {
+            return None;
+        };
+        let Some(vv) = found else {
+            return Some(None);
+        };
+        let Some(record) = txn::decode_record(&vv.value) else {
+            return Some(None);
+        };
+        Some(Some(TxnRecordView {
             status: record.status.to_public(),
             intent_spans: record.intent_spans,
             created_ts: record.created_ts,
-        })
+        }))
     }
 
     /// **Recovery primitive** (ADR 0018 §2/PR5): does this tablet currently

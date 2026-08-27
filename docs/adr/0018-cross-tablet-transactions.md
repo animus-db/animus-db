@@ -3004,3 +3004,121 @@ DynamoDB wire specifically (§5) — not a correctness gap (the typed mapping
 is real and end-to-end tested via the raw protocol), but a fidelity ceiling
 worth knowing about before reaching for this array to debug a real
 DynamoDB-edge lost-race scenario.
+
+## Amendment (2026-08-26, issue #298 shape B: an unconfirmed recovery query is never evidence of absence)
+
+### 1. The bug
+
+`ClientCtx::txn_recover` (§2/PR5's recovery protocol) makes two decisions
+that must only ever be built on **confirmed** facts: (a) "every participant
+verified staged" (`all_staged`, feeding a Commit/Abort choice on a
+`Pending` record) and (b) "no record exists at all" (feeding an orphan
+`Abort` tombstone once past `RECOVERY_GRACE`). Both reads this logic
+depends on — `txn_verify` and `txn_record_view` — can fail for a reason
+that has nothing to do with the fact being queried: a transient routing
+hiccup, or this replica's own read barrier failing, most commonly while a
+participant's tablet is mid-fork/cutover under a high split cadence. Before
+this amendment, both call sites folded that failure into the same bucket as
+a genuine negative result (`Ok(false)` for verify, "no record" for the
+record view), so an unconfirmed query could push recovery to **Abort** a
+transaction whose own coordinator (`cp_txn`) was concurrently committing,
+or had already committed — permanently losing an already-acked write. This
+is a live instance of the "duelling decider" hazard §2/PR5 accepts as
+*legal only because both deciders are assumed to reach an objectively
+correct decision from independently verified state* — an unconfirmed query
+breaks that assumption outright, it does not merely weaken it.
+
+Caught live during a `SplitMode::InPlace`-unpinned soak (ADR 0058's G5
+row): a captured `all_staged=false`/`Aborted` decision immediately
+preceding the soak's "acked write lost" panic on the identical item.
+
+### 2. The fix: an unconfirmed query is UNKNOWN, propagated as a decline, never as a negative
+
+`ClientCtx::txn_recover`'s `all_staged` loop now distinguishes `Ok(true)`
+(staged), `Ok(false)` (genuinely not staged), and `Err(_)` (could not
+verify) as three distinct outcomes — only the first two may ever feed
+`all_staged`; any `Err` makes the whole push **inconclusive**, and the call
+declines (`Pending`, proposing nothing) rather than guessing. The identical
+fix applies to the record-view side: `RaftKvNode::txn_record_view`
+(`animus-cp-data`) is widened to the `stale_get_served`/
+`linearizable_get_served` "served" discipline already used elsewhere in
+that crate — `Option<Option<TxnRecordView>>`, outer `None` meaning **not
+served** (decline), `Some(None)` meaning a **definitively confirmed**
+absence (the only value that may feed the orphan-abort branch), and
+`Some(Some(view))` meaning found. This propagates through `ClientCtx::
+txn_record_view` (now `Result<Option<TxnRecordView>, String>`) and the
+`ClientRequest::TxnRecordView`/`ClientResponse::TxnRecordViewReply` wire
+pair. A `txn_resolver_loop`-local grace tracker (mirroring
+`unresolved_decided`'s own lookup-failure tracker from the issue #298
+residuals commit) logs+meters once (`Metric::
+CpTxnRecoveryStuckInconclusive`) if a transaction stays `Pending` —
+declining on repeated inconclusive queries — well past `RECOVERY_GRACE`: a
+pure liveness signal, since correctness never depends on how long recovery
+takes to actually decide, only on never deciding wrong.
+
+### 3. Why this does not reopen the recovery-abort case's liveness
+
+Recovery still makes progress in the ordinary case (a genuinely non-staged
+participant, or a genuinely absent record, both still confirmable once the
+transient condition — a split, a leadership change — clears): the decline
+here is retried every `txn_resolver_loop` tick, the same 1-second cadence
+that already drives every other recovery push. The only behavior change is
+that a **permanently** unreachable participant now stalls that one
+transaction's own resolution (safely — its intents stay `Pending`, and the
+on-demand foreign-intent read-path push, §2/PR5 §3, still resolves them
+the moment any reader hits one directly) instead of resolving it to a
+wrong, unrecoverable Abort. This is the same "an intermittent condition
+needs a converged-or-timeout poll, not a fixed-deadline guess" discipline
+the root `CLAUDE.md` states as a standing rule; the fix simply stops this
+one code path from guessing.
+
+### 4. The decide path's own duelling-decider guard was already sound
+
+The apply-time `TxnCommit`/`TxnAbort` arms (`animus-cp-data`) already
+implement first-applied-wins with a hard assert only on two genuinely
+*conflicting* decisions racing the same log position (impossible in one
+sequential log) — a same-outcome-different-ts race, or a commit-vs-abort
+race, are both logged no-ops for the losing entry, and every caller
+(`cp_txn`, `txn_recover`) already re-reads the record's actual applied
+status rather than trusting its own proposed outcome. This amendment did
+not need to touch that guard — it was the source-side inputs to the
+*decision*, not the decision's own commit-time arbitration, that were
+unsound.
+
+### 5. Tests
+
+`animus-cp-data/tests/txn_record_view_served.rs` (new): the fixed
+primitive's own "served" contract, deterministic (`SimEnv`) — a genuinely
+absent key answers `Some(None)`, a deposed/partitioned leader's own barrier
+failure answers the outer `None`, a real staged record answers
+`Some(Some(view))`. `animus-test/tests/txn_serializable.rs`'s own `push`/
+`resolver_tick` (a `SimEnv` reimplementation of this exact protocol, this
+file's §4/PR6 corpus) carried the identical two conflations in its own
+test-double logic and was fixed to match. The animusd-level fix itself has
+no dedicated deterministic regression (`animusd` has no `animus-sim`
+dependency, a standing, named gap) — confirmed instead via a captured live
+trace from the real `ProdEnv` soak matching the predicted symptom exactly,
+both before (diagnostic fires, panic follows) and after (30 consecutive
+clean runs) the fix.
+
+### 6. What ships with this amendment, what's still deferred
+
+Landing: the `all_staged`/`txn_record_view` inconclusive-vs-negative fix
+described above; the `txn_resolver_loop` stuck-recovery grace tracker;
+`Metric::CpTxnRecoveryVerifyInconclusive`/`CpTxnRecoveryStuckInconclusive`.
+
+Still deferred, named but not fixed by this amendment: a **separate**,
+deeper issue #298 mechanism found while investigating this one — a
+coordinator-side stage/commit confirmation loss (`txn_prepare`'s own `Err`
+results, e.g. "CP group leader moved during participant stage/anchor
+commit; retry") is reported to the client as a retryable error carrying
+the house "; retry" convention, but — unlike a `StageOutcome::Fenced`
+outcome, which is *proven* to have applied nothing — a confirmation loss
+does not prove the underlying stage/commit failed to land. A client-level
+retry (an un-tokened `TransactWriteItems`, exactly DynamoDB's own
+documented duplicate-execution risk) can then legitimately restage over an
+already-committed value with a fresh `txn_id`, producing the literal
+"shape 5" duplicate-delivery signature from a mechanism distinct from
+either the seatbelt `KvCommand::TxnStage` gained in the sibling shape A fix
+or this amendment's own recovery-side fix. See `docs/engineering-
+lessons.md`'s issue #298 shape A amendment for the full account.

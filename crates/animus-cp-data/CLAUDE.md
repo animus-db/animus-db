@@ -513,6 +513,20 @@ State once here; cross-referenced from the sections below.
     time at a fresh HLC. Identified by reading, not yet caught firing live
     in a captured repro — see `docs/engineering-lessons.md`'s matching entry
     and ADR 0058's G5 row.
+  - **`RaftKvNode::txn_record_view` uses the `stale_get_served`/
+    `linearizable_get_served` "served" discipline (fixed 2026-08-26, issue
+    #298 shape B)**: `Option<Option<TxnRecordView>>`, not a plain `Option`
+    — outer `None` = **not served** (this replica's own read barrier
+    failed, e.g. mid-fork/cutover), `Some(None)` = definitively no record
+    at this key, `Some(Some(view))` = found. `animusd::ClientCtx::
+    txn_recover`'s orphan-record branch makes a real decision (whether to
+    synthesize an abort tombstone) directly off "no record" — before this
+    fix, the plain-`Option` return conflated the two into one bare `None`,
+    letting a transient barrier failure be read as a confirmed absence and
+    incorrectly abort a transaction whose record was fine and merely
+    unreachable by that one query. See `docs/engineering-lessons.md`'s
+    issue #298 shape B amendment for the full incident and
+    `tests/txn_record_view_served.rs` for the primitive's own regression.
 
   Other invariants, one line each: a tablet split's `split_key` is not
   token-aligned, so a split racing an in-flight transaction could in
