@@ -507,12 +507,49 @@ pub enum Metric {
     /// either still pending or was counted here — a union a racing trim
     /// tick cannot erase.
     ChangeLogTrimmedTotal,
+
+    // --- In-doubt recovery verify inconclusiveness (issue #298 shape B fix)
+    // --- Appended after the kind-write-path variant above; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd`'s `ClientCtx::
+    // txn_recover`/`txn_resolver_loop`.
+    /// A recovery push (`ClientCtx::txn_recover`) declined to decide because
+    /// at least one participant's `txn_verify` returned `Err` (could not
+    /// verify, e.g. a transient routing failure mid-fork/cutover) rather
+    /// than an affirmative `Ok(true)`/`Ok(false)` — an `Err` is never
+    /// evidence of "not staged," so this call proposes nothing and returns
+    /// `Pending` for the next sweep to retry.
+    CpTxnRecoveryVerifyInconclusive,
+    /// A transaction has stayed `Pending` — via repeated
+    /// [`Self::CpTxnRecoveryVerifyInconclusive`] declines — past
+    /// `txn_resolver_loop`'s own stuck-recovery grace window, without ever
+    /// reaching a decision. Metered once per stuck episode (mirroring
+    /// `unresolved_decided`'s own lookup-failure grace tracker): this is a
+    /// liveness signal for an operator, never a correctness concern — the
+    /// transaction's own intents stay safely `Pending` (never wrongly
+    /// decided) and resolve the moment `txn_verify` can actually confirm
+    /// their state again.
+    CpTxnRecoveryStuckInconclusive,
+    // --- `unresolved_decided` background-resolution gap (issue #298
+    // residuals) --- Appended after the trim-total variant; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd`'s `txn_resolver_loop`.
+    /// An `unresolved_decided` entry's `txn_record_view` lookup kept failing
+    /// for at least `animus_cp_data::RECOVERY_GRACE` — this loop has given up
+    /// background-resolving it *for now* (there is no `intent_spans` to act
+    /// on without a readable record). Correctness is unaffected: a straggling
+    /// unresolved remote intent is still resolved on demand the moment any
+    /// reader hits it (the foreign-intent read-path push, ADR 0018 §2/PR5
+    /// §3) — this counter only signals reduced background promptness for
+    /// that one transaction, e.g. because its record's tablet retired
+    /// mid-recovery.
+    CpTxnUnresolvedDecidedStuck,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 73] = [
+    pub const ALL: [Metric; 76] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -586,6 +623,9 @@ impl Metric {
         Metric::CpUnquiesces,
         Metric::CpGroupsQuiesced,
         Metric::ChangeLogTrimmedTotal,
+        Metric::CpTxnRecoveryVerifyInconclusive,
+        Metric::CpTxnRecoveryStuckInconclusive,
+        Metric::CpTxnUnresolvedDecidedStuck,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -666,6 +706,9 @@ impl Metric {
             Metric::CpUnquiesces => "cp_unquiesces",
             Metric::CpGroupsQuiesced => "cp_groups_quiesced",
             Metric::ChangeLogTrimmedTotal => "change_log_trimmed_total",
+            Metric::CpTxnRecoveryVerifyInconclusive => "cp_txn_recovery_verify_inconclusive",
+            Metric::CpTxnRecoveryStuckInconclusive => "cp_txn_recovery_stuck_inconclusive",
+            Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
         }
     }
 
