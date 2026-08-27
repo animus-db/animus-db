@@ -526,12 +526,21 @@ per-tablet CP data plane (`animus-cp-data`).
   concern, not a safety one) and any policy for *when* to call
   `promote_learner` (the host reconciler's replica-move sequencing).
 
-- **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).** The
-  control plane never calls it — it's a per-tablet CP-data primitive living here
-  because the sync core is shared. `change_membership` always rejects removing
-  the current leader, so relocating a leader's own replica needs a Raft §3.10
+- **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
+  Originally a per-tablet CP-data primitive living here because the sync
+  core is shared, described in an earlier revision of this note as
+  something "the control plane never calls" — **stale since ADR 0037**:
+  `animusd::ClientCtx::admin_remove_control_member`'s leader-self-removal
+  branch (`POST /admin/control/member/remove`) now arms one directly on
+  the **control** group too, for the identical Raft §3.10 reason (the core
+  always rejects removing the current leader, so relocating it needs a
+  handoff first). `change_membership` always rejects removing the current
+  leader, so relocating a leader's own replica needs a Raft §3.10
   handoff: arm a transfer to a voter with `peer_match(target) >= commit_index()`
-  (no config change in flight; records a one-election-timeout deadline), then
+  (no config change in flight; records a **single** one-election-timeout
+  deadline **at arm time, from `now`, not re-derived from replication
+  progress** — see the issue #405 note below for the caller-side
+  consequence of that), then
   **freeze** `propose`/`change_membership` (return `NotLeader` hinting the
   target) so the log stops growing, and send `TimeoutNow` only once the target
   **reaches `last_log_index()`** (re-sent every heartbeat until step-down). A
@@ -541,6 +550,23 @@ per-tablet CP data plane (`animus-cp-data`).
   and the arm gate must read the *same* threshold, and the return value ("did it
   arm") must never be discarded — see the engineering-lessons log (root
   `CLAUDE.md`) for the war story where they diverged.
+
+  **A single arm attempt can legitimately fail with no retry of its own
+  (issue #405, `animusd`'s own gotcha, noted here since the root cause
+  lives in this method's own gate).** `transfer_leadership` is meant to be
+  re-armed every tick by a caller that needs the target to *eventually*
+  catch up (`RaftKvNode::reconfigure_step`'s per-tablet pattern, its own
+  doc above) — a **one-shot** caller like `admin_remove_control_member`
+  instead calls it exactly once, so the arm only succeeds if `peer_match
+  (target)` has already caught up to `commit_index()` at that precise
+  instant. Ordinary background control-group churn (a liveness `UpsertMember`
+  proposal, a placement reconcile) can advance `commit_index` between an
+  operator's own "are the voters converged yet" check and this call, and a
+  loaded machine widens that window — see `crates/animusd/CLAUDE.md`'s
+  issue #405 entry and `docs/engineering-lessons.md`'s matching entry for
+  the full account and the fix (retry the *whole admin call*, not just the
+  side effect, since every refusal this one-shot arm can produce is
+  equally retryable and maps to the identical HTTP status).
 
 - **Snapshot transfer is chunked and O(chunk), not O(state).** A follower
   behind the compacted prefix is caught up via a chunked `InstallSnapshot`,
