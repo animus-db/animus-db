@@ -2499,6 +2499,18 @@ fn is_relayable_command(command: &MetaCommand) -> bool {
             // "no seed answered" — see `tests/seed_join_allocated.rs`'s
             // follower-connected-seed case.
             | MetaCommand::RegisterNode { .. }
+            // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
+            // an operator's `CreateBackup` call may land on any node, exactly
+            // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
+            // (`animusd::dynamo::create_backup`'s own propose) to the control
+            // leader is the same schema-catalog-class need every DDL-shaped
+            // wire mutation above already has. Missing this arm is the exact
+            // bimodal per-process flake the root `CLAUDE.md` warns about: a
+            // `CreateBackup` that happens to land on a follower-connected
+            // node would hang for `SCHEMA_COMMIT_TIMEOUT` instead of relaying
+            // — see `tests/schema_ddl_relay.rs`'s
+            // `create_backup_on_a_follower_is_relayed_to_the_leader`.
+            | MetaCommand::BeginBackup { .. }
             // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
             // a tablet leader's own "I finished capturing my share of this
             // backup" proposal, from wherever that leader actually runs —

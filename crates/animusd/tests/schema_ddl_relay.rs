@@ -585,3 +585,86 @@ async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
         n.shutdown_graceful().await;
     }
 }
+
+/// ADR 0059 §3 (Train 1 PR④)'s own instance of this file's regression
+/// class, the mirror of `delete_backup_on_a_follower_is_relayed_to_the_leader`
+/// just above: `CreateBackup` issued against a DynamoDB listener on a node
+/// that is **not** the control-plane leader must still commit —
+/// `MetaCommand::BeginBackup` must be on the relay allowlist, or this times
+/// out on exactly this shape (works only when the connected node happens to
+/// be the leader).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn create_backup_on_a_follower_is_relayed_to_the_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(3, dir.path()).await;
+
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+    let leader_dynamo = config.nodes[leader].dynamo;
+    let follower_dynamo = config.nodes[follower].dynamo;
+
+    let (status, body) = dynamo(
+        leader_dynamo,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"create_backup_relay_t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "body: {body}");
+
+    // The regression: `CreateBackup`, issued against the FOLLOWER's own
+    // DynamoDB listener, must relay `MetaCommand::BeginBackup` to the leader
+    // and commit — pre-fix this times out (the follower has no local leader
+    // handle to propose on, and `BeginBackup` was missing from
+    // `is_relayable_command`'s allowlist).
+    let (status, body) = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(
+                follower_dynamo,
+                "DynamoDB_20120810.CreateBackup",
+                r#"{"TableName":"create_backup_relay_t","BackupName":"relay-backup-2"}"#,
+            )
+            .await;
+            if status == 200 {
+                return (status, body);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("follower-issued CreateBackup did not commit via relay in 20s");
+    assert_eq!(status, 200, "body: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let backup_arn = created["BackupDetails"]["BackupArn"]
+        .as_str()
+        .expect("BackupArn")
+        .to_owned();
+
+    // The row replicated to *every* node's own replicated catalog, and the
+    // capture driver + completion aggregator (unaffected by which node
+    // relayed `BeginBackup`) carry it all the way to `AVAILABLE` — the
+    // honest terminal state (`docs/engineering-lessons.md`'s note on PR④:
+    // converge-polls on backup rows must poll for a stable terminal status,
+    // not a transient one).
+    for (i, n) in nodes.iter().enumerate() {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata()
+                    .backup(&backup_arn)
+                    .is_some_and(|row| row.status == animus_control::BackupStatus::Available)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {i}: backup not AVAILABLE within 20s of follower-relayed CreateBackup")
+        });
+    }
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
