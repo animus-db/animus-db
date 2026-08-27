@@ -74,6 +74,7 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
                 SplitMode::InPlace,
+                animusd::BackupStoreConfig::default(),
             )
             .await
             {

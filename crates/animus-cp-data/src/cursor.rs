@@ -144,6 +144,7 @@
 //! |---|---|---|
 //! | `"gsi"` | [`SplitPolicy::RestartFromScratch`] | A copy-based split child's cursor scope starts empty (CURSOR is never seeded, ADR 0050 rung 4); the drain's reconcile sweep is idempotent, so it restarts over the child's own range — ADR 0045 §5 Fork A/F1's argument, now structural. |
 //! | `"backfill:{index_name}"` | [`SplitPolicy::RestartFromScratch`] | Identical reasoning: the backfill seeder walks `KIND_BASE` and a fresh child's empty cursor just means "re-sweep this (narrower) range from the start." |
+//! | `"backup:{backup_id}"` | [`SplitPolicy::RestartFromScratch`] | The on-demand backup capture driver's own per-backup resumable cursor (ADR 0059 §4/§6, `animusd`, a later PR): a split-descendant tablet is a brand-new, never-before-captured identity — even though it inherits its own share of the parent's rows via `SeedBatch`, it has its own private engine and its own empty `KIND_CURSOR` scope, so its capture simply restarts from scratch over its own (narrower) range, exactly like the GSI drain/backfill seeder above. The retired parent's own cursor row for this tag, if any, is simply abandoned along with the rest of its reclaimed engine. |
 //! | the stream seal watermark | [`SplitPolicy::RestartFromScratch`] | A child's change log is born empty and its shard chain starts at its own epoch 0; the parent's chain is closed by the pre-cutover final seal, with lineage frozen in `Metadata::split_lineage` (fork F9) — no watermark inheritance exists to classify (the zero-copy design's `InheritFrozenBasis` policy retired with `stream_split_basis`, Train B rung 7). |
 //!
 //! [`classify_tag`] enumerates the `KIND_CURSOR` side of this table in code
@@ -327,6 +328,9 @@ pub fn classify_tag(tag: &str) -> Option<SplitPolicy> {
     if tag.starts_with(BACKFILL_CURSOR_TAG_PREFIX_FOR_CLASSIFICATION) {
         return Some(SplitPolicy::RestartFromScratch);
     }
+    if tag.starts_with(BACKUP_CURSOR_TAG_PREFIX_FOR_CLASSIFICATION) {
+        return Some(SplitPolicy::RestartFromScratch);
+    }
     None
 }
 
@@ -343,6 +347,11 @@ const GSI_CURSOR_TAG_FOR_CLASSIFICATION: &str = "gsi";
 /// [`GSI_CURSOR_TAG_FOR_CLASSIFICATION`] is — must stay byte-identical to
 /// `animusd::index_drain::backfill_tag`'s own `format!("backfill:{index_name}")`.
 const BACKFILL_CURSOR_TAG_PREFIX_FOR_CLASSIFICATION: &str = "backfill:";
+
+/// The `"backup:"` tag prefix, restated here for the same reason
+/// [`GSI_CURSOR_TAG_FOR_CLASSIFICATION`] is — must stay byte-identical to
+/// `animusd::backup_capture`'s own `format!("backup:{backup_id}")`.
+const BACKUP_CURSOR_TAG_PREFIX_FOR_CLASSIFICATION: &str = "backup:";
 
 #[cfg(test)]
 mod tests {
@@ -566,7 +575,12 @@ mod tests {
             );
         }
 
-        let prefixed_tag_samples = ["backfill:example-index", "backfill:by-status"];
+        let prefixed_tag_samples = [
+            "backfill:example-index",
+            "backfill:by-status",
+            "backup:bkp-1",
+            "backup:arn:animus:backup/table/users/backup/01",
+        ];
         for tag in prefixed_tag_samples {
             assert_eq!(
                 classify_tag(tag),

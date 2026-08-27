@@ -33,7 +33,8 @@
 //! - `GET  /admin/storage/key`         — on-disk versions of a key (`?tablet=&key=`)
 //! - `GET  /admin/storage/scan`        — first N live pairs (`?tablet=&start=&limit=`)
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
-//! - `GET  /admin/backups`             — the replicated backup catalog: id, table, status, per-tablet progress, sizes, creation time (ADR 0059 §3; pure observer — no capture driver/wire API yet)
+//! - `GET  /admin/backups`             — the replicated backup catalog: id, name, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — the DynamoDB wire surface, `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`, is Train 1 PR④, `animusd::dynamo`)
+//! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
@@ -367,6 +368,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
         ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
         ("GET", "/admin/system-table") => system_table(ctx, q).await,
         ("GET", "/admin/backups") => (200, backups_view(ctx)),
+        ("GET", "/admin/restores") => (200, restores_view(ctx)),
         ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
         ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
         ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
@@ -1085,6 +1087,14 @@ fn system_table_id_display(kind: syskv::EntityKind, id: &[u8]) -> Value {
             None => json!(key_str(id)),
         };
     }
+    if kind == syskv::EntityKind::PitrSegment {
+        // A composite (tablet, epoch) id (ADR 0059 §9, Train 3) — the
+        // identical shape `StreamShard` just above renders.
+        return match syskv::decode_pitr_segment_id(id) {
+            Some((tablet, epoch)) => json!(format!("{}-{epoch}", tablet.0)),
+            None => json!(key_str(id)),
+        };
+    }
     if kind == syskv::EntityKind::IndexBackfill {
         // A composite (tablet, index name) id (ADR 0045 §4) — same "not a
         // single numeric field, not cleanly a UTF-8 string either" shape as
@@ -1155,6 +1165,17 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         syskv::EntityKind::Backup | syskv::EntityKind::BackupProgress => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
+        // A `RestoreRow` (ADR 0059 §7, Train 2) — same JSON passthrough
+        // convention as `Backup`/etc. above.
+        syskv::EntityKind::Restore => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
+        // A `PitrSegmentRow` (ADR 0059 §9, Train 3) — same JSON passthrough
+        // convention as `StreamShard`/etc. above.
+        syskv::EntityKind::PitrSegment => {
+            serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
+        }
+        // Presence-only (ADR 0059 §9: the value is always empty — the tag
+        // row's existence is the fact), same convention as `IndexBackfill`.
+        syskv::EntityKind::PitrBaseBackup => Value::Null,
     }
 }
 
@@ -1168,17 +1189,27 @@ fn system_table_item(kind: syskv::EntityKind, id: &[u8], value: &[u8], version: 
     })
 }
 
-/// `GET /admin/backups` (ADR 0059 §3): the replicated backup catalog — one
-/// entry per row in `Metadata::backups`, each carrying its status, source
-/// table, creation time, total captured bytes so far, and a per-pinned-
-/// tablet progress breakdown (`Metadata::backup_tablet_progress`). Pure
-/// observer, like every other `GET` here (ADR 0020) — no capture driver
-/// exists yet in this train, so a row only ever reaches `Creating` today;
-/// this view is written to display every status the catalog can hold
-/// (`Available`/`Failed`/`Expired`) once later trains populate them.
-/// `effective_metadata()`, not `metadata_cached()` (matching `/admin/status`/
-/// `/admin/peers`): a growth/data-only node's own mirror is the honest
-/// cluster-wide view here too.
+/// `GET /admin/backups` (ADR 0059 §3/§4/§6): the replicated backup catalog —
+/// one entry per row in `Metadata::backups`, each carrying its status,
+/// source table, creation time, total captured bytes so far, and a
+/// per-pinned-tablet progress breakdown. Pure observer, like every other
+/// `GET` here (ADR 0020). `effective_metadata()`, not `metadata_cached()`
+/// (matching `/admin/status`/`/admin/peers`): a growth/data-only node's own
+/// mirror is the honest cluster-wide view here too.
+///
+/// **Split re-planning visibility (ADR 0059 §6, Train 1 PR③)**: each
+/// pinned-tablet entry's own `tablet`/`reported`/`cut_version`/`bytes`
+/// fields keep their PR① meaning exactly (a direct report at that tablet
+/// id, when it has one) for backward compatibility, but `reported` is now
+/// computed against the tablet's own **current live capture frontier**
+/// (`Metadata::live_split_descendants`) rather than a bare direct-progress
+/// check — so a pinned tablet that split mid-capture correctly shows
+/// `reported: true` only once every one of its live descendants has
+/// reported, not "never" forever. Two new fields make the re-planning
+/// itself visible rather than merely folded into a boolean: `retired`
+/// (this pinned tablet id is no longer live) and `capturing` (every one of
+/// its current live descendants — one entry, itself, for a tablet that
+/// never split).
 fn backups_view(ctx: &ClientCtx) -> Value {
     let meta = ctx.effective_metadata();
     let backups: Vec<Value> = meta
@@ -1190,14 +1221,36 @@ fn backups_view(ctx: &ClientCtx) -> Value {
                 .pinned_tablets
                 .iter()
                 .map(|pinned| {
-                    let progress = meta
+                    let direct_progress = meta
                         .backup_tablet_progress
                         .get(&(backup_id.clone(), pinned.tablet));
+                    let live_descendants = meta.live_split_descendants(pinned.tablet);
+                    let capturing: Vec<Value> = live_descendants
+                        .iter()
+                        .map(|&tablet| {
+                            let progress = meta
+                                .backup_tablet_progress
+                                .get(&(backup_id.clone(), tablet));
+                            json!({
+                                "tablet": tablet.0.to_string(),
+                                "reported": progress.is_some(),
+                                "cut_version": progress.map(|p| p.cut_version),
+                                "bytes": progress.map(|p| p.bytes),
+                            })
+                        })
+                        .collect();
+                    let reported = !live_descendants.is_empty()
+                        && live_descendants.iter().all(|&tablet| {
+                            meta.backup_tablet_progress
+                                .contains_key(&(backup_id.clone(), tablet))
+                        });
                     json!({
                         "tablet": pinned.tablet.0.to_string(),
-                        "reported": progress.is_some(),
-                        "cut_version": progress.map(|p| p.cut_version),
-                        "bytes": progress.map(|p| p.bytes),
+                        "reported": reported,
+                        "cut_version": direct_progress.map(|p| p.cut_version),
+                        "bytes": direct_progress.map(|p| p.bytes),
+                        "retired": !meta.tablets.contains_key(&pinned.tablet),
+                        "capturing": capturing,
                     })
                 })
                 .collect();
@@ -1209,17 +1262,78 @@ fn backups_view(ctx: &ClientCtx) -> Value {
                 }
                 animus_control::BackupStatus::Expired => json!({"state": "EXPIRED"}),
             };
+            // While `Creating`, the live re-derivation is genuinely more
+            // useful (real-time progress an operator is watching); once
+            // terminal, the row's own frozen `total_bytes` (ADR 0059 Train 1
+            // PR④, `MetaCommand::CompleteBackup`'s apply-time freeze) is the
+            // one that survives a later drop of the source table —
+            // `Metadata::backup_total_bytes`'s own live re-derivation would
+            // otherwise silently report `0` here the moment every one of
+            // this backup's tablets is gone, exactly the regression
+            // `docs/engineering-lessons.md`'s matching entry records.
+            let total_bytes = if matches!(row.status, animus_control::BackupStatus::Creating) {
+                meta.backup_total_bytes(backup_id)
+            } else {
+                row.total_bytes
+            };
             json!({
                 "backup_id": backup_id,
+                "backup_name": row.backup_name,
                 "table": row.table,
                 "status": status,
                 "created_wall_ms": row.manifest.created_wall_ms,
-                "total_bytes": meta.backup_total_bytes(backup_id),
+                "total_bytes": total_bytes,
                 "tablets": tablets,
             })
         })
         .collect();
     json!({ "backups": backups })
+}
+
+/// `GET /admin/restores` (ADR 0059 §7, Train 2): the replicated restore
+/// catalog — one entry per row in `Metadata::restores`, each carrying its
+/// status, source backup/table, target table, and the destination tablet's
+/// own live state (`Building` while seeding, `Active` once
+/// `CompleteRestore` has landed — the same tablet-state derivation
+/// `dynamo::table_status` uses for `DescribeTable`'s `TableStatus`). Pure
+/// observer, like every other `GET` here (ADR 0020).
+fn restores_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let restores: Vec<Value> = meta
+        .restores
+        .iter()
+        .map(|(restore_id, row)| {
+            let status = match &row.status {
+                animus_control::RestoreStatus::Seeding => json!({"state": "SEEDING"}),
+                animus_control::RestoreStatus::Done => json!({"state": "DONE"}),
+                animus_control::RestoreStatus::Failed { reason } => {
+                    json!({"state": "FAILED", "reason": reason})
+                }
+            };
+            let tablet_state = meta
+                .tablets
+                .get(&row.tablet)
+                .map(|t| format!("{:?}", t.state));
+            json!({
+                "restore_id": restore_id,
+                "backup_id": row.backup_id,
+                "source_table": row.source_table,
+                "target_table": row.target_table,
+                "status": status,
+                "tablet": row.tablet.0.to_string(),
+                "tablet_state": tablet_state,
+                "gsi_names": row.gsi_defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>(),
+                // ADR 0059 §10, Train 3 PR②: which wire op started this
+                // restore — `RestoreTableFromBackup` (an ordinary backup)
+                // or `RestoreTableToPointInTime` (`row.pitr` carries the
+                // resolved segment-replay plan only in the latter case).
+                "source": if row.pitr.is_some() { "POINT_IN_TIME" } else { "BACKUP" },
+                "pitr_target_wall_ms": row.pitr.as_ref().map(|p| p.target_wall_ms),
+                "pitr_segments_planned": row.pitr.as_ref().map(|p| p.segments.len()),
+            })
+        })
+        .collect();
+    json!({ "restores": restores })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

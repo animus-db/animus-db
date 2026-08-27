@@ -19,8 +19,8 @@ use animus_tablet::{
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    IndexDef, IndexStatus, SchemaCatalog, StreamSpec, StreamViewType, TableName, TableSchema,
-    TtlSpec,
+    IndexDef, IndexStatus, PitrSpec, SchemaCatalog, StreamSpec, StreamViewType, TableName,
+    TableSchema, TtlSpec,
 };
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
@@ -324,6 +324,77 @@ pub struct Metadata {
     /// tablet, cut_version, bytes}` objects instead.
     #[serde(default, with = "backup_progress_codec")]
     pub backup_tablet_progress: BTreeMap<(BackupId, TabletId), BackupTabletProgress>,
+    /// The **restore catalog** (ADR 0059 §7, Train 2): every
+    /// `RestoreTableFromBackup` ever begun, keyed by [`RestoreId`] — an
+    /// opaque, freshly-minted identity, mirroring [`backups`](Self::backups)'
+    /// own "never a name" discipline (a restore's *target* table name is data
+    /// on the row, not its key, so two restores racing the same target name
+    /// are simply two unrelated rows — the state machine's own
+    /// `CreateTableSchema` first-committer-wins guard is what actually
+    /// decides which one's target table survives, ADR 0059 §7's
+    /// "TableAlreadyExistsException" case). Mutated only through
+    /// [`MetaCommand::BeginRestore`] (mints a row + this restore's single
+    /// `Building` tablet, ADR 0059's Train 2 as-built note on the
+    /// pinned-tablets-vs-fresh-layout decision), [`MetaCommand::
+    /// CompleteRestore`]/[`MetaCommand::FailRestore`] (terminal transitions).
+    /// Deliberately **no** delete/reclaim command yet — a restore row is
+    /// small, bounded (one row per `RestoreTableFromBackup` call, never
+    /// per-tablet fan-out, since Train 2 mints exactly one destination
+    /// tablet per restore), and never referenced once terminal; a retention
+    /// sweep is a named Train 2 residual, not a correctness gap.
+    /// `#[serde(default)]` keeps pre-restore snapshots loading (empty map).
+    #[serde(default)]
+    pub restores: BTreeMap<RestoreId, RestoreRow>,
+    /// The **PITR segment catalog** (ADR 0059 §9, Train 3): every sealed
+    /// PITR segment ever committed, keyed by `(tablet, epoch)` — the
+    /// identical identity convention [`stream_shards`](Self::stream_shards)
+    /// uses, since a PITR segment IS a sealed-shard-shaped object over the
+    /// same `KIND_CHANGE` log, just written by a separate consumer to a
+    /// separate object namespace (ADR 0059 §9's "a fifth, independent
+    /// consumer arm"). `table`/`generation` live inside [`PitrSegmentRow`]
+    /// as descriptive fields, exactly like `StreamShardRow::table`/`label`.
+    /// Mutated only through [`MetaCommand::SealPitrSegment`] (first-
+    /// committer-wins on this key) and [`MetaCommand::ExpirePitrSegments`]
+    /// (the janitor's mark-then-remove reclaim). `#[serde(default)]` keeps
+    /// pre-PITR snapshots loading (empty map).
+    ///
+    /// **Wire shape (`#[serde(with = "pitr_segments_codec")]`)**: the
+    /// identical `serde_json` tuple-map-key workaround `stream_shards` needs
+    /// — see that field's own doc for why.
+    #[serde(default, with = "pitr_segments_codec")]
+    pub pitr_segments: BTreeMap<(TabletId, u64), PitrSegmentRow>,
+    /// A table's PITR generation allocator (ADR 0059 §9): the highest
+    /// generation number ever minted for this table name by
+    /// `MetaCommand::UpdateContinuousBackups`. **Never rewound** — including
+    /// across a disable (`TableSchema::pitr` goes to `None`, but this floor
+    /// stays), and across a `DropTableSchema`/`CreateTableSchema` recreation
+    /// of the same table name — so a re-enable, or a same-named table
+    /// recreated later, always mints a strictly higher generation than any
+    /// this name has ever used, the identical non-reuse discipline
+    /// `next_tablet_id`'s allocator floor already gives tablet ids.
+    /// `#[serde(default)]` keeps pre-PITR snapshots loading (empty map).
+    #[serde(default)]
+    pub pitr_generation: BTreeMap<TableName, u64>,
+    /// The set of [`BackupId`]s that are **PITR base snapshots** (ADR 0059
+    /// §9) rather than ordinary on-demand backups — an internally-triggered
+    /// `BeginBackup` the PITR machinery proposed on its own schedule (§9's
+    /// "reusing the Train 1 capture path unchanged"), tagged via
+    /// [`MetaCommand::MarkBackupPitrBase`] once its row is known to exist.
+    /// **Deliberately a side-set, not a [`BackupRow`] field** — this avoids
+    /// widening `MetaCommand::BeginBackup`'s own signature (and, with it,
+    /// every one of its many existing construction sites across this crate,
+    /// `animus-test`, and `animusd`) for a fact only the PITR janitor and
+    /// `DescribeContinuousBackups` ever need to know; see
+    /// `MetaCommand::MarkBackupPitrBase`'s own doc for the brief window
+    /// this trades away (a PITR base snapshot is indistinguishable from an
+    /// ordinary on-demand one for the instant between its `BeginBackup` and
+    /// its own `MarkBackupPitrBase` committing — harmless, since nothing
+    /// else queries this set). Pruned by [`MetaCommand::DeleteBackup`]'s
+    /// existing apply arm (the same finalizing command an on-demand
+    /// backup's own reclaim already uses). `#[serde(default)]` keeps
+    /// pre-PITR snapshots loading (empty set).
+    #[serde(default)]
+    pub pitr_base_backups: BTreeSet<BackupId>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -482,6 +553,56 @@ mod backup_progress_codec {
     }
 }
 
+/// Gives [`Metadata::pitr_segments`] a `serde_json`-safe wire shape — the
+/// identical rationale as [`stream_shards_codec`] above (a `(TabletId, u64)`
+/// tuple key cannot serialize as a JSON object key either). Encodes/decodes
+/// a flat `Vec` of `{tablet, epoch, ...PitrSegmentRow fields}` objects.
+mod pitr_segments_codec {
+    use std::collections::BTreeMap;
+
+    use animus_tablet::TabletId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::PitrSegmentRow;
+
+    #[derive(Serialize)]
+    struct EntryRef<'a> {
+        tablet: TabletId,
+        epoch: u64,
+        #[serde(flatten)]
+        row: &'a PitrSegmentRow,
+    }
+
+    #[derive(Deserialize)]
+    struct Entry {
+        tablet: TabletId,
+        epoch: u64,
+        #[serde(flatten)]
+        row: PitrSegmentRow,
+    }
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<(TabletId, u64), PitrSegmentRow>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let entries: Vec<EntryRef<'_>> = map
+            .iter()
+            .map(|(&(tablet, epoch), row)| EntryRef { tablet, epoch, row })
+            .collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<(TabletId, u64), PitrSegmentRow>, D::Error> {
+        let entries = Vec::<Entry>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| ((entry.tablet, entry.epoch), entry.row))
+            .collect())
+    }
+}
+
 /// A copy-based split child's lineage row ([`Metadata::split_lineage`],
 /// ADR 0050 fork F9), written once by [`MetaCommand::CutoverSplit`]'s apply
 /// — see that field's own doc for why cutover time is the only race-free
@@ -580,6 +701,47 @@ pub struct StreamShardRow {
     /// licenses removing the row itself, not this flag. `#[serde(default)]`
     /// keeps a row encoded before this field existed loading as
     /// not-yet-marked.
+    #[serde(default)]
+    pub expired: bool,
+}
+
+/// A sealed **PITR segment**'s catalog row (ADR 0059 §9, Train 3) — the
+/// PITR consumer's own twin of [`StreamShardRow`], sharing the identical
+/// `(tablet, epoch)` identity discipline and the identical `segment.rs`
+/// object codec, but recorded in [`Metadata::pitr_segments`] (a fully
+/// separate catalog from `Metadata::stream_shards`) and written to a
+/// PITR-specific object namespace (`animus_cp_data::backup::
+/// pitr_segment_object_id`) — a table's stream and its PITR coverage are
+/// two independent consumers of the same change log with two independent
+/// lifecycles (ADR 0059 §9), never sharing a catalog row or an object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrSegmentRow {
+    /// The base table this segment's tablet belongs to.
+    pub table: TableName,
+    /// The PITR generation active when this segment sealed
+    /// ([`PitrSpec::generation`]) — the coverage-epoch identity a disable/
+    /// re-enable cycle mints fresh, mirroring `StreamShardRow::label`'s own
+    /// role for streams.
+    pub generation: u64,
+    /// `(start_exclusive, end_inclusive)` committed packed-HLC range —
+    /// identical semantics to `StreamShardRow::hlc_range`.
+    pub hlc_range: (u64, u64),
+    /// The number of records the sealing leader's own scan counted.
+    pub count: u64,
+    /// The sealing leader's own `env.now()` at seal time — observability
+    /// only, and (via the janitor) the retention-age basis for this row.
+    pub seal_wall_ms: u64,
+    /// The replica set the segment object was pushed to (empty for the
+    /// single-directory `fs:` backup-store opt-in) — identical convention
+    /// to `StreamShardRow::replicas`.
+    pub replicas: Vec<NodeId>,
+    /// The unique per-attempt backup-store id this row's segment object
+    /// actually lives at (`animus_cp_data::backup::pitr_segment_object_id`)
+    /// — the identical ledger-named-object discipline `StreamShardRow::
+    /// object_id` already gives streams, applied to the PITR namespace.
+    pub object_id: String,
+    /// Set by [`MetaCommand::ExpirePitrSegments`]'s **mark** phase — the
+    /// identical semantics to `StreamShardRow::expired`.
     #[serde(default)]
     pub expired: bool,
 }
@@ -687,10 +849,222 @@ pub struct BackupRow {
     /// catalog is keyed by [`BackupId`], never by this name, ADR 0059 §3's
     /// scar).
     pub table: TableName,
+    /// The client-supplied `BackupName` (ADR 0059 Train 1 PR④, DynamoDB's
+    /// `CreateBackup` request field) — recorded verbatim, echoed by
+    /// `DescribeBackup`/`ListBackups`, never interpreted and never part of
+    /// this row's own identity (`BackupId` alone is, per this catalog's
+    /// "scar" — see [`Metadata::backups`]'s doc). `#[serde(default)]` is an
+    /// implementation convenience for a pre-existing snapshot/fixture that
+    /// predates this field (root `CLAUDE.md`: no real migration guarantee is
+    /// implied).
+    #[serde(default)]
+    pub backup_name: String,
     /// This row's lifecycle status.
     pub status: BackupStatus,
     /// The manifest stub (ADR 0059 §2), derived once at `BeginBackup` time.
     pub manifest: BackupManifest,
+    /// The backup's total captured bytes (ADR 0059 §2's "total object
+    /// sizes, for `DescribeBackup`"), frozen exactly **once**, by
+    /// [`MetaCommand::CompleteBackup`]'s own apply arm, from
+    /// [`Metadata::backup_total_bytes`] at the moment every pinned tablet's
+    /// live descendant is still resolvable. `0` while
+    /// [`Creating`](BackupStatus::Creating)/[`Failed`](BackupStatus::Failed)
+    /// (Train 1 PR④, DynamoDB's own on-demand backup contract reports no
+    /// size until `AVAILABLE` either) — **never** re-derived from
+    /// [`Metadata::backup_manifest_tablet_progress`] after the fact, which
+    /// would silently collapse to zero the moment this backup's source
+    /// table (and with it every one of its tablets) is ever dropped,
+    /// breaking ADR 0059 §3's own "a backup outlives its source table"
+    /// promise for `DescribeBackup`'s reported size specifically.
+    /// `#[serde(default)]` is an implementation convenience for a
+    /// pre-existing snapshot/fixture that predates this field.
+    #[serde(default)]
+    pub total_bytes: u64,
+}
+
+/// A restore's opaque catalog identity (ADR 0059 §7, Train 2) — an
+/// internally-minted identity, never wire-visible (unlike [`BackupId`], which
+/// doubles as the wire ARN) since `RestoreTableFromBackup` has no AWS-defined
+/// "restore id" of its own to echo back — a client only ever sees the
+/// resulting `TableDescription`.
+pub type RestoreId = String;
+
+/// A restore-in-progress catalog row's lifecycle status (ADR 0059 §7). Unlike
+/// [`BackupStatus`] there is no `Expired` — a restore row has no retention
+/// janitor yet (see [`Metadata::restores`]'s own doc).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStatus {
+    /// The restore driver (`animusd::backup_restore`) is seeding the target
+    /// tablet from the backup's data objects. The target table's own
+    /// `TableStatus` reads `CREATING` for the whole duration this row stays
+    /// in this state (derived from its tablet's own `Building` state, not
+    /// stored redundantly here — see `animusd::dynamo::table_status`).
+    Seeding,
+    /// Terminal success: the target tablet has been fully seeded and
+    /// activated (`MetaCommand::CompleteRestore`).
+    Done,
+    /// Terminal failure — a stuck-`Seeding` timeout, or a source backup that
+    /// became unreadable mid-restore (e.g. deleted and reclaimed by the
+    /// backup janitor while restore was still reading it, ADR 0059's Train 2
+    /// as-built note on this narrow, accepted race). `reason` is diagnostic
+    /// only, never interpreted. The target table's schema and its
+    /// permanently-`Building` (never-served) tablet are left in place —
+    /// `DropTableTablets`/the reconciler's ordinary `Reclaim` action already
+    /// clean up a `Building` tablet exactly like any other (state-agnostic),
+    /// so a failed restore's target table is a clean, ordinary `DeleteTable`
+    /// away from full cleanup, never half-serving.
+    Failed {
+        /// A human-readable failure reason.
+        reason: String,
+    },
+}
+
+/// A restore-in-progress catalog row (`Metadata::restores`, ADR 0059 §7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRow {
+    /// The backup this restore reads from.
+    pub backup_id: BackupId,
+    /// The backup's own source table, purely descriptive (`DescribeBackup`-
+    /// adjacent observability; never re-derived from live `Metadata`, since
+    /// the source table may have been dropped — the whole point of ADR
+    /// 0059's "restore a table dropped days ago" case).
+    pub source_table: TableName,
+    /// The new table this restore is populating.
+    pub target_table: TableName,
+    /// The single `Building` tablet minted for this restore (ADR 0059 Train
+    /// 2 as-built note: restore mints exactly **one** fresh tablet over the
+    /// whole ring, matching ordinary `CreateTable`'s own provisioning
+    /// convention, rather than mirroring the backup's historical
+    /// multi-tablet topology — see that note for the full reasoning). The
+    /// restore driver seeds this tablet from every one of the backup's data
+    /// objects, regardless of which physical tablet originally captured
+    /// them (a single destination tablet needs no per-row key routing).
+    pub tablet: TabletId,
+    /// The GSI definitions to create once this restore activates its
+    /// tablet (ADR 0059 §8): the caller's own `GlobalSecondaryIndexOverride`
+    /// if given, else every `Global`-kind index the backup's own manifest
+    /// recorded — resolved once, client-side, by the wire handler
+    /// (`animusd::dynamo::restore_table_from_backup`) before ever proposing,
+    /// the identical "client-supplied, recorded verbatim" convention
+    /// [`BackupRow::backup_name`] already uses. Each already carries
+    /// [`IndexStatus::Creating`] (mirroring `create_index`'s own override
+    /// convention) — **deliberately not declared on the target schema until
+    /// [`MetaCommand::CompleteRestore`] fires** (see that command's own doc
+    /// and the restore driver's module doc): declaring a GSI before the
+    /// tablet is seeded would let the backfill seeder observe an empty
+    /// range, mark it backfilled, and then silently miss every row this
+    /// restore seeds afterward.
+    pub gsi_defs: Vec<IndexDef>,
+    /// `Some` for a `RestoreTableToPointInTime` restore (ADR 0059 §10, Train
+    /// 3 PR②) — the segment-replay plan the wire handler resolved once,
+    /// client-side, before ever proposing (the identical "client-supplied,
+    /// recorded verbatim" convention [`gsi_defs`](Self::gsi_defs) already
+    /// uses, and for the same reason: computing this needs the backup
+    /// store's own manifest object, which this pure state machine cannot
+    /// read). `None` for an ordinary `RestoreTableFromBackup` restore — in
+    /// that case `backup_id` alone is everything the restore driver
+    /// (`animusd::backup_restore`) needs, unchanged from Train 2. See
+    /// [`PitrRestorePlan`]'s own doc for the plan shape and
+    /// [`Metadata::pitr_replay_segments`] for how it is computed.
+    pub pitr: Option<PitrRestorePlan>,
+    /// This row's lifecycle status.
+    pub status: RestoreStatus,
+}
+
+/// One PITR segment to replay, as part of a [`PitrRestorePlan`] (ADR 0059
+/// §10, Train 3 PR②) — a thin reference into the already-committed
+/// [`Metadata::pitr_segments`] catalog (never re-derived by the restore
+/// driver, which reads only this plan), resolved once by the wire handler
+/// from a **fresh** `Metadata` read at propose time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrReplaySegmentRef {
+    /// The tablet (possibly a live split descendant of the PITR base
+    /// snapshot's own pinned tablet, ADR 0059 §6's re-planning technique
+    /// applied here too) whose own chain this segment belongs to —
+    /// diagnostic only; the driver never needs it to fetch or decode.
+    pub tablet: TabletId,
+    /// This segment's own epoch within `tablet`'s chain — diagnostic only.
+    pub epoch: u64,
+    /// The backup store object id (`PitrSegmentRow::object_id`) to fetch.
+    pub object_id: String,
+    /// The `(start_exclusive, end_inclusive)` packed-HLC range to slice this
+    /// segment's decoded records to (`segment::decode_and_slice`) — **not**
+    /// necessarily the catalog row's own full `hlc_range`: for a segment
+    /// straddling the PITR base snapshot's own captured cut version, the
+    /// lower bound is raised to that cut version so an already-captured
+    /// record is never replayed a second time (harmless either way, since
+    /// `SeedBatch`'s own merge-at-carried-version is idempotent, but
+    /// avoided here rather than relied upon).
+    pub replay_range: (u64, u64),
+}
+
+/// A PITR restore's own segment-replay plan (ADR 0059 §10, Train 3 PR②) —
+/// resolved once, client-side, by `animusd::dynamo::
+/// restore_table_to_point_in_time` from a fresh `Metadata` read plus the
+/// chosen PITR base snapshot's own manifest object (fetched from the backup
+/// store — something this pure state machine has no access to, which is why
+/// this plan rides the command as already-resolved data rather than being
+/// recomputed inside `MetaCommand::BeginRestore`'s own apply arm the way
+/// `BeginBackup`'s manifest stub is). See [`Metadata::pitr_replay_segments`]
+/// for the plan-computation algorithm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PitrRestorePlan {
+    /// The restore's own target wall-clock cutoff, in epoch milliseconds
+    /// (the requested `RestoreDateTime`, truncated to the second and pushed
+    /// to that second's own last millisecond — or `LatestRestorableDateTime`
+    /// verbatim for `UseLatestRestorableTime`). Every included segment's own
+    /// `seal_wall_ms` is at or before this value (ADR 0059 §10's
+    /// per-tablet-cutoff rule, at this codebase's own segment-granularity
+    /// precision — see `pitr_replay_segments`'s own doc for the full
+    /// argument). Diagnostic/observability only, once the plan below is
+    /// already resolved.
+    pub target_wall_ms: u64,
+    /// Every PITR segment to replay, across every one of the base
+    /// snapshot's own pinned tablets and their live split descendants, in
+    /// no particular cross-tablet order (`SeedBatch`'s merge-at-carried-
+    /// version is order-independent by construction — see
+    /// `animusd::backup_restore`'s own doc for the full argument).
+    pub segments: Vec<PitrReplaySegmentRef>,
+}
+
+/// The current-generation PITR restorable window for `table` (ADR 0059
+/// §10) — the basis `RestoreTableToPointInTime`'s validation gate reads,
+/// valid whether or not the table still exists (a dropped table's PITR
+/// history survives `DropTableSchema`/`DropTableTablets`, ADR 0059 §9/§10's
+/// own carve-out). Deliberately scoped to the **latest** generation this
+/// table name has ever used, never an older one superseded by a disable/
+/// re-enable cycle — this is what makes a `T` before this generation's own
+/// coverage start (including one that falls inside an earlier disable/
+/// re-enable gap) uniformly rejected as "too early," without needing a
+/// separate gap-detection rule (this settles the ADR's own "Not yet
+/// decided" question from the Train 3 PR① amendment: option 1, reject
+/// outright, chosen over "find no coverage and use a generic error" —
+/// because scoping to the latest generation alone already produces exactly
+/// that rejection for free).
+///
+/// Distinct from (but answering the identical underlying question as)
+/// `animusd::dynamo::pitr_description`'s own `DescribeContinuousBackups`
+/// formula: that one is more precise for a **live** table (it takes the
+/// minimum over the table's *current* tablets' own last-seal times); this
+/// one instead takes the minimum over every tablet that ever sealed a
+/// segment of this generation, which is the only formulation that still
+/// makes sense once the table (and with it `Metadata::tablets_for_table`)
+/// is gone. The two agree for a live, quiescent table but can differ
+/// slightly for a live table mid-split (a retired parent's own tablet id
+/// still counts here, harmlessly conservative) — never a correctness
+/// concern for restore's own gate, which only needs a **safe** (never too
+/// generous) bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitrRestoreWindow {
+    /// The generation this window describes.
+    pub generation: u64,
+    /// The earliest wall-clock instant (epoch milliseconds), **before** the
+    /// retention floor is folded in (the caller, holding `env.wall_now()`,
+    /// does that — this pure accessor takes no "now" input at all).
+    pub earliest_ms: u64,
+    /// The latest wall-clock instant (epoch milliseconds) this generation's
+    /// own coverage can currently support a restore to.
+    pub latest_ms: u64,
 }
 
 /// A mutation of [`Metadata`], replicated through Raft and applied in log order.
@@ -928,6 +1302,34 @@ pub enum MetaCommand {
         table: TableName,
         spec: Option<TtlSpec>,
     },
+    /// Enable or disable a table's **point-in-time recovery (PITR)**
+    /// configuration (ADR 0059 §9) — the `UpdateContinuousBackups` wire
+    /// operation's own catalog toggle. Rejected if the table has no schema.
+    ///
+    /// `enabled: true`: a no-op if PITR is already enabled (re-enabling an
+    /// already-enabled table is a legal, idempotent DynamoDB call — real
+    /// AWS simply returns the current description); otherwise mints a fresh
+    /// generation from [`Metadata::pitr_generation`]'s own never-rewound
+    /// per-table floor (bumping it by exactly one) and records
+    /// `TableSchema.pitr = Some(PitrSpec { generation, enabled_wall_ms:
+    /// wall_ms })` — the ADR's "enable starts the window at now" rule.
+    ///
+    /// `enabled: false`: a no-op if PITR is already disabled; otherwise
+    /// clears `TableSchema.pitr` (the allocator floor in
+    /// `Metadata::pitr_generation` is deliberately left untouched, so a
+    /// later re-enable never reuses this generation number — see that
+    /// field's own doc). Existing `Metadata::pitr_segments` rows and any
+    /// PITR base snapshot are **not** touched here — they survive at the
+    /// catalog's own retention janitor's pace (ADR 0059 §9/§3), exactly
+    /// like a disabled-but-still-draining stream's un-reaped rows.
+    UpdateContinuousBackups {
+        table: TableName,
+        enabled: bool,
+        /// `env.wall_now()` at propose time (ADR 0051's discipline) — the
+        /// new generation's `PitrSpec::enabled_wall_ms` when `enabled` is
+        /// `true`; ignored when `enabled` is `false`.
+        wall_ms: u64,
+    },
     /// Record a sealed stream shard segment in the replicated catalog (ADR
     /// 0042 §3/§9, ADR 0043 §A3/§A8) — the tablet leader's own commit of a
     /// `SegmentStore::put` it has already durably completed.
@@ -1016,6 +1418,49 @@ pub enum MetaCommand {
         rows: Vec<(TabletId, u64)>,
         remove: bool,
     },
+    /// Record a sealed **PITR segment** in the replicated catalog (ADR 0059
+    /// §9, Train 3) — the PITR consumer's own twin of
+    /// [`SealStreamShard`](Self::SealStreamShard), sharing its exact
+    /// first-committer-wins-on-content shape, replicas-only-update
+    /// allowance, and epoch-chain sanity check, but validated against
+    /// [`PitrSegmentRow::generation`] instead of a stream label.
+    ///
+    /// **Generation validation**: `generation` must be licensed either by
+    /// the table's *current* `TableSchema.pitr.generation`, or by an
+    /// existing [`Metadata::pitr_segments`] row already present for this
+    /// exact `(table, generation)` pair (a disabled PITR's un-reaped rows
+    /// still license a further seal of the same generation — the
+    /// disable-triggered final seal, mirroring `SealStreamShard`'s F12-b
+    /// label rule exactly). A generation matching neither is rejected.
+    SealPitrSegment {
+        table: TableName,
+        generation: u64,
+        tablet: TabletId,
+        epoch: u64,
+        hlc_range: (u64, u64),
+        count: u64,
+        seal_wall_ms: u64,
+        replicas: Vec<NodeId>,
+        object_id: String,
+    },
+    /// The PITR retention janitor's two-phase reclaim of already-sealed
+    /// [`Metadata::pitr_segments`] rows (ADR 0059 §9) — the PITR twin of
+    /// [`ExpireStreamShards`](Self::ExpireStreamShards), identical
+    /// mark/remove semantics, applied to the separate PITR segment catalog.
+    ExpirePitrSegments {
+        rows: Vec<(TabletId, u64)>,
+        remove: bool,
+    },
+    /// Tag an already-`BeginBackup`'d row as a **PITR base snapshot** (ADR
+    /// 0059 §9) rather than an ordinary on-demand backup — proposed by the
+    /// PITR periodic-snapshot loop immediately after it observes its own
+    /// `BeginBackup` row exist. Idempotent insert into
+    /// [`Metadata::pitr_base_backups`]; rejected if `backup_id` names no
+    /// existing row (the proposer always sequences `BeginBackup` first and
+    /// only proposes this once that row is confirmed present, so a
+    /// rejection here should never happen in production — a defensive
+    /// seatbelt, not an expected path).
+    MarkBackupPitrBase { backup_id: BackupId },
     /// Register (or update) a **CP group member's address** (Phase 2): the
     /// `raftkv`-role listen address of member `id`, stored opaquely in
     /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
@@ -1169,14 +1614,15 @@ pub enum MetaCommand {
     /// [`BackupStatus::Creating`] catalog row at `backup_id`. The manifest
     /// stub (schema snapshot + pinned tablet list) is derived **entirely
     /// from already-agreed `Metadata`** at apply time — never from anything
-    /// the proposer carries beyond `backup_id`/`table`/`created_wall_ms` —
-    /// so every replica computes an identical stub. Rejected if `backup_id`
-    /// already names a row (a fresh id is minted per request, so there is
-    /// nothing to CAS against — first-committer-wins on a brand-new
-    /// identity, mirroring [`CreateTablet`](Self::CreateTablet)'s own
-    /// shape) or if `table` has no schema.
+    /// the proposer carries beyond `backup_id`/`table`/`created_wall_ms`/
+    /// `backup_name` — so every replica computes an identical stub. Rejected
+    /// if `backup_id` already names a row (a fresh id is minted per request,
+    /// so there is nothing to CAS against — first-committer-wins on a
+    /// brand-new identity, mirroring [`CreateTablet`](Self::CreateTablet)'s
+    /// own shape) or if `table` has no schema.
     BeginBackup {
-        /// The freshly-minted, never-reused backup identity.
+        /// The freshly-minted, never-reused backup identity (an ARN-shaped
+        /// string at the wire, ADR 0059 §3).
         backup_id: BackupId,
         /// The source table to back up.
         table: TableName,
@@ -1184,6 +1630,13 @@ pub enum MetaCommand {
         /// (`env.wall_now()`, ADR 0051's discipline) — the pure state
         /// machine has no clock.
         created_wall_ms: u64,
+        /// The client-supplied `BackupName` (ADR 0059 Train 1 PR④, DynamoDB's
+        /// `CreateBackup` request field) — recorded verbatim in
+        /// [`BackupRow::backup_name`] purely for later `DescribeBackup`/
+        /// `ListBackups` echo; never interpreted, never part of the backup's
+        /// own identity (that's `backup_id` alone, per this catalog's own
+        /// "scar," [`Metadata::backups`]'s doc).
+        backup_name: String,
     },
     /// One pinned tablet's capture-completion report (ADR 0059 §3/§4) —
     /// mirroring [`MarkIndexBackfilled`](Self::MarkIndexBackfilled)'s
@@ -1244,6 +1697,95 @@ pub enum MetaCommand {
     DeleteBackup {
         /// The backup to remove.
         backup_id: BackupId,
+    },
+    /// Mark a backup for reclaim (ADR 0059 §3, Train 1 PR④) — the two-phase
+    /// retention janitor's own **mark** step (ADR 0043 §A9's mold, reused
+    /// verbatim), driven here by the `DeleteBackup` wire operation
+    /// (`animusd::dynamo`) rather than by any retention clock (on-demand
+    /// backups never auto-expire): flips [`Available`](BackupStatus::Available)
+    /// or [`Failed`](BackupStatus::Failed) to
+    /// [`Expired`](BackupStatus::Expired), the same terminal-reclaim state
+    /// [`BackupStatus::Expired`]'s own doc already reserved for exactly this
+    /// purpose. The row itself is **not** removed here — [`DeleteBackup`]
+    /// (Self::DeleteBackup) is the existing, unmodified **finalizing**
+    /// command the backup janitor (`animusd::backup_janitor`) proposes once
+    /// it has reclaimed every object this backup's manifest/data occupy in
+    /// the backup store. Idempotent: a no-op if the row is already `Expired`
+    /// (the janitor's own crash-resume, or a repeated `DeleteBackup` wire
+    /// call, must never re-mark). Rejected if `backup_id` is unknown, or if
+    /// the row is still [`Creating`](BackupStatus::Creating) — the wire
+    /// edge's own `BackupInUseException` check happens first in the common
+    /// case, but this is the apply-time seatbelt for any other caller,
+    /// mirroring every other command's defense-in-depth precondition.
+    MarkBackupDeleted {
+        /// The backup to mark for reclaim.
+        backup_id: BackupId,
+    },
+    /// Begin a restore (ADR 0059 §7, Train 2): mints a fresh
+    /// [`RestoreRow`] in [`RestoreStatus::Seeding`] plus this restore's
+    /// single `Building` tablet, bound to `target_table` (whose schema must
+    /// already exist — the wire caller proposes `CreateTableSchema`/
+    /// `CreateTableIndex` for the LSIs first, exactly the ordering
+    /// `provision_tablet` already requires of `CreateTable`). Rejected if
+    /// `restore_id` already exists (first-committer-wins, mirroring
+    /// [`BeginBackup`](Self::BeginBackup)'s own fresh-identity collision
+    /// case) or if `tablet` already exists or sits below the monotonic
+    /// allocator floor (the identical seatbelt
+    /// [`BeginSplit`](Self::BeginSplit)/[`CreateTablet`](Self::CreateTablet)
+    /// already enforce). No epoch-CAS: like `BeginBackup`, there is nothing
+    /// to CAS against for a freshly-minted identity.
+    BeginRestore {
+        /// This restore's own opaque identity.
+        restore_id: RestoreId,
+        /// The backup being restored from.
+        backup_id: BackupId,
+        /// The backup's own source table (descriptive only, see
+        /// [`RestoreRow::source_table`]'s doc).
+        source_table: TableName,
+        /// The new table being populated.
+        target_table: TableName,
+        /// This restore's single destination tablet id (caller-allocated,
+        /// same convention as `CreateTablet`/`BeginSplit`'s own children).
+        tablet: TabletId,
+        /// The destination tablet's initial replica set.
+        replicas: Vec<NodeId>,
+        /// The GSI definitions to create once this restore completes — see
+        /// [`RestoreRow::gsi_defs`]'s own doc for why these are recorded now
+        /// but not declared on the schema until then.
+        gsi_defs: Vec<IndexDef>,
+        /// `Some` for a `RestoreTableToPointInTime` restore (ADR 0059 §10,
+        /// Train 3 PR②) — see [`RestoreRow::pitr`]'s own doc. Carried
+        /// verbatim onto the new [`RestoreRow`], never inspected or
+        /// recomputed by this apply arm.
+        pitr: Option<PitrRestorePlan>,
+    },
+    /// Complete a restore (ADR 0059 §7 step 5): activates this restore's
+    /// tablet (`Building` → `Active`, epoch bumped — mirroring
+    /// [`CutoverSplit`](Self::CutoverSplit)'s own activation, minus the
+    /// "retire a parent" half, since restore has no parent) and flips the
+    /// row to [`RestoreStatus::Done`]. Rejected if `restore_id` is unknown,
+    /// not currently [`Seeding`](RestoreStatus::Seeding), or its tablet is
+    /// not `Building` (defense-in-depth against a doubly-proposed
+    /// completion racing something else entirely — this command's own
+    /// producer, the restore driver, `animusd::backup_restore`, only ever
+    /// proposes it once per restore in practice).
+    CompleteRestore {
+        /// The restore to complete.
+        restore_id: RestoreId,
+    },
+    /// Fail a restore past a bounded stuck-timeout, or on an unreadable
+    /// source backup (ADR 0059 §7's crash/liveness contract — mirroring
+    /// [`FailBackup`](Self::FailBackup)'s own idempotent terminal-transition
+    /// shape). Idempotent on an identical repeat; contradicts (rejects) an
+    /// already-[`Done`](RestoreStatus::Done) row. The tablet is
+    /// deliberately left `Building` (never activated, never routable) —
+    /// see [`RestoreStatus::Failed`]'s own doc for why this still leaves a
+    /// cleanly deletable target table.
+    FailRestore {
+        /// The restore to fail.
+        restore_id: RestoreId,
+        /// A human-readable failure reason.
+        reason: String,
     },
 }
 
@@ -1921,6 +2463,7 @@ impl Metadata {
                 backup_id,
                 table,
                 created_wall_ms,
+                backup_name,
             } => {
                 if self.backups.contains_key(backup_id) {
                     return ApplyOutcome::Rejected("backup id already exists");
@@ -1944,12 +2487,14 @@ impl Metadata {
                     backup_id.clone(),
                     BackupRow {
                         table: table.clone(),
+                        backup_name: backup_name.clone(),
                         status: BackupStatus::Creating,
                         manifest: BackupManifest {
                             schema: schema.clone(),
                             pinned_tablets,
                             created_wall_ms: *created_wall_ms,
                         },
+                        total_bytes: 0,
                     },
                 );
                 ApplyOutcome::Applied
@@ -1966,12 +2511,10 @@ impl Metadata {
                 if !matches!(row.status, BackupStatus::Creating) {
                     return ApplyOutcome::Rejected("backup is not Creating");
                 }
-                let pinned = row
-                    .manifest
-                    .pinned_tablets
-                    .iter()
-                    .any(|t| t.tablet == *tablet);
-                if !pinned {
+                // ADR 0059 §6: `tablet` need not be directly pinned — a
+                // re-planned live descendant of a retired (split) pinned
+                // tablet is admitted too, via its own `split_lineage` chain.
+                if !self.traces_to_pinned(&row.manifest.pinned_tablets, *tablet) {
                     return ApplyOutcome::Rejected("tablet is not pinned in this backup");
                 }
                 let key = (backup_id.clone(), *tablet);
@@ -1999,19 +2542,39 @@ impl Metadata {
                 if !matches!(row.status, BackupStatus::Creating) {
                     return ApplyOutcome::Rejected("backup is not Creating");
                 }
-                let all_reported = row.manifest.pinned_tablets.iter().all(|t| {
-                    self.backup_tablet_progress
-                        .contains_key(&(backup_id.clone(), t.tablet))
-                });
+                // ADR 0059 §6: a pinned tablet that retired via a split is
+                // satisfied once every one of its LIVE `split_lineage`
+                // descendants has its own progress row, not by a (now
+                // impossible) direct report from the retired id itself.
+                let all_reported = row
+                    .manifest
+                    .pinned_tablets
+                    .iter()
+                    .all(|t| self.pinned_tablet_capture_complete(backup_id, t.tablet));
                 if !all_reported {
                     return ApplyOutcome::Rejected(
                         "not every pinned tablet has reported completion",
                     );
                 }
-                self.backups
+                // Freeze the final byte total NOW, while every pinned
+                // tablet's live descendant is still resolvable
+                // (`backup_total_bytes`'s own doc: it sums only the
+                // *currently authoritative* reporter per pinned tablet,
+                // never a stale split-superseded orphan) — `DescribeBackup`/
+                // `ListBackups` (Train 1 PR④) read this frozen field
+                // directly rather than re-deriving it, since a live
+                // re-derivation goes to exactly zero the moment the source
+                // table (and with it every one of this backup's tablets) is
+                // ever dropped (ADR 0059 §3's own "outlives the source
+                // table" promise would otherwise silently break the size
+                // this row reports, not just the table lookup).
+                let total_bytes = self.backup_total_bytes(backup_id);
+                let row = self
+                    .backups
                     .get_mut(backup_id)
-                    .expect("checked present above")
-                    .status = BackupStatus::Available;
+                    .expect("checked present above");
+                row.status = BackupStatus::Available;
+                row.total_bytes = total_bytes;
                 ApplyOutcome::Applied
             }
             MetaCommand::FailBackup { backup_id, reason } => {
@@ -2039,7 +2602,111 @@ impl Metadata {
                 }
                 self.backup_tablet_progress
                     .retain(|(id, _), _| id != backup_id);
+                // ADR 0059 §9: a PITR base snapshot's own tag row is exactly
+                // as reclaimable as the backup row it tags — never a reason
+                // by itself to keep the row alive (retention is decided
+                // upstream of this command, same as an ordinary on-demand
+                // backup's).
+                self.pitr_base_backups.remove(backup_id);
                 ApplyOutcome::Applied
+            }
+            MetaCommand::MarkBackupDeleted { backup_id } => {
+                let Some(row) = self.backups.get_mut(backup_id) else {
+                    return ApplyOutcome::Rejected("no such backup");
+                };
+                match &row.status {
+                    BackupStatus::Expired => ApplyOutcome::NoOp,
+                    BackupStatus::Creating => {
+                        ApplyOutcome::Rejected("backup is not in a deletable state")
+                    }
+                    BackupStatus::Available | BackupStatus::Failed { .. } => {
+                        row.status = BackupStatus::Expired;
+                        ApplyOutcome::Applied
+                    }
+                }
+            }
+            MetaCommand::BeginRestore {
+                restore_id,
+                backup_id,
+                source_table,
+                target_table,
+                tablet,
+                replicas,
+                gsi_defs,
+                pitr,
+            } => {
+                if self.restores.contains_key(restore_id) {
+                    return ApplyOutcome::Rejected("restore id already exists");
+                }
+                if self.tablets.contains_key(tablet) {
+                    return ApplyOutcome::Rejected("tablet already exists");
+                }
+                // Same monotonic-allocator floor as `CreateTablet`/`BeginSplit`
+                // (and for the same dropped-data-resurrection reason).
+                if tablet.0 < self.next_free_tablet_id().0 {
+                    return ApplyOutcome::Rejected("tablet id below the monotonic allocator");
+                }
+                let mut t = Tablet::with_table(
+                    *tablet,
+                    Some(target_table.clone()),
+                    KeyRange::whole(),
+                    replicas.clone(),
+                );
+                t.state = TabletState::Building;
+                self.tablets.insert(*tablet, t);
+                self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
+                self.restores.insert(
+                    restore_id.clone(),
+                    RestoreRow {
+                        backup_id: backup_id.clone(),
+                        source_table: source_table.clone(),
+                        target_table: target_table.clone(),
+                        tablet: *tablet,
+                        gsi_defs: gsi_defs.clone(),
+                        pitr: pitr.clone(),
+                        status: RestoreStatus::Seeding,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::CompleteRestore { restore_id } => {
+                let Some(row) = self.restores.get(restore_id) else {
+                    return ApplyOutcome::Rejected("no such restore");
+                };
+                if !matches!(row.status, RestoreStatus::Seeding) {
+                    return ApplyOutcome::Rejected("restore is not Seeding");
+                }
+                let tablet_id = row.tablet;
+                let Some(t) = self.tablets.get_mut(&tablet_id) else {
+                    return ApplyOutcome::Rejected("restore's tablet no longer exists");
+                };
+                if t.state != TabletState::Building {
+                    return ApplyOutcome::Rejected("restore's tablet is not Building");
+                }
+                t.state = TabletState::Active;
+                t.epoch = t.epoch.next();
+                self.restores
+                    .get_mut(restore_id)
+                    .expect("checked present above")
+                    .status = RestoreStatus::Done;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FailRestore { restore_id, reason } => {
+                let Some(row) = self.restores.get_mut(restore_id) else {
+                    return ApplyOutcome::Rejected("no such restore");
+                };
+                match &row.status {
+                    RestoreStatus::Failed { reason: existing } if existing == reason => {
+                        ApplyOutcome::NoOp
+                    }
+                    RestoreStatus::Seeding | RestoreStatus::Failed { .. } => {
+                        row.status = RestoreStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        ApplyOutcome::Applied
+                    }
+                    RestoreStatus::Done => ApplyOutcome::Rejected("restore already completed"),
+                }
             }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -2076,6 +2743,38 @@ impl Metadata {
                     return ApplyOutcome::NoOp;
                 }
                 schema.ttl = spec.clone();
+                ApplyOutcome::Applied
+            }
+            MetaCommand::UpdateContinuousBackups {
+                table,
+                enabled,
+                wall_ms,
+            } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if *enabled {
+                    if schema.pitr.is_some() {
+                        return ApplyOutcome::NoOp;
+                    }
+                    let generation = self.pitr_generation.get(table).copied().unwrap_or(0) + 1;
+                    self.pitr_generation.insert(table.clone(), generation);
+                    self.schemas
+                        .get_mut(table)
+                        .expect("checked present above")
+                        .pitr = Some(PitrSpec {
+                        generation,
+                        enabled_wall_ms: *wall_ms,
+                    });
+                } else {
+                    if schema.pitr.is_none() {
+                        return ApplyOutcome::NoOp;
+                    }
+                    self.schemas
+                        .get_mut(table)
+                        .expect("checked present above")
+                        .pitr = None;
+                }
                 ApplyOutcome::Applied
             }
             MetaCommand::SealStreamShard {
@@ -2201,6 +2900,102 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SealPitrSegment {
+                table,
+                generation,
+                tablet,
+                epoch,
+                hlc_range,
+                count,
+                seal_wall_ms,
+                replicas,
+                object_id,
+            } => {
+                // First-committer-wins on CONTENT — the identical shape
+                // `SealStreamShard` uses, see that arm's own doc for the
+                // full reasoning (crash-retry no-op vs. replica-repair
+                // update vs. genuine conflict).
+                if let Some(existing) = self.pitr_segments.get_mut(&(*tablet, *epoch)) {
+                    let content_matches = existing.table == *table
+                        && existing.generation == *generation
+                        && existing.hlc_range == *hlc_range
+                        && existing.count == *count
+                        && existing.seal_wall_ms == *seal_wall_ms
+                        && existing.object_id == *object_id;
+                    if !content_matches || existing.replicas == *replicas {
+                        return ApplyOutcome::NoOp;
+                    }
+                    existing.replicas = replicas.clone();
+                    return ApplyOutcome::Applied;
+                }
+                // Generation validation, mirroring `SealStreamShard`'s label
+                // rule: licensed by the table's *current* PITR generation,
+                // or by an existing catalog row already present for this
+                // exact (table, generation) pair.
+                let current_generation_matches = self
+                    .schemas
+                    .get(table)
+                    .and_then(|s| s.pitr.as_ref())
+                    .is_some_and(|spec| spec.generation == *generation);
+                let existing_row_for_generation = self
+                    .pitr_segments
+                    .values()
+                    .any(|row| row.table == *table && row.generation == *generation);
+                if !current_generation_matches && !existing_row_for_generation {
+                    return ApplyOutcome::Rejected(
+                        "PITR generation has no current schema entry and no existing catalog \
+                         rows to extend",
+                    );
+                }
+                // Epoch-chain sanity, identical to `SealStreamShard`.
+                if *epoch > 0 && !self.pitr_segments.contains_key(&(*tablet, *epoch - 1)) {
+                    return ApplyOutcome::Rejected(
+                        "epoch chain gap: no prior epoch row for this tablet",
+                    );
+                }
+                self.pitr_segments.insert(
+                    (*tablet, *epoch),
+                    PitrSegmentRow {
+                        table: table.clone(),
+                        generation: *generation,
+                        hlc_range: *hlc_range,
+                        count: *count,
+                        seal_wall_ms: *seal_wall_ms,
+                        replicas: replicas.clone(),
+                        object_id: object_id.clone(),
+                        expired: false,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ExpirePitrSegments { rows, remove } => {
+                let mut changed = false;
+                for (tablet, epoch) in rows {
+                    if *remove {
+                        changed |= self.pitr_segments.remove(&(*tablet, *epoch)).is_some();
+                    } else if let Some(row) = self.pitr_segments.get_mut(&(*tablet, *epoch))
+                        && !row.expired
+                    {
+                        row.expired = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
+            MetaCommand::MarkBackupPitrBase { backup_id } => {
+                if !self.backups.contains_key(backup_id) {
+                    return ApplyOutcome::Rejected("no such backup");
+                }
+                if self.pitr_base_backups.contains(backup_id) {
+                    return ApplyOutcome::NoOp;
+                }
+                self.pitr_base_backups.insert(backup_id.clone());
+                ApplyOutcome::Applied
             }
             MetaCommand::RegisterCpAddr { id, addr, tablet } => {
                 // A tablet-scoped registration for a tablet not (yet or anymore)
@@ -2452,6 +3247,15 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.ttl.as_ref())
     }
 
+    /// This table's point-in-time recovery (PITR) configuration (ADR 0059
+    /// §9), if enabled. `None` for an unknown table or one with no PITR
+    /// declared, mirroring [`table_stream`](Self::table_stream)/
+    /// [`table_ttl`](Self::table_ttl) exactly.
+    #[must_use]
+    pub fn table_pitr(&self, table: &str) -> Option<&PitrSpec> {
+        self.schemas.get(table).and_then(|s| s.pitr.as_ref())
+    }
+
     /// `tablet`'s own catalog rows for `(table, label)`, in ascending epoch
     /// order (ADR 0042 §2/§3) — the chain a `DescribeStream`/lineage-walk
     /// consumer needs for one tablet. `BTreeMap<(TabletId, u64), _>`'s own
@@ -2583,6 +3387,223 @@ impl Metadata {
         Some(shard_id_string(lineage.parent, parent_epoch))
     }
 
+    /// `tablet`'s effective PITR watermark (ADR 0059 §9) — the identical
+    /// "last sealed end-HLC" semantics as
+    /// [`stream_shard_watermark`](Self::stream_shard_watermark), over the
+    /// separate [`pitr_segments`](Self::pitr_segments) catalog. `None` if
+    /// this tablet has never sealed a PITR segment.
+    #[must_use]
+    pub fn pitr_segment_watermark(&self, tablet: TabletId) -> Option<u64> {
+        self.pitr_segments
+            .range((tablet, 0)..=(tablet, u64::MAX))
+            .next_back()
+            .map(|(_, row)| row.hlc_range.1)
+    }
+
+    /// `tablet`'s own most recent PITR seal's wall-clock time — the PITR
+    /// twin of [`last_seal_wall_ms`](Self::last_seal_wall_ms).
+    #[must_use]
+    pub fn last_pitr_seal_wall_ms(&self, tablet: TabletId) -> Option<u64> {
+        self.pitr_segments
+            .range((tablet, 0)..=(tablet, u64::MAX))
+            .next_back()
+            .map(|(_, row)| row.seal_wall_ms)
+    }
+
+    /// Every PITR generation `table` has at least one catalog row for (ADR
+    /// 0059 §9) — the PITR twin of
+    /// [`stream_labels_with_rows`](Self::stream_labels_with_rows), licensing
+    /// a disable-triggered final PITR seal exactly the way that accessor
+    /// licenses one for streams.
+    pub fn pitr_generations_with_rows(&self, table: &str) -> BTreeSet<u64> {
+        self.pitr_segments
+            .values()
+            .filter(|row| row.table == table)
+            .map(|row| row.generation)
+            .collect()
+    }
+
+    /// Every [`BackupRow`] tagged as a PITR base snapshot
+    /// ([`Metadata::pitr_base_backups`]) for `table`, in ascending
+    /// `created_wall_ms` order — the janitor's and `DescribeContinuousBackups`'
+    /// shared "which base snapshots does this table's PITR history have"
+    /// read, so the accessor logic lives in exactly one place.
+    pub fn pitr_base_backups_for_table<'a>(
+        &'a self,
+        table: &'a str,
+    ) -> impl Iterator<Item = (&'a BackupId, &'a BackupRow)> {
+        let mut rows: Vec<(&'a BackupId, &'a BackupRow)> = self
+            .pitr_base_backups
+            .iter()
+            .filter_map(|id| self.backups.get(id).map(|row| (id, row)))
+            .filter(|(_, row)| row.table == table)
+            .collect();
+        rows.sort_by_key(|(_, row)| row.manifest.created_wall_ms);
+        rows.into_iter()
+    }
+
+    /// **ADR 0059 §10 (Train 3 PR②)**: the ordered plan of PITR segments to
+    /// replay forward from a chosen PITR base snapshot's own per-tablet cut
+    /// versions (`base_tablet_progress`, taken verbatim from that backup's
+    /// frozen manifest **object** — never from this catalog, which never
+    /// held that per-tablet detail in the first place) up to
+    /// `cutoff_wall_ms`.
+    ///
+    /// **Split-lineage aware, but deliberately NOT built on
+    /// [`live_split_descendants`]** (ADR 0059 §6's own on-demand-capture
+    /// re-planning accessor) — a real bug found building this function's
+    /// own first e2e test, not by design review: `live_split_descendants`
+    /// answers "live" descendants, and a tablet retired by
+    /// `DropTableTablets` (an ordinary table drop, never a split) has
+    /// **no** `split_lineage` entry of its own to descend through, so it
+    /// reads as having no live descendant at all — exactly correct for
+    /// on-demand capture (which has nothing left to *capture* once its own
+    /// table is gone) but wrong here, where the whole point is to keep
+    /// replaying a DROPPED table's own already-sealed segments (ADR 0059
+    /// §9/§10's own outlives-the-source-table carve-out). This function
+    /// instead walks the `split_lineage` **tree forward** from each base
+    /// tablet — itself, unconditionally, plus every split descendant
+    /// however many generations deep — and includes each visited tablet's
+    /// own segments regardless of whether that tablet (or any of its
+    /// ancestors) is currently live: a table drop never touches
+    /// `split_lineage` or `pitr_segments` at all, so "was this tablet ever
+    /// live" is simply not a fact this function needs to know. A cascading
+    /// split (parent → mid → {a, b}) therefore replays the parent's own
+    /// tail, then `mid`'s own full chain, then `a`'s and `b`'s own full
+    /// chains, in one direct forward traversal with no separate ancestor
+    /// walk-back needed.
+    ///
+    /// **Precision, stated plainly rather than left to be discovered by
+    /// diffing this against the ADR's own prose**: [`PitrSegmentRow::
+    /// seal_wall_ms`] is pinned once **per segment**, never per record — a
+    /// segment is included or excluded as a whole unit against
+    /// `cutoff_wall_ms`, never split mid-body. This is a **safe**
+    /// (never-includes-a-later-write) approximation of "the packed-HLC
+    /// cutoff corresponding to wall-clock second `T`": every record inside
+    /// an included segment was durably committed strictly before that
+    /// segment's own seal, itself at or before `cutoff_wall_ms` by this
+    /// function's own filter. The cost is the opposite direction: a record
+    /// truly committed just before `T` but batched into a segment sealed
+    /// just after it is excluded, not included — bounded to at most one
+    /// seal interval's worth of imprecision, and the identical direction
+    /// ADR 0059 §9's own "never claim `now`" `LatestRestorableDateTime`
+    /// rule already accepts.
+    ///
+    /// Deliberately **not** sorted or interleaved across tablets in the
+    /// returned `Vec` — see [`PitrRestorePlan::segments`]'s own doc for why
+    /// the restore driver's replay order never matters.
+    #[must_use]
+    pub fn pitr_replay_segments(
+        &self,
+        base_tablet_progress: &[(TabletId, u64)],
+        cutoff_wall_ms: u64,
+    ) -> Vec<PitrReplaySegmentRef> {
+        let mut out = Vec::new();
+        for &(base_tablet, base_cut_version) in base_tablet_progress {
+            // Forward DFS over the `split_lineage` subtree rooted at
+            // `base_tablet` — `base_tablet` itself first (`is_root: true`,
+            // the only stack entry floored at the base's own cut version),
+            // then every split descendant, however many generations deep.
+            // Bounded by `split_lineage.len() + 1` pushes at most (each
+            // tablet is discovered as a CHILD at most once, since a child
+            // key is unique in the map), so a malformed/cyclic chain —
+            // which should never occur; `split_lineage` is a tree, written
+            // once per child — still cannot loop forever.
+            let mut stack = vec![(base_tablet, true)];
+            let mut visited = 0usize;
+            while let Some((tablet, is_root)) = stack.pop() {
+                visited += 1;
+                if visited > self.split_lineage.len() + 1 {
+                    break; // defensive bound; see doc above
+                }
+                let floor = if is_root { base_cut_version } else { 0 };
+                for (&(_, epoch), row) in self.pitr_segments.range((tablet, 0)..=(tablet, u64::MAX))
+                {
+                    if row.hlc_range.1 <= floor {
+                        continue; // fully covered by the base snapshot already
+                    }
+                    if row.seal_wall_ms > cutoff_wall_ms {
+                        continue; // sealed after the requested cutoff
+                    }
+                    out.push(PitrReplaySegmentRef {
+                        tablet,
+                        epoch,
+                        object_id: row.object_id.clone(),
+                        replay_range: (floor.max(row.hlc_range.0), row.hlc_range.1),
+                    });
+                }
+                for (&child, lineage) in &self.split_lineage {
+                    if lineage.parent == tablet {
+                        stack.push((child, false));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// See [`PitrRestoreWindow`]'s own doc for the full contract.
+    #[must_use]
+    pub fn pitr_restore_window(&self, table: &str) -> Option<PitrRestoreWindow> {
+        let live_spec = self.table_pitr(table);
+        let generation = live_spec
+            .map(|s| s.generation)
+            .or_else(|| self.pitr_generation.get(table).copied())?;
+        if generation == 0 {
+            return None; // this table name has never enabled PITR at all
+        }
+        let enabled_ms = live_spec
+            .filter(|s| s.generation == generation)
+            .map(|s| s.enabled_wall_ms);
+
+        let bases: Vec<&BackupRow> = self
+            .pitr_base_backups_for_table(table)
+            .map(|(_, row)| row)
+            .collect();
+        let segment_tablets: BTreeSet<TabletId> = self
+            .pitr_segments
+            .iter()
+            .filter(|(_, row)| row.table == table && row.generation == generation)
+            .map(|((t, _), _)| *t)
+            .collect();
+
+        let earliest_ms = enabled_ms
+            .or_else(|| bases.first().map(|r| r.manifest.created_wall_ms))
+            .or_else(|| {
+                self.pitr_segments
+                    .iter()
+                    .filter(|(_, row)| row.table == table && row.generation == generation)
+                    .map(|(_, row)| row.seal_wall_ms)
+                    .min()
+            })?;
+
+        let latest_ms = if segment_tablets.is_empty() {
+            // Nothing has sealed yet. A live, just-(re)enabled generation
+            // with no base snapshot either still has a trivially valid
+            // (zero-width) window — "restorable to the moment it was
+            // enabled" — mirroring `pitr_description`'s own identical
+            // `.unwrap_or(spec.enabled_wall_ms)` fallback; only a table
+            // whose generation is known **only** through history (no live
+            // `PitrSpec`, i.e. disabled or dropped) with no base snapshot
+            // either has genuinely nothing to report.
+            bases
+                .last()
+                .map(|r| r.manifest.created_wall_ms)
+                .or(enabled_ms)
+        } else {
+            segment_tablets
+                .iter()
+                .map(|&t| self.last_pitr_seal_wall_ms(t).unwrap_or(earliest_ms))
+                .min()
+        }?;
+
+        Some(PitrRestoreWindow {
+            generation,
+            earliest_ms,
+            latest_ms: latest_ms.max(earliest_ms),
+        })
+    }
+
     /// The tablets scoped to `table` (ADR 0023), in ascending tablet-id order.
     /// Empty if no table-scoped tablet exists for it yet (a freshly created table
     /// whose tablet has not committed, or a legacy cluster whose only tablet is the
@@ -2689,11 +3710,184 @@ impl Metadata {
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
     }
 
+    /// **ADR 0059 §6 (the backup-vs-split race)**: every currently-**live**
+    /// tablet whose `split_lineage` chain traces back to `ancestor`,
+    /// transitively. `ancestor` itself, as a single-element vec, if it is
+    /// still live (the common case — most tablets never split during a
+    /// backup's own capture window); otherwise the union of its live
+    /// descendants, recursing through however many generations a cascading
+    /// split chain produced (`split_lineage` is a tree keyed child → parent,
+    /// walked here in the opposite direction via a linear scan — cheap
+    /// enough for this catalog's size, and this accessor is a background-
+    /// loop-tick concern, never a hot path). Empty only if `ancestor` is
+    /// neither live nor has ever recorded a child in `split_lineage` — a
+    /// tablet retired some way other than a split (today, only a dropped
+    /// table's `DropTableTablets`) has no live descendant to substitute, and
+    /// a caller sees "nothing to capture from," not a false completion (see
+    /// [`pinned_tablet_capture_complete`](Self::pinned_tablet_capture_complete)'s
+    /// own empty-set handling).
+    #[must_use]
+    pub fn live_split_descendants(&self, ancestor: TabletId) -> Vec<TabletId> {
+        if self.tablets.contains_key(&ancestor) {
+            return vec![ancestor];
+        }
+        let mut out = Vec::new();
+        for (&child, lineage) in &self.split_lineage {
+            if lineage.parent == ancestor {
+                out.extend(self.live_split_descendants(child));
+            }
+        }
+        out
+    }
+
+    /// **ADR 0059 §6**: does `tablet`'s own `split_lineage` chain trace back
+    /// to one of `pinned`'s tablets (directly, or through one or more
+    /// cascading splits)? The admission test
+    /// [`MetaCommand::RecordBackupTabletComplete`]'s apply arm uses this in
+    /// place of a bare direct-membership check, so a re-planned split
+    /// descendant's own completion report is accepted — the tablet id it
+    /// carries was never itself pinned, but its lineage proves it captured
+    /// exactly the range a pinned (now-retired) ancestor would have.
+    /// Bounded by `split_lineage`'s own size against a malformed/cyclic
+    /// chain, which should never occur (`split_lineage` is a tree, written
+    /// once per child at `CutoverSplit`) but must never spin forever if it
+    /// somehow did.
+    fn traces_to_pinned(&self, pinned: &[BackupPinnedTablet], tablet: TabletId) -> bool {
+        let mut cur = tablet;
+        for _ in 0..=self.split_lineage.len() {
+            if pinned.iter().any(|t| t.tablet == cur) {
+                return true;
+            }
+            let Some(lineage) = self.split_lineage.get(&cur) else {
+                return false;
+            };
+            cur = lineage.parent;
+        }
+        false
+    }
+
+    /// **ADR 0059 §4/§6**: has `pinned` tablet's own share of `backup_id`
+    /// been fully captured? True directly (a progress row at `pinned`
+    /// itself) when `pinned` is still live and never split; otherwise —
+    /// `pinned` retired via a split — true once **every** one of its live
+    /// `split_lineage` descendants
+    /// ([`live_split_descendants`](Self::live_split_descendants)) has its
+    /// own progress row. `false` when that descendant set is empty (a
+    /// tablet retired some way other than a split has nothing to wait on
+    /// that could ever report — see `live_split_descendants`'s own doc), so
+    /// this never treats a vacuous "every descendant reported" over an
+    /// empty set as completion.
+    fn pinned_tablet_capture_complete(&self, backup_id: &str, pinned: TabletId) -> bool {
+        let live = self.live_split_descendants(pinned);
+        !live.is_empty()
+            && live.iter().all(|t| {
+                self.backup_tablet_progress
+                    .contains_key(&(backup_id.to_owned(), *t))
+            })
+    }
+
+    /// **ADR 0059 §3/§4/§6**: is every one of `backup_id`'s pinned tablets
+    /// fully captured (directly, or via re-planned live split descendants)?
+    /// The pure readiness predicate the completion aggregator (`animusd`, a
+    /// later PR) polls before proposing
+    /// [`MetaCommand::CompleteBackup`] — sharing
+    /// [`pinned_tablet_capture_complete`](Self::pinned_tablet_capture_complete)
+    /// with that command's own apply-time re-check rather than
+    /// re-deriving the same decision twice. `false` for an unknown backup id
+    /// or one not currently [`Creating`](BackupStatus::Creating).
+    #[must_use]
+    pub fn backup_ready_to_complete(&self, backup_id: &str) -> bool {
+        let Some(row) = self.backups.get(backup_id) else {
+            return false;
+        };
+        if !matches!(row.status, BackupStatus::Creating) {
+            return false;
+        }
+        row.manifest
+            .pinned_tablets
+            .iter()
+            .all(|t| self.pinned_tablet_capture_complete(backup_id, t.tablet))
+    }
+
+    /// **ADR 0059 §4/§6**: is `tablet` (a **live** tablet) currently a
+    /// capture target of `backup_id` — i.e. should a capture driver leading
+    /// `tablet` be doing work for this backup right now? True when
+    /// `backup_id` is [`Creating`](BackupStatus::Creating), `tablet` is
+    /// live, and `tablet` is directly pinned or traces back to a pinned
+    /// (now-retired) ancestor via `split_lineage`
+    /// ([`traces_to_pinned`](Self::traces_to_pinned)). The one predicate
+    /// both the capture driver (a later PR, deciding what to work on) and
+    /// this corpus's own driver-tick mirror evaluate — never re-derived
+    /// independently, so the two can't drift on what counts as "pinned."
+    #[must_use]
+    pub fn backup_capture_target(&self, backup_id: &str, tablet: TabletId) -> bool {
+        let Some(row) = self.backups.get(backup_id) else {
+            return false;
+        };
+        matches!(row.status, BackupStatus::Creating)
+            && self.tablets.contains_key(&tablet)
+            && self.traces_to_pinned(&row.manifest.pinned_tablets, tablet)
+    }
+
+    /// **ADR 0059 §3/§4/§6**: the manifest object's own authoritative
+    /// per-tablet completion-record list for `backup_id` — every one of its
+    /// pinned tablets' **current live** `split_lineage` frontier
+    /// ([`live_split_descendants`](Self::live_split_descendants)), each
+    /// paired with its own progress row (`None` until it has actually
+    /// reported).
+    ///
+    /// Deliberately **not** a blanket iteration of every
+    /// `Metadata::backup_tablet_progress` row tagged with this backup id.
+    /// Consider a pinned tablet that reports its own completion directly
+    /// and *only then* happens to split (an ordinary, backup-unrelated
+    /// split racing a backup that had already finished that one tablet's
+    /// share before the split ever committed): its direct report at the
+    /// now-retired id is genuine and harmless to leave on file, but once
+    /// the split lands that id is no longer part of its own
+    /// `live_split_descendants` frontier — its two children are — so a
+    /// naive "every progress row tagged with this backup" scan would put
+    /// **three** overlapping entries in the final manifest (the retired
+    /// parent's full-range capture, plus each child's own independent
+    /// re-capture of a sub-range of that same range), double-counting rows
+    /// a restore/verification pass would then see twice. This accessor is
+    /// what keeps that stale, superseded report out of the manifest: the
+    /// authoritative reporting tablet set for a pinned ancestor is always
+    /// exactly its current live frontier, never "whatever tablet id
+    /// happened to report, ever."
+    #[must_use]
+    pub fn backup_manifest_tablet_progress(
+        &self,
+        backup_id: &str,
+    ) -> Vec<(TabletId, Option<BackupTabletProgress>)> {
+        let Some(row) = self.backups.get(backup_id) else {
+            return Vec::new();
+        };
+        row.manifest
+            .pinned_tablets
+            .iter()
+            .flat_map(|p| self.live_split_descendants(p.tablet))
+            .map(|t| {
+                let progress = self
+                    .backup_tablet_progress
+                    .get(&(backup_id.to_owned(), t))
+                    .copied();
+                (t, progress)
+            })
+            .collect()
+    }
+
     /// The backup catalog row for `backup_id`, if any (ADR 0059 §3). A read
     /// accessor for the admin observer surface and a future wire edge.
     #[must_use]
     pub fn backup(&self, backup_id: &str) -> Option<&BackupRow> {
         self.backups.get(backup_id)
+    }
+
+    /// The restore catalog row for `restore_id`, if any (ADR 0059 §7). A
+    /// read accessor for the restore driver and observability surfaces.
+    #[must_use]
+    pub fn restore(&self, restore_id: &str) -> Option<&RestoreRow> {
+        self.restores.get(restore_id)
     }
 
     /// `backup_id`'s own per-tablet completion records (ADR 0059 §3/§4) —
@@ -2710,12 +3904,19 @@ impl Metadata {
 
     /// `backup_id`'s total captured bytes so far (ADR 0059 §2's "total
     /// object sizes, for `DescribeBackup`") — the sum of every pinned
-    /// tablet's own reported [`BackupTabletProgress::bytes`], `0` before
-    /// any tablet has reported.
+    /// tablet's own **currently authoritative** reported
+    /// [`BackupTabletProgress::bytes`]
+    /// ([`backup_manifest_tablet_progress`](Self::backup_manifest_tablet_progress),
+    /// never a blanket sum over every `backup_tablet_progress` row tagged
+    /// with this id — that accessor's own doc explains why a pinned
+    /// tablet's stale, split-superseded direct report must never be
+    /// double-counted alongside its live descendants' own shares). `0`
+    /// before any (still-authoritative) tablet has reported.
     #[must_use]
     pub fn backup_total_bytes(&self, backup_id: &str) -> u64 {
-        self.backup_tablet_progress_for(backup_id)
-            .map(|(_, progress)| progress.bytes)
+        self.backup_manifest_tablet_progress(backup_id)
+            .iter()
+            .filter_map(|(_, progress)| progress.map(|p| p.bytes))
             .sum()
     }
 }
@@ -3107,6 +4308,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "ghost".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Rejected("no such table schema")
         );
@@ -3117,6 +4319,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3140,6 +4343,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "orders".to_owned(),
                 created_wall_ms: 2000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Rejected("backup id already exists")
         );
@@ -3160,6 +4364,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3257,6 +4462,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3294,6 +4500,11 @@ mod tests {
         assert_eq!(
             m.backup("backup-1").unwrap().status,
             BackupStatus::Available
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().total_bytes,
+            100,
+            "CompleteBackup freezes the final byte total onto the row"
         );
 
         // Already `Available`: a second `CompleteBackup` is rejected, not
@@ -3356,6 +4567,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3412,6 +4624,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3471,6 +4684,7 @@ mod tests {
                 backup_id: "backup-2".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3509,6 +4723,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3547,6 +4762,318 @@ mod tests {
         );
     }
 
+    /// `MarkBackupDeleted` (ADR 0059 §3, Train 1 PR④): the janitor's own
+    /// two-phase **mark** step, driven by the `DeleteBackup` wire operation —
+    /// rejects an unknown id or a still-`Creating` backup, transitions
+    /// `Available`/`Failed` to `Expired`, and is idempotent once `Expired`.
+    /// The row itself survives this command (only the existing, unmodified
+    /// `DeleteBackup` command removes it).
+    #[test]
+    fn mark_backup_deleted_apply_arm() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+
+        // Still `Creating` — rejected (the wire edge's own
+        // `BackupInUseException` check happens first in practice; this is
+        // the apply-time seatbelt).
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("backup is not in a deletable state")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 10,
+                bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backup("backup-1").unwrap().status, BackupStatus::Expired);
+
+        // Idempotent once `Expired`.
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+
+        // A `Failed` backup is markable too (the janitor treats `Failed`
+        // identically to `Expired` for reclaim purposes).
+        let mut failed = Metadata::default();
+        table_with_one_tablet(&mut failed, "users", TabletId(1));
+        assert_eq!(
+            failed.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-2".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.apply(&MetaCommand::FailBackup {
+                backup_id: "backup-2".to_owned(),
+                reason: "timeout".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.apply(&MetaCommand::MarkBackupDeleted {
+                backup_id: "backup-2".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            failed.backup("backup-2").unwrap().status,
+            BackupStatus::Expired
+        );
+    }
+
+    // --- ADR 0059 §7, Train 2: the restore catalog -----------------------
+
+    /// `BeginRestore` (ADR 0059 §7): mints exactly one fresh `Building`
+    /// tablet over the whole ring, scoped to the target table, plus a
+    /// `Seeding` restore row — rejected on a duplicate restore id, a
+    /// colliding tablet id, or a tablet id below the monotonic allocator
+    /// floor.
+    #[test]
+    fn begin_restore_apply_arm() {
+        let mut m = Metadata::default();
+        // The target table's schema is created first, exactly as
+        // `provision_tablet` requires ahead of an ordinary `CreateTable`.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.restore("restore-1").expect("row present");
+        assert_eq!(row.backup_id, "backup-1");
+        assert_eq!(row.source_table, "users");
+        assert_eq!(row.target_table, "restored");
+        assert_eq!(row.tablet, TabletId(5));
+        assert_eq!(row.status, RestoreStatus::Seeding);
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Building);
+        assert_eq!(tablet.range, KeyRange::whole());
+        assert_eq!(tablet.table.as_deref(), Some("restored"));
+        assert!(!tablet.is_routable());
+
+        // A second `BeginRestore` at the same restore id is rejected
+        // outright, even naming a different (also-fresh) tablet.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(6),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Rejected("restore id already exists")
+        );
+
+        // A colliding tablet id.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored2".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Rejected("tablet already exists")
+        );
+
+        // Below the monotonic allocator floor.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-3".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored3".to_owned(),
+                tablet: TabletId(0),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Rejected("tablet id below the monotonic allocator")
+        );
+    }
+
+    /// `CompleteRestore`/`FailRestore` (ADR 0059 §7): completion activates
+    /// the tablet and flips the row `Done`; failure leaves the tablet
+    /// `Building` (never served) and flips the row `Failed`. Both reject a
+    /// terminal-contradicting call, and `FailRestore` is idempotent on an
+    /// identical repeat.
+    #[test]
+    fn complete_and_fail_restore_apply_arms() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "ghost".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such restore")
+        );
+
+        let before_epoch = m.tablets[&TabletId(5)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.restore("restore-1").unwrap().status, RestoreStatus::Done);
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Active);
+        assert!(tablet.is_routable());
+        assert!(tablet.epoch > before_epoch);
+
+        // Already `Done` — a second completion is rejected, not idempotent
+        // (mirroring `CompleteBackup`'s own already-`Available` rejection).
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteRestore {
+                restore_id: "restore-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("restore is not Seeding")
+        );
+        // ...and `FailRestore` cannot contradict a completed restore either.
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-1".to_owned(),
+                reason: "too late".to_owned(),
+            }),
+            ApplyOutcome::Rejected("restore already completed")
+        );
+
+        // A second, independent restore that fails instead: the tablet
+        // stays `Building` (never served, but cleanly droppable).
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-2".to_owned(),
+                backup_id: "backup-2".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored2".to_owned(),
+                tablet: TabletId(6),
+                replicas: vec![nid(1)],
+                gsi_defs: Vec::new(),
+                pitr: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.restore("restore-2").unwrap().status,
+            RestoreStatus::Failed {
+                reason: "stuck".to_owned()
+            }
+        );
+        assert_eq!(m.tablets[&TabletId(6)].state, TabletState::Building);
+        // Idempotent on an identical repeat.
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+        // A genuinely differing reason still transitions (mirrors
+        // `FailBackup`'s own "not a repair path, but a differing repeat
+        // still applies" shape).
+        assert_eq!(
+            m.apply(&MetaCommand::FailRestore {
+                restore_id: "restore-2".to_owned(),
+                reason: "stuck again".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
     /// ADR 0024/ADR 0059 §3's explicit carve-out: `DropTableSchema`/
     /// `DropTableTablets` must NOT touch the backup catalog — a backup row
     /// (and its progress records) survives a drop of its source table.
@@ -3559,6 +5086,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3608,6 +5136,247 @@ mod tests {
                 bytes: 100,
             })
         );
+        // `total_bytes` was frozen at `CompleteBackup` time and survives the
+        // drop unchanged — `backup_total_bytes`'s own live re-derivation
+        // would instead report 0 here (every one of this backup's tablets
+        // is gone from `Metadata::tablets`), which is exactly the silent
+        // regression `BackupRow::total_bytes` exists to avoid.
+        assert_eq!(row.total_bytes, 100);
+        assert_eq!(
+            m.backup_total_bytes("backup-1"),
+            0,
+            "the live accessor legitimately goes to zero post-drop — it is \
+             not what DescribeBackup/ListBackups read from, `BackupRow::\
+             total_bytes` is"
+        );
+    }
+
+    /// ADR 0059 §6: a pinned tablet that splits mid-capture re-plans onto
+    /// its live descendants — `live_split_descendants`/
+    /// `backup_capture_target`/`traces_to_pinned` all agree, and the split
+    /// child's own completion report (never itself pinned) is admitted.
+    #[test]
+    fn backup_survives_a_split_of_its_pinned_tablet() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+        let pinned = m
+            .backup("backup-1")
+            .unwrap()
+            .manifest
+            .pinned_tablets
+            .clone();
+        assert_eq!(
+            pinned,
+            vec![BackupPinnedTablet {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+            }]
+        );
+
+        // Before the split: tablet 1 is its own sole live descendant, and is
+        // the one and only capture target.
+        assert_eq!(m.live_split_descendants(TabletId(1)), vec![TabletId(1)]);
+        assert!(m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(!m.backup_ready_to_complete("backup-1"));
+
+        // Split tablet 1 into 2 (left) / 3 (right) mid-capture — the parent
+        // retires from `Metadata::tablets` entirely.
+        split_tablet(&mut m, TabletId(1), b"m".to_vec(), TabletId(2));
+        assert!(!m.tablets.contains_key(&TabletId(1)));
+
+        // The retired parent is no longer itself a capture target (it's
+        // gone); its two live children now are, via `split_lineage`.
+        assert!(!m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(m.backup_capture_target("backup-1", TabletId(2)));
+        assert!(m.backup_capture_target("backup-1", TabletId(3)));
+        let mut descendants = m.live_split_descendants(TabletId(1));
+        descendants.sort();
+        assert_eq!(descendants, vec![TabletId(2), TabletId(3)]);
+
+        // A tablet unrelated to this lineage is never a target.
+        assert!(!m.backup_capture_target("backup-1", TabletId(99)));
+
+        // A retired parent's own completion report is still ADMITTED (it is
+        // directly pinned — `traces_to_pinned` doesn't care whether the id
+        // is still live), covering the legitimate race where the parent
+        // genuinely finished its whole-range capture before an unrelated
+        // split retired it. But it does NOT count toward completion (its id
+        // is no longer part of its own `live_split_descendants` frontier —
+        // the two children are), so it must not let the backup complete
+        // with only the children's shares half-done, and (per
+        // `backup_manifest_tablet_progress`'s own doc) never becomes a
+        // stale, double-counted entry in the eventual manifest.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(1),
+                cut_version: 1,
+                bytes: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.backup_ready_to_complete("backup-1"));
+        assert!(
+            m.backup_manifest_tablet_progress("backup-1")
+                .iter()
+                .all(|(t, _)| *t != TabletId(1)),
+            "the retired parent's own orphaned report must never surface in the manifest's \
+             authoritative tablet list, which is always the current live frontier"
+        );
+
+        // Only the left child reports: not ready yet — the right child's
+        // own share is still outstanding.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(2),
+                cut_version: 10,
+                bytes: 111,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Rejected("not every pinned tablet has reported completion")
+        );
+
+        // The right child reports too: now ready, and `CompleteBackup`
+        // succeeds — the manifest's own `pinned_tablets` list still names
+        // the retired parent (a historical, never-mutated stub), while the
+        // catalog's actual progress is keyed by the two real descendants.
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(3),
+                cut_version: 12,
+                bytes: 222,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.backup("backup-1").unwrap().status,
+            BackupStatus::Available
+        );
+        assert_eq!(m.backup_total_bytes("backup-1"), 111 + 222);
+        assert_eq!(
+            m.backup("backup-1").unwrap().manifest.pinned_tablets,
+            vec![BackupPinnedTablet {
+                tablet: TabletId(1),
+                range: KeyRange::whole(),
+            }],
+            "the manifest stub's pinned-tablet list is a frozen historical \
+             snapshot, never rewritten onto the re-planned descendants"
+        );
+    }
+
+    /// A cascading split (a re-planned descendant splitting again before it
+    /// finishes its own share) re-plans transitively — `traces_to_pinned`/
+    /// `live_split_descendants` walk however many generations it takes.
+    #[test]
+    fn backup_survives_a_cascading_split_of_a_split_descendant() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+        split_tablet(&mut m, TabletId(1), b"m".to_vec(), TabletId(2));
+        // Split the LEFT child (tablet 2) again before it ever reports.
+        split_tablet(&mut m, TabletId(2), b"g".to_vec(), TabletId(4));
+        assert!(!m.tablets.contains_key(&TabletId(2)));
+
+        let mut descendants = m.live_split_descendants(TabletId(1));
+        descendants.sort();
+        assert_eq!(
+            descendants,
+            vec![TabletId(3), TabletId(4), TabletId(5)],
+            "tablet 1's live frontier is now three generations-2 tablets: \
+             the once-split-then-split-again left branch's two children, \
+             plus the untouched right child"
+        );
+        for &t in &descendants {
+            assert!(m.backup_capture_target("backup-1", t));
+        }
+        assert!(!m.backup_capture_target("backup-1", TabletId(1)));
+        assert!(!m.backup_capture_target("backup-1", TabletId(2)));
+
+        for &t in &descendants {
+            assert_eq!(
+                m.apply(&MetaCommand::RecordBackupTabletComplete {
+                    backup_id: "backup-1".to_owned(),
+                    tablet: t,
+                    cut_version: 1,
+                    bytes: 10,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert!(m.backup_ready_to_complete("backup-1"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "backup-1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// A tablet with no lineage relationship to `backup_id`'s pinned list at
+    /// all is never admitted, split or not — `traces_to_pinned` must not
+    /// accept an unrelated tablet just because *some* `split_lineage` entry
+    /// exists somewhere in the catalog.
+    #[test]
+    fn record_backup_tablet_complete_rejects_an_unrelated_tablets_report_even_with_other_splits_on_file()
+     {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        table_with_one_tablet(&mut m, "other", TabletId(10));
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "backup-1".to_owned(),
+                table: "users".to_owned(),
+                created_wall_ms: 1_000,
+                backup_name: "backup".to_string(),
+            }),
+            ApplyOutcome::Applied
+        );
+        // An unrelated table's tablet splits — its lineage must never leak
+        // into backup-1's own admission decision.
+        split_tablet(&mut m, TabletId(10), b"m".to_vec(), TabletId(11));
+        assert!(!m.backup_capture_target("backup-1", TabletId(11)));
+        assert!(!m.backup_capture_target("backup-1", TabletId(12)));
+        assert_eq!(
+            m.apply(&MetaCommand::RecordBackupTabletComplete {
+                backup_id: "backup-1".to_owned(),
+                tablet: TabletId(11),
+                cut_version: 1,
+                bytes: 1,
+            }),
+            ApplyOutcome::Rejected("tablet is not pinned in this backup")
+        );
     }
 
     /// `Metadata` round-trips through JSON with a populated backup catalog
@@ -3623,6 +5392,7 @@ mod tests {
                 backup_id: "backup-1".to_owned(),
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
+                backup_name: "backup".to_string(),
             }),
             ApplyOutcome::Applied
         );
@@ -3632,6 +5402,48 @@ mod tests {
                 tablet: TabletId(1),
                 cut_version: 10,
                 bytes: 100,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let json = serde_json::to_string(&m).expect("serializes");
+        let round_tripped: Metadata = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(m, round_tripped);
+    }
+
+    /// ADR 0059 §7 (Train 2): `Metadata::restores` round-trips through JSON
+    /// with a populated row (its key is a plain `String`, not a tuple, so
+    /// this doesn't hit the `serde_json` non-string-map-key hazard the
+    /// `stream_shards`/`index_backfill`/`backup_tablet_progress` tests above
+    /// exist for — but an empty collection still can't prove the *value*
+    /// shape round-trips, including its nested `gsi_defs: Vec<IndexDef>`).
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_restores() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "restored".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginRestore {
+                restore_id: "restore-1".to_owned(),
+                backup_id: "backup-1".to_owned(),
+                source_table: "users".to_owned(),
+                target_table: "restored".to_owned(),
+                tablet: TabletId(5),
+                replicas: vec![nid(1)],
+                gsi_defs: vec![IndexDef {
+                    name: "by-status".to_owned(),
+                    kind: crate::schema::IndexKind::Global,
+                    hash_attribute: "status".to_owned(),
+                    sort_attribute: None,
+                    projection: crate::schema::IndexProjection::All,
+                    status: IndexStatus::Creating,
+                }],
+                pitr: None,
             }),
             ApplyOutcome::Applied
         );
@@ -5602,6 +7414,730 @@ mod tests {
             }),
             ApplyOutcome::Rejected("no such table schema")
         );
+    }
+
+    // --- ADR 0059 §9: PITR catalog (Train 3) ---------------------------
+
+    fn table_with_schema(m: &mut Metadata, table: &str) {
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// Enabling PITR on a table with a schema mints generation 1 and records
+    /// the enable timestamp.
+    #[test]
+    fn update_continuous_backups_enable_mints_generation_one() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.table_pitr("orders"),
+            Some(&PitrSpec {
+                generation: 1,
+                enabled_wall_ms: 1_000,
+            })
+        );
+    }
+
+    /// Re-enabling an already-enabled table is a no-op — no fresh generation,
+    /// no window reset (mirrors real DynamoDB's own idempotent-call contract).
+    #[test]
+    fn update_continuous_backups_re_enable_is_noop() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 2_000,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.table_pitr("orders").unwrap().generation, 1);
+        assert_eq!(m.table_pitr("orders").unwrap().enabled_wall_ms, 1_000);
+    }
+
+    /// Disable clears the schema's own spec but leaves the generation floor
+    /// untouched; disabling again is a no-op. A later re-enable mints
+    /// generation 2, never reusing 1 — the ADR's "fresh window, no fake
+    /// continuity" rule.
+    #[test]
+    fn update_continuous_backups_disable_then_re_enable_mints_a_fresh_generation() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: false,
+                wall_ms: 1_500,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.table_pitr("orders"), None);
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: false,
+                wall_ms: 1_600,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 2_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.table_pitr("orders"),
+            Some(&PitrSpec {
+                generation: 2,
+                enabled_wall_ms: 2_000,
+            })
+        );
+    }
+
+    /// `UpdateContinuousBackups` against a table with no schema is `Rejected`.
+    #[test]
+    fn update_continuous_backups_rejects_unknown_table() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "no-such-table".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+    }
+
+    /// A dropped-and-recreated table under the same name never reuses a
+    /// generation its earlier incarnation already minted — the identical
+    /// non-reuse guarantee `next_tablet_id`'s allocator floor gives tablet
+    /// ids, now over `Metadata::pitr_generation`.
+    #[test]
+    fn pitr_generation_floor_survives_a_drop_and_recreate_of_the_same_table_name() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableSchema {
+                table: "orders".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 5_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.table_pitr("orders").unwrap().generation, 2);
+    }
+
+    fn pitr_seal(table: &str, generation: u64, tablet: TabletId, epoch: u64) -> MetaCommand {
+        MetaCommand::SealPitrSegment {
+            table: table.to_owned(),
+            generation,
+            tablet,
+            epoch,
+            hlc_range: (epoch * 100, epoch * 100 + 50),
+            count: 5,
+            seal_wall_ms: 1_000 + epoch,
+            replicas: Vec::new(),
+            object_id: format!("backup/pitr/{table}/{}/{epoch}/attempt-{epoch}", tablet.0),
+        }
+    }
+
+    /// A basic PITR segment seal against a currently-enabled generation
+    /// applies and is readable back through the watermark accessors.
+    #[test]
+    fn seal_pitr_segment_basic_seal_applies() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 1_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 1, TabletId(1), 0)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.pitr_segment_watermark(TabletId(1)), Some(50));
+        assert_eq!(m.last_pitr_seal_wall_ms(TabletId(1)), Some(1_000));
+        assert_eq!(m.pitr_generations_with_rows("orders"), BTreeSet::from([1]));
+    }
+
+    /// A repeat proposal of the identical seal (the sealer's own crash-retry
+    /// racing itself) is a genuine no-op.
+    #[test]
+    fn seal_pitr_segment_identical_retry_is_noop() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 1, TabletId(1), 0)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 1, TabletId(1), 0)),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// A replicas-only re-proposal (the janitor's own repair sweep shape) is
+    /// `Applied`, updating only `replicas`.
+    #[test]
+    fn seal_pitr_segment_replicas_only_update_applies() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        let mut repaired = pitr_seal("orders", 1, TabletId(1), 0);
+        if let MetaCommand::SealPitrSegment { replicas, .. } = &mut repaired {
+            *replicas = vec![nid(2)];
+        }
+        assert_eq!(m.apply(&repaired), ApplyOutcome::Applied);
+        assert_eq!(m.pitr_segments[&(TabletId(1), 0)].replicas, vec![nid(2)]);
+    }
+
+    /// A genuinely conflicting re-proposal for the same `(tablet, epoch)` —
+    /// different content, not just `replicas` — is rejected as a no-op.
+    #[test]
+    fn seal_pitr_segment_conflicting_content_is_noop() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        let mut conflicting = pitr_seal("orders", 1, TabletId(1), 0);
+        if let MetaCommand::SealPitrSegment { count, .. } = &mut conflicting {
+            *count = 999;
+        }
+        assert_eq!(m.apply(&conflicting), ApplyOutcome::NoOp);
+        assert_eq!(m.pitr_segments[&(TabletId(1), 0)].count, 5);
+    }
+
+    /// A generation matching neither the table's current spec nor any
+    /// existing catalog row is rejected outright.
+    #[test]
+    fn seal_pitr_segment_rejects_an_unlicensed_generation() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 99, TabletId(1), 0)),
+            ApplyOutcome::Rejected(
+                "PITR generation has no current schema entry and no existing catalog rows to \
+                 extend"
+            )
+        );
+    }
+
+    /// A disabled table's un-reaped rows still license a further seal of the
+    /// SAME generation — the disable-triggered final seal, mirroring
+    /// `SealStreamShard`'s F12-b rule exactly.
+    #[test]
+    fn seal_pitr_segment_disable_triggered_final_seal_is_licensed() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: false,
+            wall_ms: 2_000,
+        });
+        // The final seal after disable: epoch 1, still generation 1.
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 1, TabletId(1), 1)),
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// Epoch-chain sanity: epoch 0 always accepted; epoch > 0 requires the
+    /// tablet's own prior epoch row to exist first.
+    #[test]
+    fn seal_pitr_segment_rejects_an_epoch_chain_gap() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        assert_eq!(
+            m.apply(&pitr_seal("orders", 1, TabletId(1), 3)),
+            ApplyOutcome::Rejected("epoch chain gap: no prior epoch row for this tablet")
+        );
+    }
+
+    /// `ExpirePitrSegments`'s two-phase mark/remove shape mirrors
+    /// `ExpireStreamShards` exactly.
+    #[test]
+    fn expire_pitr_segments_mark_then_remove() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        assert_eq!(
+            m.apply(&MetaCommand::ExpirePitrSegments {
+                rows: vec![(TabletId(1), 0)],
+                remove: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.pitr_segments[&(TabletId(1), 0)].expired);
+        // Re-marking an already-marked row is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpirePitrSegments {
+                rows: vec![(TabletId(1), 0)],
+                remove: false,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::ExpirePitrSegments {
+                rows: vec![(TabletId(1), 0)],
+                remove: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.pitr_segments.contains_key(&(TabletId(1), 0)));
+        // Removing an already-absent row is a no-op.
+        assert_eq!(
+            m.apply(&MetaCommand::ExpirePitrSegments {
+                rows: vec![(TabletId(1), 0)],
+                remove: true,
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// ADR 0059 §10 (Train 3 PR②): before any base snapshot or segment has
+    /// ever landed, a freshly-enabled generation still reports a trivially
+    /// valid (zero-width) window at its own enable moment — mirroring
+    /// `animusd::dynamo::pitr_description`'s identical `.unwrap_or(spec.
+    /// enabled_wall_ms)` fallback, not `None` (which would misreport "PITR
+    /// was never enabled" the instant `RestoreTableToPointInTime` is asked
+    /// about it in this narrow window).
+    #[test]
+    fn pitr_restore_window_before_any_seal_is_a_zero_width_window_at_enable() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 5_000,
+        });
+        let window = m
+            .pitr_restore_window("orders")
+            .expect("a live generation has a window");
+        assert_eq!(window.generation, 1);
+        assert_eq!(window.earliest_ms, 5_000);
+        assert_eq!(window.latest_ms, 5_000);
+    }
+
+    /// `Latest` advances as segments seal, tracking the SLOWEST tablet ever
+    /// to have sealed a segment of the current generation — the identical
+    /// minimum-over-tablets shape `pitr_description` uses for a live
+    /// table's *current* tablets, generalized here to "every tablet this
+    /// generation's own history ever touched" (see `PitrRestoreWindow`'s
+    /// own doc for why that generalization is what still makes sense once
+    /// a table can be dropped).
+    #[test]
+    fn pitr_restore_window_advances_as_segments_seal() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&pitr_seal("orders", 1, TabletId(2), 0));
+        // The minimum across BOTH tablets that have ever sealed — tablet 2
+        // hasn't sealed its own epoch 1 yet, so `Latest` stays pinned at
+        // tablet 1's own first seal until it does.
+        let mut with_gap = m.clone();
+        with_gap.apply(&pitr_seal("orders", 1, TabletId(1), 1));
+        let window = with_gap.pitr_restore_window("orders").unwrap();
+        assert_eq!(
+            window.latest_ms, 1_000,
+            "the slower tablet (2) still bounds Latest"
+        );
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 1));
+        m.apply(&pitr_seal("orders", 1, TabletId(2), 1));
+        let window = m.pitr_restore_window("orders").unwrap();
+        assert_eq!(window.latest_ms, 1_000 + 1);
+    }
+
+    /// A `T` before the CURRENT generation's own enable moment — including
+    /// one that falls inside an earlier disable/re-enable's own now-
+    /// superseded coverage — is never consulted: `pitr_restore_window`
+    /// scopes to the table's own LATEST generation alone, so this settles
+    /// the ADR's own Train 3 PR① "not yet decided" generation-gap question.
+    #[test]
+    fn pitr_restore_window_scopes_to_the_latest_generation_only() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: false,
+            wall_ms: 5_000,
+        });
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 9_000,
+        });
+        let window = m.pitr_restore_window("orders").unwrap();
+        assert_eq!(window.generation, 2);
+        assert_eq!(
+            window.earliest_ms, 9_000,
+            "generation 1's own earlier coverage (starting at 1_000) must never surface \
+             once generation 2 is current"
+        );
+    }
+
+    /// `pitr_restore_window` works after `DropTableSchema` — the catalog's
+    /// own outlives-the-source-table rule applied to restore's own
+    /// validation gate, not just to the raw catalog rows.
+    #[test]
+    fn pitr_restore_window_survives_drop_table_schema() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&MetaCommand::DropTableSchema {
+            table: "orders".to_owned(),
+        });
+        assert!(!m.has_table_schema("orders"));
+        let window = m
+            .pitr_restore_window("orders")
+            .expect("a dropped table's PITR window must still resolve");
+        assert_eq!(window.generation, 1);
+        assert_eq!(window.latest_ms, 1_000);
+    }
+
+    /// A table name that has never enabled PITR at all (no live spec, no
+    /// generation floor) has no window — the genuine "unknown source"
+    /// case `RestoreTableToPointInTime`'s own handler maps to either
+    /// `TableNotFoundException` or `PointInTimeRecoveryUnavailableException`
+    /// depending on whether the name is a live table.
+    #[test]
+    fn pitr_restore_window_is_none_for_a_table_that_never_enabled_pitr() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(m.pitr_restore_window("orders"), None);
+        assert_eq!(m.pitr_restore_window("no-such-table"), None);
+    }
+
+    /// `pitr_replay_segments` on a tablet that never split just floors its
+    /// own chain at the base snapshot's own cut version and stops at the
+    /// cutoff — the common case.
+    #[test]
+    fn pitr_replay_segments_floors_at_the_base_cut_version_and_respects_the_cutoff() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        // Three sealed segments at seal_wall_ms 1_000/1_001/1_002 with
+        // hlc_range (0,50)/(100,150)/(200,250) (see `pitr_seal`'s own
+        // formula: `(epoch*100, epoch*100+50)`).
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 1));
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 2));
+
+        // A base snapshot captured at cut_version 25 (mid-way through
+        // epoch 0's own range) — epoch 0 must still be included (it has
+        // records past 25), sliced from 25 rather than 0.
+        let base = vec![(TabletId(1), 25)];
+        let refs = m.pitr_replay_segments(&base, 1_001); // cutoff excludes epoch 2
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        assert_eq!(refs[0].epoch, 0);
+        assert_eq!(refs[0].replay_range, (25, 50));
+        assert_eq!(refs[1].epoch, 1);
+        assert_eq!(refs[1].replay_range, (100, 150));
+    }
+
+    /// The regression for the real bug this function's own doc names: a
+    /// table drop (`DropTableTablets`) retires a tablet WITHOUT ever
+    /// writing a `split_lineage` entry for it (unlike a split) — a naive
+    /// `live_split_descendants`-based re-planning would see "no live
+    /// descendant" and silently replay NOTHING for a dropped table's own
+    /// never-split tablet, even though its segments are sitting right
+    /// there in the catalog. `pitr_replay_segments` must keep including a
+    /// base tablet's own segments regardless of whether it is currently
+    /// live.
+    #[test]
+    fn pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&MetaCommand::DropTableSchema {
+            table: "orders".to_owned(),
+        });
+        m.apply(&MetaCommand::DropTableTablets {
+            table: "orders".to_owned(),
+        });
+        assert!(!m.tablets.contains_key(&TabletId(1)), "the tablet is gone");
+        assert!(
+            m.live_split_descendants(TabletId(1)).is_empty(),
+            "a dropped, never-split tablet genuinely has no live descendant — this is the \
+             exact case `pitr_replay_segments` must not delegate to that accessor for"
+        );
+
+        let base = vec![(TabletId(1), 0)];
+        let refs = m.pitr_replay_segments(&base, 10_000);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].tablet, TabletId(1));
+        assert_eq!(refs[0].replay_range, (0, 50));
+    }
+
+    /// `pitr_replay_segments` a base tablet's own share (§6-style, ADR
+    /// 0059's re-planning technique applied to PITR): a split retires the
+    /// base tablet after the snapshot but before the requested second, so
+    /// the plan must include the parent's own remaining segment PLUS both
+    /// children's own full chains.
+    #[test]
+    fn pitr_replay_segments_re_plans_onto_live_split_descendants() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        // The base snapshot pinned tablet 1 at cut_version 10, then it
+        // sealed one more segment (epoch 0, hlc 0..50) before splitting.
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        m.apply(&MetaCommand::BeginSplit {
+            parent: TabletId(1),
+            expected_epoch: m.tablets[&TabletId(1)].epoch,
+            split_key: b"m".to_vec(),
+            children: [(TabletId(2), Vec::new()), (TabletId(3), Vec::new())],
+        });
+        m.apply(&MetaCommand::CutoverSplit {
+            parent: TabletId(1),
+            expected_epoch: m.tablets[&TabletId(1)].epoch,
+            cutover_wall_ms: 1_500,
+        });
+        assert!(!m.tablets.contains_key(&TabletId(1)));
+        // Each child seals its own fresh epoch-0 chain independently.
+        m.apply(&pitr_seal("orders", 1, TabletId(2), 0));
+        m.apply(&pitr_seal("orders", 1, TabletId(3), 0));
+
+        let base = vec![(TabletId(1), 10)];
+        let refs = m.pitr_replay_segments(&base, 10_000); // generous cutoff
+        let tablets: Vec<u64> = refs.iter().map(|r| r.tablet.0).collect();
+        assert!(tablets.contains(&1), "{refs:?}");
+        assert!(tablets.contains(&2), "{refs:?}");
+        assert!(tablets.contains(&3), "{refs:?}");
+        let parent_ref = refs.iter().find(|r| r.tablet == TabletId(1)).unwrap();
+        assert_eq!(parent_ref.replay_range, (10, 50));
+        for child in [TabletId(2), TabletId(3)] {
+            let child_ref = refs.iter().find(|r| r.tablet == child).unwrap();
+            assert_eq!(
+                child_ref.replay_range,
+                (0, 50),
+                "a split child's own chain starts fresh, not floored at the parent's cut"
+            );
+        }
+    }
+
+    /// PITR segments/generation survive `DropTableSchema` — the catalog's
+    /// deliberate outlives-the-table rule (ADR 0059 §3/§10), the override of
+    /// the streams retention-zero rule.
+    #[test]
+    fn pitr_segments_survive_drop_table_schema() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_owned(),
+            enabled: true,
+            wall_ms: 1_000,
+        });
+        m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableSchema {
+                table: "orders".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.pitr_segments.contains_key(&(TabletId(1), 0)));
+        assert_eq!(m.pitr_generation.get("orders"), Some(&1));
+    }
+
+    /// `MarkBackupPitrBase` tags an existing backup row, is idempotent on a
+    /// repeat, and is rejected against an unknown backup id.
+    #[test]
+    fn mark_backup_pitr_base_tags_an_existing_backup() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        m.apply(&MetaCommand::BeginBackup {
+            backup_id: "b1".to_owned(),
+            table: "orders".to_owned(),
+            created_wall_ms: 1_000,
+            backup_name: "pitr-base".to_owned(),
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupPitrBase {
+                backup_id: "b1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.pitr_base_backups.contains("b1"));
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupPitrBase {
+                backup_id: "b1".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::MarkBackupPitrBase {
+                backup_id: "no-such-backup".to_owned(),
+            }),
+            ApplyOutcome::Rejected("no such backup")
+        );
+    }
+
+    /// `DeleteBackup` prunes a PITR base tag alongside the row it tags.
+    #[test]
+    fn delete_backup_prunes_its_own_pitr_base_tag() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        m.apply(&MetaCommand::BeginBackup {
+            backup_id: "b1".to_owned(),
+            table: "orders".to_owned(),
+            created_wall_ms: 1_000,
+            backup_name: "pitr-base".to_owned(),
+        });
+        m.apply(&MetaCommand::MarkBackupPitrBase {
+            backup_id: "b1".to_owned(),
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::DeleteBackup {
+                backup_id: "b1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(!m.pitr_base_backups.contains("b1"));
     }
 
     // --- ADR 0042/0043 stream-shard catalog ---------------------------

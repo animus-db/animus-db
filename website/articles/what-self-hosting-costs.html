@@ -133,7 +133,7 @@
 
   <h2>The AnimusDB-specific bill, today</h2>
   <p>Everything above is the general case. The specific case is worse, and pretending otherwise would undo the point of writing this at all.</p>
-  <p>Today AnimusDB has <strong>no backup and restore tooling</strong>, <strong>no TLS and no authentication beyond opt-in SigV4 on the client DynamoDB port</strong>, and <strong>no format stability between revisions</strong> — which means upgrading is recreating the cluster and reloading the data. Those three gaps are not tuning problems. They mean the correct amount of production data to put in AnimusDB right now is none.</p>
+  <p>Today AnimusDB has <strong>no TLS and no authentication beyond opt-in SigV4 on the client DynamoDB port</strong>, and <strong>no format stability between revisions</strong> — which means upgrading is recreating the cluster and reloading the data. Those two gaps are not tuning problems. They mean the correct amount of production data to put in AnimusDB right now is none.</p>
   <p>So the honest version of the bill is in two parts.</p>
   <div class="callout">
     <h4>What it costs to evaluate it now</h4>

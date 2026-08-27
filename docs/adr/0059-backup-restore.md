@@ -1,6 +1,11 @@
 # ADR 0059 — Backup and restore: on-demand backups + point-in-time recovery
 
-- **Status:** Proposed.
+- **Status:** Accepted — Train 1 (catalog, backup-store plumbing, capture
+  driver, wire surface, janitor), Train 2 (restore), Train 3 PR① (PITR
+  mechanism: the fifth consumer arm, periodic base snapshots, retention,
+  `UpdateContinuousBackups`/`DescribeContinuousBackups`), and Train 3 PR②
+  (`RestoreTableToPointInTime`) all implemented. The backup/restore/PITR
+  feature train is complete.
 - **Date:** 2026-08-26
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (a table's manifest
   records its schema shape — partition/clustering keys, columns, GSI/LSI
@@ -617,3 +622,554 @@ as its own stacked series (root `CLAUDE.md`'s stacked-PR default):
   a trait-swap this ADR designs for (§1) but does not implement, gated on
   the Kubernetes-operator egress exception being an explicit, reviewed
   decision rather than an incidental widening.
+
+## As-built amendment (2026-08-26, Train 1 PR③ — capture driver)
+
+Two deviations from this ADR's own text, found building the capture
+driver and completion aggregator, recorded here rather than left for a
+reader to discover by diffing prose against code:
+
+- **§4's chunking is row-count-capped, not byte-budgeted.** The text calls
+  for "the split driver's own `SEED_CHUNK_BYTES`-budget convention" —
+  `animusd::backup_capture::CHUNK_ROWS` instead caps each data-chunk object
+  at a fixed row count (200). `SEED_CHUNK_BYTES` is a `const` private to
+  `index_drain.rs`'s own module (not this ADR's concern — a Rust module-
+  privacy fact, not a deliberate divergence), and porting the split
+  driver's byte-accounting helper into a second module for one PR was
+  judged not worth the duplication risk at Train 1's correctness-first
+  scope. A row cap still bounds object size well under any real DynamoDB
+  item's ~400 KB limit in practice. Matching the byte-budgeted convention
+  exactly (or sharing one implementation) is a named follow-up, not a
+  correctness gap.
+- **§6/§7's "re-planned pinned-tablet-and-range list" is `tablet_progress`,
+  not a rewritten `pinned_tablets`.** §7 step 3 describes restore reading
+  "the manifest's pinned-tablet-and-range list (already re-planned onto
+  live descendants... §6)" as if `BackupManifest::pinned_tablets` itself
+  gets updated when a split re-plans a tablet's capture. As built,
+  `pinned_tablets` is a **frozen historical stub**, written once at
+  `BeginBackup` and never rewritten (PR①'s own explicit design, kept
+  unchanged by PR③) — the re-planning instead surfaces through
+  `Metadata::backup_manifest_tablet_progress`, whose entries name whichever
+  tablets are **currently authoritative** (a live descendant, when a split
+  raced capture) and are what the completion aggregator actually writes
+  into `BackupManifestObject::tablet_progress`. That list carries each
+  tablet's `(cut_version, bytes)` but **no key range** — unlike
+  `BackupPinnedTablet`, `BackupManifestTabletEntry` has no `range` field.
+  This is a real, open question for Train 2: `RestoreTableFromBackup` does
+  not strictly need each historical reporting tablet's own range to
+  reconstruct the table correctly (`propose_seed_batch` merges each row by
+  its own logical key regardless of which tablet the restore driver mints
+  to receive it, so restore is free to choose an entirely fresh tablet
+  layout for the whole table — e.g. one tablet per the placement engine's
+  own preference — rather than mirroring the capture-time split topology),
+  but if Train 2's design instead wants to reproduce that topology
+  one-for-one, `BackupManifestTabletEntry` will need a `range` field added
+  first. Left for that train's own design pass rather than pre-emptively
+  widened here with no consumer.
+
+## As-built amendment (2026-08-27, Train 1 PR④ — wire surface + janitor)
+
+Four deviations/additions from this ADR's own text, found building
+`CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup` and the backup
+janitor, recorded here rather than left for a reader to discover by diffing
+prose against code:
+
+- **A new `MetaCommand::MarkBackupDeleted`, not a widened `DeleteBackup`.**
+  §3's text describes `DeleteBackup { backup_id }` as "an operator/retention
+  action" without separating a mark step from a finalize step. As built, the
+  wire `DeleteBackup` operation (`animusd::dynamo::delete_backup`) proposes
+  the new `MarkBackupDeleted { backup_id }` — transitioning `Available`/
+  `Failed` to `Expired` (idempotent once `Expired`; rejects a still-`Creating`
+  row as a defense-in-depth seatbelt behind the wire edge's own
+  `BackupInUseException` check) — and the **existing, unmodified**
+  `MetaCommand::DeleteBackup` (PR①'s own row-plus-progress removal) becomes
+  the janitor's own **finalizing** command, proposed only once every one of
+  a marked backup's objects has been reclaimed. `BackupStatus::Expired`
+  already existed for exactly this purpose (PR①'s own doc: "no `MetaCommand`
+  in this PR ever transitions a row into this state... so a later PR's
+  janitor-mark command doesn't need to widen this enum") — no enum change
+  was needed, only the one new command to drive the transition.
+- **`BackupRow` gained two fields the wire surface needs and PR①/PR③ never
+  carried: `backup_name: String` and `total_bytes: u64`.** `BackupName` is a
+  client-supplied, AWS-remembered attribute `CreateBackup`/`DescribeBackup`/
+  `ListBackups` must echo back identically — recorded verbatim on
+  `MetaCommand::BeginBackup` (a new field, threaded through every existing
+  construction site) and stored on the row, never interpreted. `total_bytes`
+  is **frozen exactly once**, by `CompleteBackup`'s own apply arm, from
+  `Metadata::backup_total_bytes` at the moment every pinned tablet's live
+  descendant is still resolvable — **not** re-derived live by
+  `DescribeBackup`/`ListBackups`, which would silently collapse to zero the
+  instant this backup's source table (and with it every one of its tablets)
+  is ever dropped, breaking this ADR's own §3 "outlives the source table"
+  promise for the *reported size* specifically, even though the row and its
+  progress records themselves already survived the drop correctly. Found by
+  reasoning through `backup_total_bytes`'s own doc (a live re-derivation
+  over `Metadata::tablets`) against the "works after the source table is
+  dropped" requirement below, not by a failing test — `docs/engineering-
+  lessons.md` records the general lesson.
+- **The wire ARN *is* the catalog's `BackupId`, not a separate wrapper.**
+  §3's "an ARN-shaped string at the wire" is realized literally:
+  `animusd::dynamo::create_backup` mints `wire::backup_arn(table,
+  random_suffix)` and proposes it as `BeginBackup`'s own `backup_id` — so
+  every lookup (`DescribeBackup`/`DeleteBackup`/`ListBackups`'s pagination
+  cursor) is a direct `Metadata::backups` key lookup, with no ARN-parsing
+  function anywhere in this adapter (none was needed once the ARN and the
+  key are the same string).
+- **Reclaim is local-only — a deliberate, named Train 1 simplification, not
+  the cataloged-replica reclaim §3 might suggest by analogy to the segment
+  janitor.** No backup object carries a recorded `replicas` list the way a
+  `StreamShardRow` does (`backup_capture.rs`/`backup_completion.rs` both
+  discard `BackupStoreHandle::put`'s own returned replica set), and a
+  tablet's completion record carries total bytes, not a chunk count, so
+  there is no way to enumerate a backup's own object ids without asking the
+  store. The janitor (`animusd::backup_janitor`) therefore does what §3
+  explicitly licenses for exactly this situation — `SegmentStore::list()`
+  as a debug/sweep tool, scoped to `backup/{backup_id}/`, on **this node's
+  own local** backup directory only — the identical shape the segment
+  janitor's own orphan sweep already uses, generalized here from "extra,
+  uncataloged objects" to "this backup's objects" outright. **Named
+  residual**: on a `Cluster`-backed store whose control-plane leader never
+  happens to be one of the `K` (`ClusterSegmentStore::DEFAULT_K` = 3) nodes
+  actually holding a given backup's objects, this loop's local sweep finds
+  nothing and finalizes (removes the row) on the very first tick it
+  observes the mark, before a node that *does* hold a copy ever gets to
+  sweep its own — those copies become permanent, uncataloged orphans. Below
+  or at `DEFAULT_K` cluster size (every node is always a target) the gap
+  does not manifest; above it, closing it needs either a per-object
+  `replicas` list or a cluster-wide list primitive for `ClusterSegmentStore`
+  (neither exists today), both out of this PR's scope. See
+  `backup_janitor.rs`'s own module doc and `docs/engineering-lessons.md`
+  for the fuller note.
+
+## As-built amendment (2026-08-27, Train 2 — restore)
+
+Six deviations/decisions from this ADR's own text, found building
+`RestoreTableFromBackup` and the restore driver, recorded here rather than
+left for a reader to discover by diffing prose against code.
+
+- **Settled: pinned-tablets-vs-fresh-layout (PR③'s own open question) —
+  restore mints exactly ONE fresh `Building` tablet over the whole ring,
+  never one per the backup's original (possibly many) pinned/reporting
+  tablets.** §7 step 3's text ("mint fresh `Building` tablets matching the
+  backup's key ranges") describes mirroring the historical topology; PR③'s
+  as-built note explicitly left the door open to the alternative it names
+  itself: "restore is free to choose an entirely fresh tablet layout for
+  the whole table — e.g. one tablet per the placement engine's own
+  preference." Taken at its simplest. This sidesteps the open question
+  entirely: `BackupManifestTabletEntry` needed **no** new `range` field,
+  because nothing in the restore driver ever needs to know which physical
+  tablet originally captured a given row — every data object across every
+  one of the manifest's `tablet_progress` entries seeds into the SAME
+  single destination tablet, verbatim, with no per-row key routing at all.
+  This matches ordinary `CreateTable`'s own "one tablet over the whole
+  ring" provisioning convention exactly (`ClientCtx::provision_tablet`),
+  and the existing auto-split machinery reshapes the restored table's
+  tablet count afterward, exactly as it would for any freshly-populated
+  table. **Acknowledged tradeoff**: every one of a backup's original
+  tablets funnels through one Raft group during the seed phase, so
+  restore's own write throughput on a large, many-tablet source table is
+  bounded by a single group until auto-split (if enabled) kicks in
+  afterward. A Train 2.5 follow-up could mint N tablets up front (e.g. one
+  per `pinned_tablets` entry, reusing its already-recorded `range` — no new
+  field needed even for that) and route each captured row to whichever
+  fresh tablet's range contains it — a real, but narrow and diagnosable
+  (not correctness-affecting), performance improvement rather than a gap.
+  See `animusd::backup_restore`'s own module doc for the mechanism this
+  decision produced.
+- **A real bug found building the seeder, not by design review: captured
+  values must be re-wrapped in the engine's committed envelope before
+  `SeedBatch` merges them, or a read panics.** ADR §5 states plainly that
+  capture "reads through intent resolution" and stores each row's
+  already-*resolved* value — correct, and unchanged. What §7 step 4's text
+  glossed over is that `KvCommand::SeedBatch` (reused verbatim from ADR
+  0050) is a **raw envelope-tag-included byte passthrough** — sound for the
+  split-build driver, whose child rows are still-enveloped physical bytes
+  from the same live transaction blast radius, but not sound for a
+  captured, already-resolved value, which carries no envelope tag at all.
+  Feeding one straight into `SeedBatch` merges an unwrapped value the
+  read path's envelope decoder cannot parse — the byte a real read
+  interprets as the envelope tag is instead the value's own first content
+  byte, an "unknown envelope tag" panic reachable from an ordinary
+  `ConsistentRead` `GetItem` on a restored row. Caught immediately by this
+  train's own first end-to-end test run, not by review. Fixed by
+  `animus_cp_data::backup::encode_restored_value` (a thin, well-documented
+  wrapper the restore driver calls on every `Some` value before seeding) —
+  see that function's own doc for the full mechanism, and
+  `docs/engineering-lessons.md` for the generalized lesson.
+- **A restored table's GSIs are declared on the schema only AFTER
+  activation, not up front alongside the base schema/LSIs — narrower
+  sequencing than §7's own text implies.** §7 doesn't explicitly order GSI
+  declaration against tablet activation; §8 does say GSIs are rebuilt
+  "once the restored base table's rows are seeded and activated," but
+  doesn't say *when the `CreateTableIndex` proposal itself happens*. Doing
+  it early (alongside the base schema, mirroring how `create_table` itself
+  declares every index up front) is actively wrong here: the backfill
+  seeder would observe the still-empty/`Building` destination tablet,
+  find its `KIND_BASE` scan already exhausted, and mark it backfilled
+  before this restore ever seeds a single row — silently dropping every
+  restored row from the GSI forever. The restore driver (`animusd::
+  backup_restore::complete_restore`) proposes each of `RestoreRow::
+  gsi_defs`'s `CreateTableIndex` calls **immediately after, in the same
+  step as,** `CompleteRestore` — the earliest point the tablet is
+  genuinely `Active` and fully seeded, so the backfill seeder's very next
+  sweep finds real data. `RestoreRow::gsi_defs` itself (a new `Vec<IndexDef>`
+  field, resolved once client-side by the wire handler from
+  `GlobalSecondaryIndexOverride` or the manifest's own captured GSIs,
+  forced to `IndexStatus::Creating` regardless of the source's own status)
+  is what carries this plan from propose time to the driver, since the two
+  steps can run on different nodes at very different times.
+- **A visible, deliberate AWS deviation this ordering choice produces**:
+  the `RestoreTableFromBackup` response, and any `DescribeTable` call
+  before the restore completes, do not show the target's GSIs **at all**
+  — not even as `CREATING`/backfilling, which is what real DynamoDB shows
+  from the very first response. They appear only once the base table
+  finishes seeding and activates, at which point they follow the ordinary
+  `Creating` → backfill → `Active` lifecycle a client would recognize from
+  any `UpdateTable`-added GSI. Named here rather than silently shipped as
+  if AWS-faithful; closing it (showing a synthetic pre-declared `Creating`
+  GSI in the response before the schema itself carries one) is a
+  wire-layer-only follow-up, not a data-model change.
+- **`TableStatus` needed no new persisted state at all** — derived
+  (`animusd::dynamo::table_status`) purely from whether every one of a
+  table's *current* tablets is `Active`: `CREATING` while any is
+  `Building` (true for a restore's own single tablet until activation;
+  structurally unreachable for an ordinary `CreateTable`, which blocks on
+  `await_table_serveable` before ever returning 200), `ACTIVE` otherwise.
+  This is the same "derive from live tablet state, never a redundant
+  status field" discipline the codebase already applies to a GSI's own
+  `IndexStatus` and to `BackupStatus`'s relationship to capture progress.
+- **A restore does not pin/lock its source backup against a concurrent
+  `DeleteBackup`** — a narrow, accepted residual, not a defended property.
+  If a backup is marked deleted (and, rarer still, actually reclaimed by
+  the janitor) while a restore reading from it is still in flight, the
+  restore driver's own defensive check (re-reading the backup's live
+  status each tick) fails the restore outright (`FailRestore`) rather than
+  serving a half-seeded table — never a correctness violation, but a
+  liveness one an operator could hit by deleting a backup at an unlucky
+  moment mid-restore. Closing it (a reference count, or refusing
+  `DeleteBackup` while any `Seeding` restore names the backup) is a named
+  follow-up, not implemented in this train.
+
+**Corpus** (`crates/animus-test/tests/backup_fault_corpus.rs`,
+`ANIMUS_BACKUP_SEEDS`): five restore cells, the identical self-contained-
+reimplementation technique the capture half already established —
+`restore_round_trip_matches_model_at_capture_cut_version` (including a
+staged-and-never-resolved intent, proving restore only ever sees resolved
+values), `restore_driver_crash_restart_resumes` (a true process restart of
+the destination leader mid-seed), `restore_leader_kill_mid_seed_converges`
+(a live leader kill/failover mid-seed), `restore_store_faults_still_converge`
+(the backup store genuinely unavailable partway through the sweep, healing
+later — `SegmentFaultConfig`'s own ack-lost thresholds are `put`/`delete`-
+only, checked directly against `animus-sim`'s source, so a read fault for
+restore's `get`-only workload is `SimSegmentStore::set_unavailable_until`,
+not `SegmentFaultConfig`), and `restore_after_source_drop`. GSI-rebuild
+convergence is deliberately not reimplemented a third time in this corpus —
+it is the exact `index_backfill.rs`/`index_drain.rs` machinery
+`backfill_fault_corpus.rs` already proves at depth, applied to an ordinary
+`Active` tablet indistinguishable from any other (§8's own point); the real
+production stack's end-to-end GSI-after-restore convergence is covered by
+`animusd/tests/dynamo_restore.rs` instead, alongside the full
+`CreateBackup` → `AVAILABLE` → write-more-data → `RestoreTableFromBackup` →
+converged round trip, restore-after-source-drop, and the AWS-faithful error
+shapes.
+
+**Open questions carried into Train 3 (PITR)**: none of Train 2's own
+decisions above constrain PITR's design — `RestoreTableToPointInTime` (§10)
+reuses "the same restore path as `RestoreTableFromBackup`" for its own
+seeding, so PITR inherits both the single-fresh-tablet layout decision and
+the GSI-after-activation sequencing unchanged. The one item worth a future
+PITR author's attention: whether PITR's own replay (a snapshot plus a
+change-log walk, producing the identical `SeedRow` shape per §10) needs the
+same `encode_restored_value` envelope re-wrap — very likely yes, since its
+output is described as "exactly the same `(kind, logical_key, value,
+version)` shape an on-demand backup's data objects carry," which is the
+exact shape this train found needed the wrap.
+
+## As-built amendment (2026-08-27, Train 3 PR① — PITR mechanism)
+
+Nine deviations/decisions from this ADR's own text, found building the
+fifth consumer arm, periodic base snapshots, the retention janitor's PITR
+phase, and the `UpdateContinuousBackups`/`DescribeContinuousBackups` wire
+surface, recorded here rather than left for a reader to discover by
+diffing prose against code.
+
+- **A `PitrSpec.generation: u64` counter, not a bare boolean, and a
+  separate never-rewound `Metadata::pitr_generation: BTreeMap<TableName,
+  u64>` allocator** — mirroring `StreamSpec.label`'s own identity role
+  (§9's text doesn't specify PITR's own coverage-epoch identity mechanism
+  beyond "a fresh window"). `SealPitrSegment`'s generation-licensing rule
+  mirrors `SealStreamShard`'s label rule verbatim (licensed by the table's
+  *current* generation, or an existing catalog row's own, for the
+  disable-triggered final seal). The allocator survives `DropTableSchema`
+  and a same-named table's later recreation, closing the identical
+  "convergent per-name state a delete-then-recreate can poison" scar §3
+  already names for `BackupId` — applied here to a per-table counter
+  instead of an opaque identity, since a `(table, generation)` pair is
+  already enough to disambiguate two eras of a same-named table's PITR
+  history without needing a wholly opaque id.
+- **`MetaCommand::MarkBackupPitrBase { backup_id }`, a side-tag command, not
+  a `BackupRow.pitr_base`/`BeginBackup.pitr_base` field.** Widening
+  `BeginBackup`'s own signature would have touched every one of its ~30
+  existing construction sites across `animus-control`, `animus-test`, and
+  `animusd` (the exact compiler-enumerated fan-out class root `CLAUDE.md`'s
+  engineering-practices log already documents for `backup_name`'s own
+  addition) for a fact only the PITR janitor and `DescribeContinuousBackups`
+  ever need. `Metadata::pitr_base_backups: BTreeSet<BackupId>` is populated
+  by a second proposal (`pitr_janitor::pitr_snapshot_loop`) immediately
+  after its own `BeginBackup` is observed to land, with a **self-healing
+  sweep** (matching any untagged row whose `backup_name` carries a
+  recognizable internal marker prefix) closing the gap left by a dropped
+  ack between the two proposals on every subsequent tick — a named,
+  accepted residual (a vanishingly brief window where an internal snapshot
+  looks like an ordinary on-demand one), not a defended two-phase-commit
+  property. `DeleteBackup`'s existing apply arm prunes the tag alongside
+  the row it tags.
+- **A PITR base snapshot is a `SYSTEM`-type backup for `ListBackups`
+  purposes**, realizing `wire::BackupTypeFilter::System`'s own doc comment
+  from Train 1 PR④ ("PITR base snapshots — never produced yet") literally:
+  the default (`USER`) filter excludes `pitr_base_backups`-tagged rows;
+  `SYSTEM`/`ALL` include them. `DescribeBackup`/`DeleteBackup` by ARN are
+  unchanged (a caller already holding the specific ARN is not filtered by
+  type, matching real DynamoDB) — a client can still delete a PITR base
+  snapshot directly if it discovers the ARN via `ListBackups(SYSTEM)`; this
+  is not specially guarded (a narrow, accepted residual: doing so can
+  orphan a still-needed replay base for segments sealed after it, the same
+  class of self-inflicted narrowing a user deleting any relevant backup
+  already risks). The JSON body's own `BackupType` field still always
+  renders `"USER"` (cosmetic; threading the real value through
+  `wire::BackupDetails` end to end is a named follow-up, not a correctness
+  gap for the mechanism this PR builds).
+- **The disable-triggered final seal is wired identically to F12-b's own
+  stream precedent**: a new `ClientRequest::ForcePitrSeal` RPC and
+  `ClientCtx::force_pitr_seal_tablet`, mirroring `ForceSeal`/
+  `force_seal_tablet` exactly, called for every one of a table's tablets by
+  `dynamo.rs::update_continuous_backups`'s disable path **before** it
+  proposes `MetaCommand::UpdateContinuousBackups { enabled: false, .. }` —
+  so `trim_janitor`'s PITR term (which, mirroring the stream term, applies
+  only while `pitr_enabled` is currently true) never has an unprotected
+  window the instant the flag flips.
+- **PITR shares the stream sealer's own `seal_bytes`/`seal_age` trigger
+  knobs (`ctx.data().stream_seal_knobs`) — no separate PITR-specific
+  threshold, and no CLI-configurable retention/snapshot-cadence knob at
+  all yet.** Both are deliberate Train 3 PR① simplifications, not gaps
+  discovered after the fact: `DEFAULT_PITR_RETENTION` (35 days) and
+  `DEFAULT_PITR_SNAPSHOT_CADENCE` (6 hours) are hardcoded production
+  defaults at every spawn site, the identical "no CLI flag exists yet"
+  shape `ttl_reaper.rs`'s own sweep interval already carries in this
+  codebase. Both loops' own functions take the relevant `Duration` as a
+  parameter (so a test passes a tiny value directly), and threading a real
+  `--pitr-retention-days`/reusing `--stream-seal-bytes`-shaped knobs is a
+  named follow-up — `start_with_growth`'s parameter list already carries
+  enough same-shaped `Duration`s that adding another was judged not worth
+  the ~40-call-site mechanical fan-out under this PR's own time budget.
+- **No replica-repair phase for PITR segments** — a deliberate, named Train
+  3 simplification mirroring Train 1 PR④'s own "reclaim is local-only"
+  acceptance for on-demand backups: `pitr_janitor`'s retention phase marks,
+  deletes via the cataloged `replicas` list (unlike Train 1 PR④'s backup
+  janitor, a PITR segment *does* carry a real `replicas` list, mirroring
+  `StreamShardRow`'s own, so reclaim already uses `BackupStoreHandle::
+  delete` against it rather than a local-only sweep), and removes — but
+  never re-replicates a segment that has lost a copy to cluster churn the
+  way `segment_janitor.rs`'s own phase 2 does for streams. A future train
+  can add it by copying that phase verbatim.
+- **`EarliestRestorableDateTime`/`LatestRestorableDateTime` derivation**:
+  `Earliest = max(retention floor, this generation's own enabled_wall_ms)`;
+  `Latest = min, over every one of the table's CURRENT tablets, of that
+  tablet's own last-PITR-seal wall time (or `enabled_wall_ms` for a tablet
+  that has never sealed yet)` — the minimum, not the maximum, since a
+  client's own restore-to-a-second request must be coherent across every
+  tablet, and reporting later than the slowest tablet's own actual coverage
+  would claim a restore this adapter cannot yet reconstruct for that
+  tablet's range. Both read `ctx.env.wall_now()` directly at serve time
+  (a pure read handler, not a proposed command, so there is no propose-time
+  stamping site to ride) — consistent with the "wall clock enters through
+  one seam" discipline, just at a read rather than a write.
+- **The split endgame's PITR final seal is a straight second copy of the
+  streams final-seal step, not a shared helper** — `split_driver_tick`/
+  `inplace_split_driver_tick` each gained one more `while pitr_seal_now(..)
+  .is_some() {}` loop, gated on `meta.table_pitr(&table).is_some()`,
+  immediately after the existing streams one. Not factored into one
+  parameterized function: the two write to different stores and catalog
+  collections (`crate::SegmentStoreHandle`+`stream_shards` vs.
+  `crate::BackupStoreHandle`+`pitr_segments`), and forcing them through a
+  shared abstraction was judged more likely to obscure that distinction
+  than to save the ~10 lines of duplication.
+- **Corpus scoping**: `ANIMUS_PITR_SEEDS` (`animus-test/tests/
+  pitr_fault_corpus.rs`) reimplements `pitr_seal_now` directly (the
+  `stream_lineage_corpus.rs` precedent) but deliberately does **not**
+  re-simulate the periodic-base-snapshot loop or the janitor's full tick —
+  both reuse Train 1 machinery `backup_fault_corpus.rs` already proves at
+  depth, so this corpus instead proves the janitor's own **new** logic (the
+  keep-anchor retention predicate) as a pure function under randomized
+  interleavings. See `crates/animus-test/CLAUDE.md`'s own corpus section
+  for the full scenario list and the split-scenario engine-sharing bug this
+  corpus's own first run found in its test harness (not production code).
+
+**Open questions carried into Train 3 PR② (`RestoreTableToPointInTime`)**:
+
+- §10's per-tablet cutoff replay needs to walk a PITR segment chain the
+  same way `DescribeStream`/`GetRecords` walks a stream shard chain
+  (`Metadata::pitr_segments`, ascending epoch, `segment::decode_and_slice`)
+  — no new primitive, but the replay driver itself (locate the newest base
+  snapshot at-or-before `T`, then replay each tablet's own segments/hot
+  tail up to the packed-HLC position nearest `T`) is unwritten.
+  `encode_restored_value`'s envelope re-wrap (Train 2's own as-built note)
+  very likely applies unchanged, per that note's own prediction.
+- The single-fresh-tablet restore layout decision (Train 2's own as-built
+  note) is inherited unchanged; PITR's replay produces the identical
+  `SeedRow` shape an on-demand backup's data objects carry, so
+  `propose_seed_batch` doesn't know or care whether its input came from a
+  snapshot alone or a snapshot-plus-replay.
+- **Not yet decided**: how `RestoreTableToPointInTime` selects which base
+  snapshot is "newest at or before `T`" when a table has both PITR base
+  snapshots (tagged `pitr_base_backups`) and unrelated on-demand backups a
+  client separately created via `CreateBackup` — the ADR's own §10 text
+  implies only PITR's own base-snapshot history is eligible, which
+  `Metadata::pitr_base_backups_for_table` already scopes correctly; PR②
+  should use that accessor directly rather than scanning `Metadata::
+  backups` by table name alone.
+- **Not yet decided**: whether a restore-to-a-second request against a
+  table whose PITR was disabled-then-re-enabled (crossing a generation
+  boundary) should be rejected outright for any `T` inside the gap, or
+  simply find no coverage there and fail with whatever "no restorable data
+  at this point" error DynamoDB itself defines — this ADR's §9 text
+  establishes that the gap is real and uncovered, but doesn't specify the
+  wire-facing error shape PR② should surface for it.
+
+## As-built amendment (2026-08-27, Train 3 PR② — `RestoreTableToPointInTime`)
+
+Resolves the three open questions above and records five deviations/bugs
+found while building the point-in-time restore path — the final PR of the
+backup/restore/PITR train.
+
+- **Base-snapshot selection answers the first open question directly**:
+  `restore_table_to_point_in_time` (`animusd::dynamo`) calls
+  `Metadata::pitr_base_backups_for_table` — never a bare scan of
+  `Metadata::backups` by table name — and picks the newest `Available` row
+  at or before the resolved cutoff. An unrelated on-demand backup a client
+  created via plain `CreateBackup` is structurally invisible to this path
+  regardless of its own timestamp, exactly as §10's text implies.
+- **The generation-gap question answers "reject, with `InvalidRestoreTimeException`,
+  the same code the ADR already names for an out-of-window `T`"** — no new
+  error shape. `Metadata::pitr_restore_window` (built in the PR① follow-on
+  commit) scopes `Earliest`/`Latest` to the table's *current* generation
+  only, so a `T` that falls inside an earlier generation's own window (a
+  disable/re-enable gap, or before the current generation's own enable) is
+  simply outside `[earliest_floor_ms, latest_ms]` and rejected by the same
+  bounds check as any other out-of-range request — the corpus's
+  `pitr_restore_window_scopes_to_the_latest_generation_under_random_cycles`
+  cell proves this holds under randomized disable/re-enable cycling, not
+  just the hand-picked case.
+- **Replay-integration shape: extend Train 2's own restore driver, not a
+  parallel one** — `backup_restore.rs`'s existing per-tablet, leader-side,
+  event-driven `backup_restore_loop`/`restore_tick` gained one more phase:
+  after the pre-existing base-manifest chunk sweep, a `Seeding` restore
+  carrying a `PitrRestorePlan` runs `replay_pitr_segments`, which walks the
+  plan's own resolved `PitrReplaySegmentRef`s (already epoch-ordered by
+  construction), fetches + decodes each segment
+  (`animus_cp_data::segment::decode_and_slice`), decodes every
+  `ChangeRecord`, skips `consumer_hidden()` ones (markers/seeded/staged —
+  never real content), and re-derives `KIND_BASE`/`KIND_LSI` writes via
+  `dynamo::kind_writes_for_item` — the *same* pure function a live write's
+  own leader-side evaluation already uses, so LSI-derivation logic is never
+  duplicated. `KIND_CHANGE`/`KIND_FOOTPRINT` are never replayed (a
+  footprint is rebuilt fresh by the post-activation GSI backfill
+  regardless of how base content arrived, exactly like an on-demand
+  restore's own seeded rows). This reuses `BeginRestore` → the existing
+  activation → GSI-declare sequence verbatim; `PitrRestorePlan` is carried
+  on `RestoreRow`/`MetaCommand::BeginRestore` exactly like `gsi_defs`
+  already is, so nothing downstream of `BeginRestore` needed to learn a new
+  restore "kind" exists.
+- **Confirmed: replayed values need the identical `encode_restored_value`
+  re-wrap Train 2's own seeds do** — Train 2's as-built note had predicted
+  this "very likely" without proving it; this PR's own first end-to-end run
+  proved it the hard way (a raw resolved value merged via `SeedBatch`
+  without the envelope corrupts the engine's later reads, identical to the
+  Train 2 incident). `replay_pitr_segments` re-wraps every derived value
+  before batching it into a `SeedRow`.
+- **A real, previously-shipped bug found and fixed ahead of this PR's own
+  validation gate being meaningful**: `pitr_seal_now`/`pitr_tick`
+  (`index_drain.rs`) stamped `seal_wall_ms` from `ctx.env.now()`
+  (monotonic-since-process-start `Nanos`), not `ctx.env.wall_now()` (real
+  epoch milliseconds, ADR 0051's one calendar-time seam) — since
+  `PitrSpec::enabled_wall_ms` is genuinely wall-clock,
+  `LatestRestorableDateTime` silently collapsed to
+  `EarliestRestorableDateTime` forever the instant any tablet ever sealed,
+  making every non-trivial restore window empty. Fixed to `wall_now()`; the
+  never-sealed age-trigger bootstrap fallback (which used to scan for the
+  true oldest pending record's own packed-HLC `wall_ms`) switched to
+  seeding at the now-`wall_now()`-based `now_ms` directly, since a packed
+  HLC's `wall_ms` component is monotonic-since-start and no longer
+  comparable to it. A second, narrower gate had the same class of bug:
+  `table_change_records_carry_images` didn't account for PITR at all — a
+  table with PITR enabled but no GSI/LSI/stream wrote only image-less
+  markers, which PITR replay cannot reconstruct row content from. PITR now
+  joins the same `!indexes.is_empty() || stream.is_some()` gate a stream or
+  index already trips.
+- **A real bug in this PR's own new code, found by its own first
+  end-to-end test, not by review**: the first `Metadata::
+  pitr_replay_segments` was built on `live_split_descendants` (ADR 0059
+  §6's on-demand-capture re-planning accessor), which answers "this
+  pinned tablet's currently-*live* descendants" and returns **empty** for
+  a tablet retired by an ordinary `DropTableTablets` — no `split_lineage`
+  entry exists for a drop, only for a split — so a deleted-table PITR
+  restore silently replayed nothing. Rewritten as a direct forward DFS
+  over the `split_lineage` tree, starting from each of the base snapshot's
+  own pinned tablets: every tablet visited (root or descendant) contributes
+  its own `pitr_segments` rows regardless of current liveness, since a
+  table drop never touches `split_lineage` or `pitr_segments` at all —
+  they are ADR 0024 carve-outs exactly like the backup catalog itself. The
+  root's own floor is the base snapshot's recorded cut version (never
+  replay below what the snapshot already covers); a descendant's floor is
+  0 (its own change log starts empty at birth, ADR 0050's copy-based split
+  design). Regression:
+  `pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`
+  (`animus-control`'s own unit tests) plus the corpus's
+  `deleted_table_pitr_restore_matches_the_model` cell.
+- **A second production fix the same end-to-end run found**:
+  `RestoreDateTime` is truncated to the second (§10's own contract), but
+  `pitr_restore_window`'s `earliest_ms` is millisecond-precise (derived
+  from `PitrSpec::enabled_wall_ms`, a real wall-clock timestamp with no
+  reason to land on a whole second), so a `T` naming the very same
+  wall-clock second PITR was enabled in could be rejected purely because
+  enabling didn't happen to land on that second's own first millisecond.
+  Fixed by flooring `earliest_ms` to its own second
+  (`earliest_floor_ms = (earliest_ms / 1000) * 1000`) before the bounds
+  comparison — the comparison itself still stays in whole milliseconds
+  internally; only the floor moved.
+- **Testing technique worth keeping**: the e2e suite
+  (`animusd/tests/dynamo_pitr_restore.rs`) does not race the real wall
+  clock to decide when a write is "definitely covered by the next seal" —
+  polling `LatestRestorableDateTime` for "≥ target second" doesn't
+  guarantee the target write is *included*, since Latest can advance past
+  the target second before the segment covering it is actually sealed.
+  Instead it reads the sealed segment's own `seal_wall_ms` directly off
+  `node.metadata()` (`await_next_pitr_seal`), so the test always restores
+  to a second the harness *knows* the relevant write landed in, not one it
+  merely observed the clock reach.
+- **`admin.rs`'s `/admin/restores` view** gained a `source` field
+  (`"POINT_IN_TIME"` vs. `"BACKUP"`, keyed on `RestoreRow.pitr.is_some()`)
+  plus `pitr_target_wall_ms`/`pitr_segments_planned`, for operator
+  visibility into which restores are PITR-driven and how large their
+  resolved replay plan is — no wire-facing consequence, purely
+  observability.
+- **Residuals carried forward, none blocking**: the "not yet decided"
+  ARN-scoped-delete-of-a-PITR-base-snapshot residual from PR①'s own
+  amendment is unchanged by this PR (restore never touches deletion); no
+  replica-repair phase exists for PITR segments (PR①'s own named gap,
+  unaffected by adding a reader of those segments); and — as with every
+  restore in this train — a restored table's stream/TTL config is never
+  re-enabled from the source's own history, matching Train 2's identical
+  choice for `RestoreTableFromBackup`. Corpus:
+  `crates/animus-test/tests/pitr_fault_corpus.rs`, `ANIMUS_PITR_SEEDS`
+  (held green at 300 in ~8s), covering restore-to-a-random-second against
+  mixed load with a leader kill, the same property across a split's
+  independently-sealing children, the generation-gap scoping property,
+  the deleted-table regression, and `UseLatestRestorableTime` reproducing
+  the full model. E2e: `animusd/tests/dynamo_pitr_restore.rs` — a full
+  enable → timed writes → restore-to-a-mid-point-second round trip
+  (verifying exactly the rows as of `T`, via both `RestoreDateTime` and
+  `UseLatestRestorableTime`), a deleted-table PITR restore within the
+  window, and the `TableNotFoundException`/
+  `PointInTimeRecoveryUnavailableException`/`InvalidRestoreTimeException`
+  error shapes.
