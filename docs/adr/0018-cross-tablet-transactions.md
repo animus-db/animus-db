@@ -4,15 +4,19 @@
   apply-time write-key conditions follow-up + the 2026-08-24
   `ClientRequestToken` idempotency amendment + the 2026-08-27 amendment
   closing issue #298's "deep shape A" double-materialize mechanism + a
-  second 2026-08-27 amendment confirming and closing that round's own
-  genuine-`TransactionConflict` residual (plus two sibling bugs found the
-  same way) — `SplitMode::InPlace` **still** stays pinned to `Copy`, a NEW,
-  more severe "acked write lost with no error anywhere" residual found
-  during that round's own 30-run gate blocks the un-pin (see that
-  amendment's §4/§6); CQL transactional surface, CancellationReasons
-  fidelity, manual txn-resolution admin actions, and a `KvCommand::
-  TxnResolve` outcome channel (named, not built — that amendment's §3)
-  deferred). PR1: HLC + sim clock skew; PR2:
+  second 2026-08-27 amendment confirming — and narrowing, not categorically
+  closing — that round's own genuine-`TransactionConflict` residual (plus
+  two sibling bugs found and fully closed the same way) — `SplitMode::
+  InPlace` **still** stays pinned to `Copy`: the `TransactionConflict`
+  residual recurred once more even with the fix active, and a NEW, more
+  severe "acked write lost with no error anywhere" residual was also found,
+  both during that round's own attempted 30-run gate (see that amendment's
+  §4/§6). The root structural gap both trace back to — `KvCommand::
+  TxnResolve` has no outcome channel telling its own proposer a fence-miss
+  no-op from a genuine resolve — is named, not built (that amendment's §3).
+  CQL transactional surface, CancellationReasons fidelity, and manual
+  txn-resolution admin actions remain separately deferred. PR1: HLC + sim
+  clock skew; PR2:
   HLC commit timestamps as the CP-plane MVCC version + the range-seal
   design; PR2b: MVCC snapshot reads at a timestamp + the read-timestamp
   cache/logged read ceiling; PR3: single-participant transactions — the
@@ -3624,22 +3628,51 @@ before (the failure) and after (30 consecutive soak runs attempted; see
 ### 6. Soak result and un-pin decision: NOT taken
 
 With all three fixes in place, the mandated 30-run un-pinned `SplitMode::
-InPlace` soak was attempted. The genuine `TransactionConflict` residual
-this amendment set out to close did not recur once across every run. The
-message-wrapping/decide-retry residuals (§1's two siblings) also did not
-recur. **§4's newly-found "acked write lost, no error anywhere" residual
-did recur** during the attempted 30-run batch, alongside occasional
+InPlace` soak was attempted (41 total runs across the fix-confirmation and
+gate phases, tallied honestly rather than stopping at a clean-looking
+subset). The message-wrapping/decide-retry residuals (§1's two siblings)
+did not recur in any run once their own fixes landed. **The genuine
+`TransactionConflict` residual this amendment set out to close DID recur
+once more, 17 clean runs into the formal gate**, even with `push_
+resolution_if_decided` active — the captured trace shows the identical
+"resolve reports success but the intent stays live" shape §1 describes
+recurring a SECOND time on the SAME key before a fresh stage attempt
+exhausts into `TransactionConflict` again, but the run's own log level
+(`warn`, not `debug`) does not capture whether `push_resolution_if_decided`
+fired and found the blocker still `Pending`/unconfirmable (plausible: the
+STATUS query it depends on is just as reachable to the same stale-fence-
+causing split cadence as the original resolve was), or fired and its own
+push attempt hit the identical fence race a second time. **Not root-caused
+to that level of detail** — recorded here rather than re-derived, per this
+file's own standing instruction, so a future round can instrument
+`push_resolution_if_decided` itself directly rather than re-discovering
+this gap. This confirms §3's own point sharper than intended: the fix
+closes the mechanism as originally captured and as directly unit-tested,
+but does not categorically close every path to the same symptom while
+`TxnResolve`'s own missing outcome channel remains open — a single,
+sufficiently adversarial split cadence can still reach it. **§4's
+newly-found "acked write lost, no error anywhere" residual also
+recurred** during the same investigation, alongside occasional
 recurrences of the pre-existing lineage-delivery-timeout residual (ADR
-0058's G5 row) — both verified in isolation per this file's own standing
-"a timing-sensitive failure needs an isolated rerun before being treated as
-real" discipline, and both genuinely reproduce (not host-contention
-artifacts of this investigation's own back-to-back local runs).
+0058's G5 row) — all three verified in isolation per this file's own
+standing "a timing-sensitive failure needs an isolated rerun before being
+treated as real" discipline, and all genuinely reproduce (not
+host-contention artifacts of this investigation's own back-to-back local
+runs).
 
 Per the mandate's own "any failure keeps the pin" instruction: `SplitMode::
 InPlace` stays **not** un-pinned. This round closes three confirmed, real
-bugs and materially narrows what's left, but §4's residual is a genuine,
-unresolved data-loss-shaped hazard under the un-pinned soak's own cadence
-— shipping the un-pin without root-causing it would trade a known, narrow,
+bugs (each independently worth having, each proven by a captured
+before/after trace or a red/green regression test) and meaningfully
+narrows the residual's own reachable surface, but does not close it
+categorically, and §4's own residual is a genuine, unresolved
+data-loss-shaped hazard under the un-pinned soak's own cadence — shipping
+the un-pin without root-causing both would trade a known, narrow,
 already-tracked gap (ADR 0050 rung 8's own copy-workflow acceptance soak
-staying pinned) for an unknown one. See `docs/engineering-lessons.md`'s
+staying pinned) for two unknown ones. The clearest path to actually closing
+this class, per §3's own finding, is giving `KvCommand::TxnResolve` a
+`StageOutcome`-shaped outcome channel so a resolve's own proposer — and
+`push_resolution_if_decided` — can tell a fence-miss no-op from a genuine
+resolve, rather than continuing to patch each individually-discovered
+symptom. See `docs/engineering-lessons.md`'s
 matching entry for the full tally and the next round's starting point.

@@ -11487,10 +11487,24 @@ one reporting apparent success, so the write's own intent never actually
 resolves anywhere while nothing ever signals a problem. Not root-caused
 live — recorded here, per this file's own "capture the raw shape, don't
 re-derive it" instruction, exactly so the next round does not have to
-start from zero. **Soak result: the three confirmed bugs above did not
-recur once across the attempted 30-run gate, but this new residual did
-(verified in isolation, a genuine reproduction, not host-contention noise)
-— `SplitMode::InPlace` stays not un-pinned.**
+start from zero. **Soak result (41 runs total across the fix-confirmation
+and gate phases, tallied honestly rather than stopping at a clean-looking
+subset): the two sibling bugs (message-wrapping, decide-time-fresh-retry)
+did not recur even once once their own fixes landed. The confirmed
+self-conflict `TransactionConflict` residual DID recur once more, 17 clean
+runs into the formal gate, even with the write-side push active** — the
+captured trace shows the identical false-success resolve shape recurring a
+second time on the same key, but at a log level that didn't capture
+whether the push itself found the blocker unconfirmable or hit the
+identical fence race on its own resolve attempt; not root-caused to that
+depth, recorded for the next round rather than guessed at. **This new
+"acked write lost" residual also recurred** (verified in isolation, a
+genuine reproduction, not host-contention noise) — `SplitMode::InPlace`
+stays not un-pinned, and the write-side push should be read as a real,
+tested narrowing of the residual's reachable surface, not a categorical
+close of it; `TxnResolve`'s own missing outcome channel is the more
+durable fix a future round should reach for instead of another
+individually-discovered-symptom patch.
 
 ## A converged-or-timeout poll can still race if its condition is weaker than what the assertion after it needs (issue #421)
 
