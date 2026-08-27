@@ -553,15 +553,22 @@ async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
     // It replicated to *every* node's own replicated catalog — a
     // converged-or-timeout poll, never a one-shot assert (a node's own
     // local apply can genuinely lag the commit by a beat).
+    //
+    // The durable contract is "marked deleted", not "sitting at `Expired`
+    // forever": the backup janitor (`animusd::backup_janitor`, a 200ms tick)
+    // is a second, independent, faster process that can reclaim every
+    // object and finalize (remove the row from `Metadata` entirely) before
+    // this poll's next tick ever observes `Expired` — exactly the race
+    // `animusd::dynamo::delete_backup`'s own post-propose poll was fixed for
+    // (see the engineering-lessons entry on `DeleteBackup`'s confirm-poll).
+    // A row that is simply *gone* is an equally valid success signal here —
+    // nothing else ever removes a backup row.
     for (i, n) in nodes.iter().enumerate() {
         timeout(Duration::from_secs(20), async {
             loop {
-                if n.metadata()
-                    .backup(&backup_arn)
-                    .map(|row| row.status.clone())
-                    == Some(animus_control::BackupStatus::Expired)
-                {
-                    return;
+                match n.metadata().backup(&backup_arn).map(|row| row.status.clone()) {
+                    Some(animus_control::BackupStatus::Expired) | None => return,
+                    _ => {}
                 }
                 sleep(Duration::from_millis(100)).await;
             }
@@ -569,7 +576,7 @@ async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "node {i}: backup not marked Expired within 20s of follower-relayed DeleteBackup"
+                "node {i}: backup not marked Expired (or reclaimed) within 20s of follower-relayed DeleteBackup"
             )
         });
     }

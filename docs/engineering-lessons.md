@@ -10361,6 +10361,26 @@ design review — the codebase's own "a flaky `ProdEnv` test is a real bug"
 rule held exactly as advertised. See `crates/animusd/src/dynamo.rs`'s
 `delete_backup` for the fix in place.
 
+**The same PR shipped a sibling instance of this exact bug in its own
+regression test**, not just the production code above:
+`delete_backup_on_a_follower_is_relayed_to_the_leader`
+(`crates/animusd/tests/schema_ddl_relay.rs`) issues `DeleteBackup` against a
+follower, then polls every node's `Metadata::backup(&backup_arn)` waiting for
+`BackupStatus::Expired` — the identical named-intermediate-state trap, one
+level up: fixing the production confirm-poll to accept "gone" as success
+didn't also fix a *test* that independently re-derived the same wrong check
+against the same janitor race. It flaked ~50-55% under a repeated single-test
+loop (`cargo test -p animusd --test schema_ddl_relay
+delete_backup_on_a_follower -- --test-threads=1`, run 15-20x), always with
+"backup not marked Expired within 20s" on whichever node the fast 200ms
+janitor tick reclaimed-and-finalized first. Fix mirrors `delete_backup`'s own:
+accept `Some(Expired) | None` as convergence, not `Some(Expired)` alone. The
+lesson generalizes one more notch: **when fixing a "poll for an intermediate
+state that can be skipped past" bug, grep for other pollers of the same
+value** — a test asserting the same field is exactly as exposed to the race
+as the production code was, and copying the assertion pattern (rather than
+the fix) into a new test silently reintroduces the bug.
+
 ## A live-derived accessor scoped to "currently resolvable" state silently drops to a degenerate value once its inputs are torn down — freeze the figure while it's still derivable (ADR 0059 §3, Train 1 PR④, `BackupRow::total_bytes`)
 
 `Metadata::backup_total_bytes` sums a backup's captured bytes via
