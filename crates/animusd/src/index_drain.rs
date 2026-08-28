@@ -220,7 +220,7 @@ use animus_dynamo::{
     AttributeValue, ChangeRecord, FootprintEntry, IndexFootprint, Item, index as dynamo_index,
     index_table_name, is_index_table_name, storage_key,
 };
-use animus_env::{Clock, Env, Metric, Rng};
+use animus_env::{Clock, Env, Metric};
 use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
@@ -2116,7 +2116,10 @@ async fn advance_backfill_cursor(
 /// `ClientCtx::clear_backfill_cursor_for_table`, forwarded per tablet like
 /// [`seal_now`]) from `dynamo.rs::drop_index`'s own cascade — see that
 /// function's doc for exactly when and why twice.
-pub(crate) async fn clear_backfill_cursor(group: &CpGroup, index: &str) -> Result<(), String> {
+pub(crate) async fn clear_backfill_cursor<E: Env>(
+    group: &CpGroup<E>,
+    index: &str,
+) -> Result<(), String> {
     let tag = backfill_tag(index);
     let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
     let propose_index = match group.put_kind_batch_conditioned(
@@ -2491,11 +2494,11 @@ async fn pitr_tick(
 ///
 /// Returns `Ok(Some(epoch))` on a genuine seal, `Ok(None)` if there was
 /// nothing past the watermark to seal.
-pub(crate) async fn pitr_seal_now(
-    ctx: &ClientCtx,
+pub(crate) async fn pitr_seal_now<E: Env>(
+    ctx: &ClientCtx<E>,
     table: &str,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
 ) -> Result<Option<u64>, String> {
     // `metadata_fresh()`, not `effective_metadata()` — identical
     // "permanent decision, never retried against a corrected view" argument
@@ -2683,11 +2686,11 @@ pub(crate) async fn pitr_seal_now(
 /// incident. **The "content covering at least what I intended" qualifier is
 /// load-bearing (issue #298)** — see the commit-wait poll's own doc for the
 /// dueling-seal race a bare presence check misses.
-pub(crate) async fn seal_now(
-    ctx: &ClientCtx,
+pub(crate) async fn seal_now<E: Env>(
+    ctx: &ClientCtx<E>,
     table: &str,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
 ) -> Result<Option<u64>, String> {
     // `metadata_fresh()`, not `effective_metadata()` (issue #298): this
     // read decides `watermark`/`next_epoch`, which become IMMUTABLE
@@ -2937,8 +2940,8 @@ pub(crate) async fn seal_now(
 /// these identically to how it builds one from a sealed segment's own
 /// `SegmentRecord`s.
 ///
-pub(crate) async fn hot_read(
-    group: &CpGroup,
+pub(crate) async fn hot_read<E: Env>(
+    group: &CpGroup<E>,
     from_position: u64,
     limit: usize,
 ) -> Vec<(Vec<u8>, u64, Vec<u8>)> {

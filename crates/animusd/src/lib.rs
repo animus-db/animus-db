@@ -1540,9 +1540,9 @@ impl<E: Env> CpGroup<E> {
 // Boxing `Local`'s `CpGroup` would put a heap allocation on the read/write hot
 // path just to shrink a stack value that lives for one match.
 #[allow(clippy::large_enum_variant)]
-enum CpRoute {
+enum CpRoute<E: Env = ProdEnv> {
     /// This node hosts the current leader — serve from `leader` directly.
-    Local(CpGroup),
+    Local(CpGroup<E>),
     /// Forward to the leader's node at this client-API address (ADR 0017 #3b).
     Forward(String),
     /// No leader reachable (no local leader, no route, election did not settle).
@@ -5366,8 +5366,15 @@ impl BoundDataNode {
 /// already. A few fields below still carry stale "shared in `--cluster N`"
 /// commentary describing that retired shape; treat any such comment as
 /// historical, not current behavior.
+///
+/// Generic over `E: Env` (ADR 0061 rung C5 step 1), same default-binds-
+/// `ProdEnv` shape as [`CpGroup`]/[`SharedEngine`] — the `raftkv` field is
+/// the one that actually varies with `E` (it stores `CpGroup<E>` handles);
+/// `control`'s `RaftNode<ProdEnv>` stays hardcoded (the control-plane Raft
+/// binding is not part of this rung's cut — see `ClientCtx::control`'s own
+/// note).
 #[derive(Clone)]
-pub struct ClusterEdgeState {
+pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// This **node's own** control `RaftNode` handle (at most one entry — see
     /// [`register_control`](Self::register_control)), so `propose_schema` can
     /// propose a schema `MetaCommand` **locally** when this node is the
@@ -5386,16 +5393,16 @@ pub struct ClusterEdgeState {
     /// forwards otherwise (`cp_route`/`client_route`). Each tablet maps to the
     /// handle(s) *this node* locally hosts for it (in practice at most one,
     /// since a node hosts at most one replica of a given tablet).
-    raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup>>>>,
+    raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup<E>>>>>,
 }
 
-impl Default for ClusterEdgeState {
+impl<E: Env> Default for ClusterEdgeState<E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ClusterEdgeState {
+impl<E: Env> ClusterEdgeState<E> {
     /// A fresh, isolated edge-state set for one cluster.
     pub fn new() -> Self {
         Self {
@@ -5416,7 +5423,7 @@ impl ClusterEdgeState {
 
     /// Register a node's CP group handle for `tablet` (ADR 0017 #3a / Phase 2).
     /// Called on each node that hosts a replica of `tablet`.
-    fn register_raftkv(&self, tablet: TabletId, cp: CpGroup) {
+    fn register_raftkv(&self, tablet: TabletId, cp: CpGroup<E>) {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
@@ -5434,7 +5441,7 @@ impl ClusterEdgeState {
     /// lifetime). `None` if no such handle is registered (e.g. the stand-up
     /// path claimed the tablet but has not registered yet — the caller
     /// retries on a later tick rather than GC-ing a group mid-standup).
-    fn unregister_raftkv(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup> {
+    fn unregister_raftkv(&self, tablet: TabletId, member: NodeId) -> Option<CpGroup<E>> {
         let mut map = self.raftkv.lock().expect("raftkv handles poisoned");
         let groups = map.get_mut(&tablet)?;
         let at = groups.iter().position(|g| g.env().node_id() == member)?;
@@ -5469,8 +5476,8 @@ impl ClusterEdgeState {
     /// this method's own caller's job when it needs one; every bare-abort
     /// caller above wants fire-and-forget, exactly like `CpGroup::shutdown`
     /// itself already promises.
-    fn halt_hosted_cp_groups(&self) -> Vec<CpGroup> {
-        let groups: Vec<CpGroup> = self
+    fn halt_hosted_cp_groups(&self) -> Vec<CpGroup<E>> {
+        let groups: Vec<CpGroup<E>> = self
             .raftkv
             .lock()
             .expect("raftkv handles poisoned")
@@ -5517,7 +5524,7 @@ impl ClusterEdgeState {
     /// registered handle leads; a deposed leader's `linearizable_get` returns `None`
     /// (never stale) and its `put` returns `NotLeader`, so picking the first
     /// self-styled leader is safe.
-    fn cp_leader(&self, tablet: TabletId) -> Option<CpGroup> {
+    fn cp_leader(&self, tablet: TabletId) -> Option<CpGroup<E>> {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
@@ -5531,7 +5538,7 @@ impl ClusterEdgeState {
     /// of leadership — used to read the group's current leader *hint* for
     /// cross-process forwarding (ADR 0017 #3b). `None` if this node hosts no replica
     /// of `tablet`.
-    fn local_cp(&self, tablet: TabletId) -> Option<CpGroup> {
+    fn local_cp(&self, tablet: TabletId) -> Option<CpGroup<E>> {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
@@ -5542,7 +5549,7 @@ impl ClusterEdgeState {
 
     /// Every CP group this node hosts, as `(tablet, group)` pairs in tablet order
     /// — for the admin `/admin/raftkv` view (ADR 0020). Clones the cheap handles.
-    fn hosted_groups(&self) -> Vec<(TabletId, CpGroup)> {
+    fn hosted_groups(&self) -> Vec<(TabletId, CpGroup<E>)> {
         self.raftkv
             .lock()
             .expect("raftkv handles poisoned")
@@ -6226,10 +6233,22 @@ struct DataRole {
 /// [`ControlHandle`], ADR 0035 PR1), this node's own wire-edge state (incl. the
 /// CP group handles it hosts), the cross-node CP routing table, and — iff this
 /// node runs the data role (ADR 0035 PR3) — its [`DataRole`] fields.
+///
+/// Generic over `E: Env` (ADR 0061 rung C5 step 1), same default-binds-
+/// `ProdEnv` shape as [`CpGroup`]/[`SharedEngine`]/[`ClusterEdgeState`] —
+/// see those types' docs. **`control: ControlHandle` deliberately stays the
+/// crate's existing `ProdEnv`-bound alias** (`control_handle.rs`'s `type
+/// ControlHandle = animus_node::control_handle::ControlHandle<ProdEnv,
+/// AnimusdRelayClient>`), not `ControlHandle<E>` — genericizing the control
+/// binding itself is a separate concern this rung's minimal cut does not
+/// need: nothing in `ClientCtx`'s own two `impl` blocks reads `self.control`
+/// through anything `CpGroup`/`SharedEngine`-shaped, so leaving it fixed
+/// costs nothing here and avoids threading a second, independent generic
+/// parameter (`R: RelayClient`) through this type for no present benefit.
 #[derive(Clone)]
-pub(crate) struct ClientCtx {
+pub(crate) struct ClientCtx<E: Env = ProdEnv> {
     control: ControlHandle,
-    pub(crate) edge: ClusterEdgeState,
+    pub(crate) edge: ClusterEdgeState<E>,
     /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
     /// clone of the same handle. The **only** `Env`-seam access point this
     /// context exposes to the wire edges: e.g. minting a DynamoDB Streams
@@ -6237,7 +6256,7 @@ pub(crate) struct ClientCtx {
     /// never `std::time` directly (ADR 0003's determinism rule — this crate
     /// is production-only `ProdEnv` wiring, but the seam convention still
     /// holds so nothing here quietly grows a second, ambient time source).
-    pub(crate) env: ProdEnv,
+    pub(crate) env: E,
     /// This node's data-plane fields, if it runs the data role — see
     /// [`DataRole`]'s doc. `None` on a control-only node (ADR 0035 PR3).
     /// Access via [`data`](Self::data), not directly.
@@ -6301,7 +6320,7 @@ pub(crate) struct ClientCtx {
     /// introspection (`/admin/storage/control`) — the apply task's own
     /// handle (moved into `RaftNode::start_with_metrics`) remains the sole
     /// writer.
-    pub(crate) control_storage: Option<SharedEngine>,
+    pub(crate) control_storage: Option<SharedEngine<E>>,
     /// The client DynamoDB port's SigV4 credential store (ADR 0057):
     /// `access_key_id → secret_access_key`, from the cluster config's
     /// `dynamo_auth` section (or `--dynamo-auth PATH` on a config-less
@@ -6327,7 +6346,7 @@ pub(crate) struct ClientCtx {
     pub(crate) split_mode: SplitMode,
 }
 
-impl ClientCtx {
+impl<E: Env> ClientCtx<E> {
     /// This node's [`DataRole`] fields — see that type's doc.
     ///
     /// # Panics
@@ -6622,7 +6641,7 @@ impl ClientCtx {
     ///   so forward to any known route (the receiver serves iff it is the leader,
     ///   else the client retries with fresh routing);
     /// - the tablet itself is not in the map yet (bootstrap) → **wait** for it.
-    async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute {
+    async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute<E> {
         let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
         loop {
             if let Some(tablet) = self.tablet_for(table, key)
@@ -6645,7 +6664,7 @@ impl ClientCtx {
     /// / wait — is the pure [`topology::decide_cp_route`]; this method's job is
     /// only to gather its inputs (cheaply, and lazily where a fact needs a
     /// `Metadata` deep clone) and execute the resulting decision.
-    fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute> {
+    fn resolve_cp_route(&self, tablet: TabletId) -> Option<CpRoute<E>> {
         // ADR 0044 phase-1 PR4 (the wake-on-demand edge): wake any locally
         // registered replica of this tablet before deciding anything, so a
         // first touch on a possibly-quiesced cold group doesn't wait out its
@@ -6780,7 +6799,7 @@ impl ClientCtx {
         }
     }
 
-    fn cp_stale_local(&self, tablet: TabletId) -> Option<CpGroup> {
+    fn cp_stale_local(&self, tablet: TabletId) -> Option<CpGroup<E>> {
         let data = self.data.as_ref()?;
         let group = self.edge.local_cp(tablet)?;
         (group.config().contains(&data.base_id) && group.stale_read_ready()).then_some(group)
@@ -7004,7 +7023,7 @@ impl ClientCtx {
     /// retry loop — `cp_read`'s `"; retry"` handling — tries again).
     async fn cp_get_local_resolving(
         &self,
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
         if !leader.scope_range().contains(key) {
@@ -7114,7 +7133,7 @@ impl ClientCtx {
     /// decides what "unresolved" means.
     async fn cp_get_local_snapshot(
         &self,
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         key: &[u8],
     ) -> Result<SnapshotRead, String> {
         if !leader.scope_range().contains(key) {
@@ -7209,7 +7228,7 @@ impl ClientCtx {
     /// rather than error. Shared by [`cp_scan_one`] and `cp_serve_forwarded`'s
     /// `Scan` arm.
     async fn cp_scan_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
@@ -7575,7 +7594,7 @@ impl ClientCtx {
     /// would make a value probe hang forever on a batch that correctly
     /// no-opped.
     async fn seed_rows_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         rows: Vec<animus_cp_data::SeedRow>,
     ) -> Result<(), String> {
         if rows.is_empty() {
@@ -7647,7 +7666,7 @@ impl ClientCtx {
     }
 
     async fn cp_kind_raw_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
@@ -7734,7 +7753,7 @@ impl ClientCtx {
     /// this same function's existing `"CP kind write did not commit in
     /// time"` timeout — deliberately no new outcome channel.
     pub(crate) async fn cp_kind_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -7824,7 +7843,7 @@ impl ClientCtx {
     /// (a safe no-op), never mis-applied, so the residual risk is a
     /// mis-timed error, not silent corruption.
     fn cp_batch_propose(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Option<(u64, u64, KvPair)>, String> {
         decide::frozen_refusal(leader.is_frozen())?;
@@ -7854,7 +7873,7 @@ impl ClientCtx {
     /// `accepted_term` is the term [`ProposeResult::Accepted`] carried
     /// alongside `accepted_index` — see the identity-check note below.
     async fn poll_probe(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         accepted_index: u64,
         accepted_term: u64,
         probe_key: &[u8],
@@ -7955,7 +7974,7 @@ impl ClientCtx {
     /// [`cp_put_local`](Self::cp_put_local); a per-batch quorum barrier would not
     /// scale under load).
     async fn cp_batch_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
         let Some((accepted_index, accepted_term, (probe_key, probe_val))) =
@@ -8006,7 +8025,7 @@ impl ClientCtx {
     #[allow(clippy::too_many_arguments)] // mirrors ClientRequest::TxnPrepare's own field count
     async fn txn_stage_local(
         &self,
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         table: &str,
         anchor: Option<(TxnId, Vec<u8>, String)>,
         mut writes: Vec<TxnWrite>,
@@ -10078,7 +10097,7 @@ impl ClientCtx {
     /// is a **per-tablet cap, not pushdown** (see
     /// `RaftKvNode::local_scan_kind`'s doc).
     async fn cp_scan_kind_local(
-        leader: &CpGroup,
+        leader: &CpGroup<E>,
         kind: u8,
         start: &[u8],
         end: Option<&[u8]>,
@@ -10146,7 +10165,7 @@ impl ClientCtx {
     /// [`RaftKvNode::scope_range`]'s doc for why that sliver isn't free to
     /// close; a write landing in it is *dropped* (a safe no-op that this loop
     /// times out on), never mis-applied.
-    async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
+    async fn cp_put_local(leader: &CpGroup<E>, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
         decide::frozen_refusal(leader.is_frozen())?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
@@ -10200,7 +10219,7 @@ impl ClientCtx {
     /// physical key coincidentally reads absent — see `cp_put_local`'s doc for
     /// the full hazard and why the pre-check, not just the embedded fence, is
     /// the actual guard).
-    async fn cp_delete_local(leader: &CpGroup, key: Vec<u8>) -> Result<(), String> {
+    async fn cp_delete_local(leader: &CpGroup<E>, key: Vec<u8>) -> Result<(), String> {
         decide::frozen_refusal(leader.is_frozen())?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
@@ -13487,7 +13506,7 @@ const STREAM_GROW_MID_SPLIT: &str = "tablet is mid-split — its split workflow 
 /// distinct keys (no legal interior split point regardless of tokens) —
 /// the caller answers [`STREAM_GROW_NO_SPLIT_POINT`] rather than ever
 /// calling [`ClientCtx::trigger_split`] with a meaningless key.
-async fn median_split_key(group: &CpGroup) -> Option<Vec<u8>> {
+async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
     let pairs = group.local_pairs().await;
     if pairs.len() < 2 {
         return None;
@@ -13875,7 +13894,7 @@ const CP_CONFIRM_POLL_INIT: Duration = Duration::from_micros(200);
 /// busy-spinning the CPU while it waits.
 const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 
-impl ClientCtx {
+impl<E: Env> ClientCtx<E> {
     /// Kick off a split of `tablet` at `split_key` — either the **copy-based**
     /// workflow (ADR 0050: propose `MetaCommand::BeginSplit` — parent to
     /// `Splitting`, still fully serving, two `Building` children minted at
