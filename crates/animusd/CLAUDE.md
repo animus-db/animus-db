@@ -354,6 +354,128 @@ reusing the captured config is the point of the test.
   non-obviously-related error (`error: expected item after attributes`,
   or a phantom `too_many_arguments` clippy failure on the wrong function)
   rather than something that points at the actual mistake.
+- **`ClientCtx<E, R>` gains `R: RelayClient` (ADR 0061 rung C5 step 3a, the
+  sixth 2026-08-28 amendment)** — `control` was the crate's fixed
+  `ProdEnv`/`AnimusdRelayClient`-bound `control_handle::ControlHandle`
+  alias; it is now the *generic* `animus_node::control_handle::
+  ControlHandle<E, R>`, since `schema.rs`'s `watch_metadata` and
+  `forwarding.rs`'s leader routing both read `self.control` from inside a
+  `ClientCtx<E, R>`-generic `impl` block. `ClientCtx<E: Env = ProdEnv, R:
+  RelayClient = AnimusdRelayClient>` — the same default-type-parameter
+  technique step 1 used for `E` alone, so every pre-existing bare
+  `ClientCtx` reference keeps compiling unchanged. All **six** `impl`
+  blocks (`lib.rs` and the five split modules) became `impl<E: Env, R:
+  RelayClient> ClientCtx<E, R>`, not just the two that read `self.control`
+  directly — `forwarding.rs` calls into all four siblings by name, and
+  `lib.rs`'s own admin/metrics slice is called from several of them, so the
+  bound has to be uniform for the call graph to typecheck generically.
+  **Three things this rung had to get right that a mechanical
+  find-and-replace would have missed**:
+  - **The elision gotcha bites the pattern match, not just signatures.**
+    `schema.rs`'s `let ControlHandle::Local(raft) = &self.control else {
+    .. }` used to match against `crate::ControlHandle` (this crate's own
+    concrete alias); inside a `ClientCtx<E, R>`-generic body that alias
+    resolves to its own default (`ControlHandle<ProdEnv,
+    AnimusdRelayClient>`) and fails to match a `ControlHandle<E, R>`
+    scrutinee for generic `E`/`R` — a plain `E0308` mismatch, confirmed
+    with a two-line scratch program before touching the real file (see
+    `docs/engineering-lessons.md`). The fix imports `animus_node::
+    control_handle::ControlHandle` directly (the *generic* enum) under the
+    same name, shadowing the crate alias import in that one file — every
+    other file keeps using the concrete `crate::ControlHandle` for its own
+    (still-concrete) uses.
+  - **`RelayClient` needed `Clone + Send + Sync + 'static` added as
+    supertrait bounds** (`animus-node::host`), mirroring `Env`'s own
+    supertrait shape. Without it, `ClientCtx<E, R>`'s `#[derive(Clone)]`
+    and `txn_coordinator.rs`'s one `env.spawn_task` capturing a cloned
+    `ClientCtx` (see step 3b below) don't typecheck for a *generic* `R` —
+    only the one concrete implementor that exists today
+    (`AnimusdRelayClient`, a zero-sized type that already trivially
+    satisfied all four). The alternative — bounding just the one `impl`
+    block that needs it — was rejected: `txn_status` (needing the bound)
+    and `cp_read` (not needing it) live in different files but are called
+    from each other's callers' generic scope, so the bound would have had
+    to cascade through most of the five-module call graph anyway.
+  - **A `Self`-free associated function breaks type inference for `R`.**
+    `ClientCtx::cp_kind_local(leader, ..)` (no `&self`, called from three
+    sites in `dynamo.rs`/`lib.rs`'s in-crate tests) has nothing in its
+    arguments that pins down which `R` to use once `R` is a real generic
+    parameter, not a `_`-inferred default — `error[E0283]: type
+    annotations needed`. Fixed with an explicit turbofish
+    (`ClientCtx::<E, R>::cp_kind_local(..)` inside a generic caller,
+    `ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(..)` inside a
+    concrete-`ProdEnv` test) at each of the three call sites — the compiler's
+    own suggested fix. Any other `Self`-free `ClientCtx` associated
+    function reached the same way would need the same treatment.
+  Four free functions taking `ctx: &ClientCtx<E>` explicitly (mirroring
+  step 1's own "three call chains cross into sibling functions" note) also
+  gained the `R` parameter: `dynamo::{kind_write_item_at_leader,
+  eval_kind_txn_write}`, `index_drain::{pitr_seal_now, seal_now}` — none of
+  the four reads `ctx.control`, they just need the signature to match their
+  now-`ClientCtx<E, R>`-generic callers in `write_path.rs`/
+  `txn_coordinator.rs`/`schema.rs`/`forwarding.rs`.
+- **The 91 raw `tokio` sites the sixth amendment counted are converted
+  (ADR 0061 rung C5 step 3b)** — every `tokio::time::{Instant::now,sleep}`
+  in `schema.rs`/`read_path.rs`/`write_path.rs`/`txn_coordinator.rs`/
+  `forwarding.rs` becomes `self.env.now()`/`self.env.sleep(..)` (a bare
+  `deadline = tokio::time::Instant::now() + X` becomes `self.env.now().
+  saturating_add(X)` — `Nanos` has no `Add<Duration>` impl, only the
+  `saturating_add`/`duration_since` shape `animus-cp-data::
+  cluster_segment_store`'s own deadline loops already use). Verify with
+  `grep -nE "tokio::(time|spawn|select)"` over the five files — it returns
+  nothing (comments referencing the pre-conversion shape by name are the
+  only remaining hits). **Four sites needed more than the mechanical
+  substitution**:
+  - **`schema.rs`'s `WatchMetadata` long-poll's bare `tokio::select!`**
+    (racing the metadata watch against the server-side timeout) has no
+    `Env` equivalent — replaced with `futures::future::select(watch.
+    changed(last_seen), self.env.sleep(WATCH_METADATA_SERVER_TIMEOUT))`,
+    the same shape `animus-cp-data::cluster_segment_store`'s own
+    relay-correlation race already uses. Both arms are `Unpin` without
+    `pin_mut!` (`MetadataChanged` is a plain, non-self-referential struct;
+    `env.sleep` is `async_trait`-boxed) — whichever resolves first is
+    discarded either way, preserving the exact "change or timeout,
+    whichever first" semantics.
+  - **`txn_coordinator.rs`'s awaited-branch `tokio::time::timeout`**
+    (bounding `resolve_all_parallel` by `TXN_RESOLVE_ALL_AWAIT_BUDGET`)
+    became the same `futures::future::select` shape, `Box::pin`ning the
+    resolve future first since an `async move` block capturing locals
+    across `.await` is not `Unpin` in general (unlike the plain-struct
+    `MetadataChanged` above) and `select` requires both arms to be.
+  - **`txn_coordinator.rs`'s fire-and-forget `tokio::spawn`** became
+    `self.env.spawn_task(..)` (needs `use animus_env::EnvExt;` — the trait
+    providing `spawn_task` must be in scope, unlike the supertrait methods
+    `E: Env` already brings in). Under `ProdEnv` this is `tokio::spawn`
+    underneath, so the detached, fire-and-forget lifetime is unchanged: the
+    call still returns immediately and the resolve either completes or is
+    dropped on process exit, with no handle kept either side of the
+    conversion.
+  - **Two `tokio::time::Instant::now().elapsed()` reads** (a forwarded
+    2PC-recovery caller's clock-skew fallback, `txn_coordinator.rs`) had no
+    literal translation — `Nanos` has no `elapsed()`. The original measured
+    the near-zero gap between minting an `Instant` and immediately reading
+    it back (not any real wait — `Instant::now()` then `.elapsed()` on the
+    same expression), so the faithful equivalent is two back-to-back
+    `self.env.now()` reads and `Nanos::duration_since`'s own saturating
+    subtraction, reproducing the identical near-zero result rather than
+    "fixing" what reads like a pre-existing latent bug (this comparison's
+    `now_ms` ends up far below the `wall_ms`-scale threshold it's checked
+    against either way) — an incidental bug gets its own PR, never a
+    drive-by fix bundled into a testability rung.
+  **A subtler bug this rung's own mechanical pass introduced and had to
+  catch by building, not by inspection**: seven `write_path.rs` functions
+  (`poll_probe`, `cp_batch_local`, `cp_batch_propose`, `cp_put_local`,
+  `cp_delete_local`, `cp_kind_local`, `seed_rows_local`) take `leader:
+  &CpGroup<E>` with **no `&self`** at all (per step 1's own doc, above) —
+  a blind `tokio::time::Instant::now()` → `self.env.now()` regex on the
+  whole file compiles only in files where *every* site happens to be
+  inside a `&self` method, and silently produces `error[E0425]: cannot
+  find value \`self\`` everywhere it isn't. The fix reads `leader.env()`
+  instead (a private `CpGroup<E>` accessor already visible to this
+  descendant module, unchanged from step 1) — every regex-driven or
+  find-and-replace conversion pass over this crate needs a `cargo build`
+  immediately after, function-signature-aware, not a visual diff; see
+  `docs/engineering-lessons.md`.
 - **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
   blocks for `animus-node`'s three host-capability traits
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
