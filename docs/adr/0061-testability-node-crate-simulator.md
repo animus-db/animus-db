@@ -527,6 +527,73 @@ means appended, never committed, at every `CpGroup` call site the genericization
 touches; and `rmw_lock` must stay held across exactly the read-modify-write span,
 neither narrower nor wider.
 
+#### 2026-08-28 amendment (sixth) — the orphan rule blocks moving `ClientCtx`, and 91 poll sites remain
+
+Scoping C5 step 3 found two things, one mechanical and one architectural. The
+architectural one needs a maintainer decision before any of the brain moves.
+
+**1. `ClientCtx` the struct probably cannot move to `animus-node` at all.**
+Four impls already exist *because* the type is local to `animusd` while the
+traits are foreign: `ControlLeaderHost`, `BackupObjectStore`, `TtlScanHost`
+(`client_ctx_host.rs`) and `AdminHost` (`admin.rs`). Move the struct and all
+four become foreign-trait-for-foreign-type — an orphan-rule violation. Worse,
+`BackupObjectStore`'s impl reaches `DataRole.backup_store: BackupStoreHandle`,
+which names the `prod`-gated `FsSegmentStore` and so categorically cannot exist
+in `animus-node`'s build. "Move the impls too" is dead for at least that one.
+
+Two ways out, and they differ in kind, not degree:
+
+- **(i)** `ClientCtx` stays in `animusd` permanently, and the five clusters
+  become **default methods on capability traits** defined in `animus-node`,
+  with `animusd` supplying thin accessors for `control`/`edge`/`env`/`data`/
+  routing. This is the standing "narrow capability" guidance scaled up to the
+  whole brain — consistent with C2/C3/C4, but a much wider trait surface than
+  any of those.
+- **(ii)** Split `ClientCtx` into a movable pure-state struct plus an
+  `animusd`-local wrapper that re-implements the four host traits by
+  delegating. A genuine architecture change.
+
+Neither is "move the file". **This is recorded as open**; C5 step 3 must not
+guess at it.
+
+**2. Steps 1 and 2 were signature-and-location only, so the bodies still hold
+91 raw `tokio` sites** across the five modules (`schema` 40, `write_path` 25,
+`read_path` 12, `forwarding` 8, `txn_coordinator` 6), plus a bare
+`tokio::select!` in `schema`'s `WatchMetadata` long-poll and a `tokio::spawn`
+and `tokio::time::timeout` in `txn_coordinator`. `animus-node` has no `tokio`
+dependency at all, so every one must become `env.now()`/`env.sleep()` — or, for
+the `select!` and `timeout`, a hand-rolled race against `env.sleep()`, the same
+shape C3's amendment used for relay correlation — **before any of these files
+can compile there**, independent of the lint.
+
+**3. `dynamo.rs` is a hidden fourth dependency.** `kind_write_item_at_leader`,
+`eval_kind_txn_write`, `item_key`, `KindWriteOutcome`, `kind_write_is_idempotent`,
+`encode_relayed_error` are free functions there — some already `E`-generic from
+step 1, but physically in a file that is not moving. `write_path`,
+`txn_coordinator` and `forwarding` cannot be portable until these are re-homed.
+
+**4. Two resisters resolve cheaply.** `SegmentStoreHandle`/`BackupStoreHandle`
+turn out to block nothing here — a grep of all five modules returns **zero**
+references; they are touched only by files step 3 does not move, so they become
+a later rung's problem (`index_drain`, `dynamo_streams`), where C2's
+`BackupObjectStore` pattern applies directly. And `rmw_lock` wants option (a),
+a narrow `with_rmw_lock` host capability implemented concretely in `animusd` —
+**not** a new `Env` async-lock primitive. The lock is a same-node
+collision-rate optimization, not a correctness mechanism (the OCC seatbelt is
+what makes the path safe, per `dynamo.rs`'s own note on issue #285), so it does
+not belong in the seam every `Env`-generic component shares. The capability
+method also keeps the guarded span exactly where the caller puts it, which
+matters: it must cover the local read, condition check and new-value
+computation, and drop **before** the propose/confirm poll.
+
+**Decomposition.** Step 3 splits: **3a** add `R: RelayClient` to `ClientCtx` so
+`schema`/`forwarding` can use the generic `ControlHandle<E, R>`; **3b** convert
+the 91 `tokio` sites in place, still inside `animusd`; **3c** move `read_path`
+(least entangled — 12 sites, no `self.control`) once the open question above is
+settled. `write_path`, `forwarding` and `txn_coordinator` stay put until the
+`rmw_lock` capability, the `dynamo.rs` re-homing, and the `ClientCtx`-location
+decision all land. 3a and 3b are unblocked and ship now.
+
 ### Phase D — the payoff
 
 | Rung | Work |
