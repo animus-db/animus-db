@@ -1393,3 +1393,140 @@ mod tests {
         assert!(add_numeric("abc", "1").is_none());
     }
 }
+
+/// Differential proptest for the decimal bignum ops (`decimal_parts`,
+/// `add_digits`, `sub_digits`, and the `compare_numeric`/`add_numeric`
+/// callers built on them) against [`bigdecimal::BigDecimal`], an
+/// arbitrary-precision reference — a dev-only dependency, never a
+/// production one.
+///
+/// **Scope.** DynamoDB's documented `N` contract is up to 38 significant
+/// digits and a magnitude range of roughly ±1.0×10^126 (AWS's own docs).
+/// This crate's implementation is a plain decimal-string bignum with **no
+/// exponent notation and no digit-count cap of its own** — it accepts
+/// arbitrarily long digit strings and is exact for all of them, so it is
+/// already a superset of AWS's precision guarantee rather than a narrower
+/// one. `BigDecimal` is likewise arbitrary-precision, so nothing here needs
+/// to be scoped down to fit the reference — the generated strings are
+/// bounded to 38 significant digits (matching the documented DynamoDB
+/// contract this code exists to serve) purely to keep the generated inputs
+/// realistic, not because either side would lose precision beyond that.
+#[cfg(test)]
+mod decimal_differential_tests {
+    use super::*;
+    use bigdecimal::{BigDecimal, Zero};
+    use proptest::prelude::*;
+    use std::cmp::Ordering;
+    use std::str::FromStr;
+
+    /// A DynamoDB-`N`-shaped decimal string: an optional sign, 1-38 integer
+    /// digits, and an optional 0-20-digit fraction — plain decimal text, no
+    /// exponent notation (this implementation doesn't parse it, and neither
+    /// does DynamoDB's own `N` wire encoding). Includes leading zeros and
+    /// `-0` on purpose: both are inputs `decimal_parts` must still normalize
+    /// correctly, not just the canonical forms an SDK would send.
+    fn decimal_string() -> impl Strategy<Value = String> {
+        "-?[0-9]{1,38}(\\.[0-9]{0,20})?"
+    }
+
+    fn reference(v: &str) -> BigDecimal {
+        BigDecimal::from_str(v).unwrap_or_else(|e| panic!("reference parse of {v:?}: {e}"))
+    }
+
+    proptest! {
+        /// `compare_numeric` agrees with the reference ordering over every
+        /// pair of in-contract decimal strings, including equal-value pairs
+        /// written differently (`"1.10"` vs `"1.1"`, `"-0"` vs `"0"`).
+        #[test]
+        fn compare_numeric_matches_reference(a in decimal_string(), b in decimal_string()) {
+            let want = reference(&a).cmp(&reference(&b));
+            let got = compare_numeric(&a, &b).expect("both sides are in-contract decimals");
+            prop_assert_eq!(got, want, "compare_numeric({:?}, {:?})", a, b);
+        }
+
+        /// `add_numeric` agrees with the reference sum's *value* (not its
+        /// textual form — `BigDecimal`'s `PartialEq` is scale-normalizing,
+        /// so `4` and `4.00` compare equal, matching `add_numeric`'s own
+        /// trailing-zero normalization).
+        #[test]
+        fn add_numeric_matches_reference(a in decimal_string(), b in decimal_string()) {
+            let want = reference(&a) + reference(&b);
+            let sum = add_numeric(&a, &b).expect("both sides are in-contract decimals");
+            let got = reference(&sum);
+            prop_assert_eq!(got, want, "add_numeric({:?}, {:?}) = {:?}", a, b, sum);
+        }
+
+        /// `ADD` with a negated delta is DynamoDB's only subtraction path
+        /// (there is no standalone `sub_numeric`), and internally exercises
+        /// `sub_digits` whenever the two operands' signs differ. Check it
+        /// against the reference difference directly.
+        #[test]
+        fn add_numeric_of_a_negated_operand_matches_reference_subtraction(
+            a in decimal_string(),
+            b in decimal_string(),
+        ) {
+            let negated_b = negate(&b);
+            let want = reference(&a) - reference(&b);
+            let diff = add_numeric(&a, &negated_b).expect("both sides are in-contract decimals");
+            let got = reference(&diff);
+            prop_assert_eq!(got, want, "add_numeric({:?}, {:?}) = {:?}", a, negated_b, diff);
+        }
+
+        /// `add_numeric` never produces a `-0`: DynamoDB counters must not
+        /// surface a negative zero, and the reference's `is_zero()` is the
+        /// value-level way to state "the result is exactly zero."
+        #[test]
+        fn add_numeric_normalizes_true_zero_without_a_minus_sign(
+            a in decimal_string(),
+        ) {
+            let sum = add_numeric(&a, &negate(&a)).expect("a negated in-contract decimal");
+            prop_assert!(
+                reference(&sum).is_zero(),
+                "a + (-a) must be exactly zero, got {:?}",
+                sum
+            );
+            prop_assert!(
+                !sum.starts_with('-'),
+                "zero must never carry a sign: {:?}",
+                sum
+            );
+        }
+
+        /// `decimal_parts` round-trips through the reference: the sign,
+        /// integer, and fractional digit strings it extracts recombine into
+        /// exactly the value the reference parsed from the same input.
+        #[test]
+        fn decimal_parts_recombines_to_the_reference_value(v in decimal_string()) {
+            let (neg, int, frac) = decimal_parts(&v).expect("in-contract decimal");
+            let recombined = format!(
+                "{}{}{}{}",
+                if neg { "-" } else { "" },
+                if int.is_empty() { "0" } else { int.as_str() },
+                if frac.is_empty() { "" } else { "." },
+                frac,
+            );
+            prop_assert_eq!(reference(&recombined), reference(&v), "decimal_parts({:?})", v);
+        }
+    }
+
+    /// Flip a decimal string's sign textually (used to drive `add_numeric`
+    /// down its subtraction path) — not a claim under test itself.
+    fn negate(v: &str) -> String {
+        match v.strip_prefix('-') {
+            Some(rest) => rest.to_string(),
+            None => format!("-{v}"),
+        }
+    }
+
+    /// Sanity check on the ordering claim `compare_numeric_matches_reference`
+    /// relies on being meaningful: distinct textual forms of the same value
+    /// really do compare equal against the reference (otherwise the
+    /// property above would be vacuous for exactly the cases that matter
+    /// most — trailing zeros and `-0`).
+    #[test]
+    fn reference_treats_differently_written_equal_values_as_equal() {
+        assert_eq!(reference("1.10").cmp(&reference("1.1")), Ordering::Equal);
+        assert_eq!(reference("-0").cmp(&reference("0")), Ordering::Equal);
+        assert_eq!(reference("00042").cmp(&reference("42")), Ordering::Equal);
+    }
+}

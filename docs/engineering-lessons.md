@@ -3502,6 +3502,74 @@ debugging anything that feels like it might have happened before.
   general pattern any GSI-`Query`-asserting test should follow).
   (`crates/animusd/tests/update_table_drop_index.rs`.)
 
+- **`prop_assume!` with a coin-flip-odds filter is a time bomb the moment
+  anyone raises the case count — generate the dependent value directly
+  instead (ADR 0061 Phase A, `next_compaction_plan` trigger-floor
+  properties).** Two property tests wrote `l0 in 0usize..20, trigger in
+  1usize..20` then `prop_assume!(l0 < trigger)` (and the mirror-image `>=`)
+  to test the trigger floor from both sides. That passed at proptest's
+  default case count (256) but aborted with "Too many global rejects" the
+  moment case count was bumped for a manual stress run
+  (`PROPTEST_CASES=3000`): proptest's global-reject ceiling is a **fixed
+  constant (1024)**, not scaled to the requested case count, so a ~50%
+  rejection rate needs roughly 2× that many attempts and blows the ceiling
+  well before reaching a few thousand successes — completely independent of
+  whether the property itself is fine. **General rule**: when a generated
+  input has a companion input that must be above/below/equal to it, generate
+  the dependent one directly off the first (`(1usize..20).prop_flat_map(|t|
+  (Just(t), 0..t))` for "below", `(Just(t), t..t + N)` for "at or above")
+  rather than generating both independently and filtering with
+  `prop_assume!` — it also produces a better test (every attempt is a real
+  case, not a discard) and stays correct if someone later runs the corpus at
+  a deeper case count, which per this file's own "test-scaling knobs" table
+  is exactly the kind of thing this repo's nightly/deep tiers do.
+  (`crates/animus-storage/src/lsm.rs::compaction_policy_tests`.)
+
+- **`prop_assert!`/`prop_assert_eq!`'s message argument goes through
+  `concat!` internally, so it cannot implicitly capture identifiers the way
+  a normal `format!("{x:?}")` can** — `prop_assert_eq!(got, want,
+  "compare_numeric({a:?}, {b:?})")` fails to compile with "there is no
+  argument named `a`" even though `a` is a real local in scope, because
+  proptest's macro expansion routes the string through `concat!` before it
+  ever reaches `format_args!`. Pass captured values as explicit trailing
+  positional arguments instead (`"compare_numeric({:?}, {:?})", a, b`) —
+  this is proptest-macro-specific, not a general Rust `format!` limitation,
+  so it only bites inside `proptest!{ .. }` bodies. (ADR 0061 rung A5,
+  `crates/animus-dynamo/src/condition.rs::decimal_differential_tests`.)
+
+- **Extracting a `&self` method's body into a pure free function can strand
+  a second, now-orphaned `&self`-taking helper as dead code, even though
+  nothing about *it* changed** (ADR 0061 rung A3). `LsmEngine::
+  next_compaction` called `self.level_table_budget(level)`; pulling
+  `next_compaction`'s body out into a free `next_compaction_plan(tables,
+  opts)` meant the new free function now calls a *new* free
+  `level_table_budget(level, opts)` directly — and the old `&self` method
+  wrapper, never called from anywhere else, became a silent `dead_code`
+  warning (which is `-D warnings` under this repo's clippy gate, so it's a
+  build failure, not just noise). Caught by running the crate's own
+  `cargo clippy --all-targets` before committing, not by the extraction
+  itself. **General rule for this class of refactor** (the same shape ADR
+  0061's A6 keystone rung is about to do at much larger scale): after
+  pulling a method's logic out into a free function, `grep` every sibling
+  helper the old method used — a helper with exactly one caller doesn't
+  survive the caller's disappearance.
+
+- **A differential proptest against an arbitrary-precision reference type
+  must compare parsed *values*, not rendered text** (ADR 0061 rung A5,
+  `add_numeric`/`compare_numeric` vs. `bigdecimal::BigDecimal`). This
+  crate's decimal arithmetic normalizes trailing zeros and `-0` (`"1.10" +
+  "0.90"` renders `"2"`, never `"2.00"`), and that normalization is a
+  deliberate, tested behavior, not a bug — so asserting on the reference's
+  *string* output would fail on exactly the inputs the test most needs to
+  cover. `BigDecimal`'s `PartialEq` is itself scale-normalizing (`4 ==
+  4.00`), so parsing this crate's result string back into the reference type
+  and comparing `BigDecimal == BigDecimal` sidesteps the whole issue for
+  free — no reference-side normalization step needed. Anyone reaching for a
+  reference-implementation differential test against a bignum/decimal type
+  should check whether the reference's equality is value- or
+  representation-based before writing the assertion, not after a spurious
+  failure sends them chasing a phantom bug in the code under test.
+
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
   formatting into a caller's own error type is not the same guarantee as
