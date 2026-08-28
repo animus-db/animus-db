@@ -3502,6 +3502,74 @@ debugging anything that feels like it might have happened before.
   general pattern any GSI-`Query`-asserting test should follow).
   (`crates/animusd/tests/update_table_drop_index.rs`.)
 
+- **`prop_assume!` with a coin-flip-odds filter is a time bomb the moment
+  anyone raises the case count — generate the dependent value directly
+  instead (ADR 0061 Phase A, `next_compaction_plan` trigger-floor
+  properties).** Two property tests wrote `l0 in 0usize..20, trigger in
+  1usize..20` then `prop_assume!(l0 < trigger)` (and the mirror-image `>=`)
+  to test the trigger floor from both sides. That passed at proptest's
+  default case count (256) but aborted with "Too many global rejects" the
+  moment case count was bumped for a manual stress run
+  (`PROPTEST_CASES=3000`): proptest's global-reject ceiling is a **fixed
+  constant (1024)**, not scaled to the requested case count, so a ~50%
+  rejection rate needs roughly 2× that many attempts and blows the ceiling
+  well before reaching a few thousand successes — completely independent of
+  whether the property itself is fine. **General rule**: when a generated
+  input has a companion input that must be above/below/equal to it, generate
+  the dependent one directly off the first (`(1usize..20).prop_flat_map(|t|
+  (Just(t), 0..t))` for "below", `(Just(t), t..t + N)` for "at or above")
+  rather than generating both independently and filtering with
+  `prop_assume!` — it also produces a better test (every attempt is a real
+  case, not a discard) and stays correct if someone later runs the corpus at
+  a deeper case count, which per this file's own "test-scaling knobs" table
+  is exactly the kind of thing this repo's nightly/deep tiers do.
+  (`crates/animus-storage/src/lsm.rs::compaction_policy_tests`.)
+
+- **`prop_assert!`/`prop_assert_eq!`'s message argument goes through
+  `concat!` internally, so it cannot implicitly capture identifiers the way
+  a normal `format!("{x:?}")` can** — `prop_assert_eq!(got, want,
+  "compare_numeric({a:?}, {b:?})")` fails to compile with "there is no
+  argument named `a`" even though `a` is a real local in scope, because
+  proptest's macro expansion routes the string through `concat!` before it
+  ever reaches `format_args!`. Pass captured values as explicit trailing
+  positional arguments instead (`"compare_numeric({:?}, {:?})", a, b`) —
+  this is proptest-macro-specific, not a general Rust `format!` limitation,
+  so it only bites inside `proptest!{ .. }` bodies. (ADR 0061 rung A5,
+  `crates/animus-dynamo/src/condition.rs::decimal_differential_tests`.)
+
+- **Extracting a `&self` method's body into a pure free function can strand
+  a second, now-orphaned `&self`-taking helper as dead code, even though
+  nothing about *it* changed** (ADR 0061 rung A3). `LsmEngine::
+  next_compaction` called `self.level_table_budget(level)`; pulling
+  `next_compaction`'s body out into a free `next_compaction_plan(tables,
+  opts)` meant the new free function now calls a *new* free
+  `level_table_budget(level, opts)` directly — and the old `&self` method
+  wrapper, never called from anywhere else, became a silent `dead_code`
+  warning (which is `-D warnings` under this repo's clippy gate, so it's a
+  build failure, not just noise). Caught by running the crate's own
+  `cargo clippy --all-targets` before committing, not by the extraction
+  itself. **General rule for this class of refactor** (the same shape ADR
+  0061's A6 keystone rung is about to do at much larger scale): after
+  pulling a method's logic out into a free function, `grep` every sibling
+  helper the old method used — a helper with exactly one caller doesn't
+  survive the caller's disappearance.
+
+- **A differential proptest against an arbitrary-precision reference type
+  must compare parsed *values*, not rendered text** (ADR 0061 rung A5,
+  `add_numeric`/`compare_numeric` vs. `bigdecimal::BigDecimal`). This
+  crate's decimal arithmetic normalizes trailing zeros and `-0` (`"1.10" +
+  "0.90"` renders `"2"`, never `"2.00"`), and that normalization is a
+  deliberate, tested behavior, not a bug — so asserting on the reference's
+  *string* output would fail on exactly the inputs the test most needs to
+  cover. `BigDecimal`'s `PartialEq` is itself scale-normalizing (`4 ==
+  4.00`), so parsing this crate's result string back into the reference type
+  and comparing `BigDecimal == BigDecimal` sidesteps the whole issue for
+  free — no reference-side normalization step needed. Anyone reaching for a
+  reference-implementation differential test against a bignum/decimal type
+  should check whether the reference's equality is value- or
+  representation-based before writing the assertion, not after a spurious
+  failure sends them chasing a phantom bug in the code under test.
+
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
   formatting into a caller's own error type is not the same guarantee as
@@ -8447,6 +8515,43 @@ debugging anything that feels like it might have happened before.
   a test harness sets by editing the static HTML, and the fallback is easy
   to miss precisely because it used to be a no-op ("system" removed the
   attribute) before the default changed to an explicit value.
+- **A pure predicate trapped behind a stateful handle is extracted by
+  widening its parameter list to the primitive facts the caller already
+  reads off that handle, not by trying to make the handle itself pure**
+  (ADR 0061 rung A6, `animusd`'s `decide` module). `ClientCtx::
+  confirm_wait_is_futile`/`frozen_refusal` looked `&CpGroup`-shaped
+  (`fn confirm_wait_is_futile(leader: &CpGroup, accepted_index: u64) ->
+  bool`), and `CpGroup` wraps a real `RaftKvNode<ProdEnv, _>` -- genuinely
+  impossible to construct in a unit test without full cluster bring-up. But
+  every line of each function's *body* only ever called two or three cheap,
+  already-`pub(crate)` accessors on it (`leader.engine_applied_index()`,
+  `leader.is_leader()`, `leader.is_frozen()`). Changing the signature to
+  take those return values directly (`fn confirm_wait_is_futile
+  (engine_applied_index: u64, is_leader: bool, accepted_index: u64) ->
+  bool`) turns an apparently-entangled method into a plain, directly
+  unit-testable function with a full truth table in under ten lines -- the
+  caller's one-line change is reading the same fields it already read, just
+  before the call instead of inside it. The tell that a function is a false
+  negative for "needs bring-up" is exactly this: grep its body for what it
+  actually touches on `&self`/the handle parameter, not what the
+  parameter's *type* looks like capable of.
+- **When a pure free function's existing `#[cfg(test)]` module doesn't
+  actually test the function it's named after, don't move it just because
+  the function moved** (same ADR 0061 rung A6 sweep). `confirm_futility_
+  tests` sits right next to `confirm_wait_is_futile` in `lib.rs` and reads,
+  from the name, like its unit tests -- but every test in it is a real
+  `#[tokio::test(flavor = "multi_thread")]` standing up a whole single-node
+  cluster and asserting on wall-clock timing and error-string shape of the
+  *wired* fast-fail behavior, never calling the predicate directly. Moving
+  it into the new bring-up-free `decide` module would have silently broken
+  that module's whole reason for existing (no `&self`/`ProdEnv`/`tokio`,
+  plain `#[test]`s only) for a module that only looks related by proximity
+  and naming. It stayed in `lib.rs`, documented as proving the wired
+  behavior rather than the predicate, and the predicate got its own fresh
+  truth-table tests in `decide` instead -- the two are complementary
+  coverage, not one relocated. General rule: before moving a test module
+  alongside an extracted function, read what it actually calls, not what
+  it's named after or sits beside.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
@@ -11577,3 +11682,36 @@ resolution directly (as here) or design the assertion around what's
 provable without dynamic re-resolution (e.g., the self-registered address
 *string* staying unchanged, decoupled from whether a live connection can
 currently complete).
+
+## Heavy concurrent multi-agent `cargo build`/`test` on one shared `target/` dir can exhaust disk mid-gate, unrelated to the diff under test (2026-08-28)
+
+Validating a small, self-contained `animusd` change (ADR 0061 rung A6) hit
+repeated `error: ... No space left on device` / `couldn't create a temp
+dir` / `LLVM ERROR: IO failure on output stream` failures from `cargo
+build --workspace --all-targets`, `clippy`, and even single-test-binary
+`cargo test` runs — not from any error in the code, but because several
+other agent sessions were compiling in parallel against the *same*
+`target/` directory (confirmed via `ps aux` showing concurrent `cargo
+build --workspace --all-targets` from a different shell PID) on a
+container whose real free space (`df -h /`, `Avail` column) is far smaller
+than nominal size and swings from single-digit GB to under 100MB within
+minutes as those builds run. `rm -rf target/debug/incremental` reliably
+frees the most space per byte of risk (it is a recompute-only cache, never
+a linked artifact another process depends on) but the freed space can be
+consumed again within one more `cargo build --all-targets` invocation
+(hundreds of MB per linked test binary, and this crate alone has ~100).
+**Rules that held up**: prefer `cargo check`/`clippy` over `cargo build`
+for a broad multi-crate sanity pass (no linking, far less disk); prefer
+`-p <crate>` or a single `--test <name>` over `--workspace`/`--all-targets`
+when disk is tight, since each linked binary is the expensive step, not
+compilation; set `CARGO_INCREMENTAL=0` before a build run immediately
+after clearing `incremental/` so the clearing isn't racing the same
+build's own writes into it; and when a from-scratch full-workspace gate
+genuinely cannot be completed, trust an **earlier, already-green run of
+the identical byte-for-byte source** (verified via `diff -q` against a
+saved copy) over repeatedly re-attempting a gate that fails purely on
+`ENOSPC`/linker I/O errors — re-running it does not gain information once
+the failure signature is unambiguously disk-exhaustion rather than a
+compiler diagnostic. Never `rm -rf target/` itself while sibling sessions
+may be mid-build; that destroys artifacts they still need mid-link, unlike
+`incremental/`.
