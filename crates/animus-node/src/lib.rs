@@ -11,15 +11,18 @@
 //! a build failure, not a review miss. See this crate's own `CLAUDE.md` for
 //! the full rationale and what is still to move here in later rungs.
 //!
-//! **Rung C1 (this crate's first slice, this commit)** moves the
-//! client-facing wire types ([`wire`] — `ClientRequest`/`ClientResponse`/
-//! `Surface`/`is_relayable_command` and the plain-data types they embed).
-//! `topology` and `decide` follow in the next commit of this same rung.
-//! `animusd` re-exports everything here at its own crate root so its ~500
-//! existing call sites keep compiling unchanged; see that crate's
-//! `CLAUDE.md` for the re-export shim and what has NOT moved yet
+//! **Rung C1 (this crate's first slice)** moved the pure, `Env`-free
+//! surface only: the client-facing wire types ([`wire`] — `ClientRequest`/
+//! `ClientResponse`/`Surface`/`is_relayable_command` and the plain-data
+//! types they embed), [`topology`] (CP-route resolution), and [`decide`]
+//! (the pure decision predicates lifted out of `animusd::ClientCtx` by ADR
+//! 0061 rung A6). `animusd` re-exports everything here at its own crate
+//! root so its ~500 existing call sites keep compiling unchanged; see that
+//! crate's `CLAUDE.md` for the re-export shim and what has NOT moved yet
 //! (`ClientCtx`, `handle_request`, `cp_serve_forwarded` — rung C5).
 
+pub mod decide;
+pub mod topology;
 mod wire;
 
 pub use wire::{

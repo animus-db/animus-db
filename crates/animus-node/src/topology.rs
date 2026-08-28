@@ -1,13 +1,15 @@
 //! Pure, side-effect-free decision logic for the CP data-plane's client
-//! request **routing** (extracted from `lib.rs`).
+//! request **routing** (ADR 0061 rung C1: moved from `animusd::lib` verbatim,
+//! visibility widened from `pub(crate)` to `pub` so `animusd`'s re-export
+//! shim can still name it across the crate boundary).
 //!
 //! `animusd` is the one crate that runs real distributed-system decision logic
 //! (routing, provisioning, hosting, GC) exclusively over `ProdEnv`, with no
 //! sim/unit coverage of its own — every `animusd` test is a real-socket
 //! integration test. This module pulls the pure *routing* decision (no
 //! network/lock/disk access) out of that machinery so it can be unit-tested
-//! directly, leaving `ClientCtx::resolve_cp_route` as thin `ProdEnv` wiring
-//! that gathers inputs and executes the decision.
+//! directly, leaving `ClientCtx::resolve_cp_route` (`animusd`) as thin
+//! `ProdEnv` wiring that gathers inputs and executes the decision.
 //!
 //! **The per-node tablet hosting/GC decisions this module used to hold**
 //! (`plan_join_host`, `tablets_to_reclaim`, `tablets_to_release`) **moved to
@@ -34,7 +36,7 @@ use animus_tablet::{Tablet, TabletId};
 /// iterator so the choice is deterministic on every node. `None` if no tablet in
 /// `tablets` covers `key` (the caller waits — there is no whole-keyspace
 /// fallback for table data).
-pub(crate) fn tablet_for_key<'a>(
+pub fn tablet_for_key<'a>(
     tablets: impl Iterator<Item = (&'a TabletId, &'a Tablet)>,
     key: &[u8],
 ) -> Option<TabletId> {
@@ -48,11 +50,11 @@ pub(crate) fn tablet_for_key<'a>(
 }
 
 /// The outcome of resolving a CP op's leader route (the pure decision behind
-/// `ClientCtx::resolve_cp_route`): serve **locally**, **forward** to a known
-/// address, or **wait** for the local group to settle. Never forwards a CP op to
-/// a node that may not host the leader yet — see [`decide_cp_route`].
+/// `ClientCtx::resolve_cp_route`, `animusd`): serve **locally**, **forward** to
+/// a known address, or **wait** for the local group to settle. Never forwards
+/// a CP op to a node that may not host the leader yet — see [`decide_cp_route`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RouteDecision {
+pub enum RouteDecision {
     /// This node hosts the tablet's current leader — serve from it directly.
     Local,
     /// Forward to the leader's node at this client-API address.
@@ -77,8 +79,9 @@ pub(crate) enum RouteDecision {
 /// - `fallback_forward` — a forwarding address toward *some* replica of the
 ///   tablet, used only as a last resort when this node is not itself a replica.
 ///
-/// No network/lock/disk access — the caller (`ClientCtx::resolve_cp_route`)
-/// gathers these from `ClusterEdgeState`/`Metadata` and executes the decision.
+/// No network/lock/disk access — the caller (`ClientCtx::resolve_cp_route`,
+/// `animusd`) gathers these from `ClusterEdgeState`/`Metadata` and executes
+/// the decision.
 ///
 /// The critical rule this codifies (a known past bug class, "forwarded CP op:
 /// not the leader here"): a node that already hosts *a* local replica handle for
@@ -89,7 +92,7 @@ pub(crate) enum RouteDecision {
 /// *it* is a replica (`is_replica`, e.g. its own tablet-host reconciler hasn't
 /// stood the group up yet), it must also wait rather than guess at another
 /// node's address.
-pub(crate) fn decide_cp_route(
+pub fn decide_cp_route(
     has_local_leader: bool,
     forward_hint: Option<String>,
     has_local_replica: bool,
@@ -114,8 +117,9 @@ pub(crate) fn decide_cp_route(
 }
 
 /// The fixed prefix of a "not the leader here" refusal
-/// (`ClientCtx::cp_serve_forwarded`) — shared by [`format_not_leader_refusal`]
-/// and [`parse_not_leader_refusal`] so the two stay in lockstep.
+/// (`ClientCtx::cp_serve_forwarded`, `animusd`) — shared by
+/// [`format_not_leader_refusal`] and [`parse_not_leader_refusal`] so the two
+/// stay in lockstep.
 const NOT_LEADER_REFUSAL_PREFIX: &str = "forwarded CP op: not the leader here";
 
 /// Build a "not the leader here" refusal, optionally carrying the refusing
@@ -130,12 +134,12 @@ const NOT_LEADER_REFUSAL_PREFIX: &str = "forwarded CP op: not the leader here";
 /// wrong first guess needs to retry correctly instead of forwarding blindly
 /// again.
 ///
-/// Deliberately kept a plain [`ClientResponse::Error`](crate::ClientResponse::Error)
+/// Deliberately kept a plain `ClientResponse::Error` (`animus_node::wire`)
 /// string rather than a new wire variant, so old and new binaries
 /// interoperate: an older receiver's bare refusal still parses (via
 /// [`parse_not_leader_refusal`]) as "no hint", and a non-`animusd` client
 /// just sees a slightly more detailed message.
-pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, String)>) -> String {
+pub fn format_not_leader_refusal(hint: Option<(NodeId, String)>) -> String {
     match hint {
         Some((id, addr)) => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint={id}@{addr}"),
         None => format!("{NOT_LEADER_REFUSAL_PREFIX}; leader_hint=none"),
@@ -154,7 +158,7 @@ pub(crate) fn format_not_leader_refusal(hint: Option<(NodeId, String)>) -> Strin
 /// known prefix that doesn't parse as either recognized shape falls back to
 /// "no hint" rather than panicking or, worse, silently routing a retry to a
 /// bogus address.
-pub(crate) fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, String)>> {
+pub fn parse_not_leader_refusal(msg: &str) -> Option<Option<(NodeId, String)>> {
     let suffix = msg.strip_prefix(NOT_LEADER_REFUSAL_PREFIX)?;
     let Some(hint_str) = suffix.strip_prefix("; leader_hint=") else {
         // Predates hinted refusals, or an unrecognized suffix shape — still a

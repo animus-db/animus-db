@@ -41,14 +41,15 @@ pub use animus_control::{
     ColumnDef, ColumnType, IndexStatus, MetaCommand, Metadata, NodeAddrs, NodeStatus, TableSchema,
 };
 // ADR 0061 rung C1: the client-facing wire types moved to the `E: Env`-generic
-// `animus-node` crate — see that crate's `CLAUDE.md`. Re-exported here so the
-// ~500 existing call sites across this crate (bare `ClientRequest`, `use
-// crate::KindWriteOp`, etc.) keep compiling unchanged. `topology`/`decide`
-// stay local to this crate for now; they move in the next commit of this
-// same rung.
+// `animus-node` crate — see that crate's `CLAUDE.md`. `topology` (CP-route
+// resolution) and `decide` (the pure decision predicates lifted out of
+// `ClientCtx` by rung A6) move alongside them in this same commit. All
+// re-exported here so the ~500 existing call sites across this crate (bare
+// `ClientRequest`, `topology::decide_cp_route`, `decide::frozen_refusal`,
+// `use crate::KindWriteOp`, etc.) keep compiling unchanged.
 pub use animus_node::{
     ClientRequest, ClientResponse, KindWriteOp, PendingKindWrite, Surface, TxnPrecondition,
-    TxnTableWrite, TxnWriteCondition, is_relayable_command, surface_of,
+    TxnTableWrite, TxnWriteCondition, decide, is_relayable_command, surface_of, topology,
 };
 
 mod admin;
@@ -59,14 +60,12 @@ mod backup_restore;
 mod console;
 mod control_handle;
 mod dashboard;
-mod decide;
 mod dynamo;
 mod dynamo_streams;
 mod http;
 mod index_backfill;
 mod pitr_janitor;
 mod segment_janitor;
-mod topology;
 mod ttl_reaper;
 
 use control_handle::{ControlHandle, RemoteControlClient};
