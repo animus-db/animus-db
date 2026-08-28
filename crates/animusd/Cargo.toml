@@ -45,7 +45,9 @@ harness = false
 
 [dependencies]
 async-trait.workspace = true
-animus-env.workspace = true
+# `animusd` is the real node process — it's the one place that actually
+# constructs a `ProdEnv` (ADR 0061 rung C0 gates it behind this feature).
+animus-env = { workspace = true, features = ["prod"] }
 animus-control.workspace = true
 animus-cp-data.workspace = true
 animus-storage.workspace = true

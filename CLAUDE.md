@@ -140,6 +140,15 @@ This is the single most important rule (ADR 0003). **All nondeterminism flows
 through the `Env` seam.** In every crate except `animus-env`'s `ProdEnv` and
 test code:
 
+`ProdEnv`/`FsSegmentStore` live behind `animus-env`'s default-off `prod`
+Cargo feature (ADR 0061 rung C0): a crate that depends on `animus-env` with
+`default-features = false` cannot name `ProdEnv` at all — it fails to
+compile, not just fails review. Only a crate whose own library really
+constructs one (currently `animusd`) enables `prod` on its normal
+dependency; a crate that only needs it for a real-thread test/bench enables
+it on a separate `[dev-dependencies]` entry instead. See
+`crates/animus-env/CLAUDE.md` for the full breakdown.
+
 - No wall clock — use `env.now()` / `env.sleep()`, never `std::time` or
   `tokio::time`. The **one** exception is `env.wall_now()` (ADR 0051), which
   returns calendar time for interpreting externally-supplied absolute

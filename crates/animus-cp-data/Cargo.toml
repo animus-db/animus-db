@@ -36,6 +36,11 @@ tracing.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+# This crate's own library never constructs a `ProdEnv` — only its real-thread
+# regression tests do (`tests/prod_concurrent_ts_monotonic.rs`,
+# `tests/prod_compaction_persist_round.rs`), so `prod` is opted into here, not
+# on the `[dependencies]` entry above (ADR 0061 rung C0).
+animus-env = { workspace = true, features = ["prod"] }
 animus-sim.workspace = true
 # Shared corpus seed-management scaffolding (ADR 0061 rung B1,
 # `animus_test::corpus`). This is a dev-dependency cycle (animus-test's own
