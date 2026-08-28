@@ -69,7 +69,7 @@ mod pitr_janitor;
 mod segment_janitor;
 mod ttl_reaper;
 
-use control_handle::{ControlHandle, RemoteControlClient};
+use control_handle::{AnimusdRelayClient, ControlHandle, RemoteControlClient};
 
 use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
@@ -5069,7 +5069,11 @@ impl BoundDataNode {
         let my_admin_addr = self.admin_addr;
         let my_intra_addr = self.intra_addr;
 
-        let control = ControlHandle::Remote(RemoteControlClient::new(control_seeds.clone()));
+        let control = ControlHandle::Remote(RemoteControlClient::new(
+            control_seeds.clone(),
+            AnimusdRelayClient,
+            CLIENT_TIMEOUT,
+        ));
 
         let admin_info = Arc::new(AdminInfo {
             node_id: Some(self.id.clone()),
@@ -12250,7 +12254,12 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     // `RemoteControlClient` that shares `ctx.remote_metadata` directly as its
     // mirror instead, so `effective_metadata()` keeps reading the same field
     // it always has.
-    let remote = RemoteControlClient::with_mirror(seeds.clone(), ctx.remote_metadata.clone());
+    let remote = RemoteControlClient::with_mirror(
+        seeds.clone(),
+        ctx.remote_metadata.clone(),
+        AnimusdRelayClient,
+        CLIENT_TIMEOUT,
+    );
     remote_metadata_watch_loop(remote, seeds).await
 }
 
