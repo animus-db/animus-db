@@ -280,12 +280,61 @@ brain-last.
 
 | Rung | Work |
 |---|---|
-| C1 | Create `animus-node` with **no** `tokio::net`/`ProdEnv` in its manifest. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Boundary established and compiler-enforced from the first commit |
+| C0 | **Prerequisite (added 2026-08-28, see the amendment below).** Feature-gate `animus-env`'s `prod` module — `ProdEnv`/`FsSegmentStore` behind a default-off `prod` feature; every current consumer opts in explicitly. Without this, C1's boundary is decorative |
+| C1 | Create `animus-node` depending on `animus-env` with `default-features = false` — so `ProdEnv` genuinely does not exist in that build — and with no `tokio::net`. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Also harden `is_relayable_command` from `matches!` to an exhaustive `match` (see below). Boundary established and compiler-enforced from the first commit |
 | C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill`. Each is small, self-contained, and paced by `tokio::time` today — `env.sleep()`/`env.now()`/`env.spawn_task()` instead |
 | C3 | `ControlHandle<E>`; move relay/forwarding (`relay_request`, `lib.rs:17617-17650`) off raw `TcpStream` onto the multiplexed `Network` (ADR 0026). This is what lets a multi-node cluster talk inside `SimEnv` |
 | C4 | The HTTP edges per Decision 2: parsing and dispatch become pure bytes-in/bytes-out in `animus-node`; `animusd` keeps the accept loops |
 | C5 | The brain: split `impl ClientCtx` into `read_path`, `write_path`, `txn_coordinator`, `forwarding`, `schema`; genericize over `E: Env`. The heaviest rung, but A6 has already lifted the pure predicates out of it |
 | C6 | Node assembly: `Node<E>`/`BoundNode<E>`/`BoundControlNode<E>`/`BoundDataNode<E>` move; `animusd` shrinks to binary, config, listeners, lifecycle, and the one `ProdEnv` construction. The `start_cluster*`/`run_node*` harness functions move to test support where they belong |
+
+#### 2026-08-28 amendment — C0, and why C1 alone would not have worked
+
+Scoping C1 against the code turned up that **C1 as originally written would
+not have delivered Decision 1's central claim.** Recorded here rather than
+silently corrected, because the claim is this ADR's main argument for
+choosing a new crate over genericizing in place.
+
+The wire types themselves are clean: `ClientRequest`/`ClientResponse` and
+everything they transitively reference (`KindWriteOp`, `PendingKindWrite`,
+`TxnTableWrite`, plus plain-data types from `animus-control`,
+`animus-cp-data`, `animus-tablet`, `animus-dynamo`) are ordinary serde data.
+None embeds `ProdEnv`, `CpGroup`, `RaftNode`, `RaftKvNode`, `LsmEngine`, or a
+tokio type. `topology.rs` and `decide.rs` are pure as claimed. That half of C1
+is as easy as this ADR assumed.
+
+The manifest is the problem. `animus-node` needs `animus-env` for `NodeId`.
+But `animus-env/Cargo.toml` has **no `[features]` section at all**, declares
+`tokio` unconditionally, and `lib.rs` exports `pub mod prod; pub use
+prod::{FsSegmentStore, ProdEnv};` with no `cfg` guard. Every crate in the
+graph depends on `animus-env` unconditionally, and there is no path to the
+plain data types that avoids it. So `animus_node` could write
+`animus_env::ProdEnv::new(..)` and it would compile — real sockets, no error.
+
+"No `ProdEnv` in the manifest, therefore compiler-enforced" would then have
+been **decorative**: moving the types into a crate that still drags `ProdEnv`
+in unguarded is a relabeling, not a boundary. Hence C0 as a prerequisite:
+gate `prod` behind a default-off feature so `animus-node` can depend on
+`animus-env` with `default-features = false` and the type genuinely is not
+in its build.
+
+The rejected alternative was splitting `prod.rs` into a separate
+`animus-env-prod` crate. Cleaner in principle, but a much larger diff for the
+same guarantee; the feature gate matches the "narrow, individually justified"
+spirit of Decision 4 and is mechanical for consumers (the compiler enumerates
+every site that needs `features = ["prod"]`).
+
+**One related hardening, folded into C1.** `is_relayable_command` is written
+with `matches!`, which — unlike `surface_of` and `request_kind`, both real
+`match`es with no wildcard arm — has no exhaustiveness requirement. A new
+`MetaCommand` variant therefore silently defaults to "not relayable" with no
+compiler signal: exactly the bimodal per-process flake the root `CLAUDE.md`
+warns about, currently unguarded. Rewriting it as an exhaustive `match` costs
+nothing and C1 already moves that function.
+
+Note also that after C1, `cp_serve_forwarded`'s match still lives in
+`animusd` while its input type lives in `animus-node`, so the repo's
+"grep every gating site" discipline spans a crate boundary until C5.
 
 ### Phase D — the payoff
 
