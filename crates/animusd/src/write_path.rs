@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use animus_control::{Metadata, ProposeResult};
-use animus_env::Env;
+use animus_env::{Env, Nanos};
 use animus_node::host::RelayClient;
 use animus_tablet::TabletId;
 
@@ -75,7 +75,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // Whether this write may be safely re-applied; see the retry decision
         // at the bottom of the loop.
         let idempotent = dynamo::kind_write_is_idempotent(&op);
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &base_key).await {
                 CpRoute::Local(leader) => {
@@ -155,13 +155,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // re-apply on its own. A non-idempotent write therefore gets one
             // attempt, and any transient failure is surfaced for the caller to
             // decide about, exactly as DynamoDB would.
-            if !idempotent
-                || !decide::read_should_retry(&err.message)
-                || tokio::time::Instant::now() >= deadline
+            if !idempotent || !decide::read_should_retry(&err.message) || self.env.now() >= deadline
             {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -239,7 +237,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = self.env.now().saturating_add(timeout);
         loop {
             let err = match self.cp_route(table, &first).await {
                 CpRoute::Local(leader) => {
@@ -265,10 +263,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => "no CP group leader reachable".to_string(),
             };
-            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -306,13 +304,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             animus_control::ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("seed batch not accepted: {other:?}; retry")),
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
         let mut poll = CP_CONFIRM_POLL_INIT;
-        while tokio::time::Instant::now() < deadline {
+        while leader.env().now() < deadline {
             if leader.engine_applied_index() >= index {
                 return Ok(());
             }
-            tokio::time::sleep(poll).await;
+            leader.env().sleep(poll).await;
             poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
         }
         Err("seed batch did not apply in time; retry".into())
@@ -329,7 +327,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         child: TabletId,
         rows: Vec<animus_cp_data::SeedRow>,
     ) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             match self.resolve_cp_route(child) {
                 Some(CpRoute::Local(leader)) => {
@@ -359,10 +357,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // child group not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("seed: did not reach the child's leader in time; retry".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -398,7 +396,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
         // The same exponential confirm back-off `cp_put_local` uses — NOT the
         // drain's old flat 10ms sleep. This is a client hot path since ADR
         // 0049 routed every plain Dynamo/raw-protocol write through it,
@@ -406,7 +404,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // sequential write (measured on the ADR 0049 §5 bench: ~13.6 ms/op
         // vs the pre-train ~4.7 — the poll cadence, not the marker bytes).
         let mut poll = CP_CONFIRM_POLL_INIT;
-        while tokio::time::Instant::now() < deadline {
+        while leader.env().now() < deadline {
             if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                 return Ok(());
             }
@@ -426,7 +424,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .into(),
                 );
             }
-            tokio::time::sleep(poll).await;
+            leader.env().sleep(poll).await;
             poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
         }
         Err("kind batch did not apply in time".into())
@@ -481,7 +479,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 ProposeResult::Accepted { index, term } => (index, term),
                 other => return Err(format!("kind write not accepted: {other:?}")),
             };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
         match Self::poll_probe(
             leader,
             accepted_index,
@@ -575,7 +573,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         accepted_term: u64,
         probe_key: &[u8],
         probe_val: &[u8],
-        deadline: tokio::time::Instant,
+        deadline: Nanos,
     ) -> ProbeWait {
         loop {
             // Ask the entry what it did, in preference to reading the value
@@ -656,10 +654,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 return ProbeWait::Superseded;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if leader.env().now() >= deadline {
                 return ProbeWait::TimedOut;
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            leader.env().sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -679,7 +677,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
         match Self::poll_probe(
             leader,
             accepted_index,
@@ -756,7 +754,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         match leader.put(key.clone(), value.clone()) {
             ProposeResult::Accepted { index, .. } => {
-                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
@@ -777,10 +775,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                                 .into(),
                         );
                     }
-                    if tokio::time::Instant::now() >= deadline {
+                    if leader.env().now() >= deadline {
                         return Err("CP write did not commit in time".into());
                     }
-                    tokio::time::sleep(poll).await;
+                    leader.env().sleep(poll).await;
                     poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
                 }
             }
@@ -810,7 +808,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         match leader.delete(key.clone()) {
             ProposeResult::Accepted { index, .. } => {
-                let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+                let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 let mut poll = CP_CONFIRM_POLL_INIT;
                 loop {
                     if leader.local_get(&key).await.is_none() {
@@ -831,10 +829,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                                 .into(),
                         );
                     }
-                    if tokio::time::Instant::now() >= deadline {
+                    if leader.env().now() >= deadline {
                         return Err("CP delete did not commit in time".into());
                     }
-                    tokio::time::sleep(poll).await;
+                    leader.env().sleep(poll).await;
                     poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
                 }
             }
