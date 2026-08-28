@@ -24,3 +24,5 @@ hmac.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+proptest.workspace = true
+bigdecimal.workspace = true

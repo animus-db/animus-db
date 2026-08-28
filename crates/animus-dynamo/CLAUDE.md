@@ -411,6 +411,22 @@ comment for its full type/method inventory.
 
 ## Tests
 
+`condition`'s decimal bignum ops (`decimal_parts`/`add_digits`/`sub_digits`,
+backing `compare_numeric`/`add_numeric`) also carry a **differential
+proptest** against `bigdecimal::BigDecimal` (`condition.rs::
+decimal_differential_tests`, a `[dev-dependencies]`-only crate, ADR 0061
+rung A5) — compare/add and add-of-a-negated-operand (this crate's only
+subtraction path; there is no standalone `sub_numeric`) against the
+reference over randomly generated up-to-38-significant-digit decimal
+strings. This implementation has no digit-count cap of its own (arbitrary
+length, exact), so it is already a strict superset of DynamoDB's documented
+38-digit contract — the generator is bounded to 38 digits to keep inputs
+realistic, not because either side would lose precision past that. Compares
+parsed **values**, not rendered text: this crate's arithmetic deliberately
+normalizes trailing zeros/`-0` (`"1.10" + "0.90"` renders `"2"`, never
+`"2.00"`), so a naive string-equality assertion against the reference would
+fail on exactly the cases most worth covering.
+
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
 tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`/`ttl`
 (JSON decode/encode, the index key-layout invariants, iterator-token
