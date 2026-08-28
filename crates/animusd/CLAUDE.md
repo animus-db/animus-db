@@ -122,7 +122,38 @@ reusing the captured config is the point of the test.
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
   deployment over the network. `metadata_cached()` vs. `metadata_fresh()`
-  freshness contract lives here.
+  freshness contract lives here. **`ControlHandle`/`RemoteControlClient`
+  themselves moved to `animus_node::control_handle` whole (ADR 0061 rung
+  C3c)**, genericized over `E: Env`/`R: RelayClient` — this file is now
+  just two crate-local type aliases (`ControlHandle = animus_node::
+  control_handle::ControlHandle<ProdEnv, AnimusdRelayClient>`, and
+  `RemoteControlClient`'s dual) plus `AnimusdRelayClient`, the zero-sized
+  `animus_node::host::RelayClient` implementor `RemoteControlClient::
+  metadata_fresh` relays its `Status` fetch through — a thin wrapper over
+  this crate's own **unchanged** `relay_request_with_timeout` (still a
+  fresh `TcpStream` dial on the `intra`/`client` ports, still
+  `tokio::time::timeout`-bounded, which stays here since `animus-node`
+  cannot name it at all — no `tokio` dependency, and its `disallowed_
+  methods` lint would refuse the call even if there were). Every
+  pre-existing `ControlHandle`/`RemoteControlClient` call site in
+  `lib.rs`/`admin.rs` compiles unchanged against the aliases; the two real
+  `RemoteControlClient::new`/`with_mirror` construction sites in `lib.rs`
+  gained two new arguments (`AnimusdRelayClient`, `CLIENT_TIMEOUT`), since
+  the constructor is now generic over the relay implementor and takes its
+  own transport timeout explicitly (only this crate knows that value —
+  `animus-node` doesn't duplicate the constant). See `animus-node/
+  CLAUDE.md`'s own C3a/C3b/C3c entry for the full design, including why
+  the move was clean (every field on both types was already plain data or
+  `E`-generic) rather than a generic-ification-in-place.
+- **`write_frame`/`read_frame`** keep their `TcpStream` signatures here
+  (ADR 0061 rung C3a) but now call straight into `animus_node::codec`'s
+  pure `encode_client_frame`/`frame_payload_len`/`decode_client_frame` for
+  the length-prefix arithmetic, the `MAX_FRAME_LEN` bound check, and the
+  `serde_json` encode/decode — only the actual socket reads/writes stay
+  here. `MAX_FRAME_LEN` itself is now `pub use animus_node::MAX_FRAME_LEN`
+  (re-exported at this crate's root, so every existing
+  `crate::MAX_FRAME_LEN`/`animusd::MAX_FRAME_LEN` reference kept compiling
+  unchanged).
 - **`topology`/`decide` moved to `animus-node`** (ADR 0061 rung C1) — pure,
   side-effect-free routing decisions (`decide_cp_route`, `tablet_for_key`,
   `format_not_leader_refusal`/`parse_not_leader_refusal`) and decision

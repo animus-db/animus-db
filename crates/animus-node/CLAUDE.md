@@ -189,9 +189,13 @@ rung C5 (the heaviest rung: split into `read_path`/`write_path`/
 `txn_coordinator`/`forwarding`/`schema`, genericized over `E: Env`). Rung
 C2 (above) landed five of the six leaf background loops behind narrow host
 traits; `segment_janitor` stays in `animusd` (see rung C2's own entry for
-why). C3/C4 land `ControlHandle<E>` + relay/forwarding onto the
-multiplexed `Network`, and the HTTP wire edges, in that order — see ADR
-0061's Phase C rung table for the full sequence.
+why). Rung C3 (above) landed the client-frame codec's pure half, the
+`RelayClient` capability trait, and `ControlHandle`/`RemoteControlClient`
+themselves — but **not** `ClientCtx::relay` or any call site reaching relay
+*through* `ClientCtx` (`propose_schema`, `cp_serve_forwarded`'s
+forwarding), which stay `ClientCtx`-entangled and move with it in C5. C4
+lands the HTTP wire edges — see ADR 0061's Phase C rung table for the full
+sequence.
 
 **One cross-crate discipline gap this creates until C5**:
 `cp_serve_forwarded`'s gating match (which internal-only `ClientRequest`
@@ -220,6 +224,63 @@ rung (constructed directly, not through helper builders, so the test reads
 as the same allowlist the function's doc describes) — a future edit that
 changes a variant's classification shows up as a diff in that test, not a
 silent behavior change.
+
+## What's here (rung C3a/C3b/C3c)
+
+ADR 0061 Phase C's original one-line plan for C3 ("`ControlHandle<E, R>` and
+a `RelayClient` capability trait") turned out to be four sub-rungs once
+scoped (the third 2026-08-28 amendment) — a literal "move relay onto
+`Network`" was rejected outright (it would collapse ADR 0047's `intra`
+port into `internal`, a production wire-topology change this ADR
+disclaims). This crate implements C3a–C3c; **C3d (a `Network`-backed,
+`req_id`-correlated, sim-only `RelayClient`) is deliberately deferred to
+Phase D** — nothing here builds request/reply correlation.
+
+- **`codec`** (C3a) — the **pure** half of the length-prefixed client-frame
+  wire codec: `MAX_FRAME_LEN` (64 MiB), `encode_client_frame` (serde_json
+  encode + length-prefix + bound check, returning the full framed byte
+  vector), `frame_payload_len` (validates an already-read `u32` length
+  prefix against the bound before any allocation), and
+  `decode_client_frame` (serde_json decode). No socket type anywhere in
+  this module — `animusd`'s `write_frame`/`read_frame` keep the actual
+  `TcpStream` reads/writes and call straight into these for everything
+  that doesn't touch a socket. Unit-tested directly here (round trip,
+  `MAX_FRAME_LEN` rejection on both the encode and the declared-length
+  side, a malformed-JSON decode error) — `animusd`'s own wire-edge tests
+  are still the real-socket regression net for the wrapper functions
+  themselves.
+- **`host::RelayClient`** (C3b) — a synchronous call/await RPC capability,
+  beside C2's three host traits: `async fn relay(&self, addr: String,
+  request: &ClientRequest, timeout: Duration) -> ClientResponse`. Returns
+  `ClientResponse` directly, never a `Result` — mirrors `animusd`'s
+  pre-existing `relay_request`, which already folds every transport
+  failure into `ClientResponse::Error(..)`, so no caller needs a new
+  failure shape. **No default method, and the trait itself enforces no
+  timeout** — `tokio::time::timeout` cannot live in this crate at all (no
+  `tokio` dependency), so every implementor supplies its own enforcement;
+  `animusd`'s does, wrapping its own unchanged `relay_request_with_timeout`.
+  See the trait's own doc for why `Network` (ADR 0026) doesn't fit relay
+  (no request/response correlation, and a different port) — the full
+  argument lives in ADR 0061's third 2026-08-28 amendment.
+- **`control_handle`** (C3c) — `ControlHandle<E: Env, R: RelayClient>`
+  (`Local(RaftNode<E>)` / `Remote(RemoteControlClient<R>)`) and
+  `RemoteControlClient<R>`, moved here **whole** from `animusd`. This was a
+  clean move, not just a generic-ification-in-place: every field on both
+  types was already plain data (`Vec<String>`, `Arc<Mutex<..>>`,
+  `MetadataWatch`, `MetricsHandle`, plus `Metadata`/`RaftNode`/`Role` from
+  `animus-control`, all already `E`-generic or `ProdEnv`-free) — the *only*
+  method doing real I/O, `RemoteControlClient::metadata_fresh`, used to
+  call `animusd`'s free `relay_request`; it now calls `R::relay` on a
+  generic field instead, so nothing here needed a socket type after all.
+  `RemoteControlClient` additionally carries `relay: R` and `timeout:
+  Duration` fields — the timeout is a constructor parameter, not a
+  constant duplicated in this crate, since only the host crate
+  (`animusd`'s `CLIENT_TIMEOUT`) knows the value it wants.
+  `animusd`'s own `control_handle.rs` is now a thin wrapper: two type
+  aliases binding `E = ProdEnv`, `R = AnimusdRelayClient` (a zero-sized
+  `RelayClient` implementor wrapping the crate's unchanged
+  `relay_request_with_timeout`), plus that implementor itself — see that
+  crate's own `CLAUDE.md` entry.
 
 ## Working here
 
