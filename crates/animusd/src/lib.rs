@@ -9719,7 +9719,9 @@ impl ClientCtx {
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
-                Err(e) if Self::read_should_retry(&e) && tokio::time::Instant::now() < deadline => {
+                Err(e)
+                    if decide::read_should_retry(&e) && tokio::time::Instant::now() < deadline =>
+                {
                     tracing::debug!(
                         table,
                         ?txn_id,
@@ -18622,6 +18624,7 @@ mod issue_298_conflict_tests {
                 dynamo: addrs[2],
                 admin: addrs[3],
                 intra: addrs[4],
+                advertise_host: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,
