@@ -35,6 +35,15 @@
 //! real-thread liveness coverage for the new concurrency, not a fault injection
 //! for that window.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-thread ProdEnv liveness
+// test (see the module doc above) — the race under test is a microsecond
+// scheduling window SimEnv's cooperative single-thread scheduler cannot
+// produce, so real time/threads are the point here, not a determinism hole.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv liveness test (a scheduling race SimEnv cannot produce, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
