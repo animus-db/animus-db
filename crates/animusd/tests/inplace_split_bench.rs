@@ -54,6 +54,7 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
                 admin: addrs[6 * i + 3],
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
+                advertise_host: None,
             })
             .collect();
         let config = ClusterConfig {

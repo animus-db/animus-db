@@ -56,6 +56,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
                 admin: addrs[6 * i + 3],
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
+                advertise_host: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -565,6 +566,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }
         }],
         dynamo_auth: None,

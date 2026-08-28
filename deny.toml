@@ -26,6 +26,12 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # `animus-operator`'s `kube` dependency (rustls-tls) pulls
+    # `rustls-platform-verifier` -> `webpki-root-certs`, a bundled root-CA
+    # data crate under the Community Data License Agreement, Permissive
+    # variant, v2.0 — a permissive, non-copyleft data license (comparable to
+    # CC0/MIT in the freedoms it grants), fine to redistribute under AGPL.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

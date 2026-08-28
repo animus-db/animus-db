@@ -80,8 +80,10 @@ async fn large_metadata_catch_up_stays_live() {
                 .expect("bind");
             envs.push(env);
         }
-        let book: BTreeMap<NodeId, SocketAddr> =
-            envs.iter().map(|e| (e.node_id(), e.local_addr())).collect();
+        let book: BTreeMap<NodeId, String> = envs
+            .iter()
+            .map(|e| (e.node_id(), e.local_addr().to_string()))
+            .collect();
         for e in &envs {
             e.set_peers(book.clone());
         }
@@ -252,8 +254,10 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
                 .expect("bind");
             envs.push(env);
         }
-        let book: BTreeMap<NodeId, SocketAddr> =
-            envs.iter().map(|e| (e.node_id(), e.local_addr())).collect();
+        let book: BTreeMap<NodeId, String> = envs
+            .iter()
+            .map(|e| (e.node_id(), e.local_addr().to_string()))
+            .collect();
         for e in &envs {
             e.set_peers(book.clone());
         }

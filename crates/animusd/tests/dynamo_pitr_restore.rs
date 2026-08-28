@@ -54,6 +54,7 @@ async fn start_single_node_fast_pitr(dir: &Path) -> (Node, ClusterConfig) {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         };

@@ -698,6 +698,7 @@ async fn bring_up_split_durable(
                     admin: addrs[6 * i + 3],
                     intra: addrs[6 * i + 4],
                     console: addrs[6 * i + 5],
+                    advertise_host: None,
                 }
             })
             .collect();

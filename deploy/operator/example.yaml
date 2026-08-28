@@ -1,0 +1,21 @@
+apiVersion: animusdb.io/v1alpha1
+kind: AnimusCluster
+metadata:
+  name: example
+  namespace: default
+spec:
+  image: ghcr.io/animus-db/animusd:latest
+  nodes: 3
+  # controlNodes defaults to min(3, nodes) when omitted; spelled out here
+  # for clarity. Immutable after creation.
+  controlNodes: 3
+  storage:
+    size: 10Gi
+    # storageClassName: fast-ssd
+    ephemeral: false
+  basePort: 14000
+  clientService:
+    type: ClusterIP
+  quiesceAfterSecs: 5
+  splitMode: inplace
+  # dynamoAuthSecretName: example-dynamo-credentials

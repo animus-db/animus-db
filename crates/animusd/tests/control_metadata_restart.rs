@@ -234,6 +234,7 @@ async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
         admin: free_addr(),
         intra: free_addr(),
         console: free_addr(),
+        advertise_host: None,
     };
 
     // --- First incarnation: propose a schema, then a hard shutdown. ---

@@ -110,8 +110,10 @@ async fn grow_three_to_five_under_real_time_stays_live() {
                 .expect("bind");
             envs.push(env);
         }
-        let book: BTreeMap<NodeId, SocketAddr> =
-            envs.iter().map(|e| (e.node_id(), e.local_addr())).collect();
+        let book: BTreeMap<NodeId, String> = envs
+            .iter()
+            .map(|e| (e.node_id(), e.local_addr().to_string()))
+            .collect();
         for e in &envs {
             e.set_peers(book.clone());
         }
