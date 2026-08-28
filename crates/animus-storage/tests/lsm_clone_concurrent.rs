@@ -23,6 +23,14 @@
 //! `lsm_concurrent.rs`'s own flush-vs-apply regression for the identical
 //! reason.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-thread ProdEnv liveness
+// regression (see the module doc above) — SimEnv structurally cannot exercise
+// this race, so real tokio::spawn/sleep/timeout are the point, not a hole.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv liveness test (SimEnv cannot reproduce this race, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
