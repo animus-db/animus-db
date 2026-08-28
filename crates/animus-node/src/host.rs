@@ -26,12 +26,15 @@
 //! choose to move them on their own merits.
 
 use std::io;
+use std::time::Duration;
 
 use animus_control::{Metadata, RaftNode};
 use animus_dynamo::AttributeValue;
 use animus_env::{Env, NodeId};
 use animus_tablet::TabletId;
 use async_trait::async_trait;
+
+use crate::wire::{ClientRequest, ClientResponse};
 
 /// This node's control-plane leader handle, if it currently believes it
 /// leads — the one capability every loop in this rung needs, since each
@@ -139,4 +142,53 @@ pub trait TtlScanHost {
         attribute: &str,
         expected: AttributeValue,
     ) -> Result<bool, String>;
+}
+
+/// A synchronous call/await RPC to another node's client API (ADR 0061 rung
+/// C3b, the third 2026-08-28 amendment) — the capability behind
+/// `control_handle::RemoteControlClient::metadata_fresh`'s leader-directed
+/// `Status` fetch, and the seam a future sim-only implementor (rung C3d,
+/// deferred) will need to let a `SimEnv`-driven cluster relay at all.
+///
+/// **Why this is a capability trait and not `Network` (ADR 0026)**:
+/// `Network` is fire-and-forget `send_stream`/single-consumer `recv_stream`
+/// with no request/response correlation, while relay is synchronous call/
+/// await — riding it on `Network` would need `req_id`-correlated pending-
+/// reply machinery this rung deliberately does not build (deferred whole to
+/// C3d). Worse, `Network`'s `ProdEnv` impl dials the **`internal`** port
+/// (raw Raft/`KvWire` frames) while relay dials **`intra`**/`client`; riding
+/// relay on `Network` would collapse ADR 0047's port split, a production
+/// wire-topology change this testability rung disclaims. See ADR 0061's
+/// third 2026-08-28 amendment for the full argument.
+///
+/// `animusd` implements this over its own **unchanged** `relay_request`/
+/// `relay_request_with_timeout` — still a fresh `TcpStream` per call, still
+/// dialing the `intra`/`client` ports, still framed via [`crate::codec`]'s
+/// C3a functions. **The transport timeout stays entirely inside the
+/// implementor**: this trait takes `timeout` as a plain value handed to
+/// whatever the implementor uses to enforce it (`animusd`'s impl wraps the
+/// call in `tokio::time::timeout`, which cannot live in this crate at all —
+/// see this crate's own `CLAUDE.md`'s "no tokio" invariant). A default
+/// method here calling `tokio::time::timeout` would violate that same
+/// invariant just as surely as a call site would, so there is deliberately
+/// no default method — every implementor supplies its own enforcement.
+///
+/// Returns [`ClientResponse`] directly, never a `Result`: this mirrors
+/// `animusd`'s existing `relay_request`, which already folds every
+/// transport failure (connect/write/read/decode/timeout) into
+/// `ClientResponse::Error(..)` rather than a separate error channel — a
+/// caller that already branches on `ClientResponse` (every existing relay
+/// call site) needs no new failure shape to handle.
+#[async_trait]
+pub trait RelayClient {
+    /// Relay `request` to `addr`'s client API and return its reply, or a
+    /// `ClientResponse::Error` describing any transport failure
+    /// (connect/write/read/decode/timeout) — never a panic, never a hang
+    /// past `timeout`.
+    async fn relay(
+        &self,
+        addr: String,
+        request: &ClientRequest,
+        timeout: Duration,
+    ) -> ClientResponse;
 }
