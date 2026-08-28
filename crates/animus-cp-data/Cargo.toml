@@ -37,6 +37,12 @@ async-trait.workspace = true
 
 [dev-dependencies]
 animus-sim.workspace = true
+# Shared corpus seed-management scaffolding (ADR 0061 rung B1,
+# `animus_test::corpus`). This is a dev-dependency cycle (animus-test's own
+# dev-dependencies include animus-cp-data), which Cargo permits: a dev-dep
+# cycle only needs to resolve for `cargo test`, never for building either
+# crate's library.
+animus-test.workspace = true
 # Real-thread `ProdEnv` regression (`tests/prod_concurrent_ts_monotonic.rs`):
 # the mint/propose-ordering race this guards is provably unreachable under
 # `SimEnv`'s single-threaded cooperative scheduler (no `.await` point exists

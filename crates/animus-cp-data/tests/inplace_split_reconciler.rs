@@ -35,6 +35,7 @@ use animus_env::{Clock, EnvExt, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{InPlaceSplitIntent, KeyRange, SplitChild, Tablet, TabletId, TabletState};
+use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
@@ -1294,27 +1295,32 @@ fn scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recov
 // The frozen corpus.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Scenario {
-    name: &'static str,
+    name: String,
     seed: u64,
     run: fn(u64),
 }
 
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
     }
-    h
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            run: self.run,
+        }
+    }
 }
 
 fn scenario_cells() -> Vec<Scenario> {
     macro_rules! scenario {
         ($name:literal, $f:expr) => {
             Scenario {
-                name: $name,
-                seed: name_seed($name),
+                name: $name.to_string(),
+                seed: corpus::name_seed($name),
                 run: $f,
             }
         };
@@ -1353,17 +1359,13 @@ fn scenario_cells() -> Vec<Scenario> {
 }
 
 fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_INPLACE_SPLIT_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&k| k > 0)
-        .unwrap_or(1)
+    corpus::seeds_from_env("ANIMUS_INPLACE_SPLIT_SEEDS")
 }
 
 #[test]
 fn inplace_split_reconciler_corpus_names_are_unique() {
     let cells = scenario_cells();
-    let mut names: Vec<&str> = cells.iter().map(|c| c.name).collect();
+    let mut names: Vec<&str> = cells.iter().map(|c| c.name.as_str()).collect();
     names.sort_unstable();
     let mut deduped = names.clone();
     deduped.dedup();
@@ -1373,21 +1375,14 @@ fn inplace_split_reconciler_corpus_names_are_unique() {
 #[test]
 fn inplace_split_reconciler_corpus_runs_every_scenario() {
     let k = seeds_per_cell();
-    for cell in scenario_cells() {
-        for i in 0..k {
-            let seed = if i == 0 {
-                cell.seed
-            } else {
-                name_seed(&format!("{}_s{i:02}", cell.name))
-            };
-            (cell.run)(seed);
-        }
+    for cell in corpus::seed_expand(scenario_cells(), k) {
+        (cell.run)(cell.seed);
     }
 }
 
 #[test]
 fn happy_path_is_reproducible_from_its_seed() {
-    let seed = name_seed("happy_path");
+    let seed = corpus::name_seed("happy_path");
     scenario_happy_path(seed);
     scenario_happy_path(seed);
 }
