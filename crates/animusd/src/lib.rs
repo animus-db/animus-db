@@ -11760,3 +11760,259 @@ mod issue_412_tests {
         node.shutdown();
     }
 }
+
+/// Regression for the issue #298 residual confirmed live under the
+/// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
+/// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
+/// another transaction's unresolved intent must actively push that
+/// transaction's resolution once it is confirmed **decided**, rather than
+/// only backing off and hoping a passive sweep clears it first.
+///
+/// **Constructs the confirmed mechanism directly, without needing a real
+/// split race**: stages transaction A on a key, decides it `Aborted`, and
+/// deliberately never resolves it — exactly what the live capture showed
+/// (`KvCommand::TxnResolve`'s own fence check can reject a resolve whose
+/// routing went stale between `cp_route` and the entry's actual apply,
+/// e.g. because the target tablet split in between, and — unlike
+/// `TxnStage` — `TxnResolve` has no outcome channel to report that no-op,
+/// so its proposer sees `Some(ts)` "success" regardless; skipping the
+/// resolve call entirely reproduces the same end state — a decided
+/// transaction's intent left live on its key — without needing to
+/// reproduce the fence race itself). A fresh transaction B then stages the
+/// SAME key: pre-fix, `ClientCtx::txn_prepare_pushing` only backed off and
+/// retried the identical stage, exhausting `TXN_STAGE_PUSH_ATTEMPTS`
+/// (~750ms) long before anything else cleared A's stale intent, into a
+/// genuine (non-ambiguous) `TransactionConflict` — even though A's own
+/// blocking intent belonged to an ALREADY-DECIDED transaction the whole
+/// time. Post-fix, hitting `StageOutcome::IntentBlocked` queries the
+/// blocker's own decision (`ClientCtx::txn_status`) and, finding it
+/// `Aborted`, pushes the resolution itself (fresh routing, sidestepping
+/// the stale-fence race) before retrying — converging well inside the
+/// existing retry budget.
+#[cfg(test)]
+mod issue_298_conflict_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_cp_data::{StageOutcome, TxnOutcome, TxnWrite};
+    use animus_dynamo::AttributeValue;
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::dynamo;
+    use crate::{ClientCtx, ClusterConfig, Node, RoleAddrs, run_node};
+
+    // Small fixtures duplicated per test module rather than shared — this
+    // crate's own stated convention (see `issue_412_tests`'s identical set).
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn single_node_config() -> ClusterConfig {
+        let addrs = free_addrs(6);
+        ClusterConfig {
+            nodes: vec![RoleAddrs {
+                id: crate::config::node_id(0),
+                role: NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                admin: addrs[3],
+                intra: addrs[4],
+                advertise_host: None,
+                console: addrs[5],
+            }],
+            dynamo_auth: None,
+        }
+    }
+
+    /// Same bounded fresh-config retry every in-crate bring-up in this
+    /// crate uses (`docs/engineering-lessons.md`) against the port-TOCTOU
+    /// race under `cargo test --workspace` contention.
+    async fn single_node(dir: &Path) -> Node {
+        let mut last_err = None;
+        for attempt in 0..16 {
+            let config = single_node_config();
+            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = Some(e);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        panic!(
+            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
+        );
+    }
+
+    /// Provisions `table`'s first tablet and waits for its single-voter
+    /// group to actually elect locally — `provision_tablet` alone does not
+    /// wait for that (`confirm_futility_tests`'s identical polling doc).
+    async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
+        ctx.provision_tablet(table)
+            .await
+            .expect("provisioning table");
+        let tablet = *node
+            .metadata()
+            .tablets_for_table(table)
+            .next()
+            .expect("provisioning created a tablet")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this single node hosts the tablet");
+        timeout(Duration::from_secs(10), async {
+            while !group.is_leader() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tablet group did not elect a local leader in time");
+    }
+
+    /// **Red before this fix, green after** (verified both ways during this
+    /// investigation): asserts a fresh transaction's stage on a key
+    /// blocked by an ALREADY-DECIDED-but-unresolved intent converges to
+    /// success, never a spurious `TransactionConflict`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_stage_pushes_a_decided_blockers_resolution_instead_of_conflicting() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = single_node(dir.path()).await;
+        let ctx = node.ctx_for_test();
+        provision_and_await_leader(&node, &ctx, "issue298_conflict").await;
+
+        let key = dynamo::item_key(&AttributeValue::S("k1".to_string()), None);
+
+        // Transaction A stages cleanly, then is decided `Aborted` (standing
+        // in for a participant elsewhere having failed) — but its own
+        // resolve is deliberately never called, leaving `key` an
+        // unresolved `Intent(txn_a)` even though A's record is already a
+        // final, durable decision.
+        let (txn_a, record_a, table_a, ts_a) = ctx
+            .txn_prepare_pushing(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-a".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("transaction A stages cleanly");
+        let decided_a = ctx
+            .txn_decide_anchor(&table_a, txn_a.clone(), record_a.clone(), false, ts_a, None)
+            .await
+            .expect("deciding A never fails outright in this single-node setup");
+        assert!(
+            matches!(decided_a, TxnOutcome::Aborted),
+            "A must decide Aborted: {decided_a:?}"
+        );
+        // No `txn_resolve_participant` call here — the intentional gap.
+
+        // A single, direct `txn_prepare` attempt for B (never
+        // `txn_prepare_pushing`'s own retry loop — this test asserts what
+        // ONE push accomplishes, deterministically, with no dependency on
+        // `txn_resolver_loop`'s independent per-second passive sweep also
+        // being capable of clearing this given enough wall-clock time).
+        let (_, _, _, _, outcome) = ctx
+            .txn_prepare(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-b".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("B's stage entry itself applies (as a no-op, per the guard)");
+        let (blocker, blocker_record_table, blocker_record_key) = match outcome {
+            StageOutcome::IntentBlocked {
+                txn_id,
+                record_table,
+                record_key,
+                ..
+            } => (txn_id, record_table, record_key),
+            other => panic!("expected IntentBlocked on A's still-live intent, got {other:?}"),
+        };
+        assert_eq!(blocker, txn_a, "the blocker must be A's own txn_id");
+
+        // The fix under test, called directly and in isolation — no sleep,
+        // no loop, so nothing here can be coincidentally saved by
+        // `txn_resolver_loop`'s own background sweep.
+        ctx.push_resolution_if_decided(
+            "issue298_conflict",
+            &key,
+            blocker,
+            blocker_record_table,
+            blocker_record_key,
+            0,
+        )
+        .await;
+
+        // Pre-fix (`push_resolution_if_decided` a no-op stub), this second
+        // attempt hits the identical still-live `Intent(txn_a)` and reports
+        // `IntentBlocked` again — never `Staged`. Post-fix, the push above
+        // already resolved A's intent, so this attempt stages cleanly.
+        let (txn_b, record_b, table_b, ts_b, outcome_b) = ctx
+            .txn_prepare(
+                "issue298_conflict",
+                None,
+                vec![TxnWrite::plain(key.clone(), Some(b"from-b".to_vec()))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("B's second stage attempt itself applies");
+        assert!(
+            matches!(outcome_b, StageOutcome::Staged),
+            "B must stage cleanly once A's already-decided blocker has been pushed — never a \
+             repeat IntentBlocked (which is what a spurious TransactionConflict is built from): \
+             {outcome_b:?}"
+        );
+
+        // Decide and resolve B, then confirm the key holds EXACTLY B's
+        // value — never A's (which must stay discarded, since A aborted)
+        // and never a torn/duplicated state.
+        let decided_b = ctx
+            .txn_decide_anchor(&table_b, txn_b.clone(), record_b.clone(), true, ts_b, None)
+            .await
+            .expect("deciding B never fails outright in this single-node setup");
+        assert!(
+            matches!(decided_b, TxnOutcome::Committed { .. }),
+            "B must decide Committed: {decided_b:?}"
+        );
+        ctx.txn_resolve_participant(&table_b, txn_b, record_b, vec![key.clone()], decided_b)
+            .await
+            .expect("resolving B succeeds");
+
+        let tablet = *node
+            .metadata()
+            .tablets_for_table("issue298_conflict")
+            .next()
+            .expect("tablet exists")
+            .0;
+        let group = node
+            .edge
+            .local_cp(tablet)
+            .expect("this single node hosts the tablet");
+        let value = group
+            .linearizable_get_served(&key)
+            .await
+            .expect("this replica leads the group")
+            .expect("B's committed write must be readable, never lost");
+        assert_eq!(
+            value,
+            b"from-b".to_vec(),
+            "the key must hold exactly B's value — A's aborted write must never resurface"
+        );
+
+        node.shutdown();
+    }
+}
