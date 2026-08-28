@@ -561,3 +561,201 @@ fn link_participates_in_the_injected_error_schedule() {
         "seed={seed}: a successful link must expose the real bytes"
     );
 }
+
+/// ENOSPC (`DiskConfig::set_enospc_prob`) is distinguishable from a generic
+/// injected error by `ErrorKind`, and the two compose on one shared roll: a
+/// config with only `error_prob` set never produces `StorageFull`, one with
+/// only `enospc_prob` set never produces `Other`, and one with both set
+/// produces both kinds over enough tries, reproducibly from the seed.
+#[test]
+fn enospc_is_distinguishable_from_a_generic_disk_error() {
+    fn run(seed: u64, cfg: DiskConfig) -> Vec<std::io::ErrorKind> {
+        let mut sim = Simulator::new(seed);
+        sim.set_disk_config(cfg);
+        let out = Arc::new(Mutex::new(Vec::new()));
+        {
+            let env = sim.env(nid(0));
+            let out = Arc::clone(&out);
+            env.clone().spawn_task(async move {
+                for i in 0..40u8 {
+                    if let Err(e) = env.append("f", &[i]).await {
+                        out.lock().unwrap().push(e.kind());
+                    }
+                }
+            });
+            sim.run();
+        }
+        out.lock().unwrap().clone()
+    }
+
+    let seed = 0xD15C_0008;
+
+    let mut generic_only = DiskConfig::default();
+    generic_only.set_error_prob(0.5);
+    let kinds = run(seed, generic_only);
+    assert!(
+        !kinds.is_empty(),
+        "seed={seed}: expected some failures at p=0.5"
+    );
+    assert!(
+        kinds.iter().all(|&k| k == std::io::ErrorKind::Other),
+        "seed={seed}: error_prob alone must never produce StorageFull, got {kinds:?}"
+    );
+
+    let mut enospc_only = DiskConfig::default();
+    enospc_only.set_enospc_prob(0.5);
+    let kinds = run(seed, enospc_only);
+    assert!(
+        !kinds.is_empty(),
+        "seed={seed}: expected some failures at p=0.5"
+    );
+    assert!(
+        kinds.iter().all(|&k| k == std::io::ErrorKind::StorageFull),
+        "seed={seed}: enospc_prob alone must never produce Other, got {kinds:?}"
+    );
+
+    let mut both = DiskConfig::default();
+    both.set_enospc_prob(0.3);
+    both.set_error_prob(0.3);
+    let a = run(seed, both.clone());
+    let b = run(seed, both);
+    assert_eq!(
+        a, b,
+        "seed={seed}: the enospc-vs-generic bucket choice must be reproducible"
+    );
+    assert!(
+        a.contains(&std::io::ErrorKind::StorageFull),
+        "seed={seed}: expected at least one ENOSPC over 40 tries"
+    );
+    assert!(
+        a.contains(&std::io::ErrorKind::Other),
+        "seed={seed}: expected at least one generic error over 40 tries"
+    );
+}
+
+/// With `enospc_prob` at its default (0), `error_prob`'s own draw/comparison
+/// is byte-identical to before this knob existed: the fault schedule for a
+/// generic-error-only config is unaffected by ENOSPC's addition to the code
+/// path.
+#[test]
+fn enospc_default_off_leaves_the_generic_error_schedule_unchanged() {
+    fn run(seed: u64) -> (Vec<bool>, Vec<String>) {
+        let mut sim = Simulator::new(seed);
+        let mut cfg = DiskConfig::default();
+        cfg.set_error_prob(0.4);
+        sim.set_disk_config(cfg);
+        let results = Arc::new(Mutex::new(Vec::new()));
+        {
+            let env = sim.env(nid(0));
+            let out = Arc::clone(&results);
+            env.clone().spawn_task(async move {
+                for i in 0..30u8 {
+                    let ok = env.append("f", &[i]).await.is_ok();
+                    out.lock().unwrap().push(ok);
+                }
+            });
+            sim.run();
+        }
+        let r = results.lock().unwrap().clone();
+        (r, sim.trace_lines())
+    }
+
+    // Same seed as `injected_error_schedule_is_reproducible_from_the_seed`
+    // above, which pins the exact same config's outcome sequence — this test
+    // pins that ENOSPC's addition to `inject_disk_fault` did not perturb it.
+    let seed = 0xD15C_0002;
+    let (results, trace) = run(seed);
+    assert!(
+        results.iter().any(|&ok| ok) && results.iter().any(|&ok| !ok),
+        "seed={seed}: at p=0.4 over 30 ops both outcomes should occur"
+    );
+    assert!(
+        trace
+            .iter()
+            .any(|l| l.contains("DISKFAULT") && l.contains("kind=error")),
+        "seed={seed}: a generic-only config must tag its faults kind=error, never kind=enospc"
+    );
+    assert!(
+        !trace.iter().any(|l| l.contains("kind=enospc")),
+        "seed={seed}: enospc_prob defaults to 0 — no ENOSPC fault should ever fire"
+    );
+}
+
+/// fsync-acked-but-lost (`DiskConfig::set_fsync_lie_prob`): with the fault
+/// always firing, `sync` still returns `Ok`, but a subsequent crash loses
+/// the bytes anyway — exactly like an un-synced tail, even though the caller
+/// was told the fsync succeeded. With the fault off (default), the same
+/// script persists normally across a crash.
+#[test]
+fn fsync_lie_acks_but_a_crash_still_loses_the_bytes() {
+    fn run(seed: u64, lie_prob: f64) -> (bool, Vec<u8>) {
+        let mut sim = Simulator::new(seed);
+        // First write+sync genuinely persists (fault still off) so the test
+        // can tell "the fault lost a specific later write" apart from "no
+        // write was ever really durable at all".
+        {
+            let env = sim.env(nid(0));
+            env.clone().spawn_task(async move {
+                env.append("wal", b"KEPT").await.unwrap();
+                env.sync("wal").await.unwrap();
+            });
+            sim.run();
+        }
+        let mut cfg = DiskConfig::default();
+        cfg.set_fsync_lie_prob(lie_prob);
+        sim.set_disk_config(cfg);
+        let sync_ok = Arc::new(Mutex::new(false));
+        {
+            let env = sim.env(nid(0));
+            let out = Arc::clone(&sync_ok);
+            env.clone().spawn_task(async move {
+                env.append("wal", b"maybe-lost").await.unwrap();
+                let ok = env.sync("wal").await.is_ok();
+                *out.lock().unwrap() = ok;
+            });
+            sim.run();
+        }
+        sim.crash(nid(0));
+        sim.restart(nid(0));
+        let after = Arc::new(Mutex::new(Vec::new()));
+        {
+            let env = sim.env(nid(0));
+            let o = Arc::clone(&after);
+            env.clone().spawn_task(async move {
+                *o.lock().unwrap() = env.read("wal").await.unwrap();
+            });
+            sim.run();
+        }
+        (*sync_ok.lock().unwrap(), after.lock().unwrap().clone())
+    }
+
+    let seed = 0xD15C_0009;
+
+    // Always lies: `sync` acks (`Ok`) but the second write never actually
+    // became durable, so the crash loses it — only the first, genuinely
+    // synced write survives.
+    let (ok_a, bytes_a) = run(seed, 1.0);
+    let (ok_b, bytes_b) = run(seed, 1.0);
+    assert!(ok_a, "seed={seed}: a lied-to sync must still return Ok");
+    assert_eq!(
+        ok_a, ok_b,
+        "seed={seed}: the lie itself must be reproducible"
+    );
+    assert_eq!(
+        bytes_a, bytes_b,
+        "seed={seed}: surviving bytes must be reproducible"
+    );
+    assert_eq!(
+        bytes_a, b"KEPT",
+        "seed={seed}: the lied-about write must be lost on crash despite the Ok ack, \
+         got {bytes_a:?}"
+    );
+
+    // Default off: the same script persists both writes across the crash.
+    let (ok_default, bytes_default) = run(seed, 0.0);
+    assert!(ok_default, "seed={seed}");
+    assert_eq!(
+        bytes_default, b"KEPTmaybe-lost",
+        "seed={seed}: with the fault off, a genuinely synced write must survive a crash"
+    );
+}
