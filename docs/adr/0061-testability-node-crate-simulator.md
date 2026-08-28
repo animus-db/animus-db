@@ -284,7 +284,7 @@ brain-last.
 | C1 | Create `animus-node` depending on `animus-env` with `default-features = false` — so `ProdEnv` genuinely does not exist in that build — and with no `tokio::net`. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Also harden `is_relayable_command` from `matches!` to an exhaustive `match` (see below). Boundary established and compiler-enforced from the first commit |
 | C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill` — paced by `env.sleep()`/`env.now()`/`env.spawn_task()` instead of `tokio::time`. **Requires a host-capability trait first (see the second 2026-08-28 amendment): every one of these takes `ClientCtx`, which does not move until C5.** |
 | C3 | `ControlHandle<E, R>` and a `RelayClient` capability trait, split into **C3a–C3d** (see the third 2026-08-28 amendment). The literal "move relay onto `Network`" is **rejected**: it would collapse ADR 0047's `intra` port into `internal`, a production wire-topology change this ADR disclaims. The goal — a cluster that talks inside `SimEnv` — is met by a second, sim-only `RelayClient` implementor instead |
-| C4 | The HTTP edges per Decision 2: parsing and dispatch become pure bytes-in/bytes-out in `animus-node`; `animusd` keeps the accept loops |
+| C4 | The HTTP edges per Decision 2, split into **C4a–C4d** (see the fourth 2026-08-28 amendment). `dynamo.rs`'s `run_operation`/DDL handlers are **not** a C4 rung — they fold into C5 |
 | C5 | The brain: split `impl ClientCtx` into `read_path`, `write_path`, `txn_coordinator`, `forwarding`, `schema`; genericize over `E: Env`. The heaviest rung, but A6 has already lifted the pure predicates out of it |
 | C6 | Node assembly: `Node<E>`/`BoundNode<E>`/`BoundControlNode<E>`/`BoundDataNode<E>` move; `animusd` shrinks to binary, config, listeners, lifecycle, and the one `ProdEnv` construction. The `start_cluster*`/`run_node*` harness functions move to test support where they belong |
 
@@ -429,6 +429,48 @@ time:
 > production implementation keep whatever concrete machinery it already has.
 > A second, sim-only implementor of the same trait is what buys deterministic
 > coverage — not relocating the production one.
+
+#### 2026-08-28 amendment (fourth) — C4 splits, and `dynamo.rs`'s handlers belong to C5
+
+Scoping C4 confirmed Decision 2's seam is sound — no edge streams a response, so
+the bytes-in/bytes-out buffering assumption holds cleanly — but found the rung
+is four shippable pieces plus one that is misfiled.
+
+**C4a** move `http.rs`'s pure halves (header-block splitting, `Content-Length`
+handling, `query_param`/`percent_decode`, response formatting) into
+`animus-node`; `read_http_request`/`write_response_with` become thin wrappers
+doing only `stream.read`/`write_all`. Mirrors C3a exactly. **C4b** factor the
+SigV4 gate out of `dynamo.rs::handle_conn` — `animus_dynamo::sigv4::verify` is
+already pure (and `animus-dynamo` has no `tokio` dependency at all); only the
+build-request/read-`wall_now()`/map-error sequence is entangled. Cheap,
+security-relevant, and closes the "only testable through a socket" gap this ADR
+names for SigV4 specifically. **C4c** `console.rs`'s `route` is *already* at the
+target shape — it takes `&HttpRequest` plus a `ConsoleBackend` trait and returns
+a buffered tuple, with `TcpStream` confined to `handle_conn`. It moves nearly
+verbatim. **C4d** `admin.rs`'s dispatch and its ~50 handlers behind an
+`AdminHost` capability trait (a 15-method cluster-shape slice: raft, placement,
+membership, metrics history).
+
+**What does not move: `dynamo.rs`'s `run_operation` and the DDL handlers.**
+Roughly **40** `tokio::time::Instant::now()`/`sleep` schema-commit poll loops
+live **inside the handler bodies** — one per `create_table`/`update_table`/
+`create_index`/`drop_index`/backup/restore/PITR handler, plus
+`run_transact_get`'s poll — not wrapped around them. They cannot become
+`env.sleep()`/`env.now()` without an `E: Env` bound, which needs the ~21-method
+`ClientCtx` slice those handlers reach (schema propose, tablet provisioning,
+kind-write, scan/read, the RMW lock) to be generic first.
+
+A capability trait wide enough to cover that slice would simply be `ClientCtx`
+under another name — **the exact failure mode the second amendment named for
+C2**, resurfacing one rung later. So these handlers are not a C4 rung at all:
+they fold into C5, where `ClientCtx` is split and genericized properly.
+
+**On the pattern.** Four consecutive rungs have now needed re-planning on
+contact with the code (C0's `prod` gate, C2's missing leaf, C3's port collapse,
+C4's inline poll loops). The ADR's Phase C table was written at a granularity
+that reads well but does not survive implementation. Treat every remaining rung
+description as a *hypothesis to scope*, not a plan to execute — scoping has paid
+for itself four times and has never yet been wasted.
 
 ### Phase D — the payoff
 
