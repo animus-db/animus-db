@@ -21,6 +21,7 @@
 //! crate's `CLAUDE.md` for the re-export shim and what has NOT moved yet
 //! (`ClientCtx`, `handle_request`, `cp_serve_forwarded` — rung C5).
 
+pub mod admin;
 pub mod backup_completion;
 pub mod backup_janitor;
 pub mod codec;

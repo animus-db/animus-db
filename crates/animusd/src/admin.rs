@@ -62,8 +62,10 @@ use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::NodeId;
+use animus_node::host::AdminHost;
 use animus_storage::{StorageError, WalRecordView};
 use animus_tablet::{TOKEN_BYTES, TabletId};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -342,68 +344,138 @@ fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// Route a request to its handler, returning `(http status, json body)`.
+///
+/// The `(method, path)` match table itself moved to `animus_node::admin`
+/// (ADR 0061 rung C4d) — this is now a one-line wrapper. Every handler body
+/// below is unchanged; [`AdminHost`]'s impl for [`ClientCtx`] (below) is the
+/// thin, logic-free delegation that lets the moved dispatch table reach
+/// them. See `animus_node::host::AdminHost`'s own doc for why the trait is
+/// drawn at "one method per route" rather than the raw `ClientCtx` member
+/// list.
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
-    let method = request.method.as_str();
-    let path = request.path.as_str();
-    let q = request.query.as_str();
-    let (status, value): (u16, Value) = match (method, path) {
-        ("GET", "/admin/config") => (200, config_view(ctx)),
-        ("GET", "/admin/peers") => (200, peers_view(ctx)),
-        // `effective_metadata`, not `ctx.raft.metadata()` directly: on a
-        // control-plane-follower-less growth node (ADR 0030) the local raft
-        // never replicates, so this view would otherwise show an empty cluster
-        // forever on exactly the node an operator most wants to inspect.
-        ("GET", "/admin/status") => (
-            200,
-            serde_json::to_value(ctx.effective_metadata()).unwrap_or(Value::Null),
-        ),
-        ("GET", "/admin/raft") => (200, raft_view(ctx)),
-        ("GET", "/admin/raftkv") => (200, raftkv_view(ctx, q).await),
-        ("GET", "/admin/txns") => (200, txns_view(ctx).await),
-        ("GET", "/admin/storage/lsm") => storage_lsm(ctx, q).await,
-        ("GET", "/admin/storage/control") => storage_control(ctx).await,
-        ("GET", "/admin/storage/wal") => storage_wal(ctx, q).await,
-        ("GET", "/admin/storage/wal/segment") => storage_wal_segment(ctx, q).await,
-        ("GET", "/admin/storage/key") => storage_key(ctx, q).await,
-        ("GET", "/admin/storage/scan") => storage_scan(ctx, q).await,
-        ("GET", "/admin/system-table") => system_table(ctx, q).await,
-        ("GET", "/admin/backups") => (200, backups_view(ctx)),
-        ("GET", "/admin/restores") => (200, restores_view(ctx)),
-        ("GET", "/admin/metrics") => (200, metrics_view(ctx)),
-        ("GET", "/admin/metrics/history") => (200, metrics_history_view(ctx)),
-        ("GET", "/admin/member/drain-status") => member_drain_status(ctx, q),
-        ("GET", "/admin/health") => health(ctx),
-        ("POST", "/admin/tablet/split") => action_split(ctx, &request.body).await,
-        ("POST", "/admin/stream/grow") => action_stream_grow(ctx, &request.body).await,
-        ("POST", "/admin/storage/flush") => action_flush(ctx, &request.body).await,
-        ("POST", "/admin/storage/compact") => action_compact(ctx, &request.body).await,
-        ("POST", "/admin/raftkv/reconfigure") => action_reconfigure(ctx, &request.body),
-        ("POST", "/admin/drain") => action_drain(ctx, &request.body),
-        ("POST", "/admin/member/add") => action_add_member(ctx, &request.body).await,
-        ("POST", "/admin/member/remove") => action_remove_member(ctx, &request.body),
-        ("GET", "/admin/control/members") => (200, control_members_view(ctx)),
-        ("POST", "/admin/control/member/add") => {
-            action_add_control_member(ctx, &request.body).await
-        }
-        ("POST", "/admin/control/member/remove") => {
-            action_remove_control_member(ctx, &request.body).await
-        }
-        ("POST", "/admin/data/dynamo") => action_data_dynamo(ctx, &request.body).await,
-        ("POST", "/admin/data/drop-table") => action_drop_table(ctx, &request.body).await,
-        ("POST", "/admin/data/seed") => action_data_seed(ctx, &request.body).await,
-        // A known admin path with the wrong verb vs an unknown path.
-        ("GET" | "POST", p) if p.starts_with("/admin/") => {
-            (404, json!({"error": format!("unknown admin route {p}")}))
-        }
-        _ => (
-            404,
-            json!({"error": "not found; admin routes live under /admin/"}),
-        ),
-    };
-    (
-        status,
-        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    animus_node::admin::dispatch(
+        ctx,
+        &request.method,
+        &request.path,
+        &request.query,
+        &request.body,
     )
+    .await
+}
+
+/// Thin, logic-free delegation from [`AdminHost`]'s route-shaped surface to
+/// this file's own (unmoved) handler functions — nothing is decided here
+/// that wasn't already decided by the function being called. Mirrors
+/// `client_ctx_host.rs`'s rung-C2 impl blocks in spirit (same "translate,
+/// don't reimplement" discipline), kept in this file instead since these
+/// handlers are `admin.rs`-private and there's nothing else in the crate
+/// that would want to call `AdminHost` on `ClientCtx`.
+#[async_trait]
+impl AdminHost for ClientCtx {
+    async fn config_view(&self) -> Value {
+        config_view(self)
+    }
+    async fn peers_view(&self) -> Value {
+        peers_view(self)
+    }
+    async fn status_json(&self) -> Value {
+        // `effective_metadata`, not `self.raft.metadata()` directly: on a
+        // control-plane-follower-less growth node (ADR 0030) the local raft
+        // never replicates, so this view would otherwise show an empty
+        // cluster forever on exactly the node an operator most wants to
+        // inspect.
+        serde_json::to_value(self.effective_metadata()).unwrap_or(Value::Null)
+    }
+    async fn raft_view(&self) -> Value {
+        raft_view(self)
+    }
+    async fn raftkv_view(&self, query: &str) -> Value {
+        raftkv_view(self, query).await
+    }
+    async fn txns_view(&self) -> Value {
+        txns_view(self).await
+    }
+    async fn storage_lsm(&self, query: &str) -> (u16, Value) {
+        storage_lsm(self, query).await
+    }
+    async fn storage_control(&self) -> (u16, Value) {
+        storage_control(self).await
+    }
+    async fn storage_wal(&self, query: &str) -> (u16, Value) {
+        storage_wal(self, query).await
+    }
+    async fn storage_wal_segment(&self, query: &str) -> (u16, Value) {
+        storage_wal_segment(self, query).await
+    }
+    async fn storage_key(&self, query: &str) -> (u16, Value) {
+        storage_key(self, query).await
+    }
+    async fn storage_scan(&self, query: &str) -> (u16, Value) {
+        storage_scan(self, query).await
+    }
+    async fn system_table(&self, query: &str) -> (u16, Value) {
+        system_table(self, query).await
+    }
+    async fn backups_view(&self) -> Value {
+        backups_view(self)
+    }
+    async fn restores_view(&self) -> Value {
+        restores_view(self)
+    }
+    async fn metrics_view(&self) -> Value {
+        metrics_view(self)
+    }
+    async fn metrics_history_view(&self) -> Value {
+        metrics_history_view(self)
+    }
+    async fn member_drain_status(&self, query: &str) -> (u16, Value) {
+        member_drain_status(self, query)
+    }
+    async fn health(&self) -> (u16, Value) {
+        health(self)
+    }
+    async fn action_split(&self, body: &[u8]) -> (u16, Value) {
+        action_split(self, body).await
+    }
+    async fn action_stream_grow(&self, body: &[u8]) -> (u16, Value) {
+        action_stream_grow(self, body).await
+    }
+    async fn action_flush(&self, body: &[u8]) -> (u16, Value) {
+        action_flush(self, body).await
+    }
+    async fn action_compact(&self, body: &[u8]) -> (u16, Value) {
+        action_compact(self, body).await
+    }
+    async fn action_reconfigure(&self, body: &[u8]) -> (u16, Value) {
+        action_reconfigure(self, body)
+    }
+    async fn action_drain(&self, body: &[u8]) -> (u16, Value) {
+        action_drain(self, body)
+    }
+    async fn action_add_member(&self, body: &[u8]) -> (u16, Value) {
+        action_add_member(self, body).await
+    }
+    async fn action_remove_member(&self, body: &[u8]) -> (u16, Value) {
+        action_remove_member(self, body)
+    }
+    async fn control_members_view(&self) -> Value {
+        control_members_view(self)
+    }
+    async fn action_add_control_member(&self, body: &[u8]) -> (u16, Value) {
+        action_add_control_member(self, body).await
+    }
+    async fn action_remove_control_member(&self, body: &[u8]) -> (u16, Value) {
+        action_remove_control_member(self, body).await
+    }
+    async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
+        action_data_dynamo(self, body).await
+    }
+    async fn action_drop_table(&self, body: &[u8]) -> (u16, Value) {
+        action_drop_table(self, body).await
+    }
+    async fn action_data_seed(&self, body: &[u8]) -> (u16, Value) {
+        action_data_seed(self, body).await
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
