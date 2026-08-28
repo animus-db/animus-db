@@ -420,6 +420,8 @@ impl Tablet {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -510,6 +512,142 @@ mod tests {
         // Spec anchor: Murmur3 x64_128 of the empty input (seed 0) is (0, 0).
         assert_eq!(murmur3_x64_128(b"", 0), (0, 0));
         assert_eq!(partition_token(b""), [0u8; TOKEN_BYTES]);
+    }
+
+    /// Canonical MurmurHash3 x64_128 (seed 0) reference vectors (ADR 0061
+    /// rung A2), cross-checked against an **independent** implementation —
+    /// the widely-used `mmh3` PyPI package (`mmh3.hash64(input, seed=0,
+    /// signed=False)`, itself a port of Austin Appleby's reference
+    /// `MurmurHash3.cpp` x64_128 variant), not derived from this file's own
+    /// code. Every vector matched on the first try: **this implementation
+    /// is byte-for-byte canonical MurmurHash3 x64_128 with seed 0**, not a
+    /// deliberate variant — nothing here needed to "match the actual
+    /// documented contract" instead, per the task's contingency. That
+    /// matters beyond this crate: ADR 0022/0023 require the wire edges'
+    /// own token computation to agree with this one byte-for-byte, and this
+    /// test is the independent anchor that claim can be checked against.
+    ///
+    /// Input lengths are chosen to walk every branch of `murmur3_x64_128`'s
+    /// tail handling: whole 16-byte blocks only (16, 32), a short tail of
+    /// 1-7 bytes (no `k2` contribution), an exact 8-byte tail (`k1` only,
+    /// `tail.len() > 8` is false), and a 9-15 byte tail (both `k1` and
+    /// `k2`) — see the length noted on each case.
+    #[test]
+    fn murmur3_matches_canonical_reference_vectors() {
+        let cases: &[(&[u8], u64, u64)] = &[
+            // 1 byte: short tail, k1 only.
+            (b"\x01", 0x7ace5c908374fe16, 0x778867e4430e6785),
+            // 4 bytes: short tail, k1 only.
+            (b"\x01\x02\x03\x04", 0x0a0090a9da040fe3, 0xeadc23f882b31773),
+            // 7 bytes: short tail, k1 only.
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07",
+                0xf3f3cc065f0f5de9,
+                0x3d238137f035c091,
+            ),
+            // 8 bytes: exact tail boundary (`tail.len() > 8` is false, k1 only).
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07\x08",
+                0x9ce80ca5ef93bfdc,
+                0xc567e5e6b655ac07,
+            ),
+            // 9 bytes: tail feeds both k1 and k2.
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x09",
+                0xbf9dbe3fa2269d8e,
+                0xf1031a6fe0cf7da1,
+            ),
+            // 15 bytes: longest tail before a full block.
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+                0x084bf0a04820fc95,
+                0xa57735e8cbfa38d0,
+            ),
+            // 16 bytes: exactly one full block, empty tail.
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10",
+                0xb2c94760ef740fe0,
+                0x892f5d8512b98935,
+            ),
+            // 32 bytes: two full blocks, empty tail.
+            (
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\
+                  \x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20",
+                0xde00e0aaa0eb1988,
+                0xacce4dc71351197e,
+            ),
+            // Embedded 0x00 bytes: murmur3 has no escaping, so this must
+            // hash like any other 6-byte input (contrast with `escape`,
+            // which treats 0x00 specially — the two are unrelated).
+            (
+                b"\x00\x00\x00\x01\x02\x03",
+                0x74ea98b0af771591,
+                0x4cf190bd294fb98e,
+            ),
+            // All-0xff bytes: exercises the high end of the byte range.
+            (
+                b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+                0x9e0b99eb8313b766,
+                0x6b939faad7b0c4fa,
+            ),
+            // ASCII, for a human-legible anchor alongside the byte-pattern ones.
+            (b"alice", 0x4f1a4f97e8b355aa, 0x04f9427f309f8263),
+            (b"bob", 0xb51b1f0c60b4afdd, 0xa99ecdad185bbff8),
+        ];
+        for (input, h1, h2) in cases {
+            assert_eq!(
+                murmur3_x64_128(input, 0),
+                (*h1, *h2),
+                "mismatch for input {input:02x?}"
+            );
+            // `partition_token` is h1's big-endian bytes.
+            assert_eq!(partition_token(input), h1.to_be_bytes());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Same input -> same token, on every call — the load-bearing
+        /// cross-node/cross-restart agreement invariant the module doc
+        /// states in words; this checks it holds for arbitrary inputs, not
+        /// just the one fixed `"alice"` example above.
+        #[test]
+        fn partition_token_is_deterministic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            prop_assert_eq!(partition_token(&bytes), partition_token(&bytes));
+        }
+
+        /// The token is always exactly `TOKEN_BYTES` wide, for any input
+        /// length (including empty).
+        #[test]
+        fn partition_token_is_fixed_width(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            prop_assert_eq!(partition_token(&bytes).len(), TOKEN_BYTES);
+        }
+
+        /// A batch of random inputs spreads across most of the 8 top-level
+        /// "octants" of the 64-bit token space — the randomized-input
+        /// generalization of `tokens_spread_across_the_token_space`'s fixed
+        /// 64-single-byte-key check. Guarded by `prop_assume!` on the batch
+        /// actually being (almost) all distinct inputs, since a batch of
+        /// near-duplicate inputs is not a meaningful spread sample.
+        #[test]
+        fn partition_tokens_spread_across_octants(
+            inputs in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..40), 300)
+        ) {
+            let distinct: std::collections::BTreeSet<&Vec<u8>> = inputs.iter().collect();
+            prop_assume!(distinct.len() * 10 >= inputs.len() * 9);
+
+            let mut octants: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+            for b in &inputs {
+                let token = u64::from_be_bytes(partition_token(b));
+                octants.insert((token >> 61) as u8);
+            }
+            prop_assert!(
+                octants.len() >= 6,
+                "tokens should spread across most of the 8 octants, got {:?}",
+                octants
+            );
+        }
     }
 
     #[test]
