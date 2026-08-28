@@ -23,6 +23,7 @@
 
 pub mod decide;
 pub mod host;
+pub mod index_backfill;
 pub mod topology;
 mod wire;
 
