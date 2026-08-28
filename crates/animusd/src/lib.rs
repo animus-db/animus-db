@@ -11321,7 +11321,58 @@ impl ClientCtx {
                     ),
                 }
             }
-            _ => ClientResponse::Error("unexpected forwarded request".into()),
+            // ADR 0061 rung C1 hardening (root `CLAUDE.md`'s "grep every
+            // gating match site when adding a variant to a
+            // replicated/forwarded command enum" lesson — the exact
+            // precedent `wire::is_relayable_command` set): every remaining
+            // `ClientRequest` variant is named explicitly below, in place of
+            // the `_` wildcard this replaces, so a 29th variant is a compile
+            // error here until someone deliberately decides whether it needs
+            // a real arm above. Byte-for-byte behavior-preserving — all
+            // seven fell through the old wildcard to this exact response,
+            // and still do.
+            //
+            // None of these seven is a payload `cp_serve_forwarded` is ever
+            // handed in production: each is either served directly by
+            // `handle_request`'s own top-level match (never itself wrapped
+            // in `Forwarded`) or would be a protocol violation if it were.
+            //
+            // - `Status`/`JoinInfo`: answered locally by whichever node the
+            //   client happens to be connected to (`handle_request`'s own
+            //   arms) — neither needs leader resolution, so neither is ever
+            //   forwarded.
+            // - `WatchMetadata`: served only by a genuine control-group
+            //   replica via `ClientCtx::watch_metadata` (`handle_request`'s
+            //   own arm) — a `Remote`-handle node rejects it outright rather
+            //   than forwarding it on (see that method's own doc).
+            // - `ProposeSchema`: `handle_request`'s own arm gates it
+            //   (`is_relayable_command`) and reaches the control leader via
+            //   `ClientCtx::relay`/`propose_schema` directly — it IS a
+            //   one-hop relay mechanism, never the payload of another one.
+            // - `SplitTablet`: `handle_request`'s own arm calls
+            //   `ClientCtx::trigger_split` directly, which reaches the
+            //   control leader through `MetaCommand::SplitTablet`'s own
+            //   `is_relayable_command` relay — not through `Forwarded`.
+            // - `Txn`: `handle_request`'s own arm calls `ClientCtx::cp_txn`,
+            //   the 2PC coordinator — it forwards its own `TxnPrepare`/
+            //   `TxnDecide`/`TxnResolve`/`TxnStatus`/`TxnRecordView`/
+            //   `TxnVerify` sub-RPCs (handled by the arms above), but the
+            //   top-level `Txn` request itself is never re-wrapped.
+            // - `Forwarded`: a nested forward would be a second hop —
+            //   `cp_serve_forwarded`'s only caller (`handle_request`'s own
+            //   `Forwarded` arm) already unwrapped one, and this function
+            //   never re-forwards (the documented one-hop invariant, ADR
+            //   0017 #3b) — so a `Forwarded` carrying another `Forwarded`
+            //   has nothing valid to do here.
+            ClientRequest::Status
+            | ClientRequest::Forwarded { .. }
+            | ClientRequest::ProposeSchema(_)
+            | ClientRequest::SplitTablet { .. }
+            | ClientRequest::JoinInfo
+            | ClientRequest::WatchMetadata { .. }
+            | ClientRequest::Txn { .. } => {
+                ClientResponse::Error("unexpected forwarded request".into())
+            }
         }
     }
 

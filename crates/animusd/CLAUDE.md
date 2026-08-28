@@ -197,7 +197,21 @@ reusing the captured config is the point of the test.
   `cp_serve_forwarded`'s gating match here now takes a type
   (`ClientRequest`) defined in a different crate; see `animus-node/
   CLAUDE.md`'s note on why "grep every gating site" now spans that
-  boundary until C5.
+  boundary until C5. **Hardened (a small follow-on to C1, independent of
+  C5)**: the match is now exhaustive — every `ClientRequest` variant that
+  reaches no real handling above is named explicitly in one final arm
+  (grouped by why each is never a legitimate forwarded payload), replacing
+  the `_ => ClientResponse::Error("unexpected forwarded request")`
+  wildcard that used to catch a missed variant with zero compiler signal,
+  the exact hazard the root `CLAUDE.md`'s "grep every gating match site"
+  warning describes. A future 29th `ClientRequest` variant is now a
+  compile error here until someone deliberately gives it a real arm or
+  adds it to that final list — the cross-crate *grep* is still required
+  (nothing links the two crates' files together), only the *silent-miss*
+  failure mode is gone. Regression:
+  `tests/intra_port_split.rs::cp_serve_forwarded_refuses_every_never_forwarded_variant`
+  (a live single-node cluster, since building a bare `ClientCtx` outside a
+  real bring-up isn't practical here — see this crate's own Tests section).
 - **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
   blocks for `animus-node`'s three host-capability traits
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see

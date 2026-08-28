@@ -198,16 +198,24 @@ C4 (below) lands the HTTP wire edges (C4a/b/c/d) — `dynamo.rs`'s
 `run_operation`/DDL handlers are explicitly **not** part of C4; they fold
 into C5 (see C4's own entry for why).
 
-**One cross-crate discipline gap this creates until C5**:
-`cp_serve_forwarded`'s gating match (which internal-only `ClientRequest`
-variant gets real handling when unwrapped from `Forwarded`) still lives in
-`animusd`, while its input type (`ClientRequest`) lives here. The root
-`CLAUDE.md`'s "grep every gating match site when a replicated/forwarded
-command enum gains a variant" lesson therefore spans a crate boundary for
-as long as this split lasts — a reviewer adding a `ClientRequest` variant
-here must still go find `cp_serve_forwarded` in `animusd::lib` by hand;
-there is no compiler link between the two crates for this one axis (unlike
-`surface_of`, which *is* exhaustive and lives with the type it classifies).
+**One cross-crate discipline gap this creates until C5, narrowed (not
+closed) by a small follow-on hardening**: `cp_serve_forwarded`'s gating
+match (which internal-only `ClientRequest` variant gets real handling when
+unwrapped from `Forwarded`) still lives in `animusd`, while its input type
+(`ClientRequest`) lives here. The root `CLAUDE.md`'s "grep every gating
+match site when a replicated/forwarded command enum gains a variant"
+lesson therefore still spans a crate boundary for as long as this split
+lasts — a reviewer adding a `ClientRequest` variant here must still go
+find `cp_serve_forwarded` in `animusd::lib` by hand to give it a real arm.
+**What changed**: that match is now exhaustive (no `_ =>` wildcard,
+mirroring `is_relayable_command`'s own rung C1 hardening below) — a new
+variant added here is a compile error in `animusd` until someone
+explicitly decides its arm, rather than a silent fall-through to the
+generic "unexpected forwarded request" refusal. This closes the
+*silent-miss* half of the gap the same way `surface_of` already did for
+the client-vs-intra axis; it does **not** close the *cross-crate grep*
+half — the compile error still requires a human to go find and edit the
+right function in the other crate, same as before.
 
 ## The `is_relayable_command` hardening (rung C1)
 
