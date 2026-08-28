@@ -14,18 +14,35 @@ function of one seed. This is the substrate every distributed test runs on.
 - Driving: `run()` (to quiescence), `run_for(dur)` / `run_until(deadline)`
   (bounded virtual time), `run_until_quiescent(max_steps)`.
 - Faults: `partition`/`partition_pair`/`heal`, `crash`/`restart`, `stop`
-  (process exit), `set_net_config(NetConfig)` (delay/jitter/drop),
+  (process exit), `pause(node, dur)` (alive but frozen — see below),
+  `set_net_config(NetConfig)` / `set_net_config_for(node, ..)` (per-node,
+  keyed on the **sender**) / `set_link_net_config(from, to, ..)` (per
+  directed link, most specific — ADR 0061 rung B2, mirrors
+  `set_disk_config_for`'s per-node shape one level further); `NetConfig`
+  itself now carries delay/jitter, drop, **duplicate**
+  (`set_duplicate_prob`: a surviving message is re-delivered with its own
+  independent delay draw), **corrupt** (`set_corrupt_prob`: one payload byte
+  bit-flipped), and a **heavy-tailed delay** option
+  (`set_heavy_tail_prob` + `heavy_tail_max_jitter`: an occasional much
+  slower message without raising the common-case delay) —
   `set_disk_config(DiskConfig)` / `set_disk_config_for(node, ..)` (disk faults:
   per-op injected `io::Error`s on `append`/`sync`/`read`/`read_at`/`replace`/
   `link` (ADR 0058 rung 2 — modelled as a snapshot copy into an independent
   map slot, no inode/directory concept, since that's indistinguishable from
   a real hard link for the trait's sanctioned use: sharing an already-fully-
   synced, never-mutated-in-place file), torn un-synced tails on crash, byte
-  corruption of the torn region, and
+  corruption of the torn region,
   `DiskConfig::set_sync_delay` — a fixed extra virtual-time latency on every
   `append`/`sync`, issue #279's slow-disk livelock repro; unlike the other
   knobs it draws no RNG, so it's a plain fixed cost, not a seed-sampled
-  fault), and `corrupt_durable(node, file, offset)` (flip one durable byte —
+  fault — `DiskConfig::set_enospc_prob` (ADR 0061 rung B3: an
+  `ErrorKind::StorageFull` fault, distinguishable by a caller that branches
+  on `ErrorKind`, sharing one roll with `set_error_prob`'s generic
+  `ErrorKind::Other` — see `inject_disk_fault`'s doc for the bucket split),
+  and `DiskConfig::set_fsync_lie_prob` (fsync-acked-but-lost: `sync` returns
+  `Ok` but silently skips the buffered→durable move, so the bytes stay
+  exposed to a following `crash` exactly like any other un-synced tail)),
+  and `corrupt_durable(node, file, offset)` (flip one durable byte —
   at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`.
 - Clock skew (ADR 0018 §2 sim support): `set_clock_skew_for(node, skew_nanos)`
@@ -38,7 +55,22 @@ function of one seed. This is the substrate every distributed test runs on.
   against the single global timeline, since a per-node skewed *timeline*
   would reorder the shared event loop and break determinism; skew models a
   node's clock *reading* wrong (exactly what an HLC has to tolerate), not a
-  different flow of time for that node.
+  different flow of time for that node. **Clock drift** (ADR 0061 rung B3):
+  `set_clock_drift_for(node, drift_ppm)` layers a progressively widening
+  component on top of any static skew — `drift_ppm * elapsed_nanos_since_
+  the_call / 1_000_000`, added to `now()`/`wall_now()` reads. Same
+  read-side-only limit as static skew (never the shared timer timeline), same
+  default-empty/no-RNG/no-timeline-event contract.
+- **Process pause** (`pause(node, dur)`, ADR 0061 rung B3): alive but frozen
+  for `dur` of virtual time, then resumes on its own with full state intact —
+  a GC pause / cgroup throttle / VM stall, distinct from `crash` (drops
+  volatile state) and `stop` (removes tasks). While paused: no timer the node
+  owns fires, no message it sends leaves, and no message addressed to it is
+  delivered — all three are **deferred** (re-timelined to the resume instant,
+  not dropped or cancelled), so the node "catches up" the instant it
+  unfreezes. Deterministic: the resume deadline is computed from the current
+  virtual clock, never drawn from the RNG; traced at the call site
+  (`TraceEvent::Pause`).
 
 ## What's non-obvious
 
@@ -137,6 +169,29 @@ function of one seed. This is the substrate every distributed test runs on.
   region, never in previously-durable bytes. Tests: `tests/disk_faults.rs`
   (default-off byte-identity is asserted against a run with no config at all).
 
+- **`pause`'s defer mechanism reuses the existing `(time, seq)` timeline
+  rather than adding a second queue.** A `Timer`/`Deliver` event due while its
+  owner/destination is paused is popped from the timeline as usual (the
+  global clock still advances to its scheduled time — pause freezes a
+  *node's* perception, not the shared timeline) and then, instead of firing
+  (waking a task / pushing into an inbox), is **re-inserted** at
+  `(paused_until[node], fresh_seq)` and the loop moves on. When that new key
+  is eventually reached, the node is by definition no longer paused
+  (`clock < until` is false at `clock == until`), so it fires normally —
+  possibly deferred again if a second, later-ending `pause` call landed in
+  the meantime, which composes correctly for free. This is why `pause`
+  needed one new piece of bookkeeping `Sleep` didn't carry before:
+  `timer_owner: BTreeMap<TimerId, NodeId>`, populated the first time a
+  `Sleep` future actually schedules a timeline entry (a `sleep` that
+  resolves immediately on first poll never registers one, and never needs
+  to — there's no timer to ever defer). A paused **sender's** send is
+  handled differently — not via the timeline defer (the send call already
+  computed a delivery time before there's anything to intercept) but by
+  clamping `deliver_at` up to `paused_until[from]` inline in `send_stream`,
+  which also covers the edge case of a task already ready-queued (about to
+  run) at the exact moment `pause` was called: the executor still polls it
+  synchronously (pause never blocks *execution*, only future timer/delivery
+  *events*), but whatever it sends is held back regardless.
 - **Multiplexed `(node, stream)` addressing (ADR 0026).** The inbox/waker maps
   are keyed `(NodeId, u64)` instead of `NodeId`, so a node can be addressed on
   more than one stream; `crash`/`stop` now node-prefix-scan both maps (the same
@@ -148,6 +203,34 @@ function of one seed. This is the substrate every distributed test runs on.
   `tests/determinism.rs::multiplexed_streams_are_isolated_and_deterministic`
   proves it directly (two streams to one node don't cross-talk, and the run —
   trace included — reproduces byte-for-byte from the seed).
+
+- **`NetConfig`'s new knobs share one fixed draw order per send, all gated on
+  their own threshold being non-zero** (ADR 0061 rung B2/B3): drop roll →
+  corrupt roll (+ byte offset, only if the payload is non-empty — `gen_below`
+  itself already draws nothing for `n == 0`, so an empty payload naturally
+  costs one fewer draw, not a special case) → the primary delivery's jitter
+  draw (its own heavy-tail roll, then the jitter) → duplicate roll → (if it
+  fires) the duplicate's **own, independently-drawn** jitter (its own
+  heavy-tail roll too). With every new threshold at its default 0 this
+  reduces to exactly the original two-draw sequence (drop, then jitter) —
+  the same "extra rolls are gated on non-zero, so off costs nothing"
+  discipline `DiskConfig` already established, now shared via a
+  `net_cfg_for(from, to)` resolution helper (link → per-node-on-sender →
+  global) that mirrors `disk_cfg_for`. **The duplicate is independently
+  delayed, not delivered at the same instant** — a deliberate choice (see
+  `NetConfig::set_duplicate_prob`'s doc): it models a real duplicated packet
+  taking its own path through the network, and it means a duplicate can
+  arrive *before* the original.
+- **`DiskConfig::enospc_threshold` and `error_threshold` share one roll**,
+  not two independent ones (`inject_disk_fault`): `roll < enospc_threshold`
+  fires ENOSPC, else `roll < enospc_threshold + error_threshold` fires
+  generic, else no fault. This is what keeps a pre-existing `error_prob`-only
+  config's draw *and* comparison byte-identical (`enospc_threshold` defaults
+  to 0, so the combined check degenerates to exactly the old single
+  comparison) rather than merely drawing the same number of values — two
+  independent rolls would have needed to fire in a fixed order too, but
+  would have drawn an *extra* value even for an enospc-only config, which
+  one-roll-two-buckets avoids.
 
 ## Tests
 
@@ -173,6 +256,37 @@ The HLC-specific causality-under-skew property (a behind-clock node's mint
 still exceeds an ahead-clock node's) is tested in
 `animus-cp-data/tests/hlc_skew.rs`, since it needs both this crate and
 `animus_cp_data::hlc`.
+
+`tests/net_faults.rs` (ADR 0061 rung B2/B3) covers per-node/per-link
+`NetConfig` resolution (link beats per-node-on-sender beats global — and a
+per-node override scopes to the node as *sender*, leaving another node's
+sends on the same destination unaffected), duplication (probability 1.0
+delivers every message exactly twice, with independent — usually differing —
+delays, reproducibly from the seed; probability 0 delivers once, matching
+before), wire-payload corruption (probability 1.0 flips exactly one payload
+byte reproducibly; probability 0 never touches the payload), heavy-tailed
+jitter (with the ordinary ceiling at 0 and the heavy tail always selected,
+delivery delay reaches well past what the ordinary ceiling would ever allow),
+and a default-byte-identical test proving an explicitly-default `NetConfig`
+set globally/per-node/per-link changes nothing. `tests/pause.rs` covers
+`pause`: a timer due mid-pause is deferred to the resume instant, not fired
+early or lost; a message addressed to a paused node queues (delivered only
+after resume, never dropped); a paused node's own send is held back until
+resume (including the ready-queued-at-pause-time edge case); the pause
+script is deterministic and traced (`PAUSE node=... until=...`); and another
+node's schedule is unaffected by a peer's pause. `tests/disk_faults.rs`
+additionally covers ENOSPC (`ErrorKind::StorageFull` is distinguishable from
+a generic `ErrorKind::Other` fault, the two compose on one shared roll and
+both occur reproducibly, and the default `enospc_prob == 0` leaves a
+generic-error-only config's outcome sequence pinned to what it was before
+ENOSPC existed) and fsync-acked-but-lost (`sync` returns `Ok` but a following
+crash still loses the "acked" bytes at probability 1.0, reproducibly; at
+probability 0 — the default — a genuinely synced write survives a crash as
+before). `tests/clock_skew.rs` additionally covers clock drift
+(`set_clock_drift_for`): a node's observed skew widens linearly with elapsed
+virtual time at exactly its configured ppm rate, composes additively with a
+static skew rather than replacing it, is reproducible from the seed, and
+defaults to no divergence with no call.
 
 `segment_store.rs`'s own `#[cfg(test)] mod tests` (unit tests, not a
 `tests/*.rs` integration file — small enough to sit beside the impl) covers
