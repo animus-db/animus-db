@@ -232,6 +232,26 @@ function of one seed. This is the substrate every distributed test runs on.
   would have drawn an *extra* value even for an enospc-only config, which
   one-roll-two-buckets avoids.
 
+- **Failure minimization (ADR 0061 rung B4) lives in `animus-test`, not
+  here, and deliberately minimizes *scenario parameters*, not the fault
+  *schedule*.** `animus_test::shrink` re-runs a whole scenario per candidate
+  with the seed held fixed — it never asks this crate to suppress one
+  specific fault decision (one dropped message, say) while keeping the rest
+  of the same run. That stronger form (isolate "message #4173 dropped" out
+  of an ambient `NetConfig`/`DiskConfig` probability) would need a
+  **recorded-schedule replay mode**: every fault roll here is drawn inline,
+  gated on its own threshold (see "one roll, two buckets" and the
+  duplicate-delay note above), so suppressing one roll without redrawing it
+  would shift every later roll's position in the stream — not a small
+  change, and one that risks the byte-identical-trace guarantee
+  (`tests/determinism.rs`) this crate exists to protect. Not built for that
+  reason; see `crates/animus-test/CLAUDE.md`'s "Failure minimization"
+  section for what *is* built and why scenario-parameter minimization
+  already reaches "drop one specific scheduled fault" for every corpus in
+  the repo today (their `faults: Vec<(Duration, Nemesis)>`-shaped fields are
+  already explicit, un-randomized `Scenario` data, not something this crate
+  draws from RNG).
+
 ## Tests
 
 `cargo test -p animus-sim` — `tests/determinism.rs` asserts byte-identical

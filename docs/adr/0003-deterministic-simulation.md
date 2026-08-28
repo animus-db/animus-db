@@ -21,6 +21,14 @@
   frozen) primitive. Every new knob is opt-in and default-off, so this does
   not weaken the guarantee below — see `crates/animus-sim/CLAUDE.md` for the
   full contract of each.
+- **2026-08-28 note (2):** [ADR 0061](0061-testability-node-crate-simulator.md)
+  rung B4 builds the failure-minimization facility this ADR's own
+  Consequences promised and the "Known fidelity limits" section below used to
+  list as still-missing: `animus_test::shrink`, opt-in via `ANIMUS_SHRINK=1`,
+  default off. It minimizes a failing scenario's own **parameters**, seed
+  held fixed — not the seed itself, which is opaque by design and has no
+  "smaller" — see the amended limits entry below and
+  `crates/animus-test/src/shrink.rs`'s module doc for why.
 - **Date:** 2026-08-01
 
 ## Context
@@ -46,7 +54,7 @@ so the same code runs in production and under simulation with no branches.
   that distinguishes synced from un-synced bytes (a "crash" drops un-synced
   bytes), and a cooperative single-threaded run-queue.
 
-### Known fidelity limits (audit, 2026-08-06; refreshed 2026-08-28, ADR 0061 rung B2/B3)
+### Known fidelity limits (audit, 2026-08-06; refreshed 2026-08-28, ADR 0061 rungs B2/B3/B4)
 
 The seam is honoured throughout, but both envs are weaker than the paragraph
 above reads, and the gaps are exactly where prod-only bugs have already hidden:
@@ -130,11 +138,28 @@ above reads, and the gaps are exactly where prod-only bugs have already hidden:
   practice entry; found via the WAL group-commit deadlock). Still open —
   nothing in ADR 0061 changes this boundary; it is deliberate (see the ADR's
   own Consequences).
-- **No shrinking/minimization facility yet** (ADR 0061 rung B4, not yet
-  built): a failing corpus seed's fault schedule and op count still have to
-  be triaged by manual re-running rather than automatically reduced to a
-  minimal reproducing case, despite this ADR's own Consequences promising it
-  from the start.
+- **Shrinking/minimization — closed for scenario parameters, ADR 0061 rung
+  B4.** This ADR's own Consequences promised "shrinking a failure to a
+  minimal seed" from the start; that phrase was never literally buildable —
+  a `SimEnv` run is a pure function of an *opaque* seed (ADR 0003's whole
+  point), so no seed is "smaller" than another and there is nothing to
+  shrink *to*. What rung B4 built instead, `animus_test::shrink`, is
+  **scenario-parameter minimization**: given a failing named scenario, hold
+  its seed fixed and delta-debug its own explicit parameters (fault
+  schedule, round/client/keyspace counts, outage windows — whatever the
+  corpus's own `Scenario` type exposes) down to a locally-minimal
+  reproducing case, opt-in via `ANIMUS_SHRINK=1`, default off, iteration-
+  budget-bounded, and itself deterministic (same failing input always
+  reduces to the same minimized output). **Deliberately not built**: fault-
+  *schedule* minimization (suppressing one specific injected fault — one
+  dropped message, say — out of an ambient `NetConfig`/`DiskConfig`
+  probability, as opposed to one whole scheduled `Scenario` fault entry)
+  needs a recorded-schedule replay mode so that suppressing one fault
+  decision doesn't perturb every RNG draw after it, which touches the same
+  RNG-draw-order machinery this file's byte-identical-trace guarantee
+  depends on — deferred rather than risking that guarantee for a half-
+  working version. See `crates/animus-test/CLAUDE.md`'s shrink section and
+  `crates/animus-test/src/shrink.rs`'s module doc for the full account.
 
 System code must never call `std::time::*`, spawn raw tasks, touch real
 sockets/disk, use unseeded RNG, or iterate a `HashMap`/`HashSet` (use
@@ -144,7 +169,9 @@ failing simulation run prints its seed for one-command replay.
 ## Consequences
 
 - Every distributed behavior gets a reproducible, fault-injecting test, and
-  shrinking a failure to a minimal seed becomes possible.
+  (ADR 0061 rung B4; see the amendment above for why "minimal seed" was never
+  literally the right framing) a failing scenario's own parameters can be
+  automatically minimized to a small reproducing case, holding its seed fixed.
 - There is an upfront cost: the `Env` seam must be designed carefully and all
   subsystems must be written against it from day one. Retrofitting is expensive,
   so we pay this cost first (milestone M1).
