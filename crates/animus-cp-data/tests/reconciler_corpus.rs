@@ -44,6 +44,7 @@ use animus_env::{Clock, EnvExt, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
+use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
@@ -131,17 +132,6 @@ fn view_with_down(
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: down.into_iter().collect(),
     }
-}
-
-/// FNV-1a over a scenario's name — the frozen, name-derived seed (ADR 0014
-/// style; identical algorithm to `raftkv_linearizable.rs::name_seed`).
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 // ---------------------------------------------------------------------------
@@ -495,62 +485,37 @@ where
 // The frozen corpus: named scenarios, each a fixed lifecycle script.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Scenario {
-    name: &'static str,
+    name: String,
     seed: u64,
     run: fn(u64),
 }
 
-/// Expand each cell into `k` seed variants (ADR 0014 style): variant 0 keeps
-/// the cell's canonical (frozen) name + seed, so `k=1` is byte-identical to
-/// the always-on default; variants `1..k` get a `_sNN` suffix and a fresh
-/// name-derived seed, exercising the SAME script under different
-/// Raft-election-timing interleavings.
-fn seed_expand(cells: Vec<Scenario>, k: usize) -> Vec<Scenario> {
-    if k <= 1 {
-        return cells;
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
     }
-    let mut out = Vec::with_capacity(cells.len() * k);
-    for cell in cells {
-        for i in 0..k {
-            if i == 0 {
-                out.push(Scenario {
-                    name: cell.name,
-                    seed: cell.seed,
-                    run: cell.run,
-                });
-            } else {
-                // Leak a small, bounded number of strings for `'static` names —
-                // acceptable in a test binary's corpus expansion (mirrors the
-                // sibling corpora's approach of keeping names `'static`).
-                let name: &'static str =
-                    Box::leak(format!("{}_s{i:02}", cell.name).into_boxed_str());
-                out.push(Scenario {
-                    name,
-                    seed: name_seed(name),
-                    run: cell.run,
-                });
-            }
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            run: self.run,
         }
     }
-    out
 }
 
 /// Depth knob (`ANIMUS_RECONCILER_SEEDS`, default 1) — mirrors
 /// `ANIMUS_RAFTKV_SEEDS`/`ANIMUS_CORPUS_SEEDS`.
 fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_RECONCILER_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
+    corpus::seeds_from_env("ANIMUS_RECONCILER_SEEDS")
 }
 
 macro_rules! scenario {
     ($name:expr, $f:ident) => {
         Scenario {
-            name: $name,
-            seed: name_seed($name),
+            name: $name.to_string(),
+            seed: corpus::name_seed($name),
             run: $f,
         }
     };
@@ -655,7 +620,7 @@ fn scenario_cells() -> Vec<Scenario> {
 }
 
 fn corpus() -> Vec<Scenario> {
-    seed_expand(scenario_cells(), seeds_per_cell())
+    corpus::seed_expand(scenario_cells(), seeds_per_cell())
 }
 
 // ---------------------------------------------------------------------------
@@ -2042,7 +2007,7 @@ fn reconciler_corpus_names_and_seeds_are_unique_and_frozen() {
         cells.len()
     );
 
-    let names: BTreeSet<&str> = cells.iter().map(|s| s.name).collect();
+    let names: BTreeSet<&str> = cells.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names.len(), cells.len(), "corpus names must be unique");
     let seeds: BTreeSet<u64> = cells.iter().map(|s| s.seed).collect();
     assert_eq!(seeds.len(), cells.len(), "corpus seeds must be unique");
@@ -2050,7 +2015,7 @@ fn reconciler_corpus_names_and_seeds_are_unique_and_frozen() {
     for cell in &cells {
         assert_eq!(
             cell.seed,
-            name_seed(cell.name),
+            corpus::name_seed(&cell.name),
             "frozen seed moved for {}",
             cell.name
         );
@@ -2065,10 +2030,10 @@ fn reconciler_corpus_names_and_seeds_are_unique_and_frozen() {
 fn reconciler_corpus_seed_expansion_is_additive_and_unique() {
     let base = scenario_cells();
     let k = 3;
-    let expanded = seed_expand(scenario_cells(), k);
+    let expanded = corpus::seed_expand(scenario_cells(), k);
     assert_eq!(expanded.len(), base.len() * k);
 
-    let names: BTreeSet<&str> = expanded.iter().map(|s| s.name).collect();
+    let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names.len(), expanded.len(), "expanded names must be unique");
     let seeds: BTreeSet<u64> = expanded.iter().map(|s| s.seed).collect();
     assert_eq!(seeds.len(), expanded.len(), "expanded seeds must be unique");
@@ -2080,7 +2045,7 @@ fn reconciler_corpus_seed_expansion_is_additive_and_unique() {
             .unwrap_or_else(|| panic!("base scenario {} missing after expansion", b.name));
         assert_eq!(kept.seed, b.seed, "seed moved for {}", b.name);
     }
-    assert_eq!(seed_expand(scenario_cells(), 1).len(), base.len());
+    assert_eq!(corpus::seed_expand(scenario_cells(), 1).len(), base.len());
 }
 
 /// a() single deterministic replay of one scenario twice must behave
@@ -2092,7 +2057,7 @@ fn reconciler_corpus_seed_expansion_is_additive_and_unique() {
 /// determinism hole).
 #[test]
 fn reconciler_scenario_is_reproducible_from_its_seed() {
-    let seed = name_seed("fresh_whole_keyspace_host_elect_serve");
+    let seed = corpus::name_seed("fresh_whole_keyspace_host_elect_serve");
     scenario_fresh_single_node(seed);
     scenario_fresh_single_node(seed);
 }

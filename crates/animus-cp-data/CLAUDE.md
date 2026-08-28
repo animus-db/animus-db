@@ -1331,7 +1331,11 @@ The 31 `host.rs` unit tests prove `plan` correct as a pure function; this
 corpus is the **seed-reproducible fault-injection** suite for the whole
 tablet lifecycle, following the house corpus doctrine (ADR 0014): a frozen,
 name-seeded scenario list, a depth knob, and coverage/seed-expansion
-guards. See the test file for the 19 frozen scenarios and the generic
+guards. The seeding scaffolding itself (`name_seed`/`seeds_from_env`/
+`seed_expand`) is `animus_test::corpus` (ADR 0061 rung B1), a dev-dependency
+shared with every corpus in this repo — this file's own `Scenario` implements
+`corpus::SeedVariant` rather than rolling its own expansion. See the test file
+for the 19 frozen scenarios and the generic
 invariant checks (hosting convergence, data safety, no zombie groups,
 idempotence) — two merge-lifecycle scenarios (the absorb-drain regression
 and its livelock-fix twin) were removed along with the reconciler actions

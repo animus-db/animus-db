@@ -16,6 +16,7 @@ use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::KeyRange;
+use animus_test::corpus;
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -219,11 +220,7 @@ fn mid_build_updates_win_by_carried_version_and_stale_resends_lose() {
 /// Depth knob (`ANIMUS_SPLIT_SEEDS`, default 1) — mirrors
 /// `ANIMUS_RECONCILER_SEEDS`/`ANIMUS_RAFTKV_SEEDS`.
 fn seeds_per_cell() -> u64 {
-    std::env::var("ANIMUS_SPLIT_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1)
-        .max(1)
+    corpus::seeds_from_env("ANIMUS_SPLIT_SEEDS") as u64
 }
 
 /// Corpus cell: the driver's whole recovery story is "re-run the pass" —

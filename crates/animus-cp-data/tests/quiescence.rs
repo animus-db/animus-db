@@ -46,6 +46,7 @@ use animus_env::{EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{escape, partition_token};
+use animus_test::corpus;
 use futures::executor::block_on;
 
 const NODES: [u64; 3] = [0, 1, 2];
@@ -60,11 +61,7 @@ type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 /// Depth knob (`ANIMUS_QUIESCE_SEEDS`, default 1) — mirrors `ANIMUS_
 /// RECONCILER_SEEDS`/`ANIMUS_RAFTKV_SEEDS`'s exact pattern.
 fn seed_depth() -> u64 {
-    std::env::var("ANIMUS_QUIESCE_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .max(1)
+    corpus::seeds_from_env("ANIMUS_QUIESCE_SEEDS") as u64
 }
 
 /// Every seed a scenario runs at, derived from `base` — additive under a
