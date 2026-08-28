@@ -235,7 +235,10 @@ truth; this map is just for navigation.
 - **Placement, rebalancing & growth** — `animus-placement` (ADR 0005): pure
   policy engine (RF + residency labels + failure-domain spread), `replan`
   (failure repair) + `rebalance_step` (ADR 0029: one balance-driven move per
-  call, converges to max−min ≤ 1). The control-plane leader reconciles
+  call; converges to max−min ≤ 1 when the policy sets no `SpreadPolicy` — with
+  a spread constraint the domain guard can legally block every improving move,
+  so only monotonic non-worsening and termination hold, see the property tests
+  in `animus-placement/tests/placement_props.rs`). The control-plane leader reconciles
   placement event-driven (ADR 0031). Clusters grow online: new nodes
   self-register and mirror `Metadata` (ADR 0030), join via seed addresses, and
   are decommissioned via drain → remove (ADR 0032).
