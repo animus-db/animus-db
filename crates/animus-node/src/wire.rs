@@ -766,170 +766,197 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
 /// legitimate reason to be triggerable by an arbitrary relay chain from a
 /// node that isn't even running the janitor.
 ///
+/// **As built (ADR 0061 rung C1)**: rewritten from a `matches!` (no
+/// exhaustiveness requirement — a new `MetaCommand` variant used to default
+/// silently to "not relayable" with zero compiler signal, exactly the
+/// bimodal per-process flake the root `CLAUDE.md` warns about) into this
+/// exhaustive `match` with no `_ =>` arm, preserving the exact prior
+/// classification for every existing variant. `tests::classification_is_pinned`
+/// pins it.
 pub fn is_relayable_command(command: &MetaCommand) -> bool {
-    matches!(
-        command,
+    match command {
         MetaCommand::CreateTableSchema { .. }
-            | MetaCommand::DropTableSchema { .. }
-            // Atomic `ALTER TABLE` (in-place schema replacement): a follower-
-            // connected ALTER must relay like the create/drop it replaces.
-            | MetaCommand::ReplaceTableSchema { .. }
-            | MetaCommand::CreateTableIndex { .. }
-            | MetaCommand::DropTableIndex { .. }
-            // Index status transition (ADR 0045): same schema-catalog class as
-            // `CreateTableIndex`/`DropTableIndex` — the backfill
-            // seeder/aggregator (this crate) may propose it from wherever the
-            // relevant tablet/control leader actually runs.
-            | MetaCommand::SetIndexStatus { .. }
-            // Backfill-completion catalog commit (ADR 0045 §4): a tablet
-            // leader's own "I finished seeding this index" proposal, from
-            // wherever that leader actually runs — same relay reasoning as
-            // `SealStreamShard` just below. `index_backfill_loop` (the
-            // aggregator that reads this catalog and flips a table's index
-            // to `Active`) is control-plane-leader-only and proposes
-            // `SetIndexStatus` directly, exactly like `SealStreamShard`'s own
-            // aggregator does, so it needs no relay path of its own.
-            | MetaCommand::MarkIndexBackfilled { .. }
-            // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
-            // class, same relay reason as `CreateTableIndex` — a
-            // follower-connected `CreateTable`/`UpdateTable` must reach the
-            // control leader.
-            | MetaCommand::SetTableStream { .. }
-            // DynamoDB-style TTL configuration (ADR 0051): schema-catalog
-            // class, same relay reason as `SetTableStream` — a
-            // follower-connected `UpdateTimeToLive` must reach the control
-            // leader.
-            | MetaCommand::SetTableTtl { .. }
-            // Stream-shard catalog commit (ADR 0042/0043): a tablet leader's
-            // own seal proposal, from wherever that leader actually runs —
-            // see this function's own doc for why `ExpireStreamShards` is
-            // deliberately NOT included here.
-            | MetaCommand::SealStreamShard { .. }
-            | MetaCommand::RegisterCpAddr { .. }
-            // Node address book (ADR 0032 PR1): every node self-registers its
-            // full address set at startup, from whichever node it happens to
-            // connect to for control-plane proposals — must relay like
-            // `RegisterCpAddr` (a follower-connected node has no other way to
-            // reach the control leader).
-            | MetaCommand::RegisterNodeAddrs { .. }
-            // Copy-based split workflow (ADR 0050): `trigger_split` proposes
-            // `BeginSplit` from whichever node's admin/auto-split surface
-            // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
-            // from the parent's own leader node — both need the identical
-            // follower-connected relay path `SplitTablet` already has.
-            | MetaCommand::BeginSplit { .. }
-            | MetaCommand::CutoverSplit { .. }
-            // In-place split workflow (ADR 0058 Train 2 rung 3): the SAME
-            // relay reasoning as the copy-based `BeginSplit`/`CutoverSplit`
-            // pair above — `trigger_split` (in-place mode) proposes
-            // `BeginSplitInPlace` from whichever node's admin/auto-split
-            // surface fired it, and `CutoverSplit` here is proposed by the
-            // parent's own leader node once its data-plane fork has
-            // completed and its pre-cutover vetoes pass, exactly the same
-            // follower-connected relay need.
-            | MetaCommand::BeginSplitInPlace { .. }
-            // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
-            // client relays the table's tablet creation + RF policy to the control
-            // leader. Scoped to one tablet per table by the state machine's guard.
-            | MetaCommand::CreateTablet { .. }
-            | MetaCommand::SetTabletPolicy { .. }
-            // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
-            // client relays the table's tablet removal to the control leader.
-            | MetaCommand::DropTableTablets { .. }
-            // Online growth (ADR 0030): admin add-member registers a new raftkv
-            // id as `Down` — see the doc above for why this is safe to relay
-            // unlike drain (which stays local-leader-only).
-            | MetaCommand::UpsertMember {
-                status: NodeStatus::Down,
-                ..
-            }
-            // Registration CAS (ADR 0040 Decision C): a joining process has
-            // no local control role at all yet (it hasn't even bound its
-            // listeners), so relaying `RegisterNode` via `ProposeSchema` is
-            // its *only* way to reach the real leader — exactly the
-            // `Down`-registering `UpsertMember` case just above, and safe
-            // for the identical reason: an unclaimed `RegisterNode` apply
-            // always registers the new member `Down` (never any other
-            // status), granting no placement eligibility by itself — the
-            // detector still requires a real heartbeat before anything
-            // happens to it; a *claimed* id's apply is a `NoOp`/`Rejected`
-            // no-op either way. Missing this arm would be the exact bimodal
-            // per-process flake the root `CLAUDE.md` warns about: a join
-            // that happens to land on a follower-connected seed would hang
-            // until `JOIN_DISCOVERY_BUDGET` expires, indistinguishable from
-            // "no seed answered" — see `tests/seed_join_allocated.rs`'s
-            // follower-connected-seed case.
-            | MetaCommand::RegisterNode { .. }
-            // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
-            // an operator's `CreateBackup` call may land on any node, exactly
-            // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
-            // (`animusd::dynamo::create_backup`'s own propose) to the control
-            // leader is the same schema-catalog-class need every DDL-shaped
-            // wire mutation above already has. Missing this arm is the exact
-            // bimodal per-process flake the root `CLAUDE.md` warns about: a
-            // `CreateBackup` that happens to land on a follower-connected
-            // node would hang for `SCHEMA_COMMIT_TIMEOUT` instead of relaying
-            // — see `tests/schema_ddl_relay.rs`'s
-            // `create_backup_on_a_follower_is_relayed_to_the_leader`.
-            | MetaCommand::BeginBackup { .. }
-            // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
-            // a tablet leader's own "I finished capturing my share of this
-            // backup" proposal, from wherever that leader actually runs —
-            // the identical relay reasoning as `MarkIndexBackfilled`/
-            // `SealStreamShard` just above. `CompleteBackup`/`FailBackup`
-            // are deliberately NOT included here: their only intended
-            // production caller (the completion aggregator, a
-            // control-plane-leader-only background loop, this crate) already
-            // proposes them directly off its own live `RaftNode` handle,
-            // exactly the same `ExpireStreamShards` precedent this function's
-            // own doc states above — no wire surface exists yet for either
-            // (Train 1 PR④'s concern) to need a relay path of its own.
-            | MetaCommand::RecordBackupTabletComplete { .. }
-            // `DeleteBackup` wire operation (ADR 0059 §3, Train 1 PR④): an
-            // operator's `DeleteBackup` call may land on any node, exactly
-            // like `CreateTable`/`UpdateTimeToLive` — relaying
-            // `MarkBackupDeleted` (the two-phase janitor's own **mark**
-            // step) to the control leader is the same schema-catalog-class
-            // need every DDL-shaped wire mutation above already has.
-            // `DeleteBackup` (the existing, unmodified **finalizing**
-            // command) is deliberately NOT added here — its only intended
-            // caller is the backup janitor (`animusd::backup_janitor`), a
-            // control-plane-leader-only background loop that already holds
-            // a live `RaftNode` handle, the identical `ExpireStreamShards`
-            // precedent this function's own doc states above.
-            | MetaCommand::MarkBackupDeleted { .. }
-            // Restore workflow (ADR 0059 §7, Train 2): `RestoreTableFromBackup`
-            // (`animusd::dynamo::restore_table_from_backup`) may land on any
-            // node, exactly like `CreateTable`; the restore driver
-            // (`animusd::backup_restore`) proposes `CompleteRestore`/
-            // `FailRestore` from wherever its target tablet's own leader
-            // happens to run — the identical relay reasoning as
-            // `RecordBackupTabletComplete` above.
-            | MetaCommand::BeginRestore { .. }
-            | MetaCommand::CompleteRestore { .. }
-            | MetaCommand::FailRestore { .. }
-            // PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups` (the
-            // wire operation's own catalog toggle) may land on any node,
-            // exactly like `UpdateTimeToLive` — schema-catalog class, same
-            // relay reason as `SetTableTtl` above.
-            | MetaCommand::UpdateContinuousBackups { .. }
-            // PITR segment catalog commit: a tablet leader's own seal
-            // proposal, from wherever that leader actually runs — the
-            // identical relay reasoning as `SealStreamShard` above.
-            | MetaCommand::SealPitrSegment { .. }
-            // Tagging a `BeginBackup` row as a PITR base snapshot: proposed
-            // by `pitr_janitor::pitr_snapshot_loop`, a control-plane-
-            // leader-only background loop with its own live `RaftNode`
-            // handle on every node shape it runs on — this crate never
-            // relays it through the wire edge today, but it is included
-            // here defensively, mirroring `SealPitrSegment`'s own class,
-            // rather than surfacing as an opaque relay refusal if that ever
-            // changes. `ExpirePitrSegments` is deliberately NOT included,
-            // for the identical reason `ExpireStreamShards` isn't: its only
-            // intended caller (`pitr_janitor::pitr_janitor_loop`) already
-            // proposes directly off its own live `RaftNode` handle.
-            | MetaCommand::MarkBackupPitrBase { .. }
-    )
+        // Atomic `ALTER TABLE` (in-place schema replacement): a follower-
+        // connected ALTER must relay like the create/drop it replaces.
+        | MetaCommand::ReplaceTableSchema { .. }
+        | MetaCommand::DropTableSchema { .. }
+        | MetaCommand::CreateTableIndex { .. }
+        | MetaCommand::DropTableIndex { .. }
+        // Index status transition (ADR 0045): same schema-catalog class as
+        // `CreateTableIndex`/`DropTableIndex` — the backfill
+        // seeder/aggregator (`animusd`) may propose it from wherever the
+        // relevant tablet/control leader actually runs.
+        | MetaCommand::SetIndexStatus { .. }
+        // Backfill-completion catalog commit (ADR 0045 §4): a tablet
+        // leader's own "I finished seeding this index" proposal, from
+        // wherever that leader actually runs — same relay reasoning as
+        // `SealStreamShard` just below. `index_backfill_loop` (`animusd`,
+        // the aggregator that reads this catalog and flips a table's index
+        // to `Active`) is control-plane-leader-only and proposes
+        // `SetIndexStatus` directly, exactly like `SealStreamShard`'s own
+        // aggregator does, so it needs no relay path of its own.
+        | MetaCommand::MarkIndexBackfilled { .. }
+        // DynamoDB Streams enable/disable (ADR 0042): schema-catalog
+        // class, same relay reason as `CreateTableIndex` — a
+        // follower-connected `CreateTable`/`UpdateTable` must reach the
+        // control leader.
+        | MetaCommand::SetTableStream { .. }
+        // DynamoDB-style TTL configuration (ADR 0051): schema-catalog
+        // class, same relay reason as `SetTableStream` — a
+        // follower-connected `UpdateTimeToLive` must reach the control
+        // leader.
+        | MetaCommand::SetTableTtl { .. }
+        // Stream-shard catalog commit (ADR 0042/0043): a tablet leader's
+        // own seal proposal, from wherever that leader actually runs — see
+        // this function's own doc for why `ExpireStreamShards` is
+        // deliberately NOT included here.
+        | MetaCommand::SealStreamShard { .. }
+        | MetaCommand::RegisterCpAddr { .. }
+        // Node address book (ADR 0032 PR1): every node self-registers its
+        // full address set at startup, from whichever node it happens to
+        // connect to for control-plane proposals — must relay like
+        // `RegisterCpAddr` (a follower-connected node has no other way to
+        // reach the control leader).
+        | MetaCommand::RegisterNodeAddrs { .. }
+        // Copy-based split workflow (ADR 0050): `trigger_split` proposes
+        // `BeginSplit` from whichever node's admin/auto-split surface
+        // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
+        // from the parent's own leader node — both need the identical
+        // follower-connected relay path `SplitTablet` already has.
+        | MetaCommand::BeginSplit { .. }
+        | MetaCommand::CutoverSplit { .. }
+        // In-place split workflow (ADR 0058 Train 2 rung 3): the SAME
+        // relay reasoning as the copy-based `BeginSplit`/`CutoverSplit`
+        // pair above — `trigger_split` (in-place mode) proposes
+        // `BeginSplitInPlace` from whichever node's admin/auto-split
+        // surface fired it, and `CutoverSplit` here is proposed by the
+        // parent's own leader node once its data-plane fork has
+        // completed and its pre-cutover vetoes pass, exactly the same
+        // follower-connected relay need.
+        | MetaCommand::BeginSplitInPlace { .. }
+        // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
+        // client relays the table's tablet creation + RF policy to the control
+        // leader. Scoped to one tablet per table by the state machine's guard.
+        | MetaCommand::CreateTablet { .. }
+        | MetaCommand::SetTabletPolicy { .. }
+        // Drop-table GC (ADR 0024): a `DROP TABLE` on a follower-connected
+        // client relays the table's tablet removal to the control leader.
+        | MetaCommand::DropTableTablets { .. }
+        // Registration CAS (ADR 0040 Decision C): a joining process has
+        // no local control role at all yet (it hasn't even bound its
+        // listeners), so relaying `RegisterNode` via `ProposeSchema` is
+        // its *only* way to reach the real leader — the identical
+        // `Down`-registering `UpsertMember` case handled below, and safe
+        // for the identical reason: an unclaimed `RegisterNode` apply
+        // always registers the new member `Down` (never any other
+        // status), granting no placement eligibility by itself — the
+        // detector still requires a real heartbeat before anything
+        // happens to it; a *claimed* id's apply is a `NoOp`/`Rejected`
+        // no-op either way. Missing this arm would be the exact bimodal
+        // per-process flake the root `CLAUDE.md` warns about: a join
+        // that happens to land on a follower-connected seed would hang
+        // until `JOIN_DISCOVERY_BUDGET` expires, indistinguishable from
+        // "no seed answered" — see `tests/seed_join_allocated.rs`'s
+        // follower-connected-seed case (`animusd`).
+        | MetaCommand::RegisterNode { .. }
+        // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
+        // an operator's `CreateBackup` call may land on any node, exactly
+        // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
+        // (`animusd::dynamo::create_backup`'s own propose) to the control
+        // leader is the same schema-catalog-class need every DDL-shaped
+        // wire mutation above already has. Missing this arm is the exact
+        // bimodal per-process flake the root `CLAUDE.md` warns about: a
+        // `CreateBackup` that happens to land on a follower-connected
+        // node would hang for `SCHEMA_COMMIT_TIMEOUT` instead of relaying
+        // — see `tests/schema_ddl_relay.rs`'s
+        // `create_backup_on_a_follower_is_relayed_to_the_leader`
+        // (`animusd`).
+        | MetaCommand::BeginBackup { .. }
+        // On-demand backup per-tablet completion record (ADR 0059 §3/§4):
+        // a tablet leader's own "I finished capturing my share of this
+        // backup" proposal, from wherever that leader actually runs —
+        // the identical relay reasoning as `MarkIndexBackfilled`/
+        // `SealStreamShard` just above. `CompleteBackup`/`FailBackup`
+        // are deliberately NOT included here: their only intended
+        // production caller (the completion aggregator, a
+        // control-plane-leader-only background loop, `animusd`) already
+        // proposes them directly off its own live `RaftNode` handle,
+        // exactly the same `ExpireStreamShards` precedent this function's
+        // own doc states above — no wire surface exists yet for either
+        // (Train 1 PR④'s concern) to need a relay path of its own.
+        | MetaCommand::RecordBackupTabletComplete { .. }
+        // `DeleteBackup` wire operation (ADR 0059 §3, Train 1 PR④): an
+        // operator's `DeleteBackup` call may land on any node, exactly
+        // like `CreateTable`/`UpdateTimeToLive` — relaying
+        // `MarkBackupDeleted` (the two-phase janitor's own **mark**
+        // step) to the control leader is the same schema-catalog-class
+        // need every DDL-shaped wire mutation above already has.
+        // `DeleteBackup` (the existing, unmodified **finalizing**
+        // command) is deliberately NOT added here — its only intended
+        // caller is the backup janitor (`animusd::backup_janitor`), a
+        // control-plane-leader-only background loop that already holds
+        // a live `RaftNode` handle, the identical `ExpireStreamShards`
+        // precedent this function's own doc states above.
+        | MetaCommand::MarkBackupDeleted { .. }
+        // Restore workflow (ADR 0059 §7, Train 2): `RestoreTableFromBackup`
+        // (`animusd::dynamo::restore_table_from_backup`) may land on any
+        // node, exactly like `CreateTable`; the restore driver
+        // (`animusd::backup_restore`) proposes `CompleteRestore`/
+        // `FailRestore` from wherever its target tablet's own leader
+        // happens to run — the identical relay reasoning as
+        // `RecordBackupTabletComplete` above.
+        | MetaCommand::BeginRestore { .. }
+        | MetaCommand::CompleteRestore { .. }
+        | MetaCommand::FailRestore { .. }
+        // PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups` (the
+        // wire operation's own catalog toggle) may land on any node,
+        // exactly like `UpdateTimeToLive` — schema-catalog class, same
+        // relay reason as `SetTableTtl` above.
+        | MetaCommand::UpdateContinuousBackups { .. }
+        // PITR segment catalog commit: a tablet leader's own seal
+        // proposal, from wherever that leader actually runs — the
+        // identical relay reasoning as `SealStreamShard` above.
+        | MetaCommand::SealPitrSegment { .. }
+        // Tagging a `BeginBackup` row as a PITR base snapshot: proposed
+        // by `pitr_janitor::pitr_snapshot_loop` (`animusd`), a
+        // control-plane-leader-only background loop with its own live
+        // `RaftNode` handle on every node shape it runs on — this crate
+        // never relays it through the wire edge today, but it is
+        // included here defensively, mirroring `SealPitrSegment`'s own
+        // class, rather than surfacing as an opaque relay refusal if
+        // that ever changes. `ExpirePitrSegments` is deliberately NOT
+        // included, for the identical reason `ExpireStreamShards` isn't:
+        // its only intended caller (`pitr_janitor::pitr_janitor_loop`)
+        // already proposes directly off its own live `RaftNode` handle.
+        | MetaCommand::MarkBackupPitrBase { .. } => true,
+
+        // Online growth (ADR 0030): admin add-member registers a new raftkv
+        // id as `Down` — see the doc above for why this is safe to relay
+        // unlike drain (which stays local-leader-only). Any other status
+        // transition on an *existing* member stays off this path.
+        MetaCommand::UpsertMember {
+            status: NodeStatus::Down,
+            ..
+        } => true,
+        MetaCommand::UpsertMember { .. } => false,
+
+        // No commit-log bookkeeping to relay — never sent over this path.
+        MetaCommand::NoOp => false,
+        // Epoch-CAS placement command — control-plane-internal, proposed
+        // directly by the placement reconciler off its own live `RaftNode`
+        // handle, never through the wire relay.
+        MetaCommand::CasTabletReplicas { .. } => false,
+        // See this function's own doc: destructive/housekeeping actions
+        // whose only sanctioned caller already holds a live `RaftNode`
+        // handle (or, for `RemoveMember`, is deliberately local-leader-only)
+        // rather than a relay path.
+        MetaCommand::ExpireStreamShards { .. } => false,
+        MetaCommand::ExpirePitrSegments { .. } => false,
+        MetaCommand::RemoveMember { .. } => false,
+        MetaCommand::CompleteBackup { .. } => false,
+        MetaCommand::FailBackup { .. } => false,
+        MetaCommand::DeleteBackup { .. } => false,
+    }
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -1144,4 +1171,242 @@ pub enum ClientResponse {
     /// does the answering tablet still hold a live intent for the queried
     /// `txn_id` over the queried span?
     TxnVerifyReply { staged: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use animus_control::{
+        ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, NodeAddrs, StreamSpec,
+        StreamViewType, TableSchema, TtlSpec,
+    };
+    use animus_env::nid;
+    use animus_tablet::{Epoch, KeyRange, TabletId};
+
+    use super::*;
+
+    /// Pins `is_relayable_command`'s classification of every `MetaCommand`
+    /// variant (ADR 0061 rung C1's `matches!` -> exhaustive `match`
+    /// hardening) so a future change to it is visible in a diff instead of
+    /// silently defaulting a new/moved variant to "not relayable". Kept as
+    /// one flat table (not per-variant `#[test]`s) so it reads as the same
+    /// allowlist the function's own doc describes.
+    #[test]
+    fn classification_is_pinned() {
+        let table = "t".to_string();
+        let schema = TableSchema::simple("pk", ColumnType::String);
+        let index = IndexDef {
+            name: "by_x".to_string(),
+            kind: IndexKind::Local,
+            hash_attribute: "pk".to_string(),
+            sort_attribute: Some("x".to_string()),
+            projection: IndexProjection::All,
+            status: IndexStatus::active(),
+        };
+        let addrs = NodeAddrs {
+            internal: String::new(),
+            client: String::new(),
+            intra: String::new(),
+            admin: String::new(),
+            role: "combined".to_string(),
+        };
+
+        let true_cases: Vec<MetaCommand> = vec![
+            MetaCommand::CreateTableSchema {
+                table: table.clone(),
+                schema: schema.clone(),
+            },
+            MetaCommand::DropTableSchema {
+                table: table.clone(),
+            },
+            MetaCommand::ReplaceTableSchema {
+                table: table.clone(),
+                schema: schema.clone(),
+            },
+            MetaCommand::CreateTableIndex {
+                table: table.clone(),
+                index: index.clone(),
+            },
+            MetaCommand::DropTableIndex {
+                table: table.clone(),
+                index: "by_x".to_string(),
+            },
+            MetaCommand::SetIndexStatus {
+                table: table.clone(),
+                index: "by_x".to_string(),
+                status: IndexStatus::Active,
+            },
+            MetaCommand::MarkIndexBackfilled {
+                table: table.clone(),
+                index: "by_x".to_string(),
+                tablet: TabletId(1),
+            },
+            MetaCommand::SetTableStream {
+                table: table.clone(),
+                spec: Some(StreamSpec {
+                    view_type: StreamViewType::NewAndOldImages,
+                    label: "L".to_string(),
+                }),
+            },
+            MetaCommand::SetTableTtl {
+                table: table.clone(),
+                spec: Some(TtlSpec {
+                    attribute_name: "expires_at".to_string(),
+                }),
+            },
+            MetaCommand::SealStreamShard {
+                table: table.clone(),
+                label: "L".to_string(),
+                tablet: TabletId(1),
+                epoch: 0,
+                view_type: StreamViewType::NewAndOldImages,
+                hlc_range: (0, 0),
+                count: 0,
+                seal_wall_ms: 0,
+                replicas: vec![],
+                object_id: "obj".to_string(),
+            },
+            MetaCommand::RegisterCpAddr {
+                id: nid(1),
+                addr: "127.0.0.1:1".to_string(),
+                tablet: None,
+            },
+            MetaCommand::RegisterNodeAddrs {
+                node: nid(1),
+                addrs: addrs.clone(),
+            },
+            MetaCommand::BeginSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: vec![1],
+                children: [(TabletId(2), vec![]), (TabletId(3), vec![])],
+            },
+            MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                cutover_wall_ms: 0,
+            },
+            MetaCommand::BeginSplitInPlace {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: vec![1],
+                children: [(TabletId(2), vec![]), (TabletId(3), vec![])],
+            },
+            MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some(table.clone()),
+                range: KeyRange::whole(),
+                replicas: vec![],
+            },
+            MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: None,
+            },
+            MetaCommand::DropTableTablets {
+                table: table.clone(),
+            },
+            MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: Default::default(),
+                status: NodeStatus::Down,
+            },
+            MetaCommand::RegisterNode {
+                node: nid(1),
+                addrs: addrs.clone(),
+                labels: Default::default(),
+            },
+            MetaCommand::BeginBackup {
+                backup_id: "b1".to_string(),
+                table: table.clone(),
+                created_wall_ms: 0,
+                backup_name: "b1-name".to_string(),
+            },
+            MetaCommand::RecordBackupTabletComplete {
+                backup_id: "b1".to_string(),
+                tablet: TabletId(1),
+                cut_version: 0,
+                bytes: 0,
+            },
+            MetaCommand::MarkBackupDeleted {
+                backup_id: "b1".to_string(),
+            },
+            MetaCommand::BeginRestore {
+                restore_id: "r1".to_string(),
+                backup_id: "b1".to_string(),
+                source_table: table.clone(),
+                target_table: "t2".to_string(),
+                tablet: TabletId(1),
+                replicas: vec![],
+                gsi_defs: vec![],
+                pitr: None,
+            },
+            MetaCommand::CompleteRestore {
+                restore_id: "r1".to_string(),
+            },
+            MetaCommand::FailRestore {
+                restore_id: "r1".to_string(),
+                reason: "x".to_string(),
+            },
+            MetaCommand::UpdateContinuousBackups {
+                table: table.clone(),
+                enabled: true,
+                wall_ms: 0,
+            },
+            MetaCommand::SealPitrSegment {
+                table: table.clone(),
+                generation: 1,
+                tablet: TabletId(1),
+                epoch: 0,
+                hlc_range: (0, 0),
+                count: 0,
+                seal_wall_ms: 0,
+                replicas: vec![],
+                object_id: "obj".to_string(),
+            },
+            MetaCommand::MarkBackupPitrBase {
+                backup_id: "b1".to_string(),
+            },
+        ];
+        for cmd in &true_cases {
+            assert!(is_relayable_command(cmd), "expected relayable: {cmd:?}");
+        }
+
+        let false_cases: Vec<MetaCommand> = vec![
+            MetaCommand::NoOp,
+            MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: Default::default(),
+                status: NodeStatus::Active,
+            },
+            MetaCommand::CasTabletReplicas {
+                tablet: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                replicas: vec![],
+            },
+            MetaCommand::ExpireStreamShards {
+                rows: vec![],
+                remove: false,
+            },
+            MetaCommand::ExpirePitrSegments {
+                rows: vec![],
+                remove: false,
+            },
+            MetaCommand::RemoveMember { node: nid(1) },
+            MetaCommand::CompleteBackup {
+                backup_id: "b1".to_string(),
+            },
+            MetaCommand::FailBackup {
+                backup_id: "b1".to_string(),
+                reason: "x".to_string(),
+            },
+            MetaCommand::DeleteBackup {
+                backup_id: "b1".to_string(),
+            },
+        ];
+        for cmd in &false_cases {
+            assert!(
+                !is_relayable_command(cmd),
+                "expected NOT relayable: {cmd:?}"
+            );
+        }
+    }
 }
