@@ -27,6 +27,7 @@ pub mod codec;
 pub mod control_handle;
 pub mod decide;
 pub mod host;
+pub mod http;
 pub mod index_backfill;
 pub mod pitr_janitor;
 pub mod topology;
