@@ -11702,3 +11702,43 @@ form (already documented elsewhere in this log for disk error injection,
 worth restating for a new fault kind): when a test needs a "this part is
 real, only the later part is faulty" baseline, install the fault config
 *after* the baseline operations run on the same `Simulator`, not before.
+
+Building the ADR 0061 rung B4 failure minimizer surfaced a lesson worth
+generalizing beyond this one facility: **an ADR's Consequences section can
+promise something that isn't literally buildable as stated, and the fix is
+to amend the ADR honestly rather than force-build the literal words.** ADR
+0003 promised "shrinking a failure to a minimal seed becomes possible" —
+but a `SimEnv` run is a pure function of an *opaque* seed by design (that
+opacity is the whole point of a seed), so no seed is "smaller" than
+another and there is nothing to shrink *to*. Two different seeds are two
+unrelated executions, not a big and a small version of the same one. The
+actually-buildable, actually-useful thing was minimizing a failing
+scenario's own *parameters* while holding its seed fixed — a different
+target than the ADR's own words named. Don't let a stale promise's exact
+phrasing constrain the design of the thing that fulfills its *intent*;
+when you build the right thing under a different name than the original
+promise used, say so explicitly in the doc you're amending (a reader
+diffing "shrinking" against what shipped needs the mapping spelled out, not
+left to be inferred), rather than silently reinterpreting old prose to
+have meant what you built.
+
+A second, more mechanical lesson from the same task: **when validating a
+new "fires on failure, does nothing when green" diagnostic path (a
+minimizer, an auto-triage tool, a report generator gated on an assertion
+failing), a synthetic in-memory predicate proves the algorithm but not the
+wiring** — the wiring has to be exercised against a real failure from the
+real harness it's attached to, which for an already-green corpus means
+either fabricating one temporarily (edit in a forced `result.ok = false`
+for one named case, run the real corpus loop with the new tool enabled,
+observe, then revert the edit before committing — never leave the forced
+failure in the tree) or, better where it fits, constructing a *genuine*
+regression: a real scenario whose real, deterministically-computed outcome
+is the failure you want to minimize, without needing an actual production
+bug or weakening any real assertion. `raftkv_linearizable.rs`'s shrink demo
+uses the latter (`read_pct = 100` makes the workload structurally never
+write, so `ok_writes == 0` is a genuine simulator-derived fact, not a
+fabricated boolean) — it's the same trick `negative_control.rs` uses for
+the Elle checker (hand-built histories the checker *must* reject), applied
+one layer up: prove a piece of test *infrastructure* against a
+deliberately-constructed-but-real case, not a toy stand-in and not a wish
+that a production bug will conveniently exist to test against.
