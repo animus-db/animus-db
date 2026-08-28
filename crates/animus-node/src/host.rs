@@ -33,6 +33,7 @@ use animus_dynamo::AttributeValue;
 use animus_env::{Env, NodeId};
 use animus_tablet::TabletId;
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::wire::{ClientRequest, ClientResponse};
 
@@ -191,4 +192,115 @@ pub trait RelayClient {
         request: &ClientRequest,
         timeout: Duration,
     ) -> ClientResponse;
+}
+
+/// The admin/debug HTTP-JSON endpoint's capability seam (ADR 0061 rung C4d,
+/// ADR 0020) — one async method per `/admin/*` route this node's dispatch
+/// table serves, each returning the exact `(status, body)`/`body` shape the
+/// route already produces.
+///
+/// **Why one method per route, not the ~19 raw `ClientCtx` members
+/// `admin.rs` actually touches** (`admin`, `admin_add_control_member`,
+/// `admin_add_member`, `admin_drain`, `admin_remove_control_member`,
+/// `admin_remove_member`, `control`, `control_storage`,
+/// `cp_kind_write_item`, `data_opt`, `drop_table`, `edge`,
+/// `effective_metadata`, `grow_stream`, `metrics_history`, `metrics_json`,
+/// `raft`, `stream_change_rates`, `trigger_split` — a wider set than this
+/// rung's own starting estimate found by actually scoping it): several of
+/// those fields (`edge`, `control`, `control_storage`) are handles
+/// (`ClusterEdgeState`, `ControlHandle`, `SharedEngine`) whose *own* further
+/// methods (`hosted_groups`, `local_cp`, `lsm_sstables`, `wal_stats`, raw
+/// engine/WAL scans, …) are what most handler bodies actually call, and
+/// those handle types are hardcoded to `ProdEnv` in `animusd` today (they
+/// move to `E: Env` only in rung C5, alongside `ClientCtx` itself). Naming
+/// each of those as a *narrower* capability here — one trait method per raw
+/// fact a handler reads — would mean rebuilding `ClientCtx`'s own shape one
+/// accessor at a time, exactly the "contorted trait" failure mode the
+/// second 2026-08-28 amendment named for rung C2 and the fourth named again
+/// for `dynamo.rs`'s handlers. Instead each method here is "compute and
+/// return this whole named admin view/action" — the same granularity
+/// [`ControlLeaderHost::control_leader`] already established for handing
+/// back a whole `RaftNode<E>` rather than decomposing it further. A future
+/// sim-only implementor is free to synthesize each view however it likes;
+/// nothing here requires it to reconstruct `animusd`'s own internals.
+///
+/// `animusd`'s `ClientCtx` implements this by **thin delegation to its own
+/// existing, unmoved handler functions** (`admin.rs`'s `config_view`,
+/// `raft_view`, `storage_lsm`, …) — every one of those functions, and the
+/// full ~19-member `ClientCtx` surface + the deeper `ProdEnv`-hardcoded
+/// handle types they reach, stays exactly where it is; only the *dispatch
+/// table* (this trait plus [`crate::admin::dispatch`]) crossed the crate
+/// boundary. `action_data_dynamo` still reaches `dynamo::execute_routed`
+/// and `action_data_seed` still reaches the kind-write path — both
+/// unmoved, unmodified — matching this rung's exclusion of `dynamo.rs`'s
+/// `run_operation`/DDL handlers.
+#[async_trait]
+pub trait AdminHost: Send + Sync {
+    /// `GET /admin/config`.
+    async fn config_view(&self) -> Value;
+    /// `GET /admin/peers`.
+    async fn peers_view(&self) -> Value;
+    /// `GET /admin/status` — this node's `effective_metadata()`, rendered.
+    async fn status_json(&self) -> Value;
+    /// `GET /admin/raft`.
+    async fn raft_view(&self) -> Value;
+    /// `GET /admin/raftkv?exact=`.
+    async fn raftkv_view(&self, query: &str) -> Value;
+    /// `GET /admin/txns`.
+    async fn txns_view(&self) -> Value;
+    /// `GET /admin/storage/lsm?tablet=`.
+    async fn storage_lsm(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/storage/control`.
+    async fn storage_control(&self) -> (u16, Value);
+    /// `GET /admin/storage/wal?tablet=`.
+    async fn storage_wal(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/storage/wal/segment?...`.
+    async fn storage_wal_segment(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/storage/key?tablet=&key=`.
+    async fn storage_key(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/storage/scan?tablet=&...`.
+    async fn storage_scan(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/system-table?kind=&after=&limit=`.
+    async fn system_table(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/backups`.
+    async fn backups_view(&self) -> Value;
+    /// `GET /admin/restores`.
+    async fn restores_view(&self) -> Value;
+    /// `GET /admin/metrics`.
+    async fn metrics_view(&self) -> Value;
+    /// `GET /admin/metrics/history`.
+    async fn metrics_history_view(&self) -> Value;
+    /// `GET /admin/member/drain-status?node=`.
+    async fn member_drain_status(&self, query: &str) -> (u16, Value);
+    /// `GET /admin/health`.
+    async fn health(&self) -> (u16, Value);
+    /// `POST /admin/tablet/split`.
+    async fn action_split(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/stream/grow`.
+    async fn action_stream_grow(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/storage/flush`.
+    async fn action_flush(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/storage/compact`.
+    async fn action_compact(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/raftkv/reconfigure`.
+    async fn action_reconfigure(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/drain`.
+    async fn action_drain(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/member/add`.
+    async fn action_add_member(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/member/remove`.
+    async fn action_remove_member(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/control/members`.
+    async fn control_members_view(&self) -> Value;
+    /// `POST /admin/control/member/add`.
+    async fn action_add_control_member(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/control/member/remove`.
+    async fn action_remove_control_member(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/data/dynamo` — the admin dashboard's `execute_routed`
+    /// proxy (ADR 0021); reaches `dynamo.rs`, unmoved, unmodified.
+    async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/data/drop-table`.
+    async fn action_drop_table(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/data/seed`.
+    async fn action_data_seed(&self, body: &[u8]) -> (u16, Value);
 }
