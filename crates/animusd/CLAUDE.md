@@ -219,10 +219,13 @@ reusing the captured config is the point of the test.
   /metrics` special case, before every other request reaches `dispatch`/
   `execute_routed`: when `ctx.dynamo_auth` is `Some` (a `dynamo_auth`
   cluster-config section, or `--dynamo-auth PATH` on a config-less startup
-  mode), the request's method/path/query/headers/body build an
-  `animus_dynamo::sigv4::SigV4Request`, `ctx.env.wall_now()` supplies "now"
-  (never `SystemTime::now()`, ADR 0051 discipline), and a verification
-  failure short-circuits straight to a `400` with the AWS-faithful
+  mode), `ctx.env.wall_now()` supplies "now" (never `SystemTime::now()`,
+  ADR 0051 discipline) and is handed straight into `animus_node::
+  sigv4_gate(&request, credentials, now_epoch_ms)` (ADR 0061 rung C4b) —
+  the build-`SigV4Request`-then-`verify` sequence itself is pure and lives
+  in `animus-node` now; this connection handler does only the clock read
+  and the response-shaping on failure. A verification failure short-
+  circuits straight to a `400` with the AWS-faithful
   `com.amazon.coral.service#...` body (`sigv4_error_body`, rendered via
   `serde_json` rather than `WireError::to_json`'s DynamoDB-namespace
   prefix — a different `__type` namespace entirely). This gates the item
@@ -470,15 +473,59 @@ reusing the captured config is the point of the test.
   alongside its sibling DDL-relay tests.
 - **`admin.rs`** (~58 KB) — the admin/debug HTTP-JSON endpoint (ADR 0020):
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
-  surface; also serves the SPA static assets.
-- **`http.rs`** — shared hand-rolled HTTP/1.1 helpers (request parser + response
-  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`. **`HttpRequest::
-  headers` (ADR 0057)** retains every header (lowercased name → value, a
-  repeated header's values comma-joined in receipt order — the SigV4
-  canonical form) instead of the three fields (`target`/`content-length`
-  handling/`connection`) the parser used to keep and discard the rest of;
-  those three keep their own derived fields (every existing caller
-  untouched), `headers` is purely additive.
+  surface; also serves the SPA static assets. **The `(method, path)`
+  dispatch table moved to `animus_node::admin` (ADR 0061 rung C4d)**,
+  generic over a new `animus_node::host::AdminHost` trait: this file's own
+  `dispatch` is now a one-line wrapper (`animus_node::admin::dispatch(ctx,
+  &request.method, &request.path, &request.query, &request.body).await`),
+  and `impl AdminHost for ClientCtx` (right below it) is a thin, logic-free
+  delegation to every handler function this file already had — `config_view`,
+  `raft_view`, `raftkv_view`, `storage_lsm`/`storage_control`/`storage_wal`/
+  `storage_wal_segment`/`storage_key`/`storage_scan`, `system_table`,
+  `backups_view`/`restores_view`, `metrics_view`/`metrics_history_view`,
+  `member_drain_status`, `health`, every `action_*` function, and
+  `control_members_view`, none of which moved or changed. **Scoping this
+  rung found the trait needs a materially wider surface than the ADR's own
+  starting estimate** ("a 15-method cluster-shape slice"): this file
+  actually touches 19 raw `ClientCtx` members, and three of them
+  (`edge`/`control`/`control_storage`) are handles hardcoded to `ProdEnv`
+  whose *own* further methods (`hosted_groups`, `local_cp`, `lsm_sstables`,
+  raw engine/WAL scans, …) are what most handlers actually call — so
+  `AdminHost` is drawn at "one method per admin route" instead, each
+  returning the exact `Value`/`(u16, Value)` the route already produced;
+  see that trait's own doc in `animus-node` for the full reasoning.
+  `action_data_dynamo`/`action_data_seed` still reach `dynamo::
+  execute_routed`/the kind-write path exactly as before — unmoved,
+  unmodified, matching this rung's exclusion of `dynamo.rs`'s own
+  handlers. The `OPTIONS`/CORS preflight, the dashboard's static JS/CSS
+  assets, and the dashboard shell HTML (`handle_conn`, `static_asset`,
+  `is_ui_path`) stay here, checked before `dispatch` is ever reached — they
+  read `crate::dashboard`-owned `include_str!` constants no `AdminHost`
+  method has a reason to carry. See `animus-node/CLAUDE.md`'s own rung C4d
+  entry for the full design and the finding behind the wider-than-expected
+  surface.
+- **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
+  0061 rung C4a): `read_http_request` does only `stream.read()`, handing
+  every parsing decision (header-block framing, `Content-Length`
+  validation, header lowercasing/comma-joining) to `animus_node::http::
+  parse_request_head`; `write_response`/`write_response_with` do only
+  `stream.write_all()`, formatting via `animus_node::http::
+  format_response`. `HttpRequest` itself, `query_param`, `CORS_HEADERS`,
+  and `eof` are re-exported from there (`percent_decode` isn't any more —
+  its one caller moved to `animus-node` whole alongside `console.rs`, rung
+  C4c, so nothing in this crate calls it directly today) — every existing
+  `http::*` call site across `dynamo.rs`/`admin.rs` kept compiling
+  unchanged. **`HttpRequest::headers` (ADR 0057)** retains every header
+  (lowercased name → value, a repeated header's values comma-joined in
+  receipt order — the SigV4 canonical form) instead of the three fields
+  (`target`/`content-length` handling/`connection`) the parser used to keep
+  and discard the rest of; those three keep their own derived fields (every
+  existing caller untouched), `headers` is purely additive. Unit-tested
+  directly in `animus-node` now (malformed request line, missing/oversized/
+  non-numeric `Content-Length`, duplicate-header comma-joining,
+  percent-decoding edge cases, response-formatting round trips) — this
+  crate's own real-socket edge tests (`tests/dynamo_wire.rs` and friends)
+  are still the regression net for the two thin wrappers themselves.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
@@ -499,7 +546,20 @@ reusing the captured config is the point of the test.
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
   never the admin port (documented no-auth, trusted-interface-only, ADR
-  0020) and never a route on the DynamoDB wire listener. Bound on combined
+  0020) and never a route on the DynamoDB wire listener. **The pure routing
+  moved to `animus_node::console` (ADR 0061 rung C4c)** — every request/
+  response type, the `ConsoleBackend` trait, and `route` itself, moved
+  nearly verbatim (that module was already at this rung's target shape).
+  This file is now a thin wrapper: `serve`/`handle_conn` (the real
+  `TcpListener`/`TcpStream` accept loop, never under `SimEnv`), the three
+  `include_str!`'d shell assets (kept here, alongside the shared
+  `fonts.css`/`tokens.css` `dashboard.rs`'s operator console also
+  `include_str!`s — moving them would mean duplicating or reaching across
+  the crate boundary, which this rung's "no behaviour change" charter isn't
+  here to buy), and re-exports of the types `lib.rs`'s `impl
+  console::ConsoleBackend for ClientCtx` names by path. See
+  `animus-node/CLAUDE.md`'s own rung C4c entry for the moved module's
+  design. Bound on combined
   and data-only nodes only; a control-only node hosts no CP-data tablet, so
   it binds none (`BoundControlNode::start_control_with` passes `None` into
   `spawn_common_tail`'s `console_listener` parameter). **This module still

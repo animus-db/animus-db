@@ -193,9 +193,10 @@ why). Rung C3 (above) landed the client-frame codec's pure half, the
 `RelayClient` capability trait, and `ControlHandle`/`RemoteControlClient`
 themselves — but **not** `ClientCtx::relay` or any call site reaching relay
 *through* `ClientCtx` (`propose_schema`, `cp_serve_forwarded`'s
-forwarding), which stay `ClientCtx`-entangled and move with it in C5. C4
-lands the HTTP wire edges — see ADR 0061's Phase C rung table for the full
-sequence.
+forwarding), which stay `ClientCtx`-entangled and move with it in C5. Rung
+C4 (below) lands the HTTP wire edges (C4a/b/c/d) — `dynamo.rs`'s
+`run_operation`/DDL handlers are explicitly **not** part of C4; they fold
+into C5 (see C4's own entry for why).
 
 **One cross-crate discipline gap this creates until C5**:
 `cp_serve_forwarded`'s gating match (which internal-only `ClientRequest`
@@ -282,6 +283,131 @@ Phase D** — nothing here builds request/reply correlation.
   `relay_request_with_timeout`), plus that implementor itself — see that
   crate's own `CLAUDE.md` entry.
 
+## What's here (rung C4a/C4b/C4c/C4d — the HTTP edges)
+
+ADR 0061's fourth 2026-08-28 amendment split C4 into four sub-rungs and
+found a fifth thing that is **not** a C4 rung at all: `dynamo.rs`'s
+`run_operation`/DDL handlers, which fold into C5 (they hold ~40 inline
+`tokio::time`-based schema-commit poll loops that need `ClientCtx`
+genericized first — see that amendment for the full account). All four
+sub-rungs below shipped.
+
+- **`http`** (C4a) — the pure half of the hand-rolled HTTP/1.1 parser/
+  formatter, mirroring `codec` (C3a)'s split exactly: `HttpRequest` itself
+  (moved here whole — every field `pub`, since `sigv4_gate` and `console`
+  both need it), `parse_request_head` (header-block splitting,
+  `Content-Length` validation including the `MAX_BODY` bound, header
+  lowercasing/comma-joining per ADR 0057), `query_param`/`percent_decode`,
+  `find_subslice`, `eof`, `reason`, `CORS_HEADERS`, and `format_response`
+  (status/content-type/body/keep-alive/extra-headers → the full response
+  string). No socket type anywhere in this module — `animusd`'s
+  `read_http_request`/`write_response_with` keep the actual
+  `stream.read()`/`stream.write_all()` and call straight into these for
+  everything that doesn't touch a socket. Unit-tested directly here:
+  malformed request line, missing/oversized/non-numeric `Content-Length`,
+  duplicate headers (comma-join order), percent-decoding edge cases
+  (invalid escapes passed through verbatim), and response formatting round
+  trips.
+- **`sigv4_gate`** (C4b) — `sigv4_gate(request: &http::HttpRequest,
+  credentials: &BTreeMap<String, String>, now_epoch_ms: u64) -> Result<(),
+  animus_dynamo::sigv4::SigV4Error>`: the build-`SigV4Request`-then-`verify`
+  sequence that used to run inline in `animusd::dynamo::handle_conn`.
+  Returns the **structured** `SigV4Error` (not a rendered string, despite
+  the ADR's own "roughly `Result<(), String>`" phrasing) — `animusd`'s
+  `sigv4_error_body` needs the typed variant to render the AWS-faithful
+  `com.amazon.coral.service#…` body, and collapsing to a string first would
+  lose that for no benefit, since nothing about "no clock in this crate"
+  requires it. `animusd::dynamo::handle_conn` now does only the one real
+  `ctx.env.wall_now()` read this function can't do itself (no `Env` access
+  at all here) plus the response-shaping on failure. Tested with a hand-
+  rolled signer built on `animus_dynamo::sigv4::sign` (the same test-signer
+  precedent that crate's own `CLAUDE.md` documents): a correctly signed
+  request accepted, a tampered body / wrong access key / missing
+  `Authorization` rejected with the right `SigV4Error` variant, and clock
+  skew rejected on both sides of the ±5 minute window plus accepted exactly
+  at the boundary.
+- **`console`** (C4c) — `ConsoleBackend`, every request/response type, and
+  `route` itself, moved nearly verbatim from `animusd::console` (that
+  module was already at this rung's target shape: `route` took
+  `&http::HttpRequest` + a `TableSnapshotFn` closure + a `&dyn
+  ConsoleBackend` and returned a buffered `(status, content_type, body)`
+  triple, with `TcpStream` confined to `animusd`'s own `handle_conn`). The
+  one real change: `route` now takes the console shell's HTML/CSS/JS as
+  plain `&str` parameters instead of reading module-level `include_str!`
+  constants — those constants, and the physical `console.html`/
+  `console.css`/`console.js`/`fonts.css`/`tokens.css` files backing them,
+  stay in `animusd` (`fonts.css`/`tokens.css` are also `include_str!`'d by
+  `dashboard.rs`'s *operator* console; moving them here would mean either
+  duplicating them or reaching across the crate boundary from that other
+  consumer, which this rung's "no behaviour change" charter has no reason
+  to buy). `animusd`'s `console.rs` is now a thin wrapper: `serve`/
+  `handle_conn` (the accept loop — real `TcpStream`, never under `SimEnv`),
+  the five asset constants, and re-exports of every type `lib.rs`'s `impl
+  console::ConsoleBackend for ClientCtx` names by path (`GetItemRequest`/
+  `PutItemRequest`/`DeleteItemRequest`/`CreateGsiRequest`/`CreateLsiRequest`/
+  `CreateKeyAttribute` are **not** re-exported there — they're consumed
+  purely inside this crate's own `route`/`table_api_response`, and
+  `animusd` never spells their names). Every one of the original module's
+  unit tests (JSON decode/encode shapes, `parse_table_api_route`, the
+  "no cluster-shaped field leaks into a console response" property tests)
+  moved with the code and pass unchanged — none of them touched
+  `TcpStream`.
+- **`host::AdminHost`** + **`admin`** (C4d) — the admin/debug HTTP-JSON
+  endpoint's `(method, path)` dispatch table, generic over a new
+  `AdminHost` capability trait beside `host`'s other three. **Scoping this
+  rung found the surface materially wider than the ADR's own starting
+  estimate** ("a 15-method cluster-shape slice"): `admin.rs` actually
+  touches **19** `ClientCtx` members directly (`admin`,
+  `admin_add_control_member`, `admin_add_member`, `admin_drain`,
+  `admin_remove_control_member`, `admin_remove_member`, `control`,
+  `control_storage`, `cp_kind_write_item`, `data_opt`, `drop_table`,
+  `edge`, `effective_metadata`, `grow_stream`, `metrics_history`,
+  `metrics_json`, `raft`, `stream_change_rates`, `trigger_split`) — and
+  three of those (`edge`/`control`/`control_storage`) are handles
+  (`ClusterEdgeState`/`ControlHandle`/`SharedEngine`) hardcoded to
+  `ProdEnv` in `animusd` today, whose *own* further methods
+  (`hosted_groups`, `local_cp`, `lsm_sstables`, `wal_stats`, raw
+  engine/WAL scans, …) are what most handler bodies actually call. Naming
+  each of those as a narrower capability would mean rebuilding `ClientCtx`
+  one accessor at a time — the exact "contorted trait" failure the second
+  and fourth 2026-08-28 amendments both warned about. So `AdminHost` is
+  drawn at a different granularity than C2's traits: **one method per
+  admin route**, each returning the exact `Value`/`(u16, Value)` shape the
+  route already produces — the same "hand back a whole computed thing
+  rather than decomposing further" call `ControlLeaderHost::control_leader`
+  already made for `RaftNode<E>`. See the trait's own doc for the full
+  reasoning. `admin::dispatch` is the moved `(method, path)` match table —
+  now unit-tested directly with a `FakeHost` (no `ClientCtx`, no `ProdEnv`,
+  no socket): which route fires for which method+path, that a known route
+  with the wrong verb is a 404 (not a 405) and never reaches any
+  `AdminHost` method, the two distinct 404 message shapes, and that query
+  string/POST body reach the handler untouched. `animusd`'s own `dispatch`
+  is now a one-line wrapper; `impl AdminHost for ClientCtx` (in `admin.rs`)
+  is a thin, logic-free delegation to the file's own **unmoved** handler
+  functions (`config_view`, `raft_view`, `storage_lsm`, `action_split`,
+  …) — every one of those, and the full `ClientCtx` surface + the deeper
+  `ProdEnv`-hardcoded handle types they reach, stays exactly where it is.
+  `action_data_dynamo` still reaches `dynamo::execute_routed` and
+  `action_data_seed` still reaches the kind-write path, both unmoved and
+  unmodified — matching this rung's exclusion of `dynamo.rs`'s own
+  handlers. The `OPTIONS`/CORS preflight, the dashboard's static JS/CSS
+  assets, and the dashboard shell HTML stay in `animusd`'s `handle_conn`
+  (checked *before* `dispatch` is ever reached, and reading
+  `crate::dashboard`-owned `include_str!` constants no `AdminHost` method
+  has a reason to carry).
+
+  **A testing gotcha this rung's own dispatch tests needed a real fix
+  for, not just a workaround**: this crate has no `tokio` dependency at
+  all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an
+  option for driving `dispatch`'s `async fn`. `admin::tests::block_on` is a
+  ~15-line, fully-safe (`#[forbid(unsafe_code)]` applies workspace-wide)
+  busy-poll driver built on `std::task::Waker::noop()` + `std::pin::pin!` —
+  sound specifically because every `FakeHost` method in that test module
+  resolves on its first poll (none of them ever genuinely `.await`s
+  anything). This is a reusable pattern for any future test in this crate
+  that needs to drive a small `async fn` with no real waiting inside it and
+  doesn't want to reach for a `SimEnv`/`RaftNode` bring-up just to do it.
+
 ## Working here
 
 - Same determinism discipline as the rest of the workspace (root
@@ -306,4 +432,11 @@ Phase D** — nothing here builds request/reply correlation.
   features -p animus-node` with no `--tests`/`--all-targets` stays clean).
   `cargo test -p animusd --lib` and a representative slice of `animusd`'s
   real-socket integration suite are still the regression net for the
-  wiring — see `animusd/CLAUDE.md`.
+  wiring — see `animusd/CLAUDE.md`. Since rung C4, `cargo test -p
+  animus-node` also covers pure HTTP parsing (`http::tests`), the SigV4
+  gate (`sigv4_gate::tests`), the console's request/response JSON shapes
+  and route parsing (`console::tests`), and the admin dispatch table's
+  routing decisions (`admin::tests`, driven with no runtime at all via that
+  module's own `block_on` — see its doc for why that's sound here) — all of
+  it reachable with **no socket and no `ClientCtx`**, which used to require
+  a real multi-process cluster bring-up.
