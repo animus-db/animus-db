@@ -82,8 +82,13 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 # Determinism is the load-bearing constraint (see docs/adr/0003). HashMap/HashSet
 # iteration order is nondeterministic; system code must use BTreeMap/BTreeSet.
-# These lints are a backstop, not a substitute for review.
+# real time/tokio::spawn/tokio::time/unseeded RNG must go through the `Env`
+# seam instead of std/tokio directly (ADR 0061 Decision 4 / rung B5). Both are
+# a backstop, not a substitute for review — see clippy.toml for the exact
+# disallowed items and each crate's own `#[allow(..., reason = "...")]`s for
+# the individually-justified exceptions.
 disallowed_types = "warn"
+disallowed_methods = "warn"
 
 [profile.release]
 debug = 1

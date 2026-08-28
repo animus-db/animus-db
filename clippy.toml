@@ -4,4 +4,34 @@
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "nondeterministic iteration order; use BTreeMap" },
     { path = "std::collections::HashSet", reason = "nondeterministic iteration order; use BTreeSet" },
+    { path = "rand::rngs::OsRng", reason = "OsRng is a unit struct, not a function (disallowed-methods can't name it) — use env.next_u64()/env.gen_below() (Rng) so randomness is a function of the run's seed" },
 ]
+
+# Determinism enforcement, other half (ADR 0003, ADR 0061 Decision 4 / rung
+# B5). The `Env` seam (animus-env) is the only sanctioned source of real
+# time/randomness/task-spawning; nothing outside it should call these
+# directly. Every legitimate call site — animus-env's own `ProdEnv`, a real
+# ProdEnv-liveness test/bench, or a genuine process-boundary crate — carries
+# an individually-justified `#[allow(clippy::disallowed_methods, reason =
+# "...")]` (or, for animusd, a package-level override — see
+# crates/animusd/Cargo.toml's own comment for why per-site annotation isn't
+# practical there). A bare, unexplained allow at a new call site is a review
+# finding, not a shortcut.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use env.now() (Clock); real elapsed time is nondeterministic" },
+    { path = "std::time::SystemTime::now", reason = "use env.now() for timing, or env.wall_now() (ADR 0051) for an absolute-timestamp read; never for a deadline/election/backoff" },
+    { path = "tokio::spawn", reason = "use env.spawn_task() (Spawner) so simulated tasks stay on the deterministic run-queue" },
+    { path = "tokio::time::sleep", reason = "use env.sleep() (Clock) so a wait advances virtual, not wall-clock, time" },
+    { path = "tokio::time::timeout", reason = "race the future against env.sleep() instead — a real tokio::time::timeout races real wall-clock time even under SimEnv" },
+    { path = "rand::thread_rng", reason = "use env.next_u64()/env.gen_below() (Rng) so randomness is a function of the run's seed" },
+]
+
+# Deliberately NOT listed: std::fs, std::net, tokio::fs, tokio::net. These
+# are real I/O entry points too, but unlike the methods above they have no
+# single, small, always-correct replacement to point a `reason` string at —
+# animus-env's Disk/Network seams wrap specific framing/durability contracts
+# (see animus-env/CLAUDE.md), not a drop-in substitute for e.g. a raw
+# TcpListener::bind at a process's one accept-loop boundary. animusd's
+# listener binding legitimately owns dozens of such call sites; enumerating
+# each would be exactly the wall-of-allows this rung exists to avoid. Reviewed
+# by hand instead (grep `E: Env` before assuming new I/O code needs no seam).
