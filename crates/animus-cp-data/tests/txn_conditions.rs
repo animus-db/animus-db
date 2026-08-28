@@ -343,6 +343,7 @@ fn foreign_intent_block_is_reported_distinctly_from_condition_failure() {
         StageOutcome::IntentBlocked {
             key: blocked_key,
             txn_id: blocker,
+            ..
         } => {
             assert_eq!(blocked_key, k, "seed={seed}");
             assert_eq!(blocker, txn_a, "seed={seed}");
