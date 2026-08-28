@@ -1,102 +1,34 @@
-//! Shared hand-rolled HTTP/1.1 helpers for the node's production-only HTTP edges:
-//! the DynamoDB JSON endpoint (`dynamo.rs`) and the admin interface (`admin.rs`,
-//! ADR 0020). Real tokio sockets — this is `ProdEnv`-only edge code, never under
-//! `SimEnv`, so it does its own I/O directly rather than through the `Env` seam.
-//!
-//! The parser handles the small slice of HTTP/1.1 these edges need: a request
-//! line, keep-alive, and pipelined requests. `Content-Length`/`Connection`/
-//! `X-Amz-Target` get their own derived fields as before; since ADR 0057
-//! every header is **also** retained (lowercased name → value, repeats
-//! comma-joined) in [`HttpRequest::headers`] — needed because a SigV4
-//! `SignedHeaders` list can name any header, and verification must
-//! reconstruct each one's canonical form. Responses are a single
-//! content-type-tagged body.
+//! Thin `TcpStream` wrapper over `animus-node`'s pure HTTP helpers (ADR 0061
+//! rung C4a): [`read_http_request`] does only `stream.read()`, handing every
+//! parsing decision to [`animus_node::http::parse_request_head`];
+//! [`write_response`]/[`write_response_with`] do only `stream.write_all()`,
+//! formatting via [`animus_node::http::format_response`]. `HttpRequest`
+//! itself, `query_param`, `CORS_HEADERS`, and `eof` are re-exported from
+//! there — every existing `http::*` call site this crate still uses (across
+//! `dynamo.rs`/`admin.rs`) keeps compiling unchanged. `percent_decode` isn't
+//! re-exported here any more — its one caller (table/index-name decoding in
+//! `console.rs`'s per-table routing) moved to `animus-node` whole (ADR 0061
+//! rung C4c), so nothing in this crate calls it directly today. Real tokio
+//! sockets — this is `ProdEnv`-only edge code, never under `SimEnv`.
 
-use std::collections::BTreeMap;
+pub(crate) use animus_node::http::{CORS_HEADERS, HttpRequest, MAX_BODY, eof, query_param};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Max request size (headers + body) we will buffer before erroring.
-pub(crate) const MAX_BODY: usize = 1 << 20;
-
-/// A parsed HTTP request.
-pub(crate) struct HttpRequest {
-    /// The request method (`GET`, `POST`, …).
-    pub(crate) method: String,
-    /// The request path, with any `?query` stripped off (see [`Self::query`]).
-    pub(crate) path: String,
-    /// The raw query string after `?` (empty if none). Parse with
-    /// [`query_param`].
-    pub(crate) query: String,
-    /// The `X-Amz-Target` header value (used only by the DynamoDB edge; empty
-    /// otherwise). A derived convenience over [`Self::headers`] — kept as its
-    /// own field since every caller reads it, unlike an arbitrary
-    /// `SignedHeaders` member.
-    pub(crate) target: String,
-    /// Every header on the request (ADR 0057): **lowercased** names →
-    /// values, trimmed the same way [`Self::target`]/[`Self::keep_alive`]
-    /// already were. A repeated header's values are comma-joined in the
-    /// order received — the SigV4 canonical-header form
-    /// (`animus_dynamo::sigv4::SigV4Request::headers`'s own contract) — so
-    /// this map can be handed straight to `sigv4::verify` with no further
-    /// massaging. `BTreeMap`, never `HashMap` (ADR 0003 determinism rule,
-    /// lint-enforced).
-    pub(crate) headers: BTreeMap<String, String>,
-    /// The request body bytes.
-    pub(crate) body: Vec<u8>,
-    /// Whether the client wants the connection kept alive.
-    pub(crate) keep_alive: bool,
-}
-
-/// Look up `name` in a raw `a=1&b=2` query string, returning its (un-decoded)
-/// value. Only the minimal `%NN` and `+` decoding the admin edge needs is applied.
-pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == name).then(|| percent_decode(v))
-    })
-}
-
-/// Minimal `application/x-www-form-urlencoded` value decoding: `+` → space and
-/// `%NN` → byte. Invalid escapes are passed through verbatim. `pub(crate)`
-/// (not module-private) since `console.rs`'s per-table path routing also
-/// needs it, for a table/index name that needed `encodeURIComponent` on the
-/// way in.
-pub(crate) fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-            }
-            b => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Read one HTTP/1.1 request from `stream`, buffering into `buf` (which may
 /// already hold bytes of the next pipelined request). Returns `None` at clean
-/// EOF before any bytes of a new request.
+/// EOF before any bytes of a new request. All parsing (header-block framing,
+/// `Content-Length` validation, header lowercasing/comma-joining) happens in
+/// `animus_node::http::parse_request_head`; this function does only the
+/// socket reads.
 pub(crate) async fn read_http_request(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<HttpRequest>> {
     // Read until we have the full header block (terminated by CRLFCRLF).
     let header_end = loop {
-        if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
+        if let Some(pos) = animus_node::http::find_subslice(buf, b"\r\n\r\n") {
             break pos + 4;
         }
         let mut chunk = [0u8; 4096];
@@ -115,61 +47,11 @@ pub(crate) async fn read_http_request(
     };
 
     let header_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = header_text.split("\r\n");
-    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close. An explicit
-    // `Connection` header overrides either way.
-    let request_line = lines.next().unwrap_or("");
-    // Request line: `METHOD SP request-target SP HTTP-version`.
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or("").to_owned();
-    let target_path = request_parts.next().unwrap_or("");
-    // Split the request-target into path + query string.
-    let (path, query) = match target_path.split_once('?') {
-        Some((p, q)) => (p.to_owned(), q.to_owned()),
-        None => (target_path.to_owned(), String::new()),
-    };
-    let mut keep_alive = request_line.contains("HTTP/1.1");
-    let mut target = String::new();
-    let mut content_length = 0usize;
-    let mut headers: BTreeMap<String, String> = BTreeMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim().to_ascii_lowercase();
-            let value = value.trim();
-            match name.as_str() {
-                "x-amz-target" => target = value.to_owned(),
-                "content-length" => {
-                    content_length = value.parse().map_err(|_| eof("invalid Content-Length"))?;
-                }
-                "connection" => {
-                    let v = value.to_ascii_lowercase();
-                    if v.contains("close") {
-                        keep_alive = false;
-                    } else if v.contains("keep-alive") {
-                        keep_alive = true;
-                    }
-                }
-                _ => {}
-            }
-            // Every header, not just the three special-cased above (ADR
-            // 0057) — a repeated header's values comma-join in the order
-            // received, the SigV4 canonical form.
-            headers
-                .entry(name)
-                .and_modify(|existing| {
-                    existing.push_str(", ");
-                    existing.push_str(value);
-                })
-                .or_insert_with(|| value.to_owned());
-        }
-    }
-    if content_length > MAX_BODY {
-        return Err(eof("request body too large"));
-    }
+    let head = animus_node::http::parse_request_head(&header_text)?;
 
     // Read the body (some of which may already be buffered).
     let mut body_buf = buf.split_off(header_end);
-    while body_buf.len() < content_length {
+    while body_buf.len() < head.content_length {
         let mut chunk = [0u8; 4096];
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
@@ -178,53 +60,18 @@ pub(crate) async fn read_http_request(
         body_buf.extend_from_slice(&chunk[..n]);
     }
     // Any surplus belongs to the next pipelined request.
-    let leftover = body_buf.split_off(content_length);
+    let leftover = body_buf.split_off(head.content_length);
     *buf = leftover;
 
     Ok(Some(HttpRequest {
-        method,
-        path,
-        query,
-        target,
-        headers,
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        target: head.target,
+        headers: head.headers,
         body: body_buf,
-        keep_alive,
+        keep_alive: head.keep_alive,
     }))
-}
-
-pub(crate) fn eof(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// CORS header lines for the admin edge (ADR 0021). The web dashboard is served
-/// from one node's admin port but fans out to *every* node's `/admin/*` JSON, so
-/// those cross-origin reads need a permissive `Access-Control-Allow-Origin`.
-/// Scoped to the admin listener only — the dynamo data edge never sends it;
-/// the admin port is assumed bound to a trusted interface (ADR 0020, no auth yet).
-/// Each line ends with CRLF so it can be spliced straight into the header block.
-pub(crate) const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
-     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-     Access-Control-Allow-Headers: Content-Type\r\n";
-
-/// The reason phrase for a status code (the small set our edges emit).
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "Status",
-    }
 }
 
 /// Write a minimal HTTP/1.1 response with the given `content_type` and `body`.
@@ -243,7 +90,9 @@ pub(crate) async fn write_response(
 
 /// Like [`write_response`], but splices `extra_headers` (a block of complete
 /// CRLF-terminated header lines, e.g. [`CORS_HEADERS`]) into the response before
-/// the blank line. Pass `""` for none.
+/// the blank line. Pass `""` for none. Formatting happens in
+/// `animus_node::http::format_response`; this function does only the socket
+/// write.
 pub(crate) async fn write_response_with(
     stream: &mut TcpStream,
     status: u16,
@@ -252,18 +101,8 @@ pub(crate) async fn write_response_with(
     keep_alive: bool,
     extra_headers: &str,
 ) -> std::io::Result<()> {
-    let connection = if keep_alive { "keep-alive" } else { "close" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {len}\r\n\
-         Connection: {connection}\r\n\
-         {extra_headers}\
-         \r\n\
-         {body}",
-        reason = reason(status),
-        len = body.len(),
-    );
+    let response =
+        animus_node::http::format_response(status, content_type, body, keep_alive, extra_headers);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await
 }
