@@ -49,6 +49,7 @@ mod backup_restore;
 mod console;
 mod control_handle;
 mod dashboard;
+mod decide;
 mod dynamo;
 mod dynamo_streams;
 mod http;
@@ -243,8 +244,8 @@ impl TxnAbortReason {
 
     /// Whether this reason means "this coordinator could not confirm the
     /// transaction committed" (a `"; retry"`-suffixed `Other` — the same
-    /// house-wide retryability convention [`read_should_retry`]
-    /// (`Self::read_should_retry`) already tests) as opposed to "this
+    /// house-wide retryability convention [`decide::read_should_retry`]
+    /// already tests) as opposed to "this
     /// coordinator definitively knows the transaction did not commit"
     /// (`ConditionFailed`/`TransactionConflict`, or an `Other` whose message
     /// does not end in `"; retry"`).
@@ -391,7 +392,7 @@ mod txn_abort_reason_tests {
     /// genuinely evaluated false, or an intent genuinely still blocked past
     /// every retry) regardless of their own message text; an `Other` is
     /// ambiguous exactly when — and only when — it carries the house-wide
-    /// `"; retry"` retryability suffix (`Self::read_should_retry` tests the
+    /// `"; retry"` retryability suffix (`decide::read_should_retry` tests the
     /// identical shape for the unrelated CP-read retry loop).
     #[test]
     fn is_ambiguous_classifies_by_the_house_retry_suffix() {
@@ -924,7 +925,7 @@ impl CpGroup {
     /// Whether this group has applied its split-cutover freeze (ADR 0050
     /// rung 5) — a pure flag read, never a wake. Consulted by every local
     /// write/txn propose helper before proposing; see
-    /// [`RaftKvNode::is_frozen`] and [`frozen_refusal`].
+    /// [`RaftKvNode::is_frozen`] and [`decide::frozen_refusal`].
     pub(crate) fn is_frozen(&self) -> bool {
         match self {
             CpGroup::Lsm(n) => n.is_frozen(),
@@ -1642,7 +1643,7 @@ impl ReadConsistency {
 
 /// How a [`ClientCtx::poll_probe`] confirm wait ended: the probed effect
 /// appeared (`Confirmed`), the wait became provably futile before the
-/// deadline (`Superseded` — see [`ClientCtx::confirm_wait_is_futile`]), or
+/// deadline (`Superseded` — see [`decide::confirm_wait_is_futile`]), or
 /// the deadline elapsed with the accepted entry still plausibly in flight
 /// (`TimedOut`).
 enum ProbeWait {
@@ -1861,13 +1862,11 @@ const STALE_READ_REFUSAL: &str =
 /// strong path costs one leader hop and always answers; waiting does not.
 const STALE_READ_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// ADR 0050 rung 5: the retryable refusal every mutating propose helper
-/// returns for a frozen split parent (post-`Freeze`, pre-cutover). Ends in
-/// `"; retry"` (the house retryability convention) so every existing client
-/// retry loop re-resolves routing; distinct wording so tests/admin can tell
-/// frozen from a fence/stale-routing refusal.
-const FROZEN_REFUSAL: &str =
-    "tablet frozen for split cutover (ADR 0050); a child will serve this range shortly; retry";
+// `FROZEN_REFUSAL` moved to `decide` (ADR 0061 A6) alongside the
+// `frozen_refusal` predicate it belongs to; imported below so every
+// pre-existing bare reference in this file keeps compiling unchanged.
+use decide::FROZEN_REFUSAL;
+
 /// How long [`ClientCtx::cp_forward`] backs off between retry passes when every
 /// candidate replica refused a forwarded op with `leader_hint=none` — i.e. the
 /// tablet's group has no elected leader *yet* (a split-child/first-provision
@@ -8082,15 +8081,6 @@ impl ClientCtx {
         }
     }
 
-    /// Whether a CP read error is a **transient routing/leadership/scope race**
-    /// the reader should retry with re-resolved routing (the `"; retry"` shape
-    /// every such error in this file carries), as opposed to a genuine failure
-    /// to surface. Shared by [`cp_read`](Self::cp_read)/[`cp_scan_one`]'s
-    /// internal retry loops.
-    fn read_should_retry(e: &str) -> bool {
-        e.ends_with("; retry")
-    }
-
     /// As [`cp_get_local`](Self::cp_get_local), but additionally chases a
     /// **foreign intent** (ADR 0018 §2/PR4 — a multi-participant
     /// transaction's intent whose covering record lives on a *different*
@@ -8309,7 +8299,7 @@ impl ClientCtx {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -8408,7 +8398,7 @@ impl ClientCtx {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -8440,7 +8430,7 @@ impl ClientCtx {
     /// deadline-bounded loop: bounded by [`CLIENT_TIMEOUT`], re-resolving
     /// `cp_route` every attempt (essential — after cutover the key routes to
     /// a child tablet, not the frozen parent), retrying only while
-    /// [`read_should_retry`](Self::read_should_retry) matches the error.
+    /// [`decide::read_should_retry`] matches the error.
     /// Before this fix a client writing during a split's freeze window got a
     /// terminal error instead of the write succeeding once the child
     /// activates a moment later. The retry loop lives *outside*
@@ -8552,7 +8542,7 @@ impl ClientCtx {
             // attempt, and any transient failure is surfaced for the caller to
             // decide about, exactly as DynamoDB would.
             if !idempotent
-                || !Self::read_should_retry(&err.message)
+                || !decide::read_should_retry(&err.message)
                 || tokio::time::Instant::now() >= deadline
             {
                 return Err(err);
@@ -8588,7 +8578,7 @@ impl ClientCtx {
     /// identical fix: a deadline-bounded loop mirroring
     /// [`cp_read`](Self::cp_read), re-resolving `cp_route` every attempt so a
     /// post-cutover retry lands on the child tablet, retrying only while
-    /// [`read_should_retry`](Self::read_should_retry) matches the error.
+    /// [`decide::read_should_retry`] matches the error.
     pub(crate) async fn cp_kind_write_raw(
         &self,
         table: &str,
@@ -8651,7 +8641,7 @@ impl ClientCtx {
                         writes: writes.clone(),
                         change_log: change_log.clone(),
                     };
-                    match Self::ok_or_err(
+                    match decide::ok_or_err(
                         self.cp_forward(table, &first, addr, request).await,
                         "forwarded CP kind write",
                     ) {
@@ -8661,7 +8651,7 @@ impl ClientCtx {
                 }
                 CpRoute::None => "no CP group leader reachable".to_string(),
             };
-            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -8671,21 +8661,6 @@ impl ClientCtx {
     /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
     /// cp_kind_write_raw): fence pre-check, propose, then confirm on the
     /// batch's **last** write — `Some(value)` for a put, `None` for a
-    /// ADR 0050 rung 5: the shared pre-propose freeze refusal. A frozen
-    /// split parent (post-`KvCommand::Freeze`, pre-cutover/retire) refuses
-    /// every mutating propose with this retryable error, so the caller's
-    /// ordinary retry loop re-resolves routing and lands on a child once
-    /// `CutoverSplit` activates them — the same client shape as an election
-    /// wait. Reads are deliberately NOT gated (a frozen parent's state IS
-    /// current until cutover). The apply-time whole-range seal remains the
-    /// backstop for the propose-vs-apply sliver.
-    fn frozen_refusal(leader: &CpGroup) -> Result<(), String> {
-        if leader.is_frozen() {
-            return Err(FROZEN_REFUSAL.into());
-        }
-        Ok(())
-    }
-
     /// tombstone (see `cp_kind_write_raw`'s doc for why the last write
     /// proves the whole entry). The ONE confirm implementation for a raw
     /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
@@ -8712,7 +8687,7 @@ impl ClientCtx {
         if rows.is_empty() {
             return Ok(());
         }
-        Self::frozen_refusal(leader)?;
+        decide::frozen_refusal(leader.is_frozen())?;
         let index = match leader.propose_seed_batch(rows) {
             animus_control::ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("seed batch not accepted: {other:?}; retry")),
@@ -8790,7 +8765,7 @@ impl ClientCtx {
         if writes.iter().any(|(kind, _, _)| {
             *kind == animus_cp_data::KIND_BASE || *kind == animus_cp_data::KIND_LSI
         }) {
-            Self::frozen_refusal(leader)?;
+            decide::frozen_refusal(leader.is_frozen())?;
         }
         let fence = leader.scope_range();
         for (_, key, _) in &writes {
@@ -8821,7 +8796,11 @@ impl ClientCtx {
             if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
                 return Ok(());
             }
-            if Self::confirm_wait_is_futile(leader, accepted_index) {
+            if decide::confirm_wait_is_futile(
+                leader.engine_applied_index(),
+                leader.is_leader(),
+                accepted_index,
+            ) {
                 // Close the probe-vs-apply race: the entry may have applied
                 // between the probe above and the futility read.
                 if leader.local_get_kind(probe_kind, &probe_key).await == probe_value {
@@ -8873,7 +8852,7 @@ impl ClientCtx {
         let Some((probe_key, probe_val)) = probe else {
             return Err("a kind batch must carry a base-kind write to confirm on".into());
         };
-        Self::frozen_refusal(leader)?;
+        decide::frozen_refusal(leader.is_frozen())?;
         // Pre-propose range check, the same reasoning as `cp_batch_propose`:
         // a fenced-out entry applies as a no-op, and the probe below would then
         // just time out with a generic error instead of a clean routing error.
@@ -8954,7 +8933,7 @@ impl ClientCtx {
         leader: &CpGroup,
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Option<(u64, u64, KvPair)>, String> {
-        Self::frozen_refusal(leader)?;
+        decide::frozen_refusal(leader.is_frozen())?;
         let probe = group.last().cloned();
         let fence = leader.scope_range();
         if let Some((bad_key, _)) = group.iter().find(|(k, _)| !fence.contains(k)) {
@@ -8968,49 +8947,15 @@ impl ClientCtx {
         }
     }
 
-    /// Whether waiting any longer for `accepted_index`'s effect to appear can
-    /// still succeed — the confirm-side dual of `RaftKvNode::
-    /// wait_stage_outcome`'s own `!is_leader()` bail (ADR 0018 §2). Two
-    /// futility signals, either of which ends the wait:
-    ///
-    /// - **The group has applied past the accepted entry's own log index
-    ///   without the probed effect appearing** (the caller re-probes once
-    ///   after this returns `true`, closing the probe-vs-apply race):
-    ///   whatever occupied that log position either no-opped at apply (a
-    ///   freeze/seal miss, a failed `KindBatch` condition) or is a different
-    ///   entry entirely (the accepted one was truncated by a leadership
-    ///   change, and the new leader's election no-op has already applied
-    ///   past it). Either way the effect will never appear from *this*
-    ///   propose — only a fresh retry can land it. Sound because the apply
-    ///   task advances `engine_applied` only after the entries it covers are
-    ///   merged and readable (see `animus-cp-data`'s apply-loop doc).
-    /// - **This node no longer leads the group**: the accepted entry may yet
-    ///   commit under the new leader (a retry is then a harmless idempotent
-    ///   duplicate — per-key LWW converges), or it may have been truncated —
-    ///   this node cannot tell which within bounded time, and the caller's
-    ///   retry re-resolves routing to wherever the leader now is.
-    ///
-    /// These confirm loops used to poll out the full [`CLIENT_TIMEOUT`] in
-    /// both states ("we time out, which is correct: the write did not
-    /// commit") — correct, but a 10s client-visible stall *per attempt*
-    /// under leadership churn, which is exactly what a resource-starved CI
-    /// runner's slow fsyncs produce (issue #268: two such burns exceed a
-    /// test's whole 25s put budget; the stall also hits real clients). A
-    /// futile wait now fails fast with the house retryable-error shape so
-    /// the caller's own retry loop makes progress instead. **Success still
-    /// requires exact effect equality** — this coarser signal only ever ends
-    /// a wait, never acks one (the false-ack hazard `cp_put_local`'s doc
-    /// spells out).
-    fn confirm_wait_is_futile(leader: &CpGroup, accepted_index: u64) -> bool {
-        leader.engine_applied_index() >= accepted_index || !leader.is_leader()
-    }
+    // The futility predicate this used to hold (`confirm_wait_is_futile`)
+    // moved to [`decide::confirm_wait_is_futile`] (ADR 0061 A6) — see that
+    // function's own doc for the full two-signal rationale (issue #268).
 
     /// Poll `leader`'s local engine for `probe_key` to reflect `probe_val` until
     /// `deadline` — the durable-before-ack confirm wait shared by every CP write
     /// path (mirrors [`cp_put_local`](Self::cp_put_local)). Ends early, with
-    /// [`ProbeWait::Superseded`], once [`confirm_wait_is_futile`](Self::
-    /// confirm_wait_is_futile) says the accepted entry's effect can no longer
-    /// appear.
+    /// [`ProbeWait::Superseded`], once [`decide::confirm_wait_is_futile`]
+    /// says the accepted entry's effect can no longer appear.
     ///
     /// `accepted_term` is the term [`ProposeResult::Accepted`] carried
     /// alongside `accepted_index` — see the identity-check note below.
@@ -9077,7 +9022,11 @@ impl ClientCtx {
             if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
                 return ProbeWait::Confirmed;
             }
-            if Self::confirm_wait_is_futile(leader, accepted_index) {
+            if decide::confirm_wait_is_futile(
+                leader.engine_applied_index(),
+                leader.is_leader(),
+                accepted_index,
+            ) {
                 // Close the probe-vs-apply race before giving up: re-check the
                 // outcome first, then the value. `confirm_wait_is_futile` can
                 // have returned `true` via its `!is_leader()` clause alone,
@@ -9171,7 +9120,7 @@ impl ClientCtx {
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
-        Self::frozen_refusal(leader).map_err(TxnAbortReason::Other)?;
+        decide::frozen_refusal(leader.is_frozen()).map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
             let _rmw = self.data().rmw_lock.lock().await;
@@ -9547,7 +9496,7 @@ impl ClientCtx {
     ) -> Result<TxnOutcome, String> {
         match self.cp_route(table, &record_key).await {
             CpRoute::Local(leader) => {
-                Self::frozen_refusal(&leader)?;
+                decide::frozen_refusal(leader.is_frozen())?;
                 if let Some(created_ts) = orphan_created_ts {
                     leader
                         .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
@@ -9621,7 +9570,7 @@ impl ClientCtx {
                 // parent is refused retryably — post-cutover the identical
                 // resolve re-routes to the child, which holds the copied
                 // intent + record and materializes at its own position.
-                Self::frozen_refusal(&leader)?;
+                decide::frozen_refusal(leader.is_frozen())?;
                 leader.txn_resolve(txn_id, record_key, keys, outcome).await;
                 Ok(())
             }
@@ -10828,7 +10777,7 @@ impl ClientCtx {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -11026,7 +10975,7 @@ impl ClientCtx {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !Self::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
@@ -11077,7 +11026,7 @@ impl ClientCtx {
     /// reflecting our value means it is durable. A per-write quorum barrier would
     /// not scale under concurrent load. (If we lose leadership before commit, the
     /// entry may be truncated and never appear locally — the confirm loop then
-    /// ends early via [`confirm_wait_is_futile`](Self::confirm_wait_is_futile)
+    /// ends early via [`decide::confirm_wait_is_futile`]
     /// with a retryable error rather than polling out the whole
     /// [`CLIENT_TIMEOUT`]: the write did not confirm, and the caller's retry
     /// re-resolves routing.)
@@ -11094,8 +11043,8 @@ impl ClientCtx {
     /// index applied yet" — a no-op still advances that watermark) it would
     /// **falsely ack** a write that never actually landed anywhere. This confirm
     /// loop polls value equality (success is never keyed on the coarser
-    /// applied-index signal — [`confirm_wait_is_futile`](Self::
-    /// confirm_wait_is_futile) only ever ends a wait *early with an error*),
+    /// applied-index signal — [`decide::confirm_wait_is_futile`]
+    /// only ever ends a wait *early with an error*),
     /// which degrades that hazard to "returns a retryable error" rather than a
     /// false ack — but that is a property of *this* poll, not a defense to rely on, so the
     /// explicit pre-check below is the actual guard: reject an out-of-range key
@@ -11111,7 +11060,7 @@ impl ClientCtx {
     /// close; a write landing in it is *dropped* (a safe no-op that this loop
     /// times out on), never mis-applied.
     async fn cp_put_local(leader: &CpGroup, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-        Self::frozen_refusal(leader)?;
+        decide::frozen_refusal(leader.is_frozen())?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(
@@ -11126,7 +11075,11 @@ impl ClientCtx {
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
                     }
-                    if Self::confirm_wait_is_futile(leader, index) {
+                    if decide::confirm_wait_is_futile(
+                        leader.engine_applied_index(),
+                        leader.is_leader(),
+                        index,
+                    ) {
                         // Close the probe-vs-apply race before giving up.
                         if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                             return Ok(());
@@ -11161,7 +11114,7 @@ impl ClientCtx {
     /// the full hazard and why the pre-check, not just the embedded fence, is
     /// the actual guard).
     async fn cp_delete_local(leader: &CpGroup, key: Vec<u8>) -> Result<(), String> {
-        Self::frozen_refusal(leader)?;
+        decide::frozen_refusal(leader.is_frozen())?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(
@@ -11176,7 +11129,11 @@ impl ClientCtx {
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
                     }
-                    if Self::confirm_wait_is_futile(leader, index) {
+                    if decide::confirm_wait_is_futile(
+                        leader.engine_applied_index(),
+                        leader.is_leader(),
+                        index,
+                    ) {
                         // Close the probe-vs-apply race before giving up.
                         if leader.local_get(&key).await.is_none() {
                             return Ok(());
@@ -11198,14 +11155,8 @@ impl ClientCtx {
         }
     }
 
-    /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
-    fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
-        match resp {
-            ClientResponse::PutOk => Ok(()),
-            ClientResponse::Error(e) => Err(e),
-            other => Err(format!("unexpected reply to {what}: {other:?}")),
-        }
-    }
+    // `ok_or_err` moved to [`decide::ok_or_err`] (ADR 0061 A6) — a plain
+    // `ClientResponse -> Result` map with nothing to gather from `self`.
 
     /// Route a CP-mode **read** for the plain client API (returns a wire
     /// [`ClientResponse`]). Thin adapter over [`cp_read`](Self::cp_read).
@@ -11270,8 +11221,10 @@ impl ClientCtx {
     /// address already in `tried` — the fallback
     /// [`cp_forward`](Self::cp_forward)'s hinted retry chases once the
     /// refusal's own leader hint is exhausted (already tried, or absent
-    /// because the refusing node's own replica was mid-election). Walks the
-    /// tablet's replicas in `Metadata` order (deterministic); `None` once
+    /// because the refusing node's own replica was mid-election). Gathers
+    /// the tablet's replicas in `Metadata` order (deterministic) and its
+    /// known routes, then hands off to the pure walk,
+    /// [`decide::other_tablet_replica_addr`] (ADR 0061 A6) — `None` once
     /// every known replica address has been tried (or the tablet/its route
     /// isn't known at all).
     fn other_tablet_replica_addr(
@@ -11284,9 +11237,7 @@ impl ClientCtx {
         // Intra-flavored (ADR 0047): this is a forwarding fallback, same as
         // `cp_leader_hint` above.
         let route = self.intra_route_snapshot();
-        replicas
-            .into_iter()
-            .find_map(|id| route.get(&id).cloned().filter(|a| !tried.contains(a)))
+        decide::other_tablet_replica_addr(&replicas, &route, tried)
     }
 
     /// Forward a CP op for `(table, key)` to `addr` (wrapped so the receiver
@@ -11394,9 +11345,11 @@ impl ClientCtx {
                 .filter(|(_, a)| !tried.contains(a))
                 .map(|(_, a)| a)
                 .or_else(|| tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried)));
-            match candidate {
-                Some(a) => next = a,
-                None if tablet.is_some() => {
+            // The pure decision (ADR 0061 A6) over the already-gathered
+            // candidate — see `decide::ForwardRetryStep`'s own doc.
+            match decide::decide_forward_retry(candidate, tablet.is_some()) {
+                decide::ForwardRetryStep::Retry(a) => next = a,
+                decide::ForwardRetryStep::WaitElection => {
                     // Every known candidate refused with no leader to point
                     // at: the group is mid-election (formation window after a
                     // split/provision, or a crashed leader). Wait it out and
@@ -11410,7 +11363,7 @@ impl ClientCtx {
                     // `next` unchanged: re-probe the same replica first — once
                     // the election completes it either serves or hints.
                 }
-                None => return resp,
+                decide::ForwardRetryStep::GiveUp => return resp,
             }
         }
     }
@@ -14087,7 +14040,7 @@ struct AutoSplitThresholds {
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
-/// when [`align_split_key`] finds a streamed table's split key rounds down
+/// when [`decide::align_split_key`] finds a streamed table's split key rounds down
 /// onto the target tablet's own `range.start` — matched by `auto_split_loop`
 /// to downgrade its logging (Fork E: skip + meter via
 /// [`Metric::StreamSplitSingleTokenSkipped`], never its ordinary "split did
@@ -14096,43 +14049,15 @@ struct AutoSplitThresholds {
 const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
     "split key rounds onto the tablet's own range start (single-token hot partition)";
 
-/// F11 (ADR 0042 §14, Fork D): round `split_key` down to its own 8-byte
-/// token boundary (`TOKEN_BYTES`) if `tablet`'s table is streamed, so one
-/// partition key's records — and hence one shard's, ADR 0043 §A4 — never
-/// separate across sibling tablets. A plain, unstreamed table's split key is
-/// returned unchanged. Called from the **one** choke point every split
-/// proposer funnels through ([`ClientCtx::trigger_split`]), so this can
-/// never be forgotten by a future caller the way the pre-PR2 code (rounding
-/// done only inside `auto_split_loop`) could be bypassed by the two manual
-/// paths (`POST /admin/tablet/split`, `ClientRequest::SplitTablet`).
-///
-/// Returns `(key, viable)`: `viable` is whether the (possibly rounded) key
-/// is still a legal **interior** split point for `tablet`'s current range
-/// (`KeyRange::split_at`'s own "strictly inside" rule). Rounding a hot
-/// single-token partition's own key can collapse it onto `range.start` —
-/// Fork E's accepted single-token hot-partition limit: one very hot
-/// partition key ends up owning the tablet's entire range, and it can never
-/// legally split without separating that same token's records across
-/// siblings — the exact affinity F11 exists to protect. `viable == false`
-/// for an unknown tablet too (the caller's own subsequent lookup reports
-/// that more precisely; this just never claims a key is fine for a tablet
-/// this function can't even see).
-fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
-    let Some(t) = meta.tablets.get(&tablet) else {
-        return (split_key, false);
-    };
-    let streamed = t
-        .table
-        .as_deref()
-        .is_some_and(|table| meta.table_stream(table).is_some());
-    let key = if streamed {
-        split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
-    } else {
-        split_key
-    };
-    let viable = t.range.split_at(&key).is_some();
-    (key, viable)
-}
+// F11 (ADR 0042 §14, Fork D): the split-key token-rounding predicate moved
+// to [`decide::align_split_key`] (ADR 0061 A6) — round-trip-pure over a
+// `Metadata` snapshot, no `self`/network/lock access. Called from the
+// **one** choke point every split proposer funnels through
+// ([`ClientCtx::trigger_split`]), so this can never be forgotten by a
+// future caller the way the pre-PR2 code (rounding done only inside
+// `auto_split_loop`) could be bypassed by the two manual paths (`POST
+// /admin/tablet/split`, `ClientRequest::SplitTablet`). See that function's
+// own doc for the full F11/Fork E rationale.
 
 /// Choose the two `BeginSplit` children's replica sets (ADR 0050 fork F5:
 /// **fresh placement at mint** — children are born at their final homes, so
@@ -14206,7 +14131,7 @@ fn split_child_placement(meta: &Metadata, parent: TabletId) -> Result<[Vec<NodeI
 /// once it applies, the parent's counts halve below both thresholds.
 ///
 /// **The split point is byte-weighted whenever a byte threshold is configured**
-/// (ADR 0034 — [`byte_weighted_median`], the key that roughly bisects the
+/// (ADR 0034 — [`decide::byte_weighted_median`], the key that roughly bisects the
 /// tablet's *bytes*, not just its key count): with skewed value sizes a plain
 /// positional median can leave one huge half and one tiny half, which
 /// immediately re-triggers on the huge side. A key-count-only configuration
@@ -14340,7 +14265,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // median unchanged from before this ADR (the interior key of
             // `> threshold >= 2` distinct keys `SplitTablet` accepts).
             let split_key = if thresholds.bytes.is_some() || over_change_rate_threshold {
-                byte_weighted_median(&pairs)
+                decide::byte_weighted_median(&pairs)
             } else {
                 pairs[pairs.len() / 2].0.clone()
             };
@@ -14375,47 +14300,10 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     }
 }
 
-/// The key that most closely bisects `pairs`' **total bytes** (`key.len() +
-/// value.len()` per pair), not just its key count (ADR 0034): among every
-/// interior split point `i` (`1 <= i <= pairs.len() - 1`, splitting into
-/// `pairs[..i]` / `pairs[i..]`), returns `pairs[i].0` for the `i` whose left
-/// side's byte total is closest to half the whole. A key's bytes can never be
-/// divided across the split (a split point is always a whole key boundary),
-/// so when one key's own bytes are a large fraction of the total, the
-/// closest achievable split may still be lopsided — this picks the least
-/// lopsided **achievable** boundary, which is the best any key-boundary split
-/// can do. With skewed value sizes this avoids the plain positional median's
-/// failure mode: a few huge values among many tiny ones would otherwise put
-/// almost all the bytes on one side regardless of how many *keys* end up on
-/// each side, which immediately re-triggers a split on the huge side instead
-/// of settling below threshold.
-///
-/// Always returns an **interior** key (`i >= 1`, so never `pairs[0].0`,
-/// matching the positional median's own "index > 0" guarantee). Requires
-/// `pairs.len() >= 2` (the same precondition `auto_split_loop` already checks
-/// before calling this — there is no meaningful split point for 0 or 1 keys).
-fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    debug_assert!(
-        pairs.len() >= 2,
-        "need >= 2 keys for an interior split point"
-    );
-    let total: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
-    let half = total / 2;
-    let mut best_idx = 1;
-    let mut best_diff = u64::MAX;
-    let mut prefix: u64 = 0; // bytes of pairs[0..i], updated *before* considering split `i`.
-    for (i, (key, value)) in pairs.iter().enumerate() {
-        if i >= 1 {
-            let diff = prefix.abs_diff(half);
-            if diff < best_diff {
-                best_diff = diff;
-                best_idx = i;
-            }
-        }
-        prefix += (key.len() + value.len()) as u64;
-    }
-    pairs[best_idx].0.clone()
-}
+// ADR 0034: the byte-weighted median moved to
+// [`decide::byte_weighted_median`] (ADR 0061 A6) — pure over the materialized
+// pairs, no `self`/network/lock access. See that function's own doc for the
+// full "closest achievable boundary" rationale.
 
 /// Growth PR3 (ADR 0042 §14): the exact error [`ClientRequest::
 /// TriggerAutoSplit`]'s handler (and, table-wide, [`ClientCtx::
@@ -14442,7 +14330,7 @@ const STREAM_GROW_NO_SPLIT_POINT: &str =
 const STREAM_GROW_MID_SPLIT: &str = "tablet is mid-split — its split workflow is already in flight";
 
 /// Materialize `group`'s own live pairs and compute their byte-weighted
-/// median (ADR 0034's [`byte_weighted_median`]) — the same key
+/// median (ADR 0034's [`decide::byte_weighted_median`]) — the same key
 /// `auto_split_loop` computes for a byte-configured cluster, reused here for
 /// growth PR3's manual `POST /admin/stream/grow` trigger and Fork F's
 /// change-rate auto-trigger, neither of which has (or needs) a byte/key
@@ -14456,7 +14344,7 @@ async fn median_split_key(group: &CpGroup) -> Option<Vec<u8>> {
     if pairs.len() < 2 {
         return None;
     }
-    Some(byte_weighted_median(&pairs))
+    Some(decide::byte_weighted_median(&pairs))
 }
 
 /// Accept loop shared by **both** listeners (ADR 0047) — the client port and
@@ -14960,7 +14848,8 @@ impl ClientCtx {
                 // matches), so recomputing this every attempt is
                 // equivalent to computing it once — just simpler to read
                 // alongside the fresh `new_id` above.
-                let (aligned_key, viable) = align_split_key(&meta, tablet, split_key.clone());
+                let (aligned_key, viable) =
+                    decide::align_split_key(&meta, tablet, split_key.clone());
                 if !viable {
                     self.control
                         .metrics()
@@ -17689,106 +17578,24 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io:
     Ok(Some(msg))
 }
 
-/// Unit tests for [`byte_weighted_median`] (ADR 0034) — a private free
-/// function, so this lives as an in-crate `#[cfg(test)]` module (like
-/// `split_fence_tests` above) rather than under `tests/`, which can't reach
-/// it.
-#[cfg(test)]
-mod auto_split_median_tests {
-    use super::byte_weighted_median;
+// `byte_weighted_median`'s own unit tests moved to `decide`'s test module
+// alongside the function itself (ADR 0061 A6, formerly `auto_split_median_tests`
+// here).
 
-    fn pair(key: &str, value_len: usize) -> (Vec<u8>, Vec<u8>) {
-        (key.as_bytes().to_vec(), vec![b'x'; value_len])
-    }
-
-    /// Many tiny rows plus a **few huge** ones: the byte-weighted median must
-    /// land near where the *bytes* are roughly halved, which — because the
-    /// huge values dominate the total — is a very different key than the
-    /// plain positional median (`pairs.len() / 2`, dead center by count).
-    #[test]
-    fn skewed_value_sizes_bisect_by_bytes_not_position() {
-        // 20 tiny rows (~1 byte value each) then 2 huge rows (~10,000 bytes
-        // each) at the end: positionally the median sits deep in the tiny
-        // run (index 11 of 22), but two rows alone hold the vast majority of
-        // the bytes.
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> =
-            (0..20).map(|i| pair(&format!("k{i:03}"), 1)).collect();
-        pairs.push(pair("y0", 10_000));
-        pairs.push(pair("y1", 10_000));
-
-        let total: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
-        let positional_median = pairs[pairs.len() / 2].0.clone();
-        // The positional median is one of the tiny keys, deep in the small
-        // run — nowhere near where the bytes actually split.
-        assert!(
-            positional_median.starts_with(b"k"),
-            "sanity: the plain positional median is a tiny-row key, not a \
-             huge-row one, proving the two metrics genuinely disagree here"
-        );
-
-        let split = byte_weighted_median(&pairs);
-        let split_idx = pairs
-            .iter()
-            .position(|(k, _)| k == &split)
-            .expect("split key is one of the pairs");
-
-        // Sum of bytes strictly before the split point vs. at/after it — both
-        // halves should be within a small tolerance of `total / 2`, unlike
-        // the positional median which would leave ~20KB on one side and a
-        // few dozen bytes on the other.
-        let left_bytes: u64 = pairs[..split_idx]
-            .iter()
-            .map(|(k, v)| (k.len() + v.len()) as u64)
-            .sum();
-        let right_bytes: u64 = total - left_bytes;
-        let half = total / 2;
-        // Since the two huge rows dominate, the byte-weighted cut must fall
-        // at or after the first huge row (index 20) — i.e. not inside the
-        // tiny-row run at all.
-        assert!(
-            split_idx >= 20,
-            "byte-weighted median (index {split_idx}) must fall at/after the \
-             first huge value, not inside the tiny-row run — total={total}"
-        );
-        // And it must actually roughly bisect the bytes: neither side should
-        // hold less than a third of the total (a loose bound — this is a
-        // heuristic estimator, not an exact bisection).
-        assert!(
-            left_bytes >= half / 3 && right_bytes >= half / 3,
-            "split should roughly halve bytes: left={left_bytes} right={right_bytes} half={half}"
-        );
-    }
-
-    /// Uniform value sizes: the byte-weighted median should land at (or very
-    /// near) the plain positional median, since bytes-per-row is constant.
-    #[test]
-    fn uniform_value_sizes_agree_with_positional_median() {
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
-            (0..10).map(|i| pair(&format!("k{i:03}"), 8)).collect();
-        let positional = pairs[pairs.len() / 2].0.clone();
-        let weighted = byte_weighted_median(&pairs);
-        assert_eq!(
-            weighted, positional,
-            "uniform row sizes: byte-weighted and positional medians should coincide"
-        );
-    }
-
-    /// Always returns an interior key (never the very first key), matching
-    /// the positional median's own "index > 0" guarantee — required so
-    /// `SplitTablet` always sees a valid `start < at` split point.
-    #[test]
-    fn never_returns_the_first_key() {
-        let pairs = vec![pair("a", 100_000), pair("b", 1), pair("c", 1)];
-        let split = byte_weighted_median(&pairs);
-        assert_ne!(split, b"a".to_vec(), "must not return the first key");
-    }
-}
-
-/// Regression tests for [`ClientCtx::confirm_wait_is_futile`] (issue #268) —
-/// in-crate because they need a private [`CpGroup`] handle and the
-/// `pub(crate)` [`ClientCtx::cp_kind_local`], which no external `tests/`
-/// file can reach (the same reason `gsi_drain_cursor_tests` lives inside
-/// `index_drain.rs`). Run via `cargo test -p animusd --lib`.
+/// Regression tests for the end-to-end fast-fail behavior
+/// [`decide::confirm_wait_is_futile`] enables (issue #268) — in-crate
+/// because they need a private [`CpGroup`] handle and the `pub(crate)`
+/// [`ClientCtx::cp_kind_local`], which no external `tests/` file can reach
+/// (the same reason `gsi_drain_cursor_tests` lives inside `index_drain.rs`).
+/// Run via `cargo test -p animusd --lib`.
+///
+/// **Deliberately not moved into `decide`'s own test module (ADR 0061 A6):**
+/// unlike `decide::confirm_wait_is_futile`'s own direct unit tests (a plain
+/// truth table over the predicate's three primitive inputs), these prove
+/// the *wired* behavior — a real `CpGroup` propose/apply/poll round trip
+/// through `cp_kind_local`, with real timing assertions — which needs a
+/// live single-node cluster regardless of how pure the underlying predicate
+/// is. `decide`'s own module stays bring-up-free, matching `topology.rs`.
 #[cfg(test)]
 mod confirm_futility_tests {
     use std::net::SocketAddr;
@@ -18317,138 +18124,11 @@ mod halted_shutdown_tests {
     }
 }
 
-/// Unit tests for [`align_split_key`] (F11, ADR 0042 §14, growth PR2) — a
-/// private free function, so this lives as an in-crate `#[cfg(test)]`
-/// module (like `auto_split_median_tests` above) rather than under
-/// `tests/`, which can't reach it. `manual_split_with_unaligned_key_on_
-/// streamed_table_rounds_to_token_boundary` (`tests/f11_split_alignment.rs`)
-/// covers the same rounding end to end, through a real cluster's admin HTTP
-/// surface; these are the fast, pure-function siblings for the rounding
-/// rule itself and the Fork E degenerate case.
-#[cfg(test)]
-mod align_split_key_tests {
-    use animus_control::{MetaCommand, Metadata, StreamSpec, StreamViewType};
-    use animus_tablet::{KeyRange, TabletId};
-
-    use super::align_split_key;
-
-    fn streamed_metadata_with_tablet(tablet: TabletId, range: KeyRange) -> Metadata {
-        let mut m = Metadata::default();
-        assert!(matches!(
-            m.apply(&MetaCommand::CreateTableSchema {
-                table: "orders".to_owned(),
-                schema: animus_control::TableSchema::simple(
-                    "pk",
-                    animus_control::ColumnType::String
-                ),
-            }),
-            animus_control::ApplyOutcome::Applied
-        ));
-        assert!(matches!(
-            m.apply(&MetaCommand::SetTableStream {
-                table: "orders".to_owned(),
-                spec: Some(StreamSpec {
-                    view_type: StreamViewType::NewAndOldImages,
-                    label: "L1".to_owned(),
-                }),
-            }),
-            animus_control::ApplyOutcome::Applied
-        ));
-        assert!(matches!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet,
-                table: Some("orders".to_owned()),
-                range,
-                replicas: Vec::new(),
-            }),
-            animus_control::ApplyOutcome::Applied
-        ));
-        m
-    }
-
-    /// A streamed table's split key rounds down to exactly `TOKEN_BYTES`,
-    /// discarding everything past the token — the F11 rule.
-    #[test]
-    fn rounds_a_streamed_tables_key_down_to_the_token_boundary() {
-        let tablet = TabletId(1);
-        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
-        let raw = b"orders-mXX".to_vec(); // 10 bytes.
-        let (rounded, viable) = align_split_key(&m, tablet, raw);
-        assert_eq!(rounded, b"orders-m".to_vec());
-        assert!(
-            viable,
-            "the rounded key is still strictly inside the whole range"
-        );
-    }
-
-    /// An unstreamed table's split key is returned byte-for-byte unchanged,
-    /// whatever its length — F11 only applies to a streamed table.
-    #[test]
-    fn leaves_an_unstreamed_tables_key_untouched() {
-        let mut m = Metadata::default();
-        assert!(matches!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("plain".to_owned()),
-                range: KeyRange::whole(),
-                replicas: Vec::new(),
-            }),
-            animus_control::ApplyOutcome::Applied
-        ));
-        let raw = b"any-length-key-at-all".to_vec();
-        let (key, viable) = align_split_key(&m, TabletId(1), raw.clone());
-        assert_eq!(key, raw);
-        assert!(viable);
-    }
-
-    /// A key already exactly `TOKEN_BYTES` long round-trips unchanged (the
-    /// idempotent case: `trigger_split` re-rounding a key `auto_split_loop`
-    /// or a prior caller already rounded).
-    #[test]
-    fn a_key_already_token_aligned_is_unchanged() {
-        let tablet = TabletId(1);
-        let m = streamed_metadata_with_tablet(tablet, KeyRange::whole());
-        let raw = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        let (rounded, viable) = align_split_key(&m, tablet, raw.clone());
-        assert_eq!(rounded, raw);
-        assert!(viable);
-    }
-
-    /// Fork E (ADR 0042 §14): a single very hot partition token owns the
-    /// whole tablet — rounding its own key collapses it onto `range.start`,
-    /// so `viable` reports `false` (the degenerate, structurally
-    /// unsplittable case `trigger_split` turns into a metered skip rather
-    /// than ever proposing).
-    #[test]
-    fn reports_not_viable_when_the_rounded_key_collapses_onto_range_start() {
-        // Range starting at the token "orders-m" itself (as a real sibling
-        // tablet's own `range.start` would look after a prior split) — any
-        // key beginning with that same 8-byte prefix rounds right back onto
-        // it.
-        let tablet = TabletId(2);
-        let range = KeyRange {
-            start: b"orders-m".to_vec(),
-            end: None,
-        };
-        let m = streamed_metadata_with_tablet(tablet, range);
-        let (rounded, viable) = align_split_key(&m, tablet, b"orders-mZZ".to_vec());
-        assert_eq!(rounded, b"orders-m".to_vec());
-        assert!(
-            !viable,
-            "a token-rounded key equal to the tablet's own range.start is not a legal split point"
-        );
-    }
-
-    /// An unknown tablet id reports `viable == false` (nothing to check
-    /// against) rather than optimistically claiming any key would work.
-    #[test]
-    fn reports_not_viable_for_an_unknown_tablet() {
-        let m = Metadata::default();
-        let (key, viable) = align_split_key(&m, TabletId(999), b"whatever".to_vec());
-        assert_eq!(key, b"whatever".to_vec());
-        assert!(!viable);
-    }
-}
+// `align_split_key`'s own unit tests moved to `decide`'s test module
+// alongside the function itself (ADR 0061 A6, formerly `align_split_key_tests`
+// here). `manual_split_with_unaligned_key_on_streamed_table_rounds_to_
+// token_boundary` (`tests/f11_split_alignment.rs`) still covers the same
+// rounding end to end, through a real cluster's admin HTTP surface.
 
 /// Back-compat coverage for [`ClientResponse::Status`]'s additive fields
 /// (ADR 0037 PR2's `control_voters`, mirroring `leader_hint`/`watermark`'s
