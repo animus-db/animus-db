@@ -74,6 +74,24 @@ through-Raft, fault-injecting integration tests are
 `animus-control/tests/placement_reconcile.rs` (repair) and
 `placement_rebalance.rs` (rebalancing).
 
+`tests/placement_props.rs` (ADR 0061 rung A1, `proptest` dev-dep) generalizes
+the fixed-scenario suites above over randomized topologies (random node
+counts, RF, residency labels, failure domains): `rebalance_step` moves at
+most one replica per call, never worsens spread/residency compliance on any
+move, and terminates in a provably bounded number of steps (the
+sum-of-squares argument in `rebalance_step`'s own doc); `replan` under random
+node failures never places a dropped node, keeps every surviving replica,
+and returns an RF-sized, residency-admitted set whenever `Ok`. **A precise
+finding, not a bug**: `rebalance_step`'s "converges to max−min ≤ 1" claim is
+proven here only for a policy with **no** `SpreadPolicy` — a strict or
+best-effort spread constraint can legally block every improving move on
+every eligible tablet, so the module doc for this test file explains why the
+final-balance assertion is conditioned on `policy.spread.is_none()` rather
+than asserted unconditionally. Case counts are kept modest (64/`ProptestConfig`)
+for the per-push gate; the properties hold up to several thousand cases
+locally (see the file's generation-strategy comments for how infeasible
+cases are avoided rather than filtered by a high-discard `prop_assume!`).
+
 ## Deferred (ADR 0005)
 
 Residency across read-repair / anti-entropy / hinted handoff / backup. (Policy
