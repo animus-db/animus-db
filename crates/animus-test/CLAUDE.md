@@ -17,6 +17,22 @@ properties; it also hosts cross-crate fault sweeps.
 - `src/check.rs` — `check_cycles` (serializability), `check_durability`,
   `check_convergence`; each returns a `CheckReport` carrying the run seed.
 - `src/export.rs` — `to_json`, `to_edn` (Jepsen/Elle).
+- `src/corpus.rs` (ADR 0061 rung B1) — the shared corpus-seeding scaffolding
+  every fault-injection corpus in the repo builds on: `name_seed` (the
+  house FNV-1a name→seed hash), `odd_name_seed` (a second, `| 1` hash
+  flavor four corpora use — kept as its own function, never unified with
+  `name_seed`, because unifying them would silently move those corpora's
+  committed regression seeds; see this module's own doc for which corpora
+  use which), `seeds_from_env` (the `ANIMUS_*_SEEDS` depth-knob parse), and
+  two expansion shapes: `seed_expand<T: SeedVariant>` for corpora that
+  build a `Vec<Scenario>` up front (implement `SeedVariant`'s
+  `scenario_name`/`reseeded` on your own `Scenario` type — the harness owns
+  the expansion loop, never forcing one struct shape), and `for_each_seed`
+  for corpora that drive one named scenario directly via a closure. Used
+  by `animus-test`'s own `tests/*_corpus.rs` files below and, as a dev-
+  dependency, by `animus-cp-data`'s and `animus-control`'s corpus test
+  files — a dev-dependency cycle Cargo permits, since neither crate's
+  library needs the other to build.
 
 Env knobs at a glance (details in the sections below):
 

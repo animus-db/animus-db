@@ -13,6 +13,7 @@
 //! replayable.
 
 pub mod check;
+pub mod corpus;
 pub mod export;
 pub mod history;
 
