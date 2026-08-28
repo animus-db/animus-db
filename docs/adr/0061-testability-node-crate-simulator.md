@@ -649,6 +649,79 @@ them with it, and they cannot come if they touch anything the destination crate
 excludes. Ask that question *before* choosing a crate split as the enforcement
 strategy — it is cheap to check and expensive to discover six rungs in.
 
+#### 2026-08-28 amendment (eighth) — Phase C's closing rung landed; the claim held for reads/writes, with one precise DDL boundary
+
+Scoping and building the closing rung (a `SimEnv`-driven `ClientCtx` harness
+in `animusd`'s own tests, per the seventh amendment's decision) confirmed the
+core claim exactly as written: `ClientCtx<SimEnv, _>` is constructible and
+drivable in `animusd`'s own tests, with `animus-sim` as a `[dev-dependencies]`
+entry and **no visibility widened anywhere** (the harness is an in-crate
+`#[cfg(test)] mod`, reachable via Rust's ordinary "descendant module" privacy
+rule — see `crates/animusd/CLAUDE.md`'s own section on it for the full
+design). A real write (`ClientCtx::cp_kind_write_raw`) and a real read
+(`ClientCtx::cp_get`) — the exact methods `handle_request`'s `ClientRequest::
+Put`/`Get` arms call in production — both run end to end through a real
+one-voter control `RaftNode<SimEnv>` and a real one-voter CP data-plane
+`RaftKvNode<SimEnv, MemoryEngine>`, seed-reproducibly, with no sockets and no
+`ProdEnv`. This is a full outcome against the rung's stated goal, not a
+partial one requiring an unwinding later.
+
+**One thing the seventh amendment's phrasing didn't anticipate, found while
+building rather than while scoping.** That amendment listed "the read/write/
+txn/forwarding/schema paths" as what the harness would prove reachable. The
+first four are: this rung's harness drives read/write directly, and nothing
+about txn/forwarding's own genericity (steps 1/3a/3b already made both
+`tokio`-free and `E`-generic, unchanged by this rung) is in question. **Schema
+is different in kind, not degree.** `ClientCtx::propose_schema`'s
+local-propose fast path — the thing every schema-DDL call
+(`provision_tablet`, `trigger_split`, `drop_table*`, and `propose_schema`
+itself) ultimately needs — reads `ClusterEdgeState::control: Arc<Mutex<
+Vec<RaftNode<ProdEnv>>>>`, a field that is concretely `ProdEnv`-typed
+regardless of the enclosing `ClientCtx<E, R>`'s own `E`. This is not new
+technical debt this rung introduced: it is a pre-existing, deliberate design
+choice rung C3c already made and documented on `ControlHandle`'s own doc
+(`animus-node::control_handle`) — proposing a `MetaCommand` is "inherently a
+local-Raft-log operation," so `ControlHandle::propose`/`flush` were
+deliberately never added to that seam, and every proposal instead goes
+through this one concrete, `ProdEnv`-bound handle. The closing rung's harness
+therefore cannot drive `propose_schema` under `SimEnv` at all — it seeds the
+schema catalog by proposing directly on the control `RaftNode` instead
+(bypassing `ClientCtx` for setup, the same thing `animus-node/tests/
+index_backfill_sim.rs` already does for the identical reason), which is
+sufficient for read/write coverage but means DDL stays undriven here.
+
+**A second, independent blocker, also found by building rather than
+scoping**: `DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle` hardcode
+`FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of
+`E` — not a C0 feature-gate issue (`animus-env`'s `prod` feature is
+unconditionally on for `animusd`), simply that neither handle type takes an
+`E` parameter at all. Not exercised by this rung (`cp_kind_write_raw`/
+`cp_get` never call `self.data()`), so `data: None` sufficed — but it is the
+next thing a follow-on rung driving the DynamoDB-shaped write path
+(`cp_kind_write_item`) or any of the TTL/backup/stream loops under a real
+`DataRole` will hit.
+
+**Neither blocker is treated as something to fix in this rung.** Both are
+narrow, precisely located, and — per the second and fourth 2026-08-28
+amendments' standing guidance — routing around either with a new capability
+trait purely to make DDL/`DataRole` sim-drivable would be exactly the
+"contorted trait built to make a move happen" failure mode those amendments
+warn against, not a genuine leaf capability. They are recorded here as the
+scope boundary Phase D's `SimCluster` (D1) needs to know about before it
+tries to seed schema or exercise `DataRole`-dependent paths the same way:
+`SimCluster` will need its own answer to "how does a multi-node `SimEnv`
+cluster propose schema and reach quorum on it," which is a real design
+question, not a rerun of this rung's single-node bypass.
+
+**On the pattern.** This is the first rung in Phase C's delivery whose
+closing scoping pass did *not* find the plan needed re-ordering or
+re-splitting — the six earlier amendments (C0, C2, C3, C4, C5's fifth, C5's
+sixth) each corrected the *shape* of a rung before or during work. This one
+confirms the seventh amendment's redirection (stop moving code, prove
+`SimEnv`-drivability where the code already stands) was the right call, and
+the residual findings above are refinements to *what the proof covers*, not
+corrections to *how it should be built*.
+
 ### Phase D — the payoff
 
 | Rung | Work |

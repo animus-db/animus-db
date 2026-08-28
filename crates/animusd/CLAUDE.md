@@ -2878,10 +2878,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   plausible index, so the final image would degenerate back into the
   unfiltered whole-table re-ship rung 8 fixed) — a known regression bought
   for no saved scan. The two are simply different value spaces and neither
-  bounds the other, which is the rule to remember; note this driver runs
-  only over `ProdEnv` (`animusd` has no `animus-sim` dependency), so
-  simulated-clock reasoning does not apply to it either way. No code
-  changed; the pre-pass scan stays.
+  bounds the other, which is the rule to remember; note this driver still
+  runs only over `ProdEnv` in production (nothing in the split-build path
+  is reached by the `SimEnv` `ClientCtx` harness below — see that
+  section), so simulated-clock reasoning does not apply to it either way.
+  No code changed; the pre-pass scan stays.
 - Several gotchas here are instances of cross-cutting lessons — port-TOCTOU
   bring-up retries (`support::restart_same_addrs`), "a flaky `ProdEnv` test is a
   real bug", restart-test discipline (poll for catch-up, not leadership),
@@ -2889,12 +2890,151 @@ route below the edge through the same `ClientCtx` CP primitives.
   never-accepted from accepted-unconfirmed. See the **engineering-lessons log
   (root `CLAUDE.md`)** for the general form of each.
 
+## SimEnv `ClientCtx` harness (ADR 0061 Phase C's closing rung)
+
+`lib.rs`'s `simenv_client_ctx_tests` (an in-crate `#[cfg(test)] mod`, run via
+`cargo test -p animusd --lib`) is this crate's **first** `SimEnv`-driven
+test: it constructs a real `ClientCtx<SimEnv, _>` — the production struct
+`ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient>`
+instantiated at `E = SimEnv` — and drives a genuine write + read through its
+own `cp_kind_write_raw`/`cp_get` methods, deterministically and
+seed-reproducibly, with no sockets and no `ProdEnv` anywhere in the run.
+This is what makes the seventh 2026-08-28 ADR 0061 amendment's claim ("a
+`ClientCtx<SimEnv>` can be constructed and driven in `animusd`'s own tests")
+true rather than an unverified assertion — see that amendment, and its
+eighth-amendment follow-up, for the full account of what this rung found.
+
+**What it constructs.** One `Simulator`, a one-voter control `RaftNode<
+SimEnv>` (node 0), a one-voter CP data-plane `RaftKvNode<SimEnv,
+MemoryEngine>` (node 1, tablet 1, a whole-ring `StorageScope`) registered
+into a real `ClusterEdgeState<SimEnv>`, and a real `ClientCtx<SimEnv,
+NeverRelay>` struct-literal built from those handles plus placeholder
+`AdminInfo`/routing-table/metrics fields. `NeverRelay` is a zero-sized
+`RelayClient` implementor whose `relay` always returns
+`ClientResponse::Error(..)` — sound because this fixture is single-node and
+its one tablet is always led locally, so nothing in the paths this harness
+drives ever needs to relay. `data: None` (no `DataRole`) is deliberate, not
+a shortcut — see "What it cannot drive" below.
+
+**Why an in-crate `#[cfg(test)] mod`, not `tests/*.rs`.** `ClientCtx`'s own
+fields, `ClusterEdgeState::register_raftkv`, `CpGroup`, and `AdminInfo` are
+all private to this crate. Rust's privacy rule ("visible in the defining
+module and its descendants") lets a child module of `lib.rs` construct every
+one of them exactly as they already are; an external `tests/` file could
+only reach them by widening several types' visibility for no reason beyond
+"an external file wants to construct them once." **This rung widened no
+visibility at all** — the same precedent `confirm_futility_tests`/
+`kind_batch_signal_tests` already set in this file.
+
+**What it can drive.** `cp_kind_write_raw` and `cp_get` — the *exact*
+methods `handle_request`'s `ClientRequest::Put`/`Get` arms call in
+production. The harness calls them directly rather than through
+`handle_request` itself, because `handle_request` (and
+`dynamo::marker_batch_write_raw`, the thin wrapper the real `Put` handler
+goes through) are both hardcoded to `&ClientCtx` = `ClientCtx<ProdEnv,
+AnimusdRelayClient>` and so cannot be called with a `SimEnv` context at all
+— they simply never needed a second type parameter before this rung, and
+genericizing them is not needed to prove this rung's claim (see "Not yet
+generic" below). Driving `cp_kind_write_raw` exercises the real
+route → propose → confirm loop, including the exponential confirm-poll
+backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`); `cp_get` exercises the real
+route → local-resolve loop. Both are spawned onto `ctx.env` and driven with
+`Simulator::run_for` (never `block_on` — see the gotcha below), following
+the corpus's converged-or-timeout idiom rather than a fixed-deadline assert.
+
+**What it cannot drive, and why (read before extending it) — two separate,
+precisely located blockers, neither introduced by this rung:**
+
+- **Schema DDL (`ClientCtx::propose_schema`, and therefore
+  `provision_tablet`, `trigger_split`, `drop_table*` — every DDL path).**
+  `propose_schema`'s local-propose fast path reads `ClusterEdgeState::
+  control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>` — a field that is
+  concretely, permanently `ProdEnv`-typed regardless of the enclosing
+  `ClientCtx<E, R>`'s own `E` (see that field's own doc: `ControlHandle`
+  in `animus-node::control_handle` deliberately carries no `propose`
+  method at all, "because proposing is inherently a local-Raft-log
+  operation," and every proposal instead goes through this concrete
+  handle). This is a **pre-existing, deliberate design choice** the ADR's
+  own C3c rung already documented, not a gap this rung introduced or could
+  route around without inventing a capability trait purely to make DDL
+  sim-drivable — exactly the "contorted trait" failure mode the second and
+  fourth 2026-08-28 amendments warn against. The harness's fixture
+  (`seed_schema`) works around it the honest way: it proposes
+  `CreateTableSchema`/`CreateTablet` directly on the control `RaftNode`,
+  bypassing `ClientCtx` entirely for setup — the identical thing
+  `animus-node/tests/index_backfill_sim.rs` already does for the same
+  reason.
+- **`DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle`.** Both hardcode
+  `FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>`
+  regardless of the enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s
+  `prod` feature is unconditionally on for this crate, so `FsSegmentStore`
+  genuinely exists here — the blocker isn't C0's feature gate, it's that
+  neither handle type takes an `E` parameter at all). A real `DataRole`
+  therefore cannot be built generically today. Not exercised by this rung:
+  neither `cp_kind_write_raw` nor `cp_get` ever calls
+  `self.data()`/`self.data_opt()` (verified by reading both call chains,
+  not assumed), so `data: None` is sufficient to prove this rung's claim.
+  Any future extension that needs a real `DataRole` under `SimEnv` (the
+  DynamoDB-shaped `cp_kind_write_item` write path, the TTL/backup/stream
+  loops) hits this blocker first.
+
+**Not yet generic, also worth knowing before extending this harness**:
+`handle_request` and `dynamo::marker_batch_write_raw`/
+`kind_write_item_at_leader`'s *callers* in `dynamo.rs` stay hardcoded to
+`&ClientCtx` (`E = ProdEnv`) — only the five split modules
+(`schema`/`read_path`/`write_path`/`txn_coordinator`/`forwarding`) and a
+handful of `lib.rs`-resident crate-wide accessors
+(`effective_metadata`/`data`/`data_opt`/…) are `E`-generic today. Driving
+the DynamoDB wire-shaped write path (`cp_kind_write_item`, which *is*
+already `E`-generic in `write_path.rs`) under `SimEnv` is reachable in a
+follow-on rung once a `SimEnv`-safe `DataRole` exists; driving
+`handle_request`/`dynamo.rs`'s handlers themselves is a larger, separate
+genericization this rung did not attempt.
+
+**Gotchas hit standing this up:**
+
+- **`futures::executor::block_on` does not work over a `SimEnv`-driven
+  future — it hangs.** `cp_kind_write_raw`/`cp_get` both potentially
+  `.await` an `env.sleep()` (the confirm-poll backoff, the route-wait
+  retry loop); nothing advances `SimEnv`'s virtual clock or fires its
+  timers except `Simulator::run_for`/`run_until` stepping the simulator's
+  own cooperative executor. The correct shape — the same one `animus-
+  cp-data/CLAUDE.md`'s own "Linearizable reads are async... drive them as
+  spawned tasks + `run_for`" rule already names — is `env.spawn_task(fut)`
+  capturing the result into a shared `Arc<Mutex<Option<T>>>` slot, then
+  `sim.run_for(bound)`, then read the slot back out
+  (`spawn_and_capture`, this module's own shared helper).
+- **A method call's receiver borrow and a later argument's move of the
+  same struct conflict.** `ctx.env.spawn_task(async move { ...
+  ctx.cp_kind_write_raw(..) })` does not compile: the receiver expression
+  `ctx.env` borrows `ctx` for the call, and the `async move` block later
+  in the same expression tries to move the whole `ctx` — clone `ctx.env`
+  into its own local binding *before* constructing the future that moves
+  `ctx`, mirroring `animus-node/tests/index_backfill_sim.rs`'s own
+  `let loop_env = node.env().clone(); loop_env.spawn_task(..)` idiom.
+- **`clippy::unusual_byte_groupings` fires on a hand-picked hex seed
+  literal** (`0x51_4E_0001`, meant to spell "SimEnv" loosely in hex,
+  grouped in 2-digit chunks) — clippy wants hex digits grouped in **fours**
+  from the right (`0x514E_0001`). Caught by the full `-D warnings` gate,
+  not by `cargo test` (which doesn't run clippy) — a reminder that a green
+  `cargo test` does not imply a green `cargo clippy` for a freshly written
+  sim test.
+- **`cargo clippy -p animusd --all-targets --all-features` does not pay
+  this crate's disk cost the way `cargo build`/`cargo test` with the same
+  flags does.** Clippy checks every target (including the ~100 files in
+  `tests/`) without linking full binaries, so it stayed under a few GB of
+  target-directory growth for this whole crate — safe to run as the actual
+  gate 2 command from the disk-discipline section above, unlike `cargo
+  build -p animusd --all-targets`, which is exactly what fills the disk.
+
 ## Tests
 
-`cargo test -p animusd` — all tests are real-socket `ProdEnv` integration
-tests that poll with timeouts, not deterministic assertions (this crate has
-no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
-below it). The restart tests run both incarnations in the same runtime,
+`cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`
+integration test that polls with timeouts, not a deterministic assertion;
+`simenv_client_ctx_tests` (above) is this crate's one `SimEnv`-driven
+exception, and lives in `lib.rs` rather than `tests/` for exactly the
+private-handle reason its own section gives. The restart tests run both
+incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`auto_split_median_tests`, `confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
@@ -2928,7 +3068,10 @@ block at. `lib.rs`'s own `halted_shutdown_tests` is a sixth — the
 issues #282/#279 regression above, needing the same private `CpGroup`
 (specifically its `#[cfg(test)]`-only `is_halted`) to prove bare
 `Node::shutdown()` and `Node`'s `Drop` impl both latch every hosted
-group's `halted` flag.
+group's `halted` flag. `lib.rs`'s own `simenv_client_ctx_tests` is a
+seventh, and differently motivated than the other six: it needs no private
+handle any of them is missing, but a real `ClientCtx<SimEnv, _>` — see the
+"SimEnv `ClientCtx` harness" section above for the full design.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
