@@ -80,6 +80,7 @@ the relevant one before working in a crate:
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
+| `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
 

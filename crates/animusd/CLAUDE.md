@@ -123,38 +123,50 @@ reusing the captured config is the point of the test.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
   deployment over the network. `metadata_cached()` vs. `metadata_fresh()`
   freshness contract lives here.
-- **`topology.rs`** — pure, side-effect-free routing decisions extracted from
-  `lib.rs` for unit-testing (`decide_cp_route`, `tablet_for_key`,
-  `format_not_leader_refusal`/`parse_not_leader_refusal`). All `pub(crate)`.
-- **`decide.rs`** (ADR 0061 Phase A rung A6) — pure decision predicates
-  extracted from `impl ClientCtx`, modelled directly on `topology.rs`: no
-  `&self`, no `CpGroup`/`ProdEnv`, no `tokio`, plain `#[test]`s, no bring-up.
-  `frozen_refusal`/`confirm_wait_is_futile` take primitive facts
-  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`) instead
-  of `&CpGroup` — the caller reads those fields off the real handle
-  immediately before calling in, since `CpGroup` wraps a real
-  `RaftKvNode<ProdEnv, _>` and can't be constructed without bring-up.
-  `align_split_key`/`byte_weighted_median` are pure over a `Metadata`
-  snapshot / materialized pairs and moved with their pre-existing
-  `#[cfg(test)]` coverage (`align_split_key_tests`/`auto_split_median_tests`
-  in-crate before this rung). `other_tablet_replica_addr`/
-  `decide_forward_retry` split `ClientCtx::forward_to_tablet_leader`'s
-  hinted-retry loop into a pure replica walk plus a pure next-step decision
-  (`ForwardRetryStep::{Retry,WaitElection,GiveUp}`); `lib.rs` still gathers
-  the candidate address (a `Metadata`/route-snapshot read) since that part
-  is genuinely I/O-adjacent state, not decision logic. **What did NOT
-  move**: `resolve_cp_route` already delegated its whole branch to
-  `topology::decide_cp_route`, and `not_leader_refusal` is already thin
-  wiring over `topology::format_not_leader_refusal` — both surveyed and
-  found to have no further pure logic to extract. `confirm_futility_tests`
-  (in-crate, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
-  deliberately **stayed** in `lib.rs` rather than moving alongside
+- **`topology`/`decide` moved to `animus-node`** (ADR 0061 rung C1) — pure,
+  side-effect-free routing decisions (`decide_cp_route`, `tablet_for_key`,
+  `format_not_leader_refusal`/`parse_not_leader_refusal`) and decision
+  predicates (`frozen_refusal`, `confirm_wait_is_futile`,
+  `read_should_retry`, `align_split_key`, `byte_weighted_median`,
+  `other_tablet_replica_addr`/`decide_forward_retry`), respectively — moved
+  verbatim into the `E: Env`-generic `animus-node` crate, visibility widened
+  `pub(crate)` → `pub` since a crate boundary now sits where an in-crate
+  module boundary used to. `lib.rs` re-exports both at this crate's own
+  root (`pub use animus_node::{decide, topology};`), so every existing
+  `topology::decide_cp_route`/`decide::frozen_refusal` call site kept
+  compiling unchanged. `decide`'s predicates (originally lifted out of
+  `impl ClientCtx` by ADR 0061 Phase A rung A6) take primitive facts
+  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`)
+  rather than `&CpGroup` — the caller in `lib.rs` still reads those fields
+  off the real `ProdEnv`-backed handle immediately before calling in, since
+  `CpGroup` can't be constructed without bring-up. `confirm_futility_tests`
+  (in-crate here, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
+  deliberately stays in `lib.rs` rather than moving alongside
   `confirm_wait_is_futile`: it proves the wired end-to-end fast-fail
   behavior through a real `CpGroup` propose/apply/poll round trip with
-  timing assertions, not the predicate in isolation — moving it into
-  `decide.rs` would have broken that module's "no bring-up" invariant for
-  no benefit, since `decide::confirm_wait_is_futile` already has its own
-  direct truth-table unit tests.
+  timing assertions, not the predicate in isolation — moving it would have
+  broken `animus-node`'s "no bring-up" invariant for no benefit, since
+  `decide::confirm_wait_is_futile` already has its own direct truth-table
+  unit tests there. See `animus-node/CLAUDE.md` for the full module docs,
+  now maintained there instead of here.
+- **`ClientRequest`/`ClientResponse`/`Surface`/`surface_of`/
+  `is_relayable_command`, plus the plain-data types they embed
+  (`KindWriteOp`/`PendingKindWrite`/`TxnTableWrite`/`TxnPrecondition`/
+  `TxnWriteCondition`), moved to `animus-node` too** (ADR 0061 rung C1,
+  same PR as the `topology`/`decide` move) — re-exported at this crate's
+  root the same way, so `dynamo.rs`'s `use crate::{ClientCtx, CpGroup,
+  KindWriteOp, ...}` and every other bare/`crate::`-qualified reference
+  kept compiling unchanged. `is_relayable_command` was also rewritten from
+  a non-exhaustive `matches!` to an exhaustive `match` in the same move —
+  see `animus-node/CLAUDE.md`'s own entry on that hardening.
+  `ListenerKind` (the listener-*identity* type, distinct from `Surface`'s
+  reachability *classification*) stayed here — it is `ProdEnv`-adjacent
+  (which real socket a connection came in on), not pure. `ClientCtx`,
+  `handle_request`, and `cp_serve_forwarded` have **not** moved (rung C5) —
+  `cp_serve_forwarded`'s gating match here now takes a type
+  (`ClientRequest`) defined in a different crate; see `animus-node/
+  CLAUDE.md`'s note on why "grep every gating site" now spans that
+  boundary until C5.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
   `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
