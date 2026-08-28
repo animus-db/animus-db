@@ -11,10 +11,29 @@ description = "AnimusDB Env seam: Clock/Rng/Network/Disk/Spawner traits + ProdEn
 [lints]
 workspace = true
 
+# Off by default (ADR 0061 rung C0). Gates `prod.rs` — `ProdEnv`,
+# `FsSegmentStore`, `PreBindRng` — the crate's only real-time/real-IO/real-RNG
+# implementation. The trait definitions (`Clock`/`Rng`/`Network`/`Disk`/
+# `Spawner`/`SegmentStore`), `NodeId`, and `metrics.rs` need none of this and
+# stay available unconditionally, so a crate can depend on `animus-env` with
+# `default-features = false` and genuinely not have `ProdEnv` in its build —
+# the prerequisite for the `animus-node` carve-out (ADR 0061 Phase C) to be a
+# compiler-enforced boundary rather than a decorative one. See the ADR's
+# 2026-08-28 amendment for why C1 needed this first.
+[features]
+prod = ["dep:tokio", "dep:rand", "dep:tracing"]
+
 [dependencies]
+# Needed unconditionally: `async-trait` backs the trait definitions
+# themselves (`Clock`/`Network`/`Disk`/`SegmentStore` in lib.rs, not just
+# their `ProdEnv` impls); `serde`/`thiserror` back `NodeId`'s
+# (de)serialization and `InvalidNodeId`.
 async-trait.workspace = true
-tokio.workspace = true
-rand.workspace = true
-tracing.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# Needed only by `prod.rs` (real task spawning, OS randomness, and its
+# `tracing::debug!`/`warn!` diagnostics) — gated by the `prod` feature above
+# rather than declared unconditionally.
+tokio = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }

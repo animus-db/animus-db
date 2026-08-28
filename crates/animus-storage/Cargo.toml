@@ -30,6 +30,10 @@ serde = { workspace = true }
 serde_json.workspace = true
 
 [dev-dependencies]
+# This crate's own library never constructs a `ProdEnv` — only its real-thread
+# liveness/regression tests and `engine_bench` do, so `prod` is opted into
+# here, not on the `[dependencies]` entry above (ADR 0061 rung C0).
+animus-env = { workspace = true, features = ["prod"] }
 animus-sim.workspace = true
 futures.workspace = true
 proptest.workspace = true
