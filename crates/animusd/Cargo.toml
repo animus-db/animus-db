@@ -8,8 +8,28 @@ repository.workspace = true
 authors.workspace = true
 description = "AnimusDB node server daemon."
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+disallowed_types = "warn"
+# ADR 0003 / ADR 0061 Decision 4 (rung B5): animusd is the pre-Phase-C
+# process-boundary crate (ADR 0061's `animus-node` carve-out hasn't happened
+# yet) — real sockets, ~50 tokio::spawn sites, and real-time polling/backoff
+# throughout node assembly, the wire edges, and the background loops are its
+# entire job, not a determinism hole to close by review. A survey while
+# adding this lint found ~600 real call sites (Instant::now/tokio::spawn/
+# tokio::time::{sleep,timeout}) across 84 files in this crate's src+tests+
+# benches alone — individually annotating each with `#[allow(...)]` would be
+# a wall of copy-pasted reasons repeating "this is the process boundary,"
+# not a review aid, and per-file annotation still means editing ~80 files
+# for the same one reason. This package-level override is that one reason,
+# stated once, deliberately more visible in review than a scattered `#[allow]`
+# would be. disallowed_types (HashMap/HashSet) is unrelated to the process
+# boundary and stays fully enforced. Revisit when ADR 0061 Phase C splits the
+# Env-generic `animus-node` core out of this crate — that new crate gets the
+# workspace default back, unmodified.
+disallowed_methods = "allow"
 
 [lib]
 name = "animusd"

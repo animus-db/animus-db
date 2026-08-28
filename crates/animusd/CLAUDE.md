@@ -16,6 +16,19 @@ gone. v1 is also **DynamoDB-only** (ADR 0053) — a CQL wire edge shipped for a
 time and was dropped; retrievable from git history if ever revived.
 Streams implementation notes: [`docs/streams-notes.md`](../../docs/streams-notes.md).
 
+**This crate is exempt from the `disallowed_methods` half of the
+determinism lint (ADR 0061 rung B5)** — `Cargo.toml`'s own `[lints.clippy]`
+turns it off package-wide (lib, bin, every `tests/*.rs`, the bench), with
+the reasoning in that file's comment: real time/`tokio::spawn`/real sockets
+are this crate's entire job pre-Phase-C, and ~600 real call sites across 84
+files made per-site `#[allow]`s a wall nobody would read rather than a
+review aid. `disallowed_types` (HashMap/HashSet) is untouched and still
+enforced here. This is documented, ADR-tracked debt, not a license to add
+more real-time/spawn logic carelessly — it goes away when Phase C's
+`animus-node` extraction carves the `E: Env`-generic core out of this
+crate, and new code here should still prefer `Env` methods where an
+`Env`-generic home is plausible, same as before this rung.
+
 **`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
