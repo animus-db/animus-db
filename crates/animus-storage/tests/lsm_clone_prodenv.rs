@@ -6,6 +6,14 @@
 //! Timeout-guarded so a regression fails loudly instead of hanging (mirrors
 //! `lsm_concurrent.rs`'s convention).
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-filesystem ProdEnv
+// regression (see the module doc above) — a real hard link can only be
+// proven over a real disk, so real tokio::time::timeout is the point here.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-filesystem ProdEnv regression (a hard link can only be proven over a real disk, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
