@@ -24,10 +24,34 @@ are this crate's entire job pre-Phase-C, and ~600 real call sites across 84
 files made per-site `#[allow]`s a wall nobody would read rather than a
 review aid. `disallowed_types` (HashMap/HashSet) is untouched and still
 enforced here. This is documented, ADR-tracked debt, not a license to add
-more real-time/spawn logic carelessly — it goes away when Phase C's
-`animus-node` extraction carves the `E: Env`-generic core out of this
-crate, and new code here should still prefer `Env` methods where an
-`Env`-generic home is plausible, same as before this rung.
+more real-time/spawn logic carelessly, and new code here should still
+prefer `Env` methods where an `Env`-generic home is plausible.
+
+**The exemption is no longer crate-wide.** ADR 0061 Phase C's closing rung
+(the seventh 2026-08-28 amendment) put an explicit
+`#[deny(clippy::disallowed_methods)]` on the `mod` declarations of the five
+`E: Env`-generic client-path modules in `lib.rs` — `schema`, `read_path`,
+`write_path`, `txn_coordinator`, `forwarding`. A lint attribute on a `mod`
+declaration applies to that module's whole body, so the package-level allow
+is overridden for all five: a reintroduced `Instant::now`, `tokio::spawn`
+or `tokio::time::{sleep,timeout}` in any of them is a hard **build
+failure**, not a review miss. (Verified as a negative control when the rung
+landed, not assumed: a temporary `Instant::now()` added to `read_path.rs`
+produced `error: use of a disallowed method` without even needing
+`-D warnings`.)
+
+This deny is what makes the determinism constraint compiler-enforced for
+the node's brain. ADR 0061 Decision 1 originally expected that enforcement
+from a crate boundary — moving `ClientCtx` into `animus-node` — and the
+orphan rule blocked it (the sixth amendment); lint scope turned out to be a
+real boundary too, and a cheaper one. The package-level allow now covers
+only what genuinely is the process boundary: `lib.rs` itself, `dynamo.rs`,
+the wire edges, the remaining background loops, and the test/bench targets.
+
+**Narrow it further as more of this crate becomes seam-clean; never widen
+it back to make a change compile** — that is precisely the hole this rung
+closes. A module that has no live `tokio`/real-clock sites left earns its
+own `#[deny(...)]` line.
 
 **`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
 step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/

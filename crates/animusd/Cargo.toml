@@ -26,9 +26,21 @@ disallowed_types = "warn"
 # for the same one reason. This package-level override is that one reason,
 # stated once, deliberately more visible in review than a scattered `#[allow]`
 # would be. disallowed_types (HashMap/HashSet) is unrelated to the process
-# boundary and stays fully enforced. Revisit when ADR 0061 Phase C splits the
-# Env-generic `animus-node` core out of this crate — that new crate gets the
-# workspace default back, unmodified.
+# boundary and stays fully enforced.
+#
+# NARROWED by ADR 0061 Phase C's closing rung (the seventh 2026-08-28
+# amendment). This package-level allow is no longer the whole story: the
+# five `E: Env`-generic client-path modules (`schema`, `read_path`,
+# `write_path`, `txn_coordinator`, `forwarding`) carry an explicit
+# `#[deny(clippy::disallowed_methods)]` on their `mod` declarations in
+# `lib.rs`, which overrides this allow for their whole bodies. That deny is
+# what makes the determinism constraint compiler-enforced for the node's
+# brain — the enforcement ADR 0061 Decision 1 originally expected from a
+# crate boundary, which the orphan rule blocked. This allow now covers only
+# the code that genuinely is the process boundary: `lib.rs` itself,
+# `dynamo.rs`, the wire edges, the remaining loops, and the test/bench
+# targets. Narrow it further as more modules become `Env`-seam-clean; do not
+# widen it back.
 disallowed_methods = "allow"
 
 [lib]

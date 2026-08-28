@@ -183,9 +183,20 @@ disallowed_{methods,types}, reason = "...")]`. **`animusd` is exempted at
 the package level instead** (`crates/animusd/Cargo.toml`'s `[lints.clippy]`
 override) — it is ADR 0061's own pre-Phase-C process boundary, with ~600
 real call sites the ADR judged genuinely unreasonable to hand-annotate;
-`disallowed_types` stays enforced there, only the methods half is off. See
-ADR 0003's 2026-08-28 note (3) and ADR 0061 Decision 4's as-built note for
-the full account.
+`disallowed_types` stays enforced there, only the methods half is off. **That
+exemption is not crate-wide any more**: ADR 0061 Phase C's closing rung put
+an explicit `#[deny(clippy::disallowed_methods)]` on the `mod` declarations
+of `animusd`'s five `E: Env`-generic client-path modules (`schema`,
+`read_path`, `write_path`, `txn_coordinator`, `forwarding`) in `lib.rs`, so
+a reintroduced `Instant::now`/`tokio::spawn`/`tokio::time::{sleep,timeout}`
+there is a build failure. The package-level allow now covers only the code
+that genuinely is the process boundary — `lib.rs`, `dynamo.rs`, the wire
+edges, the remaining loops, and the test/bench targets. Narrow it further as
+more of `animusd` becomes seam-clean; never widen it back to make a change
+compile. See ADR 0003's 2026-08-28 note (3), ADR 0061 Decision 4's as-built
+note, and ADR 0061's seventh 2026-08-28 amendment (why this deny is the
+enforcement the planned crate boundary was going to provide) for the full
+account.
 
 Components are generic over `E: Env` (monomorphized, never `dyn`). `Env` is a
 supertrait combining `Clock + Rng + Network + Disk + Spawner`, scoped to one

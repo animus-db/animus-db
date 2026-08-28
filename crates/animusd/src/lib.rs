@@ -60,6 +60,20 @@ pub use animus_node::{
 use animus_node::control_handle::ControlHandle as GenericControlHandle;
 use animus_node::host::RelayClient;
 
+// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): these
+// five modules are the `E: Env`-generic, `tokio`-free client path. The
+// package-level `disallowed_methods = "allow"` in this crate's `Cargo.toml`
+// is the pre-Phase-C process-boundary exemption (rung B5) and still applies
+// to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply here. Since C5
+// step 3b converted every `tokio::time`/`tokio::spawn`/`tokio::select!` site
+// in these files to the `Env` seam, the workspace default is re-enabled for
+// them explicitly — which is what makes the determinism constraint
+// compiler-enforced in place, rather than the crate boundary the ADR
+// originally planned and the orphan rule blocked. A `deny` on the `mod`
+// declaration applies to the whole module body, so a reintroduced
+// `Instant::now`/`tokio::spawn`/`tokio::time::sleep` in any of them is a
+// build failure, not a review miss. Do not widen this back to `allow` to
+// make a change compile — that is the hole this rung closes.
 mod admin;
 mod backup_capture;
 mod backup_completion;
@@ -71,15 +85,20 @@ mod control_handle;
 mod dashboard;
 mod dynamo;
 mod dynamo_streams;
+#[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
 mod index_backfill;
 mod pitr_janitor;
+#[deny(clippy::disallowed_methods)]
 mod read_path;
+#[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
 mod ttl_reaper;
+#[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
+#[deny(clippy::disallowed_methods)]
 mod write_path;
 
 use control_handle::{AnimusdRelayClient, ControlHandle, RemoteControlClient};
