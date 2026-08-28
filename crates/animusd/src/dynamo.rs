@@ -5729,9 +5729,9 @@ pub(crate) mod leader_read_failure_gate {
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
 /// client write. Every ordinary caller passes `false`.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn kind_write_item_at_leader(
-    ctx: &ClientCtx,
-    leader: &CpGroup,
+pub(crate) async fn kind_write_item_at_leader<E: Env>(
+    ctx: &ClientCtx<E>,
+    leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
@@ -5918,7 +5918,7 @@ pub(crate) mod rmw285_confirm_gate {
 /// Always `Some` — both engine backends price a tablet cheaply, so a leader
 /// that ran this has an answer. The `Option` in the reply exists for the
 /// forwarding hop alone (an older peer omits the field), not for this.
-async fn collection_bytes_at_leader(leader: &CpGroup) -> Option<u64> {
+async fn collection_bytes_at_leader<E: Env>(leader: &CpGroup<E>) -> Option<u64> {
     let base = leader.approx_bytes_kind(KIND_BASE).await;
     let lsi = leader.approx_bytes_kind(KIND_LSI).await;
     Some(base.saturating_add(lsi))
@@ -5979,9 +5979,9 @@ pub(crate) struct KindTxnWriteEval {
 /// Returns `Ok(None)` for a condition mismatch (no diff computed, mirroring
 /// [`KindWriteOutcome::ConditionFailed`]); `Ok(Some(..))` otherwise.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn eval_kind_txn_write(
-    ctx: &ClientCtx,
-    leader: &CpGroup,
+pub(crate) async fn eval_kind_txn_write<E: Env>(
+    ctx: &ClientCtx<E>,
+    leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
