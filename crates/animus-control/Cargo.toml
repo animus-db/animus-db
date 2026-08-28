@@ -35,6 +35,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 animus-sim.workspace = true
+# Shared corpus seed-management scaffolding (ADR 0061 rung B1,
+# `animus_test::corpus`). This is a dev-dependency cycle (animus-test's own
+# dev-dependencies include animus-control), which Cargo permits: a dev-dep
+# cycle only needs to resolve for `cargo test`, never for building either
+# crate's library.
+animus-test.workspace = true
 # Real-time `ProdEnv` liveness tests (the driver-liveness guarantee, ADR 0009/0017):
 # `SimEnv`'s virtual time can't trip the wall-clock election timeout, so the
 # no-election-storm property is only observable over `ProdEnv` on real threads.
