@@ -389,15 +389,13 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
         // function. `None` (auth disabled, the default) skips this
         // entirely — zero cost, byte-identical to pre-ADR-0057 behavior.
         if let Some(credentials) = &ctx.dynamo_auth {
-            let sigv4_req = animus_dynamo::sigv4::SigV4Request {
-                method: &request.method,
-                path: &request.path,
-                query: &request.query,
-                headers: &request.headers,
-                body: &request.body,
-            };
+            // ADR 0061 rung C4b: the build-request/verify sequence itself is
+            // `animus_node::sigv4_gate` — pure, no socket, no clock. This
+            // connection handler now does only the one real-clock read the
+            // gate can't do itself (`animus-node` has no `Env` access at
+            // all) and the response-shaping on failure.
             let now_epoch_ms = ctx.env.wall_now().0;
-            if let Err(err) = animus_dynamo::sigv4::verify(&sigv4_req, credentials, now_epoch_ms) {
+            if let Err(err) = animus_node::sigv4_gate(&request, credentials, now_epoch_ms) {
                 let body = sigv4_error_body(&err);
                 http::write_amz_json_response(&mut stream, 400, &body, keep_alive).await?;
                 if !keep_alive {
