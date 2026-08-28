@@ -155,3 +155,93 @@ fn same_seed_and_skew_script_is_deterministic() {
         "a different seed should not coincidentally match"
     );
 }
+
+/// `Simulator::set_clock_drift_for`: a node's clock diverges progressively
+/// with elapsed virtual time, at exactly the configured ppm rate, layered on
+/// top of any static skew — and an undrifted node still tracks the global
+/// clock exactly.
+#[test]
+fn drift_widens_the_observed_skew_over_elapsed_time() {
+    let mut sim = Simulator::new(5);
+    let fast = sim.env(nid(0)); // +100 ppm: runs fast
+    let slow = sim.env(nid(1)); // -100 ppm: runs slow
+    let plain = sim.env(nid(2)); // no drift, no skew
+
+    sim.set_clock_drift_for(nid(0), 100);
+    sim.set_clock_drift_for(nid(1), -100);
+
+    // At the drift's own start instant, elapsed = 0, so no divergence yet.
+    assert_eq!(fast.now().0, sim.now().0, "no elapsed time yet: no drift");
+    assert_eq!(slow.now().0, sim.now().0, "no elapsed time yet: no drift");
+
+    // Advance one second of virtual time (1_000_000_000 ns). At 100 ppm that
+    // is exactly 100_000 ns of accumulated drift.
+    sim.run_for(Duration::from_secs(1));
+    let global = sim.now().0;
+    assert_eq!(
+        fast.now().0,
+        global + 100_000,
+        "positive drift must add 100ppm of elapsed time"
+    );
+    assert_eq!(
+        slow.now().0,
+        global - 100_000,
+        "negative drift must subtract 100ppm of elapsed time"
+    );
+    assert_eq!(
+        plain.now().0,
+        global,
+        "an undrifted, unskewed node must track the global clock exactly"
+    );
+
+    // Advancing a second more doubles the accumulated drift.
+    sim.run_for(Duration::from_secs(1));
+    let global2 = sim.now().0;
+    assert_eq!(fast.now().0, global2 + 200_000);
+    assert_eq!(slow.now().0, global2 - 200_000);
+}
+
+/// Drift composes with a static skew (drift is layered on top, not a
+/// replacement) — and is deterministic and reproducible from the seed, same
+/// as static skew.
+#[test]
+fn drift_layers_on_top_of_static_skew_and_is_deterministic() {
+    fn run(seed: u64) -> (u64, Vec<String>) {
+        let mut sim = Simulator::new(seed);
+        let a = sim.env(nid(0));
+        sim.set_clock_skew_for(nid(0), 1_000_000); // +1ms static
+        sim.set_clock_drift_for(nid(0), 50); // +50ppm drift on top
+        sim.run_for(Duration::from_secs(2)); // 2s * 50ppm = 100_000ns drift
+        (a.now().0, sim.trace_lines())
+    }
+
+    let seed = 0xD817_7001;
+    let (now_a, trace_a) = run(seed);
+    let (now_b, trace_b) = run(seed);
+    assert_eq!(now_a, now_b, "drift+skew composition must be reproducible");
+    assert_eq!(trace_a, trace_b, "trace must be byte-identical");
+
+    let mut sim = Simulator::new(seed);
+    sim.run_for(Duration::from_secs(2));
+    let global = sim.now().0;
+    assert_eq!(
+        now_a,
+        global + 1_000_000 + 100_000,
+        "drift must add on top of the static skew, not replace it"
+    );
+}
+
+/// With no `set_clock_drift_for` call, `now()` is byte-identical to a
+/// simulator with no drift model at all — the same default-off contract
+/// static skew already has.
+#[test]
+fn drift_defaults_to_no_divergence() {
+    let mut sim = Simulator::new(6);
+    let a = sim.env(nid(0));
+    sim.run_for(Duration::from_secs(10));
+    assert_eq!(
+        a.now().0,
+        sim.now().0,
+        "an undrifted node must never diverge from the global clock"
+    );
+}
