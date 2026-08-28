@@ -1,0 +1,36 @@
+[package]
+name = "animus-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB E: Env-generic node core (ADR 0061 Phase C carve-out)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# `default-features = false` is the point of this crate (ADR 0061 rung C0/C1):
+# `prod` (ProdEnv/FsSegmentStore, and their tokio/rand/tracing deps) stays out
+# of this build entirely, so a `ProdEnv`/`tokio::net` call here is a compiler
+# error, not a review miss. Only the plain trait/`NodeId`/`metrics` surface
+# `animus-env` exposes unconditionally is available. Verify with
+# `cargo tree -e features -p animus-node` after any dependency change here —
+# see this crate's own CLAUDE.md.
+#
+# A direct `path` dependency, not `animus-env.workspace = true`: Cargo
+# refuses to let a member override an inherited workspace dependency's
+# `default-features` to `false` when the root `[workspace.dependencies]`
+# entry doesn't already say so ("cannot override workspace's
+# default-features"), and changing the *root* entry would flip every other
+# consumer's default too. Stating the path directly here sidesteps
+# workspace-dependency inheritance for this one line instead.
+animus-env = { path = "../animus-env", default-features = false }
+animus-control.workspace = true
+animus-cp-data.workspace = true
+animus-tablet.workspace = true
+animus-dynamo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
