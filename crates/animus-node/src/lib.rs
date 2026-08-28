@@ -22,6 +22,7 @@
 //! (`ClientCtx`, `handle_request`, `cp_serve_forwarded` — rung C5).
 
 pub mod decide;
+pub mod host;
 pub mod topology;
 mod wire;
 

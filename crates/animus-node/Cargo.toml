@@ -34,3 +34,5 @@ animus-tablet.workspace = true
 animus-dynamo.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true

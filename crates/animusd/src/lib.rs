@@ -57,6 +57,7 @@ mod backup_capture;
 mod backup_completion;
 mod backup_janitor;
 mod backup_restore;
+mod client_ctx_host;
 mod console;
 mod control_handle;
 mod dashboard;
