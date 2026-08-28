@@ -71,6 +71,7 @@ use animus_cp_data::RaftKvNode;
 use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
+use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
 use futures::executor::block_on;
@@ -176,18 +177,22 @@ struct Scenario {
 
 // ---------------------------------------------------------------------------
 // The frozen corpus: a committed, deterministic generator. Each scenario's seed
-// is a stable hash of its name (FNV-1a — no `std::hash` nondeterminism), so the
-// suite runs the SAME set every run and a failure names one scenario + seed.
+// is a stable hash of its name (FNV-1a — no `std::hash` nondeterminism, see
+// `animus_test::corpus`), so the suite runs the SAME set every run and a
+// failure names one scenario + seed.
 // ---------------------------------------------------------------------------
 
-/// FNV-1a over the name's bytes — a deterministic name→seed map.
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
     }
-    h
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            ..self.clone()
+        }
+    }
 }
 
 /// Single-fault nemeses sampled across the original (window-less) corpus cells.
@@ -224,7 +229,7 @@ const DEEP_WINDOW: Duration = Duration::from_millis(2500);
 /// space, a mix of reads and writes. Single-key ops (the plane is non-transactional).
 fn base_workload(name: &str, replicas: usize, faults: Vec<(Duration, Nemesis)>) -> Scenario {
     Scenario {
-        seed: name_seed(name),
+        seed: corpus::name_seed(name),
         name: name.to_string(),
         replicas,
         clients: 3,
@@ -319,11 +324,7 @@ fn corpus_cells() -> Vec<Scenario> {
 /// interleavings is the dominant bug-finding lever; `K=1` is byte-identical to the
 /// committed frozen set.
 fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_RAFTKV_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
+    corpus::seeds_from_env("ANIMUS_RAFTKV_SEEDS")
 }
 
 /// Whether the full-corpus LSM tier is enabled (`ANIMUS_RAFTKV_LSM` set to a
@@ -339,41 +340,10 @@ fn lsm_full_enabled() -> bool {
     }
 }
 
-/// Expand each cell into `k` seed variants. Variant 0 keeps the cell's canonical
-/// (frozen) name + seed (so `k=1` is the identity); variants `1..k` get a `_sNN`
-/// suffix and a fresh name-derived seed.
-fn seed_expand(cells: Vec<Scenario>, k: usize) -> Vec<Scenario> {
-    if k <= 1 {
-        return cells;
-    }
-    let mut out = Vec::with_capacity(cells.len() * k);
-    for cell in cells {
-        for i in 0..k {
-            if i == 0 {
-                out.push(cell.clone());
-            } else {
-                let name = format!("{}_s{i:02}", cell.name);
-                out.push(Scenario {
-                    seed: name_seed(&name),
-                    replicas: cell.replicas,
-                    clients: cell.clients,
-                    rounds: cell.rounds,
-                    keyspace: cell.keyspace,
-                    read_pct: cell.read_pct,
-                    faults: cell.faults.clone(),
-                    window: cell.window,
-                    name,
-                });
-            }
-        }
-    }
-    out
-}
-
 /// The corpus the headline test runs: the frozen cells, seed-expanded by the
 /// depth knob.
 fn corpus() -> Vec<Scenario> {
-    seed_expand(corpus_cells(), seeds_per_cell())
+    corpus::seed_expand(corpus_cells(), seeds_per_cell())
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,7 +1069,7 @@ fn raftkv_corpus_covers_the_fault_matrix() {
             .unwrap_or_else(|| panic!("frozen cell {legacy} disappeared from the corpus"));
         assert_eq!(
             cell.seed,
-            name_seed(legacy),
+            corpus::name_seed(legacy),
             "frozen seed moved for {legacy}"
         );
         assert!(
@@ -1117,7 +1087,7 @@ fn raftkv_corpus_covers_the_fault_matrix() {
 fn raftkv_seed_expansion_is_additive_and_unique() {
     let base = corpus_cells();
     let k = 3;
-    let expanded = seed_expand(base.clone(), k);
+    let expanded = corpus::seed_expand(base.clone(), k);
     assert_eq!(expanded.len(), base.len() * k);
 
     let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
@@ -1133,7 +1103,7 @@ fn raftkv_seed_expansion_is_additive_and_unique() {
         assert_eq!(kept.seed, b.seed, "seed moved for {}", b.name);
     }
     // k == 1 is the identity (the always-on default is byte-identical to base).
-    assert_eq!(seed_expand(base.clone(), 1).len(), base.len());
+    assert_eq!(corpus::seed_expand(base.clone(), 1).len(), base.len());
 }
 
 #[test]

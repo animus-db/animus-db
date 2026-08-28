@@ -64,6 +64,7 @@ use animus_env::{Env, EnvExt, Nanos, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId, TabletState};
+use animus_test::corpus;
 use futures::executor::block_on;
 use std::sync::{Arc, Mutex};
 
@@ -73,39 +74,11 @@ const NODES: [u64; 3] = [40, 41, 42];
 const TABLE: &str = "orders";
 const LABEL: &str = "L1";
 
-/// A stable, name-derived seed — every scenario is reproducible and
-/// attributable by name, the same convention every other corpus here uses.
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h | 1
-}
-
-fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_STREAM_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&k: &usize| k > 0)
-        .unwrap_or(1)
-}
-
-/// Depth expansion: variant 0 is the frozen canonical seed; `1..K` derive a
-/// fresh, distinct name so growing depth never perturbs the base regression.
-fn cell_seed(name: &str, variant: usize) -> u64 {
-    if variant == 0 {
-        name_seed(name)
-    } else {
-        name_seed(&format!("{name}_s{variant}"))
-    }
-}
-
-fn for_each_seed(name: &str, mut body: impl FnMut(u64)) {
-    for variant in 0..seeds_per_cell() {
-        body(cell_seed(name, variant));
-    }
+/// Depth-scaled per-cell seed derivation and expansion — shared with every
+/// sibling corpus in this crate, `animus_test::corpus`
+/// (`odd_name_seed`/`seeds_from_env`/`for_each_seed`).
+fn for_each_seed(name: &str, body: impl FnMut(u64)) {
+    corpus::for_each_seed(name, corpus::seeds_from_env("ANIMUS_STREAM_SEEDS"), body);
 }
 
 // --- tablet-group harness ----------------------------------------------

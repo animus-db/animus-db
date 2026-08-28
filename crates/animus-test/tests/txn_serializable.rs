@@ -118,6 +118,7 @@ use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
+use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
 
@@ -390,16 +391,17 @@ struct Scenario {
     window: Duration,
 }
 
-/// FNV-1a name→seed map (repo convention — see `raftkv_linearizable.rs`'s
-/// identically-named function; each corpus file defines its own, no
-/// nondeterministic `std::hash`).
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
     }
-    h
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            ..self.clone()
+        }
+    }
 }
 
 fn cell(
@@ -409,7 +411,7 @@ fn cell(
     window: Duration,
 ) -> Scenario {
     Scenario {
-        seed: name_seed(name),
+        seed: corpus::name_seed(name),
         name: name.to_string(),
         workload,
         faults,
@@ -566,43 +568,15 @@ fn corpus_cells() -> Vec<Scenario> {
     out
 }
 
-/// Depth knob (`ANIMUS_TXN_SEEDS`, default 1) — mirrors `seed_expand` in
-/// `raftkv_linearizable.rs`/`support::seed_expand`: variant 0 keeps the
-/// cell's canonical frozen name+seed, `k=1` is the identity.
+/// Depth knob (`ANIMUS_TXN_SEEDS`, default 1) — mirrors `animus_test::corpus`'s
+/// `seed_expand`: variant 0 keeps the cell's canonical frozen name+seed,
+/// `k=1` is the identity.
 fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_TXN_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
-}
-
-fn seed_expand(cells: Vec<Scenario>, k: usize) -> Vec<Scenario> {
-    if k <= 1 {
-        return cells;
-    }
-    let mut out = Vec::with_capacity(cells.len() * k);
-    for cell in cells {
-        for i in 0..k {
-            if i == 0 {
-                out.push(cell.clone());
-            } else {
-                let name = format!("{}_s{i:02}", cell.name);
-                out.push(Scenario {
-                    seed: name_seed(&name),
-                    name,
-                    workload: cell.workload.clone(),
-                    faults: cell.faults.clone(),
-                    window: cell.window,
-                });
-            }
-        }
-    }
-    out
+    corpus::seeds_from_env("ANIMUS_TXN_SEEDS")
 }
 
 fn corpus() -> Vec<Scenario> {
-    seed_expand(corpus_cells(), seeds_per_cell())
+    corpus::seed_expand(corpus_cells(), seeds_per_cell())
 }
 
 // ---------------------------------------------------------------------------
@@ -2373,7 +2347,11 @@ fn txn_corpus_covers_the_fault_matrix() {
             .iter()
             .find(|s| s.name == legacy)
             .unwrap_or_else(|| panic!("frozen cell {legacy} disappeared from the corpus"));
-        assert_eq!(c.seed, name_seed(legacy), "frozen seed moved for {legacy}");
+        assert_eq!(
+            c.seed,
+            corpus::name_seed(legacy),
+            "frozen seed moved for {legacy}"
+        );
     }
 }
 
@@ -2384,7 +2362,7 @@ fn txn_corpus_covers_the_fault_matrix() {
 fn txn_seed_expansion_is_additive_and_unique() {
     let base = corpus_cells();
     let k = 3;
-    let expanded = seed_expand(base.clone(), k);
+    let expanded = corpus::seed_expand(base.clone(), k);
     assert_eq!(expanded.len(), base.len() * k);
 
     let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
@@ -2399,7 +2377,7 @@ fn txn_seed_expansion_is_additive_and_unique() {
             .unwrap_or_else(|| panic!("base scenario {} missing after expansion", b.name));
         assert_eq!(kept.seed, b.seed, "seed moved for {}", b.name);
     }
-    assert_eq!(seed_expand(base.clone(), 1).len(), base.len());
+    assert_eq!(corpus::seed_expand(base.clone(), 1).len(), base.len());
 }
 
 #[test]
@@ -2692,6 +2670,6 @@ fn tight_pair_transactions_never_observe_a_torn_snapshot() {
         } else {
             format!("tight_pair_never_torn_s{variant:02}")
         };
-        run_tight_pair_scenario(name_seed(&name));
+        run_tight_pair_scenario(corpus::name_seed(&name));
     }
 }
