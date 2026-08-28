@@ -212,6 +212,44 @@ reusing the captured config is the point of the test.
   `tests/intra_port_split.rs::cp_serve_forwarded_refuses_every_never_forwarded_variant`
   (a live single-node cluster, since building a bare `ClientCtx` outside a
   real bring-up isn't practical here — see this crate's own Tests section).
+- **`CpGroup`/`SharedEngine`/`ClusterEdgeState`/`CpRoute`/`ClientCtx` are now
+  generic over `E: Env` (ADR 0061 rung C5 step 1)** — still entirely
+  in-crate, nothing moved. Each is `<E: Env = ProdEnv>`: a **default type
+  parameter**, not a rename-plus-alias, so every pre-existing bare
+  reference across this crate (`spawn_common_tail`'s params, `admin.rs`,
+  `dynamo.rs`, the background loops, `tests/`) keeps compiling unchanged —
+  the definition-site default is this rung's analogue of the type-alias
+  containment C3c used for `ControlHandle`. `ClientCtx`'s own `control:
+  ControlHandle` field deliberately stays the crate's fixed `ProdEnv`-bound
+  alias (not `ControlHandle<E>`) — nothing in `ClientCtx`'s two `impl`
+  blocks reads it through anything `CpGroup`/`SharedEngine`-shaped, so
+  genericizing it would add a second, unused generic parameter for no
+  benefit. **Gotcha a reviewer will hit immediately**: a default type
+  parameter resolves to its **default**, never to an enclosing generic
+  scope's own parameter, in any position it is *elided* — inside `impl<E:
+  Env> ClientCtx<E>`, a bare `&CpGroup` in a method signature means
+  `&CpGroup<ProdEnv>`, not `&CpGroup<E>`, and produces a plain `E0308`
+  mismatch against a `CpGroup<E>` value (verified empirically before
+  relying on it — see `docs/engineering-lessons.md`). Every signature
+  inside `ClientCtx`'s two `impl` blocks that names `CpGroup`/`CpRoute`
+  explicitly is therefore spelled `<E>`; **match/pattern positions and
+  value construction did not need this** (they infer from the
+  already-typed scrutinee/call arguments), which is why the ~60
+  `CpRoute::Local(leader)`-shaped match arms across those two `impl`
+  blocks needed zero changes. Three call chains cross into sibling
+  functions that also had to gain `<E: Env>` for the whole crate to
+  compile: `index_drain::{seal_now, pitr_seal_now, hot_read,
+  clear_backfill_cursor}`, `dynamo::{kind_write_item_at_leader,
+  eval_kind_txn_write, collection_bytes_at_leader}`, and this crate's own
+  `median_split_key`. Every one of these seven is a signature-only change;
+  no call-site logic moved. `DataRole` (holding `rmw_lock`,
+  `segment_store`/`backup_store`, etc.) needed **no** change at all — none
+  of its fields are `E`-typed, so it stays fully concrete and
+  `ClientCtx<E>.data: Option<DataRole>` is untouched; `kind_write_item_
+  at_leader`'s `rmw_lock` acquire/release span (scoped to read+evaluate
+  only, issue #285) is unchanged byte-for-byte. `handle_request`/
+  `cp_serve_forwarded` and the whole `impl ClientCtx` split-into-modules
+  step are still rung C5's remaining work (step 2/3 below).
 - **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
   blocks for `animus-node`'s three host-capability traits
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
