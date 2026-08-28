@@ -17,6 +17,17 @@
 //! **admin** address (as printed by `animusd`), printing the JSON response. See
 //! [`ADMIN_USAGE`] for the subcommands.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): this binary is a real network
+// client talking to a live, already-running cluster over actual sockets — it
+// is never `E: Env`-generic and has no simulated counterpart to keep in sync
+// with, so its polling loops' `Instant::now()`/`sleep()` deadlines are the
+// correct tool, not a determinism hole. One file-level allow rather than
+// repeating the same reason at each of this file's poll-loop call sites.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "animus-cli is a real-socket client CLI outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
+)]
+
 use std::process::ExitCode;
 use std::time::Duration;
 
