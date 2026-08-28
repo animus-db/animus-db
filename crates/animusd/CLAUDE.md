@@ -29,7 +29,10 @@ more real-time/spawn logic carelessly — it goes away when Phase C's
 crate, and new code here should still prefer `Env` methods where an
 `Env`-generic home is plausible, same as before this rung.
 
-**`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
+**`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
+step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/
+`write_path.rs`/`txn_coordinator.rs`/`forwarding.rs`, below) — grep for the
+symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
@@ -59,11 +62,27 @@ reusing the captured config is the point of the test.
 
 ## Module map (`src/`)
 
-- **`lib.rs`** (~6800 lines) — the node assembly and everything
-  routing/hosting: `Node`/`BoundNode`/`BoundControlNode`/`BoundDataNode`,
-  `ClientCtx`, `ClusterEdgeState`, CP routing, the tablet-host reconciler
-  and auto-split loops, and the `ClientRequest`/`ClientResponse` wire
-  types. See the sections below for the parts worth a contract.
+- **`lib.rs`** (~11,800 lines) — the node assembly: `Node`/`BoundNode`/
+  `BoundControlNode`/`BoundDataNode`, `ClientCtx`'s struct definition and
+  its `DataRole`/`CpGroup`/`CpRoute`/`ClusterEdgeState`/`SharedEngine`
+  neighbors, the tablet-host reconciler and auto-split loops, the admin/
+  metrics slice of `impl ClientCtx` (below), and the `ClientRequest`/
+  `ClientResponse` wire types (re-exported from `animus-node`, above).
+  `ClientCtx`'s other five method clusters live in their own files, listed
+  next — see the sections below for the parts worth a contract.
+- **`schema.rs`**/**`read_path.rs`**/**`write_path.rs`**/
+  **`txn_coordinator.rs`**/**`forwarding.rs`** (ADR 0061 rung C5 step 2) —
+  `impl<E: Env> ClientCtx<E>` split by concern, each file its own inherent
+  `impl` block for the same type: schema-catalog DDL + tablet provisioning
+  + split trigger + force-seal (`schema.rs`), linearizable + ADR 0055
+  eventually-consistent reads (`read_path.rs`), kind-scoped writes +
+  `poll_probe`'s confirm loop (`write_path.rs`), the 2PC coordinator
+  (`txn_coordinator.rs`), and leader routing + one-hop forwarding +
+  `cp_serve_forwarded`'s top-level dispatch (`forwarding.rs`, moved last
+  since it calls into every other cluster by name). See this file's own
+  ADR 0061 rung C5 step 2 entry, below, for the full method-by-method
+  breakdown, the visibility-widening lesson, and what deliberately stayed
+  in `lib.rs` instead.
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
@@ -192,12 +211,12 @@ reusing the captured config is the point of the test.
   see `animus-node/CLAUDE.md`'s own entry on that hardening.
   `ListenerKind` (the listener-*identity* type, distinct from `Surface`'s
   reachability *classification*) stayed here — it is `ProdEnv`-adjacent
-  (which real socket a connection came in on), not pure. `ClientCtx`,
-  `handle_request`, and `cp_serve_forwarded` have **not** moved (rung C5) —
-  `cp_serve_forwarded`'s gating match here now takes a type
-  (`ClientRequest`) defined in a different crate; see `animus-node/
-  CLAUDE.md`'s note on why "grep every gating site" now spans that
-  boundary until C5. **Hardened (a small follow-on to C1, independent of
+  (which real socket a connection came in on), not pure. `ClientCtx` and
+  `handle_request` have **not** moved (rung C5 step 3, not yet done) —
+  `cp_serve_forwarded` (now in `forwarding.rs`, see below)'s gating match
+  takes a type (`ClientRequest`) defined in a different crate; see
+  `animus-node/CLAUDE.md`'s note on why "grep every gating site" now spans
+  that boundary until step 3. **Hardened (a small follow-on to C1, independent of
   C5)**: the match is now exhaustive — every `ClientRequest` variant that
   reaches no real handling above is named explicitly in one final arm
   (grouped by why each is never a legitimate forwarded payload), replacing
@@ -247,9 +266,94 @@ reusing the captured config is the point of the test.
   of its fields are `E`-typed, so it stays fully concrete and
   `ClientCtx<E>.data: Option<DataRole>` is untouched; `kind_write_item_
   at_leader`'s `rmw_lock` acquire/release span (scoped to read+evaluate
-  only, issue #285) is unchanged byte-for-byte. `handle_request`/
-  `cp_serve_forwarded` and the whole `impl ClientCtx` split-into-modules
-  step are still rung C5's remaining work (step 2/3 below).
+  only, issue #285) is unchanged byte-for-byte. `handle_request` and moving
+  `ClientCtx` itself out of this crate are still rung C5's remaining work
+  (step 3, below the next entry).
+- **`impl<E: Env> ClientCtx<E>` split into five submodules (ADR 0061 rung
+  C5 step 2)** — `lib.rs`'s two `impl` blocks (6,287 lines, 97 methods per
+  the ADR's fifth 2026-08-28 amendment) held every `ClientCtx` method in
+  one place; each of the five clusters that amendment identified is now
+  its own file, each with its own `impl<E: Env> ClientCtx<E> { .. }`
+  block — Rust allows a type's inherent `impl` to be split across modules
+  in the same crate, so this was a mechanical, behavior-preserving
+  relocation (doc comments, attributes, and bodies moved verbatim; no
+  logic changes, no merged/split methods). Moved in the ADR's suggested
+  order, one commit per cluster: **`schema.rs`** (18 methods — schema-
+  catalog DDL proposals, tablet provisioning/serveability wait, node
+  registration, table/tablet drop, split trigger, force-seal, stream
+  growth, backfill-cursor clearing: `propose_schema`, `provision_tablet`,
+  `await_table_serveable`, `watch_metadata`, `register_node`,
+  `drop_table*`, `trigger_split`, `force_seal_tablet`,
+  `force_pitr_seal_tablet`, `grow_stream*`, `clear_backfill_cursor*`,
+  `read_stream_hot_records`, plus their private helpers); **`read_path.rs`**
+  (21 methods — `cp_read`, `cp_read_snapshot`, `cp_scan`/`cp_scan_kind*`,
+  and the ADR 0055 eventually-consistent-read fast path:
+  `cp_read_eventual*`, `cp_scan_*_eventual`, `cp_stale_local`,
+  `cp_stale_forward_target`, `relay_stale_read`, `record_eventual_read`,
+  `cp_get_local_resolving`, `confirm_or_push`, `cp_get_local_snapshot`,
+  `cp_scan_local`, `cp_scan_kind_local`, `cp_get`); **`write_path.rs`**
+  (13 methods — `cp_kind_write_item`, `cp_kind_write_raw*`,
+  `cp_kind_local`, `poll_probe`, `cp_batch_local`/`cp_batch_propose`,
+  `cp_put_local`/`cp_delete_local`, `seed_rows_local`/`seed_child_rows`);
+  **`txn_coordinator.rs`** (14 methods — the 2PC coordinator:
+  `txn_stage_local`, `txn_prepare*`, `txn_decide_anchor`,
+  `txn_resolve_participant`, `txn_status`, `txn_record_view`,
+  `txn_verify`, `recovery_resolve`, `record_recovery_metric`,
+  `split_group`, `check_preconditions`, `txn_recover`, `cp_txn`); and
+  **`forwarding.rs`**, moved last per the ADR's own ordering rationale
+  since `cp_serve_forwarded` calls into every other cluster by name so its
+  callees needed stable homes first (17 methods — `cp_route`,
+  `resolve_cp_route`, `tablet_for`, `cp_leader_hint`, `cp_forward_target`,
+  `not_leader_refusal`, `other_tablet_replica_addr`, `cp_forward`,
+  `forward_to_tablet_leader`, `relay`, `cp_serve_forwarded`, and the
+  route/intra-addr accessors `route_addr`/`route_snapshot`/
+  `control_leader_hint`/`intra_addr`/`intra_route_snapshot`/
+  `intra_control_leader_hint`). Per the ADR's minimal cut, the **admin/
+  metrics slice stayed in `lib.rs`** (9 methods: `metrics_text`,
+  `metrics_json`, `stream_change_rates`, `metrics_history`,
+  `admin_drain`, `admin_add_member`, `admin_remove_member`,
+  `admin_add_control_member`, `admin_remove_control_member`) — nothing in
+  the DynamoDB wire path or a `SimCluster` reaches them, and they have
+  their own real-socket coverage; so did a handful of small,
+  genuinely-crate-wide accessors that don't belong to any one cluster
+  (`effective_metadata`, `metadata_fresh`, `data`/`data_opt`,
+  `not_leader_error`) — moving them into one cluster would only have
+  forced the identical `pub(crate)` widening onto them with no locality
+  benefit, since `admin.rs`/`dynamo.rs`/`backup_capture.rs`/
+  `backup_restore.rs`/`client_ctx_host.rs`/`dynamo_streams.rs`/
+  `index_drain.rs` and every one of the five new clusters all call them.
+  **The visibility lesson (mechanical, not a design call)**: Rust's
+  privacy rule is "visible in the defining module and its descendants,"
+  never ancestors or siblings — so a method that used to be a bare `fn`
+  (visible everywhere in the crate, since every module here is a
+  descendant of the `lib.rs` root) had to widen to `pub(crate)` the
+  moment it moved into a child module (`schema`/`read_path`/etc.) *and*
+  gets called from a sibling (another one of the five, or `dynamo.rs`/
+  `admin.rs`) or from code that stays in the parent (`lib.rs` itself:
+  `handle_request`, the admin methods, an in-crate `#[cfg(test)] mod`,
+  background-loop free functions). Conversely, a method that stays
+  private and lives in `lib.rs` (`CpGroup`'s own methods, free functions,
+  constants) needed **no** widening to stay callable from the five new
+  child modules — a parent's private items remain visible to every
+  descendant, so this direction was already free. 30 methods widened
+  from private to `pub(crate)` across the five clusters for this reason
+  (see each cluster's own commit message for the exact list and why);
+  `docs/engineering-lessons.md` has the general-purpose version of this
+  lesson. Each module's `use` list is explicit (traced via `cannot find`
+  compiler errors from a temporary `use crate::*;`, then narrowed) rather
+  than a blanket glob-import, per this rung's own "keep each module's use
+  list tight" instruction. Two extraction-tooling gotchas worth recording
+  for anyone repeating this kind of split: a multi-line attribute (e.g.
+  `#[tracing::instrument(\n    name = "...",\n)]`) and a single-line
+  attribute followed by a trailing `// comment` (`#[allow(clippy::
+  too_many_arguments)] // mirrors ...`) both need bracket-aware scanning
+  to find their true start when walking upward from a `fn` signature — a
+  naive "stop at the first line not starting with `///`/`#[`" heuristic
+  leaves the attribute orphaned above the *next* function once the one it
+  belonged to is extracted, which compiles as a **different**,
+  non-obviously-related error (`error: expected item after attributes`,
+  or a phantom `too_many_arguments` clippy failure on the wrong function)
+  rather than something that points at the actual mistake.
 - **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
   blocks for `animus-node`'s three host-capability traits
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
