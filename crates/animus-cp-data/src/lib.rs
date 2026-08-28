@@ -6559,11 +6559,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             continue;
                         };
                         if let txn::Envelope::Intent {
-                            txn_id: blocker, ..
+                            txn_id: blocker,
+                            record_key: blocker_record_key,
+                            record_table: blocker_record_table,
+                            ..
                         } = txn::decode_envelope(&vv.value)
                             && blocker != txn_id
                         {
-                            break 'blocked Some((key.clone(), blocker));
+                            break 'blocked Some((
+                                key.clone(),
+                                blocker,
+                                blocker_record_key,
+                                blocker_record_table,
+                            ));
                         }
                     }
                     None
@@ -6595,7 +6603,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                          no-op"
                     );
                 }
-                if let Some((blocked_key, blocker)) = &blocked_by {
+                if let Some((blocked_key, blocker, ..)) = &blocked_by {
                     tracing::warn!(
                         ?txn_id,
                         blocking_txn = ?blocker,
@@ -6789,10 +6797,18 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // `ConditionFailed` here too.
                 let outcome = if already_decided {
                     txn::StageOutcome::Fenced
-                } else if let Some((blocked_key, blocker)) = blocked_by {
+                } else if let Some((
+                    blocked_key,
+                    blocker,
+                    blocker_record_key,
+                    blocker_record_table,
+                )) = blocked_by
+                {
                     txn::StageOutcome::IntentBlocked {
                         key: blocked_key,
                         txn_id: blocker,
+                        record_key: blocker_record_key,
+                        record_table: blocker_record_table,
                     }
                 } else if !all_in_fence {
                     txn::StageOutcome::Fenced
