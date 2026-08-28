@@ -282,7 +282,7 @@ brain-last.
 |---|---|
 | C0 | **Prerequisite (added 2026-08-28, see the amendment below).** Feature-gate `animus-env`'s `prod` module — `ProdEnv`/`FsSegmentStore` behind a default-off `prod` feature; every current consumer opts in explicitly. Without this, C1's boundary is decorative |
 | C1 | Create `animus-node` depending on `animus-env` with `default-features = false` — so `ProdEnv` genuinely does not exist in that build — and with no `tokio::net`. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Also harden `is_relayable_command` from `matches!` to an exhaustive `match` (see below). Boundary established and compiler-enforced from the first commit |
-| C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill`. Each is small, self-contained, and paced by `tokio::time` today — `env.sleep()`/`env.now()`/`env.spawn_task()` instead |
+| C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill` — paced by `env.sleep()`/`env.now()`/`env.spawn_task()` instead of `tokio::time`. **Requires a host-capability trait first (see the second 2026-08-28 amendment): every one of these takes `ClientCtx`, which does not move until C5.** |
 | C3 | `ControlHandle<E>`; move relay/forwarding (`relay_request`, `lib.rs:17617-17650`) off raw `TcpStream` onto the multiplexed `Network` (ADR 0026). This is what lets a multi-node cluster talk inside `SimEnv` |
 | C4 | The HTTP edges per Decision 2: parsing and dispatch become pure bytes-in/bytes-out in `animus-node`; `animusd` keeps the accept loops |
 | C5 | The brain: split `impl ClientCtx` into `read_path`, `write_path`, `txn_coordinator`, `forwarding`, `schema`; genericize over `E: Env`. The heaviest rung, but A6 has already lifted the pure predicates out of it |
@@ -335,6 +335,45 @@ nothing and C1 already moves that function.
 Note also that after C1, `cp_serve_forwarded`'s match still lives in
 `animusd` while its input type lives in `animus-node`, so the repo's
 "grep every gating site" discipline spans a crate boundary until C5.
+
+#### 2026-08-28 amendment (second) — there is no leaf; C2 needs a capability trait
+
+This ADR's Phase C ordering is described as "leaf-first, brain-last", with C2's
+background loops as the easy first movers because each is "small,
+self-contained". Scoping C2 found that **premise is wrong**: all six loops take
+`ClientCtx` by value or reference, and four also take `&RaftNode<ProdEnv>`.
+`ClientCtx` is the 5,569-line brain that C5 moves last. On the ADR's own
+ordering, nothing in C2 can move.
+
+Stated plainly because it is the second time Phase C's plan has not survived
+contact with the code (the first being C0), and because the naive reactions —
+pulling C5 forward, or moving the loops together with the brain — would both
+undo the leaf-first property that makes this phase reviewable.
+
+The loops turn out to depend on a **very small slice** of `ClientCtx`:
+
+| Loop | Capabilities used |
+|---|---|
+| `ttl_reaper` | `effective_metadata()` |
+| `index_backfill` | the leader's `metadata()`, `propose()` |
+| `backup_completion` | `data_opt()` |
+
+So the fix is dependency inversion, not reordering. C2 gains a prerequisite
+step: define a narrow **host-capability trait** in `animus-node` naming just
+the operations the loops need, implement it for `animusd`'s `ClientCtx`, and
+move each loop generic over `E: Env` plus that trait. `ClientCtx` stays where
+it is until C5; the loops stop depending on it as a concrete type.
+
+This is better for the ADR's actual goal than the original plan, not merely a
+workaround. A loop generic over a capability trait can be driven in `SimEnv`
+against a **fake host** — no cluster, no sockets, no `ClientCtx` at all — which
+is precisely the deterministic coverage Phase D wants for the janitor and
+reaper arms. Moving the loops while still coupled to a concrete `ClientCtx`
+would have produced code inside `animus-node` that still could not be
+sim-tested until C5 landed.
+
+Expect the same shape at C3 and C4: the question at each rung is not "can this
+file move" but "what narrow capability does it actually need from its host".
 
 ### Phase D — the payoff
 
