@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
-use animus_env::{Env, Metric};
+use animus_env::{Env, EnvExt, Metric};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
 
@@ -320,7 +320,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     );
                     last_retryable = Some(msg);
                     if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
-                        tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
+                        self.env.sleep(TXN_STAGE_PUSH_BACKOFF).await;
                     }
                     continue;
                 }
@@ -357,7 +357,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
             if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
-                tokio::time::sleep(TXN_STAGE_PUSH_BACKOFF).await;
+                self.env.sleep(TXN_STAGE_PUSH_BACKOFF).await;
             }
         }
         match (last_blocked, last_retryable) {
@@ -819,7 +819,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 };
                 let now_ms = match self.cp_route(record_table, record_key).await {
                     CpRoute::Local(leader) => leader.env().now().0 / 1_000_000,
-                    _ => tokio::time::Instant::now().elapsed().as_millis() as u64,
+                    // `Nanos` has no `elapsed()` (`tokio::time::Instant::
+                    // elapsed` is a tokio-only convenience) — two
+                    // back-to-back `now()` reads and a saturating diff
+                    // reproduce the identical near-zero duration the
+                    // original `tokio::time::Instant::now().elapsed()`
+                    // always measured here (the gap between minting and
+                    // reading its own instant, not any real wait).
+                    _ => {
+                        let t = self.env.now();
+                        t.duration_since(self.env.now()).as_millis() as u64
+                    }
                 };
                 if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
                     return Ok(TxnDecisionStatus::Pending);
@@ -882,7 +892,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // this node's own — the grace window is generous (seconds) and
             // liveness-only, so modest cross-node clock skew here is
             // harmless (it can only shift *when* a push is attempted).
-            _ => tokio::time::Instant::now().elapsed().as_millis() as u64,
+            // `Nanos` has no `elapsed()` (`tokio::time::Instant::elapsed` is
+            // a tokio-only convenience) — two back-to-back `now()` reads and
+            // a saturating diff reproduce the identical near-zero duration
+            // the original `tokio::time::Instant::now().elapsed()` always
+            // measured here.
+            _ => {
+                let t = self.env.now();
+                t.duration_since(self.env.now()).as_millis() as u64
+            }
         };
         if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
             return Ok(TxnDecisionStatus::Pending);
@@ -1519,13 +1537,35 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // 0049 — keeps the original fire-and-forget sequential
                     // spawn unchanged (see `dynamo::txn_resolve_awaited`).
                     if awaits_resolve {
-                        let _ = tokio::time::timeout(
-                            TXN_RESOLVE_ALL_AWAIT_BUDGET,
-                            resolve_all_parallel(TxnOutcome::Committed { commit_ts }, staged),
+                        // Race against the budget instead of `tokio::time::
+                        // timeout` (no `Env` equivalent) — `Box::pin` the
+                        // resolve future since an `async move` block capturing
+                        // locals across `.await` points is not `Unpin` in
+                        // general and `futures::future::select` requires both
+                        // arms to be. Whichever resolves first is discarded
+                        // either way (the pre-existing code discarded the
+                        // `Result<(), Elapsed>` too), so this preserves the
+                        // exact "await `resolve_all_parallel`, but never past
+                        // `TXN_RESOLVE_ALL_AWAIT_BUDGET`" semantics.
+                        let budget = Box::pin(resolve_all_parallel(
+                            TxnOutcome::Committed { commit_ts },
+                            staged,
+                        ));
+                        let _ = futures::future::select(
+                            budget,
+                            self.env.sleep(TXN_RESOLVE_ALL_AWAIT_BUDGET),
                         )
                         .await;
                     } else {
-                        tokio::spawn(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
+                        // `env.spawn_task` (ADR 0003) instead of raw
+                        // `tokio::spawn` — under `ProdEnv` this is the same
+                        // `tokio::spawn` underneath, so the detached,
+                        // fire-and-forget lifetime is unchanged: this call
+                        // still returns immediately, and the resolve runs to
+                        // completion (or is dropped on process exit) with no
+                        // handle kept here either way.
+                        self.env
+                            .spawn_task(resolve_all(TxnOutcome::Committed { commit_ts }, staged));
                     }
                     Ok(commit_ts)
                 }
