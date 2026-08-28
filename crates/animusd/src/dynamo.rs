@@ -183,6 +183,7 @@ use animus_dynamo::{
     storage_key,
 };
 use animus_env::{Clock, Env, Metric, Rng};
+use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -5729,8 +5730,8 @@ pub(crate) mod leader_read_failure_gate {
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
 /// client write. Every ordinary caller passes `false`.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn kind_write_item_at_leader<E: Env>(
-    ctx: &ClientCtx<E>,
+pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
@@ -5806,7 +5807,11 @@ pub(crate) async fn kind_write_item_at_leader<E: Env>(
     };
     #[cfg(test)]
     rmw285_confirm_gate::wait_if_armed(table).await;
-    ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
+    // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local` takes no
+    // `self`/`R`-typed argument, so nothing here pins down `R` for the
+    // now-generic `ClientCtx<E, R>` path — both `E`/`R` are already this
+    // function's own generic parameters.
+    ClientCtx::<E, R>::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
     let collection_bytes = collection_bytes_at_leader(leader).await;
@@ -5979,8 +5984,8 @@ pub(crate) struct KindTxnWriteEval {
 /// Returns `Ok(None)` for a condition mismatch (no diff computed, mirroring
 /// [`KindWriteOutcome::ConditionFailed`]); `Ok(Some(..))` otherwise.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn eval_kind_txn_write<E: Env>(
-    ctx: &ClientCtx<E>,
+pub(crate) async fn eval_kind_txn_write<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,

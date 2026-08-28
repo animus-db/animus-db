@@ -5,6 +5,7 @@
 
 use animus_cp_data::{FastRead, IntentInfo, TxnDecisionStatus};
 use animus_env::{Env, Metric};
+use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
@@ -13,7 +14,7 @@ use crate::{
     relay_request_with_timeout,
 };
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// The local replica this node may serve an **eventually-consistent**
     /// read of `tablet` from (ADR 0055), or `None` if it may not.
     ///

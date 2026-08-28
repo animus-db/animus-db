@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::{TxnDecisionStatus, TxnOutcome};
 use animus_env::{Env, NodeId};
+use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
     relay_request_with_timeout, topology,
 };
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// The client-API address `id` currently routes to, if known (ADR 0032
     /// PR1) — a single lookup into the live [`client_route`](Self::client_route)
     /// map, kept fresh by [`route_sync_loop`]. Never holds the lock across an

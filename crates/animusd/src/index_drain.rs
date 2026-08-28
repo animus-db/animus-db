@@ -221,6 +221,7 @@ use animus_dynamo::{
     index_table_name, is_index_table_name, storage_key,
 };
 use animus_env::{Clock, Env, Metric};
+use animus_node::host::RelayClient;
 use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
@@ -2494,8 +2495,8 @@ async fn pitr_tick(
 ///
 /// Returns `Ok(Some(epoch))` on a genuine seal, `Ok(None)` if there was
 /// nothing past the watermark to seal.
-pub(crate) async fn pitr_seal_now<E: Env>(
-    ctx: &ClientCtx<E>,
+pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     tablet: TabletId,
     group: &CpGroup<E>,
@@ -2686,8 +2687,8 @@ pub(crate) async fn pitr_seal_now<E: Env>(
 /// incident. **The "content covering at least what I intended" qualifier is
 /// load-bearing (issue #298)** — see the commit-wait poll's own doc for the
 /// dueling-seal race a bare presence check misses.
-pub(crate) async fn seal_now<E: Env>(
-    ctx: &ClientCtx<E>,
+pub(crate) async fn seal_now<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     table: &str,
     tablet: TabletId,
     group: &CpGroup<E>,

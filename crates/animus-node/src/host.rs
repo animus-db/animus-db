@@ -180,8 +180,24 @@ pub trait TtlScanHost {
 /// `ClientResponse::Error(..)` rather than a separate error channel — a
 /// caller that already branches on `ClientResponse` (every existing relay
 /// call site) needs no new failure shape to handle.
+///
+/// **Supertrait bounds (`Clone + Send + Sync + 'static`) added by ADR 0061
+/// rung C5 step 3a**, mirroring [`animus_env::Env`]'s own shape: once
+/// `ClientCtx<E, R>` (`animusd`) carries an `R: RelayClient` alongside its
+/// `E: Env`, its own `#[derive(Clone)]` and every background task that
+/// spawns a future capturing a cloned `ClientCtx` need `ClientCtx<E, R>:
+/// Clone + Send + Sync + 'static` to hold for *any* `R: RelayClient` — not
+/// just the one concrete implementor that happens to exist today
+/// (`animusd::AnimusdRelayClient`, a zero-sized type that already satisfied
+/// all four trivially). Declaring the bounds here, once, is what lets every
+/// `ClientCtx` method cluster stay written as `impl<E: Env, R: RelayClient>
+/// ClientCtx<E, R>` without each one separately re-deriving (or forgetting)
+/// the same bound — the alternative was a per-file bound that would have had
+/// to cascade through every method-call chain crossing an `impl` block
+/// boundary, which is most of them (`forwarding.rs` alone calls into all
+/// four siblings by name).
 #[async_trait]
-pub trait RelayClient {
+pub trait RelayClient: Clone + Send + Sync + 'static {
     /// Relay `request` to `addr`'s client API and return its reply, or a
     /// `ClientResponse::Error` describing any transport failure
     /// (connect/write/read/decode/timeout) — never a panic, never a hang

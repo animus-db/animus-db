@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
 use animus_env::{Env, Metric};
+use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
 
 use crate::{
@@ -20,7 +21,7 @@ use crate::{
     outcome_to_status,
 };
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The one place a stage actually executes on the leader's own node**
     /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
     /// [`txn_prepare`](Self::txn_prepare)'s own `CpRoute::Local` branch (no

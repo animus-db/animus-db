@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use animus_control::{Metadata, ProposeResult};
 use animus_env::Env;
+use animus_node::host::RelayClient;
 use animus_tablet::TabletId;
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
     SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo, topology,
 };
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The evaluate-at-leader write primitive (ADR 0046 U3)** —
     /// `PutItem`/`DeleteItem`/`UpdateItem`'s entry point on an indexed or
     /// streamed table, replacing the edge-evaluated

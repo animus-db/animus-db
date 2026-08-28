@@ -8,19 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_env::{Env, Metric, NodeId};
+use animus_node::control_handle::ControlHandle;
+use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId, TabletState};
 
 use crate::ReadConsistency;
 use crate::{
-    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, ControlHandle, CpRoute,
-    MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult,
-    RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
+    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, MAX_REPLICATION_FACTOR,
+    MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult, RegisterOutcome,
+    SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
     SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT, SplitMode,
     WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, split_child_placement,
     topology,
 };
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5 for
     /// the long-poll mechanism itself; ADR 0038 PR5 for the incremental
     /// reply shape below): park on this node's own

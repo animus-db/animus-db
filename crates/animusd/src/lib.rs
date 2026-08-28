@@ -51,6 +51,14 @@ pub use animus_node::{
     ClientRequest, ClientResponse, KindWriteOp, PendingKindWrite, Surface, TxnPrecondition,
     TxnTableWrite, TxnWriteCondition, decide, is_relayable_command, surface_of, topology,
 };
+// ADR 0061 rung C5 step 3a: `ClientCtx`'s own `control` field needs the
+// *generic* `ControlHandle<E, R>` (not this crate's `E = ProdEnv`/`R =
+// AnimusdRelayClient`-bound `control_handle::ControlHandle` alias below,
+// which cannot be matched against inside a `impl<E: Env, R: RelayClient>
+// ClientCtx<E, R>` body — see `crates/animusd/CLAUDE.md`'s elision gotcha)
+// and the `RelayClient` bound itself.
+use animus_node::control_handle::ControlHandle as GenericControlHandle;
+use animus_node::host::RelayClient;
 
 mod admin;
 mod backup_capture;
@@ -6241,18 +6249,27 @@ struct DataRole {
 ///
 /// Generic over `E: Env` (ADR 0061 rung C5 step 1), same default-binds-
 /// `ProdEnv` shape as [`CpGroup`]/[`SharedEngine`]/[`ClusterEdgeState`] —
-/// see those types' docs. **`control: ControlHandle` deliberately stays the
-/// crate's existing `ProdEnv`-bound alias** (`control_handle.rs`'s `type
-/// ControlHandle = animus_node::control_handle::ControlHandle<ProdEnv,
-/// AnimusdRelayClient>`), not `ControlHandle<E>` — genericizing the control
-/// binding itself is a separate concern this rung's minimal cut does not
-/// need: nothing in `ClientCtx`'s own two `impl` blocks reads `self.control`
-/// through anything `CpGroup`/`SharedEngine`-shaped, so leaving it fixed
-/// costs nothing here and avoids threading a second, independent generic
-/// parameter (`R: RelayClient`) through this type for no present benefit.
+/// see those types' docs. **Also generic over `R: RelayClient` (ADR 0061
+/// rung C5 step 3a, the sixth 2026-08-28 amendment)**: `control` is now
+/// [`GenericControlHandle<E, R>`] rather than this crate's fixed
+/// `ProdEnv`/`AnimusdRelayClient`-bound `control_handle::ControlHandle`
+/// alias — `schema.rs`'s `watch_metadata` and `forwarding.rs`'s leader
+/// routing both read `self.control` from inside a `ClientCtx<E, R>`-generic
+/// `impl` block, so the field itself has to be generic too. Both `E` and `R`
+/// default (`ProdEnv`/[`AnimusdRelayClient`]), so every pre-existing bare
+/// `ClientCtx` reference across this crate (`admin.rs`, `dynamo.rs`, the
+/// background loops, `tests/`) keeps compiling unchanged — same
+/// default-type-parameter containment step 1 used for `E` alone. `R` needed
+/// its own `Clone + Send + Sync + 'static` supertrait bounds added to
+/// [`RelayClient`] itself (`animus-node`) for `ClientCtx<E, R>`'s own
+/// `#[derive(Clone)]` and its one `env.spawn_task` capturing a cloned
+/// `ClientCtx` (`txn_coordinator.rs`'s `cp_txn`) to typecheck generically —
+/// the same `Clone + Send + Sync + 'static` shape `Env`'s own supertrait
+/// bound already carries, so this mirrors an established precedent rather
+/// than inventing a new one.
 #[derive(Clone)]
-pub(crate) struct ClientCtx<E: Env = ProdEnv> {
-    control: ControlHandle,
+pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient> {
+    control: GenericControlHandle<E, R>,
     pub(crate) edge: ClusterEdgeState<E>,
     /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
     /// clone of the same handle. The **only** `Env`-seam access point this
@@ -6351,7 +6368,7 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv> {
     pub(crate) split_mode: SplitMode,
 }
 
-impl<E: Env> ClientCtx<E> {
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// This node's [`DataRole`] fields — see that type's doc.
     ///
     /// # Panics
@@ -10996,10 +11013,12 @@ mod confirm_futility_tests {
 
     use tokio::time::{sleep, timeout};
 
+    use animus_env::ProdEnv;
+
     use crate::config::NodeRole;
     use crate::{
-        ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame,
-        run_node, write_frame,
+        AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
+        RoleAddrs, read_frame, run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -11115,7 +11134,10 @@ mod confirm_futility_tests {
         // A batch guarded by a condition that cannot hold (the key was never
         // written): accepted + applied as a no-op, effect never appears.
         let started = tokio::time::Instant::now();
-        let err = ClientCtx::cp_kind_local(
+        // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local`
+        // takes no `self`/`R`-typed argument, so nothing here pins down `R`
+        // for the now-generic `ClientCtx<E, R>` path.
+        let err = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
             &group,
             vec![(
                 animus_cp_data::KIND_BASE,
@@ -11141,7 +11163,7 @@ mod confirm_futility_tests {
 
         // The early exit fired on the no-op, not on a broken group: an
         // ordinary unconditioned write through the same path still confirms.
-        ClientCtx::cp_kind_local(
+        ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
             &group,
             vec![(
                 animus_cp_data::KIND_BASE,
