@@ -15,10 +15,10 @@ use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
 
 use crate::{
-    ClientCtx, ClientRequest, ClientResponse, CpGroup, CpRoute, PendingKindWrite, ReadConsistency,
-    StageConditions, TXN_RESOLVE_ALL_AWAIT_BUDGET, TXN_STAGE_PUSH_ATTEMPTS, TXN_STAGE_PUSH_BACKOFF,
-    TxnAbortReason, TxnPrecondition, TxnTableWrite, TxnWrite, TxnWriteCondition, decide, dynamo,
-    outcome_to_status,
+    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpGroup, CpRoute, PendingKindWrite,
+    ReadConsistency, StageConditions, TXN_RESOLVE_ALL_AWAIT_BUDGET, TXN_STAGE_PUSH_ATTEMPTS,
+    TXN_STAGE_PUSH_BACKOFF, TxnAbortReason, TxnPrecondition, TxnTableWrite, TxnWrite,
+    TxnWriteCondition, decide, dynamo, outcome_to_status,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -149,7 +149,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// can actually verify every participant, not just the anchor. Ignored
     /// for a participant's own stage (`anchor: Some(..)`), which never
     /// creates a record to populate.
-    async fn txn_prepare(
+    pub(crate) async fn txn_prepare(
         &self,
         table: &str,
         anchor: Option<(TxnId, Vec<u8>, String)>,
@@ -242,15 +242,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// (the apply path already knows definitively whether — and why — this
     /// exact stage no-op'd, so a second read to re-derive the same fact was
     /// redundant once the apply arm started reporting it). `Staged` returns
-    /// success; `IntentBlocked` retries the whole stage after a short
-    /// backoff — bounded (`TXN_STAGE_PUSH_ATTEMPTS`), mirroring the bounded
-    /// retry a *read* already does against a foreign pending intent (the
-    /// backoff alone, not an explicit push of the blocker — that gives the
-    /// blocking transaction room to clear on its own: its own coordinator
-    /// finishing, or `txn_resolver_loop`'s passive per-second sweep pushing
-    /// it once past `RECOVERY_GRACE`); `ConditionFailed`/`Fenced` are both
-    /// **final** — retrying an identical stage changes nothing, so these
-    /// return a client-facing error immediately, never looping.
+    /// success; `IntentBlocked` first tries [`push_resolution_if_decided`]
+    /// (ADR 0018 §2 issue #298 residual fix — see that method's own doc)
+    /// and then retries the whole stage after a short backoff — bounded
+    /// (`TXN_STAGE_PUSH_ATTEMPTS`), mirroring the bounded retry a *read*
+    /// already does against a foreign pending intent, giving a genuinely
+    /// still-live blocking transaction room to clear on its own otherwise
+    /// (its own coordinator finishing, or `txn_resolver_loop`'s passive
+    /// per-second sweep pushing it once past `RECOVERY_GRACE`);
+    /// `ConditionFailed`/`Fenced` are both **final** — retrying an
+    /// identical stage changes nothing, so these return a client-facing
+    /// error immediately, never looping.
     ///
     /// **Issue #412: a stage attempt that never even applied also gets this
     /// same bounded retry, when its own failure is retryable-shaped.**
@@ -277,6 +279,78 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `TransactionConflict` and a non-retryable `Other` (no CP group
     /// leader reachable, a malformed request) still propagate immediately,
     /// unchanged.
+    ///
+    /// **`push_resolution_if_decided`** (ADR 0018 §2 issue #298 residual
+    /// fix, confirmed live under the un-pinned `SplitMode::InPlace` proof
+    /// soak): the write-side sibling of the foreign-intent READ path's
+    /// `confirm_or_push`/`resolve_intent_given_status`. A blocker found at
+    /// stage time may already be DECIDED — most commonly this exact
+    /// coordinator's own immediately-prior attempt (a fresh `TxnId` retry,
+    /// `TxnAbortReason::is_safe_to_retry_fresh`, racing its own
+    /// already-aborted first try's still-live intent, because that
+    /// attempt's own `resolve_all` resolve landed as a silent no-op:
+    /// `KvCommand::TxnResolve`'s `fence` check can reject a resolve whose
+    /// routing went stale between `cp_route` and the entry's actual apply —
+    /// e.g. the target tablet split in between — and unlike `TxnStage`,
+    /// `TxnResolve` has no outcome channel to report that, so the resolve's
+    /// own proposer sees `Some(ts)` "success" regardless; the resolve
+    /// outcome-channel gap itself is named as a separate, deferred issue in
+    /// `docs/adr/0018-cross-tablet-transactions.md`'s matching amendment).
+    /// Querying the blocker's own decision and, if it already decided,
+    /// actively pushing its resolution with FRESH routing — this call's own
+    /// fresh `cp_route` (inside `txn_resolve_participant`) is what correctly
+    /// reaches whatever tablet the key belongs to NOW, sidestepping the
+    /// stale-fence race the ORIGINAL resolve hit — converges well inside
+    /// [`txn_prepare_pushing`](Self::txn_prepare_pushing)'s own short retry
+    /// budget instead of exhausting it into a spurious `TransactionConflict`.
+    /// A still-`Pending`/unconfirmable blocker is left alone (never pushed
+    /// via `txn_recover` — that risks aborting a genuinely live coordinator
+    /// before `RECOVERY_GRACE`); the caller's own existing backoff-and-retry
+    /// is exactly the right, unchanged behavior for GENUINE still-in-flight
+    /// cross-transaction contention. Regression:
+    /// `issue_298_conflict_tests::a_fresh_stage_pushes_a_decided_blockers_
+    /// resolution_instead_of_conflicting`.
+    pub(crate) async fn push_resolution_if_decided(
+        &self,
+        table: &str,
+        blocked_key: &[u8],
+        blocker: TxnId,
+        blocker_record_table: String,
+        blocker_record_key: Vec<u8>,
+        attempt: u32,
+    ) {
+        let decided_outcome = match self
+            .txn_status(&blocker_record_table, &blocker_record_key)
+            .await
+        {
+            Ok(TxnDecisionStatus::Committed { commit_ts }) => {
+                Some(TxnOutcome::Committed { commit_ts })
+            }
+            Ok(TxnDecisionStatus::Aborted) => Some(TxnOutcome::Aborted),
+            Ok(TxnDecisionStatus::Pending) | Err(_) => None,
+        };
+        if let Some(outcome) = decided_outcome {
+            tracing::debug!(
+                table,
+                ?blocked_key,
+                blocking_txn = ?blocker,
+                ?outcome,
+                attempt,
+                "txn prepare: blocker already decided — pushing its resolution before \
+                 retrying the stage"
+            );
+            let _ = self
+                .txn_resolve_participant(
+                    table,
+                    blocker,
+                    blocker_record_key,
+                    vec![blocked_key.to_vec()],
+                    outcome,
+                )
+                .await;
+        }
+    }
+
     pub(crate) async fn txn_prepare_pushing(
         &self,
         table: &str,
@@ -331,6 +405,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 StageOutcome::IntentBlocked {
                     key,
                     txn_id: blocker,
+                    record_key: blocker_record_key,
+                    record_table: blocker_record_table,
                 } => {
                     tracing::debug!(
                         table,
@@ -340,6 +416,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         "txn prepare: stage blocked by another transaction's unresolved intent; \
                          retrying"
                     );
+                    self.push_resolution_if_decided(
+                        table,
+                        &key,
+                        blocker,
+                        blocker_record_table,
+                        blocker_record_key,
+                        attempt,
+                    )
+                    .await;
                     last_blocked = Some(key);
                 }
                 StageOutcome::ConditionFailed { key } => {
@@ -367,13 +452,45 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }),
             // Every attempt failed at `txn_prepare` itself with a
             // retryable-shaped `Other` (issue #412) and none ever reached
-            // `IntentBlocked` — report the last such failure rather than
-            // the generic exhaustion text below, since it names the actual
-            // recurring condition.
-            (None, Some(msg)) => Err(TxnAbortReason::Other(format!(
-                "txn prepare: stage on table `{table}` did not converge after \
-                 {TXN_STAGE_PUSH_ATTEMPTS} attempts (last transient failure: {msg})"
-            ))),
+            // `IntentBlocked` — report the last such failure **verbatim**
+            // rather than wrapping it in exhaustion prose.
+            //
+            // **The wrap used to silently reclassify an already-safe
+            // message** (issue #298 residual, confirmed live 2026-08-27):
+            // every `msg` reaching this arm already carries the house `";
+            // retry"` suffix (it is only ever caught by the loop above's own
+            // `msg.ends_with("; retry")` guard) — for a message shaped like
+            // `TxnAbortReason::is_safe_to_retry_fresh`'s own
+            // `"txn prepare: leader-side evaluation failed:"` allowlist
+            // entry, `msg` was *already* both `is_ambiguous()` **and**
+            // `is_safe_to_retry_fresh()` before reaching this arm. A prior
+            // version of this arm nested `msg` inside a new sentence
+            // (`"txn prepare: stage on table \`{table}\` did not converge
+            // after N attempts (last transient failure: {msg})"`), which
+            // broke classification **twice over**: the nesting parenthesis
+            // moved `"; retry"` before the closing `")"` (failing
+            // `is_ambiguous`'s suffix check outright), and even once that
+            // was patched to re-append `"; retry"` at the very end, the new
+            // sentence's own leading text meant the whole message no longer
+            // **starts with** `"txn prepare: leader-side evaluation
+            // failed:"` (failing `is_safe_to_retry_fresh`'s prefix check
+            // specifically) — silently downgrading a message that was
+            // PROVABLY safe to retry with a fresh `TxnId` (this stage never
+            // even reached its own propose) into one `run_transact` could
+            // only leave stuck `PENDING` for the full ADR 0051 TTL window
+            // (600s) — far past any real client's retry budget (this soak's
+            // own `RETRYABLE_BLIP_DEADLINE`, 90s, included). Passing `msg`
+            // through unchanged means this arm can never accidentally
+            // downgrade a classification the underlying reason already
+            // earned — exhausting `TXN_STAGE_PUSH_ATTEMPTS` on an identical
+            // recurring reason doesn't change how safe that reason is to
+            // retry, so there is nothing to re-derive here. See
+            // `docs/engineering-lessons.md`'s matching issue #298 entry for
+            // the full incident (a live capture under the un-pinned
+            // `SplitMode::InPlace` soak) and the general "a wrapping
+            // `format!` around a classified message is itself a
+            // classification bug" lesson.
+            (None, Some(msg)) => Err(TxnAbortReason::Other(msg)),
             // Every `TXN_STAGE_PUSH_ATTEMPTS` attempt returning `Ok` with an
             // outcome other than `Staged`/`IntentBlocked`/`ConditionFailed`/
             // `Fenced` is unreachable (`StageOutcome` is exhaustively
@@ -415,7 +532,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `txn_id` (see [`txn_recover`](Self::txn_recover)'s doc) and must
     /// synthesize an `Aborted` tombstone (`RaftKvNode::txn_abort_orphan`)
     /// rather than proposing against a record that doesn't exist.
-    async fn txn_decide_anchor(
+    pub(crate) async fn txn_decide_anchor(
         &self,
         table: &str,
         txn_id: TxnId,
@@ -477,13 +594,85 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
+    /// Retry [`txn_decide_anchor`](Self::txn_decide_anchor) — with the SAME
+    /// `txn_id`, never a fresh one — while its own attempt fails outright
+    /// (a `"; retry"`-suffixed error, never even reaching a decision),
+    /// bounded by [`CLIENT_TIMEOUT`]. Mirrors [`cp_kind_write_item`](Self::cp_kind_write_item)'s
+    /// issue #288 freeze-refusal retry shape: `txn_decide_anchor`'s own
+    /// `cp_route` call already re-resolves routing fresh every attempt
+    /// (essential — after a cutover the record routes to a child tablet,
+    /// not the frozen parent), so this wrapper only needs to supply the
+    /// backoff-and-loop.
+    ///
+    /// **Load-bearing, not a style choice** (ADR 0018 §2 issue #298
+    /// residual fix): [`cp_txn`](Self::cp_txn) only ever calls this from a
+    /// point where it already knows whether every participant staged. When
+    /// they all did (the ordinary commit path — the abort paths only ever
+    /// reach here because *some* participant did NOT stage), a decide-step
+    /// failure that is safe to retry with a FRESH `TxnId` per
+    /// `TxnAbortReason::is_safe_to_retry_fresh`'s own allowlist (most
+    /// commonly `FROZEN_REFUSAL`, shared byte-for-byte between a stage-time
+    /// and a decide-time freeze) is, in fact, NOT safe here: every
+    /// participant's intent is already durably staged, so
+    /// `ClientCtx::txn_recover`'s own independent `all_staged`-driven
+    /// decision can legitimately COMMIT this exact (original) `txn_id` at
+    /// any moment — a fresh retry racing that is precisely the
+    /// double-materialize hazard this whole amendment exists to close
+    /// (confirmed live: `multi_split_soak_streamed_gsi_table_under_mixed_
+    /// load`'s own `delivered=146/144` signature, both `x…a`/`x…b` keys of
+    /// one transactional pair delivered twice — once via this exact race).
+    /// Retrying the SAME decision instead is always safe: a repeat
+    /// `TxnCommit`/`TxnAbort` propose for an already-decided record is a
+    /// logged no-op (`animus-cp-data`'s own first-applied-wins doctrine),
+    /// and it never abandons already-staged work the way minting a fresh
+    /// `TxnId` would. See `docs/adr/0018-cross-tablet-transactions.md`'s
+    /// matching amendment for the full incident.
+    async fn txn_decide_anchor_retrying(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+        min_commit_ts: HlcTimestamp,
+    ) -> Result<TxnOutcome, String> {
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
+        loop {
+            match self
+                .txn_decide_anchor(
+                    table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    commit,
+                    min_commit_ts,
+                    None,
+                )
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) if decide::read_should_retry(&e) && self.env.now() < deadline => {
+                    tracing::debug!(
+                        table,
+                        ?txn_id,
+                        commit,
+                        %e,
+                        "txn decide: anchor decide attempt itself failed with a retryable \
+                         routing/leadership/freeze race; retrying the SAME decision (never a \
+                         fresh TxnId — every participant may already be staged)"
+                    );
+                    self.env.sleep(TXN_STAGE_PUSH_BACKOFF).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// **Resolve** `keys` on `table`'s tablet leader per the already-decided
     /// `outcome` — the wire-routed counterpart of [`RaftKvNode::txn_resolve`],
     /// used for every participant (the anchor's own keys included, via the
     /// same routing as any other CP op) once the coordinator has a final
     /// decision. Routed by `keys[0]`, never `record_key` (see
     /// [`ClientRequest::TxnResolve`]'s doc).
-    async fn txn_resolve_participant(
+    pub(crate) async fn txn_resolve_participant(
         &self,
         table: &str,
         txn_id: TxnId,
@@ -1434,13 +1623,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // record's **actual** outcome, never assume the abort we asked
             // for is what happened.
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     false,
                     candidate,
-                    None,
                 )
                 .await
             {
@@ -1459,7 +1647,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Ok(commit_ts)
                 }
                 Err(e) => Err(TxnAbortReason::Other(format!(
-                    "transaction aborted: {reason} (and abort itself failed: {e})"
+                    "transaction aborted: {reason} (and abort itself failed after retrying: {e}); \
+                     retry"
                 ))),
             }
         } else if !preconditions.is_empty()
@@ -1472,13 +1661,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // Precondition check #2 (pre-commit refresh — see this method's own
             // doc for why this is a value re-check, not the ADR's ts-based one).
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     false,
                     candidate,
-                    None,
                 )
                 .await
             {
@@ -1494,22 +1682,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Err(e) => Err(TxnAbortReason::Other(format!(
                     "transaction aborted: a precondition changed between prepare and commit \
-                     (and abort itself failed: {e})"
+                     (and abort itself failed after retrying: {e}); retry"
                 ))),
             }
         } else {
             match self
-                .txn_decide_anchor(
+                .txn_decide_anchor_retrying(
                     &anchor_table,
                     txn_id.clone(),
                     record_key.clone(),
                     true,
                     candidate,
-                    None,
                 )
                 .await
-                .map_err(TxnAbortReason::Other)?
-            {
+                .map_err(|e| {
+                    TxnAbortReason::Other(format!(
+                        "txn decide: anchor commit failed after every participant staged, even \
+                         after retrying the same decision ({e}); retry"
+                    ))
+                })? {
                 TxnOutcome::Committed { commit_ts } => {
                     // ADR 0018 §2/PR5: the deviation PR4 flagged, lifted —
                     // the anchor's commit is already durable and IS the
