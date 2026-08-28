@@ -66,10 +66,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             );
         };
         let watch = raft.metadata_watch();
-        tokio::select! {
-            _ = watch.changed(last_seen) => {}
-            () = tokio::time::sleep(WATCH_METADATA_SERVER_TIMEOUT) => {}
-        }
+        // Race the watch against the server-side timeout (no `Env`
+        // equivalent to `tokio::select!` — `animus-cp-data::
+        // cluster_segment_store` uses the identical `futures::future::
+        // select` shape for its own relay-correlation race). Both arms are
+        // `Unpin` (`MetadataChanged` is a plain, non-self-referential
+        // struct; `env.sleep` is `async_trait`-boxed), so no `pin_mut!` is
+        // needed. Whichever resolves first is discarded either way — this
+        // preserves the exact "wait for a change or WATCH_METADATA_SERVER_
+        // TIMEOUT, whichever comes first" semantics `tokio::select!` gave.
+        let _ = futures::future::select(
+            watch.changed(last_seen),
+            self.env.sleep(WATCH_METADATA_SERVER_TIMEOUT),
+        )
+        .await;
         let leader_hint = self.control_leader_hint();
         // Intra-cluster dual (ADR 0047) — the same `self.control.leader()`
         // id, resolved through `intra_addr` instead of `route_addr`. This is
@@ -199,7 +209,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// the committed tablet id. Idempotent + race-safe: the state machine admits only
     /// one `CreateTablet` per table, so concurrent callers converge on one tablet.
     pub(crate) async fn provision_tablet(&self, table: &str) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         // Propose-side patience (the `propose_and_await` discipline — see the
         // retry-amplification entries in `docs/engineering-lessons.md`): the
         // *poll* below stays at `SCHEMA_POLL_INTERVAL` so a commit is observed
@@ -220,7 +230,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // switches to `SetTabletPolicy` once the tablet exists — hence an
         // inline pacer, reset on the phase switch so the policy proposal is
         // not held back by the create proposal's own patience window.
-        let mut next_propose_at = tokio::time::Instant::now();
+        let mut next_propose_at = self.env.now();
         let mut last_proposed_create: Option<bool> = None;
         loop {
             // Fresh, not `metadata_cached()` (ADR 0035 PR4): the "no tablet
@@ -264,7 +274,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 if meta.policies.contains_key(&tablet) {
                     return Ok(());
                 }
-                let now = tokio::time::Instant::now();
+                let now = self.env.now();
                 if last_proposed_create != Some(false) || now >= next_propose_at {
                     let sent = self
                         .propose_schema(&MetaCommand::SetTabletPolicy {
@@ -273,12 +283,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         })
                         .await;
                     last_proposed_create = Some(false);
-                    next_propose_at = now
-                        + if sent {
-                            SCHEMA_PROPOSE_PATIENCE
-                        } else {
-                            Duration::ZERO
-                        };
+                    next_propose_at = now.saturating_add(if sent {
+                        SCHEMA_PROPOSE_PATIENCE
+                    } else {
+                        Duration::ZERO
+                    });
                 }
             } else {
                 // No tablet yet: pick the first min(N, RF) Active CP members and
@@ -290,7 +299,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .map(|(id, _)| id.clone())
                     .collect();
                 replicas.truncate(MAX_REPLICATION_FACTOR);
-                let now = tokio::time::Instant::now();
+                let now = self.env.now();
                 if !replicas.is_empty()
                     && (last_proposed_create != Some(true) || now >= next_propose_at)
                 {
@@ -307,18 +316,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         })
                         .await;
                     last_proposed_create = Some(true);
-                    next_propose_at = now
-                        + if sent {
-                            SCHEMA_PROPOSE_PATIENCE
-                        } else {
-                            Duration::ZERO
-                        };
+                    next_propose_at = now.saturating_add(if sent {
+                        SCHEMA_PROPOSE_PATIENCE
+                    } else {
+                        Duration::ZERO
+                    });
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("table tablet did not provision in time".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -359,7 +367,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // but it can surface a non-retryable-shaped transient early (e.g. a
         // forwarding hop's transport error mid-formation) — so wrap it in the
         // house converged-or-timeout retry loop with its own overall deadline.
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             // Deliberately `Strong` (ADR 0055): this probe exists to prove
             // the group has actually elected and can serve a linearizable
@@ -374,13 +382,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Ok(_) => return Ok(()),
                 Err(e) => e,
             };
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err(format!(
                     "table `{table}` was created but its tablet did not become \
                      serveable in time: {err}"
                 ));
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -451,8 +459,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             Some(t) => t.epoch,
         };
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
-        let mut next_propose_at = tokio::time::Instant::now();
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        let mut next_propose_at = self.env.now();
         loop {
             // Confirmed: the parent's own STATE became `Splitting` — the one
             // transition only a committed `BeginSplit` of this exact tablet
@@ -479,10 +487,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(_) => {}
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return ClientResponse::Error("split did not begin in time".into());
             }
-            if tokio::time::Instant::now() >= next_propose_at {
+            if self.env.now() >= next_propose_at {
                 // Child ids come from the **monotonic allocator**
                 // (`next_free_tablet_id`, ADR 0023 — the same allocator
                 // provisioning uses), *not* `max(existing ids) + 1`, which
@@ -548,14 +556,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     },
                 };
                 let sent = self.propose_schema(&cmd).await;
-                next_propose_at = tokio::time::Instant::now()
-                    + if sent {
-                        SCHEMA_PROPOSE_PATIENCE
-                    } else {
-                        Duration::ZERO
-                    };
+                next_propose_at = self.env.now().saturating_add(if sent {
+                    SCHEMA_PROPOSE_PATIENCE
+                } else {
+                    Duration::ZERO
+                });
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -844,26 +851,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     where
         Fut: std::future::Future<Output = Option<T>>,
     {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut next_propose_at = tokio::time::Instant::now();
+        let deadline = self.env.now().saturating_add(timeout);
+        let mut next_propose_at = self.env.now();
         loop {
             if let Some(value) = committed().await {
                 return Ok(value);
             }
-            let now = tokio::time::Instant::now();
+            let now = self.env.now();
             if now >= deadline {
                 return Err(());
             }
             if now >= next_propose_at {
                 let sent = self.propose_schema(&command).await;
-                next_propose_at = now
-                    + if sent {
-                        SCHEMA_PROPOSE_PATIENCE
-                    } else {
-                        Duration::ZERO
-                    };
+                next_propose_at = now.saturating_add(if sent {
+                    SCHEMA_PROPOSE_PATIENCE
+                } else {
+                    Duration::ZERO
+                });
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -879,7 +885,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// helper's doc); the outer loop here still re-resolves between chases
     /// as its converged-or-timeout backstop.
     pub(crate) async fn force_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
@@ -902,7 +908,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                        ClientResponse::Error(e) if self.env.now() >= deadline => {
                             return Err(e);
                         }
                         ClientResponse::Error(_) => {} // retry below
@@ -915,10 +921,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("force-seal did not reach a tablet leader in time".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -927,7 +933,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// [`force_seal_tablet`](Self::force_seal_tablet), identical shape and
     /// identical forwarding discipline.
     pub(crate) async fn force_pitr_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
@@ -950,7 +956,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                        ClientResponse::Error(e) if self.env.now() >= deadline => {
                             return Err(e);
                         }
                         ClientResponse::Error(_) => {} // retry below
@@ -963,10 +969,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("PITR force-seal did not reach a tablet leader in time".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -990,7 +996,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// error (including this action's own expected skips) is a terminal
     /// outcome, not a signal to keep retrying.
     pub(crate) async fn grow_stream_tablet(&self, tablet: TabletId) -> ClientResponse {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
@@ -1012,12 +1018,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return ClientResponse::Error(
                     "stream grow: did not reach this tablet's leader in time".into(),
                 );
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -1101,7 +1107,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         tablet: TabletId,
         index: &str,
     ) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
@@ -1117,7 +1123,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                        ClientResponse::Error(e) if self.env.now() >= deadline => {
                             return Err(e);
                         }
                         ClientResponse::Error(_) => {} // retry below
@@ -1130,10 +1136,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("backfill-cursor clear did not reach a tablet leader in time".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -1192,7 +1198,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         from_position: u64,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
@@ -1216,7 +1222,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .await
                     {
                         ClientResponse::Pairs(pairs) => return Ok(pairs),
-                        ClientResponse::Error(e) if tokio::time::Instant::now() >= deadline => {
+                        ClientResponse::Error(e) if self.env.now() >= deadline => {
                             return Err(e);
                         }
                         ClientResponse::Error(_) => {} // retry below
@@ -1229,10 +1235,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::None) | None => {} // not settled yet, retry
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return Err("stream hot read did not reach a tablet leader in time".into());
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 }
