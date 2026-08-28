@@ -2396,6 +2396,7 @@ mod system_table_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 console: addrs[5],
+                advertise_host: None,
             }],
             dynamo_auth: None,
         }

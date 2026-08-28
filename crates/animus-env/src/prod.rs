@@ -55,22 +55,34 @@ struct Demux {
 struct Inner {
     node_id: NodeId,
     start: Instant,
-    /// The peer address book.
-    peers: Arc<StdMutex<BTreeMap<NodeId, SocketAddr>>>,
-    /// This env's own listener address.
+    /// The peer address book: node id -> `host:port` (a hostname or a numeric
+    /// address — `TcpStream::connect` resolves either). Kept as a string end
+    /// to end (ADR: advertise/dial split) so a peer can be registered by a
+    /// stable DNS name (e.g. a Kubernetes StatefulSet pod's own name) rather
+    /// than the numeric address it happens to be bound to.
+    peers: Arc<StdMutex<BTreeMap<NodeId, String>>>,
+    /// This env's own listener address (always numeric — this is a bind
+    /// address, never an advertised one).
     local_addr: SocketAddr,
-    /// Cached outbound connections, one per destination address, so `send`/
-    /// `send_stream` do not pay a TCP handshake per message (Raft heartbeats/
-    /// AppendEntries/votes are the hot path). Keyed by `SocketAddr`, not
-    /// `NodeId`: the frame header carries `from` per message and the receiver
-    /// demuxes per *listener*, so one connection per address is correct even
+    /// Cached outbound connections, one per destination address string, so
+    /// `send`/`send_stream` do not pay a TCP handshake (or, for a hostname
+    /// peer, a fresh DNS lookup) per message (Raft heartbeats/AppendEntries/
+    /// votes are the hot path). Keyed by the address **string** exactly as
+    /// registered in `peers`, not `NodeId` and not a resolved `SocketAddr`:
+    /// the frame header carries `from` per message and the receiver demuxes
+    /// per *listener*, so one connection per address string is correct even
     /// when several ids map to it, and a re-mapped peer id naturally picks up
-    /// a fresh connection. The outer `StdMutex` only guards map lookup/insert
-    /// (never held across `.await`); the per-address `tokio::sync::Mutex`
-    /// serializes whole-frame writes so concurrent senders to one peer never
-    /// interleave frames, without head-of-line blocking *across* peers.
+    /// a fresh connection. Resolution (DNS or numeric parse) happens only on
+    /// the connect path — an already-cached live stream is reused with no
+    /// lookup at all; a write failure drops the stale entry and the
+    /// reconnect-once re-resolves, which is what lets a moved pod (same
+    /// hostname, new IP) recover on its very next send. The outer `StdMutex`
+    /// only guards map lookup/insert (never held across `.await`); the
+    /// per-address `tokio::sync::Mutex` serializes whole-frame writes so
+    /// concurrent senders to one peer never interleave frames, without
+    /// head-of-line blocking *across* peers.
     #[allow(clippy::type_complexity)]
-    conns: Arc<StdMutex<BTreeMap<SocketAddr, Arc<Mutex<Option<TcpStream>>>>>>,
+    conns: Arc<StdMutex<BTreeMap<String, Arc<Mutex<Option<TcpStream>>>>>>,
     data_dir: PathBuf,
     /// Files whose *directory entry* is already durable — i.e. whose containing
     /// directory chain has been fsynced since the file was (re)created. A file's
@@ -144,9 +156,10 @@ impl ProdEnv {
         self.inner.local_addr
     }
 
-    /// Install (or replace) the peer address book: a map from node id to socket
-    /// address for every node this env may send to.
-    pub fn set_peers(&self, peers: BTreeMap<NodeId, SocketAddr>) {
+    /// Install (or replace) the peer address book: a map from node id to
+    /// `host:port` (a hostname or a numeric address) for every node this env
+    /// may send to.
+    pub fn set_peers(&self, peers: BTreeMap<NodeId, String>) {
         *self.inner.peers.lock().expect("peers poisoned") = peers;
     }
 
@@ -178,7 +191,7 @@ impl ProdEnv {
     /// A generalized replicated-address + periodic-resync mechanism for the
     /// control role (mirroring `peer_sync_loop`) is deliberately deferred —
     /// see the ADR 0037 stack's engineering-lessons entry.
-    pub fn merge_peer(&self, id: NodeId, addr: SocketAddr) {
+    pub fn merge_peer(&self, id: NodeId, addr: String) {
         self.inner
             .peers
             .lock()
@@ -470,7 +483,7 @@ impl Network for ProdEnv {
         let addr = {
             let peers = self.inner.peers.lock().expect("peers poisoned");
             match peers.get(&to) {
-                Some(&addr) => addr,
+                Some(addr) => addr.clone(),
                 None => {
                     // Fire-and-forget: an unknown peer is just another way the
                     // message is dropped (the caller gets no delivery result). It
@@ -497,10 +510,10 @@ impl Network for ProdEnv {
         // per-address `Arc` out and drop the guard before any I/O.
         let slot = {
             let mut conns = self.inner.conns.lock().expect("conns poisoned");
-            Arc::clone(conns.entry(addr).or_default())
+            Arc::clone(conns.entry(addr.clone()).or_default())
         };
-        if let Err(err) = send_frame_pooled(&slot, addr, from, stream, &payload).await {
-            tracing::debug!(?err, to = %to, "send failed (dropped)");
+        if let Err(err) = send_frame_pooled(&slot, &addr, from, stream, &payload).await {
+            tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
         }
     }
 
@@ -567,16 +580,22 @@ fn spawn_accept(
 }
 
 /// Send one frame over the cached connection for `addr`, connecting (with
-/// `TCP_NODELAY`) if there is none. Holding the per-address lock across the
-/// whole frame write is what keeps concurrent senders' frames from
-/// interleaving. On a write error the cached stream is stale (e.g. the peer
-/// restarted since the last send) — drop it, reconnect **once**, resend the
-/// whole frame (the receiver never saw a partial frame: the dead connection
-/// took it), then surface the error if that also fails, matching the old
+/// `TCP_NODELAY`) if there is none. `addr` is a `host:port` string — a
+/// hostname (resolved via async DNS by `TcpStream::connect`'s own
+/// `ToSocketAddrs` impl for `&str`) or a numeric address. Resolution only
+/// happens on this connect path: a cached, already-live stream is reused
+/// with no lookup at all. Holding the per-address lock across the whole
+/// frame write is what keeps concurrent senders' frames from interleaving.
+/// On a write error the cached stream is stale (e.g. the peer restarted
+/// since the last send, or — for a hostname peer — moved to a new address
+/// entirely) — drop it, reconnect **once** (re-resolving `addr` fresh, which
+/// is exactly the cache invalidation a moved pod needs), resend the whole
+/// frame (the receiver never saw a partial frame: the dead connection took
+/// it), then surface the error if that also fails, matching the old
 /// connect-per-message fire-and-forget semantics.
 async fn send_frame_pooled(
     slot: &Mutex<Option<TcpStream>>,
-    addr: SocketAddr,
+    addr: &str,
     from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
@@ -596,7 +615,12 @@ async fn send_frame_pooled(
     Ok(())
 }
 
-async fn connect_nodelay(addr: SocketAddr) -> std::io::Result<TcpStream> {
+async fn connect_nodelay(addr: &str) -> std::io::Result<TcpStream> {
+    // `TcpStream::connect` is generic over `ToSocketAddrs`, which tokio
+    // implements for `&str` (a `host:port` string) with an internal async
+    // DNS resolution — a numeric `"1.2.3.4:5"` string resolves trivially, a
+    // hostname like `"my-pod.my-svc:5"` goes through a real lookup. Either
+    // way this is the only place in the send path that ever resolves.
     let stream = TcpStream::connect(addr).await?;
     // Frames are small (heartbeats, votes) and latency-sensitive; never let
     // Nagle hold one back waiting to coalesce.
@@ -1217,7 +1241,7 @@ mod tests {
         let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
             .await
             .expect("bind b");
-        b.set_peers([(nid(0), a_addr)].into_iter().collect());
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
 
         // Two receive loops on `a`, one per stream, each collecting its frames'
         // first payload byte (the sequence number) into its own vector.
@@ -1298,7 +1322,7 @@ mod tests {
         let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let (a, _) = ProdEnv::bind(nid(0), loop0, dir_a).await.expect("bind a");
         let (b, b_addr) = ProdEnv::bind(nid(1), loop0, dir_b).await.expect("bind b");
-        a.set_peers([(nid(1), b_addr)].into_iter().collect());
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
         (a, b, b_addr)
     }
 
@@ -1461,7 +1485,7 @@ mod tests {
         // dropped (see `Network::send`'s doc), not an error.
         a.send(nid(2), b"too-early".to_vec()).await;
 
-        a.merge_peer(nid(2), c_addr);
+        a.merge_peer(nid(2), c_addr.to_string());
 
         // The pre-existing entry for `b` still works...
         a.send(nid(1), b"still-reachable".to_vec()).await;
@@ -1483,6 +1507,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&dir_c);
+    }
+
+    /// A peer registered by **hostname**, not a numeric address (the
+    /// advertise/dial split's whole point — a Kubernetes pod advertises its
+    /// stable DNS name), is genuinely reachable: `TcpStream::connect`'s own
+    /// `ToSocketAddrs` impl for `&str` resolves it. `"localhost"` is a
+    /// hostname every sandbox can resolve without a real DNS server, so this
+    /// exercises the actual resolution path rather than a numeric string
+    /// that merely happens to parse.
+    #[tokio::test]
+    async fn send_delivers_to_a_peer_registered_by_hostname() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, _) = ProdEnv::bind(nid(0), loop0, &dir_a).await.expect("bind a");
+        let (b, b_addr) = ProdEnv::bind(nid(1), loop0, &dir_b).await.expect("bind b");
+
+        // Register `b` by hostname:port rather than its numeric address.
+        a.set_peers(
+            [(nid(1), format!("localhost:{}", b_addr.port()))]
+                .into_iter()
+                .collect(),
+        );
+
+        a.send(nid(1), b"via-hostname".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv via hostname-registered peer timed out");
+        assert_eq!(env.from, nid(0));
+        assert_eq!(env.payload, b"via-hostname");
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// Durability smoke test for the directory-fsync paths: `replace` (rename +

@@ -301,6 +301,7 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             admin: free(),
             intra: free(),
             console: free(),
+            advertise_host: None,
         }
     };
     let config = animusd::ClusterConfig {

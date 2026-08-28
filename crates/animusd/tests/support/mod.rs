@@ -55,6 +55,7 @@ fn single_node_config() -> ClusterConfig {
             admin: a[3],
             intra: a[4],
             console: a[5],
+            advertise_host: None,
         }],
         dynamo_auth: None,
     }
@@ -135,6 +136,7 @@ pub async fn bring_up_deadline(
                 admin: addrs[6 * i + 3],
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
+                advertise_host: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -195,6 +197,7 @@ pub async fn grow_deadline(
                 admin: addrs[6 * i + 3],
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
+                advertise_host: None,
             });
         }
         let expanded = ClusterConfig {
@@ -272,10 +275,11 @@ pub async fn join_fresh_deadline(
             admin: raw[3],
             intra: raw[4],
             console: raw[5],
+            advertise_host: None,
         };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
         match animusd::run_node_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             Some(id),
             addrs.clone(),
             &node_dir,
@@ -321,10 +325,11 @@ pub async fn join_data_fresh_deadline(
             admin: raw[3],
             intra: raw[4],
             console: raw[5],
+            advertise_host: None,
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             Some(id),
             addrs,
             &node_dir,
@@ -376,10 +381,11 @@ pub async fn join_allocated_fresh_deadline(
             admin: raw[3],
             intra: raw[4],
             console: raw[5],
+            advertise_host: None,
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             None,
             addrs.clone(),
             &node_dir,
@@ -424,10 +430,11 @@ pub async fn join_data_allocated_fresh_deadline(
             admin: raw[3],
             intra: raw[4],
             console: raw[5],
+            advertise_host: None,
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
         match animusd::run_node_data_join(
-            seeds.to_vec(),
+            seeds.iter().map(ToString::to_string).collect(),
             None,
             addrs,
             &node_dir,
@@ -483,6 +490,7 @@ pub async fn bring_up_split(
                     admin: addrs[6 * i + 3],
                     intra: addrs[6 * i + 4],
                     console: addrs[6 * i + 5],
+                    advertise_host: None,
                 }
             })
             .collect();

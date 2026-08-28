@@ -352,6 +352,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // both ways (flag **and** the loaded file's own section) is a hard
     // startup error — see `run_single`.
     let mut dynamo_auth_path: Option<String> = None;
+    // `--advertise-host NAME` (ADR 0060) — see `run_join`'s own doc.
+    // `--config`/`--node`: applied to that one node's own config entry
+    // (`apply_advertise_host_flag`, the same "flag and config both set it
+    // is a hard error" shape `dynamo_auth_path` above uses). `--cluster N`:
+    // applied to every generated node (they still each bind their own
+    // distinct port, so `{host}:{port}` stays a unique identity per node).
+    // `--cluster-control`/`--cluster-data`: a documented gap, matching this
+    // dev-only path's existing `--quiesce-after`/`--split-mode` ones — not
+    // threaded through, since `run_in_process_split_cluster` has no
+    // per-node-advertise-host wrapper to call.
+    let mut advertise_host: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -399,6 +410,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
+            }
+            "--advertise-host" => {
+                advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -472,6 +486,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 split_mode.unwrap_or_default(),
                 dynamo_auth_flag,
                 backup_store_config,
+                advertise_host,
             )
             .await
         }
@@ -492,6 +507,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 split_mode.unwrap_or_default(),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
+                advertise_host,
             )
             .await
         }
@@ -553,6 +569,32 @@ fn stream_seal_knobs(bytes: Option<u64>, age_secs: Option<u64>) -> animusd::Stre
         seal_bytes: bytes.unwrap_or(default.seal_bytes),
         seal_age: age_secs.map_or(default.seal_age, Duration::from_secs),
     }
+}
+
+/// Parse a `--seed ADDR[,ADDR...]` CLI value into the `host:port` strings
+/// `run_node_join`/`run_node_data_join` dial (ADR 0060's advertise/dial
+/// split): each comma-separated entry is carried through as-is rather than
+/// `.parse::<SocketAddr>()`'d — a seed may name a hostname (a Kubernetes
+/// pod's stable DNS name) as well as a numeric address, and the only place
+/// that ever needs to resolve one is the actual connect call
+/// (`TcpStream::connect`'s own `ToSocketAddrs` impl for `&str`). Still
+/// rejects an entry with no `:port` at all — a cheap shape check that names
+/// an obviously-wrong value at the CLI boundary rather than as an opaque
+/// connect failure deep in the join retry loop.
+fn parse_seed_arg(seed_arg: &str) -> Result<Vec<String>, String> {
+    seed_arg
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            if s.contains(':') {
+                Ok(s.to_string())
+            } else {
+                Err(format!(
+                    "invalid --seed address `{s}`: expected a `host:port` string"
+                ))
+            }
+        })
+        .collect()
 }
 
 /// [`animusd::SegmentStoreConfig`] from the optional `--segment-store` CLI
@@ -626,6 +668,37 @@ fn apply_dynamo_auth_flag(
     }
 }
 
+/// Apply `--advertise-host NAME` (ADR 0060) onto `config.nodes[index]`
+/// (this process's own entry only — every other node's `advertise_host`
+/// stays exactly what its own config entry already says): the same
+/// "flag and config file both set it is a hard error, not a silent
+/// precedence rule" shape [`apply_dynamo_auth_flag`] uses, so a config
+/// generated once (with no `advertise_host` of its own) and started with a
+/// different `--advertise-host` per pod is the common case, while a config
+/// that *does* carry an explicit `advertise_host` for this entry can't be
+/// silently overridden by a stale flag left on the command line.
+fn apply_advertise_host_flag(
+    config: &mut ClusterConfig,
+    index: usize,
+    flag: Option<String>,
+) -> Result<(), String> {
+    let entry = config
+        .nodes
+        .get_mut(index)
+        .ok_or_else(|| format!("node index {index} out of range"))?;
+    match (&entry.advertise_host, flag) {
+        (Some(_), Some(_)) => Err(format!(
+            "node {index}'s advertise_host is set both in the config file and via \
+             --advertise-host — specify it one way, not both"
+        )),
+        (None, Some(flag)) => {
+            entry.advertise_host = Some(flag);
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
 /// Per-process: run node `index` from the config file.
 ///
 /// `dynamo_auth_flag` (ADR 0057) is `--dynamo-auth PATH`, already loaded —
@@ -649,10 +722,12 @@ async fn run_single(
     split_mode: animusd::SplitMode,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     backup_store_config: animusd::BackupStoreConfig,
+    advertise_host: Option<String>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
+    apply_advertise_host_flag(&mut config, index, advertise_host)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
     let node = animusd::run_node_with_streams_quiesce_and_split_mode(
@@ -769,6 +844,8 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     // shape/semantics; accepted here too since a data-only node binds the
     // dynamo listener (ADR 0035 PR4).
     let mut dynamo_auth_path: Option<String> = None;
+    // `--advertise-host NAME` (ADR 0060) — see `run_join`'s own doc.
+    let mut advertise_host: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -784,6 +861,9 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
             }
+            "--advertise-host" => {
+                advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
+            }
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
@@ -796,7 +876,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("data requires --node I")?;
-            run_data_config(&path, index, dir, backend, dynamo_auth_flag).await
+            run_data_config(&path, index, dir, backend, dynamo_auth_flag, advertise_host).await
         }
         (None, Some(seed_arg)) => {
             let id = id
@@ -815,6 +895,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 dir,
                 backend,
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
+                advertise_host,
             )
             .await
         }
@@ -833,10 +914,12 @@ async fn run_data_config(
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
+    advertise_host: Option<String>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
+    apply_advertise_host_flag(&mut config, index, advertise_host)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
 
     let node = animusd::run_node_data(&config, index, &dir, backend)
@@ -864,6 +947,7 @@ async fn run_data_config(
 /// index to derive it from); the CLI's data dir defaults to a name built from
 /// `id` when given, else a mint-pending placeholder distinguished by
 /// `base_port`.
+#[allow(clippy::too_many_arguments)]
 async fn run_data_join(
     seed_arg: &str,
     id: Option<NodeId>,
@@ -872,15 +956,9 @@ async fn run_data_join(
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
+    advertise_host: Option<String>,
 ) -> Result<(), String> {
-    let seeds: Vec<SocketAddr> = seed_arg
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<SocketAddr>()
-                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
+    let seeds: Vec<String> = parse_seed_arg(seed_arg)?;
     if seeds.is_empty() {
         return Err("data --seed requires at least one address".into());
     }
@@ -898,6 +976,7 @@ async fn run_data_join(
         admin: p(3),
         intra: p(4),
         console: p(5),
+        advertise_host,
     };
     let dir_name = id
         .as_ref()
@@ -952,6 +1031,13 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     let mut base_port: Option<u16> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut backend = animusd::StorageBackend::default();
+    // `--advertise-host NAME` (ADR 0060's advertise/dial split): this
+    // node's own stable dial name, if its bind address (`--ip`, e.g. a
+    // Kubernetes pod's own wildcard/pod-IP bind) isn't itself something a
+    // peer can dial reliably. `None` (the default) is byte-identical to
+    // before this ADR — every self-registered address is the bind address
+    // itself, stringified. See `RoleAddrs::advertise_host`'s own doc.
+    let mut advertise_host: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -962,19 +1048,15 @@ async fn run_join(args: &[String]) -> Result<(), String> {
             "--base-port" => base_port = Some(parse_next(&mut it, "--base-port")?),
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
+            "--advertise-host" => {
+                advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
+            }
             other => return Err(format!("unknown join argument `{other}`")),
         }
     }
 
     let seed_arg = seed_arg.ok_or("join requires --seed ADDR[,ADDR...]")?;
-    let seeds: Vec<SocketAddr> = seed_arg
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<SocketAddr>()
-                .map_err(|e| format!("invalid --seed address `{s}`: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
+    let seeds: Vec<String> = parse_seed_arg(&seed_arg)?;
     if seeds.is_empty() {
         return Err("join requires at least one --seed address".into());
     }
@@ -1000,6 +1082,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         admin: p(3),
         intra: p(4),
         console: p(5),
+        advertise_host,
     };
     let dir_name = id
         .as_ref()
@@ -1041,12 +1124,13 @@ async fn run_in_process_cluster(
     split_mode: animusd::SplitMode,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     backup_store_config: animusd::BackupStoreConfig,
+    advertise_host: Option<String>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
     }
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("animusd"));
-    let bound = animusd::bind_cluster(n, ip, &dir)
+    let bound = animusd::bind_cluster_with_advertise_host(n, ip, &dir, advertise_host)
         .await
         .map_err(|e| format!("failed to bind cluster: {e}"))?;
     let nodes = animusd::start_cluster_with_growth_and_quiesce_after(
@@ -1189,6 +1273,40 @@ async fn run_in_process_split_cluster(
     Ok(())
 }
 
+/// Waits for either Ctrl-C (SIGINT, an interactive stop) or SIGTERM (a
+/// Kubernetes pod's `preStop`/termination signal) before every call site runs
+/// its own `shutdown_graceful()`. Without the SIGTERM half, a pod eviction
+/// never reaches graceful shutdown at all — Kubernetes sends SIGTERM, not
+/// SIGINT, on pod termination.
+#[cfg(unix)]
+async fn wait_for_ctrl_c() {
+    use tokio::signal::unix::{SignalKind, signal};
+    // A failure to install the SIGTERM handler is not fatal — Ctrl-C alone
+    // still works — but is worth a loud warning since it silently drops the
+    // pod-termination path this exists for.
+    let mut sigterm = signal(SignalKind::terminate())
+        .inspect_err(|e| tracing::warn!(?e, "failed to install a SIGTERM handler"))
+        .ok();
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            if let Err(e) = res {
+                tracing::warn!(?e, "failed to listen for Ctrl-C");
+            }
+        }
+        _ = async {
+            match &mut sigterm {
+                Some(s) => { s.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
+    println!("animusd: shutting down");
+}
+
+/// Non-unix fallback: SIGTERM has no portable equivalent outside unix, so
+/// this waits on Ctrl-C alone (this workspace is linux-first — see the crate
+/// guide — this branch exists only so the crate still builds elsewhere).
+#[cfg(not(unix))]
 async fn wait_for_ctrl_c() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::warn!(?e, "failed to listen for Ctrl-C");

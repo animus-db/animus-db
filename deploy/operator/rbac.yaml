@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: animus-operator
+  namespace: animus-operator
+  labels:
+    app.kubernetes.io/name: animus-operator
+---
+# Cluster-scoped: the operator watches AnimusCluster objects (and their
+# children) across every namespace it is asked to manage, and CRDs/
+# namespaces themselves are cluster-scoped resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: animus-operator
+  labels:
+    app.kubernetes.io/name: animus-operator
+rules:
+  - apiGroups: ["animusdb.io"]
+    resources: ["animusclusters"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["animusdb.io"]
+    resources: ["animusclusters/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: the controller reads pod status/conditions as part of
+  # computing AnimusCluster status, but pods themselves are owned by the
+  # StatefulSet controller, not this operator.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: animus-operator
+  labels:
+    app.kubernetes.io/name: animus-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: animus-operator
+subjects:
+  - kind: ServiceAccount
+    name: animus-operator
+    namespace: animus-operator

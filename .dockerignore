@@ -1,0 +1,19 @@
+# Keep the Docker build context to just what the Dockerfile COPYs
+# (Cargo.toml, Cargo.lock, crates/) so the context transfer and cache-mount
+# builds stay fast and don't invalidate on unrelated churn.
+
+target/
+.git/
+website/
+docs/
+.github/
+.claude/
+
+# Editor/OS junk that sometimes ends up in a worktree.
+*.swp
+*.swo
+.DS_Store
+
+# Local scratch/log output, never part of the build.
+/tmp/
+*.log

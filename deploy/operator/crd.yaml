@@ -1,0 +1,226 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: animusclusters.animusdb.io
+spec:
+  group: animusdb.io
+  names:
+    kind: AnimusCluster
+    plural: animusclusters
+    shortNames:
+    - adbc
+    singular: animuscluster
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for AnimusClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: '`AnimusCluster.spec` — the desired state of one AnimusDB cluster.'
+            properties:
+              autoSplitBytes:
+                description: |-
+                  **Not currently wired into `entrypoint.sh`** — `animusd`'s
+                  `--config FILE --node I` invocation (what every pod in this
+                  deployment shape runs) does not accept `--auto-split-bytes` today;
+                  that flag exists only on the dev-only `--cluster N` in-process mode.
+                  Kept on the spec for forward compatibility and documented loudly
+                  here and in the crate guide rather than silently dropped.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              basePort:
+                description: |-
+                  The first of the six-port stride every pod binds
+                  (`base_port + {internal:0, client:1, dynamo:2, admin:3, intra:4,
+                  console:5}`). Defaults to [`DEFAULT_BASE_PORT`](Self::DEFAULT_BASE_PORT).
+                format: int32
+                nullable: true
+                type: integer
+              clientService:
+                default: {}
+                description: The client-facing dynamo port's own `Service`.
+                properties:
+                  type:
+                    description: |-
+                      `Service.spec.type` — `ClusterIP` (default), `LoadBalancer`, or
+                      `NodePort`.
+                    nullable: true
+                    type: string
+                type: object
+              controlNodes:
+                description: |-
+                  How many of the leading pods (ordinals `0..controlNodes`) run the
+                  combined control+data role (`NodeRole::Both`); the rest run
+                  data-only (`NodeRole::Data`). Defaults to `min(3, nodes)`.
+                  **Immutable after creation** — a later change is rejected (a status
+                  condition is set; the field's original value keeps governing the
+                  cluster) since there is no admission webhook in v1 to reject the
+                  write itself.
+                format: int32
+                nullable: true
+                type: integer
+              dynamoAuthSecretName:
+                description: |-
+                  Name of a `Secret` (in the same namespace) holding the DynamoDB
+                  SigV4 credential store (`{"credentials": {"AKID...": "secret...",
+                  ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
+                  and passed as `--dynamo-auth /etc/animus/dynamo-auth/credentials.json`
+                  to every pod (both roles accept the flag).
+                nullable: true
+                type: string
+              image:
+                description: |-
+                  The `animusd` container image. Defaults to
+                  [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
+                nullable: true
+                type: string
+              nodes:
+                description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
+                format: int32
+                type: integer
+              quiesceAfterSecs:
+                description: |-
+                  `--quiesce-after SECS` (combined-role pods only — see
+                  `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table).
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              resources:
+                description: Passthrough container resource requests/limits.
+                nullable: true
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                      This field depends on the DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                          type: string
+                        request:
+                          description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  limits:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                  requests:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                type: object
+              splitMode:
+                description: '`--split-mode {copy,inplace}` (combined-role pods only).'
+                nullable: true
+                type: string
+              storage:
+                default: {}
+                description: Data volume configuration.
+                properties:
+                  ephemeral:
+                    description: |-
+                      When `true`, every pod uses an `emptyDir` instead of a
+                      `PersistentVolumeClaim`, and `animusd` is started with `--ephemeral`
+                      (the volatile in-memory storage engine) — data does not survive a
+                      pod restart. Defaults to `false`.
+                    nullable: true
+                    type: boolean
+                  size:
+                    description: PVC size (e.g. `"10Gi"`). Defaults to `"10Gi"` when omitted.
+                    nullable: true
+                    type: string
+                  storageClassName:
+                    description: |-
+                      `StorageClassName` for the PVC. Omitted lets the cluster default
+                      apply.
+                    nullable: true
+                    type: string
+                type: object
+            required:
+            - nodes
+            type: object
+          status:
+            description: '`AnimusCluster.status`.'
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Typed conditions (`status.conditions[]`), the usual Kubernetes shape.
+                items:
+                  description: |-
+                    One `status.conditions[]` entry — the standard Kubernetes condition
+                    shape (`type`/`status`/`reason`/`message`/`lastTransitionTime`).
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      description: The three-valued Kubernetes condition status.
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                description: The `.metadata.generation` this status was computed from.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: The cluster's coarse lifecycle phase.
+                enum:
+                - Pending
+                - Bootstrapping
+                - Ready
+                - Degraded
+                - Deleting
+                - null
+                nullable: true
+                type: string
+              readyNodes:
+                description: |-
+                  Ready pod count, mirrored from the `StatefulSet`'s own
+                  `status.readyReplicas`.
+                format: int32
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: AnimusCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
