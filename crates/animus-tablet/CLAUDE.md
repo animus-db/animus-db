@@ -91,3 +91,18 @@ successor invariant).
 `contains_range`, `split_at` bounds, token determinism + fixed width,
 the Murmur3 empty-input spec anchor, token spread across ring octants,
 and table-scoped `serves_table`.
+
+**Canonical Murmur3 reference vectors** (ADR 0061 rung A2,
+`murmur3_matches_canonical_reference_vectors`): 12 `(input, h1, h2)` cases —
+walking every branch of the tail-handling code (1/4/7/8/9/15/16/32-byte
+inputs, embedded `0x00` bytes, all-`0xff` bytes) — cross-checked against an
+**independent** implementation (the `mmh3` PyPI package, itself a port of
+Austin Appleby's reference `MurmurHash3.cpp`), not derived from this file's
+own code. Every vector matched on the first try: **this implementation is
+byte-for-byte canonical MurmurHash3 x64_128 with seed 0**, not a deliberate
+variant — worth knowing given ADR 0022/0023 require the wire adapters' own
+token computation to agree with this one byte-for-byte, since this test is
+now the independent anchor that claim can be checked against. `proptest`
+(dev-dep) adds `partition_token` properties — determinism and fixed width
+over arbitrary byte inputs, and a randomized-batch generalization of the
+fixed octant-spread check — at a modest case count for the per-push gate.
