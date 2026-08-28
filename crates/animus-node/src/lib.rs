@@ -24,6 +24,7 @@
 pub mod backup_completion;
 pub mod backup_janitor;
 pub mod codec;
+pub mod control_handle;
 pub mod decide;
 pub mod host;
 pub mod index_backfill;
@@ -33,6 +34,7 @@ pub mod ttl_reaper;
 mod wire;
 
 pub use codec::{MAX_FRAME_LEN, decode_client_frame, encode_client_frame, frame_payload_len};
+pub use control_handle::{ControlHandle, RemoteControlClient};
 pub use wire::{
     ClientRequest, ClientResponse, KindWriteOp, PendingKindWrite, Surface, TxnPrecondition,
     TxnTableWrite, TxnWriteCondition, is_relayable_command, surface_of,
