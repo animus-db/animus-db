@@ -283,7 +283,7 @@ brain-last.
 | C0 | **Prerequisite (added 2026-08-28, see the amendment below).** Feature-gate `animus-env`'s `prod` module — `ProdEnv`/`FsSegmentStore` behind a default-off `prod` feature; every current consumer opts in explicitly. Without this, C1's boundary is decorative |
 | C1 | Create `animus-node` depending on `animus-env` with `default-features = false` — so `ProdEnv` genuinely does not exist in that build — and with no `tokio::net`. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Also harden `is_relayable_command` from `matches!` to an exhaustive `match` (see below). Boundary established and compiler-enforced from the first commit |
 | C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill` — paced by `env.sleep()`/`env.now()`/`env.spawn_task()` instead of `tokio::time`. **Requires a host-capability trait first (see the second 2026-08-28 amendment): every one of these takes `ClientCtx`, which does not move until C5.** |
-| C3 | `ControlHandle<E>`; move relay/forwarding (`relay_request`, `lib.rs:17617-17650`) off raw `TcpStream` onto the multiplexed `Network` (ADR 0026). This is what lets a multi-node cluster talk inside `SimEnv` |
+| C3 | `ControlHandle<E, R>` and a `RelayClient` capability trait, split into **C3a–C3d** (see the third 2026-08-28 amendment). The literal "move relay onto `Network`" is **rejected**: it would collapse ADR 0047's `intra` port into `internal`, a production wire-topology change this ADR disclaims. The goal — a cluster that talks inside `SimEnv` — is met by a second, sim-only `RelayClient` implementor instead |
 | C4 | The HTTP edges per Decision 2: parsing and dispatch become pure bytes-in/bytes-out in `animus-node`; `animusd` keeps the accept loops |
 | C5 | The brain: split `impl ClientCtx` into `read_path`, `write_path`, `txn_coordinator`, `forwarding`, `schema`; genericize over `E: Env`. The heaviest rung, but A6 has already lifted the pure predicates out of it |
 | C6 | Node assembly: `Node<E>`/`BoundNode<E>`/`BoundControlNode<E>`/`BoundDataNode<E>` move; `animusd` shrinks to binary, config, listeners, lifecycle, and the one `ProdEnv` construction. The `start_cluster*`/`run_node*` harness functions move to test support where they belong |
@@ -374,6 +374,61 @@ sim-tested until C5 landed.
 
 Expect the same shape at C3 and C4: the question at each rung is not "can this
 file move" but "what narrow capability does it actually need from its host".
+
+#### 2026-08-28 amendment (third) — C3 splits, and the literal reading is rejected
+
+Scoping C3 found two things the one-line plan did not anticipate. The pattern
+from the second amendment held a third time, so it is now stated as standing
+guidance below rather than rediscovered per rung.
+
+**1. `Network` does not fit relay, and the literal move would change the wire.**
+ADR 0026's `Network` is fire-and-forget `send_stream`/single-consumer
+`recv_stream` with **no request/response correlation**. Relay is synchronous
+call/await RPC. Two concurrent relay calls to one peer on a shared stream
+cannot match replies to callers without a `req_id`. That machinery would have
+to be built — the codebase already has the shape twice
+(`animus-cp-data::cluster_segment_store`'s `req_id` + `Pending` slots polled
+via `env.sleep()`, deliberately not `tokio::sync::oneshot` because `SimEnv`
+callers have no tokio runtime; and `RaftKvNode`'s `ReadProbe`/`ReadProbeAck`).
+
+Worse, `Network`'s `ProdEnv` impl dials the **`internal`** port (raw Raft/
+`KvWire` frames), while relay dials **`intra`** (or `client`). ADR 0047 split
+`intra` off `client` precisely so internal `ClientRequest` traffic never rides
+the client edge; `internal` is a third, orthogonal port. Literally riding relay
+on `Network` therefore **collapses `intra` into `internal`** — a production
+wire-topology change, contradicting this ADR's own "explicitly not in scope:
+any behaviour change" and fighting ADR 0047's separation rationale.
+
+So the literal reading is rejected. The *spirit* — a multi-node cluster that
+talks inside `SimEnv` — is achieved by making relay a capability and giving it
+a second, sim-only implementor. Production keeps its existing transport and
+ports, byte for byte. Anyone wanting the production merge should propose it as
+its own change with its own ADR amendment; it is not a testability rung's to
+smuggle in.
+
+**2. C3 is four rungs, not one.**
+
+| Sub-rung | Work |
+|---|---|
+| C3a | Move the **pure** half of `write_frame`/`read_frame` — framing arithmetic, `MAX_FRAME_LEN` bound, serde calls — into `animus-node` as functions over `&[u8]`. ~90% of those two functions; no socket. Trivial, independently shippable |
+| C3b | A `RelayClient` capability trait in `animus-node::host`, beside C2's three. `animusd` implements it over the **unchanged** `relay_request` — still raw `TcpStream`, still on `intra`/`client`, zero wire change |
+| C3c | `ControlHandle<E, R: RelayClient>` / `RemoteControlClient<R>`. Mechanical once C3b exists: every `Local` arm is already a synchronous passthrough to an `E`-generic `RaftNode<E>` accessor, and `metadata_fresh` is the single method doing real I/O |
+| C3d | A `Network`-backed `RelayClient` implementor, **sim-only**, with the `req_id` correlation above and a reserved stream constant. This is what actually lets a cluster talk inside `SimEnv`, and it feeds Phase D's `SimCluster` |
+
+Deferred to C5 as `ClientCtx`-entangled: `ClientCtx::relay` and every call site
+reaching relay through it (`propose_schema`, `cp_serve_forwarded`'s
+forwarding). C3 only frees the free functions and `control_handle.rs`, neither
+of which touches `ClientCtx`.
+
+**Standing guidance for C4 and C5.** Three rungs in, the same question has been
+load-bearing every time, and asking "can this file move?" has been wrong every
+time:
+
+> Ask what **narrow capability** the code needs from its host, name that as a
+> trait in `animus-node`, implement it thinly in `animusd`, and let the
+> production implementation keep whatever concrete machinery it already has.
+> A second, sim-only implementor of the same trait is what buys deterministic
+> coverage — not relocating the production one.
 
 ### Phase D — the payoff
 
