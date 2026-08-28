@@ -137,17 +137,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///   else the client retries with fresh routing);
     /// - the tablet itself is not in the map yet (bootstrap) → **wait** for it.
     pub(crate) async fn cp_route(&self, table: &str, key: &[u8]) -> CpRoute<E> {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             if let Some(tablet) = self.tablet_for(table, key)
                 && let Some(route) = self.resolve_cp_route(tablet)
             {
                 return route;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return CpRoute::None;
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -382,12 +382,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         addr: String,
         request: ClientRequest,
     ) -> ClientResponse {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         let mut tried: BTreeSet<String> = BTreeSet::new();
         let mut next = addr;
         loop {
             tried.insert(next.clone());
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.duration_since(self.env.now());
             let resp = relay_request_with_timeout(
                 next.clone(),
                 &ClientRequest::Forwarded {
@@ -403,7 +403,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             let Some(hint) = topology::parse_not_leader_refusal(e) else {
                 return resp;
             };
-            if tokio::time::Instant::now() >= deadline {
+            if self.env.now() >= deadline {
                 return resp;
             }
             let candidate = hint
@@ -419,11 +419,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // at: the group is mid-election (formation window after a
                     // split/provision, or a crashed leader). Wait it out and
                     // re-run the pass — bounded by the same overall deadline.
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.duration_since(self.env.now());
                     if remaining.is_zero() {
                         return resp;
                     }
-                    tokio::time::sleep(FORWARD_ELECTION_BACKOFF.min(remaining)).await;
+                    self.env
+                        .sleep(FORWARD_ELECTION_BACKOFF.min(remaining))
+                        .await;
                     tried.clear();
                     // `next` unchanged: re-probe the same replica first — once
                     // the election completes it either serves or hints.
