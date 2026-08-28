@@ -475,15 +475,22 @@ fn outcome_to_status(o: &TxnOutcome) -> TxnDecisionStatus {
 /// [`LsmEngine`] or the volatile [`MemoryEngine`], chosen by [`StorageBackend`] at
 /// start; the enum lets the node hold one regardless of engine. `RaftKvNode` is
 /// cheap to clone (clones share the core + engine), so the variants clone too.
+///
+/// Generic over `E: Env` (ADR 0061 rung C5 step 1) — the default binds `E =
+/// ProdEnv`, so every pre-existing bare `CpGroup` reference in this crate
+/// (~180 call sites, none of which name a type parameter) keeps compiling
+/// unchanged; this default is this checkpoint's "type alias at the
+/// instantiation site" equivalent, containing the blast radius to this
+/// definition rather than touching every call site.
 #[derive(Clone)]
-enum CpGroup {
+enum CpGroup<E: Env = ProdEnv> {
     /// Durable on-disk LSM (default; survives a restart).
-    Lsm(RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>),
+    Lsm(RaftKvNode<E, LsmEngine<E>>),
     /// Volatile in-memory engine (ephemeral runs).
-    Mem(RaftKvNode<ProdEnv, MemoryEngine>),
+    Mem(RaftKvNode<E, MemoryEngine>),
 }
 
-impl CpGroup {
+impl<E: Env> CpGroup<E> {
     /// Propose a write to the group (honored on the leader), stamping `fence`
     /// Propose a write to this group. See [`RaftKvNode::put`].
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
@@ -1000,7 +1007,7 @@ impl CpGroup {
     /// the shared edge registry (`node_id()`). Per-tablet files are located by
     /// the engine factory's own `db-t{t}-` naming (ADR 0050 rung 1), not by
     /// env identity.
-    fn env(&self) -> &ProdEnv {
+    fn env(&self) -> &E {
         match self {
             CpGroup::Lsm(n) => n.env(),
             CpGroup::Mem(n) => n.env(),
