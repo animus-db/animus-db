@@ -16377,7 +16377,7 @@ async fn finish_data_join(
 ///
 /// An over-cap length prefix is rejected with a clean `InvalidData` error (the
 /// connection closes) before any allocation, never a panic or an OOM.
-pub const MAX_FRAME_LEN: usize = 64 << 20;
+pub use animus_node::MAX_FRAME_LEN;
 
 /// Send `request` to a peer node's client API over a fresh connection and
 /// return its reply (or a [`ClientResponse::Error`] on any transport
@@ -16415,49 +16415,47 @@ async fn relay_request_with_timeout(
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
+/// **The pure framing arithmetic — the length-prefix encoding, the
+/// [`MAX_FRAME_LEN`] bound check, and the `serde_json` encode itself — moved
+/// to [`animus_node::codec::encode_client_frame`] (ADR 0061 rung C3a)**;
+/// this function keeps only the actual socket write, which needs a real
+/// `TcpStream` and so cannot move into `animus-node` (no `tokio`
+/// dependency there at all).
+///
 /// # Errors
 /// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
 /// receiver would drop the connection anyway — failing at the sender names the
 /// culprit instead of surfacing as a mysterious peer hang-up).
 pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(msg).expect("client message serializes");
-    if bytes.len() > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "frame of {} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})",
-                bytes.len()
-            ),
-        ));
-    }
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
+    let framed = animus_node::codec::encode_client_frame(msg)?;
+    stream.write_all(&framed).await?;
     stream.flush().await?;
     Ok(())
 }
 
 /// Read a length-prefixed JSON frame, or `None` at clean EOF.
 ///
+/// **The pure framing arithmetic — the [`MAX_FRAME_LEN`] bound check on the
+/// declared length, and the `serde_json` decode itself — moved to
+/// [`animus_node::codec::frame_payload_len`]/
+/// [`animus_node::codec::decode_client_frame`] (ADR 0061 rung C3a)**; this
+/// function keeps only the actual socket reads, which need a real
+/// `TcpStream`.
+///
 /// # Errors
 /// Propagates read failures and decode errors; a declared length over
 /// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
 /// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
 pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
-    let len = match stream.read_u32().await {
-        Ok(len) => len as usize,
+    let raw_len = match stream.read_u32().await {
+        Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     };
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("declared frame length {len} exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})"),
-        ));
-    }
+    let len = animus_node::codec::frame_payload_len(raw_len)?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    let msg = serde_json::from_slice(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let msg = animus_node::codec::decode_client_frame(&buf)?;
     Ok(Some(msg))
 }
 
