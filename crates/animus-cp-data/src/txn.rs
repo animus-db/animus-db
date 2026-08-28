@@ -228,8 +228,18 @@ pub enum StageOutcome {
     /// A key in `writes` already held a **different** transaction's
     /// unresolved intent (`KvCommand::TxnStage`'s writer-push-intents guard,
     /// ADR 0018 §2/PR6) — the whole stage no-op'd. `txn_id` is the blocking
-    /// transaction, so a pusher can push it directly.
-    IntentBlocked { key: Vec<u8>, txn_id: TxnId },
+    /// transaction; `record_key`/`record_table` are copied straight from the
+    /// blocking `Envelope::Intent` itself (ADR 0018 §2 issue #298 residual
+    /// fix) so a pusher can route a status query straight to the blocker's
+    /// own anchor record and push its resolution, without a second read —
+    /// the write-side sibling of the foreign-intent read path's
+    /// [`IntentInfo`](crate::IntentInfo)/`confirm_or_push`.
+    IntentBlocked {
+        key: Vec<u8>,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        record_table: String,
+    },
     /// The stage was rejected for a structural reason unrelated to this
     /// transaction's own conditions or a foreign intent: a key (or the
     /// anchor's own record key) fell outside this group's current fence/was
