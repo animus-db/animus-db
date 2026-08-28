@@ -433,7 +433,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         table: &str,
         key: Vec<u8>,
     ) -> Result<SnapshotRead, String> {
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &key).await {
                 CpRoute::Local(leader) => match self.cp_get_local_snapshot(&leader, &key).await {
@@ -465,10 +465,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -532,7 +532,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         {
             return Ok(v);
         }
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &key).await {
                 CpRoute::Local(leader) => match self.cp_get_local_resolving(&leader, &key).await {
@@ -564,10 +564,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -672,7 +672,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         {
             return Ok(p);
         }
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
@@ -703,10 +703,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
@@ -861,7 +861,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         {
             return Ok(p);
         }
-        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
@@ -901,10 +901,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => return Err("no CP group leader reachable".into()),
             };
-            if !decide::read_should_retry(&err) || tokio::time::Instant::now() >= deadline {
+            if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
         }
     }
 
