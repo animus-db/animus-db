@@ -285,8 +285,8 @@ brain-last.
 | C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill` — paced by `env.sleep()`/`env.now()`/`env.spawn_task()` instead of `tokio::time`. **Requires a host-capability trait first (see the second 2026-08-28 amendment): every one of these takes `ClientCtx`, which does not move until C5.** |
 | C3 | `ControlHandle<E, R>` and a `RelayClient` capability trait, split into **C3a–C3d** (see the third 2026-08-28 amendment). The literal "move relay onto `Network`" is **rejected**: it would collapse ADR 0047's `intra` port into `internal`, a production wire-topology change this ADR disclaims. The goal — a cluster that talks inside `SimEnv` — is met by a second, sim-only `RelayClient` implementor instead |
 | C4 | The HTTP edges per Decision 2, split into **C4a–C4d** (see the fourth 2026-08-28 amendment). `dynamo.rs`'s `run_operation`/DDL handlers are **not** a C4 rung — they fold into C5 |
-| C5 | The brain, **minus admin/metrics** (see the fifth 2026-08-28 amendment): genericize `CpGroup`/`SharedEngine`/`ClientCtx` over `E: Env` **in place** first, then split into modules, then move. Absorbs `dynamo.rs`'s `run_operation` per the fourth amendment. The heaviest rung |
-| C6 | Node assembly: `Node<E>`/`BoundNode<E>`/`BoundControlNode<E>`/`BoundDataNode<E>` move; `animusd` shrinks to binary, config, listeners, lifecycle, and the one `ProdEnv` construction. The `start_cluster*`/`run_node*` harness functions move to test support where they belong |
+| C5 | The brain, **minus admin/metrics** (see the fifth 2026-08-28 amendment): genericize `CpGroup`/`SharedEngine`/`ClientCtx` over `E: Env` **in place** first, then split into modules. The heaviest rung. **The move itself is dropped** — the seventh 2026-08-28 amendment closes Phase C with the brain staying in `animusd`, generic, `tokio`-free, and lint-enforced in place; step 3c and the `dynamo.rs` absorption go with it |
+| C6 | ~~Node assembly moves~~ — **dropped** by the seventh 2026-08-28 amendment: the assembly was only in the plan because the brain was. Replaced by Phase C's closing rung: a `SimEnv`-driven `ClientCtx` harness in `animusd`'s own tests, and narrowing rung B5's package-level `disallowed_methods` exemption to the files that still need it |
 
 #### 2026-08-28 amendment — C0, and why C1 alone would not have worked
 
@@ -594,11 +594,66 @@ settled. `write_path`, `forwarding` and `txn_coordinator` stay put until the
 `rmw_lock` capability, the `dynamo.rs` re-homing, and the `ClientCtx`-location
 decision all land. 3a and 3b are unblocked and ship now.
 
+#### 2026-08-28 amendment (seventh) — Decision 1 was right for the leaves and wrong for the brain
+
+The sixth amendment recorded that the orphan rule blocks moving `ClientCtx` into
+`animus-node`, and left the way forward open. This settles it, and in doing so
+revises **Decision 1** for the remainder of Phase C.
+
+**The realisation.** Sim-testability of the read/write/txn/forwarding/schema
+paths does not require the crate move at all. `ClientCtx<E>` is already generic
+(step 1) and its module bodies are `tokio`-free (step 3b). A
+`ClientCtx<SimEnv>` can therefore be constructed and driven **in `animusd`'s own
+tests**, with `animus-sim` as a dev-dependency. The deterministic coverage
+Phase D wants is reachable without moving a line.
+
+What the move was actually buying was **compiler-enforced determinism** —
+Decision 1's entire argument for a crate boundary over genericizing in place.
+And that is now obtainable another way. `animusd` is package-level exempt from
+`disallowed_methods` (rung B5, because it then had ~600 real call sites). Once
+the five modules are `tokio`-free, that exemption narrows: `#[deny(clippy::
+disallowed_methods)]` on `schema`/`read_path`/`write_path`/`txn_coordinator`/
+`forwarding`, with the package exemption retained only for `lib.rs` and
+`dynamo.rs`. That is compiler enforcement, scoped precisely where it matters.
+
+**Decision 1's premise has weakened, and this ADR should say so rather than
+quietly keep spending rungs against it.** It rejected genericize-in-place
+because doing so "leaves nothing to stop it — the same review-only enforcement
+that already left the hole." True when written. No longer: rung B5 built the
+lint infrastructure that did not exist then, and lint scope is a real boundary,
+not a review convention.
+
+**Decision.** Phase C stops moving code at the brain. Concretely:
+
+- `ClientCtx` and the five clusters **stay in `animusd`**, generic over
+  `E: Env`, `tokio`-free, and lint-enforced in place.
+- **Rung 3c is dropped.** So is **C6** (node assembly) — the assembly never
+  needed to move either; it was only in the plan because the brain was.
+- A `SimEnv`-driven test harness lands in `animusd`'s own tests, giving the
+  read/write/txn paths their first deterministic coverage. This is what Phase D
+  builds `SimCluster` on.
+
+**What `animus-node` keeps** is everything that moved *cleanly*, because those
+pieces genuinely were leaves: the wire types, `topology`, `decide`, the frame
+codec, the SigV4 gate, HTTP parsing, console routing, admin dispatch,
+`ControlHandle`, five capability traits, and five background loops — with 107
+unit tests and 5 sim tests running in under two seconds, none of which existed
+before this ADR.
+
+**The general lesson, for the next architecture ADR in this repo.** A crate
+boundary is an excellent enforcement mechanism for code that is already a leaf,
+and a poor one for code that is load-bearing in its own crate's type graph. The
+orphan rule is the specific mechanism, but the shape is general: a type with
+foreign-trait impls cannot leave the crate that owns those impls without taking
+them with it, and they cannot come if they touch anything the destination crate
+excludes. Ask that question *before* choosing a crate split as the enforcement
+strategy — it is cheap to check and expensive to discover six rungs in.
+
 ### Phase D — the payoff
 
 | Rung | Work |
 |---|---|
-| D1 | `SimCluster` harness: a multi-node `animus-node` cluster driven by `SimEnv`, on B1's shared corpus scaffolding |
+| D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence` |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. Success is measured by the `prod-liveness` CI job shrinking enough to drop its 2-attempt retry |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |
