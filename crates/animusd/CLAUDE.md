@@ -167,6 +167,19 @@ reusing the captured config is the point of the test.
   (`ClientRequest`) defined in a different crate; see `animus-node/
   CLAUDE.md`'s note on why "grep every gating site" now spans that
   boundary until C5.
+- **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
+  blocks for `animus-node`'s three host-capability traits
+  (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
+  that crate's own `host` module doc for the shape and why three, not
+  one). Every method here is a **thin, logic-free delegation** —
+  `self.edge.leader_handle()`, `self.data_opt().map(|d| d.backup_store
+  ...)`, one call into `dynamo::kind_write_item_at_leader` — nothing is
+  decided here that wasn't already decided by an existing `ClientCtx`/
+  `CpGroup`/`BackupStoreHandle` method. This is the seam that let five of
+  the six leaf background loops (`ttl_reaper.rs`, `index_backfill.rs`,
+  `backup_completion.rs`, `backup_janitor.rs`, `pitr_janitor.rs` — each
+  now a thin wrapper into `animus-node`, see their own entries below) move
+  without `ClientCtx` itself moving, which doesn't happen until rung C5.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
   `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
@@ -199,6 +212,13 @@ reusing the captured config is the point of the test.
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
   sealed-vs-open serve split, `StreamHotRead`) is in
   `docs/streams-notes.md` — this entry is just the module pointer.
+- **`pitr_janitor.rs`'s two loop bodies moved to `animus_node::
+  pitr_janitor`** (ADR 0061 rung C2) — this module is now a thin wrapper
+  for both `pitr_snapshot_loop` and `pitr_janitor_loop`, same shape as
+  `backup_completion.rs`'s own move above (`DEFAULT_PITR_RETENTION`/
+  `DEFAULT_PITR_SNAPSHOT_CADENCE` re-exported from there too, so every
+  existing `pitr_janitor::DEFAULT_*` call site elsewhere in this crate kept
+  compiling unchanged).
 - **`pitr_janitor.rs`** (ADR 0059 §9, Train 3) — PITR's two control-plane-
   leader-only background loops, mirroring `segment_janitor.rs`/
   `backup_janitor.rs`'s own shape: `pitr_snapshot_loop` (periodic
@@ -218,6 +238,15 @@ reusing the captured config is the point of the test.
   scope gap. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
   lives in `index_drain.rs`, alongside the stream seal arm it mirrors — see
   that module's doc.
+- **`segment_janitor.rs` did NOT move in rung C2** (ADR 0061) — the one of
+  the six leaf background loops that rung's scoping left behind, on
+  purpose. Its replica-repair phase reads live bytes from whichever
+  recorded replicas are still `Active` cluster members and pushes them to
+  freshly-chosen targets via `SegmentStoreHandle::repair` — real placement/
+  membership orchestration, not a value nameable as one narrow I/O
+  delegation the way `BackupObjectStore::backup_put` captures "durably
+  store these bytes somewhere." See `animus-node/CLAUDE.md`'s rung C2
+  entry for the fuller reasoning; this file's design (below) is unchanged.
 - **`segment_janitor.rs`** (ADR 0043 §A9) — the **segment janitor**: a
   control-plane-**leader**-only background loop (`segment_janitor_loop`)
   doing two-phase retention reclaim + replica repair over the whole
@@ -230,6 +259,15 @@ reusing the captured config is the point of the test.
   children), never tablet presence, and the max-epoch pin applies to live
   tablets only (a retired chain can never seal again) — both halves
   red-proven in `tests/stream_janitor.rs::retired_parents_*`.
+- **`index_backfill.rs`'s loop body moved to `animus_node::
+  index_backfill`** (ADR 0061 rung C2 — the first loop moved, and the only
+  one needing no capability beyond `ControlLeaderHost<E>`: `metadata()`/
+  `propose()` live directly on `animus_control::RaftNode<E>`, already
+  `E`-generic, no `ClientCtx` in sight). This module is now a thin
+  wrapper; `tests/index_backfill.rs` (below) is unchanged and still the
+  real-cluster regression net, alongside a new `SimEnv`-driven corpus in
+  `animus-node`'s own `tests/index_backfill_sim.rs` (a real single-voter
+  `RaftNode<SimEnv>`, no sockets).
 - **`index_backfill.rs`** (ADR 0045 §4) — the secondary-index
   **backfill-completion aggregator**: another control-plane-**leader**-only
   background loop (`index_backfill_loop`), same self-gating idiom as
@@ -332,6 +370,22 @@ reusing the captured config is the point of the test.
   token-aligned, so it never exercised the bug either way — see
   `docs/engineering-lessons.md`'s Testing entry on this exact
   fixture-vs-production-shape gap).
+- **`ttl_reaper.rs`'s loop body moved to `animus_node::ttl_reaper`** (ADR
+  0061 rung C2) — the widest of this rung's five moves: the scan/cursor/
+  expiry-decision control flow below is now `E: Env`-generic over a new
+  `TtlScanHost` trait, but the actual delete still delegates one call
+  (`TtlScanHost::ttl_delete_if_attribute_equals`) straight into this
+  crate's own `dynamo::kind_write_item_at_leader` — the OCC seatbelt, GSI/
+  LSI/change-log/stream side effects, and `rmw_lock` scoping described
+  below are **not** duplicated or reimplemented, only reached through one
+  more layer of indirection. `DEFAULT_TTL_SWEEP_INTERVAL` re-exports from
+  there, so every existing `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL` call
+  site kept compiling unchanged. A new `SimEnv`-driven test
+  (`animus-node`'s `tests/ttl_reaper_sim.rs`) drives the moved loop against
+  a **fully synthetic** host — no `CpGroup`, no `ClientCtx`, not even a
+  `RaftNode` — the first deterministic coverage this loop has ever had;
+  `tests/dynamo_ttl.rs` (below) is unchanged and stays the real-cluster
+  regression net for the write-path side this loop delegates to.
 - **`ttl_reaper.rs`** (ADR 0051) — the DynamoDB-style **TTL reaper**: a
   per-node background loop, spawned everywhere `index_drain::
   change_consumer_loop` is (combined + data-only; see the module map
@@ -1998,6 +2052,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ttl_reaper.rs`'s "read for free, wake only to write" discipline — never
   a standing veto like the split-build driver's). Spawned on combined and
   data-only nodes only (a control-only node hosts no CP-data tablet).
+- **`backup_completion.rs`'s loop body moved to `animus_node::
+  backup_completion`** (ADR 0061 rung C2) — this module is now a thin
+  wrapper (`ctx.env.clone()` + a call into the moved, `E: Env`-generic
+  loop; `ClientCtx` implements the two capability traits it needs,
+  `client_ctx_host.rs`). Design unchanged from the paragraph below, which
+  now describes the moved code — see `animus-node/CLAUDE.md`'s own rung C2
+  entry for the trait shapes.
 - **`backup_completion.rs`** (ADR 0059 §3/§4, Train 1 PR③) — the on-demand
   backup **completion aggregator**: a control-plane-**leader**-only
   background loop (`backup_completion_loop`), the identical self-gating
@@ -2019,6 +2080,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
   and control-only nodes (never data-only, which never becomes control
   leader at all).
+- **`backup_janitor.rs`'s loop body moved to `animus_node::backup_janitor`**
+  (ADR 0061 rung C2) — this module is now a thin wrapper, same shape as
+  `backup_completion.rs`'s own move above. The regression tests that used
+  to live in this file's own `#[cfg(test)] mod tests` (a hand-rolled
+  `FsSegmentStore` + `reclaim_one` helper) moved with the logic, now
+  `animus_node::backup_janitor::tests` against a synthetic
+  `BackupObjectStore` and a real single-voter `RaftNode<SimEnv>` — see
+  that crate's own doc.
 - **`backup_janitor.rs`** (ADR 0059 §3, Train 1 PR④) — the on-demand
   backup **janitor**: a control-plane-**leader**-only background loop
   (`backup_janitor_loop`), the identical self-gating shape as

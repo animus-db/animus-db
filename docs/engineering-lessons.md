@@ -11915,3 +11915,80 @@ one visibility level that silently means something different depending on
 which side of the boundary you're standing on, and `cargo build` catches
 it late (at use, not at declaration) rather than at the point where the
 mistake was actually made.
+
+## Host-capability traits let a leaf loop move before its "brain" does (ADR 0061 rung C2)
+
+Phase C's plan called the six `animusd` background loops (`ttl_reaper`,
+`backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`,
+`index_backfill`) easy first movers into `animus-node`. Scoping the rung
+found that wrong: every one of them takes `ClientCtx` by value or reference,
+and `ClientCtx` is the crate's 5,569-line brain, not scheduled to move until
+rung C5. On the plan's own ordering, nothing in C2 could move at all.
+
+The fix generalizes beyond this one rung: when code B (a loop, a handler, a
+consumer) can only move because it depends on code A (a big, not-yet-movable
+"god object"), don't wait for A to move and don't reimplement A's logic
+inside B's new home. Instead, scope exactly which **operations** of A, B
+actually calls — usually a small, named slice, even when A itself is huge —
+define a narrow trait for just that slice, implement it for A as a **thin,
+logic-free delegation** (translate the shape, call the existing method,
+nothing more), and move B generic over the trait. A stayed exactly where it
+was; B stopped depending on its *type*, only on a few of its *operations*.
+Three traits came out of this rung (`ControlLeaderHost<E>`,
+`BackupObjectStore`, `TtlScanHost` — see `animus-node/CLAUDE.md`'s own rung
+C2 entry), sized by cohesive capability rather than one trait per loop or one
+fat trait for everything; a trait every implementor exercises in full is a
+good sign, a trait that exists only to make one specific move compile is not.
+
+This is *better* for testability than moving the loops unchanged would have
+been, not merely a workaround: a loop generic over a capability trait can be
+driven under `SimEnv` against a synthetic fake implementing just that trait
+— no cluster, no sockets, no `ClientCtx` — which is deterministic coverage
+those loops had never had. A loop moved but left coupled to a concrete
+`ClientCtx` would still have been untestable until C5 landed; the capability
+trait is what makes the move worth doing now rather than later.
+
+Corollary, worth stating because it looks like a shortcut and isn't one: not
+every loop in the batch has to move. `segment_janitor.rs` stayed in
+`animusd` this rung — its replica-repair phase makes real placement/
+membership decisions (which replicas are still live, where to push a
+repaired copy), not a value nameable as one narrow I/O delegation the way
+"durably store these bytes" is. Forcing it to move would have meant either
+smuggling real decision logic into the leaf crate (exactly what this phase
+is supposed to prevent) or building a capability surface wide enough to
+expose that logic anyway, which is a contorted trait wearing a narrow one's
+clothes. A partial rung with a precise, per-loop account of what moved and
+why the rest didn't is a better outcome than forcing every item on the list
+to move.
+
+## `propose()`'s `Accepted` says nothing about apply-time rejection, and a test can silently misconstruct its own fixture because of it
+
+Building a `SimEnv` test for the (now moved) `index_backfill` loop, a
+two-tablet-per-table fixture was built by calling `MetaCommand::CreateTablet`
+twice for the same table. Both calls returned `ProposeResult::Accepted` (the
+`assert!(matches!(.., Accepted))` on each passed), so the test proceeded
+believing both tablets existed — but the *second* `CreateTablet` is a
+deliberate apply-time rejection (`Metadata::apply`'s own rule, ADR 0023: "one
+`CreateTablet` per table; every further tablet comes only from a real
+split"). Since `Metadata` is `DRIVER_APPLIED` (ADR 0038), `propose()`'s
+`Accepted` means only "appended to my own Raft log" — the semantic
+accept/reject decision happens later, asynchronously, in the apply task, and
+`propose()`'s return value cannot see it. The test's own straggler-tablet
+assertion then passed for the wrong reason: with only one tablet actually in
+`Metadata.tablets`, "every tablet has reported" went vacuously true the
+moment that one tablet reported, which looked identical to the intended
+"both tablets must report" property from the assertion's own perspective.
+
+General lesson: **a green assertion on `ProposeResult::Accepted` is not
+evidence a command's own semantic rule accepted it** — for any
+`DRIVER_APPLIED` state machine (`Metadata` here; the CP-data `KvState`
+plane the same way), check the *post-apply* state (`node.metadata()`,
+re-read after enough `sim.run_for`/`run_until` for the apply task to have
+run) before trusting a fixture built from a sequence of proposals, especially
+one hand-built for a test rather than driven through a real client that
+would have surfaced the rejection. The existing `animus-control` test suite
+already knows this rule (`complete_backup_requires_every_pinned_tablet`
+drives `BeginSplit`/`CutoverSplit` for exactly this reason, with a comment
+saying so) — the lesson here is that the same trap is easy to walk into
+fresh when writing a *new* crate's *first* `SimEnv` fixture, where there is
+no existing sibling test to copy the pattern from.

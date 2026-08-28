@@ -95,16 +95,103 @@ nothing outside the `animus-node`/`animusd` pair is meant to consume these
 types; the visibility widening only reflects where the crate boundary now
 sits.
 
+## What's here (rung C2)
+
+ADR 0061 Phase C's original plan called the six background loops
+(`ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`,
+`backup_completion`, `index_backfill`) the easy first movers of Phase C.
+Scoping this rung found that premise wrong (see the ADR's second
+2026-08-28 amendment): every one of them takes `animusd`'s `ClientCtx` —
+the 5,569-line brain rung C5 moves last — so on the original ordering
+nothing in C2 could move at all. The fix is dependency inversion, not
+reordering: a small set of **host-capability traits**, below, each naming
+just the slice of `ClientCtx`'s surface one or more loops actually use.
+
+- **`host`** — three traits, chosen by capability rather than by loop, so a
+  loop's own generic bound is the intersection of only what it needs:
+  - **`ControlLeaderHost<E>`** — one method, `control_leader(&self) ->
+    Option<RaftNode<E>>`. Every moved loop needs this (each self-gates its
+    own tick on "am I the control-plane leader right now," `animusd`'s
+    "run everywhere, self-gate" spawn pattern). It hands back a whole
+    `RaftNode<E>` rather than exposing `metadata()`/`propose()` as two
+    separate trait methods, because `animus_control::RaftNode<E>` is
+    **already `E`-generic** — no `ClientCtx` involved at all — so wrapping
+    it a second time would add a layer with no benefit.
+  - **`BackupObjectStore`** — four methods (`backup_put`/
+    `backup_list_local`/`backup_delete_local`/`backup_delete_at`) over the
+    backup object store, each returning `None` on a control-only leader
+    (mirroring `ClientCtx::data_opt()` returning `None` there). Not
+    `E`-generic — nothing in its signatures is `Env`-typed. Used by
+    `backup_completion` (`put` only), `backup_janitor` (`list_local`/
+    `delete_local` only), and `pitr_janitor` (`delete_at` only) — each
+    loop's own generic bound names only the methods it calls, but they
+    share one trait because they are one cohesive capability (durable
+    backup-object I/O), and `ClientCtx` implements all four anyway (it is
+    the one host), so splitting further would buy nothing.
+  - **`TtlScanHost`** — four methods (`ttl_metadata`/`led_tablets`/
+    `scan_base_capped`/`ttl_delete_if_attribute_equals`) scoped to exactly
+    what `ttl_reaper` needs: a `Metadata` read, which tablets this node
+    leads, a pure local non-waking scan, and one conditional-delete write.
+    The write method is the widest one in this rung — it delegates to
+    `animusd`'s full ADR 0049 kind-write machinery (OCC seatbelt, GSI/LSI/
+    change-log/stream side effects) behind one call, rather than exposing
+    any of that as separate capabilities, because none of it is a decision
+    the *loop* makes; the loop only decides *which* item is expired and
+    *when* to look.
+
+  Every trait method `animusd`'s `ClientCtx` implements
+  (`client_ctx_host.rs`) is a **thin, logic-free delegation** to an
+  already-existing method — nothing new was decided when adding these
+  impls, only translated. See each trait's own doc for the full per-method
+  contract.
+
+- **`index_backfill`**, **`ttl_reaper`**, **`backup_completion`**,
+  **`backup_janitor`**, **`pitr_janitor`** — five of the six loops, moved
+  verbatim (same pacing, same ordering, same decisions — `tokio::time::
+  sleep`/`Instant::now` became `env.sleep()`/`env.now()`, `tokio::spawn`
+  callers are unaffected since `animusd` still owns every spawn site).
+  Each module's own doc carries the full per-loop design (unchanged from
+  `animusd/CLAUDE.md`'s prior entries, now the canonical copy — that
+  crate's own entries point here). `animusd`'s own modules of the same
+  name are now thin wrappers: clone `ctx.env`, call into here with `ctx`
+  itself as the trait-implementing host, thread through any interval/
+  duration parameters unchanged. Every pre-existing `animusd` call site
+  (`ttl_reaper::ttl_reaper_loop(ctx.clone(), interval)`, etc.) compiles and
+  behaves identically.
+
+- **`segment_janitor` did NOT move** — the one loop this rung leaves in
+  `animusd`, with reasons specific enough to act on rather than a vague
+  "too hard": its replica-repair phase reads live bytes from whichever of
+  a row's recorded replicas are still `Active` cluster members and pushes
+  them to freshly-chosen targets via `SegmentStoreHandle::repair`
+  (`animus_cp_data::cluster_segment_store::ClusterSegmentStore`'s own
+  placement choice) — real orchestration logic over cluster membership and
+  replica selection, not a value this rung's I/O-delegation pattern can
+  capture as one narrow method the way `BackupObjectStore::backup_put`
+  captures "durably store these bytes somewhere." Its orphan-reap phase
+  layers an age-gate on top of that same repair machinery. Forcing this
+  loop to move under the established pattern would mean either dragging
+  real placement-decision logic into `animus-node` (the C5-shaped work
+  this rung is explicitly not) or building a capability surface wide
+  enough to expose that logic anyway — a trait that exists only to make
+  the move happen, the exact "contorted trait" ADR 0061's C2 amendment
+  warns against. It stays in `animusd`, `#[allow(dead_code)]`-free and
+  otherwise untouched, a candidate for a later rung once C5 has landed
+  `ClientCtx`'s own split (at which point the repair/placement logic may
+  belong in `animus-placement`-adjacent code rather than behind a
+  `TtlScanHost`-shaped seam here at all).
+
 ## What has NOT moved yet
 
 `ClientCtx` (the struct and its `impl` blocks), `handle_request`, and
 `cp_serve_forwarded` are all still in `animusd`, unchanged — they move in
 rung C5 (the heaviest rung: split into `read_path`/`write_path`/
-`txn_coordinator`/`forwarding`/`schema`, genericized over `E: Env`). Rungs
-C2–C4 land the leaf background loops (`ttl_reaper`, `backup_janitor`,
-etc.), `ControlHandle<E>` + relay/forwarding onto the multiplexed
-`Network`, and the HTTP wire edges, in that order — see ADR 0061's Phase C
-rung table for the full sequence.
+`txn_coordinator`/`forwarding`/`schema`, genericized over `E: Env`). Rung
+C2 (above) landed five of the six leaf background loops behind narrow host
+traits; `segment_janitor` stays in `animusd` (see rung C2's own entry for
+why). C3/C4 land `ControlHandle<E>` + relay/forwarding onto the
+multiplexed `Network`, and the HTTP wire edges, in that order — see ADR
+0061's Phase C rung table for the full sequence.
 
 **One cross-crate discipline gap this creates until C5**:
 `cp_serve_forwarded`'s gating match (which internal-only `ClientRequest`
@@ -145,8 +232,17 @@ silent behavior change.
   methods on a concrete `ProdEnv`-backed handle, no direct socket/clock/RNG
   access. If something genuinely needs `ProdEnv`, it belongs in `animusd`
   until (or unless) it can be expressed over `E: Env` instead.
-- `cargo test -p animus-node` runs this crate's own unit tests directly
-  (fast — no real sockets, no `SimEnv` cluster harness yet; that's ADR 0061
-  Phase D's `SimCluster`). `cargo test -p animusd --lib` and a representative
-  slice of `animusd`'s real-socket integration suite are still the
-  regression net for the wiring — see `animusd/CLAUDE.md`.
+- `cargo test -p animus-node` runs this crate's own unit tests plus, since
+  rung C2, a handful of real `SimEnv` integration tests
+  (`tests/index_backfill_sim.rs`, `tests/ttl_reaper_sim.rs`, and the
+  in-module `backup_janitor::tests`) driving a moved loop against either a
+  tiny single-voter `RaftNode<SimEnv>` (no sockets, no multi-node cluster)
+  or a fully synthetic fake host (no `RaftNode` at all) — fast and
+  deterministic, but **not** the multi-node `SimCluster` harness ADR 0061
+  Phase D still has to build; a `[dev-dependencies]`-only `animus-sim`/
+  `animus-storage` pair backs these (verified not to reintroduce the
+  `prod` feature into this crate's *library* build — `cargo tree -e
+  features -p animus-node` with no `--tests`/`--all-targets` stays clean).
+  `cargo test -p animusd --lib` and a representative slice of `animusd`'s
+  real-socket integration suite are still the regression net for the
+  wiring — see `animusd/CLAUDE.md`.
