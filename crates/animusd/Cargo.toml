@@ -48,6 +48,9 @@ async-trait.workspace = true
 # `animusd` is the real node process — it's the one place that actually
 # constructs a `ProdEnv` (ADR 0061 rung C0 gates it behind this feature).
 animus-env = { workspace = true, features = ["prod"] }
+# The `E: Env`-generic node core (ADR 0061 Phase C carve-out) this crate
+# re-exports its wire types/`topology`/`decide` from at the crate root.
+animus-node.workspace = true
 animus-control.workspace = true
 animus-cp-data.workspace = true
 animus-storage.workspace = true
