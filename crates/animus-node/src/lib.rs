@@ -26,6 +26,7 @@ pub mod backup_janitor;
 pub mod decide;
 pub mod host;
 pub mod index_backfill;
+pub mod pitr_janitor;
 pub mod topology;
 pub mod ttl_reaper;
 mod wire;
