@@ -345,6 +345,14 @@ Three things about them that a doc comment cannot enforce:
   it and answers arbitrarily stale data — which is the DynamoDB contract,
   not an oversight. See ADR 0055 §2.
 
+  `stale_read_ready()`'s own truth table (has-a-leader × caught-up-to-commit)
+  is directly unit-tested via `RaftKvNode::stale_read_ready_decision` — a
+  pure associated function over just the three fields the gate reads,
+  extracted so the table is provable without a running `RaftKvNode`/
+  `RaftCore` (`lib.rs::stale_read_ready_tests`, ADR 0061 rung A4). The full
+  integration tests above still own the "nothing blocks/proposes/wakes"
+  properties, which aren't expressible at the pure-function level.
+
 Four rules that aren't derivable from a doc comment:
 
 - **A group owns a scope *set*, not one scope.** `with_kind(kind)` derives a

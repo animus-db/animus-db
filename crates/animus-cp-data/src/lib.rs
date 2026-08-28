@@ -4034,7 +4034,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let core = self.lock();
             (core.leader().is_some(), core.commit_index())
         };
-        has_leader && self.engine_applied_index() >= commit
+        Self::stale_read_ready_decision(has_leader, self.engine_applied_index(), commit)
+    }
+
+    /// The pure decision behind [`stale_read_ready`](Self::stale_read_ready),
+    /// extracted so its truth table is directly unit-testable without
+    /// constructing a `RaftKvNode`/`RaftCore` at all. See that method's doc
+    /// for what each input means and why both must hold. Takes no `&self` —
+    /// a plain associated function over exactly the three facts the gate
+    /// reads: whether the replica currently knows a leader, how far its own
+    /// engine has applied, and the core's committed index.
+    fn stale_read_ready_decision(
+        has_leader: bool,
+        engine_applied_index: u64,
+        commit_index: u64,
+    ) -> bool {
+        has_leader && engine_applied_index >= commit_index
     }
 
     /// An **eventually-consistent** read of `key` from this replica's own
@@ -9161,5 +9176,132 @@ mod campaign_now_tests {
             node0.is_leader(),
             "the campaigning voter must win leadership well within one election timeout"
         );
+    }
+}
+
+/// Table-driven coverage of [`RaftKvNode::stale_read_ready_decision`] (ADR
+/// 0055's cheap eventually-consistent-read freshness gate): the full outcome
+/// table over its two real inputs (knows-a-leader, and whether the engine
+/// has applied everything the core has committed) plus the boundary cases
+/// around "caught up" — no `RaftCore`/`RaftKvNode` construction, no `Env`,
+/// no lock.
+#[cfg(test)]
+mod stale_read_ready_tests {
+    use super::*;
+    use animus_sim::SimEnv;
+    use animus_storage::MemoryEngine;
+
+    /// `RaftKvNode<SimEnv, MemoryEngine>::stale_read_ready_decision` — the
+    /// concrete instantiation is arbitrary (the function reads none of
+    /// `E`/`S`), just something that satisfies the impl block's bounds.
+    fn decide(has_leader: bool, engine_applied_index: u64, commit_index: u64) -> bool {
+        RaftKvNode::<SimEnv, MemoryEngine>::stale_read_ready_decision(
+            has_leader,
+            engine_applied_index,
+            commit_index,
+        )
+    }
+
+    /// The full 2x3 outcome table this gate computes: has-a-leader crossed
+    /// with applied-vs-commit being behind / exactly caught up / ahead
+    /// (`engine_applied_index` can only ever be `>= commit_index` once
+    /// caught up, in practice, but the function itself takes plain `u64`s
+    /// and its `>=` check is what's under test, not that invariant).
+    #[test]
+    fn full_outcome_table() {
+        let cases: &[(bool, u64, u64, bool, &str)] = &[
+            // (has_leader, engine_applied_index, commit_index, expected, why)
+            (
+                false,
+                0,
+                0,
+                false,
+                "no leader, trivially caught up -> still not ready",
+            ),
+            (
+                false,
+                100,
+                10,
+                false,
+                "no leader, engine way ahead of commit -> still not ready: \
+                 a replica with no leader_id may hold state that never \
+                 existed on this tablet, so the gate must not trust it \
+                 regardless of how far it has applied",
+            ),
+            (
+                true,
+                0,
+                1,
+                false,
+                "leader known, but engine strictly behind the committed index -> not ready",
+            ),
+            (
+                true,
+                9,
+                10,
+                false,
+                "leader known, engine one entry behind commit -> not ready (off-by-one floor)",
+            ),
+            (
+                true,
+                10,
+                10,
+                true,
+                "leader known, engine exactly caught up to commit -> ready (the >= boundary)",
+            ),
+            (
+                true,
+                11,
+                10,
+                true,
+                "leader known, engine ahead of the sampled commit (a commit_index read \
+                 before a concurrent advance) -> ready",
+            ),
+            (
+                true,
+                0,
+                0,
+                true,
+                "leader known, nothing committed yet -> trivially ready",
+            ),
+        ];
+        for &(has_leader, applied, commit, expected, why) in cases {
+            assert_eq!(
+                decide(has_leader, applied, commit),
+                expected,
+                "has_leader={has_leader} applied={applied} commit={commit}: {why}"
+            );
+        }
+    }
+
+    /// Without a known leader, the gate is closed no matter how far ahead
+    /// the engine is of the commit index — the leader check is a hard
+    /// prerequisite, not something a sufficiently-caught-up engine can
+    /// substitute for.
+    #[test]
+    fn no_leader_never_ready_regardless_of_applied_index() {
+        for applied in [0, 1, 1_000, u64::MAX] {
+            for commit in [0, 1, 1_000, u64::MAX] {
+                assert!(
+                    !decide(false, applied, commit),
+                    "applied={applied} commit={commit} must stay not-ready with no known leader"
+                );
+            }
+        }
+    }
+
+    /// With a known leader, readiness is exactly the "caught up" predicate:
+    /// ready iff `engine_applied_index >= commit_index`.
+    #[test]
+    fn with_leader_readiness_matches_caught_up_predicate() {
+        for applied in 0u64..8 {
+            for commit in 0u64..8 {
+                assert_eq!(
+                    decide(true, applied, commit),
+                    applied >= commit,
+                    "applied={applied} commit={commit}"
+                );
+            }
+        }
     }
 }
