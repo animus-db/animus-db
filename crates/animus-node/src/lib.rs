@@ -24,6 +24,7 @@
 pub mod backup_completion;
 pub mod backup_janitor;
 pub mod codec;
+pub mod console;
 pub mod control_handle;
 pub mod decide;
 pub mod host;
