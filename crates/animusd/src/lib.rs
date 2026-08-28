@@ -11801,3 +11801,338 @@ mod issue_412_tests {
         node.shutdown();
     }
 }
+
+/// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): a
+/// `SimEnv`-driven harness that constructs a real `ClientCtx<SimEnv, _>` —
+/// the production struct, not a reimplementation — and drives a genuine
+/// write + read through its own `cp_kind_write_raw`/`cp_get` methods,
+/// deterministically and seed-reproducibly, with no sockets and no
+/// `ProdEnv` anywhere in the run.
+///
+/// **Deliberately an in-crate `#[cfg(test)] mod`, not a `tests/*.rs`
+/// file.** `ClientCtx`'s own fields, `ClusterEdgeState::register_raftkv`,
+/// `CpGroup`, and `AdminInfo` are all private to this crate — reaching them
+/// from `tests/` would require widening several types' visibility for no
+/// reason beyond "an external file wants to construct them once." Rust's
+/// privacy rule ("visible in the defining module and its descendants") lets
+/// a child module of `lib.rs` see and construct every one of them exactly
+/// as they already are, so this module widens **nothing** — the same
+/// precedent `confirm_futility_tests`/`kind_batch_signal_tests` already set
+/// in this file (see this crate's own `CLAUDE.md`).
+///
+/// **What this proves.** `ClientCtx<E, R>`'s five split modules (`schema`,
+/// `read_path`, `write_path`, `txn_coordinator`, `forwarding`) are `E:
+/// Env`-generic and `tokio`-free (rung C5 steps 1/3a/3b) — this is the
+/// first test that actually instantiates `E = SimEnv` and drives a real
+/// write/read round trip through them, rather than merely compiling
+/// generically. The write (`cp_kind_write_raw`) and read (`cp_get`) calls
+/// below are the *exact* methods `handle_request`'s `ClientRequest::
+/// Put`/`Get` arms call in production — this harness calls them directly
+/// (skipping only `handle_request` and `dynamo::marker_batch_write_raw`
+/// themselves, both of which stay hardcoded to `&ClientCtx` = `ClientCtx<
+/// ProdEnv, AnimusdRelayClient>` and so cannot be called with a `SimEnv`
+/// context at all — see this crate's own `CLAUDE.md` for the accounting).
+///
+/// **What this harness does NOT drive, and why (read before extending
+/// it).** `ClientCtx::propose_schema` — and therefore `provision_tablet`,
+/// `trigger_split`, `drop_table*`, every schema-DDL path — cannot be driven
+/// under `SimEnv` here: `propose_schema`'s local-propose fast path reads
+/// `ClusterEdgeState::control`, which is a concrete `Arc<Mutex<Vec<RaftNode<
+/// ProdEnv>>>>` **by pre-existing, deliberate design** (`ControlHandle`'s
+/// own doc in `animus-node::control_handle` explains why: proposing is
+/// "inherently a local-Raft-log operation," and `ControlHandle::propose`/
+/// `flush` were deliberately never added to that seam — see that type's
+/// doc). This is not a gap this rung introduced or could route around
+/// without inventing a contorted trait purely to make DDL sim-drivable —
+/// exactly the failure mode ADR 0061's second and fourth 2026-08-28
+/// amendments warn against. The fixture below therefore seeds the schema
+/// catalog + first tablet by proposing directly on the control `RaftNode`
+/// (`seed_schema`), bypassing `ClientCtx` entirely for setup — the same
+/// thing `animus-node/tests/index_backfill_sim.rs` already does for the
+/// identical reason. See `crates/animusd/CLAUDE.md`'s own section on this
+/// harness for the full field-by-field accounting of what could and could
+/// not be constructed, and `docs/adr/0061-...md`'s eighth amendment for why
+/// this is recorded as a precise, honest scope boundary rather than forced.
+#[cfg(test)]
+mod simenv_client_ctx_tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, StorageScope};
+    use animus_env::{EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+
+    use super::*;
+
+    /// This harness is single-node: the one tablet it hosts is always led
+    /// locally, so nothing here ever needs to relay to another node. A real
+    /// `Network`-backed `RelayClient` (ADR 0061's deferred C3d) is Phase
+    /// D's job, not this rung's — see `crates/animusd/CLAUDE.md`.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this SimEnv harness is single-node and never relays (addr={addr})"
+            ))
+        }
+    }
+
+    type SimClientCtx = ClientCtx<SimEnv, NeverRelay>;
+
+    /// A placeholder socket address for `AdminInfo`'s fields — never
+    /// dialed (this harness never binds a listener), just plain data the
+    /// struct literal needs a value for.
+    fn placeholder_addr() -> SocketAddr {
+        "127.0.0.1:1".parse().expect("valid placeholder addr")
+    }
+
+    /// A one-voter control `RaftNode<SimEnv>` (node 0) plus a one-voter CP
+    /// data-plane `RaftKvNode<SimEnv, MemoryEngine>` (node 1, tablet 1, a
+    /// whole-ring range) wired into a real `ClientCtx<SimEnv, NeverRelay>`
+    /// — no sockets, no `ProdEnv`, no `tokio`. Mirrors `animus-node/tests/
+    /// index_backfill_sim.rs`'s single-voter control fixture and
+    /// `animus-cp-data/tests/kind_batch.rs`'s `RaftKvNode<SimEnv,
+    /// MemoryEngine>` fixture, wired together through a real `ClientCtx`.
+    ///
+    /// `data: None` (no `DataRole`, ADR 0035 PR3's control-only shape) is
+    /// deliberate, not a shortcut: neither `cp_kind_write_raw` nor `cp_get`
+    /// — the two production methods this harness drives — ever calls
+    /// `self.data()`/`self.data_opt()` (verified by reading both call
+    /// chains, not assumed), so a `DataRole` is not needed to prove this
+    /// rung's claim. Building one for real would need `SegmentStoreHandle`/
+    /// `BackupStoreHandle`, both of which hardcode `FsSegmentStore`/
+    /// `ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of this
+    /// `ClientCtx`'s own `E` — a second, separate blocker from the
+    /// `propose_schema` one above, not exercised by anything this test
+    /// asserts on. See `crates/animusd/CLAUDE.md`'s harness section.
+    fn single_node_ctx(
+        seed: u64,
+    ) -> (
+        Simulator,
+        SimClientCtx,
+        RaftNode<SimEnv>,
+        RaftKvNode<SimEnv, MemoryEngine>,
+    ) {
+        let sim = Simulator::new(seed);
+        let control: RaftNode<SimEnv> =
+            RaftNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
+        let tablet = TabletId(1);
+        let kv: RaftKvNode<SimEnv, MemoryEngine> = RaftKvNode::start_scoped(
+            sim.env(nid(1)),
+            vec![nid(1)],
+            MemoryEngine::new(),
+            StorageScope::new(KeyRange::whole()),
+        );
+
+        let edge = ClusterEdgeState::<SimEnv>::new();
+        edge.register_raftkv(tablet, CpGroup::Mem(kv.clone()));
+
+        let admin = Arc::new(AdminInfo {
+            node_id: Some(nid(0)),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: vec![nid(0)],
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_threshold: None,
+            auto_split_bytes_threshold: None,
+        });
+
+        let ctx: SimClientCtx = ClientCtx {
+            control: GenericControlHandle::Local(control.clone()),
+            edge,
+            // This node's own internal env (ADR 0040 PR1's "every role's
+            // clone of the same handle") — only ever used here for
+            // `now()`/`sleep()`/`spawn_task`, never for networking, so
+            // sharing the control node's own id for it is harmless (every
+            // node id in one `Simulator` shares one virtual clock).
+            env: sim.env(nid(0)),
+            data: None,
+            client_route: Arc::new(Mutex::new(BTreeMap::new())),
+            intra_route: Arc::new(Mutex::new(BTreeMap::new())),
+            admin,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            split_mode: SplitMode::default(),
+        };
+
+        (sim, ctx, control, kv)
+    }
+
+    /// Seed the schema catalog + first tablet directly on the control
+    /// `RaftNode`, bypassing `ClientCtx::propose_schema` — see this
+    /// module's own top-of-file doc for exactly why that method cannot be
+    /// driven here. Mirrors `animus-node/tests/index_backfill_sim.rs`'s
+    /// identical direct-propose setup.
+    fn seed_schema(control: &RaftNode<SimEnv>, table: &str, tablet: TabletId) {
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_write_through_cp_kind_write_raw_reads_back_through_cp_get() {
+        run(0x514E_0001);
+    }
+
+    #[test]
+    fn a_write_through_cp_kind_write_raw_reads_back_through_cp_get_seed2() {
+        run(0x514E_0002);
+    }
+
+    #[test]
+    fn a_write_through_cp_kind_write_raw_reads_back_through_cp_get_seed3() {
+        run(0x514E_0003);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_from_an_explicit_env_seed` reruns this exact
+    /// scenario from a printed seed, honored the same way every other sim
+    /// test in this repo is.
+    #[test]
+    fn replays_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x514E_0004);
+        run(seed);
+    }
+
+    /// A key absent from a table with no data ever gets a genuine absent
+    /// answer (`ClientResponse::Value(None)`), never an error — the same
+    /// `cp_get` fast path (`!effective_metadata().has_table_tablet`) a real
+    /// wire client hits on a freshly created, still-empty table.
+    #[test]
+    fn a_table_with_no_tablet_reads_as_a_clean_absent_not_an_error() {
+        let seed = 0x514E_0005;
+        let (mut sim, ctx, _control, _kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(200));
+
+        let read_result = spawn_and_capture(&mut sim, &ctx, {
+            let ctx = ctx.clone();
+            async move {
+                ctx.cp_get("nonexistent-table", b"whatever".to_vec(), false)
+                    .await
+            }
+        });
+        assert_eq!(
+            read_result,
+            Some(ClientResponse::Value(None)),
+            "an unprovisioned table must read as a clean absent, not an error (seed={seed})"
+        );
+    }
+
+    /// Spawn `fut` onto `ctx.env` and drive `sim` until it completes,
+    /// returning its output. `fut` must actually resolve within `timeout`
+    /// of virtual time — this is the harness's own converged-or-timeout
+    /// idiom (root `CLAUDE.md`'s "Testing" rule: no fixed-deadline one-shot
+    /// assert against an eventual property), scaled generously for a
+    /// single local write/read (`CLIENT_TIMEOUT` itself is 10s; every call
+    /// here is local-only, so it either confirms within a handful of the
+    /// exponential-backoff confirm-poll ticks or it never will).
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, ctx: &SimClientCtx, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let env = ctx.env.clone();
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        sim.run_for(Duration::from_secs(2));
+        slot.lock().expect("result slot poisoned").take()
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, ctx, control, kv) = single_node_ctx(seed);
+        sim.run_for(Duration::from_millis(500));
+        assert!(
+            kv.is_leader(),
+            "the sole KV voter must be its own leader (seed={seed})"
+        );
+
+        let table = "orders";
+        let tablet = TabletId(1);
+        seed_schema(&control, table, tablet);
+        sim.run_for(Duration::from_millis(200));
+        assert!(
+            ctx.effective_metadata().has_table_tablet(table),
+            "the seeded schema/tablet must be visible on this node's own control read \
+             (seed={seed})"
+        );
+
+        let key = b"item-1".to_vec();
+        let value = b"hello from the SimEnv ClientCtx harness".to_vec();
+
+        // The write: a real `ClientCtx::cp_kind_write_raw` call — the same
+        // production route -> propose -> confirm loop `handle_request`'s
+        // `ClientRequest::Put` arm drives (via `dynamo::
+        // marker_batch_write_raw`, which this call inlines minus the
+        // change-log marker — nothing here asserts on Streams). Not a
+        // reimplementation: this exercises the real exponential
+        // confirm-poll backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`) under a
+        // virtual clock, spawned so the sim's own executor can actually
+        // drive any `env.sleep()` inside it forward.
+        let write_result = spawn_and_capture(&mut sim, &ctx, {
+            let ctx = ctx.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            let value = value.clone();
+            async move {
+                ctx.cp_kind_write_raw(&table, vec![(KIND_BASE, key, Some(value))], Vec::new())
+                    .await
+            }
+        });
+        assert_eq!(
+            write_result,
+            Some(Ok(())),
+            "the write must land through the production write path (seed={seed})"
+        );
+
+        // The read: `ClientCtx::cp_get` — the exact method
+        // `handle_request`'s `ClientRequest::Get` arm calls, exercising the
+        // production route -> local-resolve loop.
+        let read_result = spawn_and_capture(&mut sim, &ctx, {
+            let ctx = ctx.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            async move { ctx.cp_get(&table, key, false).await }
+        });
+        assert_eq!(
+            read_result,
+            Some(ClientResponse::Value(Some(value))),
+            "the read must observe the write through the production read path (seed={seed})"
+        );
+    }
+}
