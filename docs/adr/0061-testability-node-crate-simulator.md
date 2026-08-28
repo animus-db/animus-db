@@ -168,6 +168,71 @@ to a minute.
 the process-boundary sites in `animusd` and inside `animus-env`'s `ProdEnv`.
 Every allow is a documented exception rather than an invisible default.
 
+**As built (rung B5, 2026-08-28) — one refinement found by actually doing
+the survey.** `OsRng` (`rand::rngs::OsRng`) is a unit struct, not a
+function — `disallowed-methods` can't name it (clippy rejects the config
+entry outright); it lives in `disallowed-types` instead, alongside
+`HashMap`/`HashSet`, with the same lint-level plumbing. More significantly,
+the survey this rung actually ran (grep every crate's `src`/`tests`/
+`benches` for the six method patterns, real code only) found the crates
+this ADR's `Env` seam actually targets — `animus-control`, `animus-cp-data`,
+`animus-storage`, `animus-tablet`, `animus-placement`, `animus-dynamo`,
+`animus-sim`, `animus-test` — already **clean in their `src/`**: zero real
+call sites. The discipline this decision converts from review-enforced to
+lint-enforced had, in fact, already held. What the survey did find:
+- **`animus-env/src/prod.rs`** (~32 sites) — exactly the sanctioned
+  `ProdEnv` implementation Decision 4 already named; one module-level
+  allow (plus two narrower `impl Rng` block-level `disallowed_types`
+  allows for the two `OsRng` sites, kept separate from the file-level
+  methods allow so an accidental future `HashMap` in this file still
+  trips the lint).
+- **A handful of real-thread `ProdEnv` liveness tests/benches** in
+  `animus-storage` (3 test files + 1 bench), `animus-control` (2 test
+  files + one single test function), and `animus-cp-data` (2 test files)
+  — every one already carried a module doc explaining, independently of
+  this rung, exactly why it must run on real threads/time (the "`SimEnv`
+  proves logic, not liveness" class the root `CLAUDE.md` documents). Each
+  got one file- or function-level allow citing that existing doc rather
+  than restating it.
+- **`animus-cli`** (one file, 7 sites) and **`animus-operator`** (one call
+  site) — real process-boundary tools outside the `Env` seam entirely (a
+  network client CLI; a Kubernetes reconcile loop polling a real pod).
+  File-level and call-site allows respectively.
+- **`animusd`** (~600 real call sites across 84 files: `src/lib.rs` alone
+  has ~174, `dynamo.rs` ~57, `index_drain.rs` ~33, plus ~70 `tests/*.rs`
+  files that are, by this crate's own documented design, **all**
+  real-socket `ProdEnv` integration tests). This is exactly the case this
+  Decision anticipated needing judgment on, and the honest answer is the
+  one this Decision's own text undersold: per-site `#[allow]`s here would
+  be hundreds of near-identical copies of the same one reason ("this is
+  the process boundary Phase C hasn't carved out yet"), which is worse
+  than no lint — a wall of allows nobody reads is not review-enforced
+  either, just review-enforced with extra steps. `crates/animusd/Cargo.toml`
+  gets a package-level `[lints.clippy] disallowed_methods = "allow"`
+  override instead (Cargo's `[lints]` table applies to every target in
+  the package — lib, bin, every integration test, the bench — so this one
+  entry, not 84 file edits, is the actual scope of the exemption),
+  documented in that file's own comment and cross-referenced from ADR
+  0003. `disallowed_types` (HashMap/HashSet) is untouched by this
+  override and stays fully enforced in `animusd` — it has nothing to do
+  with the process boundary. This is intentional, tracked debt: it goes
+  away when Phase C's `animus-node` extraction gives the newly-carved
+  Env-generic core the workspace default back, unmodified.
+
+**Deliberately not lint-enforced**: raw I/O entry points
+(`std::fs`/`std::net`/`tokio::fs`/`tokio::net`). Unlike the six methods
+above, none has a single, small, always-correct replacement a `reason`
+string can name — `animus-env`'s `Disk`/`Network` traits wrap specific
+framing/durability contracts, not a drop-in substitute for e.g. a raw
+`TcpListener::bind` at a process's one accept-loop boundary — and
+`animusd`'s listener binding alone owns dozens of such sites. Enumerating
+each would be exactly the wall-of-allows this rung exists to avoid;
+reviewed by hand instead (see `clippy.toml`'s own comment).
+
+Full validation: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, and `cargo build --workspace`
+all green.
+
 ## Delivery plan
 
 Each phase is a `gh-stack` series. Phases are ordered by dependency: A
@@ -202,7 +267,7 @@ mechanical, and it produces exactly the module that Phase C moves first.
 | B2 | Per-node and per-link network fault config, mirroring `set_disk_config_for`'s shape |
 | B3 | New faults: message duplication, wire-payload corruption, delay distributions, `pause(node, dur)` process-pause, ENOSPC `ErrorKind`, clock drift rate, fsync-acked-but-lost |
 | B4 | **Failure minimization**: shrink a failing seed's fault schedule and op count to a minimal reproducing case, replayable by a printed handle |
-| B5 | `clippy.toml` `disallowed-methods` per Decision 4, with justified allows |
+| B5 | `clippy.toml` `disallowed-methods` per Decision 4, with justified allows — **done**, see Decision 4's as-built note for what the survey found and where `animusd` was exempted instead of hand-annotated |
 | B6 | Refresh ADR 0003's "known fidelity limits" — it undersells what shipped (clock skew, disk faults) and still lists gaps B2/B3 close |
 
 B1 lands first so that everything after it (including every Phase D corpus)

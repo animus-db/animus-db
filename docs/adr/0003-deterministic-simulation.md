@@ -29,6 +29,27 @@
   held fixed — not the seed itself, which is opaque by design and has no
   "smaller" — see the amended limits entry below and
   `crates/animus-test/src/shrink.rs`'s module doc for why.
+- **2026-08-28 note (3):** [ADR 0061](0061-testability-node-crate-simulator.md)
+  rung B5 closes the enforcement gap the "This is enforced in review and by
+  `clippy.toml`" line below used to describe accurately only for
+  `HashMap`/`HashSet`: `clippy.toml` now also carries `disallowed-methods`
+  for `Instant::now`/`SystemTime::now`/`tokio::spawn`/
+  `tokio::time::{sleep,timeout}`/`thread_rng`/`OsRng`, workspace-wide. The
+  crates this ADR's seam actually targets (`animus-control`, `animus-cp-data`,
+  `animus-storage`, `animus-tablet`, `animus-placement`, `animus-dynamo`,
+  `animus-sim`, `animus-test`) were already clean in their non-test code —
+  the discipline had held by review — so the lint mostly formalizes an
+  existing fact rather than surfacing violations; the handful of genuine
+  exceptions (real-thread `ProdEnv` liveness tests, `animus-env`'s own
+  `ProdEnv`, `animus-cli`/`animus-operator`'s real-socket process boundaries)
+  carry individually-justified `#[allow(clippy::disallowed_methods, reason =
+  "...")]`s. **`animusd` is the one deliberate exception**: it is the
+  pre-Phase-C process boundary this whole crate-split ADR exists to carve
+  down, with ~600 real call sites across 84 files — the lint is disabled at
+  the package level there (`crates/animusd/Cargo.toml`'s own `[lints.clippy]`
+  comment explains why), tracked as intentional debt until Phase C's
+  `animus-node` extraction gives that Env-generic core the workspace default
+  back. See rung B5's own delivery note for the full per-crate count.
 - **Date:** 2026-08-01
 
 ## Context
@@ -163,8 +184,19 @@ above reads, and the gaps are exactly where prod-only bugs have already hidden:
 
 System code must never call `std::time::*`, spawn raw tasks, touch real
 sockets/disk, use unseeded RNG, or iterate a `HashMap`/`HashSet` (use
-`BTreeMap`/`BTreeSet`). This is enforced in review and by `clippy.toml`. A
-failing simulation run prints its seed for one-command replay.
+`BTreeMap`/`BTreeSet`). **Lint-enforced (`clippy.toml`) as of ADR 0061 rung
+B5**, not review-only: `disallowed-types` catches `HashMap`/`HashSet`/`OsRng`;
+`disallowed-methods` catches `Instant::now`/`SystemTime::now`/`tokio::spawn`/
+`tokio::time::{sleep,timeout}`/`thread_rng`. Raw socket/disk I/O
+(`std::fs`/`std::net`/`tokio::fs`/`tokio::net`) is **not** lint-enforced —
+rung B5 judged it impractical (no single small replacement to name in a
+`reason` string, and `animusd`'s listener binding alone would need dozens of
+individually-meaningless allows) and left it review-only; see the ADR's own
+Decision 4 delivery note. Every exception to the two enforced lints carries
+an individually-justified `#[allow(clippy::disallowed_{methods,types}, reason
+= "...")]`, except `animusd`, exempted at the package level as documented
+debt (see the 2026-08-28 note (3) above). A failing simulation run prints
+its seed for one-command replay.
 
 ## Consequences
 
