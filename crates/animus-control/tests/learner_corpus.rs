@@ -30,6 +30,7 @@ use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_env::{NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
+use animus_test::corpus;
 
 const VOTERS: [u64; 3] = [0, 1, 2];
 const LEARNER: u64 = 3;
@@ -330,23 +331,7 @@ fn learner_survives_a_snapshot_race_with_concurrent_commits() {
 /// name + index, matching this crate's existing seed-derivation style) and
 /// runs both fault scenarios again at each one.
 fn seeds_per_scenario() -> usize {
-    std::env::var("ANIMUS_LEARNER_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
-}
-
-fn name_seed(name: &str) -> u64 {
-    // A small, fixed, deterministic string hash (FNV-1a) — no RNG, no
-    // dependency on hash-map iteration order, matching this repo's existing
-    // "seed derived from a scenario's own name" convention.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    h
+    corpus::seeds_from_env("ANIMUS_LEARNER_SEEDS")
 }
 
 #[test]
@@ -356,21 +341,21 @@ fn learner_corpus_runs_at_configured_depth() {
         let catch_up_seed = if i == 0 {
             0x1EA5_0001
         } else {
-            name_seed(&format!("catch_up_under_partition_s{i:03}"))
+            corpus::name_seed(&format!("catch_up_under_partition_s{i:03}"))
         };
         scenario_catch_up_under_partition(catch_up_seed);
 
         let failover_seed = if i == 0 {
             0x1EA5_0002
         } else {
-            name_seed(&format!("leader_change_mid_catch_up_s{i:03}"))
+            corpus::name_seed(&format!("leader_change_mid_catch_up_s{i:03}"))
         };
         scenario_leader_change_mid_catch_up(failover_seed);
 
         let snapshot_seed = if i == 0 {
             0x1EA5_0003
         } else {
-            name_seed(&format!("snapshot_race_s{i:03}"))
+            corpus::name_seed(&format!("snapshot_race_s{i:03}"))
         };
         scenario_snapshot_race(snapshot_seed);
     }
