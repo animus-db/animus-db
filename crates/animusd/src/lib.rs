@@ -12442,15 +12442,20 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Stri
 /// [`StorageScope`], not by separate files. Mirrors [`CpGroup`]'s two-backend
 /// shape; cheap to clone (clones share state), so the per-node [`CpReconciler`]
 /// (ADR 0031 PR4) can hand every tablet's group its own clone.
+///
+/// Generic over `E: Env` (ADR 0061 rung C5 step 1), same default-binds-
+/// `ProdEnv` shape as [`CpGroup`] — see that type's doc for why the default
+/// parameter, not a rename + separate alias, is this rung's containment
+/// mechanism.
 #[derive(Clone)]
-enum SharedEngine {
+enum SharedEngine<E: Env = ProdEnv> {
     /// Durable on-disk LSM (default; survives a restart).
-    Lsm(LsmEngine<ProdEnv>),
+    Lsm(LsmEngine<E>),
     /// Volatile in-memory engine (ephemeral runs).
     Mem(MemoryEngine),
 }
 
-impl SharedEngine {
+impl<E: Env> SharedEngine<E> {
     // ---- admin / debug introspection (ADR 0020, extended ADR 0038 PR4) ----
     // Mirrors `CpGroup`'s own identically-shaped introspection methods
     // (`backend_name`/`lsm_sstables`/`lsm_memtable`/`wal_segment_sizes`/
