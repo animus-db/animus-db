@@ -255,6 +255,14 @@ fn follower_catches_up_via_multi_chunk_snapshot() {
 /// catch-up races leadership/AppendEntries and does not reliably traverse a long
 /// chunk-stream; here the transfer is forced end-to-end.
 #[test]
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): the rest of this file is
+// deterministic SimEnv logic — this one function is the exception, a plain
+// synchronous wall-clock perf-regression timing (see the doc comment above:
+// "the property SimEnv's virtual time cannot express"), not system logic.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "wall-clock perf-regression timing, not system logic under the Env seam (see the doc comment above); ADR 0061 Decision 4"
+)]
 fn large_snapshot_ships_in_o_chunk_time_not_o_state() {
     let pair: [NodeId; 2] = [nid(0), nid(1)];
     let now = Nanos(1_000_000_000);
