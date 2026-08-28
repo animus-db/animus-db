@@ -427,6 +427,21 @@ multi-thread test; the sim proves logic/order, not real-thread races.
 its workload actually reaches — drive the *maintenance* machinery (cross
 the flush threshold), not just the write path.
 
+`LsmEngine::next_compaction`'s level-picking policy (L0→L1 trigger, then
+shallowest-over-budget cascade) is extracted as a free function,
+`next_compaction_plan(tables, opts)`, specifically so it's unit/property-
+testable without a live engine — see `compaction_policy_tests` in
+`lsm.rs` for the truth table and a cascade-termination property (ADR 0061
+rung A3). **Gotcha found while adding that property test, not fixed
+(behaviour-preserving refactor):** `LsmOptions::level_fanout` has no
+lower-bound validation. The per-level table budget is
+`L1_TABLE_BUDGET * level_fanout^(level - 1)`, so with `level_fanout <= 1`
+the budget never grows with depth — a table set whose fully-merged size
+exceeds `L1_TABLE_BUDGET` (4) can cascade down through every level forever
+without ever settling. Worth a validation at `LsmOptions` construction if
+this is ever exposed to untrusted/operator config rather than fixed
+defaults.
+
 `cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a
 hand-rolled (no criterion) macro-benchmark over **`ProdEnv`** comparing
 `LsmEngine` vs `MemoryEngine` on put/get/scan throughput + latency and
