@@ -113,6 +113,35 @@ reusing the captured config is the point of the test.
 - **`topology.rs`** — pure, side-effect-free routing decisions extracted from
   `lib.rs` for unit-testing (`decide_cp_route`, `tablet_for_key`,
   `format_not_leader_refusal`/`parse_not_leader_refusal`). All `pub(crate)`.
+- **`decide.rs`** (ADR 0061 Phase A rung A6) — pure decision predicates
+  extracted from `impl ClientCtx`, modelled directly on `topology.rs`: no
+  `&self`, no `CpGroup`/`ProdEnv`, no `tokio`, plain `#[test]`s, no bring-up.
+  `frozen_refusal`/`confirm_wait_is_futile` take primitive facts
+  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`) instead
+  of `&CpGroup` — the caller reads those fields off the real handle
+  immediately before calling in, since `CpGroup` wraps a real
+  `RaftKvNode<ProdEnv, _>` and can't be constructed without bring-up.
+  `align_split_key`/`byte_weighted_median` are pure over a `Metadata`
+  snapshot / materialized pairs and moved with their pre-existing
+  `#[cfg(test)]` coverage (`align_split_key_tests`/`auto_split_median_tests`
+  in-crate before this rung). `other_tablet_replica_addr`/
+  `decide_forward_retry` split `ClientCtx::forward_to_tablet_leader`'s
+  hinted-retry loop into a pure replica walk plus a pure next-step decision
+  (`ForwardRetryStep::{Retry,WaitElection,GiveUp}`); `lib.rs` still gathers
+  the candidate address (a `Metadata`/route-snapshot read) since that part
+  is genuinely I/O-adjacent state, not decision logic. **What did NOT
+  move**: `resolve_cp_route` already delegated its whole branch to
+  `topology::decide_cp_route`, and `not_leader_refusal` is already thin
+  wiring over `topology::format_not_leader_refusal` — both surveyed and
+  found to have no further pure logic to extract. `confirm_futility_tests`
+  (in-crate, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
+  deliberately **stayed** in `lib.rs` rather than moving alongside
+  `confirm_wait_is_futile`: it proves the wired end-to-end fast-fail
+  behavior through a real `CpGroup` propose/apply/poll round trip with
+  timing assertions, not the predicate in isolation — moving it into
+  `decide.rs` would have broken that module's "no bring-up" invariant for
+  no benefit, since `decide::confirm_wait_is_futile` already has its own
+  direct truth-table unit tests.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
   `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
