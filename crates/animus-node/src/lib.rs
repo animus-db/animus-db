@@ -22,6 +22,7 @@
 //! (`ClientCtx`, `handle_request`, `cp_serve_forwarded` — rung C5).
 
 pub mod backup_completion;
+pub mod backup_janitor;
 pub mod decide;
 pub mod host;
 pub mod index_backfill;

@@ -36,3 +36,14 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Test-only: the ADR 0061 rung C2 `SimEnv` corpus drives a moved loop
+# against a real (but tiny, single-voter, in-process) control `RaftNode`
+# under `SimEnv` — no sockets, no multi-node cluster, no `ClientCtx`. A
+# `[dev-dependencies]` entry's own features never apply to this crate's
+# *library* build (see this crate's own CLAUDE.md and `animus-env/
+# CLAUDE.md`'s "dev-only placement" note) — `cargo tree -e features -p
+# animus-node` (no `--tests`/`--all-targets`) must stay clean of `prod`.
+animus-sim.workspace = true
+animus-storage.workspace = true
