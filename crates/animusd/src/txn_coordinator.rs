@@ -9,16 +9,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::{StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
+use animus_cp_data::{ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
 use animus_env::{Env, EnvExt, Metric};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
 
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpGroup, CpRoute, PendingKindWrite,
-    ReadConsistency, StageConditions, TXN_RESOLVE_ALL_AWAIT_BUDGET, TXN_STAGE_PUSH_ATTEMPTS,
-    TXN_STAGE_PUSH_BACKOFF, TxnAbortReason, TxnPrecondition, TxnTableWrite, TxnWrite,
-    TxnWriteCondition, decide, dynamo, outcome_to_status,
+    ReadConsistency, StageConditions, TXN_RESOLVE_ALL_AWAIT_BUDGET,
+    TXN_RESOLVE_FENCED_RETRY_ATTEMPTS, TXN_STAGE_PUSH_ATTEMPTS, TXN_STAGE_PUSH_BACKOFF,
+    TxnAbortReason, TxnPrecondition, TxnTableWrite, TxnWrite, TxnWriteCondition, decide, dynamo,
+    outcome_to_status,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -339,15 +340,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 "txn prepare: blocker already decided — pushing its resolution before \
                  retrying the stage"
             );
-            let _ = self
-                .txn_resolve_participant(
-                    table,
-                    blocker,
-                    blocker_record_key,
-                    vec![blocked_key.to_vec()],
-                    outcome,
-                )
-                .await;
+            self.txn_resolve_participant_retrying(
+                table,
+                blocker,
+                blocker_record_key,
+                vec![blocked_key.to_vec()],
+                outcome,
+            )
+            .await;
         }
     }
 
@@ -672,6 +672,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// same routing as any other CP op) once the coordinator has a final
     /// decision. Routed by `keys[0]`, never `record_key` (see
     /// [`ClientRequest::TxnResolve`]'s doc).
+    ///
+    /// **A single, one-shot attempt at whatever `cp_route` resolves right
+    /// now** (ADR 0018 §2 write-loss amendment §3/§6) — `Ok(ResolveOutcome::
+    /// Fenced)` means this attempt's routing was stale (a concurrent split
+    /// moved the target key's range between `cp_route` and the entry's
+    /// actual apply) and the resolve did **not** take effect; the caller
+    /// must re-route (a fresh `cp_route` call) and retry, never treat this
+    /// as done. [`txn_resolve_participant_retrying`](Self::
+    /// txn_resolve_participant_retrying) is the bounded-retry wrapper every
+    /// production caller should use instead of calling this directly.
     pub(crate) async fn txn_resolve_participant(
         &self,
         table: &str,
@@ -679,9 +689,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: TxnOutcome,
-    ) -> Result<(), String> {
+    ) -> Result<ResolveOutcome, String> {
         let Some(first) = keys.first().cloned() else {
-            return Ok(()); // nothing to resolve
+            return Ok(ResolveOutcome::Resolved); // nothing to resolve
         };
         match self.cp_route(table, &first).await {
             CpRoute::Local(leader) => {
@@ -690,8 +700,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // resolve re-routes to the child, which holds the copied
                 // intent + record and materializes at its own position.
                 decide::frozen_refusal(leader.is_frozen())?;
-                leader.txn_resolve(txn_id, record_key, keys, outcome).await;
-                Ok(())
+                match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
+                    Some((_, outcome)) => Ok(outcome),
+                    None => Err("CP group leader moved during resolve; retry".into()),
+                }
             }
             CpRoute::Forward(addr) => {
                 let request = ClientRequest::TxnResolve {
@@ -701,14 +713,81 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     keys,
                     outcome,
                 };
-                // Best-effort regardless of outcome: a resolve failure never
-                // blocks the client-visible commit (already durable on the
-                // anchor); it just leaves the intent for a later resolver
-                // (PR5) or a reader hitting it (the foreign-intent path).
-                let _ = self.cp_forward(table, &first, addr, request).await;
-                Ok(())
+                match self.cp_forward(table, &first, addr, request).await {
+                    ClientResponse::TxnResolved { outcome } => Ok(outcome),
+                    ClientResponse::Error(e) => Err(e),
+                    other => Err(format!(
+                        "unexpected reply to forwarded TxnResolve: {other:?}"
+                    )),
+                }
             }
-            CpRoute::None => Ok(()),
+            // Nowhere to route this to right now — an ordinary retryable
+            // gap, not a confirmed resolve; never silently treated as
+            // `Resolved` (this used to be `Ok(())`, indistinguishable from
+            // success — the exact ambiguity this amendment closes).
+            CpRoute::None => Err("no CP group leader reachable for resolve; retry".into()),
+        }
+    }
+
+    /// **Bounded-retry wrapper** around
+    /// [`txn_resolve_participant`](Self::txn_resolve_participant) — the
+    /// actual fix for the ADR 0018 §2 write-loss amendment's §4 "acked
+    /// write lost, no error anywhere" residual: a `Fenced` outcome means a
+    /// concurrent split moved the target key's range out from under the
+    /// PREVIOUS attempt's routing decision, so this loops re-resolving
+    /// `cp_route` **fresh** each attempt (via a brand-new
+    /// `txn_resolve_participant` call, never reusing a stale route) instead
+    /// of ever swallowing the no-op as done. A transient routing/leadership
+    /// `Err` gets the identical bounded retry — the two failure shapes are
+    /// both "try again with fresh metadata," just for different reasons.
+    /// Best-effort and fire-and-forget, like every existing caller of the
+    /// one-shot primitive: a resolve that still hasn't landed once this
+    /// exhausts its attempts is left for `txn_resolver_loop`'s next tick or
+    /// a reader's own on-demand foreign-intent push — this wrapper only
+    /// narrows the window, it is not the sole safety net.
+    pub(crate) async fn txn_resolve_participant_retrying(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        outcome: TxnOutcome,
+    ) {
+        for attempt in 0..TXN_RESOLVE_FENCED_RETRY_ATTEMPTS {
+            let result = self
+                .txn_resolve_participant(
+                    table,
+                    txn_id.clone(),
+                    record_key.clone(),
+                    keys.clone(),
+                    outcome.clone(),
+                )
+                .await;
+            match result {
+                Ok(ResolveOutcome::Resolved | ResolveOutcome::OutcomeMismatch) => return,
+                Ok(ResolveOutcome::Fenced) => {
+                    tracing::debug!(
+                        table,
+                        ?txn_id,
+                        attempt,
+                        "txn resolve: fence-miss (a concurrent split likely moved this key's \
+                         range) — re-routing with fresh metadata and retrying"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        table,
+                        ?txn_id,
+                        attempt,
+                        %e,
+                        "txn resolve: attempt failed with a retryable routing/leadership race; \
+                         retrying"
+                    );
+                }
+            }
+            if attempt + 1 < TXN_RESOLVE_FENCED_RETRY_ATTEMPTS {
+                self.env.sleep(TXN_STAGE_PUSH_BACKOFF).await;
+            }
         }
     }
 
@@ -904,15 +983,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 .push(key);
         }
         for ((table, _tablet), keys) in by_table_tablet {
-            let _ = self
-                .txn_resolve_participant(
-                    &table,
-                    txn_id.clone(),
-                    record_key.clone(),
-                    keys,
-                    outcome.clone(),
-                )
-                .await;
+            self.txn_resolve_participant_retrying(
+                &table,
+                txn_id.clone(),
+                record_key.clone(),
+                keys,
+                outcome.clone(),
+            )
+            .await;
         }
     }
 
@@ -1550,15 +1628,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             let record_key = record_key.clone();
             async move {
                 for (table, keys) in staged {
-                    let _ = this
-                        .txn_resolve_participant(
-                            &table,
-                            txn_id.clone(),
-                            record_key.clone(),
-                            keys,
-                            outcome.clone(),
-                        )
-                        .await;
+                    this.txn_resolve_participant_retrying(
+                        &table,
+                        txn_id.clone(),
+                        record_key.clone(),
+                        keys,
+                        outcome.clone(),
+                    )
+                    .await;
                 }
             }
         };
@@ -1606,9 +1683,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     let record_key = record_key.clone();
                     let outcome = outcome.clone();
                     async move {
-                        let _ = this
-                            .txn_resolve_participant(&table, txn_id, record_key, keys, outcome)
-                            .await;
+                        this.txn_resolve_participant_retrying(
+                            &table, txn_id, record_key, keys, outcome,
+                        )
+                        .await;
                     }
                 });
                 futures::future::join_all(futs).await;

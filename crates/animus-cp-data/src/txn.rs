@@ -249,6 +249,49 @@ pub enum StageOutcome {
     Fenced,
 }
 
+/// The result of one **apply-time `TxnResolve`** attempt (ADR 0018 §2
+/// write-loss amendment, §3/§6 of the 2026-08-27 amendment) — the
+/// `TxnResolve` analogue of [`StageOutcome`], closing the gap that
+/// amendment names: `RaftKvNode::txn_resolve`'s only signal used to be
+/// "did this entry apply," which a **fence-miss no-op** (a concurrent split
+/// moved the target key's range out from under the caller's routing
+/// decision between `cp_route` and this entry's actual apply) satisfies
+/// exactly as well as a genuine resolve — the proposer had no way to learn
+/// its own resolve never took effect, and (per the amendment's §4) this is
+/// the leading hypothesis for a real captured "acked write lost, no error
+/// anywhere" trace. Recorded per apply, keyed by Raft log index and paired
+/// with the entry's own term (mirroring [`StageOutcome`]/`CasResults`), so
+/// every replica records the identical value and a proposer can poll for
+/// it once its own entry applies.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolveOutcome {
+    /// Every key in `keys` fell inside this group's live fence and was
+    /// resolved (or had already been resolved — an idempotent WAL-replay
+    /// or retried resolve is not a failure). The carried `outcome`, if this
+    /// group anchors the record, also matched the record's own decided
+    /// status.
+    Resolved,
+    /// The whole entry no-op'd, whole-or-nothing, because at least one key
+    /// in `keys` (or a derived kind-write key a commit was about to
+    /// materialize) fell outside this group's current fence or into an
+    /// already-sealed range — a concurrent split or freeze moved the
+    /// key(s) out from under the caller's routing decision between
+    /// `cp_route` and this entry's actual apply. **The caller must
+    /// re-route with fresh metadata and retry the resolve against
+    /// whichever tablet(s) now actually own these keys — never treat this
+    /// as done**, since nothing here touched the stored intent(s) at all.
+    Fenced,
+    /// Defense-in-depth (ADR 0018 §2/PR6): this group anchors `txn_id`'s
+    /// record, and the carried `outcome` did not match that record's own
+    /// already-decided status — the whole entry no-op'd. No known live
+    /// violator as of this variant's introduction (see
+    /// `KvCommand::TxnResolve`'s doc); re-routing would not help, since the
+    /// mismatch is against this group's own record, not a stale route —
+    /// reported distinctly from `Fenced` so a caller (or an investigator)
+    /// never conflates the two causes.
+    OutcomeMismatch,
+}
+
 /// A transaction's status as observed by a caller with **no local record
 /// access** (ADR 0018 §2/PR4) — the public mirror of [`TxnStatus`] a
 /// cross-tablet `TxnStatus` query (or any other external caller) reads back.

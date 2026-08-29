@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::{SeedRow, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView};
+use animus_cp_data::{
+    ResolveOutcome, SeedRow, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+};
 use animus_env::NodeId;
 use animus_tablet::KeyRange;
 
@@ -1171,6 +1173,21 @@ pub enum ClientResponse {
     /// does the answering tablet still hold a live intent for the queried
     /// `txn_id` over the queried span?
     TxnVerifyReply { staged: bool },
+    /// Reply to [`TxnResolve`](ClientRequest::TxnResolve) (ADR 0018 §2
+    /// write-loss amendment §3/§6): the resolve entry committed and
+    /// applied, carrying the actual [`ResolveOutcome`] it produced.
+    ///
+    /// **A caller must check `outcome` before treating this as done** —
+    /// `Resolved` is the only success case; `Fenced`/`OutcomeMismatch`
+    /// mean nothing here actually resolved (most commonly a concurrent
+    /// split moved the target key's range out from under the caller's
+    /// routing decision between `cp_route` and this entry's actual apply),
+    /// and the caller must re-route with fresh metadata and retry against
+    /// whichever tablet(s) now actually own these keys. Before this
+    /// variant existed, every case here (including a fence-miss no-op)
+    /// replied `ClientResponse::PutOk`, indistinguishable from a genuine
+    /// resolve — the exact gap the amendment names.
+    TxnResolved { outcome: ResolveOutcome },
 }
 
 #[cfg(test)]

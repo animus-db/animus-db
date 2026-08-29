@@ -195,6 +195,7 @@ fn resolve(
         n.txn_resolve(txn_id, record_key, keys, outcome).await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
 }
 
 fn decide(
