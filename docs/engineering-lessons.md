@@ -9849,6 +9849,40 @@ debugging anything that feels like it might have happened before.
   suite for the extracted `classify_kind_batch_outcome` predicate
   `poll_probe` now calls, including the term-mismatch case — proven red
   pre-fix by dropping the predicate's term-equality guard).
+  **Amendment (2026-08-29): the two siblings this entry's own "audit every
+  sibling" rule pointed at — `Cas`'s `CasResults` and `TxnStage`'s
+  `StageOutcomes` — turned out to have the identical gap, and this entry's
+  own earlier claim that `CasResults`' shape was "sound for CAS" is
+  corrected here rather than left to mislead a future reader.** That claim
+  reasoned `compare_and_swap` only ever consulted `cas_result` "after
+  confirming the entry applied via a value/ceiling read that already
+  implies commit" — but the actual code never did any such confirming read:
+  `compare_and_swap`'s own poll loop called `cas_result(index)` directly,
+  with no value/ceiling check and (worse) no `is_leader()` guard either,
+  despite a comment claiming a step-down check existed. `stage_outcome`/
+  `wait_stage_outcome` had the `is_leader()` guard but the identical
+  index-only lookup. Both are now fixed exactly like `KindBatchOutcomes`:
+  `CasResults`/`StageOutcomes` store `(term, outcome)`, and
+  `cas_result`/`stage_outcome` take the caller's own accepted `term`,
+  returning `None` (never a stale `Some`) on a mismatch — propagating up
+  through `wait_stage_outcome`, `txn_stage_anchor`/`txn_stage_participant`,
+  and `compare_and_swap` (which also gained the missing `is_leader()` check
+  its own comment had wrongly implied was already there). Regression:
+  `animus-cp-data/tests/cas_outcome_identity.rs`, the `Cas` mirror of
+  `kind_batch_outcome_identity.rs` — same isolate/accept/elect/collide/heal
+  shape, proven red pre-fix by reverting `cas_result` to its index-only
+  form, plus an end-to-end check that the public `compare_and_swap` async
+  entry point itself never surfaces a false `Some(_)` for a truncated
+  attempt. **`TxnResolve` has a related but distinct gap — it has no
+  outcome channel at all, not a term-unsafe one — tracked separately, not
+  closed by this round** (see this file's "A resolve's silent no-op is
+  invisible to its own proposer" entry). **The generalizable lesson,
+  restated**: "audit every sibling" is not satisfied by naming the siblings
+  in a doc comment — it means actually reading each sibling's own call
+  chain down to its lowest-level accessor before asserting any one of them
+  is safe by a different mechanism; an assumption of safety that isn't
+  independently verified is exactly as dangerous as the missing fix itself,
+  because it makes a future auditor skip the very sibling that needed it.
 - **A `CARGO_TARGET_DIR` shared across concurrently-running agent
   worktrees can silently link one session's build against ANOTHER
   session's stale source** (2026-08-23, discovered mid-fix on the
