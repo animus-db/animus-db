@@ -25,6 +25,7 @@ animus-placement = { path = "crates/animus-placement" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-dynamo = { path = "crates/animus-dynamo" }
 animus-test = { path = "crates/animus-test" }
+animus-node = { path = "crates/animus-node" }
 animusd = { path = "crates/animusd" }
 
 # Third-party.

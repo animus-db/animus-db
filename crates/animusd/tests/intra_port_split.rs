@@ -22,7 +22,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, Node, read_frame};
+use animusd::{ClientRequest, ClientResponse, MetaCommand, Node, read_frame};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -267,6 +267,79 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
         ClientResponse::Value(Some(value.to_vec())),
         "expected the leader's own intra port to serve the forwarded Get end-to-end"
     );
+
+    for node in &nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
+/// **`cp_serve_forwarded`'s exhaustive-match hardening, pinned end to end**
+/// (the same precedent `wire::tests::classification_is_pinned` set for
+/// `is_relayable_command` — see the root `CLAUDE.md`'s "grep every gating
+/// match site" lesson and `cp_serve_forwarded`'s own new match-arm comment).
+///
+/// The seven `ClientRequest` variants that are never legitimately handed to
+/// `cp_serve_forwarded` (each is served directly by `handle_request`'s own
+/// top-level match, or — for `Forwarded` itself — would be a second-hop
+/// protocol violation) still get the exact response they always did once
+/// wrapped in `Forwarded` and sent anyway: this doesn't need a synthetic
+/// `ClientCtx` (impractical to build outside a real bring-up — see
+/// `crates/animusd/CLAUDE.md`'s Tests section on why this crate's own
+/// suites are all real-socket `ProdEnv` integration tests), just a live
+/// node's intra port, exactly like every other `cp_serve_forwarded` arm
+/// this file already exercises via `call_forwarded`. A single-node cluster
+/// is enough — this is a pure "does this arm exist and answer correctly"
+/// check, not a routing/leadership scenario.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cp_serve_forwarded_refuses_every_never_forwarded_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    let (nodes, config) = bring_up(1, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let intra = config.nodes[0].intra;
+
+    let cases: Vec<(&str, ClientRequest)> = vec![
+        ("Status", ClientRequest::Status),
+        ("JoinInfo", ClientRequest::JoinInfo),
+        (
+            "WatchMetadata",
+            ClientRequest::WatchMetadata { last_seen: 0 },
+        ),
+        (
+            "ProposeSchema",
+            ClientRequest::ProposeSchema(MetaCommand::NoOp),
+        ),
+        (
+            "SplitTablet",
+            ClientRequest::SplitTablet {
+                tablet: 0,
+                split_key: b"k".to_vec(),
+            },
+        ),
+        (
+            "Txn",
+            ClientRequest::Txn {
+                writes: Vec::new(),
+                preconditions: Vec::new(),
+                write_conditions: Vec::new(),
+            },
+        ),
+        (
+            "Forwarded",
+            ClientRequest::Forwarded {
+                request: Box::new(ClientRequest::Status),
+                traceparent: None,
+            },
+        ),
+    ];
+
+    for (name, inner) in cases {
+        let response = call_forwarded(intra, inner).await;
+        assert_eq!(
+            response,
+            ClientResponse::Error("unexpected forwarded request".into()),
+            "expected the pinned refusal for a doubly-wrapped {name}, got {response:?}"
+        );
+    }
 
     for node in &nodes {
         node.shutdown_graceful().await;

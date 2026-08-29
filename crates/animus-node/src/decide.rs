@@ -1,21 +1,25 @@
 //! Pure, side-effect-free decision predicates extracted from `impl ClientCtx`
-//! (ADR 0061 Phase A rung A6 — the keystone: the first cut into the
-//! 5,569-line brain, and the module Phase C's structural carve moves first).
+//! (`animusd`, ADR 0061 Phase A rung A6 — the keystone: the first cut into
+//! the 5,569-line brain, and the module Phase C's structural carve moves
+//! first). Moved here verbatim by rung C1, visibility widened from
+//! `pub(crate)` to `pub` so `animusd`'s re-export shim can still name it
+//! across the crate boundary.
 //!
 //! Every function here takes plain values (no `&self`, no `&CpGroup`, no
 //! `ProdEnv`, no `tokio`) and returns a plain value — the same shape
 //! [`crate::topology`] already established for CP-route resolution. A caller
-//! in `lib.rs` gathers the (cheap, already-computed) facts a decision needs —
-//! `leader.engine_applied_index()`, `leader.is_leader()`, `leader.is_frozen()`
-//! — and calls the matching function here to make the actual decision, which
-//! is then directly unit-testable without standing up a `CpGroup` (a real
-//! `RaftKvNode<ProdEnv, _>` handle) at all.
+//! in `animusd`'s `lib.rs` gathers the (cheap, already-computed) facts a
+//! decision needs — `leader.engine_applied_index()`, `leader.is_leader()`,
+//! `leader.is_frozen()` — and calls the matching function here to make the
+//! actual decision, which is then directly unit-testable without standing up
+//! a `CpGroup` (a real `RaftKvNode<ProdEnv, _>` handle) at all.
 //!
 //! **What did *not* move here.** [`crate::topology::decide_cp_route`] already
-//! owns CP leader-route resolution (`resolve_cp_route` fully delegates to
-//! it) — nothing to extend. `ClientCtx::not_leader_refusal` is already thin
-//! wiring over [`crate::topology::format_not_leader_refusal`] — nothing pure
-//! left to pull out. See each function's own doc below for the handful of
+//! owns CP leader-route resolution (`resolve_cp_route`, `animusd`, fully
+//! delegates to it) — nothing to extend. `ClientCtx::not_leader_refusal`
+//! (`animusd`) is already thin wiring over
+//! [`crate::topology::format_not_leader_refusal`] — nothing pure left to
+//! pull out. See each function's own doc below for the handful of
 //! candidates surveyed and found genuinely entangled (real Raft/lock state,
 //! not just data) rather than pure.
 
@@ -32,7 +36,7 @@ use crate::ClientResponse;
 /// `"; retry"` (the house retryability convention) so every existing client
 /// retry loop re-resolves routing; distinct wording so tests/admin can tell
 /// frozen from a fence/stale-routing refusal.
-pub(crate) const FROZEN_REFUSAL: &str =
+pub const FROZEN_REFUSAL: &str =
     "tablet frozen for split cutover (ADR 0050); a child will serve this range shortly; retry";
 
 /// ADR 0050 rung 5: the shared pre-propose freeze refusal. A frozen split
@@ -45,9 +49,9 @@ pub(crate) const FROZEN_REFUSAL: &str =
 /// propose-vs-apply sliver.
 ///
 /// `is_frozen` is `CpGroup::is_frozen()`'s own value — a pure flag read on
-/// the real handle; every caller in `lib.rs` reads it fresh immediately
-/// before calling this.
-pub(crate) fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
+/// the real handle; every caller in `animusd`'s `lib.rs` reads it fresh
+/// immediately before calling this.
+pub fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
     if is_frozen {
         return Err(FROZEN_REFUSAL.into());
     }
@@ -80,7 +84,7 @@ pub(crate) fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
 /// house retryable-error shape so the caller's own retry loop makes progress
 /// instead. **Success still requires exact effect equality** — this coarser
 /// signal only ever ends a wait, never acks one.
-pub(crate) fn confirm_wait_is_futile(
+pub fn confirm_wait_is_futile(
     engine_applied_index: u64,
     is_leader: bool,
     accepted_index: u64,
@@ -91,13 +95,14 @@ pub(crate) fn confirm_wait_is_futile(
 /// Whether a CP read error is a **transient routing/leadership/scope race**
 /// the reader should retry with re-resolved routing (the `"; retry"` shape
 /// every such error in this file carries), as opposed to a genuine failure
-/// to surface. Shared by every CP read/write retry loop in `lib.rs`.
-pub(crate) fn read_should_retry(e: &str) -> bool {
+/// to surface. Shared by every CP read/write retry loop in `animusd`'s
+/// `lib.rs`.
+pub fn read_should_retry(e: &str) -> bool {
     e.ends_with("; retry")
 }
 
 /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
-pub(crate) fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
+pub fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
     match resp {
         ClientResponse::PutOk => Ok(()),
         ClientResponse::Error(e) => Err(e),
@@ -119,11 +124,7 @@ pub(crate) fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> 
 /// false` for an unknown tablet too (the caller's own subsequent lookup
 /// reports that more precisely; this just never claims a key is fine for a
 /// tablet this function can't even see).
-pub(crate) fn align_split_key(
-    meta: &Metadata,
-    tablet: TabletId,
-    split_key: Vec<u8>,
-) -> (Vec<u8>, bool) {
+pub fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
     let Some(t) = meta.tablets.get(&tablet) else {
         return (split_key, false);
     };
@@ -142,16 +143,16 @@ pub(crate) fn align_split_key(
 
 /// ADR 0034: the key that roughly bisects `pairs`' total **bytes** (key +
 /// value length), not just its position — the split point `auto_split_loop`
-/// uses whenever a byte threshold is configured. With skewed value sizes a
-/// plain positional median can leave one huge half and one tiny half, which
-/// immediately re-triggers a split on the huge side instead of settling
-/// below threshold.
+/// (`animusd`) uses whenever a byte threshold is configured. With skewed
+/// value sizes a plain positional median can leave one huge half and one
+/// tiny half, which immediately re-triggers a split on the huge side instead
+/// of settling below threshold.
 ///
 /// Always returns an **interior** key (`i >= 1`, so never `pairs[0].0`,
 /// matching the positional median's own "index > 0" guarantee). Requires
 /// `pairs.len() >= 2` (the same precondition callers already check before
 /// calling this — there is no meaningful split point for 0 or 1 keys).
-pub(crate) fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+pub fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     debug_assert!(
         pairs.len() >= 2,
         "need >= 2 keys for an interior split point"
@@ -176,13 +177,13 @@ pub(crate) fn byte_weighted_median(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 
 /// Another known client-API address for a tablet, distinct from every
 /// address already in `tried` — the fallback
-/// `ClientCtx::forward_to_tablet_leader`'s hinted retry chases once the
-/// refusal's own leader hint is exhausted (already tried, or absent because
-/// the refusing node's own replica was mid-election). Walks `replicas` in
-/// order (callers pass a `Metadata`-derived, and therefore deterministic,
-/// order); `None` once every known replica address has been tried (or none
-/// has a known route at all).
-pub(crate) fn other_tablet_replica_addr(
+/// `ClientCtx::forward_to_tablet_leader`'s (`animusd`) hinted retry chases
+/// once the refusal's own leader hint is exhausted (already tried, or
+/// absent because the refusing node's own replica was mid-election). Walks
+/// `replicas` in order (callers pass a `Metadata`-derived, and therefore
+/// deterministic, order); `None` once every known replica address has been
+/// tried (or none has a known route at all).
+pub fn other_tablet_replica_addr(
     replicas: &[NodeId],
     route: &BTreeMap<NodeId, String>,
     tried: &BTreeSet<String>,
@@ -192,12 +193,13 @@ pub(crate) fn other_tablet_replica_addr(
         .find_map(|id| route.get(id).cloned().filter(|a| !tried.contains(a)))
 }
 
-/// One step of `ClientCtx::forward_to_tablet_leader`'s hinted-retry loop —
-/// the pure decision behind it, given the already-resolved `candidate`
-/// address (the refusal's own leader hint if untried, else
-/// [`other_tablet_replica_addr`]'s fallback, computed by the caller).
+/// One step of `ClientCtx::forward_to_tablet_leader`'s (`animusd`)
+/// hinted-retry loop — the pure decision behind it, given the
+/// already-resolved `candidate` address (the refusal's own leader hint if
+/// untried, else [`other_tablet_replica_addr`]'s fallback, computed by the
+/// caller).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ForwardRetryStep {
+pub enum ForwardRetryStep {
     /// Retry the forwarded op at this address.
     Retry(String),
     /// Every known candidate for a **known** tablet refused with no leader
@@ -215,10 +217,7 @@ pub(crate) enum ForwardRetryStep {
 /// See [`ForwardRetryStep`]. `tablet_known` is `tablet.is_some()` at the call
 /// site — only a resolvable tablet's group can be "mid-election"; an
 /// unresolvable one has nothing to wait out.
-pub(crate) fn decide_forward_retry(
-    candidate: Option<String>,
-    tablet_known: bool,
-) -> ForwardRetryStep {
+pub fn decide_forward_retry(candidate: Option<String>, tablet_known: bool) -> ForwardRetryStep {
     match candidate {
         Some(a) => ForwardRetryStep::Retry(a),
         None if tablet_known => ForwardRetryStep::WaitElection,

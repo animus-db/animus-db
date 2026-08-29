@@ -183,6 +183,7 @@ use animus_dynamo::{
     storage_key,
 };
 use animus_env::{Clock, Env, Metric, Rng};
+use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -389,15 +390,13 @@ async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<(
         // function. `None` (auth disabled, the default) skips this
         // entirely — zero cost, byte-identical to pre-ADR-0057 behavior.
         if let Some(credentials) = &ctx.dynamo_auth {
-            let sigv4_req = animus_dynamo::sigv4::SigV4Request {
-                method: &request.method,
-                path: &request.path,
-                query: &request.query,
-                headers: &request.headers,
-                body: &request.body,
-            };
+            // ADR 0061 rung C4b: the build-request/verify sequence itself is
+            // `animus_node::sigv4_gate` — pure, no socket, no clock. This
+            // connection handler now does only the one real-clock read the
+            // gate can't do itself (`animus-node` has no `Env` access at
+            // all) and the response-shaping on failure.
             let now_epoch_ms = ctx.env.wall_now().0;
-            if let Err(err) = animus_dynamo::sigv4::verify(&sigv4_req, credentials, now_epoch_ms) {
+            if let Err(err) = animus_node::sigv4_gate(&request, credentials, now_epoch_ms) {
                 let body = sigv4_error_body(&err);
                 http::write_amz_json_response(&mut stream, 400, &body, keep_alive).await?;
                 if !keep_alive {
@@ -5731,9 +5730,9 @@ pub(crate) mod leader_read_failure_gate {
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
 /// client write. Every ordinary caller passes `false`.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn kind_write_item_at_leader(
-    ctx: &ClientCtx,
-    leader: &CpGroup,
+pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,
@@ -5808,7 +5807,11 @@ pub(crate) async fn kind_write_item_at_leader(
     };
     #[cfg(test)]
     rmw285_confirm_gate::wait_if_armed(table).await;
-    ClientCtx::cp_kind_local(leader, writes, vec![change_log], seatbelt)
+    // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local` takes no
+    // `self`/`R`-typed argument, so nothing here pins down `R` for the
+    // now-generic `ClientCtx<E, R>` path — both `E`/`R` are already this
+    // function's own generic parameters.
+    ClientCtx::<E, R>::cp_kind_local(leader, writes, vec![change_log], seatbelt)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
     let collection_bytes = collection_bytes_at_leader(leader).await;
@@ -5920,7 +5923,7 @@ pub(crate) mod rmw285_confirm_gate {
 /// Always `Some` — both engine backends price a tablet cheaply, so a leader
 /// that ran this has an answer. The `Option` in the reply exists for the
 /// forwarding hop alone (an older peer omits the field), not for this.
-async fn collection_bytes_at_leader(leader: &CpGroup) -> Option<u64> {
+async fn collection_bytes_at_leader<E: Env>(leader: &CpGroup<E>) -> Option<u64> {
     let base = leader.approx_bytes_kind(KIND_BASE).await;
     let lsi = leader.approx_bytes_kind(KIND_LSI).await;
     Some(base.saturating_add(lsi))
@@ -5981,9 +5984,9 @@ pub(crate) struct KindTxnWriteEval {
 /// Returns `Ok(None)` for a condition mismatch (no diff computed, mirroring
 /// [`KindWriteOutcome::ConditionFailed`]); `Ok(Some(..))` otherwise.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn eval_kind_txn_write(
-    ctx: &ClientCtx,
-    leader: &CpGroup,
+pub(crate) async fn eval_kind_txn_write<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
     pk: &AttributeValue,

@@ -8552,6 +8552,55 @@ debugging anything that feels like it might have happened before.
   coverage, not one relocated. General rule: before moving a test module
   alongside an extracted function, read what it actually calls, not what
   it's named after or sits beside.
+- **Splitting a large `impl` block across files by line-range extraction:
+  a naive "walk upward from the `fn` signature, stop at the first line
+  that isn't a doc comment" heuristic silently orphans multi-line and
+  trailing-comment attributes, and the resulting compile error points at
+  the wrong function (ADR 0061 rung C5 step 2, `animusd`'s `ClientCtx`
+  split into `schema.rs`/`read_path.rs`/`write_path.rs`/
+  `txn_coordinator.rs`/`forwarding.rs`).** Two attribute shapes break a
+  naive upward walk that only recognizes `///`/`#[...]` (single-line,
+  balanced) directly above a signature: a **multi-line** attribute
+  (`#[tracing::instrument(\n    name = "...",\n    skip(self),\n)]`,
+  rustfmt's own style once an attribute's arguments don't fit one line)
+  and a **single-line attribute with a trailing line comment**
+  (`#[allow(clippy::too_many_arguments)] // mirrors ClientRequest::...`).
+  Neither matches "line starts with `#[` and ends with `]`", so the walk
+  stops one line short, extracts everything from the signature down but
+  leaves the attribute behind — and because the attribute is syntactically
+  valid on its own, it silently reattaches itself (per Rust's "doc
+  comments/attributes attach to the next item" rule) to whatever function
+  ends up sitting below the extracted one after the move. The resulting
+  error is **not** "attribute not found" at the extraction site — it's
+  `error: expected item after attributes` if nothing follows, or a
+  `too_many_arguments`/wrong-`#[allow]` clippy failure on an unrelated
+  function if something does — neither of which points at the actual
+  mistake. Fix: track bracket balance (`(`/`)`/`[`/`]`, since `#[attr(args)]`
+  mixes both) walking upward from a line that looks like an attribute's
+  *tail* (matches `^\)*\]\s*,?\s*(//.*)?$`) until the balance returns to
+  zero at a line that starts with `#[` — that's the true start; verify by
+  re-grepping the moved chunk and the source file afterward for the
+  attribute's own text (`#[allow(clippy::` or `#[tracing::instrument`,
+  whatever the file actually uses) rather than trusting the tool's line
+  count alone. The corollary compiler-privacy lesson from the same
+  rung: this codebase's module tree makes every file a *descendant* of
+  `lib.rs` (the crate root), so a formerly-bare `fn` (no `pub`/`pub(crate)`)
+  that only needed to be reachable from sibling files staying in `lib.rs`
+  needed **no** visibility change to keep compiling once callers moved
+  into new child modules — Rust's privacy rule is "visible in the
+  defining module and its descendants," and a parent's private items stay
+  visible to every descendant regardless of which descendant. The
+  widening was only needed in the other direction: a method that itself
+  moved into a new child module (`schema.rs` et al.) and is called from a
+  *sibling* child module or from code that stays in the parent needs
+  `pub(crate)` — 30 of the ~83 relocated methods needed it for exactly
+  that reason (`cp_serve_forwarded`, moved last, turned out to be the
+  single biggest source of these: it calls into every other cluster by
+  name). `cargo build`'s `E0624: method \`x\` is private` errors name the
+  exact call site, so the mechanical move-then-build-then-widen loop
+  catches every miss — but only if each intermediate build is actually
+  run, since a batch of moves without an intervening build can mask one
+  widening behind another's cascading errors.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
@@ -12008,3 +12057,485 @@ documents "the library doesn't need this" precisely rather than
 mechanically *enforcing* it under every possible invocation — say so
 plainly rather than overclaiming the boundary when reporting work like
 this.
+
+## Overriding a workspace-inherited dependency's `default-features` (ADR 0061 rung C1)
+
+Creating `animus-node` with `animus-env = { workspace = true, default-features
+= false }` fails at manifest-parse time — "`default-features = false` cannot
+override workspace's `default-features`" — even though the root
+`[workspace.dependencies]` entry for `animus-env` doesn't mention
+`default-features` at all (so the *effective* default is already "no
+features on," since `animus-env`'s own `[features]` table declares no
+`default = [...]` list). Cargo's inheritance rule cares about the presence
+of the override relative to what the root entry states, not about what the
+resulting feature set would actually be — a member cannot set
+`default-features = false` on an inherited dependency unless the root entry
+already says `default-features = false` too. The fix is not to touch the
+root entry (that would flip every other consumer's default, the same
+one-crate-widens-scope-for-everyone hazard the ADR 0061 rung C0 entry above
+warns about with feature gates generally) but to stop inheriting for that
+one line: `animus-env = { path = "../animus-env", default-features = false
+}`, a direct path dependency, sidesteps workspace-dependency inheritance
+entirely and takes the override with no restriction. General lesson: when a
+new crate needs a *stricter* feature configuration than a workspace
+dependency's inherited default for one line only, reach for a direct `path`
+(or `version`) dependency rather than fighting the inheritance override
+rule — it's not a workaround, it's the mechanism Cargo actually offers for
+"this one dependency, this one consumer, opts out of workspace defaults."
+
+## Moving a `pub(crate)` item across a new crate boundary (ADR 0061 rung C1)
+
+Carving `animus-node` out of `animusd` (wire types, `topology`, `decide`)
+surfaced a mechanical but easy-to-miss step: every moved item that was
+`pub(crate)` in `animusd` had to become `pub` in `animus-node`, and every
+moved struct's individual fields that were `pub(crate)` (not just the
+struct itself) had to widen too. `pub(crate)` scopes to the crate that
+*declares* the item — once the item lives in a different crate than its
+callers, `pub(crate)` silently becomes "unreachable from anywhere but
+`animus-node`'s own tests," a privacy error at every call site in
+`animusd`, including inside a `pub use` re-export shim (`pub use
+animus_node::topology;` compiles, but `animusd::topology::decide_cp_route`
+from outside `animus-node` does not, unless `decide_cp_route` itself is
+`pub`). This is easy to miss because the compiler error at the *re-export*
+site is clean (`pub use` of a private path is legal within the same crate,
+since `lib.rs` is inside `animusd`, the crate importing it) — the failure
+only shows up downstream, at whichever call site first tries to actually
+*use* the re-exported name, with a plain "function is private" error that
+doesn't obviously point back at the moved declaration's visibility. Two
+concrete instances this rung hit: `PendingKindWrite`/`TxnTableWrite`'s
+struct fields (some call sites build them via struct literal, not just the
+`TxnTableWrite::plain` constructor, so the fields themselves — not just the
+types — needed widening), and every function/enum in `topology.rs`/
+`decide.rs` (all `pub(crate)` in the original single-crate layout, all
+needing `pub` once `animusd` became a foreign-crate consumer). General
+lesson: when moving code across a *new* crate boundary (as opposed to
+refactoring within one crate), grep every moved item's visibility
+modifier, not just its `pub`/private status — `pub(crate)` is exactly the
+one visibility level that silently means something different depending on
+which side of the boundary you're standing on, and `cargo build` catches
+it late (at use, not at declaration) rather than at the point where the
+mistake was actually made.
+
+## Host-capability traits let a leaf loop move before its "brain" does (ADR 0061 rung C2)
+
+Phase C's plan called the six `animusd` background loops (`ttl_reaper`,
+`backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`,
+`index_backfill`) easy first movers into `animus-node`. Scoping the rung
+found that wrong: every one of them takes `ClientCtx` by value or reference,
+and `ClientCtx` is the crate's 5,569-line brain, not scheduled to move until
+rung C5. On the plan's own ordering, nothing in C2 could move at all.
+
+The fix generalizes beyond this one rung: when code B (a loop, a handler, a
+consumer) can only move because it depends on code A (a big, not-yet-movable
+"god object"), don't wait for A to move and don't reimplement A's logic
+inside B's new home. Instead, scope exactly which **operations** of A, B
+actually calls — usually a small, named slice, even when A itself is huge —
+define a narrow trait for just that slice, implement it for A as a **thin,
+logic-free delegation** (translate the shape, call the existing method,
+nothing more), and move B generic over the trait. A stayed exactly where it
+was; B stopped depending on its *type*, only on a few of its *operations*.
+Three traits came out of this rung (`ControlLeaderHost<E>`,
+`BackupObjectStore`, `TtlScanHost` — see `animus-node/CLAUDE.md`'s own rung
+C2 entry), sized by cohesive capability rather than one trait per loop or one
+fat trait for everything; a trait every implementor exercises in full is a
+good sign, a trait that exists only to make one specific move compile is not.
+
+This is *better* for testability than moving the loops unchanged would have
+been, not merely a workaround: a loop generic over a capability trait can be
+driven under `SimEnv` against a synthetic fake implementing just that trait
+— no cluster, no sockets, no `ClientCtx` — which is deterministic coverage
+those loops had never had. A loop moved but left coupled to a concrete
+`ClientCtx` would still have been untestable until C5 landed; the capability
+trait is what makes the move worth doing now rather than later.
+
+Corollary, worth stating because it looks like a shortcut and isn't one: not
+every loop in the batch has to move. `segment_janitor.rs` stayed in
+`animusd` this rung — its replica-repair phase makes real placement/
+membership decisions (which replicas are still live, where to push a
+repaired copy), not a value nameable as one narrow I/O delegation the way
+"durably store these bytes" is. Forcing it to move would have meant either
+smuggling real decision logic into the leaf crate (exactly what this phase
+is supposed to prevent) or building a capability surface wide enough to
+expose that logic anyway, which is a contorted trait wearing a narrow one's
+clothes. A partial rung with a precise, per-loop account of what moved and
+why the rest didn't is a better outcome than forcing every item on the list
+to move.
+
+## `propose()`'s `Accepted` says nothing about apply-time rejection, and a test can silently misconstruct its own fixture because of it
+
+Building a `SimEnv` test for the (now moved) `index_backfill` loop, a
+two-tablet-per-table fixture was built by calling `MetaCommand::CreateTablet`
+twice for the same table. Both calls returned `ProposeResult::Accepted` (the
+`assert!(matches!(.., Accepted))` on each passed), so the test proceeded
+believing both tablets existed — but the *second* `CreateTablet` is a
+deliberate apply-time rejection (`Metadata::apply`'s own rule, ADR 0023: "one
+`CreateTablet` per table; every further tablet comes only from a real
+split"). Since `Metadata` is `DRIVER_APPLIED` (ADR 0038), `propose()`'s
+`Accepted` means only "appended to my own Raft log" — the semantic
+accept/reject decision happens later, asynchronously, in the apply task, and
+`propose()`'s return value cannot see it. The test's own straggler-tablet
+assertion then passed for the wrong reason: with only one tablet actually in
+`Metadata.tablets`, "every tablet has reported" went vacuously true the
+moment that one tablet reported, which looked identical to the intended
+"both tablets must report" property from the assertion's own perspective.
+
+General lesson: **a green assertion on `ProposeResult::Accepted` is not
+evidence a command's own semantic rule accepted it** — for any
+`DRIVER_APPLIED` state machine (`Metadata` here; the CP-data `KvState`
+plane the same way), check the *post-apply* state (`node.metadata()`,
+re-read after enough `sim.run_for`/`run_until` for the apply task to have
+run) before trusting a fixture built from a sequence of proposals, especially
+one hand-built for a test rather than driven through a real client that
+would have surfaced the rejection. The existing `animus-control` test suite
+already knows this rule (`complete_backup_requires_every_pinned_tablet`
+drives `BeginSplit`/`CutoverSplit` for exactly this reason, with a comment
+saying so) — the lesson here is that the same trap is easy to walk into
+fresh when writing a *new* crate's *first* `SimEnv` fixture, where there is
+no existing sibling test to copy the pattern from.
+
+## A type alias at the concrete instantiation site can keep a "genericize this type" rung from cascading into its every consumer
+
+ADR 0061 rung C3c genericized `animusd`'s `ControlHandle`/
+`RemoteControlClient` (`Local(RaftNode<ProdEnv>)` → `Local(RaftNode<E>)`;
+`RemoteControlClient`'s one real-I/O method reaching a new `RelayClient`
+trait instead of a concrete `relay_request` free function) and moved both
+whole into `animus-node`. The natural worry going in: `ClientCtx.control:
+ControlHandle` is a field on the crate's ~5,500-line hub struct, so
+"genericize `ControlHandle`" sounds like it should force `ClientCtx` itself
+to grow `<E, R>` parameters — which would have meant threading them through
+every function that takes or returns a `ClientCtx`, the exact C5-shaped
+blast radius this rung was explicitly scoped to avoid.
+
+It didn't happen, because `animusd` only ever needs *one* concrete
+instantiation of the newly-generic type: `ControlHandle<ProdEnv,
+AnimusdRelayClient>`. A crate-local type alias (`pub(crate) type
+ControlHandle = animus_node::control_handle::ControlHandle<ProdEnv,
+AnimusdRelayClient>;`) binds the generic type back down to a concrete one at
+its single point of use, so every existing `ControlHandle::Local(..)`/
+`ClientCtx.control: ControlHandle` site keeps compiling completely
+unchanged — `ClientCtx` never sees a type parameter, because from its point
+of view the alias *is* a concrete type. Only the two real constructor call
+sites (`RemoteControlClient::new`/`with_mirror`) needed a one-line update
+(pass the new `relay`/`timeout` arguments) since a constructor's arity
+genuinely changed; every read-only accessor call site was untouched.
+
+General lesson: when scoping "genericize type `T` and move it to a lower
+crate," check whether the *consuming* crate only ever needs one concrete
+instantiation of `T` before assuming the generic parameters must propagate
+into every struct that holds a `T`. If so, a local type alias at the
+instantiation site is the seam that contains the diff to "the type moved
+and gained parameters" rather than "half the crate grew two more generic
+parameters" — the same shape `animus-node`'s own `ProdEnv`-free boundary
+already relies on one level up (this crate depends on `animus-control`
+un-genericized from *its* point of view too, via `animus-control`'s own
+`E`-generic types resolving concretely wherever `animusd` instantiates
+them). This is a smaller instance of the same "ask what narrow thing the
+caller actually needs" question ADR 0061's standing C4/C5 guidance already
+names for capability traits — here applied to a type's own generic
+parameters rather than a trait's method set.
+
+## `cargo build --workspace --all-targets` can exhaust disk long before `cargo clippy --workspace --all-targets` does — they are not equivalent load for a space budget
+
+On a workspace this size, `cargo clippy --all-targets --all-features`
+type-checks every test/bench binary in every crate (including
+`animus-operator`'s `kube`-client dependency tree) without linking full
+executables for most of them, so it fits comfortably in a constrained
+`target/` budget. `cargo build --workspace --all-targets` does the full
+codegen + link for the *same* set of binaries — every `#[test]`
+binary and bench in every crate, not just the ones a given task's gate
+list actually needs — and on a session with single-digit GB of headroom
+this can run the disk to zero mid-build (`rustc-LLVM ERROR: IO failure on
+output stream: No space left on device`), which then fails *unrelated*
+crates (`animus-storage`'s `lsm_clone_concurrent` test, `animus-cp-data`'s
+`apply_signal` test) that have nothing to do with the change in flight —
+a confusing false signal if read as "the change broke something," when the
+actual cause is disk exhaustion from building targets the task's own gate
+never asked for. This repo's stated validation gate is `cargo build
+--workspace` (no `--all-targets`); reach for `--all-targets` only when a
+task specifically needs every test binary to *build* (not just
+type-check), and clean `target/debug/{deps,build,incremental}` proactively
+between build attempts on a constrained disk rather than after the error —
+the clippy pass already proved the code type-checks, so the extra
+`--all-targets` build was buying confirmation the task didn't ask for at a
+cost the disk couldn't afford.
+
+## A member-access grep that only matches one line misses `receiver\n.method()` sites rustfmt wrapped onto two lines (ADR 0061 rung C4d)
+
+Scoping the `AdminHost` capability trait (rung C4d) started from a
+single-line regex — `grep -noE "ctx\.[a-zA-Z_]+" admin.rs` — to enumerate
+every `ClientCtx` member `admin.rs`'s handlers actually touch, the same way
+earlier rungs' scoping passes had. It found 14 members and matched the
+ADR's own "a 15-method cluster-shape slice" estimate closely enough to look
+confirmed. It wasn't: `ctx.stream_change_rates()` and `ctx.trigger_split(..)`
+were invisible to it, because rustfmt had wrapped both call sites as
+
+```rust
+let stream_change_rates: Vec<Value> = ctx
+    .stream_change_rates()
+```
+
+— `ctx` and `.stream_change_rates()` on separate lines, so a pattern
+anchored on `ctx\.` never sees the method name at all. A second pass that
+first collapsed `re.sub(r'ctx\s*\n\s*\.', 'ctx.', text)` before matching
+found 19 members, not 14 — `admin_add_control_member`,
+`admin_remove_control_member`, `cp_kind_write_item`, `stream_change_rates`,
+and `trigger_split` had all been missed, some of them (`cp_kind_write_item`,
+`trigger_split`) real write-path primitives whose absence from a
+capability-trait scoping pass would have been a correctness gap, not just a
+miscount, had it gone unnoticed and the trait shipped one method short.
+
+This is worth being deliberate about any time a task's *validation*, not
+just its implementation, rests on grepping a large `rustfmt`-formatted
+file for one identifier chained off another (`x.method()`,
+`self.field.method()`): rustfmt line-wraps a chain at ~100 columns with no
+regard for keeping the receiver and the first `.` on the same line, so a
+single-line regex silently undercounts on exactly the call sites long
+enough to wrap — which correlates with exactly the call sites most likely
+to be doing something nontrivial. Either collapse whitespace-then-dot
+before matching (as above), or use a tool that already understands Rust
+syntax (`cargo expand`, an AST-aware grep, or simply reading the file)
+rather than trusting a plain-text line-oriented pattern to enumerate a
+type's own usage.
+
+## Driving a trait's `async fn` in a `tokio`-free crate's own unit tests: `std::task::Waker::noop()` + `std::pin::pin!`, no `unsafe`
+
+`animus-node` has no `tokio` dependency at all, in `[dev-dependencies]`
+either (ADR 0061's rung C0/C1 boundary is enforced for the whole crate, not
+just its library target) — so unit-testing `animus_node::admin::dispatch`
+(an `async fn` calling into `#[async_trait]` `AdminHost` methods) against a
+fake host couldn't reach for `#[tokio::test]`. The fix isn't a hand-rolled
+`RawWaker` (which needs `unsafe` for `Waker::from_raw`, and this workspace
+lints `unsafe_code` at `forbid`): `std::task::Waker::noop()` (stabilized
+well before this workspace's MSRV) is a ready-made no-op waker, and
+`std::pin::pin!(fut)` stack-pins a future with no `unsafe Pin::new_unchecked`
+and no heap allocation. A ~10-line `loop { if let Poll::Ready(v) =
+fut.as_mut().poll(&mut cx) { return v; } }` around those two is a complete,
+safe, dependency-free `block_on` — sound whenever the future under test
+never genuinely parks (resolves on its first poll, or every intermediate
+`Pending` is guaranteed transient), which covers exactly the shape a pure
+routing/dispatch test wants: a fake implementor whose methods return
+immediately. Reach for this before adding a `futures`/`pollster`
+dependency (or, worse, quietly loosening the crate's "no `tokio`, no
+`unsafe`" invariants) just to drive a small `async fn` in a test.
+
+## A default type parameter contains "genericize this type" blast radius the same way a type alias does — but it only resolves in *elided type positions*, never inside an enclosing generic scope (ADR 0061 rung C5 step 1, `CpGroup<E>`/`ClientCtx<E>`)
+
+Rung C5 step 1 genericized `animusd`'s `CpGroup`/`SharedEngine`/
+`ClusterEdgeState`/`CpRoute`/`ClientCtx` over `E: Env` **in place**
+(same crate, nothing moved yet — see ADR 0061's fifth 2026-08-28
+amendment). Unlike C3c's `ControlHandle` (a type consumed at exactly one
+concrete instantiation, so a crate-local `type ControlHandle =
+animus_node::control_handle::ControlHandle<ProdEnv, AnimusdRelayClient>;`
+contained the whole diff to the type's own definition — see the entry
+above), these five types are each still *named directly*, by their own
+name, at roughly 200 call sites apiece throughout the crate — no single
+alias site to bind. The equivalent seam here is a **default type
+parameter on the definition itself**: `enum CpGroup<E: Env = ProdEnv>`,
+`struct ClientCtx<E: Env = ProdEnv>`, etc. This is legal, ordinary Rust
+(confirmed with a standalone `rustc` snippet before relying on it
+workspace-wide) and has the identical effect for every call site that
+never spells a type parameter: a bare `CpGroup`/`Option<ClientCtx>` in a
+non-generic function, a struct field, or a `match` arm still means
+`CpGroup<ProdEnv>`, so none of ~400 existing bare references anywhere
+in the crate needed to change.
+
+**The one place the analogy breaks, and the one worth knowing before
+attempting this**: a default type parameter resolves to its **default**
+whenever it is *elided in a type position* — including inside a
+function that is *itself* generic over the identical-looking parameter
+name. Verified directly:
+
+```rust
+enum CpGroup<E: Env = ProdEnv> { A(E) }
+fn takes_ref<E: Env>(x: &CpGroup) {}   // x: &CpGroup<ProdEnv>, NOT &CpGroup<E>
+```
+
+Calling `takes_ref::<SimEnv>(&some_cp_group_e)` is a plain `E0308`
+mismatch — the bare `CpGroup` in the signature never "sees" the
+function's own `E`, because default-parameter resolution only consults
+the default, never an enclosing scope's same-named parameter. The
+practical consequence: once `CpGroup`/`ClientCtx` grew a default `E`,
+every method/associated-fn signature *inside* the two `impl<E: Env>
+ClientCtx<E> { .. }` blocks that named `CpGroup`/`CpRoute` explicitly
+(`leader: &CpGroup`, `-> Option<CpRoute>`, …) had to be rewritten to
+`<E>` by hand — about 30 sites, all caught by `cargo build` as plain
+type-mismatch errors naming the exact line, not silently accepted with
+the wrong meaning. Three sibling free functions the impl blocks call
+into by name (`index_drain::{seal_now, pitr_seal_now, hot_read,
+clear_backfill_cursor}`, `dynamo::{kind_write_item_at_leader,
+eval_kind_txn_write, collection_bytes_at_leader}`, this crate's own
+`median_split_key`) needed the identical `<E: Env>` treatment for the
+same reason — a generic caller passing a `&ClientCtx<E>`/`&CpGroup<E>`
+into a callee whose signature still says bare `ClientCtx`/`CpGroup`
+hits the same mismatch, one level removed.
+
+**What did NOT need fixing, and why it matters for scoping this kind of
+change**: pattern-matching against an already-typed value
+(`CpRoute::Local(leader) => ..`) and constructing a value whose type is
+inferred from a `return`/call-argument context (`Some(CpRoute::
+Local(leader))`) both resolve through ordinary type inference from the
+already-known concrete type, not through default-parameter elision —
+default resolution only applies when nothing else pins the type. Of the
+roughly 90 `CpRoute`-mentioning lines inside `ClientCtx`'s two `impl`
+blocks, only the 2 function *signatures* returning `CpRoute` needed a
+change; the ~60 match arms and constructions elsewhere were untouched.
+Anyone repeating this pattern for another type should expect the same
+split: audit signatures (return types, parameter types, struct/enum
+field types) exhaustively by hand or by grep, then let `cargo build`
+catch anything missed — but expect the match/construction sites to be
+free, and don't waste time annotating them defensively.
+
+## A second default-typed generic parameter can force a supertrait bound that only shows up when a downstream call site needs it — and a blind regex conversion silently mis-targets `self`-free functions (ADR 0061 rung C5 step 3a/3b)
+
+Two lessons from genericizing `ClientCtx<E: Env = ProdEnv>` a second time,
+over `R: RelayClient = AnimusdRelayClient` (step 3a), then converting the
+91 raw `tokio::time`/`tokio::spawn`/`tokio::select!` sites the resulting
+`impl<E: Env, R: RelayClient> ClientCtx<E, R>` blocks still held (step
+3b).
+
+**1. A second generic parameter's supertrait bounds are invisible until a
+*specific* method needs them — and the fix belongs on the trait, not on
+one `impl` block.** Adding `R: RelayClient` alone compiled fine for every
+method that never called `.clone()`/spawned a future capturing `self`.
+The first sign of trouble was `txn_coordinator.rs`'s existing `let this =
+self.clone()` (for a parallel resolve fan-out) and this rung's own
+conversion of a `tokio::spawn(resolve_all(..))` into
+`self.env.spawn_task(resolve_all(..))`: both need `ClientCtx<E, R>: Clone
++ Send + Sync + 'static` to hold **generically**, and nothing about `R:
+RelayClient` implied any of those — `AnimusdRelayClient`, the one
+concrete implementor that exists today, trivially satisfies all four as a
+zero-sized type, so nothing forced the question until a specific method
+in a specific file tried to rely on it. The tempting narrow fix — bound
+just `txn_coordinator.rs`'s own `impl` block (`impl<E: Env, R: RelayClient
++ Clone + Send + Sync + 'static> ClientCtx<E, R>`) — turns out to not stay
+narrow: `read_path.rs` calls `self.txn_status(..)`, a method defined in
+that same stricter-bounded block, so the bound would have had to cascade
+into every file that transitively calls into it, which given
+`forwarding.rs`'s "calls into every sibling by name" role is most of the
+five-module call graph. Adding `Clone + Send + Sync + 'static` as
+supertrait bounds on `RelayClient` itself (mirroring `Env`'s own
+supertrait shape exactly) closed it in one place instead — a design the
+type's own pre-existing doc comment had already implicitly promised
+("cheap to clone... the `RelayClient` implementor itself must make cheap
+to clone") without the compiler enforcing it. When a widened generic
+bound seems to demand a per-call-site or per-`impl`-block fix, check
+whether the *shape* of what every caller needs is already the same shape
+a sibling supertrait (here, `Env`) already carries — the fix usually
+belongs on the trait.
+
+**2. A regex-driven `tokio::time::Instant::now()` → `self.env.now()`
+conversion is only safe inside a function that actually has `&self` —
+and a file can have both kinds without any visual signal.** `write_path.rs`
+has 13 methods on `impl<E: Env, R: RelayClient> ClientCtx<E, R>`, but 7 of
+them (`poll_probe`, `cp_batch_local`, `cp_batch_propose`, `cp_put_local`,
+`cp_delete_local`, `cp_kind_local`, `seed_rows_local`) are deliberately
+`Self`-free — they take `leader: &CpGroup<E>` as their first parameter
+instead of `&self`, a design choice from ADR 0061 rung C5 step 1 (they're
+called from `dynamo.rs`'s free functions, which never construct a
+`ClientCtx` reference just to reach them). A single crate-wide
+`tokio::time::Instant::now()` → `self.env.now()` regex substitution
+compiled clean in `read_path.rs`/`forwarding.rs`/`txn_coordinator.rs`
+(every method there takes `&self`) but produced 14 `error[E0425]: cannot
+find value \`self\`` sites in `write_path.rs` alone — caught immediately
+by `cargo build`, never by re-reading the diff, since the substituted
+line looks completely ordinary in isolation (`let deadline =
+self.env.now().saturating_add(CLIENT_TIMEOUT);` reads fine whether or not
+`self` is in scope three lines up). The fix was `leader.env()` instead
+(`CpGroup<E>`'s own private `env(&self) -> &E` accessor, already visible
+to any descendant module per the standing privacy-widening lesson) — a
+mechanical, per-call-site substitution once the seven functions were
+identified, but identifying them required reading every function
+signature in the file first, not trusting the regex to have been
+scoped correctly. **The general rule this reinforces**: a `sed`/regex
+conversion pass over a body of `&self`-shaped code must never be trusted
+crate-wide without an immediate `cargo build` right after — and the build
+output's line numbers, not a visual diff, are what actually finds the
+functions the assumption didn't hold for.
+
+Two smaller findings from the same rung, worth a shorter note: a
+`Self`-free associated function (`ClientCtx::cp_kind_local`, called
+`ClientCtx::cp_kind_local(leader, ..)` with no `self` argument at all)
+gives type inference nothing to pin a newly-added generic parameter on —
+`error[E0283]: type annotations needed`, fixed with an explicit turbofish
+at each of its three call sites, exactly as the compiler's own suggestion
+said; and a pattern match against a type alias only resolves generically
+when the alias itself is imported *as the generic item* — `crate::
+ControlHandle::Local(raft)` (this crate's own `ProdEnv`/
+`AnimusdRelayClient`-bound alias) fails to match a `ControlHandle<E, R>`
+value for generic `E`/`R` with a plain `E0308`, confirmed with a two-line
+standalone `rustc` snippet before touching the real file, and fixed by
+importing `animus_node::control_handle::ControlHandle` (the generic enum)
+directly under the same name in the one file that needed the generic
+match, leaving every other file's `crate::ControlHandle` (still matched
+against a concrete value there) untouched.
+
+## Driving a production `E: Env`-generic type under `SimEnv` for the first time in a new crate: `block_on` hangs, a receiver borrow can conflict with a later move, and clippy catches what `cargo test` can't (ADR 0061 Phase C's closing rung)
+
+Building the first `SimEnv`-driven `ClientCtx<SimEnv, _>` harness in
+`animusd`'s own tests (no crate move — see that ADR's seventh/eighth
+2026-08-28 amendments) surfaced three small, generalizable gotchas, all
+likely to recur verbatim when Phase D's `SimCluster` does the same thing at
+multi-node scale.
+
+**1. `futures::executor::block_on` silently hangs over any future that can
+genuinely `.await` an `env.sleep()` — there is no error, just a stuck test
+process.** `ClientCtx::cp_kind_write_raw`/`cp_get` both contain retry loops
+that `.await self.env.sleep(..)` (the confirm-poll backoff, the
+route-resolution wait). `block_on` polls a future on the *calling* thread
+with no relationship to `Simulator`'s own cooperative executor — nothing
+ever advances the virtual clock or fires the pending timer, so a future
+that would resolve instantly under real time never resolves at all here.
+The fix (already established practice in `animus-cp-data`'s own tests, but
+easy to reach for the wrong tool anyway when a codebase's "obvious" way to
+run one `async fn` synchronously is `block_on`): spawn the future onto the
+env (`env.spawn_task`) and drive it forward with `Simulator::run_for`/
+`run_until`, capturing the result through a shared `Arc<Mutex<Option<T>>>`
+slot read back out afterward. Any first-time `SimEnv` harness for a type
+that wasn't written with `SimEnv` in mind from the start should budget for
+finding at least one call site that can genuinely suspend, and reach for
+this shape by default rather than trying `block_on` first and debugging the
+hang.
+
+**2. A method call's receiver-borrow and a later argument's whole-value move
+of the same struct conflict, even when the method itself takes `&self`.**
+`ctx.env.spawn_task(async move { .. ctx.cp_kind_write_raw(..) .. })` fails
+to borrow-check: evaluating the receiver `ctx.env` borrows `ctx` for the
+duration of the call, and the `async move` block constructed as the
+*argument* to that same call tries to move the whole `ctx` — a conflict the
+error message reports as a move-while-borrowed on `ctx`, not obviously
+pointing at "the receiver and the argument are both touching the same
+value." The fix is mechanical once recognized: bind the needed field to its
+own local (`let env = ctx.env.clone(); env.spawn_task(async move { ..
+ctx.cp_kind_write_raw(..) .. })`) so the move and the borrow no longer share
+an expression. `animus-node`'s own sim tests already do this
+(`let loop_env = node.env().clone(); loop_env.spawn_task(..)`) — worth
+recognizing as a named idiom rather than rediscovering the borrow-checker
+message each time a new harness hits it.
+
+**3. `cargo test` proves the code compiles and the assertions pass; it does
+not run clippy, and a fresh sim test's own literals are exactly the kind of
+thing clippy catches that a passing test run won't.** A hand-picked hex seed
+literal grouped for readability (`0x51_4E_0001`, meant to loosely spell a
+mnemonic in hex) passed `cargo test -p animusd --lib` clean but failed
+`cargo clippy -p animusd --all-targets --all-features -- -D warnings` on
+`clippy::unusual_byte_groupings` (hex digits must group in fours from the
+right). Unsurprising once stated, but worth the reminder that finishing a
+rung's gate list in test-only order (test, then clippy) can produce a false
+sense of "done" after step one — the validation gate's own ordering (fmt,
+clippy, build, test) exists partly to catch exactly this before a test pass
+is mistaken for a full green gate.
+
+**A fourth, purely operational finding, worth recording beside the existing
+"`cargo build --workspace --all-targets` can exhaust disk long before
+`cargo clippy --workspace --all-targets` does" entry above**: the same gap
+holds at single-crate scope, not just workspace scope. `cargo build -p
+animusd --lib --tests` (compiling and *linking* all ~100 of this crate's
+test binaries in one invocation) exhausted this session's disk mid-build,
+while `cargo clippy -p animusd --all-targets --all-features -- -D warnings`
+— checking the exact same set of targets — completed in well under a
+minute using only a few GB, because clippy (like `cargo check`) never links
+a final binary for any target it checks. When a task's own validation gate
+calls for a crate-scoped `--all-targets` clippy run, it is safe to run as
+written even under this repo's documented disk constraints; a
+`--all-targets` *build* or *test* invocation for the same crate is the one
+to keep scoped down (`--lib`, or one `--test <name>` at a time).

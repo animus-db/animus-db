@@ -282,11 +282,11 @@ brain-last.
 |---|---|
 | C0 | **Prerequisite (added 2026-08-28, see the amendment below).** Feature-gate `animus-env`'s `prod` module — `ProdEnv`/`FsSegmentStore` behind a default-off `prod` feature; every current consumer opts in explicitly. Without this, C1's boundary is decorative |
 | C1 | Create `animus-node` depending on `animus-env` with `default-features = false` — so `ProdEnv` genuinely does not exist in that build — and with no `tokio::net`. Move the wire types (`ClientRequest`/`ClientResponse`/`Surface`/`is_relayable_command`), `topology.rs`, and A6's `decide` module. Also harden `is_relayable_command` from `matches!` to an exhaustive `match` (see below). Boundary established and compiler-enforced from the first commit |
-| C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill`. Each is small, self-contained, and paced by `tokio::time` today — `env.sleep()`/`env.now()`/`env.spawn_task()` instead |
-| C3 | `ControlHandle<E>`; move relay/forwarding (`relay_request`, `lib.rs:17617-17650`) off raw `TcpStream` onto the multiplexed `Network` (ADR 0026). This is what lets a multi-node cluster talk inside `SimEnv` |
-| C4 | The HTTP edges per Decision 2: parsing and dispatch become pure bytes-in/bytes-out in `animus-node`; `animusd` keeps the accept loops |
-| C5 | The brain: split `impl ClientCtx` into `read_path`, `write_path`, `txn_coordinator`, `forwarding`, `schema`; genericize over `E: Env`. The heaviest rung, but A6 has already lifted the pure predicates out of it |
-| C6 | Node assembly: `Node<E>`/`BoundNode<E>`/`BoundControlNode<E>`/`BoundDataNode<E>` move; `animusd` shrinks to binary, config, listeners, lifecycle, and the one `ProdEnv` construction. The `start_cluster*`/`run_node*` harness functions move to test support where they belong |
+| C2 | Genericize and move the leaf background loops: `ttl_reaper`, `backup_janitor`, `pitr_janitor`, `segment_janitor`, `backup_completion`, `index_backfill` — paced by `env.sleep()`/`env.now()`/`env.spawn_task()` instead of `tokio::time`. **Requires a host-capability trait first (see the second 2026-08-28 amendment): every one of these takes `ClientCtx`, which does not move until C5.** |
+| C3 | `ControlHandle<E, R>` and a `RelayClient` capability trait, split into **C3a–C3d** (see the third 2026-08-28 amendment). The literal "move relay onto `Network`" is **rejected**: it would collapse ADR 0047's `intra` port into `internal`, a production wire-topology change this ADR disclaims. The goal — a cluster that talks inside `SimEnv` — is met by a second, sim-only `RelayClient` implementor instead |
+| C4 | The HTTP edges per Decision 2, split into **C4a–C4d** (see the fourth 2026-08-28 amendment). `dynamo.rs`'s `run_operation`/DDL handlers are **not** a C4 rung — they fold into C5 |
+| C5 | The brain, **minus admin/metrics** (see the fifth 2026-08-28 amendment): genericize `CpGroup`/`SharedEngine`/`ClientCtx` over `E: Env` **in place** first, then split into modules. The heaviest rung. **The move itself is dropped** — the seventh 2026-08-28 amendment closes Phase C with the brain staying in `animusd`, generic, `tokio`-free, and lint-enforced in place; step 3c and the `dynamo.rs` absorption go with it |
+| C6 | ~~Node assembly moves~~ — **dropped** by the seventh 2026-08-28 amendment: the assembly was only in the plan because the brain was. Replaced by Phase C's closing rung: a `SimEnv`-driven `ClientCtx` harness in `animusd`'s own tests, and narrowing rung B5's package-level `disallowed_methods` exemption to the files that still need it |
 
 #### 2026-08-28 amendment — C0, and why C1 alone would not have worked
 
@@ -336,11 +336,397 @@ Note also that after C1, `cp_serve_forwarded`'s match still lives in
 `animusd` while its input type lives in `animus-node`, so the repo's
 "grep every gating site" discipline spans a crate boundary until C5.
 
+#### 2026-08-28 amendment (second) — there is no leaf; C2 needs a capability trait
+
+This ADR's Phase C ordering is described as "leaf-first, brain-last", with C2's
+background loops as the easy first movers because each is "small,
+self-contained". Scoping C2 found that **premise is wrong**: all six loops take
+`ClientCtx` by value or reference, and four also take `&RaftNode<ProdEnv>`.
+`ClientCtx` is the 5,569-line brain that C5 moves last. On the ADR's own
+ordering, nothing in C2 can move.
+
+Stated plainly because it is the second time Phase C's plan has not survived
+contact with the code (the first being C0), and because the naive reactions —
+pulling C5 forward, or moving the loops together with the brain — would both
+undo the leaf-first property that makes this phase reviewable.
+
+The loops turn out to depend on a **very small slice** of `ClientCtx`:
+
+| Loop | Capabilities used |
+|---|---|
+| `ttl_reaper` | `effective_metadata()` |
+| `index_backfill` | the leader's `metadata()`, `propose()` |
+| `backup_completion` | `data_opt()` |
+
+So the fix is dependency inversion, not reordering. C2 gains a prerequisite
+step: define a narrow **host-capability trait** in `animus-node` naming just
+the operations the loops need, implement it for `animusd`'s `ClientCtx`, and
+move each loop generic over `E: Env` plus that trait. `ClientCtx` stays where
+it is until C5; the loops stop depending on it as a concrete type.
+
+This is better for the ADR's actual goal than the original plan, not merely a
+workaround. A loop generic over a capability trait can be driven in `SimEnv`
+against a **fake host** — no cluster, no sockets, no `ClientCtx` at all — which
+is precisely the deterministic coverage Phase D wants for the janitor and
+reaper arms. Moving the loops while still coupled to a concrete `ClientCtx`
+would have produced code inside `animus-node` that still could not be
+sim-tested until C5 landed.
+
+Expect the same shape at C3 and C4: the question at each rung is not "can this
+file move" but "what narrow capability does it actually need from its host".
+
+#### 2026-08-28 amendment (third) — C3 splits, and the literal reading is rejected
+
+Scoping C3 found two things the one-line plan did not anticipate. The pattern
+from the second amendment held a third time, so it is now stated as standing
+guidance below rather than rediscovered per rung.
+
+**1. `Network` does not fit relay, and the literal move would change the wire.**
+ADR 0026's `Network` is fire-and-forget `send_stream`/single-consumer
+`recv_stream` with **no request/response correlation**. Relay is synchronous
+call/await RPC. Two concurrent relay calls to one peer on a shared stream
+cannot match replies to callers without a `req_id`. That machinery would have
+to be built — the codebase already has the shape twice
+(`animus-cp-data::cluster_segment_store`'s `req_id` + `Pending` slots polled
+via `env.sleep()`, deliberately not `tokio::sync::oneshot` because `SimEnv`
+callers have no tokio runtime; and `RaftKvNode`'s `ReadProbe`/`ReadProbeAck`).
+
+Worse, `Network`'s `ProdEnv` impl dials the **`internal`** port (raw Raft/
+`KvWire` frames), while relay dials **`intra`** (or `client`). ADR 0047 split
+`intra` off `client` precisely so internal `ClientRequest` traffic never rides
+the client edge; `internal` is a third, orthogonal port. Literally riding relay
+on `Network` therefore **collapses `intra` into `internal`** — a production
+wire-topology change, contradicting this ADR's own "explicitly not in scope:
+any behaviour change" and fighting ADR 0047's separation rationale.
+
+So the literal reading is rejected. The *spirit* — a multi-node cluster that
+talks inside `SimEnv` — is achieved by making relay a capability and giving it
+a second, sim-only implementor. Production keeps its existing transport and
+ports, byte for byte. Anyone wanting the production merge should propose it as
+its own change with its own ADR amendment; it is not a testability rung's to
+smuggle in.
+
+**2. C3 is four rungs, not one.**
+
+| Sub-rung | Work |
+|---|---|
+| C3a | Move the **pure** half of `write_frame`/`read_frame` — framing arithmetic, `MAX_FRAME_LEN` bound, serde calls — into `animus-node` as functions over `&[u8]`. ~90% of those two functions; no socket. Trivial, independently shippable |
+| C3b | A `RelayClient` capability trait in `animus-node::host`, beside C2's three. `animusd` implements it over the **unchanged** `relay_request` — still raw `TcpStream`, still on `intra`/`client`, zero wire change |
+| C3c | `ControlHandle<E, R: RelayClient>` / `RemoteControlClient<R>`. Mechanical once C3b exists: every `Local` arm is already a synchronous passthrough to an `E`-generic `RaftNode<E>` accessor, and `metadata_fresh` is the single method doing real I/O |
+| C3d | A `Network`-backed `RelayClient` implementor, **sim-only**, with the `req_id` correlation above and a reserved stream constant. This is what actually lets a cluster talk inside `SimEnv`, and it feeds Phase D's `SimCluster` |
+
+Deferred to C5 as `ClientCtx`-entangled: `ClientCtx::relay` and every call site
+reaching relay through it (`propose_schema`, `cp_serve_forwarded`'s
+forwarding). C3 only frees the free functions and `control_handle.rs`, neither
+of which touches `ClientCtx`.
+
+**Standing guidance for C4 and C5.** Three rungs in, the same question has been
+load-bearing every time, and asking "can this file move?" has been wrong every
+time:
+
+> Ask what **narrow capability** the code needs from its host, name that as a
+> trait in `animus-node`, implement it thinly in `animusd`, and let the
+> production implementation keep whatever concrete machinery it already has.
+> A second, sim-only implementor of the same trait is what buys deterministic
+> coverage — not relocating the production one.
+
+#### 2026-08-28 amendment (fourth) — C4 splits, and `dynamo.rs`'s handlers belong to C5
+
+Scoping C4 confirmed Decision 2's seam is sound — no edge streams a response, so
+the bytes-in/bytes-out buffering assumption holds cleanly — but found the rung
+is four shippable pieces plus one that is misfiled.
+
+**C4a** move `http.rs`'s pure halves (header-block splitting, `Content-Length`
+handling, `query_param`/`percent_decode`, response formatting) into
+`animus-node`; `read_http_request`/`write_response_with` become thin wrappers
+doing only `stream.read`/`write_all`. Mirrors C3a exactly. **C4b** factor the
+SigV4 gate out of `dynamo.rs::handle_conn` — `animus_dynamo::sigv4::verify` is
+already pure (and `animus-dynamo` has no `tokio` dependency at all); only the
+build-request/read-`wall_now()`/map-error sequence is entangled. Cheap,
+security-relevant, and closes the "only testable through a socket" gap this ADR
+names for SigV4 specifically. **C4c** `console.rs`'s `route` is *already* at the
+target shape — it takes `&HttpRequest` plus a `ConsoleBackend` trait and returns
+a buffered tuple, with `TcpStream` confined to `handle_conn`. It moves nearly
+verbatim. **C4d** `admin.rs`'s dispatch and its ~50 handlers behind an
+`AdminHost` capability trait (a 15-method cluster-shape slice: raft, placement,
+membership, metrics history).
+
+**What does not move: `dynamo.rs`'s `run_operation` and the DDL handlers.**
+Roughly **40** `tokio::time::Instant::now()`/`sleep` schema-commit poll loops
+live **inside the handler bodies** — one per `create_table`/`update_table`/
+`create_index`/`drop_index`/backup/restore/PITR handler, plus
+`run_transact_get`'s poll — not wrapped around them. They cannot become
+`env.sleep()`/`env.now()` without an `E: Env` bound, which needs the ~21-method
+`ClientCtx` slice those handlers reach (schema propose, tablet provisioning,
+kind-write, scan/read, the RMW lock) to be generic first.
+
+A capability trait wide enough to cover that slice would simply be `ClientCtx`
+under another name — **the exact failure mode the second amendment named for
+C2**, resurfacing one rung later. So these handlers are not a C4 rung at all:
+they fold into C5, where `ClientCtx` is split and genericized properly.
+
+**On the pattern.** Four consecutive rungs have now needed re-planning on
+contact with the code (C0's `prod` gate, C2's missing leaf, C3's port collapse,
+C4's inline poll loops). The ADR's Phase C table was written at a granularity
+that reads well but does not survive implementation. Treat every remaining rung
+description as a *hypothesis to scope*, not a plan to execute — scoping has paid
+for itself four times and has never yet been wasted.
+
+#### 2026-08-28 amendment (fifth) — C5's shape, and what it deliberately leaves behind
+
+Scoping C5 found the rung larger than recorded and differently shaped. `impl
+ClientCtx` is now **6,287 lines across 97 methods** (it grew during C2–C4), and
+the clusters do not separate the way this ADR assumed.
+
+**Read and write are line-interleaved**, not regionally separable — `cp_read`
+ends where `cp_kind_write_item` begins. Read, write and 2PC share `poll_probe`;
+`cp_serve_forwarded` calls into all three by name. So "move the read path first"
+silently drags most of the rung with it: the false-leaf trap the second
+amendment already named once.
+
+**Three things genuinely resist the move**, and each needs a decision rather
+than effort:
+
+- `DataRole::rmw_lock: Arc<tokio::sync::Mutex<()>>`. `animus-node` has no
+  `tokio` dependency and `Env` exposes no async-lock primitive. Either add one
+  to the seam, or keep RMW serialization behind a `with_rmw_lock` host
+  capability implemented concretely in `animusd`.
+- `SegmentStoreHandle`/`BackupStoreHandle` hardcode `FsSegmentStore` — the
+  `prod`-gated type that **cannot exist** in `animus-node`'s build (C0). They go
+  behind a capability trait, as C2 already did for `BackupObjectStore`.
+- Only **16** of the folded-in poll loops share the mechanical deadline shape.
+  `run_transact_get`'s is round-bounded, `poll_probe` wraps a three-tier
+  term-checked confirm, and `cp_txn`'s retry allowlist carries a comment
+  recording **two reverted attempts** that caused double-materialization.
+  A shared `poll_until` helper may absorb the 16; the other three keep their
+  bespoke logic. Flattening them would reintroduce proven bugs.
+
+**Decision — the minimal cut.** C5 excludes **admin/metrics** (9 methods, ~612
+lines). Nothing in the DynamoDB wire path or Phase D's `SimCluster` reaches
+`admin_add_member`/`metrics_history`/`admin_drain`; they are served through C4d's
+`AdminHost` with `ClientCtx` as one concrete implementor, and they have their own
+real-socket coverage. They stay `ProdEnv`-hardcoded in `animusd` indefinitely.
+That trims ~10% of the rung for near-zero loss against Phase D's goals.
+
+**Decision — sequencing.** Genericize `CpGroup<E>`/`SharedEngine<E>`/
+`ControlHandle` binding/`ClientCtx` over `E: Env` **in place inside `animusd`**
+first, with `cargo build` as the check; then split into modules; then move. This
+is deliberately the "genericize in place" approach Decision 1 rejects as a
+*standing state* — but as a transient first step immediately before the physical
+move it separates type-signature churn from boundary enforcement, which is the
+same C0→C1 sequencing that has now worked twice. The step-1 diff touches every
+read/write/txn call site at once and is not meaningfully green midway, so it
+needs internal checkpoints (`CpGroup<E>` green before `ClientCtx`'s own
+signature).
+
+**Hazards for review**, from the repo's own hard-won rules — a mechanical-looking
+refactor can silently undo any of these: `poll_probe`'s term-checked confirm
+exists because index-alone confirmation false-acked; `cp_txn`'s narrow retry
+allowlist exists because wider ones double-materialized; `ProposeResult::Accepted`
+means appended, never committed, at every `CpGroup` call site the genericization
+touches; and `rmw_lock` must stay held across exactly the read-modify-write span,
+neither narrower nor wider.
+
+#### 2026-08-28 amendment (sixth) — the orphan rule blocks moving `ClientCtx`, and 91 poll sites remain
+
+Scoping C5 step 3 found two things, one mechanical and one architectural. The
+architectural one needs a maintainer decision before any of the brain moves.
+
+**1. `ClientCtx` the struct probably cannot move to `animus-node` at all.**
+Four impls already exist *because* the type is local to `animusd` while the
+traits are foreign: `ControlLeaderHost`, `BackupObjectStore`, `TtlScanHost`
+(`client_ctx_host.rs`) and `AdminHost` (`admin.rs`). Move the struct and all
+four become foreign-trait-for-foreign-type — an orphan-rule violation. Worse,
+`BackupObjectStore`'s impl reaches `DataRole.backup_store: BackupStoreHandle`,
+which names the `prod`-gated `FsSegmentStore` and so categorically cannot exist
+in `animus-node`'s build. "Move the impls too" is dead for at least that one.
+
+Two ways out, and they differ in kind, not degree:
+
+- **(i)** `ClientCtx` stays in `animusd` permanently, and the five clusters
+  become **default methods on capability traits** defined in `animus-node`,
+  with `animusd` supplying thin accessors for `control`/`edge`/`env`/`data`/
+  routing. This is the standing "narrow capability" guidance scaled up to the
+  whole brain — consistent with C2/C3/C4, but a much wider trait surface than
+  any of those.
+- **(ii)** Split `ClientCtx` into a movable pure-state struct plus an
+  `animusd`-local wrapper that re-implements the four host traits by
+  delegating. A genuine architecture change.
+
+Neither is "move the file". **This is recorded as open**; C5 step 3 must not
+guess at it.
+
+**2. Steps 1 and 2 were signature-and-location only, so the bodies still hold
+91 raw `tokio` sites** across the five modules (`schema` 40, `write_path` 25,
+`read_path` 12, `forwarding` 8, `txn_coordinator` 6), plus a bare
+`tokio::select!` in `schema`'s `WatchMetadata` long-poll and a `tokio::spawn`
+and `tokio::time::timeout` in `txn_coordinator`. `animus-node` has no `tokio`
+dependency at all, so every one must become `env.now()`/`env.sleep()` — or, for
+the `select!` and `timeout`, a hand-rolled race against `env.sleep()`, the same
+shape C3's amendment used for relay correlation — **before any of these files
+can compile there**, independent of the lint.
+
+**3. `dynamo.rs` is a hidden fourth dependency.** `kind_write_item_at_leader`,
+`eval_kind_txn_write`, `item_key`, `KindWriteOutcome`, `kind_write_is_idempotent`,
+`encode_relayed_error` are free functions there — some already `E`-generic from
+step 1, but physically in a file that is not moving. `write_path`,
+`txn_coordinator` and `forwarding` cannot be portable until these are re-homed.
+
+**4. Two resisters resolve cheaply.** `SegmentStoreHandle`/`BackupStoreHandle`
+turn out to block nothing here — a grep of all five modules returns **zero**
+references; they are touched only by files step 3 does not move, so they become
+a later rung's problem (`index_drain`, `dynamo_streams`), where C2's
+`BackupObjectStore` pattern applies directly. And `rmw_lock` wants option (a),
+a narrow `with_rmw_lock` host capability implemented concretely in `animusd` —
+**not** a new `Env` async-lock primitive. The lock is a same-node
+collision-rate optimization, not a correctness mechanism (the OCC seatbelt is
+what makes the path safe, per `dynamo.rs`'s own note on issue #285), so it does
+not belong in the seam every `Env`-generic component shares. The capability
+method also keeps the guarded span exactly where the caller puts it, which
+matters: it must cover the local read, condition check and new-value
+computation, and drop **before** the propose/confirm poll.
+
+**Decomposition.** Step 3 splits: **3a** add `R: RelayClient` to `ClientCtx` so
+`schema`/`forwarding` can use the generic `ControlHandle<E, R>`; **3b** convert
+the 91 `tokio` sites in place, still inside `animusd`; **3c** move `read_path`
+(least entangled — 12 sites, no `self.control`) once the open question above is
+settled. `write_path`, `forwarding` and `txn_coordinator` stay put until the
+`rmw_lock` capability, the `dynamo.rs` re-homing, and the `ClientCtx`-location
+decision all land. 3a and 3b are unblocked and ship now.
+
+#### 2026-08-28 amendment (seventh) — Decision 1 was right for the leaves and wrong for the brain
+
+The sixth amendment recorded that the orphan rule blocks moving `ClientCtx` into
+`animus-node`, and left the way forward open. This settles it, and in doing so
+revises **Decision 1** for the remainder of Phase C.
+
+**The realisation.** Sim-testability of the read/write/txn/forwarding/schema
+paths does not require the crate move at all. `ClientCtx<E>` is already generic
+(step 1) and its module bodies are `tokio`-free (step 3b). A
+`ClientCtx<SimEnv>` can therefore be constructed and driven **in `animusd`'s own
+tests**, with `animus-sim` as a dev-dependency. The deterministic coverage
+Phase D wants is reachable without moving a line.
+
+What the move was actually buying was **compiler-enforced determinism** —
+Decision 1's entire argument for a crate boundary over genericizing in place.
+And that is now obtainable another way. `animusd` is package-level exempt from
+`disallowed_methods` (rung B5, because it then had ~600 real call sites). Once
+the five modules are `tokio`-free, that exemption narrows: `#[deny(clippy::
+disallowed_methods)]` on `schema`/`read_path`/`write_path`/`txn_coordinator`/
+`forwarding`, with the package exemption retained only for `lib.rs` and
+`dynamo.rs`. That is compiler enforcement, scoped precisely where it matters.
+
+**Decision 1's premise has weakened, and this ADR should say so rather than
+quietly keep spending rungs against it.** It rejected genericize-in-place
+because doing so "leaves nothing to stop it — the same review-only enforcement
+that already left the hole." True when written. No longer: rung B5 built the
+lint infrastructure that did not exist then, and lint scope is a real boundary,
+not a review convention.
+
+**Decision.** Phase C stops moving code at the brain. Concretely:
+
+- `ClientCtx` and the five clusters **stay in `animusd`**, generic over
+  `E: Env`, `tokio`-free, and lint-enforced in place.
+- **Rung 3c is dropped.** So is **C6** (node assembly) — the assembly never
+  needed to move either; it was only in the plan because the brain was.
+- A `SimEnv`-driven test harness lands in `animusd`'s own tests, giving the
+  read/write/txn paths their first deterministic coverage. This is what Phase D
+  builds `SimCluster` on.
+
+**What `animus-node` keeps** is everything that moved *cleanly*, because those
+pieces genuinely were leaves: the wire types, `topology`, `decide`, the frame
+codec, the SigV4 gate, HTTP parsing, console routing, admin dispatch,
+`ControlHandle`, five capability traits, and five background loops — with 107
+unit tests and 5 sim tests running in under two seconds, none of which existed
+before this ADR.
+
+**The general lesson, for the next architecture ADR in this repo.** A crate
+boundary is an excellent enforcement mechanism for code that is already a leaf,
+and a poor one for code that is load-bearing in its own crate's type graph. The
+orphan rule is the specific mechanism, but the shape is general: a type with
+foreign-trait impls cannot leave the crate that owns those impls without taking
+them with it, and they cannot come if they touch anything the destination crate
+excludes. Ask that question *before* choosing a crate split as the enforcement
+strategy — it is cheap to check and expensive to discover six rungs in.
+
+#### 2026-08-28 amendment (eighth) — Phase C's closing rung landed; the claim held for reads/writes, with one precise DDL boundary
+
+Scoping and building the closing rung (a `SimEnv`-driven `ClientCtx` harness
+in `animusd`'s own tests, per the seventh amendment's decision) confirmed the
+core claim exactly as written: `ClientCtx<SimEnv, _>` is constructible and
+drivable in `animusd`'s own tests, with `animus-sim` as a `[dev-dependencies]`
+entry and **no visibility widened anywhere** (the harness is an in-crate
+`#[cfg(test)] mod`, reachable via Rust's ordinary "descendant module" privacy
+rule — see `crates/animusd/CLAUDE.md`'s own section on it for the full
+design). A real write (`ClientCtx::cp_kind_write_raw`) and a real read
+(`ClientCtx::cp_get`) — the exact methods `handle_request`'s `ClientRequest::
+Put`/`Get` arms call in production — both run end to end through a real
+one-voter control `RaftNode<SimEnv>` and a real one-voter CP data-plane
+`RaftKvNode<SimEnv, MemoryEngine>`, seed-reproducibly, with no sockets and no
+`ProdEnv`. This is a full outcome against the rung's stated goal, not a
+partial one requiring an unwinding later.
+
+**One thing the seventh amendment's phrasing didn't anticipate, found while
+building rather than while scoping.** That amendment listed "the read/write/
+txn/forwarding/schema paths" as what the harness would prove reachable. The
+first four are: this rung's harness drives read/write directly, and nothing
+about txn/forwarding's own genericity (steps 1/3a/3b already made both
+`tokio`-free and `E`-generic, unchanged by this rung) is in question. **Schema
+is different in kind, not degree.** `ClientCtx::propose_schema`'s
+local-propose fast path — the thing every schema-DDL call
+(`provision_tablet`, `trigger_split`, `drop_table*`, and `propose_schema`
+itself) ultimately needs — reads `ClusterEdgeState::control: Arc<Mutex<
+Vec<RaftNode<ProdEnv>>>>`, a field that is concretely `ProdEnv`-typed
+regardless of the enclosing `ClientCtx<E, R>`'s own `E`. This is not new
+technical debt this rung introduced: it is a pre-existing, deliberate design
+choice rung C3c already made and documented on `ControlHandle`'s own doc
+(`animus-node::control_handle`) — proposing a `MetaCommand` is "inherently a
+local-Raft-log operation," so `ControlHandle::propose`/`flush` were
+deliberately never added to that seam, and every proposal instead goes
+through this one concrete, `ProdEnv`-bound handle. The closing rung's harness
+therefore cannot drive `propose_schema` under `SimEnv` at all — it seeds the
+schema catalog by proposing directly on the control `RaftNode` instead
+(bypassing `ClientCtx` for setup, the same thing `animus-node/tests/
+index_backfill_sim.rs` already does for the identical reason), which is
+sufficient for read/write coverage but means DDL stays undriven here.
+
+**A second, independent blocker, also found by building rather than
+scoping**: `DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle` hardcode
+`FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of
+`E` — not a C0 feature-gate issue (`animus-env`'s `prod` feature is
+unconditionally on for `animusd`), simply that neither handle type takes an
+`E` parameter at all. Not exercised by this rung (`cp_kind_write_raw`/
+`cp_get` never call `self.data()`), so `data: None` sufficed — but it is the
+next thing a follow-on rung driving the DynamoDB-shaped write path
+(`cp_kind_write_item`) or any of the TTL/backup/stream loops under a real
+`DataRole` will hit.
+
+**Neither blocker is treated as something to fix in this rung.** Both are
+narrow, precisely located, and — per the second and fourth 2026-08-28
+amendments' standing guidance — routing around either with a new capability
+trait purely to make DDL/`DataRole` sim-drivable would be exactly the
+"contorted trait built to make a move happen" failure mode those amendments
+warn against, not a genuine leaf capability. They are recorded here as the
+scope boundary Phase D's `SimCluster` (D1) needs to know about before it
+tries to seed schema or exercise `DataRole`-dependent paths the same way:
+`SimCluster` will need its own answer to "how does a multi-node `SimEnv`
+cluster propose schema and reach quorum on it," which is a real design
+question, not a rerun of this rung's single-node bypass.
+
+**On the pattern.** This is the first rung in Phase C's delivery whose
+closing scoping pass did *not* find the plan needed re-ordering or
+re-splitting — the six earlier amendments (C0, C2, C3, C4, C5's fifth, C5's
+sixth) each corrected the *shape* of a rung before or during work. This one
+confirms the seventh amendment's redirection (stop moving code, prove
+`SimEnv`-drivability where the code already stands) was the right call, and
+the residual findings above are refinements to *what the proof covers*, not
+corrections to *how it should be built*.
+
 ### Phase D — the payoff
 
 | Rung | Work |
 |---|---|
-| D1 | `SimCluster` harness: a multi-node `animus-node` cluster driven by `SimEnv`, on B1's shared corpus scaffolding |
+| D1 | `SimCluster` harness: a multi-node cluster driven by `SimEnv`, on B1's shared corpus scaffolding. Built on `ClientCtx<SimEnv>` in `animusd`'s own tests, per the seventh 2026-08-28 amendment — not on a moved `animus-node` assembly |
 | D2 | An end-to-end DynamoDB-wire corpus — requests in at the wire edge, faults injected, resulting history checked by the existing `check_cycles`/`check_durability`/`check_convergence` |
 | D3 | Migrate the `animusd` integration suite: **keep** the tests that genuinely prove real-thread liveness (group commit, lock contention, election timing — per the engineering-lessons rule that `SimEnv` does not prove thread liveness), convert the rest. Success is measured by the `prod-liveness` CI job shrinking enough to drop its 2-attempt retry |
 | D4 | Deterministic coverage for the behaviours that have none today: the auto-split byte trigger (`lib.rs:14397`), the dropped-table GC reclaim loop, join/growth sequencing, and the backup-janitor async loop (its replicated state machine is already sim-tested in `animus-control/tests/backup_catalog.rs`; the loop driving it is not) |

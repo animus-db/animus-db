@@ -24,12 +24,39 @@ are this crate's entire job pre-Phase-C, and ~600 real call sites across 84
 files made per-site `#[allow]`s a wall nobody would read rather than a
 review aid. `disallowed_types` (HashMap/HashSet) is untouched and still
 enforced here. This is documented, ADR-tracked debt, not a license to add
-more real-time/spawn logic carelessly — it goes away when Phase C's
-`animus-node` extraction carves the `E: Env`-generic core out of this
-crate, and new code here should still prefer `Env` methods where an
-`Env`-generic home is plausible, same as before this rung.
+more real-time/spawn logic carelessly, and new code here should still
+prefer `Env` methods where an `Env`-generic home is plausible.
 
-**`lib.rs` is ~6800 lines** — grep for the symbol, don't scroll. It also holds
+**The exemption is no longer crate-wide.** ADR 0061 Phase C's closing rung
+(the seventh 2026-08-28 amendment) put an explicit
+`#[deny(clippy::disallowed_methods)]` on the `mod` declarations of the five
+`E: Env`-generic client-path modules in `lib.rs` — `schema`, `read_path`,
+`write_path`, `txn_coordinator`, `forwarding`. A lint attribute on a `mod`
+declaration applies to that module's whole body, so the package-level allow
+is overridden for all five: a reintroduced `Instant::now`, `tokio::spawn`
+or `tokio::time::{sleep,timeout}` in any of them is a hard **build
+failure**, not a review miss. (Verified as a negative control when the rung
+landed, not assumed: a temporary `Instant::now()` added to `read_path.rs`
+produced `error: use of a disallowed method` without even needing
+`-D warnings`.)
+
+This deny is what makes the determinism constraint compiler-enforced for
+the node's brain. ADR 0061 Decision 1 originally expected that enforcement
+from a crate boundary — moving `ClientCtx` into `animus-node` — and the
+orphan rule blocked it (the sixth amendment); lint scope turned out to be a
+real boundary too, and a cheaper one. The package-level allow now covers
+only what genuinely is the process boundary: `lib.rs` itself, `dynamo.rs`,
+the wire edges, the remaining background loops, and the test/bench targets.
+
+**Narrow it further as more of this crate becomes seam-clean; never widen
+it back to make a change compile** — that is precisely the hole this rung
+closes. A module that has no live `tokio`/real-clock sites left earns its
+own `#[deny(...)]` line.
+
+**`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
+step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/
+`write_path.rs`/`txn_coordinator.rs`/`forwarding.rs`, below) — grep for the
+symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
@@ -59,11 +86,27 @@ reusing the captured config is the point of the test.
 
 ## Module map (`src/`)
 
-- **`lib.rs`** (~6800 lines) — the node assembly and everything
-  routing/hosting: `Node`/`BoundNode`/`BoundControlNode`/`BoundDataNode`,
-  `ClientCtx`, `ClusterEdgeState`, CP routing, the tablet-host reconciler
-  and auto-split loops, and the `ClientRequest`/`ClientResponse` wire
-  types. See the sections below for the parts worth a contract.
+- **`lib.rs`** (~11,800 lines) — the node assembly: `Node`/`BoundNode`/
+  `BoundControlNode`/`BoundDataNode`, `ClientCtx`'s struct definition and
+  its `DataRole`/`CpGroup`/`CpRoute`/`ClusterEdgeState`/`SharedEngine`
+  neighbors, the tablet-host reconciler and auto-split loops, the admin/
+  metrics slice of `impl ClientCtx` (below), and the `ClientRequest`/
+  `ClientResponse` wire types (re-exported from `animus-node`, above).
+  `ClientCtx`'s other five method clusters live in their own files, listed
+  next — see the sections below for the parts worth a contract.
+- **`schema.rs`**/**`read_path.rs`**/**`write_path.rs`**/
+  **`txn_coordinator.rs`**/**`forwarding.rs`** (ADR 0061 rung C5 step 2) —
+  `impl<E: Env> ClientCtx<E>` split by concern, each file its own inherent
+  `impl` block for the same type: schema-catalog DDL + tablet provisioning
+  + split trigger + force-seal (`schema.rs`), linearizable + ADR 0055
+  eventually-consistent reads (`read_path.rs`), kind-scoped writes +
+  `poll_probe`'s confirm loop (`write_path.rs`), the 2PC coordinator
+  (`txn_coordinator.rs`), and leader routing + one-hop forwarding +
+  `cp_serve_forwarded`'s top-level dispatch (`forwarding.rs`, moved last
+  since it calls into every other cluster by name). See this file's own
+  ADR 0061 rung C5 step 2 entry, below, for the full method-by-method
+  breakdown, the visibility-widening lesson, and what deliberately stayed
+  in `lib.rs` instead.
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
 - **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
@@ -122,39 +165,354 @@ reusing the captured config is the point of the test.
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
   deployment over the network. `metadata_cached()` vs. `metadata_fresh()`
-  freshness contract lives here.
-- **`topology.rs`** — pure, side-effect-free routing decisions extracted from
-  `lib.rs` for unit-testing (`decide_cp_route`, `tablet_for_key`,
-  `format_not_leader_refusal`/`parse_not_leader_refusal`). All `pub(crate)`.
-- **`decide.rs`** (ADR 0061 Phase A rung A6) — pure decision predicates
-  extracted from `impl ClientCtx`, modelled directly on `topology.rs`: no
-  `&self`, no `CpGroup`/`ProdEnv`, no `tokio`, plain `#[test]`s, no bring-up.
-  `frozen_refusal`/`confirm_wait_is_futile` take primitive facts
-  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`) instead
-  of `&CpGroup` — the caller reads those fields off the real handle
-  immediately before calling in, since `CpGroup` wraps a real
-  `RaftKvNode<ProdEnv, _>` and can't be constructed without bring-up.
-  `align_split_key`/`byte_weighted_median` are pure over a `Metadata`
-  snapshot / materialized pairs and moved with their pre-existing
-  `#[cfg(test)]` coverage (`align_split_key_tests`/`auto_split_median_tests`
-  in-crate before this rung). `other_tablet_replica_addr`/
-  `decide_forward_retry` split `ClientCtx::forward_to_tablet_leader`'s
-  hinted-retry loop into a pure replica walk plus a pure next-step decision
-  (`ForwardRetryStep::{Retry,WaitElection,GiveUp}`); `lib.rs` still gathers
-  the candidate address (a `Metadata`/route-snapshot read) since that part
-  is genuinely I/O-adjacent state, not decision logic. **What did NOT
-  move**: `resolve_cp_route` already delegated its whole branch to
-  `topology::decide_cp_route`, and `not_leader_refusal` is already thin
-  wiring over `topology::format_not_leader_refusal` — both surveyed and
-  found to have no further pure logic to extract. `confirm_futility_tests`
-  (in-crate, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
-  deliberately **stayed** in `lib.rs` rather than moving alongside
+  freshness contract lives here. **`ControlHandle`/`RemoteControlClient`
+  themselves moved to `animus_node::control_handle` whole (ADR 0061 rung
+  C3c)**, genericized over `E: Env`/`R: RelayClient` — this file is now
+  just two crate-local type aliases (`ControlHandle = animus_node::
+  control_handle::ControlHandle<ProdEnv, AnimusdRelayClient>`, and
+  `RemoteControlClient`'s dual) plus `AnimusdRelayClient`, the zero-sized
+  `animus_node::host::RelayClient` implementor `RemoteControlClient::
+  metadata_fresh` relays its `Status` fetch through — a thin wrapper over
+  this crate's own **unchanged** `relay_request_with_timeout` (still a
+  fresh `TcpStream` dial on the `intra`/`client` ports, still
+  `tokio::time::timeout`-bounded, which stays here since `animus-node`
+  cannot name it at all — no `tokio` dependency, and its `disallowed_
+  methods` lint would refuse the call even if there were). Every
+  pre-existing `ControlHandle`/`RemoteControlClient` call site in
+  `lib.rs`/`admin.rs` compiles unchanged against the aliases; the two real
+  `RemoteControlClient::new`/`with_mirror` construction sites in `lib.rs`
+  gained two new arguments (`AnimusdRelayClient`, `CLIENT_TIMEOUT`), since
+  the constructor is now generic over the relay implementor and takes its
+  own transport timeout explicitly (only this crate knows that value —
+  `animus-node` doesn't duplicate the constant). See `animus-node/
+  CLAUDE.md`'s own C3a/C3b/C3c entry for the full design, including why
+  the move was clean (every field on both types was already plain data or
+  `E`-generic) rather than a generic-ification-in-place.
+- **`write_frame`/`read_frame`** keep their `TcpStream` signatures here
+  (ADR 0061 rung C3a) but now call straight into `animus_node::codec`'s
+  pure `encode_client_frame`/`frame_payload_len`/`decode_client_frame` for
+  the length-prefix arithmetic, the `MAX_FRAME_LEN` bound check, and the
+  `serde_json` encode/decode — only the actual socket reads/writes stay
+  here. `MAX_FRAME_LEN` itself is now `pub use animus_node::MAX_FRAME_LEN`
+  (re-exported at this crate's root, so every existing
+  `crate::MAX_FRAME_LEN`/`animusd::MAX_FRAME_LEN` reference kept compiling
+  unchanged).
+- **`topology`/`decide` moved to `animus-node`** (ADR 0061 rung C1) — pure,
+  side-effect-free routing decisions (`decide_cp_route`, `tablet_for_key`,
+  `format_not_leader_refusal`/`parse_not_leader_refusal`) and decision
+  predicates (`frozen_refusal`, `confirm_wait_is_futile`,
+  `read_should_retry`, `align_split_key`, `byte_weighted_median`,
+  `other_tablet_replica_addr`/`decide_forward_retry`), respectively — moved
+  verbatim into the `E: Env`-generic `animus-node` crate, visibility widened
+  `pub(crate)` → `pub` since a crate boundary now sits where an in-crate
+  module boundary used to. `lib.rs` re-exports both at this crate's own
+  root (`pub use animus_node::{decide, topology};`), so every existing
+  `topology::decide_cp_route`/`decide::frozen_refusal` call site kept
+  compiling unchanged. `decide`'s predicates (originally lifted out of
+  `impl ClientCtx` by ADR 0061 Phase A rung A6) take primitive facts
+  (`is_frozen: bool`, `engine_applied_index: u64`, `is_leader: bool`)
+  rather than `&CpGroup` — the caller in `lib.rs` still reads those fields
+  off the real `ProdEnv`-backed handle immediately before calling in, since
+  `CpGroup` can't be constructed without bring-up. `confirm_futility_tests`
+  (in-crate here, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
+  deliberately stays in `lib.rs` rather than moving alongside
   `confirm_wait_is_futile`: it proves the wired end-to-end fast-fail
   behavior through a real `CpGroup` propose/apply/poll round trip with
-  timing assertions, not the predicate in isolation — moving it into
-  `decide.rs` would have broken that module's "no bring-up" invariant for
-  no benefit, since `decide::confirm_wait_is_futile` already has its own
-  direct truth-table unit tests.
+  timing assertions, not the predicate in isolation — moving it would have
+  broken `animus-node`'s "no bring-up" invariant for no benefit, since
+  `decide::confirm_wait_is_futile` already has its own direct truth-table
+  unit tests there. See `animus-node/CLAUDE.md` for the full module docs,
+  now maintained there instead of here.
+- **`ClientRequest`/`ClientResponse`/`Surface`/`surface_of`/
+  `is_relayable_command`, plus the plain-data types they embed
+  (`KindWriteOp`/`PendingKindWrite`/`TxnTableWrite`/`TxnPrecondition`/
+  `TxnWriteCondition`), moved to `animus-node` too** (ADR 0061 rung C1,
+  same PR as the `topology`/`decide` move) — re-exported at this crate's
+  root the same way, so `dynamo.rs`'s `use crate::{ClientCtx, CpGroup,
+  KindWriteOp, ...}` and every other bare/`crate::`-qualified reference
+  kept compiling unchanged. `is_relayable_command` was also rewritten from
+  a non-exhaustive `matches!` to an exhaustive `match` in the same move —
+  see `animus-node/CLAUDE.md`'s own entry on that hardening.
+  `ListenerKind` (the listener-*identity* type, distinct from `Surface`'s
+  reachability *classification*) stayed here — it is `ProdEnv`-adjacent
+  (which real socket a connection came in on), not pure. `ClientCtx` and
+  `handle_request` have **not** moved (rung C5 step 3, not yet done) —
+  `cp_serve_forwarded` (now in `forwarding.rs`, see below)'s gating match
+  takes a type (`ClientRequest`) defined in a different crate; see
+  `animus-node/CLAUDE.md`'s note on why "grep every gating site" now spans
+  that boundary until step 3. **Hardened (a small follow-on to C1, independent of
+  C5)**: the match is now exhaustive — every `ClientRequest` variant that
+  reaches no real handling above is named explicitly in one final arm
+  (grouped by why each is never a legitimate forwarded payload), replacing
+  the `_ => ClientResponse::Error("unexpected forwarded request")`
+  wildcard that used to catch a missed variant with zero compiler signal,
+  the exact hazard the root `CLAUDE.md`'s "grep every gating match site"
+  warning describes. A future 29th `ClientRequest` variant is now a
+  compile error here until someone deliberately gives it a real arm or
+  adds it to that final list — the cross-crate *grep* is still required
+  (nothing links the two crates' files together), only the *silent-miss*
+  failure mode is gone. Regression:
+  `tests/intra_port_split.rs::cp_serve_forwarded_refuses_every_never_forwarded_variant`
+  (a live single-node cluster, since building a bare `ClientCtx` outside a
+  real bring-up isn't practical here — see this crate's own Tests section).
+- **`CpGroup`/`SharedEngine`/`ClusterEdgeState`/`CpRoute`/`ClientCtx` are now
+  generic over `E: Env` (ADR 0061 rung C5 step 1)** — still entirely
+  in-crate, nothing moved. Each is `<E: Env = ProdEnv>`: a **default type
+  parameter**, not a rename-plus-alias, so every pre-existing bare
+  reference across this crate (`spawn_common_tail`'s params, `admin.rs`,
+  `dynamo.rs`, the background loops, `tests/`) keeps compiling unchanged —
+  the definition-site default is this rung's analogue of the type-alias
+  containment C3c used for `ControlHandle`. `ClientCtx`'s own `control:
+  ControlHandle` field deliberately stays the crate's fixed `ProdEnv`-bound
+  alias (not `ControlHandle<E>`) — nothing in `ClientCtx`'s two `impl`
+  blocks reads it through anything `CpGroup`/`SharedEngine`-shaped, so
+  genericizing it would add a second, unused generic parameter for no
+  benefit. **Gotcha a reviewer will hit immediately**: a default type
+  parameter resolves to its **default**, never to an enclosing generic
+  scope's own parameter, in any position it is *elided* — inside `impl<E:
+  Env> ClientCtx<E>`, a bare `&CpGroup` in a method signature means
+  `&CpGroup<ProdEnv>`, not `&CpGroup<E>`, and produces a plain `E0308`
+  mismatch against a `CpGroup<E>` value (verified empirically before
+  relying on it — see `docs/engineering-lessons.md`). Every signature
+  inside `ClientCtx`'s two `impl` blocks that names `CpGroup`/`CpRoute`
+  explicitly is therefore spelled `<E>`; **match/pattern positions and
+  value construction did not need this** (they infer from the
+  already-typed scrutinee/call arguments), which is why the ~60
+  `CpRoute::Local(leader)`-shaped match arms across those two `impl`
+  blocks needed zero changes. Three call chains cross into sibling
+  functions that also had to gain `<E: Env>` for the whole crate to
+  compile: `index_drain::{seal_now, pitr_seal_now, hot_read,
+  clear_backfill_cursor}`, `dynamo::{kind_write_item_at_leader,
+  eval_kind_txn_write, collection_bytes_at_leader}`, and this crate's own
+  `median_split_key`. Every one of these seven is a signature-only change;
+  no call-site logic moved. `DataRole` (holding `rmw_lock`,
+  `segment_store`/`backup_store`, etc.) needed **no** change at all — none
+  of its fields are `E`-typed, so it stays fully concrete and
+  `ClientCtx<E>.data: Option<DataRole>` is untouched; `kind_write_item_
+  at_leader`'s `rmw_lock` acquire/release span (scoped to read+evaluate
+  only, issue #285) is unchanged byte-for-byte. `handle_request` and moving
+  `ClientCtx` itself out of this crate are still rung C5's remaining work
+  (step 3, below the next entry).
+- **`impl<E: Env> ClientCtx<E>` split into five submodules (ADR 0061 rung
+  C5 step 2)** — `lib.rs`'s two `impl` blocks (6,287 lines, 97 methods per
+  the ADR's fifth 2026-08-28 amendment) held every `ClientCtx` method in
+  one place; each of the five clusters that amendment identified is now
+  its own file, each with its own `impl<E: Env> ClientCtx<E> { .. }`
+  block — Rust allows a type's inherent `impl` to be split across modules
+  in the same crate, so this was a mechanical, behavior-preserving
+  relocation (doc comments, attributes, and bodies moved verbatim; no
+  logic changes, no merged/split methods). Moved in the ADR's suggested
+  order, one commit per cluster: **`schema.rs`** (18 methods — schema-
+  catalog DDL proposals, tablet provisioning/serveability wait, node
+  registration, table/tablet drop, split trigger, force-seal, stream
+  growth, backfill-cursor clearing: `propose_schema`, `provision_tablet`,
+  `await_table_serveable`, `watch_metadata`, `register_node`,
+  `drop_table*`, `trigger_split`, `force_seal_tablet`,
+  `force_pitr_seal_tablet`, `grow_stream*`, `clear_backfill_cursor*`,
+  `read_stream_hot_records`, plus their private helpers); **`read_path.rs`**
+  (21 methods — `cp_read`, `cp_read_snapshot`, `cp_scan`/`cp_scan_kind*`,
+  and the ADR 0055 eventually-consistent-read fast path:
+  `cp_read_eventual*`, `cp_scan_*_eventual`, `cp_stale_local`,
+  `cp_stale_forward_target`, `relay_stale_read`, `record_eventual_read`,
+  `cp_get_local_resolving`, `confirm_or_push`, `cp_get_local_snapshot`,
+  `cp_scan_local`, `cp_scan_kind_local`, `cp_get`); **`write_path.rs`**
+  (13 methods — `cp_kind_write_item`, `cp_kind_write_raw*`,
+  `cp_kind_local`, `poll_probe`, `cp_batch_local`/`cp_batch_propose`,
+  `cp_put_local`/`cp_delete_local`, `seed_rows_local`/`seed_child_rows`);
+  **`txn_coordinator.rs`** (14 methods — the 2PC coordinator:
+  `txn_stage_local`, `txn_prepare*`, `txn_decide_anchor`,
+  `txn_resolve_participant`, `txn_status`, `txn_record_view`,
+  `txn_verify`, `recovery_resolve`, `record_recovery_metric`,
+  `split_group`, `check_preconditions`, `txn_recover`, `cp_txn`); and
+  **`forwarding.rs`**, moved last per the ADR's own ordering rationale
+  since `cp_serve_forwarded` calls into every other cluster by name so its
+  callees needed stable homes first (17 methods — `cp_route`,
+  `resolve_cp_route`, `tablet_for`, `cp_leader_hint`, `cp_forward_target`,
+  `not_leader_refusal`, `other_tablet_replica_addr`, `cp_forward`,
+  `forward_to_tablet_leader`, `relay`, `cp_serve_forwarded`, and the
+  route/intra-addr accessors `route_addr`/`route_snapshot`/
+  `control_leader_hint`/`intra_addr`/`intra_route_snapshot`/
+  `intra_control_leader_hint`). Per the ADR's minimal cut, the **admin/
+  metrics slice stayed in `lib.rs`** (9 methods: `metrics_text`,
+  `metrics_json`, `stream_change_rates`, `metrics_history`,
+  `admin_drain`, `admin_add_member`, `admin_remove_member`,
+  `admin_add_control_member`, `admin_remove_control_member`) — nothing in
+  the DynamoDB wire path or a `SimCluster` reaches them, and they have
+  their own real-socket coverage; so did a handful of small,
+  genuinely-crate-wide accessors that don't belong to any one cluster
+  (`effective_metadata`, `metadata_fresh`, `data`/`data_opt`,
+  `not_leader_error`) — moving them into one cluster would only have
+  forced the identical `pub(crate)` widening onto them with no locality
+  benefit, since `admin.rs`/`dynamo.rs`/`backup_capture.rs`/
+  `backup_restore.rs`/`client_ctx_host.rs`/`dynamo_streams.rs`/
+  `index_drain.rs` and every one of the five new clusters all call them.
+  **The visibility lesson (mechanical, not a design call)**: Rust's
+  privacy rule is "visible in the defining module and its descendants,"
+  never ancestors or siblings — so a method that used to be a bare `fn`
+  (visible everywhere in the crate, since every module here is a
+  descendant of the `lib.rs` root) had to widen to `pub(crate)` the
+  moment it moved into a child module (`schema`/`read_path`/etc.) *and*
+  gets called from a sibling (another one of the five, or `dynamo.rs`/
+  `admin.rs`) or from code that stays in the parent (`lib.rs` itself:
+  `handle_request`, the admin methods, an in-crate `#[cfg(test)] mod`,
+  background-loop free functions). Conversely, a method that stays
+  private and lives in `lib.rs` (`CpGroup`'s own methods, free functions,
+  constants) needed **no** widening to stay callable from the five new
+  child modules — a parent's private items remain visible to every
+  descendant, so this direction was already free. 30 methods widened
+  from private to `pub(crate)` across the five clusters for this reason
+  (see each cluster's own commit message for the exact list and why);
+  `docs/engineering-lessons.md` has the general-purpose version of this
+  lesson. Each module's `use` list is explicit (traced via `cannot find`
+  compiler errors from a temporary `use crate::*;`, then narrowed) rather
+  than a blanket glob-import, per this rung's own "keep each module's use
+  list tight" instruction. Two extraction-tooling gotchas worth recording
+  for anyone repeating this kind of split: a multi-line attribute (e.g.
+  `#[tracing::instrument(\n    name = "...",\n)]`) and a single-line
+  attribute followed by a trailing `// comment` (`#[allow(clippy::
+  too_many_arguments)] // mirrors ...`) both need bracket-aware scanning
+  to find their true start when walking upward from a `fn` signature — a
+  naive "stop at the first line not starting with `///`/`#[`" heuristic
+  leaves the attribute orphaned above the *next* function once the one it
+  belonged to is extracted, which compiles as a **different**,
+  non-obviously-related error (`error: expected item after attributes`,
+  or a phantom `too_many_arguments` clippy failure on the wrong function)
+  rather than something that points at the actual mistake.
+- **`ClientCtx<E, R>` gains `R: RelayClient` (ADR 0061 rung C5 step 3a, the
+  sixth 2026-08-28 amendment)** — `control` was the crate's fixed
+  `ProdEnv`/`AnimusdRelayClient`-bound `control_handle::ControlHandle`
+  alias; it is now the *generic* `animus_node::control_handle::
+  ControlHandle<E, R>`, since `schema.rs`'s `watch_metadata` and
+  `forwarding.rs`'s leader routing both read `self.control` from inside a
+  `ClientCtx<E, R>`-generic `impl` block. `ClientCtx<E: Env = ProdEnv, R:
+  RelayClient = AnimusdRelayClient>` — the same default-type-parameter
+  technique step 1 used for `E` alone, so every pre-existing bare
+  `ClientCtx` reference keeps compiling unchanged. All **six** `impl`
+  blocks (`lib.rs` and the five split modules) became `impl<E: Env, R:
+  RelayClient> ClientCtx<E, R>`, not just the two that read `self.control`
+  directly — `forwarding.rs` calls into all four siblings by name, and
+  `lib.rs`'s own admin/metrics slice is called from several of them, so the
+  bound has to be uniform for the call graph to typecheck generically.
+  **Three things this rung had to get right that a mechanical
+  find-and-replace would have missed**:
+  - **The elision gotcha bites the pattern match, not just signatures.**
+    `schema.rs`'s `let ControlHandle::Local(raft) = &self.control else {
+    .. }` used to match against `crate::ControlHandle` (this crate's own
+    concrete alias); inside a `ClientCtx<E, R>`-generic body that alias
+    resolves to its own default (`ControlHandle<ProdEnv,
+    AnimusdRelayClient>`) and fails to match a `ControlHandle<E, R>`
+    scrutinee for generic `E`/`R` — a plain `E0308` mismatch, confirmed
+    with a two-line scratch program before touching the real file (see
+    `docs/engineering-lessons.md`). The fix imports `animus_node::
+    control_handle::ControlHandle` directly (the *generic* enum) under the
+    same name, shadowing the crate alias import in that one file — every
+    other file keeps using the concrete `crate::ControlHandle` for its own
+    (still-concrete) uses.
+  - **`RelayClient` needed `Clone + Send + Sync + 'static` added as
+    supertrait bounds** (`animus-node::host`), mirroring `Env`'s own
+    supertrait shape. Without it, `ClientCtx<E, R>`'s `#[derive(Clone)]`
+    and `txn_coordinator.rs`'s one `env.spawn_task` capturing a cloned
+    `ClientCtx` (see step 3b below) don't typecheck for a *generic* `R` —
+    only the one concrete implementor that exists today
+    (`AnimusdRelayClient`, a zero-sized type that already trivially
+    satisfied all four). The alternative — bounding just the one `impl`
+    block that needs it — was rejected: `txn_status` (needing the bound)
+    and `cp_read` (not needing it) live in different files but are called
+    from each other's callers' generic scope, so the bound would have had
+    to cascade through most of the five-module call graph anyway.
+  - **A `Self`-free associated function breaks type inference for `R`.**
+    `ClientCtx::cp_kind_local(leader, ..)` (no `&self`, called from three
+    sites in `dynamo.rs`/`lib.rs`'s in-crate tests) has nothing in its
+    arguments that pins down which `R` to use once `R` is a real generic
+    parameter, not a `_`-inferred default — `error[E0283]: type
+    annotations needed`. Fixed with an explicit turbofish
+    (`ClientCtx::<E, R>::cp_kind_local(..)` inside a generic caller,
+    `ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(..)` inside a
+    concrete-`ProdEnv` test) at each of the three call sites — the compiler's
+    own suggested fix. Any other `Self`-free `ClientCtx` associated
+    function reached the same way would need the same treatment.
+  Four free functions taking `ctx: &ClientCtx<E>` explicitly (mirroring
+  step 1's own "three call chains cross into sibling functions" note) also
+  gained the `R` parameter: `dynamo::{kind_write_item_at_leader,
+  eval_kind_txn_write}`, `index_drain::{pitr_seal_now, seal_now}` — none of
+  the four reads `ctx.control`, they just need the signature to match their
+  now-`ClientCtx<E, R>`-generic callers in `write_path.rs`/
+  `txn_coordinator.rs`/`schema.rs`/`forwarding.rs`.
+- **The 91 raw `tokio` sites the sixth amendment counted are converted
+  (ADR 0061 rung C5 step 3b)** — every `tokio::time::{Instant::now,sleep}`
+  in `schema.rs`/`read_path.rs`/`write_path.rs`/`txn_coordinator.rs`/
+  `forwarding.rs` becomes `self.env.now()`/`self.env.sleep(..)` (a bare
+  `deadline = tokio::time::Instant::now() + X` becomes `self.env.now().
+  saturating_add(X)` — `Nanos` has no `Add<Duration>` impl, only the
+  `saturating_add`/`duration_since` shape `animus-cp-data::
+  cluster_segment_store`'s own deadline loops already use). Verify with
+  `grep -nE "tokio::(time|spawn|select)"` over the five files — it returns
+  nothing (comments referencing the pre-conversion shape by name are the
+  only remaining hits). **Four sites needed more than the mechanical
+  substitution**:
+  - **`schema.rs`'s `WatchMetadata` long-poll's bare `tokio::select!`**
+    (racing the metadata watch against the server-side timeout) has no
+    `Env` equivalent — replaced with `futures::future::select(watch.
+    changed(last_seen), self.env.sleep(WATCH_METADATA_SERVER_TIMEOUT))`,
+    the same shape `animus-cp-data::cluster_segment_store`'s own
+    relay-correlation race already uses. Both arms are `Unpin` without
+    `pin_mut!` (`MetadataChanged` is a plain, non-self-referential struct;
+    `env.sleep` is `async_trait`-boxed) — whichever resolves first is
+    discarded either way, preserving the exact "change or timeout,
+    whichever first" semantics.
+  - **`txn_coordinator.rs`'s awaited-branch `tokio::time::timeout`**
+    (bounding `resolve_all_parallel` by `TXN_RESOLVE_ALL_AWAIT_BUDGET`)
+    became the same `futures::future::select` shape, `Box::pin`ning the
+    resolve future first since an `async move` block capturing locals
+    across `.await` is not `Unpin` in general (unlike the plain-struct
+    `MetadataChanged` above) and `select` requires both arms to be.
+  - **`txn_coordinator.rs`'s fire-and-forget `tokio::spawn`** became
+    `self.env.spawn_task(..)` (needs `use animus_env::EnvExt;` — the trait
+    providing `spawn_task` must be in scope, unlike the supertrait methods
+    `E: Env` already brings in). Under `ProdEnv` this is `tokio::spawn`
+    underneath, so the detached, fire-and-forget lifetime is unchanged: the
+    call still returns immediately and the resolve either completes or is
+    dropped on process exit, with no handle kept either side of the
+    conversion.
+  - **Two `tokio::time::Instant::now().elapsed()` reads** (a forwarded
+    2PC-recovery caller's clock-skew fallback, `txn_coordinator.rs`) had no
+    literal translation — `Nanos` has no `elapsed()`. The original measured
+    the near-zero gap between minting an `Instant` and immediately reading
+    it back (not any real wait — `Instant::now()` then `.elapsed()` on the
+    same expression), so the faithful equivalent is two back-to-back
+    `self.env.now()` reads and `Nanos::duration_since`'s own saturating
+    subtraction, reproducing the identical near-zero result rather than
+    "fixing" what reads like a pre-existing latent bug (this comparison's
+    `now_ms` ends up far below the `wall_ms`-scale threshold it's checked
+    against either way) — an incidental bug gets its own PR, never a
+    drive-by fix bundled into a testability rung.
+  **A subtler bug this rung's own mechanical pass introduced and had to
+  catch by building, not by inspection**: seven `write_path.rs` functions
+  (`poll_probe`, `cp_batch_local`, `cp_batch_propose`, `cp_put_local`,
+  `cp_delete_local`, `cp_kind_local`, `seed_rows_local`) take `leader:
+  &CpGroup<E>` with **no `&self`** at all (per step 1's own doc, above) —
+  a blind `tokio::time::Instant::now()` → `self.env.now()` regex on the
+  whole file compiles only in files where *every* site happens to be
+  inside a `&self` method, and silently produces `error[E0425]: cannot
+  find value \`self\`` everywhere it isn't. The fix reads `leader.env()`
+  instead (a private `CpGroup<E>` accessor already visible to this
+  descendant module, unchanged from step 1) — every regex-driven or
+  find-and-replace conversion pass over this crate needs a `cargo build`
+  immediately after, function-signature-aware, not a visual diff; see
+  `docs/engineering-lessons.md`.
+- **`client_ctx_host.rs`** (new, ADR 0061 rung C2) — `ClientCtx`'s `impl`
+  blocks for `animus-node`'s three host-capability traits
+  (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
+  that crate's own `host` module doc for the shape and why three, not
+  one). Every method here is a **thin, logic-free delegation** —
+  `self.edge.leader_handle()`, `self.data_opt().map(|d| d.backup_store
+  ...)`, one call into `dynamo::kind_write_item_at_leader` — nothing is
+  decided here that wasn't already decided by an existing `ClientCtx`/
+  `CpGroup`/`BackupStoreHandle` method. This is the seam that let five of
+  the six leaf background loops (`ttl_reaper.rs`, `index_backfill.rs`,
+  `backup_completion.rs`, `backup_janitor.rs`, `pitr_janitor.rs` — each
+  now a thin wrapper into `animus-node`, see their own entries below) move
+  without `ClientCtx` itself moving, which doesn't happen until rung C5.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
   `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
@@ -163,10 +521,13 @@ reusing the captured config is the point of the test.
   /metrics` special case, before every other request reaches `dispatch`/
   `execute_routed`: when `ctx.dynamo_auth` is `Some` (a `dynamo_auth`
   cluster-config section, or `--dynamo-auth PATH` on a config-less startup
-  mode), the request's method/path/query/headers/body build an
-  `animus_dynamo::sigv4::SigV4Request`, `ctx.env.wall_now()` supplies "now"
-  (never `SystemTime::now()`, ADR 0051 discipline), and a verification
-  failure short-circuits straight to a `400` with the AWS-faithful
+  mode), `ctx.env.wall_now()` supplies "now" (never `SystemTime::now()`,
+  ADR 0051 discipline) and is handed straight into `animus_node::
+  sigv4_gate(&request, credentials, now_epoch_ms)` (ADR 0061 rung C4b) —
+  the build-`SigV4Request`-then-`verify` sequence itself is pure and lives
+  in `animus-node` now; this connection handler does only the clock read
+  and the response-shaping on failure. A verification failure short-
+  circuits straight to a `400` with the AWS-faithful
   `com.amazon.coral.service#...` body (`sigv4_error_body`, rendered via
   `serde_json` rather than `WireError::to_json`'s DynamoDB-namespace
   prefix — a different `__type` namespace entirely). This gates the item
@@ -187,6 +548,13 @@ reusing the captured config is the point of the test.
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
   sealed-vs-open serve split, `StreamHotRead`) is in
   `docs/streams-notes.md` — this entry is just the module pointer.
+- **`pitr_janitor.rs`'s two loop bodies moved to `animus_node::
+  pitr_janitor`** (ADR 0061 rung C2) — this module is now a thin wrapper
+  for both `pitr_snapshot_loop` and `pitr_janitor_loop`, same shape as
+  `backup_completion.rs`'s own move above (`DEFAULT_PITR_RETENTION`/
+  `DEFAULT_PITR_SNAPSHOT_CADENCE` re-exported from there too, so every
+  existing `pitr_janitor::DEFAULT_*` call site elsewhere in this crate kept
+  compiling unchanged).
 - **`pitr_janitor.rs`** (ADR 0059 §9, Train 3) — PITR's two control-plane-
   leader-only background loops, mirroring `segment_janitor.rs`/
   `backup_janitor.rs`'s own shape: `pitr_snapshot_loop` (periodic
@@ -206,6 +574,15 @@ reusing the captured config is the point of the test.
   scope gap. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
   lives in `index_drain.rs`, alongside the stream seal arm it mirrors — see
   that module's doc.
+- **`segment_janitor.rs` did NOT move in rung C2** (ADR 0061) — the one of
+  the six leaf background loops that rung's scoping left behind, on
+  purpose. Its replica-repair phase reads live bytes from whichever
+  recorded replicas are still `Active` cluster members and pushes them to
+  freshly-chosen targets via `SegmentStoreHandle::repair` — real placement/
+  membership orchestration, not a value nameable as one narrow I/O
+  delegation the way `BackupObjectStore::backup_put` captures "durably
+  store these bytes somewhere." See `animus-node/CLAUDE.md`'s rung C2
+  entry for the fuller reasoning; this file's design (below) is unchanged.
 - **`segment_janitor.rs`** (ADR 0043 §A9) — the **segment janitor**: a
   control-plane-**leader**-only background loop (`segment_janitor_loop`)
   doing two-phase retention reclaim + replica repair over the whole
@@ -218,6 +595,15 @@ reusing the captured config is the point of the test.
   children), never tablet presence, and the max-epoch pin applies to live
   tablets only (a retired chain can never seal again) — both halves
   red-proven in `tests/stream_janitor.rs::retired_parents_*`.
+- **`index_backfill.rs`'s loop body moved to `animus_node::
+  index_backfill`** (ADR 0061 rung C2 — the first loop moved, and the only
+  one needing no capability beyond `ControlLeaderHost<E>`: `metadata()`/
+  `propose()` live directly on `animus_control::RaftNode<E>`, already
+  `E`-generic, no `ClientCtx` in sight). This module is now a thin
+  wrapper; `tests/index_backfill.rs` (below) is unchanged and still the
+  real-cluster regression net, alongside a new `SimEnv`-driven corpus in
+  `animus-node`'s own `tests/index_backfill_sim.rs` (a real single-voter
+  `RaftNode<SimEnv>`, no sockets).
 - **`index_backfill.rs`** (ADR 0045 §4) — the secondary-index
   **backfill-completion aggregator**: another control-plane-**leader**-only
   background loop (`index_backfill_loop`), same self-gating idiom as
@@ -320,6 +706,22 @@ reusing the captured config is the point of the test.
   token-aligned, so it never exercised the bug either way — see
   `docs/engineering-lessons.md`'s Testing entry on this exact
   fixture-vs-production-shape gap).
+- **`ttl_reaper.rs`'s loop body moved to `animus_node::ttl_reaper`** (ADR
+  0061 rung C2) — the widest of this rung's five moves: the scan/cursor/
+  expiry-decision control flow below is now `E: Env`-generic over a new
+  `TtlScanHost` trait, but the actual delete still delegates one call
+  (`TtlScanHost::ttl_delete_if_attribute_equals`) straight into this
+  crate's own `dynamo::kind_write_item_at_leader` — the OCC seatbelt, GSI/
+  LSI/change-log/stream side effects, and `rmw_lock` scoping described
+  below are **not** duplicated or reimplemented, only reached through one
+  more layer of indirection. `DEFAULT_TTL_SWEEP_INTERVAL` re-exports from
+  there, so every existing `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL` call
+  site kept compiling unchanged. A new `SimEnv`-driven test
+  (`animus-node`'s `tests/ttl_reaper_sim.rs`) drives the moved loop against
+  a **fully synthetic** host — no `CpGroup`, no `ClientCtx`, not even a
+  `RaftNode` — the first deterministic coverage this loop has ever had;
+  `tests/dynamo_ttl.rs` (below) is unchanged and stays the real-cluster
+  regression net for the write-path side this loop delegates to.
 - **`ttl_reaper.rs`** (ADR 0051) — the DynamoDB-style **TTL reaper**: a
   per-node background loop, spawned everywhere `index_drain::
   change_consumer_loop` is (combined + data-only; see the module map
@@ -373,15 +775,59 @@ reusing the captured config is the point of the test.
   alongside its sibling DDL-relay tests.
 - **`admin.rs`** (~58 KB) — the admin/debug HTTP-JSON endpoint (ADR 0020):
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
-  surface; also serves the SPA static assets.
-- **`http.rs`** — shared hand-rolled HTTP/1.1 helpers (request parser + response
-  writers) used by `dynamo.rs`, `admin.rs`, and `console.rs`. **`HttpRequest::
-  headers` (ADR 0057)** retains every header (lowercased name → value, a
-  repeated header's values comma-joined in receipt order — the SigV4
-  canonical form) instead of the three fields (`target`/`content-length`
-  handling/`connection`) the parser used to keep and discard the rest of;
-  those three keep their own derived fields (every existing caller
-  untouched), `headers` is purely additive.
+  surface; also serves the SPA static assets. **The `(method, path)`
+  dispatch table moved to `animus_node::admin` (ADR 0061 rung C4d)**,
+  generic over a new `animus_node::host::AdminHost` trait: this file's own
+  `dispatch` is now a one-line wrapper (`animus_node::admin::dispatch(ctx,
+  &request.method, &request.path, &request.query, &request.body).await`),
+  and `impl AdminHost for ClientCtx` (right below it) is a thin, logic-free
+  delegation to every handler function this file already had — `config_view`,
+  `raft_view`, `raftkv_view`, `storage_lsm`/`storage_control`/`storage_wal`/
+  `storage_wal_segment`/`storage_key`/`storage_scan`, `system_table`,
+  `backups_view`/`restores_view`, `metrics_view`/`metrics_history_view`,
+  `member_drain_status`, `health`, every `action_*` function, and
+  `control_members_view`, none of which moved or changed. **Scoping this
+  rung found the trait needs a materially wider surface than the ADR's own
+  starting estimate** ("a 15-method cluster-shape slice"): this file
+  actually touches 19 raw `ClientCtx` members, and three of them
+  (`edge`/`control`/`control_storage`) are handles hardcoded to `ProdEnv`
+  whose *own* further methods (`hosted_groups`, `local_cp`, `lsm_sstables`,
+  raw engine/WAL scans, …) are what most handlers actually call — so
+  `AdminHost` is drawn at "one method per admin route" instead, each
+  returning the exact `Value`/`(u16, Value)` the route already produced;
+  see that trait's own doc in `animus-node` for the full reasoning.
+  `action_data_dynamo`/`action_data_seed` still reach `dynamo::
+  execute_routed`/the kind-write path exactly as before — unmoved,
+  unmodified, matching this rung's exclusion of `dynamo.rs`'s own
+  handlers. The `OPTIONS`/CORS preflight, the dashboard's static JS/CSS
+  assets, and the dashboard shell HTML (`handle_conn`, `static_asset`,
+  `is_ui_path`) stay here, checked before `dispatch` is ever reached — they
+  read `crate::dashboard`-owned `include_str!` constants no `AdminHost`
+  method has a reason to carry. See `animus-node/CLAUDE.md`'s own rung C4d
+  entry for the full design and the finding behind the wider-than-expected
+  surface.
+- **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
+  0061 rung C4a): `read_http_request` does only `stream.read()`, handing
+  every parsing decision (header-block framing, `Content-Length`
+  validation, header lowercasing/comma-joining) to `animus_node::http::
+  parse_request_head`; `write_response`/`write_response_with` do only
+  `stream.write_all()`, formatting via `animus_node::http::
+  format_response`. `HttpRequest` itself, `query_param`, `CORS_HEADERS`,
+  and `eof` are re-exported from there (`percent_decode` isn't any more —
+  its one caller moved to `animus-node` whole alongside `console.rs`, rung
+  C4c, so nothing in this crate calls it directly today) — every existing
+  `http::*` call site across `dynamo.rs`/`admin.rs` kept compiling
+  unchanged. **`HttpRequest::headers` (ADR 0057)** retains every header
+  (lowercased name → value, a repeated header's values comma-joined in
+  receipt order — the SigV4 canonical form) instead of the three fields
+  (`target`/`content-length` handling/`connection`) the parser used to keep
+  and discard the rest of; those three keep their own derived fields (every
+  existing caller untouched), `headers` is purely additive. Unit-tested
+  directly in `animus-node` now (malformed request line, missing/oversized/
+  non-numeric `Content-Length`, duplicate-header comma-joining,
+  percent-decoding edge cases, response-formatting round trips) — this
+  crate's own real-socket edge tests (`tests/dynamo_wire.rs` and friends)
+  are still the regression net for the two thin wrappers themselves.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
@@ -402,7 +848,20 @@ reusing the captured config is the point of the test.
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
   never the admin port (documented no-auth, trusted-interface-only, ADR
-  0020) and never a route on the DynamoDB wire listener. Bound on combined
+  0020) and never a route on the DynamoDB wire listener. **The pure routing
+  moved to `animus_node::console` (ADR 0061 rung C4c)** — every request/
+  response type, the `ConsoleBackend` trait, and `route` itself, moved
+  nearly verbatim (that module was already at this rung's target shape).
+  This file is now a thin wrapper: `serve`/`handle_conn` (the real
+  `TcpListener`/`TcpStream` accept loop, never under `SimEnv`), the three
+  `include_str!`'d shell assets (kept here, alongside the shared
+  `fonts.css`/`tokens.css` `dashboard.rs`'s operator console also
+  `include_str!`s — moving them would mean duplicating or reaching across
+  the crate boundary, which this rung's "no behaviour change" charter isn't
+  here to buy), and re-exports of the types `lib.rs`'s `impl
+  console::ConsoleBackend for ClientCtx` names by path. See
+  `animus-node/CLAUDE.md`'s own rung C4c entry for the moved module's
+  design. Bound on combined
   and data-only nodes only; a control-only node hosts no CP-data tablet, so
   it binds none (`BoundControlNode::start_control_with` passes `None` into
   `spawn_common_tail`'s `console_listener` parameter). **This module still
@@ -1986,6 +2445,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ttl_reaper.rs`'s "read for free, wake only to write" discipline — never
   a standing veto like the split-build driver's). Spawned on combined and
   data-only nodes only (a control-only node hosts no CP-data tablet).
+- **`backup_completion.rs`'s loop body moved to `animus_node::
+  backup_completion`** (ADR 0061 rung C2) — this module is now a thin
+  wrapper (`ctx.env.clone()` + a call into the moved, `E: Env`-generic
+  loop; `ClientCtx` implements the two capability traits it needs,
+  `client_ctx_host.rs`). Design unchanged from the paragraph below, which
+  now describes the moved code — see `animus-node/CLAUDE.md`'s own rung C2
+  entry for the trait shapes.
 - **`backup_completion.rs`** (ADR 0059 §3/§4, Train 1 PR③) — the on-demand
   backup **completion aggregator**: a control-plane-**leader**-only
   background loop (`backup_completion_loop`), the identical self-gating
@@ -2007,6 +2473,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
   and control-only nodes (never data-only, which never becomes control
   leader at all).
+- **`backup_janitor.rs`'s loop body moved to `animus_node::backup_janitor`**
+  (ADR 0061 rung C2) — this module is now a thin wrapper, same shape as
+  `backup_completion.rs`'s own move above. The regression tests that used
+  to live in this file's own `#[cfg(test)] mod tests` (a hand-rolled
+  `FsSegmentStore` + `reclaim_one` helper) moved with the logic, now
+  `animus_node::backup_janitor::tests` against a synthetic
+  `BackupObjectStore` and a real single-voter `RaftNode<SimEnv>` — see
+  that crate's own doc.
 - **`backup_janitor.rs`** (ADR 0059 §3, Train 1 PR④) — the on-demand
   backup **janitor**: a control-plane-**leader**-only background loop
   (`backup_janitor_loop`), the identical self-gating shape as
@@ -2404,10 +2878,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   plausible index, so the final image would degenerate back into the
   unfiltered whole-table re-ship rung 8 fixed) — a known regression bought
   for no saved scan. The two are simply different value spaces and neither
-  bounds the other, which is the rule to remember; note this driver runs
-  only over `ProdEnv` (`animusd` has no `animus-sim` dependency), so
-  simulated-clock reasoning does not apply to it either way. No code
-  changed; the pre-pass scan stays.
+  bounds the other, which is the rule to remember; note this driver still
+  runs only over `ProdEnv` in production (nothing in the split-build path
+  is reached by the `SimEnv` `ClientCtx` harness below — see that
+  section), so simulated-clock reasoning does not apply to it either way.
+  No code changed; the pre-pass scan stays.
 - Several gotchas here are instances of cross-cutting lessons — port-TOCTOU
   bring-up retries (`support::restart_same_addrs`), "a flaky `ProdEnv` test is a
   real bug", restart-test discipline (poll for catch-up, not leadership),
@@ -2415,12 +2890,151 @@ route below the edge through the same `ClientCtx` CP primitives.
   never-accepted from accepted-unconfirmed. See the **engineering-lessons log
   (root `CLAUDE.md`)** for the general form of each.
 
+## SimEnv `ClientCtx` harness (ADR 0061 Phase C's closing rung)
+
+`lib.rs`'s `simenv_client_ctx_tests` (an in-crate `#[cfg(test)] mod`, run via
+`cargo test -p animusd --lib`) is this crate's **first** `SimEnv`-driven
+test: it constructs a real `ClientCtx<SimEnv, _>` — the production struct
+`ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient>`
+instantiated at `E = SimEnv` — and drives a genuine write + read through its
+own `cp_kind_write_raw`/`cp_get` methods, deterministically and
+seed-reproducibly, with no sockets and no `ProdEnv` anywhere in the run.
+This is what makes the seventh 2026-08-28 ADR 0061 amendment's claim ("a
+`ClientCtx<SimEnv>` can be constructed and driven in `animusd`'s own tests")
+true rather than an unverified assertion — see that amendment, and its
+eighth-amendment follow-up, for the full account of what this rung found.
+
+**What it constructs.** One `Simulator`, a one-voter control `RaftNode<
+SimEnv>` (node 0), a one-voter CP data-plane `RaftKvNode<SimEnv,
+MemoryEngine>` (node 1, tablet 1, a whole-ring `StorageScope`) registered
+into a real `ClusterEdgeState<SimEnv>`, and a real `ClientCtx<SimEnv,
+NeverRelay>` struct-literal built from those handles plus placeholder
+`AdminInfo`/routing-table/metrics fields. `NeverRelay` is a zero-sized
+`RelayClient` implementor whose `relay` always returns
+`ClientResponse::Error(..)` — sound because this fixture is single-node and
+its one tablet is always led locally, so nothing in the paths this harness
+drives ever needs to relay. `data: None` (no `DataRole`) is deliberate, not
+a shortcut — see "What it cannot drive" below.
+
+**Why an in-crate `#[cfg(test)] mod`, not `tests/*.rs`.** `ClientCtx`'s own
+fields, `ClusterEdgeState::register_raftkv`, `CpGroup`, and `AdminInfo` are
+all private to this crate. Rust's privacy rule ("visible in the defining
+module and its descendants") lets a child module of `lib.rs` construct every
+one of them exactly as they already are; an external `tests/` file could
+only reach them by widening several types' visibility for no reason beyond
+"an external file wants to construct them once." **This rung widened no
+visibility at all** — the same precedent `confirm_futility_tests`/
+`kind_batch_signal_tests` already set in this file.
+
+**What it can drive.** `cp_kind_write_raw` and `cp_get` — the *exact*
+methods `handle_request`'s `ClientRequest::Put`/`Get` arms call in
+production. The harness calls them directly rather than through
+`handle_request` itself, because `handle_request` (and
+`dynamo::marker_batch_write_raw`, the thin wrapper the real `Put` handler
+goes through) are both hardcoded to `&ClientCtx` = `ClientCtx<ProdEnv,
+AnimusdRelayClient>` and so cannot be called with a `SimEnv` context at all
+— they simply never needed a second type parameter before this rung, and
+genericizing them is not needed to prove this rung's claim (see "Not yet
+generic" below). Driving `cp_kind_write_raw` exercises the real
+route → propose → confirm loop, including the exponential confirm-poll
+backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`); `cp_get` exercises the real
+route → local-resolve loop. Both are spawned onto `ctx.env` and driven with
+`Simulator::run_for` (never `block_on` — see the gotcha below), following
+the corpus's converged-or-timeout idiom rather than a fixed-deadline assert.
+
+**What it cannot drive, and why (read before extending it) — two separate,
+precisely located blockers, neither introduced by this rung:**
+
+- **Schema DDL (`ClientCtx::propose_schema`, and therefore
+  `provision_tablet`, `trigger_split`, `drop_table*` — every DDL path).**
+  `propose_schema`'s local-propose fast path reads `ClusterEdgeState::
+  control: Arc<Mutex<Vec<RaftNode<ProdEnv>>>>` — a field that is
+  concretely, permanently `ProdEnv`-typed regardless of the enclosing
+  `ClientCtx<E, R>`'s own `E` (see that field's own doc: `ControlHandle`
+  in `animus-node::control_handle` deliberately carries no `propose`
+  method at all, "because proposing is inherently a local-Raft-log
+  operation," and every proposal instead goes through this concrete
+  handle). This is a **pre-existing, deliberate design choice** the ADR's
+  own C3c rung already documented, not a gap this rung introduced or could
+  route around without inventing a capability trait purely to make DDL
+  sim-drivable — exactly the "contorted trait" failure mode the second and
+  fourth 2026-08-28 amendments warn against. The harness's fixture
+  (`seed_schema`) works around it the honest way: it proposes
+  `CreateTableSchema`/`CreateTablet` directly on the control `RaftNode`,
+  bypassing `ClientCtx` entirely for setup — the identical thing
+  `animus-node/tests/index_backfill_sim.rs` already does for the same
+  reason.
+- **`DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle`.** Both hardcode
+  `FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>`
+  regardless of the enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s
+  `prod` feature is unconditionally on for this crate, so `FsSegmentStore`
+  genuinely exists here — the blocker isn't C0's feature gate, it's that
+  neither handle type takes an `E` parameter at all). A real `DataRole`
+  therefore cannot be built generically today. Not exercised by this rung:
+  neither `cp_kind_write_raw` nor `cp_get` ever calls
+  `self.data()`/`self.data_opt()` (verified by reading both call chains,
+  not assumed), so `data: None` is sufficient to prove this rung's claim.
+  Any future extension that needs a real `DataRole` under `SimEnv` (the
+  DynamoDB-shaped `cp_kind_write_item` write path, the TTL/backup/stream
+  loops) hits this blocker first.
+
+**Not yet generic, also worth knowing before extending this harness**:
+`handle_request` and `dynamo::marker_batch_write_raw`/
+`kind_write_item_at_leader`'s *callers* in `dynamo.rs` stay hardcoded to
+`&ClientCtx` (`E = ProdEnv`) — only the five split modules
+(`schema`/`read_path`/`write_path`/`txn_coordinator`/`forwarding`) and a
+handful of `lib.rs`-resident crate-wide accessors
+(`effective_metadata`/`data`/`data_opt`/…) are `E`-generic today. Driving
+the DynamoDB wire-shaped write path (`cp_kind_write_item`, which *is*
+already `E`-generic in `write_path.rs`) under `SimEnv` is reachable in a
+follow-on rung once a `SimEnv`-safe `DataRole` exists; driving
+`handle_request`/`dynamo.rs`'s handlers themselves is a larger, separate
+genericization this rung did not attempt.
+
+**Gotchas hit standing this up:**
+
+- **`futures::executor::block_on` does not work over a `SimEnv`-driven
+  future — it hangs.** `cp_kind_write_raw`/`cp_get` both potentially
+  `.await` an `env.sleep()` (the confirm-poll backoff, the route-wait
+  retry loop); nothing advances `SimEnv`'s virtual clock or fires its
+  timers except `Simulator::run_for`/`run_until` stepping the simulator's
+  own cooperative executor. The correct shape — the same one `animus-
+  cp-data/CLAUDE.md`'s own "Linearizable reads are async... drive them as
+  spawned tasks + `run_for`" rule already names — is `env.spawn_task(fut)`
+  capturing the result into a shared `Arc<Mutex<Option<T>>>` slot, then
+  `sim.run_for(bound)`, then read the slot back out
+  (`spawn_and_capture`, this module's own shared helper).
+- **A method call's receiver borrow and a later argument's move of the
+  same struct conflict.** `ctx.env.spawn_task(async move { ...
+  ctx.cp_kind_write_raw(..) })` does not compile: the receiver expression
+  `ctx.env` borrows `ctx` for the call, and the `async move` block later
+  in the same expression tries to move the whole `ctx` — clone `ctx.env`
+  into its own local binding *before* constructing the future that moves
+  `ctx`, mirroring `animus-node/tests/index_backfill_sim.rs`'s own
+  `let loop_env = node.env().clone(); loop_env.spawn_task(..)` idiom.
+- **`clippy::unusual_byte_groupings` fires on a hand-picked hex seed
+  literal** (`0x51_4E_0001`, meant to spell "SimEnv" loosely in hex,
+  grouped in 2-digit chunks) — clippy wants hex digits grouped in **fours**
+  from the right (`0x514E_0001`). Caught by the full `-D warnings` gate,
+  not by `cargo test` (which doesn't run clippy) — a reminder that a green
+  `cargo test` does not imply a green `cargo clippy` for a freshly written
+  sim test.
+- **`cargo clippy -p animusd --all-targets --all-features` does not pay
+  this crate's disk cost the way `cargo build`/`cargo test` with the same
+  flags does.** Clippy checks every target (including the ~100 files in
+  `tests/`) without linking full binaries, so it stayed under a few GB of
+  target-directory growth for this whole crate — safe to run as the actual
+  gate 2 command from the disk-discipline section above, unlike `cargo
+  build -p animusd --all-targets`, which is exactly what fills the disk.
+
 ## Tests
 
-`cargo test -p animusd` — all tests are real-socket `ProdEnv` integration
-tests that poll with timeouts, not deterministic assertions (this crate has
-no `SimEnv` — it is the assembly/wire layer over the two sim-tested crates
-below it). The restart tests run both incarnations in the same runtime,
+`cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`
+integration test that polls with timeouts, not a deterministic assertion;
+`simenv_client_ctx_tests` (above) is this crate's one `SimEnv`-driven
+exception, and lives in `lib.rs` rather than `tests/` for exactly the
+private-handle reason its own section gives. The restart tests run both
+incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`auto_split_median_tests`, `confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the private
@@ -2454,7 +3068,10 @@ block at. `lib.rs`'s own `halted_shutdown_tests` is a sixth — the
 issues #282/#279 regression above, needing the same private `CpGroup`
 (specifically its `#[cfg(test)]`-only `is_halted`) to prove bare
 `Node::shutdown()` and `Node`'s `Drop` impl both latch every hosted
-group's `halted` flag.
+group's `halted` flag. `lib.rs`'s own `simenv_client_ctx_tests` is a
+seventh, and differently motivated than the other six: it needs no private
+handle any of them is missing, but a real `ClientCtx<SimEnv, _>` — see the
+"SimEnv `ClientCtx` harness" section above for the full design.
 
 One binary per behavior; the file names describe them (`ls
 crates/animusd/tests/`) — covering combined/control-only/data-only/split
