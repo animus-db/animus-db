@@ -1117,15 +1117,25 @@ struct ReadState {
 }
 
 /// Per-CAS outcomes recorded at apply time, keyed by the entry's **Raft log
-/// index** (the value [`ProposeResult::Accepted`] hands the proposer): `true` if
-/// the swap happened, `false` if `expected` did not match. Every replica records
-/// the identical value because the CAS is decided deterministically in commit
-/// order against the same committed engine state. The proposer polls until the
-/// entry is applied, then reads its index here (see [`RaftKvNode::cas_result`] /
-/// [`RaftKvNode::compare_and_swap`]).
+/// index** (the value [`ProposeResult::Accepted`] hands the proposer) and
+/// paired with the entry's own **term** — `true` if the swap happened,
+/// `false` if `expected` did not match. Every replica records the identical
+/// value because the CAS is decided deterministically in commit order
+/// against the same committed engine state. The proposer polls until the
+/// entry is applied, then reads its index here (see
+/// [`RaftKvNode::cas_result`] / [`RaftKvNode::compare_and_swap`]).
+///
+/// **The term is load-bearing, not incidental** (mirrors
+/// [`KindBatchOutcomes`]' own doc): an entry this proposer appended but
+/// never committed (a leadership change truncated it) can have its log
+/// position reoccupied by a *different* `Cas`, which then applies and
+/// records an outcome at the identical index — index alone cannot tell that
+/// apart from the proposer's own entry having applied. `cas_result` requires
+/// the caller's own accepted term to match before ever returning the
+/// recorded outcome as this proposer's own.
 #[derive(Default)]
 struct CasResults {
-    outcomes: BTreeMap<u64, bool>,
+    outcomes: BTreeMap<u64, (u64, bool)>,
 }
 
 /// What a `KindBatch` entry actually did at apply time — the introspection
@@ -1209,17 +1219,26 @@ impl KindBatchOutcomes {
 }
 
 /// Per-`TxnStage` outcomes recorded at apply time, keyed by the entry's
-/// **Raft log index** — the [`StageOutcome`] introspection primitive (ADR
-/// 0018 §2 apply-time write-key conditions amendment), mirroring
-/// [`CasResults`] exactly: every replica records the identical value (the
-/// stage is decided deterministically in commit order against the same
+/// **Raft log index** and paired with the entry's own **term** — the
+/// [`StageOutcome`] introspection primitive (ADR 0018 §2 apply-time
+/// write-key conditions amendment), mirroring [`CasResults`]/
+/// [`KindBatchOutcomes`] exactly: every replica records the identical value
+/// (the stage is decided deterministically in commit order against the same
 /// committed engine state), and a proposer polls until its entry applies,
 /// then reads its index here (see
 /// [`RaftKvNode::stage_outcome`]/[`RaftKvNode::txn_stage_anchor`]/
 /// [`RaftKvNode::txn_stage_participant`]).
+///
+/// **The term is load-bearing, not incidental** — same reasoning as
+/// [`CasResults`]/[`KindBatchOutcomes`]: a truncated, never-committed
+/// `TxnStage` entry's log position can be reoccupied by a different command
+/// after a leadership change, which then applies and records an outcome at
+/// the identical index. `stage_outcome`/`wait_stage_outcome` require the
+/// caller's own accepted term to match before ever returning the recorded
+/// outcome as this proposer's own.
 #[derive(Default)]
 struct StageOutcomes {
-    outcomes: BTreeMap<u64, StageOutcome>,
+    outcomes: BTreeMap<u64, (u64, StageOutcome)>,
 }
 
 /// This group's own in-memory index of the transaction records it holds
@@ -2711,11 +2730,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             };
             (cmd, (txn_id, record_key))
         });
-        let index = match result {
-            ProposeResult::Accepted { index, .. } => index,
+        let (index, term) = match result {
+            ProposeResult::Accepted { index, term } => (index, term),
             ProposeResult::NotLeader { .. } => return None,
         };
-        let outcome = self.wait_stage_outcome(index).await?;
+        let outcome = self.wait_stage_outcome(index, term).await?;
         Some((txn_id, record_key, outcome))
     }
 
@@ -2762,11 +2781,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             };
             (cmd, ts)
         });
-        let index = match result {
-            ProposeResult::Accepted { index, .. } => index,
+        let (index, term) = match result {
+            ProposeResult::Accepted { index, term } => (index, term),
             ProposeResult::NotLeader { .. } => return None,
         };
-        let outcome = self.wait_stage_outcome(index).await?;
+        let outcome = self.wait_stage_outcome(index, term).await?;
         Some((ts, outcome))
     }
 
@@ -3225,8 +3244,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
-    /// Poll [`stage_outcome`](Self::stage_outcome) for `index` directly,
-    /// bounded by [`CAS_TIMEOUT`]/[`CAS_POLL`] — mirrors
+    /// Poll [`stage_outcome`](Self::stage_outcome) for `(index, term)`
+    /// directly, bounded by [`CAS_TIMEOUT`]/[`CAS_POLL`] — mirrors
     /// [`compare_and_swap`](Self::compare_and_swap)'s own outcome-polling
     /// loop, **not** [`wait_applied`](Self::wait_applied) followed by a
     /// separate fetch.
@@ -3243,15 +3262,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// anything the image already covers). So for every other command here,
     /// "applied" and "has a recorded outcome" coincide, but for `TxnStage`
     /// they do not: `wait_applied(index).await == true` does **not**
-    /// guarantee `stage_outcome(index)` is `Some`. Polling the outcome
+    /// guarantee `stage_outcome(index, term)` is `Some`. Polling the outcome
     /// directly (like CAS always has) makes this method's own `None` mean
     /// exactly what every other propose-and-wait method's `None` means —
     /// "give up, caller retries" — instead of ever hard-`expect`ing a fact
     /// that isn't actually guaranteed.
-    async fn wait_stage_outcome(&self, index: u64) -> Option<StageOutcome> {
+    ///
+    /// **`term` must be the term [`ProposeResult::Accepted`] handed the
+    /// caller for this exact entry** (see [`StageOutcomes`]'s doc): an
+    /// uncommitted entry's index can be reoccupied by a different command
+    /// after a leadership change, so a `None` here can mean either "not
+    /// applied here yet" or "a different entry now occupies this index" —
+    /// either way the caller cannot trust its own stage landed and must
+    /// treat it as unconfirmed (retry/propose again), never as a definitive
+    /// success or failure.
+    async fn wait_stage_outcome(&self, index: u64, term: u64) -> Option<StageOutcome> {
         let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
         loop {
-            if let Some(outcome) = self.stage_outcome(index) {
+            if let Some(outcome) = self.stage_outcome(index, term) {
                 return Some(outcome);
             }
             if !self.is_leader() || self.env.now().0 >= deadline {
@@ -3261,23 +3289,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
-    /// The recorded outcome of the CAS committed at Raft log `index` (the value
-    /// [`cas`](Self::cas) returned in [`ProposeResult::Accepted`]): `Some(true)`
-    /// if the swap happened, `Some(false)` if `expected` did not match, or `None`
-    /// if that index has not applied on this replica yet. Every replica records
-    /// the identical outcome (the decision is deterministic in commit order).
     /// The recorded outcome of the `TxnStage` committed at Raft log `index`
     /// (ADR 0018 §2 apply-time write-key conditions amendment) — `None` if
-    /// that index has not applied on this replica yet. Mirrors
-    /// [`cas_result`](Self::cas_result) exactly; see [`StageOutcome`]'s doc
-    /// for what each variant means to a caller.
-    pub fn stage_outcome(&self, index: u64) -> Option<StageOutcome> {
-        self.stage
+    /// that index has not applied on this replica yet, **or if the entry
+    /// recorded there was accepted under a different term than `term`**
+    /// (see [`StageOutcomes`]'s doc): an uncommitted entry's index can be
+    /// reoccupied by a different command after a leadership change, so
+    /// index alone never proves the recorded outcome is this caller's own.
+    /// `term` must be the term the caller's own [`ProposeResult::Accepted`]
+    /// returned for this entry. Mirrors [`cas_result`](Self::cas_result)
+    /// exactly; see [`StageOutcome`]'s doc for what each variant means to a
+    /// caller once confirmed.
+    pub fn stage_outcome(&self, index: u64, term: u64) -> Option<StageOutcome> {
+        match self
+            .stage
             .lock()
             .expect("stage outcomes poisoned")
             .outcomes
             .get(&index)
-            .cloned()
+        {
+            Some((recorded_term, outcome)) if *recorded_term == term => Some(outcome.clone()),
+            _ => None,
+        }
     }
 
     /// What the `KindBatch` committed at Raft log `index` actually did, paired
@@ -3308,13 +3341,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .cloned()
     }
 
-    pub fn cas_result(&self, index: u64) -> Option<bool> {
-        self.cas
+    /// The recorded outcome of the CAS committed at Raft log `index` — `Some(true)`
+    /// if the swap happened, `Some(false)` if `expected` did not match the
+    /// committed value, or `None` if that index has not applied on this
+    /// replica yet, **or if the entry recorded there was accepted under a
+    /// different term than `term`** (see [`CasResults`]'s doc): an
+    /// uncommitted entry's index can be reoccupied by a different `Cas`
+    /// after a leadership change, so index alone never proves the recorded
+    /// outcome is this caller's own. `term` must be the term the caller's
+    /// own [`ProposeResult::Accepted`] returned for this entry. Every
+    /// replica records the identical outcome (the decision is deterministic
+    /// in commit order).
+    pub fn cas_result(&self, index: u64, term: u64) -> Option<bool> {
+        match self
+            .cas
             .lock()
             .expect("cas results poisoned")
             .outcomes
             .get(&index)
-            .copied()
+        {
+            Some((recorded_term, swapped)) if *recorded_term == term => Some(*swapped),
+            _ => None,
+        }
     }
 
     /// Propose a CAS on the leader and **wait for its committed outcome**: returns
@@ -3330,19 +3378,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
     ) -> Option<bool> {
-        let index = match self.cas(key, expected, value) {
-            ProposeResult::Accepted { index, .. } => index,
+        let (index, term) = match self.cas(key, expected, value) {
+            ProposeResult::Accepted { index, term } => (index, term),
             ProposeResult::NotLeader { .. } => return None,
         };
         let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
         loop {
-            if let Some(outcome) = self.cas_result(index) {
+            if let Some(outcome) = self.cas_result(index, term) {
                 return Some(outcome);
             }
-            // A step-down before this entry applies means it may never apply on
-            // this node — give up rather than wait out the full timeout uselessly,
-            // but still bound by the deadline for the in-flight case.
-            if self.env.now().0 >= deadline {
+            // A step-down before this entry applies (or commits under a
+            // different term, e.g. a truncation-and-reoccupation) means it
+            // may never apply as *this* proposer's own entry — give up
+            // rather than wait out the full timeout uselessly, mirroring
+            // `wait_applied`/`wait_stage_outcome`'s identical guard.
+            if !self.is_leader() || self.env.now().0 >= deadline {
                 return None;
             }
             self.env.sleep(CAS_POLL).await;
@@ -6385,7 +6435,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 cas.lock()
                     .expect("cas results poisoned")
                     .outcomes
-                    .insert(index, swapped);
+                    .insert(index, (term, swapped));
             }
             KvCommand::Freeze { ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -6836,7 +6886,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .lock()
                     .expect("stage outcomes poisoned")
                     .outcomes
-                    .insert(index, outcome);
+                    .insert(index, (term, outcome));
             }
             KvCommand::TxnCommit {
                 txn_id,
@@ -9055,8 +9105,8 @@ mod pr5_orphan_and_resurrection_tests {
             };
             (cmd, ts)
         });
-        let restage_index = match result {
-            ProposeResult::Accepted { index, .. } => index,
+        let (restage_index, restage_term) = match result {
+            ProposeResult::Accepted { index, term } => (index, term),
             other => panic!("restage proposal rejected: {other:?} (seed={seed})"),
         };
         let applied = drive(&mut sim, node_b.env(), Duration::from_millis(300), {
@@ -9070,7 +9120,7 @@ mod pr5_orphan_and_resurrection_tests {
              (seed={seed}, ts={restage_ts:?})"
         );
         assert_eq!(
-            node_b.stage_outcome(restage_index),
+            node_b.stage_outcome(restage_index, restage_term),
             Some(StageOutcome::Fenced),
             "the seatbelt must reject the restage as Fenced, never silently stage it \
              (seed={seed})"

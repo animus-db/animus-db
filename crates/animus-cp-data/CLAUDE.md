@@ -448,19 +448,39 @@ State once here; cross-referenced from the sections below.
   key's *current committed* value and compares to `expected`; equal → merge
   at `index`, else no-op. Every replica applies the same order against the
   same state with no clock/RNG, so every replica makes the **identical**
-  decision. Outcome is stashed in driver `CasResults` keyed by the log index.
+  decision. Outcome is stashed in driver `CasResults`, keyed by the log index
+  **and paired with the entry's own Raft term** (fixed alongside
+  `StageOutcomes` below — see that bullet's term-identity paragraph, which
+  applies here identically): `cas_result(index, term)`/`compare_and_swap`
+  require the caller's own `ProposeResult::Accepted`'s `term` to match before
+  ever trusting a recorded outcome as this proposer's own, and
+  `compare_and_swap`'s own poll loop also checks `is_leader()` every
+  iteration (previously it did not, despite a comment implying it did — see
+  `wait_applied`/`wait_stage_outcome`'s identical guard). Regression:
+  `tests/cas_outcome_identity.rs`.
 - **`TxnStage`'s own-key conditions are decided at *apply* time too, the
   identical CAS-style discipline** — evaluated against each key's current
   committed value inside the same apply arm that decides the pre-existing
   fence/seal/foreign-intent gates, recording a `StageOutcome` per Raft log
   index (`StageOutcomes`, mirroring `CasResults`). **`wait_applied(index)
-  .await == true` does NOT imply `stage_outcome(index)` is `Some`** — a
+  .await == true` does NOT imply `stage_outcome(index, term)` is `Some`** — a
   snapshot install can advance `engine_applied` past `index` without this
   replica individually applying (hence recording an outcome for) that exact
   entry, since an install globs many commands together. `txn_stage_anchor`/
   `_participant` poll `stage_outcome` directly instead (`wait_stage_outcome`)
   — `None` on timeout, never a hard-`expect`ed fact that turns out not to be
-  guaranteed. See `docs/engineering-lessons.md` for the general lesson.
+  guaranteed. **`StageOutcomes` (like `CasResults`) is keyed by index and
+  paired with the entry's own term** (closed 2026-08-29, mirroring the fix
+  `KindBatchOutcomes` got first — see `docs/engineering-lessons.md`'s
+  amendment to the `KindBatchOutcome` entry): an uncommitted `TxnStage`
+  entry's index can be reoccupied by a different command after a leadership
+  change, so `stage_outcome`/`wait_stage_outcome` require the caller's own
+  accepted term to match, propagating `None` ("not confirmed as mine, retry")
+  rather than ever returning a stale entry's outcome as this proposer's own.
+  `txn_stage_anchor`/`txn_stage_participant` thread the accepted `term`
+  through unchanged in their own public shape (still `Option<(..,
+  StageOutcome)>`, `None` on ambiguity same as before). See
+  `docs/engineering-lessons.md` for the general lesson.
 - **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
   "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
