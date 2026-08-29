@@ -374,7 +374,12 @@ per-tablet CP data plane (`animus-cp-data`).
   time**, never from anything the proposer captured — the same
   determinism argument `BeginSplit`'s child ranges and `CutoverSplit`'s
   child recomputation already rest on (see `docs/engineering-lessons.md`'s
-  entry on this). `CompleteBackup` requires every pinned tablet to have a
+  entry on this). The tablet list feeding `pinned_tablets` filters out
+  `TabletState::Building` rows — during a copy-based split's (ADR 0050)
+  build/tail window `tablets_for_table` can return the `Splitting` parent
+  plus its two not-yet-cutover `Building` children all at once, and only
+  the parent is the current authoritative owner of the range (see
+  `docs/engineering-lessons.md`'s entry on this fix). `CompleteBackup` requires every pinned tablet to have a
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
