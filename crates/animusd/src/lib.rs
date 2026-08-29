@@ -1626,10 +1626,44 @@ impl ReadConsistency {
 /// deadline (`Superseded` — see [`decide::confirm_wait_is_futile`]), or
 /// the deadline elapsed with the accepted entry still plausibly in flight
 /// (`TimedOut`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProbeWait {
     Confirmed,
     Superseded,
     TimedOut,
+}
+
+/// Whether [`ClientCtx::poll_probe`]'s value-equality fallback is sound for
+/// the write it is confirming (issue #469). `poll_probe` normally proves
+/// confirmation via `classify_kind_batch_outcome` — provably *this
+/// proposer's own* (index, term) entry applied. When that channel is
+/// `Inconclusive` (not yet applied, aged out of the bounded outcome map, or
+/// applied-but-not-yet-readable), the pre-existing fallback instead asks
+/// "does the key already hold the bytes I proposed?" — but plain value
+/// equality proves only that *some* entry produced these bytes, never that
+/// *this* entry did. For an **idempotent** write (Put/Delete/SET/REMOVE, a
+/// set union or difference) that distinction is moot: any entry landing
+/// these exact bytes is a legitimate success, no matter whose. For a
+/// **non-idempotent** write (a numeric `ADD`) it is not: two evaluators can
+/// read the same stale `old` and compute byte-identical `new` from a pure
+/// function of `(cur, delta)` — nothing downstream disambiguates them — so a
+/// different, concurrently-committed entry can land the exact bytes THIS
+/// entry was proposing, moments before this entry's own (legitimate)
+/// `ConditionFailed` no-op is recorded. Confirming on value equality there
+/// falsely acks a write that never actually applied. `ProbeIdentity` is
+/// this caller-supplied gate: threaded down from wherever
+/// [`dynamo::kind_write_is_idempotent`] (or the equivalent structural
+/// knowledge — a raw batch primitive that only ever writes Put semantics)
+/// is already known, never recomputed inside `poll_probe` itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeIdentity {
+    /// The write is idempotent: the value-equality fallback may run.
+    ValueProves,
+    /// The write is NOT idempotent (a numeric `ADD`): value equality proves
+    /// nothing about authorship, so the fallback must not run — only this
+    /// proposer's own (index, term) resolving through
+    /// `classify_kind_batch_outcome` may confirm.
+    RequiresOwnEntry,
 }
 
 /// What a `KindBatch` apply-time outcome, read alone (no value probe), proves
@@ -11037,7 +11071,7 @@ mod confirm_futility_tests {
     use crate::config::NodeRole;
     use crate::{
         AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
-        RoleAddrs, read_frame, run_node, write_frame,
+        ProbeIdentity, RoleAddrs, read_frame, run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -11165,6 +11199,8 @@ mod confirm_futility_tests {
             )],
             Vec::new(),
             vec![(b"cf-guard".to_vec(), Some(b"wrong-expected".to_vec()))],
+            // A Put-shaped kind write (never an `ADD`) — idempotent.
+            ProbeIdentity::ValueProves,
         )
         .await
         .expect_err("a condition-failed kind batch must not confirm");
@@ -11191,6 +11227,7 @@ mod confirm_futility_tests {
             )],
             Vec::new(),
             Vec::new(),
+            ProbeIdentity::ValueProves,
         )
         .await
         .expect("an ordinary write after the futile one still confirms");

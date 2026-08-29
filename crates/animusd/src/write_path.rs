@@ -14,8 +14,8 @@ use animus_tablet::TabletId;
 
 use crate::{
     CLIENT_TIMEOUT, CP_CONFIRM_POLL_INIT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest,
-    ClientResponse, CpGroup, CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeWait,
-    SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo, topology,
+    ClientResponse, CpGroup, CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity,
+    ProbeWait, SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -451,11 +451,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// silently, indistinguishable from a fence miss, so it surfaces through
     /// this same function's existing `"CP kind write did not commit in
     /// time"` timeout — deliberately no new outcome channel.
+    ///
+    /// **`identity` (issue #469)**: threaded straight through to
+    /// [`poll_probe`](Self::poll_probe)'s value-equality fallback gate — see
+    /// [`ProbeIdentity`]'s doc for why an idempotent write may confirm on
+    /// value equality alone but a non-idempotent one (a numeric `ADD`) may
+    /// not. The caller already knows this (`dynamo::
+    /// kind_write_is_idempotent`, computed once per write); `poll_probe`
+    /// never recomputes it.
     pub(crate) async fn cp_kind_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        identity: ProbeIdentity,
     ) -> Result<(), String> {
         let probe = writes
             .iter()
@@ -486,6 +495,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             accepted_term,
             &probe_key,
             &probe_val,
+            identity,
             deadline,
         )
         .await
@@ -567,12 +577,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///
     /// `accepted_term` is the term [`ProposeResult::Accepted`] carried
     /// alongside `accepted_index` — see the identity-check note below.
+    ///
+    /// `identity` gates the value-equality fallback below (issue #469): see
+    /// [`ProbeIdentity`]'s doc for the full false-ack hazard it closes.
     async fn poll_probe(
         leader: &CpGroup<E>,
         accepted_index: u64,
         accepted_term: u64,
         probe_key: &[u8],
         probe_val: &[u8],
+        identity: ProbeIdentity,
         deadline: Nanos,
     ) -> ProbeWait {
         loop {
@@ -627,7 +641,34 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // behaviour.
                 KindBatchSignal::Inconclusive => {}
             }
-            if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
+            // **Value equality proves visibility, not authorship — sound
+            // only when the write is idempotent (issue #469).** This
+            // fallback answers "does the key already hold the bytes I
+            // proposed?", which is a different question from "did MY entry
+            // put them there?" For Put/Delete/SET/REMOVE/a set union or
+            // difference the two coincide: any entry landing these exact
+            // bytes is a legitimate success, whoever's entry it was. For a
+            // numeric `ADD` they do not: `kind_write_item_at_leader` reads
+            // `old` under a lock it releases *before* proposing (issue
+            // #285), so two concurrent evaluators of the same key can read
+            // the identical stale `old`, compute byte-identical `new` (a
+            // pure function of `(cur, delta)`), and each propose an entry
+            // carrying those same bytes with an own-key OCC seatbelt keyed
+            // to that same stale `old`. The first such entry to apply wins
+            // the seatbelt and writes the bytes; every later one legitimately
+            // `ConditionFailed`s and no-ops — but in the window after the
+            // winner's bytes are visible and before *this* entry's own
+            // outcome is recorded, value equality already matches, even
+            // though this entry never applied. Confirming there acks an
+            // increment that never landed. So for a non-idempotent write
+            // (`identity == RequiresOwnEntry`) this fallback must not run at
+            // all — not even to read the key — and the loop instead keeps
+            // polling `classify_kind_batch_outcome` for this entry's own
+            // (index, term) until it resolves or the deadline ends the wait
+            // in `TimedOut`, never a value guess.
+            if identity == ProbeIdentity::ValueProves
+                && leader.local_get(probe_key).await.as_deref() == Some(probe_val)
+            {
                 return ProbeWait::Confirmed;
             }
             if decide::confirm_wait_is_futile(
@@ -649,7 +690,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 {
                     return ProbeWait::Confirmed;
                 }
-                if leader.local_get(probe_key).await.as_deref() == Some(probe_val) {
+                // Same idempotency gate as the fallback above — a
+                // non-idempotent write must not consult the value here
+                // either, for the identical reason: a different,
+                // concurrently-committed entry's bytes prove nothing about
+                // whether THIS entry (about to be judged futile) applied.
+                if identity == ProbeIdentity::ValueProves
+                    && leader.local_get(probe_key).await.as_deref() == Some(probe_val)
+                {
                     return ProbeWait::Confirmed;
                 }
                 return ProbeWait::Superseded;
@@ -668,6 +716,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// durable (the leader applies only after a quorum commit + WAL fsync, as in
     /// [`cp_put_local`](Self::cp_put_local); a per-batch quorum barrier would not
     /// scale under load).
+    ///
+    /// Confirms with [`ProbeIdentity::ValueProves`] (issue #469): this
+    /// primitive is the raw `Batch` command, which only ever carries plain
+    /// key/value puts — there is no `ADD`-shaped write at this layer — so
+    /// every write it can possibly confirm is structurally idempotent, and
+    /// the value-equality fallback is always sound here.
     pub(crate) async fn cp_batch_local(
         leader: &CpGroup<E>,
         group: Vec<(Vec<u8>, Vec<u8>)>,
@@ -684,6 +738,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             accepted_term,
             &probe_key,
             &probe_val,
+            ProbeIdentity::ValueProves,
             deadline,
         )
         .await
@@ -838,5 +893,239 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
         }
+    }
+}
+
+/// Regression for issue #469: a lost-acked-write via `poll_probe`'s
+/// value-equality fallback. `poll_probe` is private to this module (no
+/// `pub(crate)`) — this lives as a child module here, not in `lib.rs` or an
+/// external `tests/*.rs` file, specifically so it can call `poll_probe`
+/// directly rather than only its `cp_kind_local`/`cp_batch_local` wrappers,
+/// which is what lets this test pin the exact accepted-but-unapplied window
+/// the bug lives in (see `poll_probe`'s own doc for the mechanism). Mirrors
+/// `lib.rs`'s `simenv_client_ctx_tests` harness style (a single-voter
+/// `RaftKvNode<SimEnv, MemoryEngine>`, no sockets, no `ProdEnv`) — see that
+/// module's doc for why constructing these types here widens nothing.
+///
+/// **The scenario.** Entry A is an ordinary unconditioned `KindBatch` that
+/// writes `(key, value)` and is allowed to fully commit + apply. Entry B
+/// proposes the exact SAME `(key, value)` bytes but carries an own-key OCC
+/// seatbelt engineered to legitimately fail once entry B itself applies (a
+/// guard key with an expected value that can never match) — the same shape
+/// a concurrent numeric `ADD` evaluator produces from a stale read (issue
+/// #469's own account: two evaluators reading identical stale `old` under
+/// `kind_write_item_at_leader`'s released-before-propose lock compute
+/// byte-identical `new`). With entry B accepted but not yet applied,
+/// `poll_probe` is driven directly for entry B's own `(index, term)`. The
+/// pre-fix code's ungated value-equality fallback matches entry A's already-
+/// visible bytes at the very first poll and falsely reports `Confirmed` —
+/// before entry B has had any chance to apply and legitimately
+/// `ConditionFailed`. The fix (`ProbeIdentity::RequiresOwnEntry`) never
+/// consults the value at all for a non-idempotent write, so the wait
+/// continues until entry B's own outcome resolves — `Superseded`, never a
+/// false `Confirmed`.
+#[cfg(test)]
+mod poll_probe_identity_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, RaftKvNode};
+    use animus_env::{Clock, EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!(
+                "NeverRelay: this single-node harness never relays (addr={addr})"
+            ))
+        }
+    }
+
+    /// A one-voter `RaftKvNode<SimEnv, MemoryEngine>` wrapped as a
+    /// `CpGroup<SimEnv>` — no control plane, no schema catalog: `poll_probe`
+    /// needs only a leader handle, so this harness skips everything
+    /// `simenv_client_ctx_tests`' fuller fixture sets up for a real
+    /// `ClientCtx` write/read round trip.
+    fn single_voter_group(seed: u64) -> (Simulator, CpGroup<SimEnv>) {
+        let sim = Simulator::new(seed);
+        let kv: RaftKvNode<SimEnv, MemoryEngine> =
+            RaftKvNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
+        (sim, CpGroup::Mem(kv))
+    }
+
+    /// Spawn `fut` on `env` and drive `sim` until it resolves — the
+    /// harness's own converged-or-timeout idiom (root `CLAUDE.md`'s
+    /// "Testing" rule), mirroring `simenv_client_ctx_tests::
+    /// spawn_and_capture`.
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        sim.run_for(Duration::from_secs(2));
+        slot.lock().expect("result slot poisoned").take()
+    }
+
+    #[test]
+    fn a_non_idempotent_probe_never_confirms_on_a_different_entrys_identical_bytes() {
+        run(0x0469_0001);
+    }
+
+    #[test]
+    fn a_non_idempotent_probe_never_confirms_on_a_different_entrys_identical_bytes_seed2() {
+        run(0x0469_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_issue_469_from_an_explicit_env_seed` reruns
+    /// this exact scenario from a printed seed.
+    #[test]
+    fn replays_issue_469_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x0469_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, leader) = single_voter_group(seed);
+        sim.run_for(Duration::from_millis(500));
+        assert!(
+            leader.is_leader(),
+            "the sole voter must be its own leader (seed={seed})"
+        );
+
+        let key = b"item".to_vec();
+        let value = b"same-bytes-both-entries-propose".to_vec();
+
+        // Entry A: an ordinary unconditioned put, allowed to fully commit
+        // and apply before entry B is ever proposed.
+        let (a_index, _a_term) = match leader.put_kind_batch_conditioned(
+            vec![(KIND_BASE, key.clone(), Some(value.clone()))],
+            Vec::new(),
+            Vec::new(),
+        ) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => panic!("entry A not accepted (seed={seed}): {other:?}"),
+        };
+        sim.run_for(Duration::from_millis(500));
+        assert!(
+            leader.engine_applied_index() >= a_index,
+            "entry A must apply before entry B is proposed (seed={seed})"
+        );
+        assert_eq!(
+            futures::executor::block_on(leader.local_get(&key)),
+            Some(value.clone()),
+            "entry A's write must be visible before entry B is proposed \
+             (seed={seed})"
+        );
+
+        // Entry B: proposes the exact SAME (key, value) bytes, guarded by an
+        // own-key OCC seatbelt that can never hold (the guard key is never
+        // written) — engineered to legitimately `ConditionFailed` once
+        // entry B itself applies. This is the concurrent-`ADD`-evaluator
+        // shape from issue #469's own account, reproduced directly rather
+        // than through a real race: both entries propose byte-identical
+        // `new` bytes, and only one of them may legitimately win.
+        //
+        // **Entry B's own propose lives INSIDE the spawned task, as the
+        // first thing its future does — not before spawning it.** This is
+        // load-bearing, not a style choice: `SimEnv` is single-threaded
+        // cooperative (root `CLAUDE.md`), so a task only yields the
+        // scheduler at an `.await` that actually returns `Pending`. Entry B
+        // does not exist as a Raft entry until this future's first poll
+        // proposes it, so the apply-drain loop has nothing to race ahead
+        // of; proposing it and immediately awaiting `poll_probe` in the
+        // same poll means the very first thing this task's future does is
+        // observe entry B accepted-but-unapplied (asserted below) — no
+        // other task, in particular the apply loop, gets a turn in
+        // between. Proposing B before spawning (an earlier draft of this
+        // test did exactly that) let the already-running apply loop drain
+        // and record entry B's outcome during the *next* `sim.run_for`
+        // before `poll_probe`'s own task ever got its first poll — closing
+        // the very window this test exists to pin, and the pre-fix code
+        // then genuinely never got a chance to consult the stale value
+        // (silently passing for the wrong reason).
+        let guard_key = b"guard-never-written".to_vec();
+        let deadline = leader.env().now().saturating_add(Duration::from_secs(5));
+        let env = leader.env().clone();
+        let sanity_unapplied_at_probe_start: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let result = spawn_and_capture(&mut sim, &env, {
+            let leader = leader.clone();
+            let key = key.clone();
+            let value = value.clone();
+            let sanity = sanity_unapplied_at_probe_start.clone();
+            async move {
+                let (b_index, b_term) = match leader.put_kind_batch_conditioned(
+                    vec![(KIND_BASE, key.clone(), Some(value.clone()))],
+                    Vec::new(),
+                    vec![(guard_key, Some(b"can-never-match".to_vec()))],
+                ) {
+                    ProposeResult::Accepted { index, term } => (index, term),
+                    other => panic!("entry B not accepted: {other:?}"),
+                };
+                *sanity.lock().expect("sanity slot poisoned") =
+                    Some(leader.kind_batch_outcome(b_index).is_none());
+                ClientCtx::<SimEnv, NeverRelay>::poll_probe(
+                    &leader,
+                    b_index,
+                    b_term,
+                    &key,
+                    &value,
+                    ProbeIdentity::RequiresOwnEntry,
+                    deadline,
+                )
+                .await
+            }
+        });
+
+        assert_eq!(
+            sanity_unapplied_at_probe_start
+                .lock()
+                .expect("sanity slot poisoned")
+                .take(),
+            Some(true),
+            "entry B must have no recorded outcome at the instant its own \
+             confirm-poll begins, or this run doesn't exercise the \
+             accepted-but-unapplied window this test exists to pin \
+             (seed={seed})"
+        );
+
+        assert_ne!(
+            result,
+            Some(ProbeWait::Confirmed),
+            "a non-idempotent write's confirm-poll must never treat a \
+             DIFFERENT, already-applied entry's identical bytes as proof \
+             THIS entry applied (seed={seed}): {result:?}"
+        );
+        // Not just "not Confirmed" — the scenario is engineered to resolve
+        // cleanly once entry B's own outcome is recorded (`ConditionFailed`
+        // -> `NoOp` -> `Superseded`), proving the fixed loop actually made
+        // progress rather than degrading to a `TimedOut` guess.
+        assert_eq!(
+            result,
+            Some(ProbeWait::Superseded),
+            "entry B's own ConditionFailed outcome should resolve the wait \
+             once applied (seed={seed}): {result:?}"
+        );
     }
 }
