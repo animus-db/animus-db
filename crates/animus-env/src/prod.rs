@@ -6,6 +6,24 @@
 //! simulation tests, which run against `animus-sim`'s `SimEnv`. Keep production
 //! behavior here so the rest of the codebase stays environment-agnostic.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): every other crate is expected to
+// reach real time/randomness/task-spawning ONLY through the `Clock`/`Rng`/
+// `Spawner` methods this module implements — that's the whole point of the
+// `Env` seam. This module IS that implementation, so it is the one place in
+// the workspace where `Instant::now`/`SystemTime::now`/`tokio::spawn`/
+// `tokio::time::{sleep,timeout}` are the correct, intended call — exempted
+// here at the module level rather than at each of this file's ~30 call
+// sites, which would just repeat the same one reason thirty times.
+// `OsRng` (a unit struct, so it trips `disallowed_types` rather than this
+// lint) is allowed individually at its own four call sites below instead —
+// unlike the rest of this file's real-time/IO, it's few enough sites that
+// scoping the allow tightly costs nothing and keeps `disallowed_types`
+// (HashMap/HashSet, ADR 0003's other half) live for the rest of this file.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "this module is ProdEnv itself — the sanctioned real-time/IO/RNG implementation the Env seam exists to wrap (ADR 0003); see ADR 0061 Decision 4"
+)]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -435,6 +453,10 @@ impl Clock for ProdEnv {
     }
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "OsRng is the sanctioned real-randomness source ProdEnv's Rng impl wraps (ADR 0003); see ADR 0061 Decision 4"
+)]
 impl Rng for ProdEnv {
     fn next_u64(&self) -> u64 {
         rand::RngCore::next_u64(&mut rand::rngs::OsRng)
@@ -467,6 +489,10 @@ impl Rng for ProdEnv {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PreBindRng;
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "OsRng is the sanctioned real-randomness source PreBindRng wraps at the pre-bind CLI boundary (ADR 0040 PR4); see ADR 0061 Decision 4"
+)]
 impl Rng for PreBindRng {
     fn next_u64(&self) -> u64 {
         rand::RngCore::next_u64(&mut rand::rngs::OsRng)

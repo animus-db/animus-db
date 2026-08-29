@@ -14,6 +14,15 @@
 //! multi-MB metadata on the multi-threaded `ProdEnv` — the class `SimEnv`'s virtual
 //! time cannot observe.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-thread ProdEnv driver-
+// liveness smoke test (see the module doc above) — the whole point is
+// observing real time/threads, which SimEnv's virtual clock structurally
+// cannot do.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv driver-liveness smoke test (the class SimEnv's virtual clock cannot observe, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

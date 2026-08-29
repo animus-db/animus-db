@@ -125,6 +125,9 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | on-demand backup capture fault-injection corpus depth (`animus-test`, ADR 0059 Train 1) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | PITR sealing fault-injection corpus depth (`animus-test`, ADR 0059 Train 3) |
+| `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
+| `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |
+| `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `animus-storage`'s `engine_bench` workload tuning |
 | `ANIMUS_BENCH_{NODES,ITEMS,OPS,VALUE_BYTES,CLIENTS,JSON}` | — | `animusd`'s `cluster_bench` workload tuning (node count, preload size, measured ops/class, item size, concurrent-client sweep, JSON output path) |
 
@@ -137,6 +140,15 @@ This is the single most important rule (ADR 0003). **All nondeterminism flows
 through the `Env` seam.** In every crate except `animus-env`'s `ProdEnv` and
 test code:
 
+`ProdEnv`/`FsSegmentStore` live behind `animus-env`'s default-off `prod`
+Cargo feature (ADR 0061 rung C0): a crate that depends on `animus-env` with
+`default-features = false` cannot name `ProdEnv` at all — it fails to
+compile, not just fails review. Only a crate whose own library really
+constructs one (currently `animusd`) enables `prod` on its normal
+dependency; a crate that only needs it for a real-thread test/bench enables
+it on a separate `[dev-dependencies]` entry instead. See
+`crates/animus-env/CLAUDE.md` for the full breakdown.
+
 - No wall clock — use `env.now()` / `env.sleep()`, never `std::time` or
   `tokio::time`. The **one** exception is `env.wall_now()` (ADR 0051), which
   returns calendar time for interpreting externally-supplied absolute
@@ -144,15 +156,35 @@ test code:
   inside the seam (`SimEnv` derives it from virtual time, so it stays
   seed-reproducible), but it is **never** for timing: every deadline,
   timeout, election, and backoff keeps using `env.now()`, which cannot step
-  backwards.
+  backwards. **Lint-enforced** (`Instant::now`/`SystemTime::now`/
+  `tokio::time::{sleep,timeout}`, ADR 0061 rung B5).
 - No raw task spawning — use `env.spawn_task(..)`, never `tokio::spawn`.
+  **Lint-enforced** (`tokio::spawn`, ADR 0061 rung B5).
 - No real I/O — use `env.send`/`recv` and `env.append`/`sync`/`read`, never
-  `std::net`/`std::fs`/`tokio::{net,fs}`.
+  `std::net`/`std::fs`/`tokio::{net,fs}`. **Not** lint-enforced (ADR 0061
+  rung B5 judged it impractical — no single small replacement to name in a
+  `reason` string, and `animusd`'s listener binding alone would need dozens
+  of individually-meaningless allows); reviewed by hand.
 - No unseeded randomness — use `env.next_u64()` / `env.gen_below(..)`, never
-  `thread_rng`/`OsRng`.
+  `thread_rng`/`OsRng`. **Lint-enforced** (`thread_rng` via
+  `disallowed-methods`, `OsRng` via `disallowed-types` since it's a type not
+  a function; ADR 0061 rung B5).
 - **No `HashMap`/`HashSet` in logic** — their iteration order is
   nondeterministic. Use `BTreeMap`/`BTreeSet`. This is lint-enforced via
   `clippy.toml`.
+
+Every lint-enforced item above is `clippy.toml`'s `disallowed-methods`/
+`disallowed-types`, workspace-wide via `[workspace.lints.clippy]` — a
+legitimate exception (`animus-env`'s `ProdEnv`, a real-thread `ProdEnv`
+liveness test, `animus-cli`/`animus-operator`'s real-socket process
+boundaries) carries an individually-justified `#[allow(clippy::
+disallowed_{methods,types}, reason = "...")]`. **`animusd` is exempted at
+the package level instead** (`crates/animusd/Cargo.toml`'s `[lints.clippy]`
+override) — it is ADR 0061's own pre-Phase-C process boundary, with ~600
+real call sites the ADR judged genuinely unreasonable to hand-annotate;
+`disallowed_types` stays enforced there, only the methods half is off. See
+ADR 0003's 2026-08-28 note (3) and ADR 0061 Decision 4's as-built note for
+the full account.
 
 Components are generic over `E: Env` (monomorphized, never `dyn`). `Env` is a
 supertrait combining `Clock + Rng + Network + Disk + Spawner`, scoped to one

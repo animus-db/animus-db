@@ -11715,3 +11715,296 @@ the failure signature is unambiguously disk-exhaustion rather than a
 compiler diagnostic. Never `rm -rf target/` itself while sibling sessions
 may be mid-build; that destroys artifacts they still need mid-link, unlike
 `incremental/`.
+
+## A "shared X" refactor across N near-identical copies needs a captured before/after mapping, not just a source read — and a Cargo dev-dependency cycle is fine (ADR 0061 rung B1, shared corpus harness)
+
+Extracting `animus-test::corpus` (`name_seed`/`seeds_from_env`/`seed_expand`/
+`for_each_seed`) out of 9 corpus files' hand-rolled copies looked, from
+reading the source, like one identical FNV-1a function duplicated nine
+times. It wasn't: four of the nine (`backup_fault_corpus.rs`,
+`backfill_fault_corpus.rs`, `stream_lineage_corpus.rs`,
+`pitr_fault_corpus.rs`) OR'd the low bit onto the hash
+(`h | 1`, no comment anywhere explaining why) while the other five didn't —
+a genuine, silent divergence that a "these all look the same, let me
+dedupe" pass would have collapsed into a single behavior, quietly moving
+every one of those four corpora's committed regression seeds. The fix
+was to keep both hash flavors as two distinct public functions
+(`name_seed`/`odd_name_seed`) rather than unify them, and to structure the
+migration so drift was provable rather than asserted: **before** touching
+each corpus file, append a throwaway `#[test] fn temp_dump_seed_map()`
+that prints every frozen scenario's `(name, seed)` pair, capture that
+output; migrate the file onto the shared module; rerun the identical dump
+test; `diff` the two captures for byte-for-byte equality; only then delete
+the temp test. Nine independent before/after diffs, all empty, is what
+actually backs the "seeds didn't move" claim — the corpus's own internal
+`assert_eq!(seed, name_seed(name))`-style guards are not independent
+evidence, because after the refactor they check the refactored function
+against itself. The general form: when consolidating N call sites that
+"do the same thing," capture each site's *observable output* independently
+of the code before assuming the code is identical enough to merge, and
+treat that captured baseline (not a source-level read) as the diff target
+for the refactored version.
+
+The second finding was a design-constraint, not a bug: two of the corpora
+being migrated (`animus-cp-data`, `animus-control`) live in crates
+`animus-test` **already** dev-depends on (for its own corpus tests), so
+adding `animus-test` as those crates' dev-dependency looked like it would
+create a manifest cycle. It doesn't — `cargo check -p animus-cp-data
+--tests`/`-p animus-control --tests` built clean immediately. Cargo
+permits a dependency cycle that exists **only** through `[dev-dependencies]`
+edges on both sides, because a dev-dependency is never required to build a
+crate's own library — only its own tests/examples/benches, which are never
+on the path of building anything that depends on that crate normally. Two
+crates whose test suites need each other's test-only library code is a
+legitimate shape, not a smell to route around with a lower shared crate;
+worth checking with an actual `cargo check` before assuming a cycle is
+real and re-architecting to avoid it.
+
+Third, smaller finding: two authoring shapes for "expand a frozen scenario
+into K seed variants" existed and both were worth preserving as distinct
+primitives rather than forcing one on the other. Corpora that build a
+`Vec<Scenario>` up front (`raftkv_linearizable.rs`, `txn_serializable.rs`,
+`reconciler_corpus.rs`, `inplace_split_reconciler.rs`) share a
+`seed_expand<T: SeedVariant>(cells: Vec<T>, k: usize) -> Vec<T>`, generic
+via a two-method trait (`scenario_name`/`reseeded`) so the harness owns the
+expansion loop without forcing every corpus's `Scenario` into one shape.
+Corpora that drive one named scenario directly with no `Vec<Scenario>`
+(`backup_fault_corpus.rs` and its three siblings) share a closure-based
+`for_each_seed(name, k, body)` instead — trying to unify these into one
+API would have meant either building a throwaway `Vec<Scenario>` where none
+existed before, or threading a trait through call sites that have no
+struct to hang it on. Two of the four `seed_expand`-style corpora
+(`reconciler_corpus.rs`, `inplace_split_reconciler.rs`) also carried a
+`name: &'static str` field purely to dodge threading an owned `String`
+through expansion, with `reconciler_corpus.rs` actually paying for it via
+`Box::leak` (a small, bounded, but real per-test-run leak) while
+`inplace_split_reconciler.rs` avoided the leak by rebuilding the struct
+field-by-field with a Copy-only reasoning that quietly relied on `name`
+staying `&'static str` forever. Switching both to owned `String` (and
+deriving `Clone`) removed the leak entirely with no observable behavior
+change — the field's `'static`-ness was never load-bearing, just an
+artifact of the original author reaching for the same shape as a sibling
+corpus that also never needed `'static` originally.
+
+## Extending a seed-gated fault model: share the roll, don't add a parallel one; and a "frozen node" fault needs the primitive it freezes to know who owns it (ADR 0061 rung B2/B3)
+
+Adding `DiskConfig::set_enospc_prob` (an ENOSPC-distinguishable disk fault,
+alongside the pre-existing generic `error_prob`) was tempting to implement
+as a second, independent RNG roll — draw once for "does the generic error
+fire", draw again for "does ENOSPC fire". That would have been wrong even
+though both draws would individually be deterministic: it changes the
+**number** of RNG draws `inject_disk_fault` makes for a config that only
+ever set `error_prob` (now it would draw for ENOSPC too, even at threshold
+0 — no, gating each draw on its own threshold avoids that specific case —
+but it still changes draw *count* the moment both are configured together,
+and more importantly it's a second source of truth for "did a fault fire
+at all" that has to agree with the first). The fix that actually preserves
+byte-identity for every existing config is **one shared roll, two
+buckets**: draw once, and check `roll < enospc_threshold` then `roll <
+enospc_threshold + error_threshold`. With the new knob at its default (0),
+the combined check degenerates to *exactly* the original single comparison
+against `error_threshold` — not merely "the same number of draws", the
+identical draw feeding an identical comparison. The general form: when a
+new fault variant is meant to be mutually exclusive with an existing one on
+the same op, don't reach for "another independent `if` with another
+independent draw" — fold it into the existing roll as an additional bucket,
+so the old knob's byte-identity proof needs no new argument at all (it's
+still "the same draw, the same comparison" — just with a widened, but
+default-empty, lower bucket carved out of the front of the range).
+
+Implementing `Simulator::pause(node, dur)` (alive-but-frozen: no timer
+fires, no send leaves, no delivery lands, until a bounded resume instant)
+surfaced a structural gap: the simulator's `Sleep` future — the thing that
+actually schedules a `Timer` event on the shared timeline — had never once
+needed to know *which node* it belonged to, because nothing before this had
+a reason to treat one node's timers differently from another's. A `pause`
+that must defer only the *paused* node's timers needs exactly that
+ownership, so `Sleep` gained a `node: NodeId` field (populated from
+`SimEnv`'s own `self.node_id`, already on hand at the `Clock::sleep` call
+site) and `SimState` gained `timer_owner: BTreeMap<TimerId, NodeId>`,
+written once, the first time a `Sleep` actually schedules a timeline entry
+(not on every poll — a `sleep` that resolves immediately never needs an
+owner, since there's no timer to ever defer). The general lesson: a new
+fault that targets "state belonging to one node" can require retrofitting
+ownership tracking onto a primitive that has lived fine without it for
+years, because nothing about that primitive's own job ever needed to
+distinguish nodes — the fault is what introduces the need, not a
+pre-existing design gap. Look for this before assuming a new fault is a
+pure additive knob: does it need to single out state by node/owner that the
+mechanism it's modifying currently treats uniformly?
+
+Two smaller traps hit while building the corpus for these: (1) a spawned
+async block that does `out.lock().unwrap().push(some_async_call().await)`
+in one expression fails `Send` bound checking (`spawn_task` requires `Send
++ 'static`) because the temporary `MutexGuard` from `.lock()` is deemed
+live across the `.await` even though it's logically dropped before the
+push's argument is evaluated — split it into `let x = foo().await; guard =
+lock(); push(x);` on two statements, the same fix this crate's own
+`append`/`sync` doc comments already document for *production* code, which
+turns out to bite test code identically. (2) A test asserting "an fsync
+that lies still loses the *second* write but the first, genuinely synced
+write survives" needs the fault **installed after** the first write's
+already-successful sync, not from the start of the simulator run — with
+`fsync_lie_prob` set globally from t=0, *every* sync lies, including the
+one meant to be the test's trusted baseline, and the failure surfaces as
+"everything is gone", easy to misdiagnose as the fault implementation being
+too aggressive rather than the test's own setup being wrong. The general
+form (already documented elsewhere in this log for disk error injection,
+worth restating for a new fault kind): when a test needs a "this part is
+real, only the later part is faulty" baseline, install the fault config
+*after* the baseline operations run on the same `Simulator`, not before.
+
+Building the ADR 0061 rung B4 failure minimizer surfaced a lesson worth
+generalizing beyond this one facility: **an ADR's Consequences section can
+promise something that isn't literally buildable as stated, and the fix is
+to amend the ADR honestly rather than force-build the literal words.** ADR
+0003 promised "shrinking a failure to a minimal seed becomes possible" —
+but a `SimEnv` run is a pure function of an *opaque* seed by design (that
+opacity is the whole point of a seed), so no seed is "smaller" than
+another and there is nothing to shrink *to*. Two different seeds are two
+unrelated executions, not a big and a small version of the same one. The
+actually-buildable, actually-useful thing was minimizing a failing
+scenario's own *parameters* while holding its seed fixed — a different
+target than the ADR's own words named. Don't let a stale promise's exact
+phrasing constrain the design of the thing that fulfills its *intent*;
+when you build the right thing under a different name than the original
+promise used, say so explicitly in the doc you're amending (a reader
+diffing "shrinking" against what shipped needs the mapping spelled out, not
+left to be inferred), rather than silently reinterpreting old prose to
+have meant what you built.
+
+A second, more mechanical lesson from the same task: **when validating a
+new "fires on failure, does nothing when green" diagnostic path (a
+minimizer, an auto-triage tool, a report generator gated on an assertion
+failing), a synthetic in-memory predicate proves the algorithm but not the
+wiring** — the wiring has to be exercised against a real failure from the
+real harness it's attached to, which for an already-green corpus means
+either fabricating one temporarily (edit in a forced `result.ok = false`
+for one named case, run the real corpus loop with the new tool enabled,
+observe, then revert the edit before committing — never leave the forced
+failure in the tree) or, better where it fits, constructing a *genuine*
+regression: a real scenario whose real, deterministically-computed outcome
+is the failure you want to minimize, without needing an actual production
+bug or weakening any real assertion. `raftkv_linearizable.rs`'s shrink demo
+uses the latter (`read_pct = 100` makes the workload structurally never
+write, so `ok_writes == 0` is a genuine simulator-derived fact, not a
+fabricated boolean) — it's the same trick `negative_control.rs` uses for
+the Elle checker (hand-built histories the checker *must* reject), applied
+one layer up: prove a piece of test *infrastructure* against a
+deliberately-constructed-but-real case, not a toy stand-in and not a wish
+that a production bug will conveniently exist to test against.
+
+## `disallowed-methods` can't name a unit struct, and a package-level Cargo `[lints]` override beats scattering `#![allow]` across dozens of same-crate test-binary roots (ADR 0061 rung B5)
+
+Two mechanical findings from adding `clippy.toml` `disallowed-methods`
+entries for the non-`HashMap`/`HashSet` half of ADR 0003's determinism rule
+(`Instant::now`, `SystemTime::now`, `tokio::spawn`,
+`tokio::time::{sleep,timeout}`, `thread_rng`, `OsRng`).
+
+**A `disallowed-methods` entry for a type used as a bare value (`OsRng`,
+`rand::rngs::OsRng` — a zero-sized unit struct instantiated inline, e.g.
+`&mut rand::rngs::OsRng`) silently fails its own config, not the build.**
+Clippy accepts the `clippy.toml` entry but emits `warning: expected a
+function, found a struct` at every crate root the moment anything in the
+workspace triggers a clippy pass — a real signal, easy to read as noise and
+scroll past since it doesn't fail `-D warnings` on its own (a malformed
+`disallowed-methods` config entry is a warning, not an error). The fix is
+routing that specific item through `disallowed-types` instead (same
+`clippy::disallowed_types` lint HashMap/HashSet already use, same
+`[workspace.lints.clippy]` level already set to `"warn"` for it) — a type
+name goes in `disallowed-types`, a callable path goes in
+`disallowed-methods`, and clippy's own warning names which one you picked
+wrong. Generalizable check before adding any `disallowed-methods` entry: is
+the target actually a function/method, or a type that merely gets
+constructed/referenced bare? `OsRng`, `PhantomData`, a marker/unit struct
+used as a value — all belong in `disallowed-types`, regardless of how
+"function-like" the call site reads (`&mut rand::rngs::OsRng` looks like it
+could be an argument to a function named `OsRng`, but it's a value of type
+`OsRng`).
+
+**Cargo's `[lints]` table is package-scoped, not crate(-root)-scoped — it
+applies to every target the package builds (lib, every `[[bin]]`, every
+`tests/*.rs` integration-test binary, every bench), which makes it the
+right tool for exempting a lint across a package with many separate
+compilation-unit roots, not just a `#![allow]` at one crate root.** A
+source-level `#![allow(clippy::disallowed_methods, reason = "...")]` inner
+attribute only covers the one file it's written in plus any `mod`s it
+pulls in from the *same* crate root — it does **not** reach a sibling
+`tests/other_file.rs`, since each file under `tests/` compiles as its own
+independent crate root under Cargo's integration-test model. A package like
+`animusd` with one `lib.rs`, one `main.rs`, and ~70 separate `tests/*.rs`
+crate roots therefore has ~72 independent places a file-level `#![allow]`
+would need to go to fully exempt the package by that method — worse than
+useless, since it reads as "someone forgot 12 of them" rather than "this is
+deliberately exempted." A package-level override
+(`crates/animusd/Cargo.toml`'s `[lints.clippy] disallowed_methods =
+"allow"`, replacing the `[lints] workspace = true` shorthand with the
+workspace's other lints copied in by hand plus this one override) is a
+single, visible, one-time decision that covers every target in the package
+by construction — no target can silently fall outside it the way a missed
+file would. The general principle: when a lint needs to be off for "this
+whole package, as a documented exception," reach for the package's own
+`Cargo.toml` `[lints]` table before reaching for `#![allow]` — the latter
+is the right tool for a *specific file or item* inside an otherwise-linted
+package, not for exempting the package itself, and picking the wrong one
+for the latter produces an incomplete-looking wall of near-duplicate
+annotations that a reviewer has to trust is exhaustive rather than a single
+statement that obviously is.
+
+Third, softer finding: **before assuming a new lint needs a lot of
+`#[allow]`s, grep the real call sites first** — `grep`-ing every crate this
+task actually targeted (the ones this ADR's `Env` seam is meant to cover)
+for real code (not doc comments mentioning the disallowed name) found
+`src/` already at zero violations everywhere except `animus-env`'s own
+`ProdEnv` and the crate this rung already expected to be the hard case
+(`animusd`). The discipline the lint was about to start enforcing had, in
+every other crate, already held under review alone — worth confirming
+before writing a single `#[allow]`, since it changes the shape of the work
+from "find and annotate a pile of violations" to "confirm there's nothing
+to annotate, then handle the two known exceptions."
+
+## Feature-gating an item everything transitively depends on (ADR 0061 rung C0)
+
+Gating `animus-env`'s `ProdEnv`/`FsSegmentStore` behind a default-off `prod`
+feature (so a crate can depend on `animus-env` with `default-features =
+false` and genuinely not have `ProdEnv` in its build) turned up two
+generalizable points, beyond the "grep real code, not doc comments" one
+above (the same trap bit again here: `tracing` was declared as an
+unconditional dependency, but every non-doc-comment `tracing::` call in the
+crate lived in `prod.rs` — the crate had been unknowingly carrying a
+prod-only dependency as if the whole crate needed it, for a `tracing`
+version bump exactly zero call sites outside `prod.rs` would ever notice).
+
+**First: to prove a feature gate actually closes the door, don't just read
+the `#[cfg]` and reason about it — compile against it.** A tiny scratch
+crate (own `Cargo.toml`, path-dependency on the gated crate with
+`default-features = false`, one line naming the item that should be
+unreachable) is cheap and unambiguous: either it fails to compile with a
+"configured out ... gated behind the `X` feature" note pointing at the
+`#[cfg]`, or it doesn't, and either way you have the compiler's word for it
+instead of your own reading of the manifest. (Needs the target crate's
+`rust-toolchain.toml` copied alongside it if the workspace pins a toolchain
+newer than whatever `rustc` is on `PATH` — otherwise the scratch build fails
+on an unrelated MSRV mismatch before it ever gets to the question being
+tested.) The same technique generalizes to proving any "X should not be
+reachable from Y" claim about a manifest, not just this one.
+
+**Second: `cargo tree -e features -p <crate>` on its own is not the tree
+that ships** — by default it includes the package's `[dev-dependencies]`,
+so a dev-only feature (like `prod` on a `[dev-dependencies]` entry added
+specifically so the *library* stays clean) shows up in the default `tree`
+output and can look like it leaked into the library when it didn't. Add
+`--no-dev-dependencies` to see the graph `cargo build -p <crate>` (library
+only, no tests/benches) actually resolves — that is the tree that answers
+"does the library itself pull this in." Separately: with the workspace's
+resolver (`resolver = "3"`, the edition-2024 default), a package's own
+`[dev-dependencies]` features are *not* unified into its own library build,
+confirmed by comparing `--no-dev-dependencies` output (no `prod`) against
+plain `cargo tree` output (shows `prod`) for the same package — but a
+single `cargo build --workspace --all-targets` invocation still unifies
+features across every target it builds *together*, including other
+packages' test binaries, so putting a feature on `[dev-dependencies]`
+documents "the library doesn't need this" precisely rather than
+mechanically *enforcing* it under every possible invocation — say so
+plainly rather than overclaiming the boundary when reporting work like
+this.

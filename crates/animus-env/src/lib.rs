@@ -21,7 +21,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Real-time/real-IO/real-RNG implementation ([`ProdEnv`], [`FsSegmentStore`],
+/// `PreBindRng`) — gated behind the default-off `prod` feature (ADR 0061
+/// rung C0) so a crate that depends on `animus-env` with
+/// `default-features = false` genuinely cannot name `ProdEnv`: the boundary
+/// `animus-node` (ADR 0061 Phase C) needs is compiler-enforced, not just a
+/// convention. Every current consumer that actually constructs a `ProdEnv`
+/// opts in explicitly with `features = ["prod"]`.
+#[cfg(feature = "prod")]
 pub mod prod;
+#[cfg(feature = "prod")]
 pub use prod::{FsSegmentStore, ProdEnv};
 
 pub mod metrics;

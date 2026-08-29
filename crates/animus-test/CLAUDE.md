@@ -17,6 +17,29 @@ properties; it also hosts cross-crate fault sweeps.
 - `src/check.rs` — `check_cycles` (serializability), `check_durability`,
   `check_convergence`; each returns a `CheckReport` carrying the run seed.
 - `src/export.rs` — `to_json`, `to_edn` (Jepsen/Elle).
+- `src/corpus.rs` (ADR 0061 rung B1) — the shared corpus-seeding scaffolding
+  every fault-injection corpus in the repo builds on: `name_seed` (the
+  house FNV-1a name→seed hash), `odd_name_seed` (a second, `| 1` hash
+  flavor four corpora use — kept as its own function, never unified with
+  `name_seed`, because unifying them would silently move those corpora's
+  committed regression seeds; see this module's own doc for which corpora
+  use which), `seeds_from_env` (the `ANIMUS_*_SEEDS` depth-knob parse), and
+  two expansion shapes: `seed_expand<T: SeedVariant>` for corpora that
+  build a `Vec<Scenario>` up front (implement `SeedVariant`'s
+  `scenario_name`/`reseeded` on your own `Scenario` type — the harness owns
+  the expansion loop, never forcing one struct shape), and `for_each_seed`
+  for corpora that drive one named scenario directly via a closure. Used
+  by `animus-test`'s own `tests/*_corpus.rs` files below and, as a dev-
+  dependency, by `animus-cp-data`'s and `animus-control`'s corpus test
+  files — a dev-dependency cycle Cargo permits, since neither crate's
+  library needs the other to build.
+- `src/shrink.rs` (ADR 0061 rung B4) — the generic failure-minimization
+  engine every corpus can wire in: `minimize` (greedy delta-debugging over a
+  caller-supplied `candidates`/`still_fails` pair), `ShrinkBudget`/
+  `ShrinkReport`, `shrink_enabled`/`budget_from_env` (the `ANIMUS_SHRINK`/
+  `ANIMUS_SHRINK_MAX_CHECKS` env-knob parse), and `describe`/`replay_json`
+  for printing a human report plus a copy-pasteable machine handle. See
+  "Failure minimization" below.
 
 Env knobs at a glance (details in the sections below):
 
@@ -30,6 +53,9 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
+| `ANIMUS_SHRINK=1` | off | minimize a failed corpus scenario's parameters to a small reproducing case (ADR 0061 rung B4) |
+| `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | override the minimizer's check-count budget |
+| `ANIMUS_SHRINK_REPLAY=<json>` | unset | a corpus's own replay entry point (e.g. `raftkv_shrink_replay`) re-runs this minimized case and asserts it still fails |
 
 ## What's non-obvious
 
@@ -81,6 +107,63 @@ Env knobs at a glance (details in the sections below):
   once added.
 - `CheckReport.seed` exists so a flagged anomaly is replayable; surface it in
   assertion messages.
+
+### Failure minimization (`src/shrink.rs`, ADR 0061 rung B4)
+
+- **You cannot shrink a seed.** A `SimEnv` run is a pure function of an
+  *opaque* seed (ADR 0003) — no seed is "smaller" than another, so searching
+  over seeds directly minimizes nothing. `shrink::minimize` instead
+  delta-debugs a failing scenario's own **parameters** (whatever its
+  `Scenario` type exposes — fault schedule, round/client/keyspace counts,
+  outage windows), holding the seed fixed and re-running the whole
+  simulation at each candidate. This is strategy (a) from the module's own
+  doc, chosen over fault-*schedule* minimization (suppressing one specific
+  injected fault decision, e.g. one dropped message out of an ambient
+  `NetConfig` probability, rather than one whole scheduled `Scenario` fault
+  entry) because the latter needs a recorded-schedule replay mode that
+  doesn't exist yet — see `crates/animus-sim/CLAUDE.md`'s own note on this.
+- **Greedy, not full ddmin.** Given the current case, try every "one step
+  smaller" candidate (in a fixed order) and keep the first that still
+  reproduces the failure, restarting from it; stop at a local fixpoint (no
+  candidate reduces further) or when `ShrinkBudget::max_checks` runs out.
+  This repo's `Scenario` types have small parameter spaces (a handful of
+  scalar knobs, single-digit-to-low-tens fault lists), so the simpler
+  algorithm converges in well under the default 500-check budget without
+  needing ddmin's binary-search subset removal.
+- **Deterministic by construction.** The candidate generator is a plain
+  function of the current case (fixed order, no RNG), the predicate reruns
+  the same seed every time, and the budget is a check *count* — never
+  wall-clock time, so a slower machine can't silently produce a
+  less-minimized result. Same failing input ⇒ same minimized output, always.
+- **Opt-in, zero cost by default.** `shrink_enabled()` gates on
+  `ANIMUS_SHRINK=1`; a corpus calls it only *after* already observing a
+  failure (never on a green run's hot path), so an unset `ANIMUS_SHRINK`
+  (the default) never calls into this module — normal corpus runs are
+  unaffected: same seeds, same runtime, byte-for-byte.
+- **Wiring a corpus in** (see `raftkv_linearizable.rs` for the worked
+  example): (1) derive `Serialize`/`Deserialize` on the `Scenario` type
+  (`std::time::Duration` fields serialize fine via serde's own support); (2)
+  write a `candidates(&Scenario) -> Vec<Scenario>` covering the fields worth
+  reducing — skip identity fields (`name`) and the seed itself, and skip any
+  field whose value changes what's *being tested* rather than merely its
+  size (e.g. `raftkv_linearizable.rs` never reduces `replicas`, since some
+  nemeses are only meaningful at a specific group size); (3) at the point a
+  scenario is observed to fail, call `shrink::minimize` with that generator
+  and `shrink::budget_from_env()`, then `shrink::describe` (human report) and
+  `shrink::replay_json` (machine handle) to print both — see
+  `shrink_and_report` in `raftkv_linearizable.rs`; (4) add one `#[ignore]`d
+  replay test that reads the printed JSON from `ANIMUS_SHRINK_REPLAY`,
+  deserializes it, reruns it, and asserts the failure still reproduces (see
+  `raftkv_shrink_replay`) — this is the "developer can replay the minimal
+  case directly" half of the deliverable, proven to round-trip in
+  `raftkv_shrink_reduces_a_real_regression_to_its_minimal_repro`.
+- **What it cannot do yet**: isolate one specific dropped/corrupted/
+  duplicated *message* out of an ambient `NetConfig`/`DiskConfig` probability
+  — that granularity needs fault-schedule minimization (strategy (b)),
+  deferred; see `crates/animus-sim/CLAUDE.md`. It also never touches fields a
+  corpus's own `candidates` function doesn't mention (by design — the corpus
+  author decides what's safe to reduce without changing which failure is
+  being modeled).
 
 ## Tests
 
@@ -147,6 +230,30 @@ retrievable from git history.)
   A `StopRestart` on this tier re-opens the engine via `LsmEngine::open_with`
   on the same per-node prefix — engine recovery *plus* Raft-WAL re-apply
   (idempotent).
+- **`ANIMUS_SHRINK` wiring (ADR 0061 rung B4)** — this is the worked example
+  the "Failure minimization" section above points to. `Scenario`/`Nemesis`
+  derive `Serialize`/`Deserialize`; `scenario_candidates` reduces the fault
+  list (drop one at a time), `window`, `rounds`, `keyspace`, and `clients`
+  (never `name`/`seed`/`replicas` — see its own doc for why); when
+  `raftkv_corpus_is_linearizable` observes a scenario fail and
+  `ANIMUS_SHRINK=1` is set, `shrink_and_report` minimizes it and prints a
+  report plus a JSON replay handle *before* the existing assertion still
+  panics (minimization is a diagnostic only — it never softens the
+  failure). `raftkv_shrink_replay` (`#[ignore]`d) is the paste-back replay
+  entry point: set `ANIMUS_SHRINK_REPLAY` to the printed JSON and run it
+  alone to re-confirm the minimized case fails. Proven two ways:
+  `raftkv_shrink_reduces_a_real_regression_to_its_minimal_repro` builds a
+  scenario with 4 real faults where a **genuine, real-simulator-derived**
+  failure (`read_pct = 100` makes `client_loop` structurally never write, so
+  `ok_writes == 0` regardless of every fault/size knob) reduces to zero
+  faults and every scalar at its floor, checked and round-tripped through
+  JSON; separately, forcing a real `cycles.ok = false` for one named cell and
+  running the corpus with `ANIMUS_SHRINK=1` end-to-end (verified by hand
+  during development, not committed — forcing a real failure into a
+  currently-green corpus isn't a scenario that belongs in the tree) shrank
+  `leader_kill_early_3`'s single fault away and every scalar to its floor,
+  and the printed replay handle reproduced identically through
+  `raftkv_shrink_replay`.
 
 ### Elle-against-cross-tablet-transactions: the multi-tablet corpus (ADR 0018 §4, PR6)
 

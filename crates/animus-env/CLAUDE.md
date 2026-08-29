@@ -16,12 +16,44 @@ the production implementation; the deterministic implementation lives in
   `Envelope`, `BoxFuture`, `PRIMARY_STREAM` (the default stream id the
   `send`/`recv` defaults ride on, ADR 0026), and the `EnvExt::spawn_task`
   convenience. Also `SegmentStore` (ADR 0043 §A7, below) — a seam that is
-  deliberately **not** part of `Env`.
+  deliberately **not** part of `Env`. All of this is available
+  **unconditionally** (no feature needed) — none of it depends on `prod.rs`.
 - `prod.rs` — `ProdEnv`: real monotonic clock, `OsRng`, `tokio::spawn`,
   length-prefixed TCP, `tokio::fs` + `fsync`. Owns a real recording metrics sink
   and exposes `metrics_text()` (ADR 0015). Also `FsSegmentStore` (below),
   the single-directory `SegmentStore` impl, since it does the same real
   `tokio::fs` I/O `ProdEnv` does.
+- **`prod.rs` is gated behind a default-off `prod` Cargo feature (ADR 0061
+  rung C0)**, added specifically so `ProdEnv`/`FsSegmentStore` can be made
+  compiler-unreachable from a crate's manifest, not just avoided by
+  convention — the prerequisite for the `animus-node` carve-out (ADR 0061
+  Phase C) to be an enforced boundary. `pub mod prod;` and
+  `pub use prod::{FsSegmentStore, ProdEnv};` in `lib.rs` both carry
+  `#[cfg(feature = "prod")]`. The trait definitions, `NodeId`, and
+  `metrics.rs` need none of `prod.rs`'s dependencies and are never gated.
+  **Only `tokio`, `rand`, and `tracing` are `prod.rs`-only** and became
+  `optional = true` dependencies pulled in by the feature
+  (`async-trait`/`serde`/`thiserror` back the trait definitions and `NodeId`
+  themselves, so they stay unconditional). Every current consumer that
+  actually constructs a `ProdEnv`/`FsSegmentStore` opts in explicitly with
+  `features = ["prod"]` — on the `[dependencies]` entry for a crate whose
+  own *library* does the constructing (`animusd`, the one real process
+  boundary before Phase C), or on a separate `[dev-dependencies]` entry for
+  a crate that only needs it in tests/benches (`animus-control`,
+  `animus-cp-data`, `animus-storage` — each has a real-thread `ProdEnv`
+  liveness/regression test or, for `animus-storage`, `engine_bench` too).
+  The dev-only placement doesn't yet *enforce* anything on its own — Cargo's
+  resolver keeps a workspace member's dev-dependency features off its
+  library build (verify with `cargo tree -e features -p <crate>
+  --no-dev-dependencies`, which is exactly how this was checked), but a
+  `cargo build --workspace` that also builds test/bench targets in the same
+  invocation unifies features across everything being built in that
+  invocation — it documents the real boundary correctly regardless. Prove
+  the gate itself holds with a scratch crate depending on `animus-env { path
+  = "...", default-features = false }`: naming `animus_env::ProdEnv` fails
+  to compile with `error[E0425]: cannot find type ProdEnv in crate
+  animus_env ... found an item that was configured out ... gated behind the
+  prod feature`.
 - `test_support.rs` — `assert_segment_store_contract` (below): a
   `#[doc(hidden)]`, always-compiled (not `#[cfg(test)]`) cross-crate test
   helper, since `#[cfg(test)]` only gates this crate's own test binaries and
@@ -192,6 +224,20 @@ the production implementation; the deterministic implementation lives in
   tail consistently across all of them.
 - `ProdEnv` is *not* covered by the simulation tests (it's the nondeterministic
   side). Don't add logic here that the deterministic path needs to share.
+- **`prod.rs` carries a module-level `#![allow(clippy::disallowed_methods,
+  reason = "...")]`** (ADR 0061 rung B5) — this file is the one sanctioned
+  place `Instant::now`/`SystemTime::now`/`tokio::spawn`/
+  `tokio::time::{sleep,timeout}` are the correct call, so the workspace-wide
+  `clippy.toml` `disallowed-methods` lint is exempted here at the module
+  level rather than at each of its ~30 call sites. The two `OsRng` sites
+  (`impl Rng for ProdEnv`/`impl Rng for PreBindRng`) are separately
+  `disallowed_types`-allowed at their own `impl` blocks, not folded into
+  that same module-level allow — `OsRng` is a unit struct (trips
+  `disallowed-types`, not `disallowed-methods`) and keeping the two allows
+  apart means an accidental future `HashMap` elsewhere in this file would
+  still trip the lint. Don't widen either allow's scope without checking
+  whether the new code is actually more `ProdEnv`-sanctioned real I/O, or
+  just convenient to exempt.
 - `ProdEnv::shutdown()` aborts every task the env owns — its inbound-connection
   accept loop plus everything spawned through `Spawner::spawn` (so the env tracks
   spawned `AbortHandle`s). `animusd`'s `Node::shutdown` calls it on each of the
@@ -334,7 +380,11 @@ the production implementation; the deterministic implementation lives in
 The seam is exercised end-to-end through `animus-sim` (`cargo test -p
 animus-sim`). One `ProdEnv` unit test (`prod::tests`, real temp dir) asserts a
 nested `"sub/dir/file"` `append`+`sync`+`read` round-trips — i.e. the disk
-creates parent directories. `cargo test -p animus-env`. `metrics.rs::tests`
+creates parent directories. `cargo test -p animus-env` runs the
+feature-independent tests (`lib.rs`/`metrics.rs`); `prod::tests` only exists
+(and only runs) with the `prod` feature on — `cargo test -p animus-env
+--features prod` (or `--all-features`, which the workspace gate already
+runs). `metrics.rs::tests`
 cover incr/snapshot round-trips, that clones share one sink, and that the text
 export is stable + ordered. `lib.rs::tests` (ADR 0040 PR4) covers
 `NodeId::mint`/`base64url_nopad`: known base64url test vectors, no padding/

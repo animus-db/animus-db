@@ -38,6 +38,7 @@ use animus_env::{Env, Rng, SegmentStore, nid};
 use animus_sim::{SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
+use animus_test::corpus;
 use futures::executor::block_on;
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
@@ -45,35 +46,11 @@ type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 const NODES: [u64; 3] = [80, 81, 82];
 const TABLE: &str = "orders";
 
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h | 1
-}
-
-fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_PITR_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&k: &usize| k > 0)
-        .unwrap_or(1)
-}
-
-fn cell_seed(name: &str, variant: usize) -> u64 {
-    if variant == 0 {
-        name_seed(name)
-    } else {
-        name_seed(&format!("{name}_s{variant}"))
-    }
-}
-
-fn for_each_seed(name: &str, mut body: impl FnMut(u64)) {
-    for variant in 0..seeds_per_cell() {
-        body(cell_seed(name, variant));
-    }
+/// Depth-scaled per-cell seed derivation and expansion — shared with every
+/// sibling corpus in this crate, `animus_test::corpus`
+/// (`odd_name_seed`/`seeds_from_env`/`for_each_seed`).
+fn for_each_seed(name: &str, body: impl FnMut(u64)) {
+    corpus::for_each_seed(name, corpus::seeds_from_env("ANIMUS_PITR_SEEDS"), body);
 }
 
 // --- tablet-group harness (mirrors stream_lineage_corpus.rs) --------------

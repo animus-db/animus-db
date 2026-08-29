@@ -71,9 +71,12 @@ use animus_cp_data::RaftKvNode;
 use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
+use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
+use animus_test::shrink::{self, ShrinkReport};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
 use futures::executor::block_on;
+use serde::{Deserialize, Serialize};
 
 /// A group node over a chosen engine tier.
 type Node<S> = RaftKvNode<SimEnv, S>;
@@ -118,7 +121,7 @@ const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 
 /// A fault the nemesis injects at a scheduled virtual time, resolved against the
 /// live group at run time (so a scenario is shape-relative).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum Nemesis {
     /// Crash the current leader (drops un-synced disk + inbox, mutes sends). The
     /// survivors must elect a new leader and keep serving; every acked write must
@@ -156,7 +159,7 @@ enum Nemesis {
 /// A seed-reproducible scenario: a named group size + workload + an explicit fault
 /// schedule (virtual time → nemesis). `HealAll` is always applied by the runner at
 /// the end, so it is not scheduled here.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Scenario {
     name: String,
     seed: u64,
@@ -176,18 +179,22 @@ struct Scenario {
 
 // ---------------------------------------------------------------------------
 // The frozen corpus: a committed, deterministic generator. Each scenario's seed
-// is a stable hash of its name (FNV-1a — no `std::hash` nondeterminism), so the
-// suite runs the SAME set every run and a failure names one scenario + seed.
+// is a stable hash of its name (FNV-1a — no `std::hash` nondeterminism, see
+// `animus_test::corpus`), so the suite runs the SAME set every run and a
+// failure names one scenario + seed.
 // ---------------------------------------------------------------------------
 
-/// FNV-1a over the name's bytes — a deterministic name→seed map.
-fn name_seed(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
     }
-    h
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            ..self.clone()
+        }
+    }
 }
 
 /// Single-fault nemeses sampled across the original (window-less) corpus cells.
@@ -224,7 +231,7 @@ const DEEP_WINDOW: Duration = Duration::from_millis(2500);
 /// space, a mix of reads and writes. Single-key ops (the plane is non-transactional).
 fn base_workload(name: &str, replicas: usize, faults: Vec<(Duration, Nemesis)>) -> Scenario {
     Scenario {
-        seed: name_seed(name),
+        seed: corpus::name_seed(name),
         name: name.to_string(),
         replicas,
         clients: 3,
@@ -319,11 +326,7 @@ fn corpus_cells() -> Vec<Scenario> {
 /// interleavings is the dominant bug-finding lever; `K=1` is byte-identical to the
 /// committed frozen set.
 fn seeds_per_cell() -> usize {
-    std::env::var("ANIMUS_RAFTKV_SEEDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1)
+    corpus::seeds_from_env("ANIMUS_RAFTKV_SEEDS")
 }
 
 /// Whether the full-corpus LSM tier is enabled (`ANIMUS_RAFTKV_LSM` set to a
@@ -339,41 +342,10 @@ fn lsm_full_enabled() -> bool {
     }
 }
 
-/// Expand each cell into `k` seed variants. Variant 0 keeps the cell's canonical
-/// (frozen) name + seed (so `k=1` is the identity); variants `1..k` get a `_sNN`
-/// suffix and a fresh name-derived seed.
-fn seed_expand(cells: Vec<Scenario>, k: usize) -> Vec<Scenario> {
-    if k <= 1 {
-        return cells;
-    }
-    let mut out = Vec::with_capacity(cells.len() * k);
-    for cell in cells {
-        for i in 0..k {
-            if i == 0 {
-                out.push(cell.clone());
-            } else {
-                let name = format!("{}_s{i:02}", cell.name);
-                out.push(Scenario {
-                    seed: name_seed(&name),
-                    replicas: cell.replicas,
-                    clients: cell.clients,
-                    rounds: cell.rounds,
-                    keyspace: cell.keyspace,
-                    read_pct: cell.read_pct,
-                    faults: cell.faults.clone(),
-                    window: cell.window,
-                    name,
-                });
-            }
-        }
-    }
-    out
-}
-
 /// The corpus the headline test runs: the frozen cells, seed-expanded by the
 /// depth knob.
 fn corpus() -> Vec<Scenario> {
-    seed_expand(corpus_cells(), seeds_per_cell())
+    corpus::seed_expand(corpus_cells(), seeds_per_cell())
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +921,103 @@ fn assert_scenario_ok(tier: &str, s: &Scenario, r: &ScenarioResult) {
 }
 
 // ---------------------------------------------------------------------------
+// Failure minimization (ADR 0061 rung B4): `ANIMUS_SHRINK=1` wiring for this
+// corpus, on top of `animus_test::shrink`'s generic engine. Strategy (a)
+// (scenario-parameter minimization) per that module's doc — the seed stays
+// fixed throughout, only `Scenario`'s own explicit fields (never RNG-drawn
+// here) are reduced.
+// ---------------------------------------------------------------------------
+
+/// Whether a scenario result violates any of the three checks — the shared
+/// failure predicate for both `assert_scenario_ok` (via the checks it makes)
+/// and the shrink wiring below (which needs a plain `bool`, not an assert).
+fn scenario_failed(r: &ScenarioResult) -> bool {
+    !r.cycles.ok || !r.durability.ok || !r.convergence.ok
+}
+
+/// Delta-debugging candidates for a [`Scenario`]: every "one step smaller"
+/// variant, in a fixed, deterministic order. Each candidate changes exactly
+/// one dimension:
+///
+/// - drop one scheduled fault (tried first — usually the highest-leverage
+///   move, and the one this corpus's `faults: Vec<(Duration, Nemesis)>` field
+///   makes possible for free, since it's already an explicit, un-randomized
+///   list rather than something drawn from `NetConfig`'s ambient probability
+///   — see `animus_test::shrink`'s module doc on why that granularity is
+///   reachable under strategy (a) here specifically);
+/// - zero a real outage window;
+/// - halve `rounds` / `keyspace` (floor 1);
+/// - decrement `clients` (floor 1).
+///
+/// Deliberately **not** touched: `name` (identity), `seed` (fixed throughout
+/// — strategy (a)'s whole premise), and `replicas` (some nemeses, e.g.
+/// `LeaderMinority`, are only meaningful at a specific group size; reducing
+/// it risks silently changing which fault the scenario even models, which
+/// would no longer be minimizing the *same* failure).
+fn scenario_candidates(s: &Scenario) -> Vec<Scenario> {
+    let mut out = Vec::new();
+    for i in 0..s.faults.len() {
+        let mut faults = s.faults.clone();
+        faults.remove(i);
+        out.push(Scenario {
+            faults,
+            ..s.clone()
+        });
+    }
+    if !s.window.is_zero() {
+        out.push(Scenario {
+            window: Duration::ZERO,
+            ..s.clone()
+        });
+    }
+    if s.rounds > 1 {
+        out.push(Scenario {
+            rounds: (s.rounds / 2).max(1),
+            ..s.clone()
+        });
+    }
+    if s.keyspace > 1 {
+        out.push(Scenario {
+            keyspace: (s.keyspace / 2).max(1),
+            ..s.clone()
+        });
+    }
+    if s.clients > 1 {
+        out.push(Scenario {
+            clients: s.clients - 1,
+            ..s.clone()
+        });
+    }
+    out
+}
+
+/// Shrink one observed failure and print a report + a copy-pasteable replay
+/// handle. Called only after a scenario is already known to have failed —
+/// never on the hot path of a green run — and only when `ANIMUS_SHRINK=1`, so
+/// this adds zero cost/behavior to a normal corpus run (the default).
+fn shrink_and_report(s: &Scenario) -> ShrinkReport<Scenario> {
+    let report = shrink::minimize(
+        s.clone(),
+        scenario_candidates,
+        |cand| scenario_failed(&run_scenario(cand)),
+        shrink::budget_from_env(),
+    );
+    eprintln!("{}", shrink::describe(&s.name, &report));
+    match shrink::replay_json(&report) {
+        Ok(json) => {
+            eprintln!("  replay handle (JSON): {json}");
+            eprintln!(
+                "  Replay directly: ANIMUS_SHRINK_REPLAY='{json}' \\\n    \
+                 cargo test -p animus-test --test raftkv_linearizable \\\n    \
+                 raftkv_shrink_replay -- --ignored --nocapture"
+            );
+        }
+        Err(e) => eprintln!("  (failed to serialize replay handle: {e})"),
+    }
+    report
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -994,6 +1063,14 @@ fn raftkv_corpus_is_linearizable() {
         // Serializability is a SAFETY property — it must hold on every scenario.
         // Convergence + durability are EVENTUAL — the poll gives them room to
         // heal; only budget exhaustion is a genuine failure.
+        if scenario_failed(&r) && shrink::shrink_enabled() {
+            // Never on the hot path of a green run — only after we already
+            // know this scenario failed, and only opted in via
+            // ANIMUS_SHRINK=1 (see the root CLAUDE.md knob table). Still
+            // asserts below exactly as before: minimization only adds a
+            // diagnostic, it never softens the failure.
+            shrink_and_report(s);
+        }
         assert_scenario_ok("mem", s, &r);
         total_ok_writes += r.ok_writes;
         if !s.faults.is_empty() && r.ok_writes > 0 {
@@ -1099,7 +1176,7 @@ fn raftkv_corpus_covers_the_fault_matrix() {
             .unwrap_or_else(|| panic!("frozen cell {legacy} disappeared from the corpus"));
         assert_eq!(
             cell.seed,
-            name_seed(legacy),
+            corpus::name_seed(legacy),
             "frozen seed moved for {legacy}"
         );
         assert!(
@@ -1117,7 +1194,7 @@ fn raftkv_corpus_covers_the_fault_matrix() {
 fn raftkv_seed_expansion_is_additive_and_unique() {
     let base = corpus_cells();
     let k = 3;
-    let expanded = seed_expand(base.clone(), k);
+    let expanded = corpus::seed_expand(base.clone(), k);
     assert_eq!(expanded.len(), base.len() * k);
 
     let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
@@ -1133,7 +1210,7 @@ fn raftkv_seed_expansion_is_additive_and_unique() {
         assert_eq!(kept.seed, b.seed, "seed moved for {}", b.name);
     }
     // k == 1 is the identity (the always-on default is byte-identical to base).
-    assert_eq!(seed_expand(base.clone(), 1).len(), base.len());
+    assert_eq!(corpus::seed_expand(base.clone(), 1).len(), base.len());
 }
 
 #[test]
@@ -1236,5 +1313,148 @@ fn raftkv_lsm_run_is_deterministic() {
         serde_json::to_string(&b.history).unwrap(),
         "LSM history not reproducible for seed {}",
         scenario.seed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Failure minimization (ADR 0061 rung B4) — the end-to-end proof against the
+// real simulator (`animus_test::shrink`'s own crate-local unit tests already
+// prove the algorithm itself on a fast synthetic case; this proves the
+// *wiring* against this corpus's real `Scenario`/`run_scenario`/`RaftKvNode`
+// stack).
+// ---------------------------------------------------------------------------
+
+/// A manufactured, deterministic regression — never touches the corpus's own
+/// pass/fail assertions (`assert_scenario_ok`) or any invariant the real
+/// system claims — that gives the shrinker a **genuine, real-simulator-
+/// derived** failure to reduce rather than a synthetic int predicate:
+/// `read_pct = 100` makes `client_loop` structurally never choose a write
+/// (`is_read = gen_below(100) < read_pct` is always true — see
+/// `client_loop` above), so `ok_writes == 0` for **any** fault schedule,
+/// group shape, or workload size — a real property of a real run, just an
+/// uninteresting one, chosen because it makes the "this dimension is a red
+/// herring" claim checkable by construction rather than by luck.
+///
+/// Reproduces `ANIMUS_SHRINK`'s real corpus wiring end to end: the four
+/// scheduled faults and the workload's own size are every dimension
+/// [`scenario_candidates`] knows how to reduce, none of them affect this
+/// failure at all, so a correct minimizer must strip **all** of them to
+/// their floor while the (real, simulator-derived) failure keeps
+/// reproducing throughout — proving the wiring against genuine `RaftKvNode`/
+/// `Simulator` runs, not a unit-test stand-in.
+#[test]
+fn raftkv_shrink_reduces_a_real_regression_to_its_minimal_repro() {
+    let mut scenario = base_workload(
+        "shrink_demo_read_only_never_writes",
+        3,
+        vec![
+            (Duration::from_millis(700), Nemesis::LeaderKill),
+            (Duration::from_millis(1500), Nemesis::FollowerKill),
+            (Duration::from_millis(2200), Nemesis::PartitionLeader),
+            (Duration::from_millis(3000), Nemesis::Lossy),
+        ],
+    );
+    scenario.read_pct = 100;
+    scenario.rounds = 6;
+    scenario.clients = 3;
+    scenario.keyspace = 3;
+
+    fn regression_reproduces(s: &Scenario) -> bool {
+        run_scenario(s).ok_writes == 0
+    }
+
+    assert!(
+        regression_reproduces(&scenario),
+        "sanity: the manufactured case must genuinely fail (0 acked writes) \
+         before shrinking it"
+    );
+
+    let report = shrink::minimize(
+        scenario.clone(),
+        scenario_candidates,
+        regression_reproduces,
+        shrink::ShrinkBudget::default(),
+    );
+    eprintln!("{}", shrink::describe(&scenario.name, &report));
+
+    assert!(
+        report.converged(),
+        "expected a genuine fixpoint within the default budget: {report:?}"
+    );
+    assert!(
+        report.minimized.faults.is_empty(),
+        "every scheduled fault is a red herring for this regression and must \
+         be stripped, got {:?}",
+        report.minimized.faults
+    );
+    assert_eq!(
+        report.minimized.rounds, 1,
+        "round count is irrelevant to this regression and must hit its floor"
+    );
+    assert_eq!(
+        report.minimized.keyspace, 1,
+        "keyspace is irrelevant to this regression and must hit its floor"
+    );
+    assert_eq!(
+        report.minimized.clients, 1,
+        "client count is irrelevant to this regression and must hit its floor"
+    );
+    assert_eq!(
+        report.minimized.seed, scenario.seed,
+        "strategy (a) never changes the seed — see animus_test::shrink's module doc"
+    );
+    assert!(
+        regression_reproduces(&report.minimized),
+        "the minimized case must still reproduce the original failure"
+    );
+
+    // The printed replay handle round-trips through serde exactly as a
+    // developer pasting it into ANIMUS_SHRINK_REPLAY (`raftkv_shrink_replay`,
+    // below) would rely on — proving the handle itself is actually
+    // reusable, not just that this process's own in-memory report looks
+    // right. (`raftkv_shrink_replay`'s own predicate is `scenario_failed`,
+    // the real corpus's failure notion — not this demo's manufactured
+    // `ok_writes == 0` regression — so it is exercised separately, in
+    // `raftkv_corpus_is_linearizable`'s own `ANIMUS_SHRINK=1` path.)
+    let json = shrink::replay_json(&report).expect("Scenario must serialize");
+    let replayed: Scenario = serde_json::from_str(&json).expect("Scenario must round-trip");
+    assert_eq!(replayed.seed, report.minimized.seed);
+    assert_eq!(replayed.faults.len(), report.minimized.faults.len());
+    assert!(regression_reproduces(&replayed));
+}
+
+/// The replay entry point named in every `ANIMUS_SHRINK` report
+/// (`shrink_and_report`'s printed instructions): paste the JSON a shrink run
+/// printed into `ANIMUS_SHRINK_REPLAY` and run this single test to re-run
+/// exactly that minimized case and confirm it still reproduces. `#[ignore]`d
+/// like any other opt-in diagnostic entry point — it does nothing (and
+/// asserts nothing) when the env var is unset, so it is inert in a normal
+/// `cargo test` run.
+#[test]
+#[ignore = "opt-in replay entry point — set ANIMUS_SHRINK_REPLAY to a shrink report's printed JSON"]
+fn raftkv_shrink_replay() {
+    let Ok(json) = std::env::var("ANIMUS_SHRINK_REPLAY") else {
+        eprintln!(
+            "raftkv_shrink_replay: skipped — set ANIMUS_SHRINK_REPLAY to a \
+             shrink report's printed JSON to replay it"
+        );
+        return;
+    };
+    let scenario: Scenario =
+        serde_json::from_str(&json).expect("ANIMUS_SHRINK_REPLAY must be a Scenario JSON blob");
+    let r = run_scenario(&scenario);
+    eprintln!(
+        "replayed '{}' (seed={}): cycles.ok={} durability.ok={} convergence.ok={} ok_writes={}",
+        scenario.name, scenario.seed, r.cycles.ok, r.durability.ok, r.convergence.ok, r.ok_writes
+    );
+    assert!(
+        scenario_failed(&r),
+        "replayed scenario '{}' (seed={}) did NOT reproduce the failure — \
+         cycles.ok={} durability.ok={} convergence.ok={}",
+        scenario.name,
+        scenario.seed,
+        r.cycles.ok,
+        r.durability.ok,
+        r.convergence.ok
     );
 }

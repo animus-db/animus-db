@@ -25,6 +25,14 @@
 //! [`LsmEngine`]: animus_storage::LsmEngine
 //! [`MemoryEngine`]: animus_storage::MemoryEngine
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a ProdEnv wall-clock macro-bench
+// (see the module doc above) — timing real elapsed time against a real disk
+// is this file's entire job, not system logic under the Env seam.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "ProdEnv wall-clock macro-benchmark over a real disk (see module doc); ADR 0061 Decision 4"
+)]
+
 use std::time::{Duration, Instant};
 
 use animus_env::ProdEnv;

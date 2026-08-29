@@ -13,8 +13,10 @@
 //! replayable.
 
 pub mod check;
+pub mod corpus;
 pub mod export;
 pub mod history;
+pub mod shrink;
 
 pub use check::{CheckReport, check_convergence, check_cycles, check_durability};
 pub use history::{Entry, History, Key, ListVal, Mop, Outcome, Process, Recorder};

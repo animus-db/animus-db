@@ -11,6 +11,15 @@
 //! bounded (no runaway term growth) and settles to one stable leader
 //! afterward.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-time ProdEnv liveness
+// guard (see the module doc above) — SimEnv's virtual clock cannot observe
+// an election-storm risk under real scheduling, so real time/threads are the
+// point here, not a determinism hole.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-time ProdEnv liveness guard (SimEnv's virtual clock cannot see real-scheduling election risk, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

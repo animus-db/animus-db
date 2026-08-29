@@ -59,6 +59,15 @@
 //! same key/value is idempotent. All of it is a bounded
 //! converged-or-timeout loop, never a fixed one-shot wait.
 
+// ADR 0003 / ADR 0061 Decision 4 (rung B5): a real-thread ProdEnv regression
+// (see the module doc above) — the race under test is structurally
+// unreachable under SimEnv's cooperative single-thread scheduler, so real
+// time/threads/spawn are the point here, not a determinism hole.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "real-thread ProdEnv regression (the race is unreachable under SimEnv's cooperative scheduler, see module doc); ADR 0061 Decision 4"
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

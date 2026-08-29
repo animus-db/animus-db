@@ -219,6 +219,14 @@ async fn drain_and_remove_node(
                  ({tablets_remaining} tablets remaining, status {member_status:?})"
             ));
         }
+        // ADR 0003 / ADR 0061 Decision 4 (rung B5): this reconcile loop polls a
+        // real Kubernetes pod's admin port over a real network, outside the
+        // Env seam (kube-rs, no SimEnv counterpart) — a real wall-clock wait
+        // is the correct tool here, not a determinism hole.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "animus-operator polls a real pod's admin port outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
+        )]
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 

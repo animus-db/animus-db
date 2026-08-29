@@ -14,11 +14,19 @@
 //! Fault injection — [`partition`](Simulator::partition),
 //! [`heal`](Simulator::heal), [`crash`](Simulator::crash),
 //! [`restart`](Simulator::restart), [`stop`](Simulator::stop) (process exit),
-//! the [`NetConfig`] delay/drop model, and the [`DiskConfig`] disk fault model
-//! (injected I/O errors, torn crash tails, corruption —
-//! [`corrupt_durable`](Simulator::corrupt_durable) for at-rest corruption) —
-//! is all reproducible from the seed. A recorded [`trace`](Simulator::trace)
-//! is byte-identical across repeated runs of the same scenario and seed.
+//! [`pause`](Simulator::pause) (alive-but-frozen), the [`NetConfig`]
+//! delay/drop/duplicate/corrupt model (global, per-node
+//! [`set_net_config_for`](Simulator::set_net_config_for), or per-link
+//! [`set_link_net_config`](Simulator::set_link_net_config)), and the
+//! [`DiskConfig`] disk fault model (injected I/O errors including
+//! ENOSPC, torn crash tails, corruption —
+//! [`corrupt_durable`](Simulator::corrupt_durable) for at-rest corruption —
+//! and fsync-acked-but-lost) — is all reproducible from the seed. Per-node
+//! [`set_clock_skew_for`](Simulator::set_clock_skew_for) and
+//! [`set_clock_drift_for`](Simulator::set_clock_drift_for) model a node whose
+//! clock reads wrong, statically or progressively. A recorded
+//! [`trace`](Simulator::trace) is byte-identical across repeated runs of the
+//! same scenario and seed.
 //!
 //! See `docs/adr/0003-deterministic-simulation.md`.
 
@@ -60,16 +68,47 @@ enum Event {
     Deliver { to: NodeId, env: Envelope },
 }
 
-/// Network delay and drop model. Delay jitter and drop sampling draw from the
-/// simulation RNG, so they are reproducible from the seed.
+/// Network delay/drop/duplicate/corruption model. Every sample (drop,
+/// duplicate, corrupt, heavy-tail selection, jitter) draws from the
+/// simulation RNG, so a configured schedule is reproducible from the seed.
+/// **Every non-default knob defaults off**: with a plain `NetConfig::default()`
+/// (`drop_threshold == 0`, `duplicate_threshold == 0`, `corrupt_threshold ==
+/// 0`, `heavy_tail_threshold == 0` — the state every prior `NetConfig`
+/// already had), a send draws exactly the same RNG values in the same order
+/// it did before these knobs existed: a drop roll (only if `drop_threshold >
+/// 0`) then a jitter draw (only if `max_jitter > 0`) — see the doc on
+/// [`Simulator::set_net_config`] for the full, extended draw order once any
+/// of the new knobs are enabled.
+///
+/// Scope with [`Simulator::set_net_config`] (global),
+/// [`Simulator::set_net_config_for`] (per-node, keyed on the **sender**), or
+/// [`Simulator::set_link_net_config`] (per directed link) — mirrors the
+/// [`DiskConfig`]/[`Simulator::set_disk_config_for`] pattern.
 #[derive(Clone)]
 pub struct NetConfig {
     /// Minimum one-way delivery delay.
     pub base_delay: Duration,
     /// Maximum additional uniform jitter on top of `base_delay`.
     pub max_jitter: Duration,
+    /// With [`set_heavy_tail_prob`](Self::set_heavy_tail_prob) `> 0`: the
+    /// jitter ceiling used instead of `max_jitter` on the draws that land in
+    /// the heavy tail — an occasional much-slower message (a GC pause on the
+    /// peer, a retried TCP segment) without raising the delay for the common
+    /// case. Unused (never read) while the heavy-tail probability is 0.
+    pub heavy_tail_max_jitter: Duration,
     /// A message is dropped when `rng.next_u64() < drop_threshold`.
     drop_threshold: u64,
+    /// A surviving (non-dropped) message is corrupted (one payload byte
+    /// bit-flipped) when `rng.next_u64() < corrupt_threshold`.
+    corrupt_threshold: u64,
+    /// A surviving message is additionally re-delivered — a duplicate, with
+    /// its own independent delay draw — when
+    /// `rng.next_u64() < duplicate_threshold`.
+    duplicate_threshold: u64,
+    /// Probability (per delay draw, so once for the original send and,
+    /// independently, once more for a duplicate) that the jitter draw uses
+    /// `heavy_tail_max_jitter` instead of `max_jitter`.
+    heavy_tail_threshold: u64,
 }
 
 impl Default for NetConfig {
@@ -77,7 +116,11 @@ impl Default for NetConfig {
         Self {
             base_delay: Duration::from_millis(1),
             max_jitter: Duration::from_millis(4),
+            heavy_tail_max_jitter: Duration::ZERO,
             drop_threshold: 0,
+            corrupt_threshold: 0,
+            duplicate_threshold: 0,
+            heavy_tail_threshold: 0,
         }
     }
 }
@@ -86,6 +129,38 @@ impl NetConfig {
     /// Set the independent per-message drop probability in `[0.0, 1.0]`.
     pub fn set_drop_prob(&mut self, p: f64) {
         self.drop_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Set the independent per-message wire-payload-corruption probability in
+    /// `[0.0, 1.0]` — the network analogue of [`DiskConfig`]'s at-rest
+    /// corruption. On a hit, one seed-chosen byte of the payload is
+    /// bit-flipped before the (possibly duplicated) delivery is scheduled; a
+    /// zero-length payload cannot be corrupted (the roll still happens —
+    /// determinism doesn't depend on payload length — but nothing is
+    /// flipped and no [`TraceEvent::NetCorrupt`] is recorded).
+    pub fn set_corrupt_prob(&mut self, p: f64) {
+        self.corrupt_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Set the independent per-message duplication probability in
+    /// `[0.0, 1.0]`. On a hit, a surviving message is delivered **twice**:
+    /// the duplicate carries the same (possibly corrupted) bytes but draws
+    /// its **own independent delay** (including its own heavy-tail roll),
+    /// so it can arrive before, at, or after the original — modelling a real
+    /// duplicated packet's independent path through the network, rather than
+    /// a same-instant echo.
+    pub fn set_duplicate_prob(&mut self, p: f64) {
+        self.duplicate_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Set the probability, in `[0.0, 1.0]`, that a delay draw lands in the
+    /// heavy tail (using [`heavy_tail_max_jitter`](Self::heavy_tail_max_jitter)
+    /// instead of [`max_jitter`](Self::max_jitter)). Set
+    /// `heavy_tail_max_jitter` alongside this (a plain field, like
+    /// `base_delay`/`max_jitter`) — a nonzero probability with a zero ceiling
+    /// is a no-op.
+    pub fn set_heavy_tail_prob(&mut self, p: f64) {
+        self.heavy_tail_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
     }
 }
 
@@ -98,10 +173,25 @@ impl NetConfig {
 /// [`Simulator::set_disk_config_for`] (mirrors the [`NetConfig`] pattern).
 #[derive(Clone, Default)]
 pub struct DiskConfig {
-    /// An `append`/`sync`/`read`/`read_at`/`replace` fails (with an injected
-    /// `io::Error`, and no state change) when `rng.next_u64() < error_threshold`.
-    /// Metadata ops (`size`/`remove`/`list`) are never injected.
+    /// An `append`/`sync`/`read`/`read_at`/`replace` fails with a generic
+    /// injected `io::Error` (`ErrorKind::Other`, and no state change) when
+    /// the single per-op roll lands in `[enospc_threshold, enospc_threshold +
+    /// error_threshold)`. Metadata ops (`size`/`remove`/`list`) are never
+    /// injected. See [`enospc_threshold`](Self::enospc_threshold) for the
+    /// ENOSPC-distinguishable sibling this shares its roll with.
     error_threshold: u64,
+    /// Like [`error_threshold`](Self::error_threshold), but the injected
+    /// error carries `ErrorKind::StorageFull` (ENOSPC) instead of `Other`, so
+    /// a caller that branches on `ErrorKind` (as production code must, to
+    /// tell "disk full" apart from a generic read/write failure) can be
+    /// exercised under simulation. **One roll decides both**: a single
+    /// `rng.next_u64()` per injectable op lands in `[0, enospc_threshold)`
+    /// (ENOSPC), then `[enospc_threshold, enospc_threshold +
+    /// error_threshold)` (generic), else no fault — so with the default
+    /// `enospc_threshold == 0` this reduces to exactly the prior single-draw,
+    /// single-comparison generic-error check (same draw, same outcome),
+    /// keeping every existing `error_prob`-only config byte-identical.
+    enospc_threshold: u64,
     /// On [`Simulator::crash`], keep a seed-chosen **strict prefix** of each
     /// file's un-synced buffered bytes (instead of dropping the whole buffer
     /// atomically), moving it into the durable image — modelling a write torn
@@ -125,12 +215,34 @@ pub struct DiskConfig {
     /// trace event ordering beyond the timer it schedules, so it composes
     /// cleanly with the other knobs.
     sync_delay: Option<Duration>,
+    /// **fsync-acked-but-lost**: on a hit (`rng.next_u64() < fsync_lie_threshold`,
+    /// sampled independently inside [`Disk::sync`], only after the
+    /// `error_threshold`/`enospc_threshold` roll above has already missed —
+    /// a call that fails outright never reaches this roll, since nothing was
+    /// "acked" at all), `sync` still returns `Ok` but the buffered bytes it
+    /// would normally move into the durable image are left exactly where
+    /// they were: still buffered, still vulnerable to
+    /// [`Simulator::crash`]'s un-synced-bytes handling (whole-buffer drop by
+    /// default, or [`torn_tail_on_crash`](Self::torn_tail_on_crash)/
+    /// [`corrupt_on_crash`](Self::corrupt_on_crash) if configured) — modelling
+    /// a real filesystem that acks an `fsync` and then loses the write on
+    /// power loss. Reads are unaffected (a lied-to `sync` is transparent to
+    /// `read`/`read_at`, exactly like any other un-synced tail); only a
+    /// following crash reveals the lie.
+    fsync_lie_threshold: u64,
 }
 
 impl DiskConfig {
     /// Set the independent per-op disk error probability in `[0.0, 1.0]`.
     pub fn set_error_prob(&mut self, p: f64) {
         self.error_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
+    }
+
+    /// Set the independent per-op ENOSPC probability in `[0.0, 1.0]` — see
+    /// [`enospc_threshold`](Self::enospc_threshold) for how this composes
+    /// with [`set_error_prob`](Self::set_error_prob) on one shared roll.
+    pub fn set_enospc_prob(&mut self, p: f64) {
+        self.enospc_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
     }
 
     /// Inject `dur` of extra virtual-time latency into every subsequent
@@ -140,6 +252,12 @@ impl DiskConfig {
     /// setter, no RNG involved.
     pub fn set_sync_delay(&mut self, dur: Duration) {
         self.sync_delay = Some(dur);
+    }
+
+    /// Set the independent per-`sync` fsync-acked-but-lost probability in
+    /// `[0.0, 1.0]` — see [`fsync_lie_threshold`](Self::fsync_lie_threshold).
+    pub fn set_fsync_lie_prob(&mut self, p: f64) {
+        self.fsync_lie_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
     }
 }
 
@@ -175,13 +293,45 @@ pub enum TraceEvent {
     },
     /// A sleep timer fired.
     Timer { t: u64, id: TimerId },
-    /// A disk op failed with an injected error ([`DiskConfig`] error rate).
+    /// A surviving message was corrupted in transit: one payload byte was
+    /// bit-flipped ([`NetConfig::set_corrupt_prob`]).
+    NetCorrupt {
+        t: u64,
+        from: NodeId,
+        to: NodeId,
+        stream: u64,
+        offset: u64,
+    },
+    /// A surviving message was additionally re-delivered as a duplicate, with
+    /// its own independent delay draw ([`NetConfig::set_duplicate_prob`]).
+    Duplicate {
+        t: u64,
+        from: NodeId,
+        to: NodeId,
+        stream: u64,
+        len: usize,
+    },
+    /// A node was paused ([`Simulator::pause`]): frozen until virtual time
+    /// reaches `until` — no timer owned by it fires and no message it sends
+    /// leaves before then; messages addressed to it queue (deferred, not
+    /// dropped) until then too.
+    Pause { t: u64, node: NodeId, until: u64 },
+    /// A disk op failed with an injected error ([`DiskConfig::error_threshold`]
+    /// / [`DiskConfig::enospc_threshold`]). `kind` is `"enospc"` (the op
+    /// failed with `ErrorKind::StorageFull`) or `"error"` (generic
+    /// `ErrorKind::Other`).
     DiskFault {
         t: u64,
         node: NodeId,
         op: &'static str,
         file: String,
+        kind: &'static str,
     },
+    /// A `sync` returned `Ok` without actually moving its buffered bytes into
+    /// the durable image ([`DiskConfig::set_fsync_lie_prob`]) — the ack was a
+    /// lie; those bytes are still exposed to a following crash exactly like
+    /// any other un-synced tail.
+    FsyncLie { t: u64, node: NodeId, file: String },
     /// A crash tore a file's un-synced tail: `kept` buffered bytes were
     /// retained (now durable), `dropped` were lost ([`DiskConfig::torn_tail_on_crash`]).
     DiskTear {
@@ -233,8 +383,44 @@ impl std::fmt::Display for TraceEvent {
                 write!(f, "t={t} DROP {from}->{to} stream={stream} ({reason})")
             }
             TraceEvent::Timer { t, id } => write!(f, "t={t} TIMER id={id}"),
-            TraceEvent::DiskFault { t, node, op, file } => {
-                write!(f, "t={t} DISKFAULT node={node} op={op} file={file}")
+            TraceEvent::NetCorrupt {
+                t,
+                from,
+                to,
+                stream,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "t={t} NETCORRUPT {from}->{to} stream={stream} offset={offset}"
+                )
+            }
+            TraceEvent::Duplicate {
+                t,
+                from,
+                to,
+                stream,
+                len,
+            } => {
+                write!(f, "t={t} DUPLICATE {from}->{to} stream={stream} len={len}")
+            }
+            TraceEvent::Pause { t, node, until } => {
+                write!(f, "t={t} PAUSE node={node} until={until}")
+            }
+            TraceEvent::DiskFault {
+                t,
+                node,
+                op,
+                file,
+                kind,
+            } => {
+                write!(
+                    f,
+                    "t={t} DISKFAULT node={node} op={op} file={file} kind={kind}"
+                )
+            }
+            TraceEvent::FsyncLie { t, node, file } => {
+                write!(f, "t={t} FSYNCLIE node={node} file={file}")
             }
             TraceEvent::DiskTear {
                 t,
@@ -268,6 +454,15 @@ struct SimState {
     clock: u64,
     rng: ChaCha8Rng,
     net: NetConfig,
+    // Per-node overrides of the global network fault model, keyed on the
+    // **sender** (every `NetConfig` knob is sampled/applied at send time on
+    // the sending node's own env — see `net_cfg_for`).
+    node_net_cfg: BTreeMap<NodeId, NetConfig>,
+    // Per-directed-link overrides, keyed `(from, to)` — the same directional
+    // keying `partitions` already uses, so an asymmetric link (e.g. a lossy
+    // uplink but healthy downlink) can be modelled. Most specific: beats both
+    // `node_net_cfg` and `net`.
+    link_net_cfg: BTreeMap<(NodeId, NodeId), NetConfig>,
     disk_cfg: DiskConfig,
     // Per-node overrides of the global disk fault model.
     node_disk_cfg: BTreeMap<NodeId, DiskConfig>,
@@ -276,6 +471,27 @@ struct SimState {
     // default-empty so every existing test stays byte-identical (see
     // `set_clock_skew_for`).
     clock_skew: BTreeMap<NodeId, i64>,
+    // Per-node clock **drift rate** (signed parts-per-million, plus the
+    // virtual-time instant drift was configured at): `now()` adds a component
+    // that grows with elapsed virtual time since that instant, layered on top
+    // of `clock_skew`. Absent = no drift; default-empty, same contract as
+    // `clock_skew` (see `set_clock_drift_for`).
+    clock_drift: BTreeMap<NodeId, (i64, u64)>,
+    // Per-node pause deadline (absolute virtual time a paused node resumes
+    // at). Absent = never paused. While `clock < paused_until[node]`: a timer
+    // this node owns does not fire and a message addressed to it is not
+    // delivered — both are deferred (re-timelined) to fire at exactly
+    // `paused_until[node]` instead — and a message it sends is not delivered
+    // before that instant either (see `send_stream`'s deliver_at clamp). See
+    // `Simulator::pause`.
+    paused_until: BTreeMap<NodeId, u64>,
+    // Which node owns each pending sleep timer, so a firing `Event::Timer`
+    // can check whether its owner is currently paused. Populated the first
+    // time a `Sleep` future is polled (mirrors `task_owner`'s "record at
+    // creation" shape); entries are never removed (a `TimerId` is never
+    // reused, so this is a small unbounded map for the lifetime of a
+    // simulation — the same tradeoff `task_owner` already makes).
+    timer_owner: BTreeMap<TimerId, NodeId>,
 
     next_task_id: TaskId,
     // `None` while a task's future is checked out for polling.
@@ -313,31 +529,72 @@ impl SimState {
         self.node_disk_cfg.get(node).unwrap_or(&self.disk_cfg)
     }
 
+    /// The effective network fault/delay model for a message from `from` to
+    /// `to`. Resolution order, **most specific wins**: a link override for
+    /// the exact directed `(from, to)` pair
+    /// ([`Simulator::set_link_net_config`]), else a per-node override keyed
+    /// on the **sender** ([`Simulator::set_net_config_for`] — every knob
+    /// this config carries is sampled/applied at send time on the sender's
+    /// own env, so the sender is the natural node-level key, mirroring
+    /// `disk_cfg_for`'s "the acting node's own override wins" shape), else
+    /// the global config ([`Simulator::set_net_config`]).
+    fn net_cfg_for(&self, from: &NodeId, to: &NodeId) -> &NetConfig {
+        if let Some(cfg) = self.link_net_cfg.get(&(from.clone(), to.clone())) {
+            return cfg;
+        }
+        self.node_net_cfg.get(from).unwrap_or(&self.net)
+    }
+
     /// Sample error injection for one disk op on `node`. Draws RNG **only**
-    /// when the effective error rate is non-zero, so the default (off) config
-    /// perturbs neither the RNG stream nor the trace. On a hit, records a
-    /// trace event and returns the `io::Error` the op must surface; the op
-    /// must make **no** state change (a cleanly failed I/O call).
+    /// when the effective error rate (generic or ENOSPC) is non-zero, so the
+    /// default (off) config perturbs neither the RNG stream nor the trace.
+    /// On a hit, records a trace event and returns the `io::Error` the op
+    /// must surface (`ErrorKind::StorageFull` for ENOSPC, `ErrorKind::Other`
+    /// for a generic fault); the op must make **no** state change (a cleanly
+    /// failed I/O call). One shared roll decides between the two: it lands
+    /// in `[0, enospc_threshold)` for ENOSPC, then
+    /// `[enospc_threshold, enospc_threshold + error_threshold)` for generic,
+    /// else no fault — with `enospc_threshold == 0` (every pre-existing
+    /// config) this is exactly the old single-draw, single-comparison check.
     fn inject_disk_fault(
         &mut self,
         node: NodeId,
         op: &'static str,
         file: &str,
     ) -> Option<std::io::Error> {
-        let threshold = self.disk_cfg_for(&node).error_threshold;
-        if threshold == 0 || self.rng.next_u64() >= threshold {
+        let cfg = self.disk_cfg_for(&node);
+        let (error_threshold, enospc_threshold) = (cfg.error_threshold, cfg.enospc_threshold);
+        if error_threshold == 0 && enospc_threshold == 0 {
             return None;
         }
+        let roll = self.rng.next_u64();
         let t = self.clock;
-        self.trace.push(TraceEvent::DiskFault {
-            t,
-            node: node.clone(),
-            op,
-            file: file.to_owned(),
-        });
-        Some(std::io::Error::other(format!(
-            "sim injected disk fault: {op} {file} (node {node})"
-        )))
+        if roll < enospc_threshold {
+            self.trace.push(TraceEvent::DiskFault {
+                t,
+                node: node.clone(),
+                op,
+                file: file.to_owned(),
+                kind: "enospc",
+            });
+            return Some(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!("sim injected ENOSPC: {op} {file} (node {node})"),
+            ));
+        }
+        if roll < enospc_threshold.saturating_add(error_threshold) {
+            self.trace.push(TraceEvent::DiskFault {
+                t,
+                node: node.clone(),
+                op,
+                file: file.to_owned(),
+                kind: "error",
+            });
+            return Some(std::io::Error::other(format!(
+                "sim injected disk fault: {op} {file} (node {node})"
+            )));
+        }
+        None
     }
 }
 
@@ -402,9 +659,14 @@ impl Simulator {
             clock: 0,
             rng: ChaCha8Rng::seed_from_u64(seed),
             net: NetConfig::default(),
+            node_net_cfg: BTreeMap::new(),
+            link_net_cfg: BTreeMap::new(),
             disk_cfg: DiskConfig::default(),
             node_disk_cfg: BTreeMap::new(),
             clock_skew: BTreeMap::new(),
+            clock_drift: BTreeMap::new(),
+            paused_until: BTreeMap::new(),
+            timer_owner: BTreeMap::new(),
             next_task_id: 0,
             tasks: BTreeMap::new(),
             task_owner: BTreeMap::new(),
@@ -449,9 +711,35 @@ impl Simulator {
         }
     }
 
-    /// Replace the network delay/drop model.
+    /// Replace the **global** network delay/drop/duplicate/corrupt model
+    /// ([`NetConfig`]). A per-node override
+    /// ([`set_net_config_for`](Self::set_net_config_for)) or a per-link one
+    /// ([`set_link_net_config`](Self::set_link_net_config)) takes precedence
+    /// — see [`NetConfig`]'s own doc for the full resolution order.
     pub fn set_net_config(&self, cfg: NetConfig) {
         self.shared.lock().net = cfg;
+    }
+
+    /// Set a **per-node** network fault/delay model, overriding the global
+    /// one for every message `node` **sends** (so a test can make one node's
+    /// outbound link flaky while the rest stay healthy). Mirrors
+    /// [`set_disk_config_for`](Self::set_disk_config_for)'s shape; beaten by
+    /// a link override for the specific `(node, to)` pair — see
+    /// [`NetConfig`]'s doc for the full resolution order.
+    pub fn set_net_config_for(&self, node: NodeId, cfg: NetConfig) {
+        self.shared.lock().node_net_cfg.insert(node, cfg);
+    }
+
+    /// Set a **per-directed-link** network fault/delay model for messages
+    /// from `from` to `to` specifically — the most specific override, beating
+    /// both [`set_net_config_for`](Self::set_net_config_for) and
+    /// [`set_net_config`](Self::set_net_config). Directional like
+    /// [`partition`](Self::partition): configuring `(from, to)` says nothing
+    /// about `(to, from)`, so an asymmetric link (e.g. a lossy uplink but a
+    /// healthy downlink) is expressible — call this twice, once per
+    /// direction, for a symmetric one.
+    pub fn set_link_net_config(&self, from: NodeId, to: NodeId, cfg: NetConfig) {
+        self.shared.lock().link_net_cfg.insert((from, to), cfg);
     }
 
     /// Replace the **global** disk fault model ([`DiskConfig`]; default: no
@@ -490,6 +778,37 @@ impl Simulator {
     /// ordering at all.
     pub fn set_clock_skew_for(&self, node: NodeId, skew_nanos: i64) {
         self.shared.lock().clock_skew.insert(node, skew_nanos);
+    }
+
+    /// Set `node`'s clock **drift rate**, in signed parts-per-million (ppm)
+    /// of elapsed virtual time (positive = the clock runs fast, negative =
+    /// slow) — layered on top of any static
+    /// [`set_clock_skew_for`](Self::set_clock_skew_for) offset, so a node can
+    /// carry both a fixed offset and a progressively widening one. The drift
+    /// start point is the virtual clock's value **at the moment this is
+    /// called**; every later `now()`/`wall_now()` read adds
+    /// `drift_ppm * elapsed_nanos_since_that_moment / 1_000_000` on top of the
+    /// static skew. Calling this again for the same node replaces both the
+    /// rate and the start point (mirrors every other per-node setter's
+    /// overwrite semantics).
+    ///
+    /// Deterministic by construction, same contract as
+    /// [`set_clock_skew_for`](Self::set_clock_skew_for): the rate is set
+    /// explicitly, never drawn from the RNG, and introduces no new timeline
+    /// event. **Opt-in and default-empty** — with no call, every node's
+    /// `now()` is byte-identical to a simulator with no drift model at all.
+    ///
+    /// Same **read-side-only** limit as static skew: this affects
+    /// `Clock::now()`/`Clock::wall_now()` reads only, never the shared timer
+    /// timeline — see [`set_clock_skew_for`](Self::set_clock_skew_for)'s doc
+    /// for why a per-node skewed *timeline* would break the single-`(time,
+    /// seq)`-timeline determinism story this crate provides. Drift models a
+    /// node's clock *reading* progressively wrong, not a different flow of
+    /// time for that node.
+    pub fn set_clock_drift_for(&self, node: NodeId, drift_ppm: i64) {
+        let mut st = self.shared.lock();
+        let start = st.clock;
+        st.clock_drift.insert(node, (drift_ppm, start));
     }
 
     /// Flip (bit-invert) one **durable** byte of `file` on `node`'s disk at
@@ -708,6 +1027,47 @@ impl Simulator {
         }
     }
 
+    /// Pause `node`: alive but frozen for `dur` of virtual time from now,
+    /// then resumes on its own with its full state intact — a GC pause,
+    /// cgroup throttle, or VM stall, distinct from both
+    /// [`crash`](Self::crash) (drops volatile state) and
+    /// [`stop`](Self::stop) (removes tasks entirely). While paused:
+    ///
+    /// - **No timer this node owns fires.** A `Clock::sleep` timer due while
+    ///   the node is paused is deferred (re-timelined, not cancelled) to fire
+    ///   at exactly the resume instant instead — the node "catches up" the
+    ///   instant it unfreezes.
+    /// - **No message it sends leaves before it resumes.** A send made while
+    ///   paused has its delivery clamped to no earlier than the resume
+    ///   instant (this also covers the edge case of a task already in the
+    ///   ready queue at the moment `pause` is called, mid-send when frozen).
+    /// - **Messages addressed to it queue, they are not dropped.** A
+    ///   delivery due while the node is paused is deferred the same way a
+    ///   timer is, to fire (adding to the inbox and waking any parked
+    ///   `recv`) at the resume instant — nothing sent to a paused node is
+    ///   lost, it just arrives late, all at once, on resume.
+    ///
+    /// Calling this again for the same node before it resumes replaces the
+    /// resume instant (mirrors every other per-node setter's overwrite
+    /// semantics) — a shorter second call can shorten the pause; a longer one
+    /// extends it, and an event already deferred to the old resume instant
+    /// will, on reaching it, see the node still paused and defer again to the
+    /// new instant.
+    ///
+    /// Deterministic by construction: the deadline is explicitly computed
+    /// from the current virtual clock, never drawn from the RNG. Traced at
+    /// the call site ([`TraceEvent::Pause`]) — the point the fault actually
+    /// takes effect; the deferred timers/deliveries this causes remain
+    /// visible in the trace too, simply at a later `t` than they would have
+    /// had unpaused.
+    pub fn pause(&self, node: NodeId, dur: Duration) {
+        let mut st = self.shared.lock();
+        let t = st.clock;
+        let until = t.saturating_add(dur_nanos(dur));
+        st.paused_until.insert(node.clone(), until);
+        st.trace.push(TraceEvent::Pause { t, node, until });
+    }
+
     /// The recorded history of this run.
     #[must_use]
     pub fn trace(&self) -> Vec<TraceEvent> {
@@ -839,8 +1199,26 @@ impl Simulator {
             let t = st.clock;
             match event {
                 Event::Timer(id) => {
-                    st.trace.push(TraceEvent::Timer { t, id });
-                    st.timer_wakers.remove(&id)
+                    // A timer owned by a currently-paused node does not fire:
+                    // re-timeline it to fire at the resume instant instead
+                    // (`Simulator::pause`), without touching `timer_wakers` —
+                    // the parked `Sleep` future is left registered exactly as
+                    // it was, so it wakes the instant this replayed event
+                    // finally fires.
+                    let owner = st.timer_owner.get(&id).cloned();
+                    let defer_until = owner
+                        .as_ref()
+                        .and_then(|o| st.paused_until.get(o).copied())
+                        .filter(|&until| t < until);
+                    if let Some(until) = defer_until {
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        st.timeline.insert((until, seq), Event::Timer(id));
+                        None
+                    } else {
+                        st.trace.push(TraceEvent::Timer { t, id });
+                        st.timer_wakers.remove(&id)
+                    }
                 }
                 Event::Deliver { to, env } => {
                     let from = env.from.clone();
@@ -862,6 +1240,15 @@ impl Simulator {
                             stream,
                             reason: "partition",
                         });
+                        None
+                    } else if let Some(until) =
+                        st.paused_until.get(&to).copied().filter(|&until| t < until)
+                    {
+                        // The destination is paused: queue, don't drop — defer
+                        // this same delivery to fire at the resume instant.
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        st.timeline.insert((until, seq), Event::Deliver { to, env });
                         None
                     } else {
                         let len = env.payload.len();
@@ -900,16 +1287,21 @@ impl Clock for SimEnv {
     fn now(&self) -> Nanos {
         let st = self.shared.lock();
         let skew = st.clock_skew.get(&self.node_id).copied().unwrap_or(0);
-        Nanos(apply_clock_skew(st.clock, skew))
+        let drift = st.clock_drift.get(&self.node_id).copied();
+        Nanos(apply_clock_skew(
+            st.clock,
+            effective_skew(skew, drift, st.clock),
+        ))
     }
 
     fn wall_now(&self) -> UnixMillis {
         // A pure function of virtual time: a fixed epoch base plus however far
         // this node's (skewed) monotonic reading has advanced. So the calendar
         // time a TTL sweep sees is as seed-reproducible as everything else
-        // (ADR 0003), *and* `set_clock_skew_for` skews the wall clock exactly
-        // as it skews the monotonic one — which is what a real node with a
-        // wrong clock does, and what a TTL reaper has to tolerate.
+        // (ADR 0003), *and* `set_clock_skew_for`/`set_clock_drift_for` skew the
+        // wall clock exactly as they skew the monotonic one — which is what a
+        // real node with a wrong (or drifting) clock does, and what a TTL
+        // reaper has to tolerate.
         UnixMillis(SIM_WALL_EPOCH_MS.saturating_add(self.now().0 / 1_000_000))
     }
 
@@ -917,6 +1309,7 @@ impl Clock for SimEnv {
         let deadline = self.shared.lock().clock.saturating_add(dur_nanos(dur));
         Sleep {
             shared: Arc::clone(&self.shared),
+            node: self.node_id.clone(),
             deadline,
             timer: None,
         }
@@ -936,6 +1329,17 @@ impl RngTrait for SimEnv {
 
 #[async_trait::async_trait]
 impl Network for SimEnv {
+    /// Fixed draw order (documented here since it is what the byte-identical
+    /// default-off guarantee depends on): **drop** roll → **corrupt** roll
+    /// (+ byte offset, only if the payload is non-empty) → the primary
+    /// delivery's jitter draw (its own **heavy-tail** roll, then the jitter
+    /// itself) → **duplicate** roll → (if it fires) the duplicate's own,
+    /// fully independent jitter draw (its own heavy-tail roll, then jitter).
+    /// Every roll is gated on its threshold being non-zero, so with an
+    /// unconfigured [`NetConfig`] (every threshold `0`, matching every
+    /// `NetConfig` that existed before this method grew these knobs) this
+    /// reduces to exactly the original two-draw sequence (drop roll, then
+    /// jitter) in the original order — see [`NetConfig`]'s own doc.
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
         let mut st = self.shared.lock();
         let from = self.node_id.clone();
@@ -961,8 +1365,10 @@ impl Network for SimEnv {
             return;
         }
 
+        let net_cfg = st.net_cfg_for(&from, &to).clone();
+
         // Independent random drop at send time.
-        if st.net.drop_threshold > 0 && st.rng.next_u64() < st.net.drop_threshold {
+        if net_cfg.drop_threshold > 0 && st.rng.next_u64() < net_cfg.drop_threshold {
             st.trace.push(TraceEvent::Drop {
                 t,
                 from,
@@ -973,27 +1379,86 @@ impl Network for SimEnv {
             return;
         }
 
-        let base = dur_nanos(st.net.base_delay);
-        let jitter_max = dur_nanos(st.net.max_jitter);
-        let jitter = if jitter_max == 0 {
-            0
-        } else {
-            gen_below(&mut st.rng, jitter_max + 1)
-        };
-        let deliver_at = st.clock.saturating_add(base + jitter);
+        // Wire-payload corruption: flip one seed-chosen byte of a surviving
+        // message. The roll always happens when configured (independent of
+        // payload length, so determinism never depends on message size), but
+        // an empty payload has nothing to flip.
+        let mut payload = payload;
+        if net_cfg.corrupt_threshold > 0 && st.rng.next_u64() < net_cfg.corrupt_threshold {
+            if payload.is_empty() {
+                // Nothing to corrupt; the roll still happened (see above).
+            } else {
+                let offset = gen_below(&mut st.rng, payload.len() as u64) as usize;
+                payload[offset] ^= 0xFF;
+                st.trace.push(TraceEvent::NetCorrupt {
+                    t,
+                    from: from.clone(),
+                    to: to.clone(),
+                    stream,
+                    offset: offset as u64,
+                });
+            }
+        }
+
+        let base = dur_nanos(net_cfg.base_delay);
+        let jitter = draw_jitter(&mut st.rng, &net_cfg);
+        let mut deliver_at = st.clock.saturating_add(base + jitter);
+        // A paused sender's message must not leave before it resumes — this
+        // covers the edge case of a task already ready-queued (about to run)
+        // at the moment `Simulator::pause` was called (see its doc).
+        if let Some(&until) = st.paused_until.get(&from) {
+            deliver_at = deliver_at.max(until);
+        }
+
+        // Duplication: decided (and, if it fires, its clone captured) before
+        // the primary payload is moved into its envelope below.
+        let duplicate =
+            net_cfg.duplicate_threshold > 0 && st.rng.next_u64() < net_cfg.duplicate_threshold;
+        let dup_payload = duplicate.then(|| payload.clone());
+
         let seq = st.next_seq;
         st.next_seq += 1;
         st.timeline.insert(
             (deliver_at, seq),
             Event::Deliver {
-                to,
+                to: to.clone(),
                 env: Envelope {
-                    from,
+                    from: from.clone(),
                     stream,
                     payload,
                 },
             },
         );
+
+        if let Some(dup_payload) = dup_payload {
+            // Independent delay draw (its own heavy-tail roll included): the
+            // duplicate can land before, at, or after the original.
+            let dup_jitter = draw_jitter(&mut st.rng, &net_cfg);
+            let mut dup_deliver_at = st.clock.saturating_add(base + dup_jitter);
+            if let Some(&until) = st.paused_until.get(&from) {
+                dup_deliver_at = dup_deliver_at.max(until);
+            }
+            let dup_seq = st.next_seq;
+            st.next_seq += 1;
+            st.trace.push(TraceEvent::Duplicate {
+                t,
+                from: from.clone(),
+                to: to.clone(),
+                stream,
+                len,
+            });
+            st.timeline.insert(
+                (dup_deliver_at, dup_seq),
+                Event::Deliver {
+                    to,
+                    env: Envelope {
+                        from,
+                        stream,
+                        payload: dup_payload,
+                    },
+                },
+            );
+        }
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
@@ -1047,8 +1512,26 @@ impl Disk for SimEnv {
             if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "sync", file) {
                 return Err(e);
             }
+            // fsync-acked-but-lost: sampled independently of, and only after,
+            // the error/ENOSPC roll above (a call that already failed never
+            // reaches here — nothing was "acked" at all). Draws RNG only when
+            // configured non-zero, so a config with no `fsync_lie_prob` set
+            // draws nothing extra here and stays byte-identical.
+            let fsync_lie_threshold = st.disk_cfg_for(&self.node_id).fsync_lie_threshold;
+            let lie = fsync_lie_threshold != 0 && st.rng.next_u64() < fsync_lie_threshold;
             let key = (self.node_id.clone(), file.to_owned());
-            if let Some(f) = st.disks.get_mut(&key) {
+            if lie {
+                let t = st.clock;
+                st.trace.push(TraceEvent::FsyncLie {
+                    t,
+                    node: self.node_id.clone(),
+                    file: file.to_owned(),
+                });
+                // Deliberately do NOT move buffered -> durable: the ack
+                // returned below is a lie, and these bytes stay exactly as
+                // exposed to a following `Simulator::crash` as any other
+                // un-synced tail.
+            } else if let Some(f) = st.disks.get_mut(&key) {
                 let mut buffered = std::mem::take(&mut f.buffered);
                 f.durable.append(&mut buffered);
             }
@@ -1191,6 +1674,13 @@ impl Env for SimEnv {
 /// Future that completes once virtual time reaches its deadline.
 struct Sleep {
     shared: Arc<Shared>,
+    // Which node this timer belongs to, so a firing `Event::Timer` can check
+    // whether the node is currently paused (`Simulator::pause`) and, if so,
+    // defer the fire instead of waking. Recorded into `timer_owner` the first
+    // time this future actually schedules a timeline entry (below) — not
+    // needed at all for a `sleep` that resolves immediately (deadline already
+    // past on first poll), since there is no timer to ever defer.
+    node: NodeId,
     deadline: u64,
     timer: Option<TimerId>,
 }
@@ -1211,6 +1701,7 @@ impl Future for Sleep {
                 let id = st.next_timer_id;
                 st.next_timer_id += 1;
                 st.timer_wakers.insert(id, cx.waker().clone());
+                st.timer_owner.insert(id, self.node.clone());
                 let seq = st.next_seq;
                 st.next_seq += 1;
                 let deadline = self.deadline;
@@ -1273,6 +1764,45 @@ fn apply_clock_skew(clock: u64, skew_nanos: i64) -> u64 {
         clock.saturating_add(skew_nanos as u64)
     } else {
         clock.saturating_sub(skew_nanos.unsigned_abs())
+    }
+}
+
+/// The total signed skew to apply to a `now()` read: the static
+/// [`Simulator::set_clock_skew_for`] offset plus the accumulated
+/// [`Simulator::set_clock_drift_for`] component (`drift_ppm * elapsed_nanos
+/// since the drift's start instant / 1_000_000`, clamped into `i64`). `i128`
+/// arithmetic throughout avoids any intermediate overflow; the result is fed
+/// straight into [`apply_clock_skew`], which does its own saturating
+/// clamp-at-zero/`u64::MAX` on the final reading.
+fn effective_skew(base_skew: i64, drift: Option<(i64, u64)>, clock: u64) -> i64 {
+    let Some((drift_ppm, start)) = drift else {
+        return base_skew;
+    };
+    let elapsed = i128::from(clock.saturating_sub(start));
+    let component = (elapsed * i128::from(drift_ppm)) / 1_000_000;
+    let component = component.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    base_skew.saturating_add(component)
+}
+
+/// Draw one send's delivery jitter for `cfg`. With probability
+/// `cfg.heavy_tail_threshold` (an extra roll, only drawn when that threshold
+/// is non-zero), draws uniformly from `[0, cfg.heavy_tail_max_jitter]`
+/// instead of the default `[0, cfg.max_jitter]` — modelling an occasional
+/// very slow message without raising the delay for the common case. With
+/// `heavy_tail_threshold == 0` (every `NetConfig` before this knob existed)
+/// this draws no extra roll and reduces to exactly the original uniform-
+/// jitter draw.
+fn draw_jitter(rng: &mut ChaCha8Rng, cfg: &NetConfig) -> u64 {
+    let heavy = cfg.heavy_tail_threshold > 0 && rng.next_u64() < cfg.heavy_tail_threshold;
+    let jitter_max = dur_nanos(if heavy {
+        cfg.heavy_tail_max_jitter
+    } else {
+        cfg.max_jitter
+    });
+    if jitter_max == 0 {
+        0
+    } else {
+        gen_below(rng, jitter_max + 1)
     }
 }
 
