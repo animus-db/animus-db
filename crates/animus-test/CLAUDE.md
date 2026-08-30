@@ -354,15 +354,40 @@ retrievable from git history.)
   coordinator-abandoned transaction still converges: `Workload::
   abandon_prepare_pct`/`abandon_commit_pct` model a coordinator that stops
   mid-2PC (after a successful prepare, or after a confirmed-but-unresolved
-  commit) — recorded `info`, never `fail` (house rule). ~25 frozen cells:
+  commit) — recorded `info`, never `fail` (house rule). ~33 frozen cells:
   3 baselines (default/rmw-heavy/read-heavy mix), 2 coordinator-abandon
   cells, participant/anchor leader-kill × 3 timings each, partition-during-
   prepare × 3 timings, lossy links, clock skew within/beyond
   `HLC_MAX_OFFSET` (beyond is a **liveness**-only knob — some reads may time
   out, `check_cycles` must stay green throughout, per the ADR's Decision
-  section), and 6 compound cells crossing abandonment/faults/workload mix.
-  Depth knob **`ANIMUS_TXN_SEEDS`** (default 1 = frozen; `seed_expand`'s
-  usual variant-0-keeps-the-canonical-seed convention).
+  section), 6 compound cells crossing abandonment/faults/workload mix, and
+  (ADR 0061 Decision 3) a second fault-primitives tier:
+  `ParticipantFsyncLie`/`AnchorFsyncLie` (`DiskConfig::set_fsync_lie_prob`,
+  scoped per-group via `set_disk_config_for` — this corpus's 3 independent
+  groups need per-group scoping the single-group `raftkv_linearizable.rs`
+  corpus didn't) each paired with a same-group leader kill shortly after
+  (`FSYNC_LIE_REVEAL_GAP`), so the crash's un-synced-bytes handling reveals
+  whatever the lie actually lost on a staged write — real teeth for 2PC's
+  own durability claim, compounding the existing coordinator-abandon
+  workload with a genuine durability lie instead of a clean crash; `Chaos`
+  (drop+duplicate folded into one `NetConfig`, standalone and read-heavy
+  cells — deliberately excludes `set_corrupt_prob`, same unfixed
+  `animus-cp-data::codec` allocator-abort gap `raftkv_linearizable.rs`'s own
+  `Chaos` excludes, see `docs/engineering-lessons.md`); and
+  `AnchorClockDrift` (`Simulator::set_clock_drift_for`, standalone and
+  compounded with a participant kill) — a clock that starts synced and
+  degrades *live* over the fault window rather than snapping to a fixed
+  skew instantly, same liveness-only discipline as `ClockSkewBeyond`.
+  `heal_all` resets both the per-node `DiskConfig` overrides and clock
+  drift alongside its pre-existing net-config/clock-skew resets (the
+  identical "a fired fault must not outlive its window" trap
+  `raftkv_linearizable.rs`'s own `heal_all` documents for its own,
+  globally-scoped `FsyncLie`). Depth knob **`ANIMUS_TXN_SEEDS`** (default 1
+  = frozen; `seed_expand`'s usual variant-0-keeps-the-canonical-seed
+  convention; held green at `=100` for the new fault-primitives cells in
+  isolation, `=15` for the full corpus — see the file's own history for why
+  full-corpus runs above `~s24` currently need the pre-existing
+  `compound_lossy_and_anchor_kill` finding below excluded first).
 - **A single-decider assumption in the recovery protocol itself, found by
   this corpus under real fault injection**: see the ADR 0018 PR6 amendment
   for the full account — the coordinator's own decide attempt and the
@@ -371,6 +396,22 @@ retrievable from git history.)
   the coordinator's own round trip is still genuinely in flight past
   `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
   is impossible by construction" assert does not tolerate that.
+- **A real, pre-existing, UNFIXED `check_kind_consistency` finding, found
+  incidentally while validating the ADR 0061 Decision 3 fault-primitives
+  tier at this corpus's own nightly CI depth** (`ANIMUS_TXN_SEEDS=40`,
+  matching `corpus-deep.yml`'s existing txn tier — no new fault involved):
+  `compound_lossy_and_anchor_kill_s25` (seed `8035380114809936673`)
+  reproduces identically on unmodified `main`, i.e. **before** any of the
+  fault-primitives-tier changes in this section — a `Lossy` + `AnchorLeaderKill`
+  cell whose `KIND_LSI` derived row diverges from its own base row
+  (`Some([1, 11])` vs `Some([1])`). Left unfixed and undiagnosed per this
+  repo's "an incidental bug gets its own PR" convention — it is unrelated to
+  the fault primitives this section documents, was simply never exercised
+  before (this corpus's default depth is 1; nightly CI's `=40` had not, as
+  of this finding, actually been run green end-to-end at that depth with
+  the `kind_consistency` check present). The new fault-primitives cells
+  themselves are clean through `ANIMUS_TXN_SEEDS=100` when run in isolation
+  from this cell (see the previous bullet's depth note).
 
 ### Elle-adjacent, but not Elle: the DynamoDB Streams lineage-walk corpus (ADR 0042/0043, round-3 PR8)
 
