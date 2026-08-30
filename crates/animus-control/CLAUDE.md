@@ -597,6 +597,23 @@ per-tablet CP data plane (`animus-cp-data`).
   Regression: `tests/slow_disk_no_livelock.rs` (verified red on the pre-fix
   driver across four seeds: 2/10 proposals accepted, the group leaderless).
 
+  **`node.rs`'s `persist_wal` has no halted-gate at all** (unlike
+  `animus-cp-data`'s own `persist_wal`/`flush_pending`, which tolerate a
+  live I/O error only while a group's `halted: AtomicBool` is set — see
+  `docs/engineering-lessons.md`'s "halted-gated durability assert" entry,
+  issues #282/#279): here `env.append(WAL, ..).await.expect("wal append")`
+  and `env.sync(WAL).await.expect("wal sync")` are bare, unconditional
+  `.expect()`s with no tolerated-error path whatsoever, on any node,
+  live or shutting down. **Test-authoring consequence**: never point
+  `DiskConfig::set_enospc_prob`/`set_error_prob` at a live node's disk in
+  this crate's tests (`SimEnv` or otherwise) — an injected disk error on
+  the consensus loop's own WAL append/sync panics the test process itself
+  rather than exercising any application-level fault handling, since there
+  is none to exercise. `DiskConfig::set_fsync_lie_prob` (never errors —
+  `sync` returns `Ok` and silently leaves the bytes buffered) and
+  `torn_tail_on_crash`/`corrupt_on_crash` (fire only at `Simulator::crash`,
+  not mid-`.expect()`) remain safe.
+
 - **One apply model, generic across both planes (ADR 0017, cut over to
   `Metadata` by ADR 0038 PR3).** `StateMachine::DRIVER_APPLIED = true` is now
   set for **both** `Metadata` (this crate) and the data plane's `KvState`
