@@ -13216,3 +13216,55 @@ once to confirm the binary's test set actually matches the source before
 reading a "N passed" line as proof of anything; a stale binary reports
 green precisely because it silently tests less, never because it tests the
 same thing and fails to notice a problem.
+## A racing-proposers workload can't tell "won" from "lost" by presence alone — it has to confirm by content (`animus-control`'s `control_corpus.rs`, ADR 0061 rung B1 sibling)
+
+Building `control_corpus.rs` — a new seed-depth corpus for `animus-control`'s
+own machinery (the ADR 0038 apply task, the schema-catalog exclusivity
+guarantee), modeled on `raftkv_linearizable.rs`'s harness shape — the
+schema-race workload's first draft had each racer's confirm loop treat "the
+table now exists" as its own success signal. That's the exact
+`ProposeResult::Accepted`-isn't-apply-time-truth trap the entry above already
+names, but with an extra twist specific to a **race**: here `Accepted` isn't
+even ambiguous about *whether* the command took effect (a single proposer's
+own straggler command, `CreateTablet`-fixture-style) — it's ambiguous about
+*whose* content took effect, since `CreateTableSchema` rejects outright on an
+existing name (first-committer-wins, not idempotent-on-identical the way
+`RegisterNode`'s CAS is) and TWO different proposers can each see "yes, a
+schema for this table now exists" as true. A confirm loop that stops
+retrying the instant presence flips true will, for the losing racer, log a
+false "I won" — exactly the durability check's "this confirmed effect must
+survive" assertion firing on content that was never actually this
+proposer's own. The fix: read the table's *actual* schema back and compare
+it, structurally, against the exact value this proposer proposed —
+`Some(existing) if *existing == schema => won`, `Some(_) => lost, stop
+retrying (nothing left to retry against a name that already belongs to
+someone else)`, `None => keep trying`. General lesson: **when a workload
+races N proposers for one identity and the state machine's own accept rule
+is "first-committer-wins, reject the rest" rather than idempotent-on-match,
+"does the effect exist" is the wrong confirm predicate — it has to be "does
+the effect that exists match MINE," or a losing proposer misreports itself
+as a winner and a durability check built on that misreport is checking a
+claim nobody should have made.**
+
+## Don't copy a sibling corpus's engine-tiering generic ceremony without first checking whether the new node type is generic over the storage engine at all (`animus-control`'s `control_corpus.rs`)
+
+`raftkv_linearizable.rs` (the explicit template `control_corpus.rs` was
+told to copy the *architecture*, not the content, of) is generic over both
+`E: Env` and `S: StorageEngine` because `animus-cp-data::RaftKvNode<E, S>`
+itself is — its `EngineFactory<S>` type alias and the `Group<S>`/`Node<S>`
+plumbing exist to let the corpus run the identical scenario set over both
+`MemoryEngine` and `LsmEngine<SimEnv>`. A first draft of the new corpus
+started copying that same `<S: StorageEngine>` shape onto `Group`/`Node`
+before checking whether it was needed — it wasn't:
+`animus_control::RaftNode<E>` is generic **only** over `E`; `start<S:
+StorageEngine>(..)` is a generic *associated function*, not a type
+parameter of `RaftNode` itself, so the engine type is erased the moment a
+node is constructed and there is nothing for a second generic parameter to
+thread through. Carrying the extra `<S>` ceremony over unused would have
+meant a `PhantomData` or a spurious "this corpus supports engine tiers"
+claim the harness never actually exercises. General lesson: **before
+copying a template corpus's generic shape onto a new one, check whether the
+concrete type the new corpus actually drives is generic the same way the
+template's was — a sibling module's own genericity is a property of *that*
+module's dependency, not a fixed feature of "how a corpus harness in this
+repo looks."**

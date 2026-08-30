@@ -893,3 +893,60 @@ every tick, flooding the log with hundreds of entries — the first draft of
 `slow_disk_no_livelock.rs` measured that churn's throughput instead of the
 property it meant to. `CreateTableSchema` is inert: nothing in the driver
 reacts to it.
+
+### The control-plane machinery fault-injection corpus (`tests/control_corpus.rs`)
+
+The seed-depth counterpart to this crate's ~30 fixed-single-seed acceptance
+tests above, proving the control-plane-*unique* machinery (the ADR 0038 async
+apply task, the replicated schema catalog's exclusivity guarantee) under a
+real fault matrix, not just at one hand-picked seed. `learner_corpus.rs`
+already covers the learner/membership-class vocabulary (ADR 0058 Train 1,
+`ANIMUS_LEARNER_SEEDS`) — this is its sibling for everything else.
+**Self-contained**, mirroring `animus-test`'s `raftkv_linearizable.rs`
+architecture (declarative `Scenario`/`Nemesis`/`Group::apply`/`run_scenario`/
+`assert_scenario_ok`) with one adaptation: a `Scenario::workload: Workload`
+field selects which bespoke `spawn_*_workload` function the runner drives
+(mirroring `animus-test`'s `txn_serializable.rs`'s own `Workload` struct),
+since this plane's interesting scenarios need genuinely different client
+shapes (concurrent schema proposers vs. plain no-contention churn), not just
+different parameters of one shared loop.
+
+**No `check_cycles` here** — a single Raft log total-orders every
+`MetaCommand`, so there is no client-visible read/write history to build an
+Elle dependency graph over. The property is convergence + safety invariants
+instead, checked on every scenario: (1) **convergence** —
+`nodes[i].metadata() == nodes[j].metadata()` for every replica pair, via the
+same converged-or-timeout poll shape every corpus in this repo uses; (2)
+**durability** — an effect a proposer's own retry loop actually *confirmed*
+(read back after proposing, never merely `ProposeResult::Accepted`, which
+only means "appended to the leader's log") must survive into the final
+converged state; (3) **schema-catalog exclusivity** (a safety property,
+checked unconditionally, fault or not) — `MetaCommand::CreateTableSchema`
+rejects outright on an existing table name (first-committer-wins, **not**
+idempotent-on-identical the way `RegisterNode`'s CAS is), so for every table
+name two or more racers proposed, the surviving schema (if any) must be
+byte-identical to exactly one of the racing proposals on every replica, and
+never absent if any racer's proposal was ever durably confirmed.
+
+**Gotcha this corpus's own build found**: a racing proposer's confirm loop
+must decide "won" vs. "lost" by **content**, never by presence — since
+`CreateTableSchema` rejects rather than no-ops on an existing name, "the
+table now exists" is true for every racer the instant *any* of them wins,
+so a presence-only check makes a losing racer misreport itself as a winner.
+See `docs/engineering-lessons.md`'s matching entry for the general lesson.
+
+**PR① scope** (this file's current state): a `Workload::SchemaRace`
+(2-3 concurrent proposers racing `CreateTableSchema`, same-table or
+distinct-name) and a `Workload::PlainChurn` (non-contending `UpsertMember`,
+the non-vacuity floor) over a nemesis subset —
+`LeaderKill`/`FollowerKill`/`PartitionLeader`/`SplitBrain`/`Lossy`.
+Deliberately **not yet included**: `StopRestart` (needs `RaftNode::start` to
+reopen the *same* `StorageEngine` handle a crashed node used, deferred
+alongside the apply-task-no-double-apply invariant it exists to probe) and
+an allocator-injectivity check (needs a dedicated `Workload::AllocatorRace`)
+— both are explicit hooks left in the file's own "Future invariants" comment
+for the next PRs in this stack to fill in without reshaping the harness.
+Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen cells; held
+green at `=40` during this PR's own validation). A structural
+`control_corpus_covers_the_fault_matrix` guard keeps the nemesis/workload
+matrix honest, mirroring `raftkv_corpus_covers_the_fault_matrix`.
