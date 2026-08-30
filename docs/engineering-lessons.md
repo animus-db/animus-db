@@ -12758,6 +12758,298 @@ this same failure mode: a set-returning primitive whose membership changes
 mid-lifecycle needs every caller to state its own filter, because the
 primitive can't know which callers only want the settled members.
 
+## `Simulator::stop` does not clear the `crashed` flag `Simulator::crash` set — composing them silently mutes the reconstructed node forever (quiescence corpus fault-primitives wiring)
+
+Writing a crash-based test cell for `animus-cp-data/tests/quiescence.rs`
+(ADR 0061 Decision 3, giving `DiskConfig::torn_tail_on_crash`/
+`corrupt_on_crash` real teeth — see the next entry) needed the genuine
+process-restart shape the sibling `raftkv` corpus's `StopRestart` nemesis
+already uses: `Simulator::stop` (kills tasks + volatile state, keeps
+durable disk) followed by a fresh `RaftKvNode::start` on the same node id,
+which recovers from the durable WAL. But `torn_tail_on_crash`/
+`corrupt_on_crash` only fire inside `Simulator::crash`, not `stop` (see the
+"a crash-only fault has zero test teeth" pattern this composition exists to
+avoid) — so the natural-looking sequence is `crash` (to tear/corrupt the
+un-synced tail) → `stop` (to kill the task so a fresh one can be
+constructed) → reconstruct. That sequence silently breaks: `crash` inserts
+the node into `Simulator`'s shared `crashed: BTreeSet<NodeId>`, and `stop`'s
+own doc says outright "Unlike `crash`, this does not mute or set the node
+`crashed`" — meaning it also doesn't **clear** it. Every message to or from
+a node still in `crashed` is dropped (`DROP ... (crashed)` /
+`DROP ... (sender-crashed)` in the trace), so the freshly reconstructed
+node — despite having brand-new tasks and a live env — never sends or
+receives a single message for the rest of the run. This is genuinely quiet:
+no panic, no error, just a replica that sits at its pre-crash term with
+`engine_applied_index() == 0` forever, which reads exactly like "the
+recovered WAL was empty" rather than "the network is silently muted" — the
+first draft of this test's own failure looked like a WAL-recovery bug for
+several debugging passes before an `eprintln!` of `is_leader`/`term`/
+`engine_applied_index` plus the trace tail made the all-drops pattern
+obvious. The fix is one extra call: `sim.crash(id); sim.stop(id);
+sim.restart(id);` (clears `crashed`; `restart`'s own re-arm step finds
+nothing to re-arm, since `stop` already removed every task it owned) —
+*then* construct the fresh node. **General rule**: two fault primitives
+that individually look composable (each has its own clear, narrow doc)
+should still be traced through each other's state machine before combining
+them in a new way no existing test does — `crash`+`stop` is exactly the
+kind of pairing where each method's doc is accurate in isolation but their
+combined effect on a third piece of shared state (`crashed`) is only
+obvious from reading both source bodies side by side, not from either doc
+comment alone.
+
+## `corrupt_on_crash`'s single-byte WAL corruption can produce a syntactically-valid-but-wrong `HlcTimestamp` that hard-panics a later apply — a fresh, reproducible instance of the "no per-record WAL checksum" gap (quiescence corpus fault-primitives wiring)
+
+Composing `DiskConfig::set_fsync_lie_prob` (accumulate several writes'
+worth of un-synced WAL bytes on a live leader) with a later
+`torn_tail_on_crash`+`corrupt_on_crash` crash and a genuine restart (see
+the entry above) — the only way to give either disk-tearing field real
+teeth — reliably reproduces a **hard `assert!` panic**, not just stale or
+wrong served data: `animus_cp_data::assert_ts_monotonic` (`lib.rs`, ADR
+0018 §2), "HLC ts ... did not strictly exceed the last applied ... the
+witnessing chain is broken," once the recovered replica catches up and
+applies an entry past the corrupted record. Isolated directly: the
+identical scenario and seed with `torn_tail_on_crash` alone (no corruption)
+converges cleanly (`engine_applied_index` matches the honest survivors'
+exactly); adding `corrupt_on_crash` to that same seed panics the whole test
+process every time. The mechanism is exactly what `WalRecord::decode`'s own
+doc and the sibling `raftkv` corpus's `wal_fault_disk_config` doc already
+name as a residual gap, now confirmed to reach further than either
+anticipated: the Raft WAL's on-disk record framing is plain
+newline-terminated `serde_json` with **no per-record checksum**, so a
+single flipped byte that happens to land inside a numeric JSON field (here,
+a packed `HlcTimestamp`) can produce a record that still **decodes
+successfully** — just with the wrong value — rather than the torn/
+unparseable trailing line `decode` is built to tolerate. The already-known
+version of this gap (the sibling `raftkv`/`txn` corpora's own documented,
+unfixed `NetConfig::set_corrupt_prob` finding, an allocator-abort `SIGABRT`
+in `animus-cp-data::codec`'s wire decoder) is the *wire* half of this same
+root cause; this is the *WAL* half, a different call site with a different
+failure shape (a hard-panicking safety assert instead of an OOM abort) but
+the identical missing-checksum cause. **Handled the same way the wire half
+already is**: excluded from the corpus cell (`corrupt_on_crash` stays
+armed-off, `torn_tail_on_crash` alone still gives the cell real, working
+teeth), documented in full in the test's own doc comment, and left as a
+named, unfixed, real finding for its own follow-up issue/PR rather than
+folded into the corpus PR — a fault primitive that reliably hard-panics the
+process is out of scope for an ambient corpus cell's assertions the same
+way `set_enospc_prob`/`set_error_prob` already are for a different reason
+(they hit this crate's own `persist_wal` `halted` assert). **General
+lesson**: when a repo already has one documented, unfixed "no checksum on
+this framing" finding for one call site of a shared codec/record format,
+treat every *other* call site of that same un-checksummed framing as a
+credible candidate for the identical class of bug before assuming a
+freshly-discovered hard panic under `corrupt_on_crash`/`set_corrupt_prob`
+is a coincidence or a test-harness mistake — reach for isolating which
+disk/net-fault knob actually causes it (toggle one off, keep the seed
+fixed, re-run) before suspecting the new test code itself.
+
+## `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` were never actually exercised against a `RaftCore`-backed WAL before (ADR 0061 Decision 3, `stream_lineage_corpus.rs` fault wiring)
+
+Both fields are documented and unit-tested in `animus-sim` itself
+(`tests/disk_faults.rs`) and exercised against `animus-storage`'s
+`LsmEngine` (`tests/lsm_disk_faults.rs`), but grepping the whole workspace
+for either name turned up no use anywhere in `animus-control` or
+`animus-cp-data` — meaning the shared Raft consensus WAL format
+(`animus_control::persist::{WalRecord, PersistedState}`, used by *both* the
+control plane's own `RaftCore<MetaCommand, Metadata>` and every per-tablet
+`RaftKvNode`'s `RaftCore<KvCommand, KvState>`) had never actually been
+crashed-and-torn under simulation before this corpus's own
+`torn_tail_crash_survives_a_true_restart` cell. Worth confirming *why* it's
+safe before assuming so: `PersistedState::decode`/`decode_tagged`
+(`persist.rs`) frame the WAL as newline-delimited JSON and recover via
+`bytes.split(b'\n').filter_map(|line| serde_json::from_slice(line).ok())`
+— any line that fails to parse, not merely a strict trailing partial one,
+is silently dropped. This is a *more* permissive recovery contract than
+`animus-storage`'s own length-prefixed-plus-CRC WAL format (`lsm/wal.rs`),
+which goes out of its way to distinguish a genuinely torn trailing record
+from mid-file corruption by position (`wal_resync_point`) and hard-errors
+on the latter — but it's still sound for this WAL's own recovery
+discipline (an un-replayed record's effect was, by definition, never acted
+on), so `torn_tail_on_crash`/`corrupt_on_crash` compose safely with it with
+no risk of a hard panic or silent divergence, unlike the LSM format's own
+stricter contract. The general check before wiring either fault into a new
+corpus: confirm which WAL/durable-record codec the crashed component
+actually uses, and whether that codec's own recovery already documents (or
+can be shown to have) a total, non-panicking answer for "this record failed
+to parse" — not just a trailing-partial-write answer, since `corrupt_on_
+crash` can in principle land its flipped byte anywhere inside the retained
+(non-dropped) tail, not only in what would otherwise have been a clean
+trailing partial line.
+## A crash-only disk fault has zero test teeth unless something later reads the crashed node's own post-crash state back (`pitr_fault_corpus.rs`, ADR 0061 Decision 3 wiring)
+
+Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a new
+`scenario_wal_torn_on_crash_kill_sealing_leader` cell surfaced a design trap
+worth naming on its own, separate from the already-documented `crash` →
+`restart` → `stop` sequencing gotcha (see the entries this generalizes from,
+found by the sibling backup-corpus PR): in this corpus,
+`current_open_pitr_epoch` — the very value the new cell exists to protect —
+is derived **only** from the hand-scripted `Metadata` struct the test drives
+directly with `.apply()` calls, never from anything read off the crashing
+node's own Raft WAL or storage engine. Copying `scenario_kill_sealing_leader`
+verbatim (crash a node, fail over to the two survivors, never look at the
+crashed node again) and simply turning on the torn-tail disk config would
+have compiled, run green, and proven **nothing**: the tear sits on a file
+nothing in the scenario ever reads again. The fault only gets real teeth once
+the crashed node is brought all the way back — `crash` → `restart` → `stop` →
+a fresh `RaftKvNode::start_hosted` on the same id/engine — and made to
+participate in a *further* round of writes and a second seal, so its own
+recovery from the torn/corrupted tail can actually influence what the next
+`pending_changes()` scan (and therefore the next epoch number) sees. The
+general check this generalizes to: before wiring a disk- or network-fault
+primitive into an existing scenario as a "near-copy plus one fault call",
+trace where the property-under-test's own inputs actually come from — a
+fault that lands on state nothing downstream ever reads is a no-op with a
+green checkmark, not a stronger test.
+
+## Getting a torn/corrupted WAL tail ahead of a *fresh-process* restart needs `crash` → `restart` → `stop`, not `stop` alone (`backup_fault_corpus.rs`, ADR 0061 Decision 3)
+
+Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a
+`RaftKvNode`-level corpus scenario that also wants a genuine fresh-process
+restart (the `sim.stop` + a brand-new `RaftKvNode::start_hosted` on the same
+id/engine idiom `capture_driver_node_crash_restart`/
+`raftkv_linearizable.rs`'s `StopRestart` nemesis both use) runs into a real
+mismatch between the two primitives: the tear/corrupt logic lives **only**
+inside `Simulator::crash` — `Simulator::stop`'s own disk handling
+unconditionally clears any buffered-but-unsynced bytes with no tear
+consideration at all (see both methods' doc comments), so a scenario that
+only ever calls `stop` can set `torn_tail_on_crash: true` all it wants and
+never actually exercise it. Reaching first is not enough either: `crash`
+also inserts the node into `Simulator`'s `crashed` set, which both the
+send and deliver paths check permanently — a node left in that set (nothing
+but `restart` ever removes it) has every future send and delivery silently
+dropped, including everything a freshly-constructed `RaftKvNode` on that
+same id would try to do, which reads as the fresh node being inexplicably
+unable to participate in Raft at all rather than as a leftover crashed-flag
+bug. The composed fix, safe because nothing drives the executor between
+these three synchronous calls (so `restart`'s re-armed old tasks are
+removed by the immediately-following `stop` before they're ever re-polled):
+`sim.crash(node)` (applies the configured tear/corruption to whatever was
+genuinely buffered at that instant), `sim.restart(node)` (clears the
+`crashed` flag — its task re-arming is a harmless no-op here), `sim.stop
+(node)` (drops those tasks, keeps the now-torn durable state), *then*
+construct the fresh node. Generalizes beyond this one corpus: any scenario
+combining a `DiskConfig` crash-only fault with a `stop`-based fresh-restart
+idiom needs this three-call sequence, not a straight substitution of
+`crash` for `stop`.
+## Wiring fault primitives into a per-group corpus needs `set_*_for` scoping, and running a corpus at its own nightly depth for the first time can surface an unrelated pre-existing failure (ADR 0061 Decision 3, `txn_serializable.rs`)
+
+Porting `raftkv_linearizable.rs`'s ADR 0061 Decision 3 fault-primitives
+wiring (`DiskConfig::set_fsync_lie_prob`, a compound `NetConfig`,
+`Simulator::set_clock_drift_for`) to `txn_serializable.rs` needed one real
+adaptation, not a copy-paste: the raftkv corpus is a single Raft group, so
+its `Nemesis::FsyncLie` sets `DiskConfig` **globally**
+(`Simulator::set_disk_config`); the txn corpus has 3 *independent* tablet
+groups sharing one `Simulator`, so a global disk fault would lie to every
+group at once regardless of which one a scenario means to target —
+`set_disk_config_for`/`set_clock_drift_for` (per-node, not the bare
+`set_disk_config`/no per-node clock-drift equivalent needed by the
+single-group corpus) are the right primitives once a corpus has more than
+one independently-faulted unit sharing a `Simulator`. The general form:
+when porting a fault-wiring pattern from a single-topology corpus to a
+multi-topology one, re-derive which scope (`_for`, whole-`Simulator`, or
+per-link) is correct for the *new* corpus's own shape — don't assume the
+source corpus's scope choice transfers, since a single-group corpus never
+had a reason to need anything narrower than global. `heal_all` resetting
+these per-node overrides individually (not just the global `NetConfig`) is
+the same "a fired fault must not outlive its window" trap the raftkv PR's
+own `heal_all` already documents, just for a `_for`-scoped fault instead of
+a global one — resetting the global default does nothing for a per-node
+override that was never routed through the global setter at all.
+
+Separately: `ANIMUS_TXN_SEEDS=40` (the depth `corpus-deep.yml`'s existing
+nightly tier already configures for this corpus) surfaced a **pre-existing,
+unrelated** `check_kind_consistency` divergence on `main`, with no new
+fault involved — `compound_lossy_and_anchor_kill_s25` (seed
+`8035380114809936673`, a `Lossy` + `AnchorLeaderKill` cell) reproduces
+identically on the unmodified checkout. This corpus's own default depth is
+1, so nightly's `=40` had evidently not actually been run to completion
+against this specific check before — a fault-primitives PR that happens to
+validate at that depth is not the same thing as nightly CI having done so.
+The general lesson: a corpus's documented "held green at depth K" claim is
+only as trustworthy as the last time someone actually ran it at K and
+looked at the result — treat validating a change at a corpus's own stated
+nightly depth as an opportunity to check that claim is still true, not just
+a formality for the change at hand, and when it turns out not to be, that
+is a real, separate finding (this repo's "incidental bug gets its own PR"
+convention) — report it plainly rather than quietly dropping the depth or
+excluding the offending cell to get a clean run.
+
+## Wiring `animus-sim`'s fault primitives into a real corpus for the first time (ADR 0061 Decision 3, `raftkv_linearizable.rs`)
+
+`animus-sim`'s deepened fault vocabulary (`NetConfig::set_duplicate_prob`/
+`set_corrupt_prob`/`set_heavy_tail_prob`, `DiskConfig::set_fsync_lie_prob`/
+`torn_tail_on_crash`/`corrupt_on_crash`) had been proven correct in its own
+meta-tests (`animus-sim/tests/net_faults.rs`, `disk_faults.rs`) but never
+actually driven through a real protocol-correctness corpus. Wiring it into
+the flagship raftkv linearizability corpus surfaced two lessons, one a
+harness trap and the other a real, still-open production finding.
+
+**1. A `Nemesis` that sets a global `Env` fault config for "the rest of the
+run" must be reset by the runner's heal step, or it silently keeps firing
+past its own scenario's intended fault window.** Every pre-existing
+`Nemesis` variant in this corpus only ever touched partitions/crashes
+(healed by `Simulator::heal`/`restart`) or `NetConfig` (reset by
+`heal_all`'s pre-existing `self.sim.set_net_config(NetConfig::default())`).
+The moment a variant (`FsyncLie`) set a global `DiskConfig` for the first
+time, `heal_all` needed the identical reset
+(`self.sim.set_disk_config(DiskConfig::default())`) or the lie would keep
+firing for every scenario cell that happens to run after it in the same
+process — invisible in this corpus's own harness (each scenario gets a
+fresh `Simulator`, so nothing here actually leaked), but exactly the trap a
+future corpus sharing one `Simulator` across cells (or a future `Nemesis`
+composing several fault-window phases within one scenario) would fall
+into silently. General rule: every new global-fault-setting `Nemesis`
+needs its own explicit line in whatever "return to steady state" step the
+harness already has for the fault classes that came before it — don't
+assume the existing reset call already covers a fault dimension it
+predates.
+
+**2. A wire codec that "never panics" can still abort the whole process —
+and this corpus caught a real instance of it within minutes of running at
+depth.** The task briefing (based on a prior investigation) asserted
+`NetConfig::set_corrupt_prob` was "verified safe" for this corpus because
+`animus_cp_data::codec::decode_wire` is bounds-checked and its
+`KvWire`/`RaftMsg` match sites `warn!`/drop on a decode `Err` rather than
+panicking. That's true for the primitive per-byte reads (`Cursor::u8`/`u32`/
+`u64`/`bytes` all bounds-check via `take()` before ever touching memory) but
+false for a whole class of *array* decoders: `read_raft`'s `AppendEntries`
+arm (`codec.rs`) reads an untrusted `n: u32` entry count straight off the
+wire and calls `Vec::with_capacity(n as usize)` **before** a single one of
+those `n` entries has been validated against the cursor's remaining bytes.
+A single bit-flip landing inside those 4 length bytes can turn `n` into
+something close to `u32::MAX`; since each `LogEntry<KvCommand>` is a
+multi-field struct, `with_capacity` then requests on the order of a
+terabyte, which Rust's allocator failure path (`handle_alloc_error`)
+**aborts the process on** — not a catchable panic, and nothing a
+`std::panic::catch_unwind` or a `Result`-based decode error contract can
+intercept. Reproduced deterministically at `ANIMUS_RAFTKV_SEEDS=20`:
+`chaos_early_3_s09`, seed `422907917505132688`, `SIGABRT`. Grepping
+`codec.rs` for the same `let n = c.u32()?; ... Vec::with_capacity(n as
+usize)` shape found **at least a dozen more sites** (`read_kind_writes`,
+`read_change_logs`, `TxnStage`'s `puts`/`conditions`, `SplitTablet`'s
+`replicas`, `TxnRecord`'s `spans`/`conditions`, `SeedBatch`'s `rows`, and
+`read_raft`'s own `AppendEntries`/`InstallSnapshot`-adjacent arms) — this is
+a **systemic gap in the codec's array-decoding pattern**, not a one-off in
+one match arm. Deliberately **not fixed as part of this corpus PR** (the
+repo's own "an incidental bug gets its own PR" rule, root `CLAUDE.md`
+Conventions) — `Nemesis::Chaos` ships without `set_corrupt_prob` instead
+(see its own doc in `raftkv_linearizable.rs`), the same "primitive excluded
+from this corpus, real fix deferred to its own crate/PR" treatment this
+corpus already gives `DiskConfig::set_enospc_prob`/`set_error_prob` for the
+identical hard-abort-vs-graceful-`Err` reason. **The general lesson**: when
+a decode path's own doc (or a fault-injection plan) claims "bounds-checked,
+never panics," verify that claim against every *array*-shaped decoder
+specifically — a scalar bounds check (`take(n)` before slicing) is not the
+same guarantee as a *count*-driven pre-allocation being bounded, and the
+difference is invisible until something (a corrupted wire byte, a
+malformed peer, a fuzzer) actually supplies an adversarial count. The real
+fix (tracked as a follow-up, not implemented here) is straightforward:
+either drop the `with_capacity` hint for array decoders entirely (a
+`push`-per-iteration loop already bounds itself correctly via `Cursor::
+take`'s own check, just without the allocation being *pre*-sized) or cap
+the hint at some cheap function of the cursor's actual remaining byte
+length before ever calling `with_capacity`.
+
 ## A nightly CI job's sequential steps without `continue-on-error` let the first failure hide every corpus after it (`corpus-deep.yml`)
 
 `corpus-deep.yml` ran all ten deep-seed fault-injection corpora as
@@ -12968,3 +13260,254 @@ promoted to the standard shape without also being read as a downgrade.
   healthy (observed live: 2 of 3 nodes deafened during a DNS-lag
   bootstrap window). Retry with a short backoff instead; any future accept
   loop at a process boundary gets the same review scrutiny.
+
+## A shared `CARGO_TARGET_DIR` across worktree sessions can silently serve a stale test binary missing newly-added `#[test]` fns — `--list` (or a forced `touch`) before trusting a count (2026-08-30, `pitr_fault_corpus.rs` merge validation)
+
+Resolving PR #490's `docs/engineering-lessons.md` merge conflict and then
+validating with `CARGO_TARGET_DIR=/home/user/animus-db-shared-target cargo
+test -p animus-test --test pitr_fault_corpus` (as instructed, to avoid
+duplicating multi-GB build artifacts across worktrees) first reported **"12
+passed; 0 failed"** — a clean-looking green run — even though the checked-out
+file on disk plainly had 17 `#[test]` functions (confirmed by `grep -c
+'^#\[test\]'`) and the PR's own commit message and crate-guide entry both
+say "17 tests". `cargo test`'s own summary line only ever counts what its
+test binary actually contains; it has no way to notice that the binary
+itself is stale, so a naive "did the count match expectations and did
+everything pass" check would have reported a false clean bill of health
+while silently missing the five tests this very PR exists to add
+(`wal_fsync_lie_kill_sealing_leader`,
+`chaotic_network_pitr_rollover`/`chaotic_network_idle_group_never_
+proposes_a_pitr_seal`, `wal_torn_on_crash_kill_sealing_leader`,
+`restore_to_random_second_under_clock_drift`) — the exact set most likely to
+carry a real bug, being new. `cargo test -- --list` against the same
+un-touched binary reproducibly showed the same wrong 12; `touch`-ing the
+source file to force a fresh `rustc` invocation (visible via `-v`) made the
+list jump to the correct 17, all passing. The mechanism was never fully
+isolated (candidates include a leftover fingerprint/object from an earlier
+build of an older revision of this same file at this same worktree path,
+whose mtime cargo's fingerprint check treated as not-older-than the fresh
+checkout's), but the shared-target-dir setup itself is exactly the
+precondition that makes a stale-fingerprint hit both possible and likely: the
+same crate/test-target combination gets rebuilt from this same worktree path
+across many separate sessions over time, all landing in one directory tree
+cargo's own dep-graph fingerprinting was never designed to be shared this
+widely. **The general check going forward**: whenever a validation run's
+result matters (a merge/rebase gate, a "should be N/N" acceptance check) and
+`CARGO_TARGET_DIR` points at a directory shared across worktrees/sessions,
+don't trust the bare pass count — run `cargo test -- --list` (or diff the
+printed test names against a `grep -c '^#\[test\]'` of the file) at least
+once to confirm the binary's test set actually matches the source before
+reading a "N passed" line as proof of anything; a stale binary reports
+green precisely because it silently tests less, never because it tests the
+same thing and fails to notice a problem.
+## A racing-proposers workload can't tell "won" from "lost" by presence alone — it has to confirm by content (`animus-control`'s `control_corpus.rs`, ADR 0061 rung B1 sibling)
+
+Building `control_corpus.rs` — a new seed-depth corpus for `animus-control`'s
+own machinery (the ADR 0038 apply task, the schema-catalog exclusivity
+guarantee), modeled on `raftkv_linearizable.rs`'s harness shape — the
+schema-race workload's first draft had each racer's confirm loop treat "the
+table now exists" as its own success signal. That's the exact
+`ProposeResult::Accepted`-isn't-apply-time-truth trap the entry above already
+names, but with an extra twist specific to a **race**: here `Accepted` isn't
+even ambiguous about *whether* the command took effect (a single proposer's
+own straggler command, `CreateTablet`-fixture-style) — it's ambiguous about
+*whose* content took effect, since `CreateTableSchema` rejects outright on an
+existing name (first-committer-wins, not idempotent-on-identical the way
+`RegisterNode`'s CAS is) and TWO different proposers can each see "yes, a
+schema for this table now exists" as true. A confirm loop that stops
+retrying the instant presence flips true will, for the losing racer, log a
+false "I won" — exactly the durability check's "this confirmed effect must
+survive" assertion firing on content that was never actually this
+proposer's own. The fix: read the table's *actual* schema back and compare
+it, structurally, against the exact value this proposer proposed —
+`Some(existing) if *existing == schema => won`, `Some(_) => lost, stop
+retrying (nothing left to retry against a name that already belongs to
+someone else)`, `None => keep trying`. General lesson: **when a workload
+races N proposers for one identity and the state machine's own accept rule
+is "first-committer-wins, reject the rest" rather than idempotent-on-match,
+"does the effect exist" is the wrong confirm predicate — it has to be "does
+the effect that exists match MINE," or a losing proposer misreports itself
+as a winner and a durability check built on that misreport is checking a
+claim nobody should have made.**
+
+## Don't copy a sibling corpus's engine-tiering generic ceremony without first checking whether the new node type is generic over the storage engine at all (`animus-control`'s `control_corpus.rs`)
+
+`raftkv_linearizable.rs` (the explicit template `control_corpus.rs` was
+told to copy the *architecture*, not the content, of) is generic over both
+`E: Env` and `S: StorageEngine` because `animus-cp-data::RaftKvNode<E, S>`
+itself is — its `EngineFactory<S>` type alias and the `Group<S>`/`Node<S>`
+plumbing exist to let the corpus run the identical scenario set over both
+`MemoryEngine` and `LsmEngine<SimEnv>`. A first draft of the new corpus
+started copying that same `<S: StorageEngine>` shape onto `Group`/`Node`
+before checking whether it was needed — it wasn't:
+`animus_control::RaftNode<E>` is generic **only** over `E`; `start<S:
+StorageEngine>(..)` is a generic *associated function*, not a type
+parameter of `RaftNode` itself, so the engine type is erased the moment a
+node is constructed and there is nothing for a second generic parameter to
+thread through. Carrying the extra `<S>` ceremony over unused would have
+meant a `PhantomData` or a spurious "this corpus supports engine tiers"
+claim the harness never actually exercises. General lesson: **before
+copying a template corpus's generic shape onto a new one, check whether the
+concrete type the new corpus actually drives is generic the same way the
+template's was — a sibling module's own genericity is a property of *that*
+module's dependency, not a fixed feature of "how a corpus harness in this
+repo looks."**
+
+## Not every "the same id was confirmed twice" is a double-assignment — check whether the racing proposals were content-identical first (`animus-control`'s `control_corpus.rs`, `AllocatorRace`, PR② of the control-corpus stack)
+
+Building `Workload::AllocatorRace`'s invariant #4 (allocator injectivity),
+the first draft's `check_allocator_injectivity` had two parts: (1) a
+content-aware sampler (`Shared::sample_tablets`) that flags a `TabletId`
+observed with two *disagreeing* fingerprints, and (2) a second check that
+every `TabletId` a client's own confirm loop reported as applied
+(`confirmed_tablet_ids`) was pairwise distinct. Part (2) immediately failed
+the fault-free baseline: every `AllocatorRace` client races
+`MetaCommand::CreateTablet` for the identical shared table, so every
+racer's proposal is byte-identical **except for the candidate tablet id**
+(same table name, same range, same replica set). Before any proposal has
+committed, several racers legitimately read the same stale
+`next_free_tablet_id()` and each proposes with that same candidate id — and
+once the tablet that actually lands carries that id, EVERY one of those
+racers correctly observes "the tablet that now exists carries my own
+candidate id" and calls `confirm_tablet_id`. That is not a bug: there is no
+meaningful sense in which "whose literal `CreateTablet` call committed" is
+distinguishable when the content besides the id is identical — multiple
+racers correctly recognizing the identical, single, real assignment is
+expected, not a double-assignment. The fix was to delete part (2) entirely
+and rely solely on the content-aware sampler, which is strictly the
+stronger and correct check (it only flags a *disagreeing* fingerprint for
+the same id, never a repeated agreement). Contrast this with
+`BeginSplit`'s own phase of the same workload, where each racer's split key
+is deliberately distinct per proposer index — there, a "confirm by content"
+check (the child's actual range boundary matching MY split key, not just
+presence of my candidate ids) is exactly right, and is what the racing-
+proposers lesson above (`won`-vs-`lost` by content, not presence) already
+prescribes. **General lesson: when a race's confirm signal is "this
+proposal's content == what committed," first ask whether every racer's
+proposal *could be* content-identical except for the field the race is
+actually about — if so, a raw "confirmed exactly once" assertion over that
+field alone is checking a stronger, false property; the real invariant is
+"no two DIFFERENT contents were ever attributed to the same identity,"
+which only a fingerprint/content comparison (not an occurrence count) can
+state correctly.**
+
+## An open cross-plane fault-finding (issue #495, the shared WAL-corruption gap) does not automatically reproduce in every plane that shares the vulnerable codec — confirm per-plane before assuming (`animus-control`'s `control_corpus.rs`, PR②)
+
+Issue #495 is a confirmed, reproducible hard panic in `animus-cp-data`:
+composing `DiskConfig::torn_tail_on_crash` with `corrupt_on_crash` lets a
+corrupted-but-still-JSON-valid WAL record (`animus-control::persist::
+WalRecord`, no per-record checksum — the codec `animus-control` and
+`animus-cp-data` **share**) decode successfully with a wrong value, which
+that plane's `assert_ts_monotonic` (an HLC-timestamp monotonicity invariant)
+then trips on once a later entry applies past it. Building `control_corpus.rs`'s
+own `#[ignore]`d regression probe for the identical composition, the natural
+assumption was "the codec is shared, so the panic should reproduce here
+too" — it did not, across a deliberate 80-combination sweep (many seeds ×
+`PlainChurn`/`AllocatorRace` workloads × `LeaderKill`/`FollowerKill` ×
+with/without an `FsyncLie`-accumulated un-synced buffer before the crash,
+done during development, not committed as code). The underlying codec gap
+is real in both places (the corruption fires identically — confirmed by
+inspecting `DiskCorrupt`/`DiskTear` trace events), but `animus-control`'s
+`Metadata::apply`/recovery path has no invariant as strict as
+`assert_ts_monotonic` for a wrong-but-decodable *numeric* field to trip —
+this plane's commands carry no HLC timestamp at all, and its epoch/CAS
+checks *reject* a mismatch rather than *asserting* on one, so a corrupted
+epoch or tablet id just fails a CAS instead of panicking. **General lesson:
+a fault-finding confirmed in one plane over a codec/primitive that plane
+shares with another does not transfer by assumption — the reproducing
+mechanism is downstream of the shared corruption (some specific invariant
+the corrupted-but-valid value eventually trips), and a sibling plane may
+share the corruption but not the invariant. Confirm (or rule out) the
+composition explicitly in each plane it could plausibly reach, and record a
+negative result as carefully as a positive one — it is what tells a future
+reader whether the standing regression probe is still watching for
+something that could happen, or has already been checked and cleared for
+that plane's current invariant set.**
+
+## `Simulator::crash`+`restart` is not a stand-in for a real process restart — a "does recovery actually rebuild from disk" test needs `stop` + a fresh constructor (`animus-control`'s `control_corpus.rs`, PR③)
+
+`animus-sim`'s `Simulator::crash` mutes a node (drops its un-synced disk +
+volatile inbox, keeps its tasks alive but silent) and `restart` un-mutes and
+re-arms those SAME still-live tasks — the node's `RaftCore`, driver loop,
+and (for `animus-control`) ADR 0038's async apply task never actually stop
+running; they just stop being able to send/receive for a while. This is the
+right primitive for "the node was briefly unreachable/froze," and it's what
+every pre-existing `LeaderKill`/`FollowerKill`-shaped nemesis in this
+repo's corpora uses. It is the WRONG primitive for proving a genuine
+crash-recovery code path — anything gated on "a fresh process just started
+and has to rebuild its in-memory state from durable disk" (here:
+`meta_apply_loop`'s `mirror::rebuild_metadata_from_engine` call plus
+reseeding its `engine_applied` watermark from the engine's own
+`syskv::applied_index_key()`, rather than trusting `core.last_applied()`)
+never runs at all under crash+restart, because the in-memory state that
+code path exists to rebuild was never actually destroyed. Proving that path
+needs `Simulator::stop` (removes the node's tasks entirely — genuinely
+nothing left running under that node id) followed by constructing a BRAND
+NEW driver/node that reopens the SAME retained durable-engine handle
+(mirroring `tests/restart.rs`'s pattern: keep the `MemoryEngine` alive in a
+variable outside the node so a later `RaftNode::start` can re-clone it,
+exactly like a real disk surviving a process exit). **General lesson: when
+a fault nemesis is meant to exercise "recovery from durable state after a
+restart," check whether the simulator primitive it uses actually destroys
+the in-memory state the recovery code is supposed to rebuild — a
+crash-and-resume primitive that merely mutes/re-arms the same live task
+will make the test pass for the wrong reason (nothing to recover, so
+nothing can prove the recovery path works) rather than for the right one.**
+
+A second, sharper gotcha discovered building this nemesis: `Simulator::stop`
+does **not** clear a `crashed` flag a prior `Simulator::crash` on the same
+node id set — the two are independent pieces of state (`crashed: BTreeSet`
+vs. simply having no owned tasks). A cell that ever crashes a node and then
+later `stop`s + reconstructs it on the same id, without an intervening
+`Simulator::restart` (which is what actually clears `crashed`), ends up with
+a fresh `RaftNode` whose every outbound send is silently swallowed forever
+by the stale mute — with no panic, no error, just an isolated node that
+looks alive but never converges, i.e. exactly the shape of bug this session
+already burned time on once before with a different composition (see the
+sibling entry on issue #421 above). The fix is a fixed compose order —
+`crash; stop; restart` (the `restart` call clears the mute even though
+there are no tasks left for it to re-arm) — *before* constructing the fresh
+node. This repo's `control_corpus.rs` has no cell that currently composes
+`StopRestart` with a prior crash on the same id, but the defensive order is
+applied unconditionally in `Group::stop_node` anyway, since it costs
+nothing and rules the entire hazard class out by construction rather than
+by "don't do that" convention.
+
+## A real multi-chunk `InstallSnapshot` transfer completes in single-digit milliseconds of virtual time — a coarse `Vec<(Duration, Nemesis)>` fault schedule cannot reliably land "mid-transfer" (`animus-control`'s `control_corpus.rs`, PR③)
+
+Composing a fault with an in-flight chunked snapshot transfer sounds like it
+should fit this repo's usual `faults: Vec<(Duration, Nemesis)>` scenario
+shape (schedule the fault at some duration into the run, mirroring every
+`LeaderKill`/`PartitionLeader` cell elsewhere in this corpus). An
+exploratory run (millisecond-granularity polling of a real, healed,
+multi-chunk transfer between two real `RaftNode`s) found this doesn't work:
+once the leader starts shipping chunks to a caught-up-eligible follower,
+the WHOLE transfer — first chunk received through fully reassembled
+`Metadata` — completes in roughly 3ms of virtual time, because this plane's
+replication path has no artificial per-chunk delay and virtual time costs
+no real wall-clock proportional to its size. A fault scheduled "2.2 seconds
+into the run" has essentially zero chance of landing inside a 3ms window
+whose START time itself isn't even known in advance (it depends on when
+the leader notices the follower is behind past its compacted prefix, which
+depends on heartbeat timing, election history, etc. — all seed-dependent).
+The fix was to replace the duration guess with a **condition-based poll**:
+step virtual time in small (200µs) increments, checking a directly
+observable proxy for "the transfer has started but not finished" (the
+receiving follower's `snapshot_index() > 0` — set from the FIRST chunk's
+base index — while its reassembled state, e.g. `metadata().members.len()`,
+is still short of the target), and inject the fault the instant that holds.
+This lands inside the real window regardless of a given seed's exact
+timing, and the test itself asserts it actually caught the window (rather
+than the transfer racing past a coarse poll entirely) before proceeding —
+so a future change that made the transfer effectively instantaneous would
+fail loudly here instead of silently degrading into a fault-free no-op
+cell. **General lesson: before reaching for a scenario harness's existing
+`Duration`-based fault-scheduling shape to hit a specific in-flight window,
+measure how long that window actually is in virtual time — a data-plane
+"lazy, on-demand, lasts-until-idle" mechanism can complete in microseconds
+to milliseconds once triggered, which no second-or-millisecond-granularity
+fixed schedule can reliably intersect; a condition-based poll on a directly
+observable proxy for "in progress" is the fix, and asserting the poll
+actually caught the window (not just that the scenario as a whole
+converged afterward) is what keeps the test honest about whether it
+exercised the fault window at all.**

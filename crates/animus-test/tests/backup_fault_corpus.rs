@@ -67,11 +67,12 @@ use animus_cp_data::backup::{
     self as backup_codec, BackupManifestObject, BackupManifestTabletEntry,
 };
 use animus_cp_data::cursor;
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
     KIND_BASE, KIND_CURSOR, KIND_LSI, RaftKvNode, SeedRow, StorageScope, TxnWrite,
 };
-use animus_env::{Clock, EnvExt, SegmentStore, nid};
-use animus_sim::{SegmentFaultConfig, SimEnv, SimSegmentStore, Simulator};
+use animus_env::{Clock, EnvExt, NodeId, SegmentStore, nid};
+use animus_sim::{DiskConfig, NetConfig, SegmentFaultConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId, escape, partition_token};
 use animus_test::corpus;
@@ -2006,5 +2007,708 @@ fn restore_after_source_drop() {
     for_each_seed(
         "restore_after_source_drop",
         scenario_restore_after_source_drop,
+    );
+}
+
+// ============================================================================
+// `Env`-level fault-primitive cells (ADR 0061 Decision 3) — new cells only,
+// each a close copy of an existing one above with ONE added fault call. Per
+// this corpus's own doctrine (ADR 0014), none of the cells above are
+// modified; these are additive. `NetConfig::set_corrupt_prob` is
+// deliberately never used here: as of this branch,
+// `animus-cp-data::codec`'s `Vec::with_capacity(n as usize)` call sites read
+// an untrusted wire length prefix with no upper-bound check, so a corrupted
+// message near `u32::MAX` risks an allocator abort rather than a clean
+// application-level error — out of scope until that fix lands (mirrors the
+// conservative choice sibling corpora made for the identical reason).
+// `DiskConfig::set_enospc_prob`/`set_error_prob` are excluded for a
+// different reason: their error branches in `persist_wal` are
+// `assert!(halted.load(..), ..)`, and this corpus's scenarios never call the
+// per-node `shutdown()` that sets `halted` — firing either on a live node
+// hard-panics the whole test process.
+// ============================================================================
+
+// --- cell 11: wal_fsync_lie_leader_kill_mid_capture -------------------------
+
+/// Near-copy of [`leader_kill_mid_capture`] with one added fault: a global
+/// [`DiskConfig::set_fsync_lie_prob`] of 0.3, active from before the first
+/// write. `sync` on any node may now return `Ok` while silently leaving the
+/// synced bytes un-synced — transparent to every read until a crash reveals
+/// it ([`DiskConfig::set_fsync_lie_prob`]'s own doc). Proves the capture
+/// cursor's own durability claim survives a lied-to `sync` on the crashing
+/// leader: `confirm` only ever observes a write as durable via the
+/// *applied* index, which Raft only advances once a majority holds the
+/// entry, so a lie on the crashing node alone (the other two replicas never
+/// crash in this scenario, so their own un-synced tails — lied to or not —
+/// are never revealed/lost) can delay convergence but never surface as a
+/// gap in the model-matched backup; there is nothing here for a lied-to
+/// write to silently drop, because this scenario never treats an
+/// unconfirmed write as committed in the first place.
+fn scenario_wal_fsync_lie_leader_kill_mid_capture(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut dcfg = DiskConfig::default();
+    dcfg.set_fsync_lie_prob(0.3);
+    sim.set_disk_config(dcfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // A couple of ticks under the first leader, then kill it mid-sweep.
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+    let cursor_key_bytes = cursor::cursor_key(&group.range.start, &backup_cursor_tag("backup-1"));
+    let cursor_before =
+        block_on(group.nodes[leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+    assert!(
+        cursor_before.is_some(),
+        "[seed={seed}] a cursor must exist by now"
+    );
+
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+    let mut cursor_after = None;
+    for _ in 0..200 {
+        cursor_after =
+            block_on(group.nodes[new_leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+        if cursor_after == cursor_before {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert_eq!(
+        cursor_after, cursor_before,
+        "[seed={seed}] the newly-elected leader must converge to the identical \
+         durably-committed cursor even under a lied-to fsync on the crashing \
+         leader"
+    );
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+}
+
+#[test]
+fn wal_fsync_lie_leader_kill_mid_capture() {
+    for_each_seed(
+        "wal_fsync_lie_leader_kill_mid_capture",
+        scenario_wal_fsync_lie_leader_kill_mid_capture,
+    );
+}
+
+// --- cell 12: chaotic_network_capture_converges -----------------------------
+
+/// Near-copy of [`single_tablet_backup_converges_under_concurrent_writes`]
+/// with one added fault: a compound [`NetConfig`] (5% drop, 10% duplicate,
+/// with its own independent delay draw per [`NetConfig::
+/// set_duplicate_prob`]'s doc) active for the group's entire lifetime, not
+/// just during capture. Proves the capture driver's write-once discipline
+/// and the completion aggregator's manifest assembly both converge —
+/// through ordinary Raft/2PC retry, not anything backup-specific — under a
+/// genuinely lossy, duplicating network, not just the near-reliable default
+/// every other cell in this file runs under.
+fn scenario_chaotic_network_capture_converges(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+
+    let mut ncfg = NetConfig::default();
+    ncfg.set_drop_prob(0.05);
+    ncfg.set_duplicate_prob(0.1);
+    sim.set_net_config(ncfg);
+
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..10 {
+        let pk = format!("pre{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+
+    // A pending, never-resolved transaction intent — its staged value must
+    // never surface anywhere in the backup (ADR 0059 §5).
+    let staged_key = logical(b"pending-intent");
+    let staged_value = b"never-committed".to_vec();
+    let write = TxnWrite {
+        key: staged_key,
+        value: Some(staged_value.clone()),
+        kind_writes: Vec::new(),
+        change_log: None,
+        stage_marker: None,
+    };
+    let n = group.nodes[leader].clone();
+    let env = n.env().clone();
+    let slot: std::sync::Arc<std::sync::Mutex<Option<_>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.spawn_task(async move {
+        let r = n
+            .txn_stage_anchor("t", vec![write], Vec::new(), Vec::new())
+            .await;
+        *s.lock().unwrap() = Some(r);
+    });
+    // A wider window than the fault-free original — a lossy/duplicating
+    // link can cost the stage attempt an extra retry round trip.
+    for _ in 0..200 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert!(
+        slot.lock().unwrap().take().flatten().is_some(),
+        "[seed={seed}] the intent must stage even under a lossy/duplicating network"
+    );
+
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // Pin the capture (first tick) BEFORE any post-pin write lands.
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+
+    // Concurrent writes AFTER the pin: must never appear in the backup.
+    for i in 0..5 {
+        let leader = elect(&mut sim, &group, &live, seed);
+        write_base_row(
+            &mut sim,
+            &group.nodes[leader],
+            format!("post{i:03}").as_bytes(),
+            b"late",
+        );
+    }
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+
+    assert_backup_matches_model(&store, "backup-1", &model, &[staged_value], seed);
+}
+
+#[test]
+fn chaotic_network_capture_converges() {
+    for_each_seed(
+        "chaotic_network_capture_converges",
+        scenario_chaotic_network_capture_converges,
+    );
+}
+
+// --- cell 13: capture_driver_wal_torn_on_restart ----------------------------
+
+/// Near-copy of [`capture_driver_node_crash_restart`]'s true-process-restart
+/// technique, with one added fault: a global `DiskConfig{torn_tail_on_crash:
+/// true, corrupt_on_crash: true, ..}`, set right after `Simulator::new`, so
+/// it's in effect for every node's disk throughout. The highest-value new
+/// cell — it proves capture-cursor recovery tolerates a torn/corrupted last
+/// WAL record on the exact node whose cursor the capture driver depends on
+/// for resumability, not just a clean process restart.
+///
+/// `torn_tail_on_crash`/`corrupt_on_crash` only fire inside
+/// [`Simulator::crash`], never [`Simulator::stop`] (`stop` unconditionally
+/// drops any un-synced buffer with no tear/corrupt consideration — see both
+/// methods' own docs), so getting an actual torn/corrupted tail on the
+/// node's Raft-log WAL ahead of a genuine fresh-process restart needs one
+/// extra step versus the pure-`stop`-based original: `sim.crash` first (this
+/// is what applies the tear/corruption to whatever was buffered-but-
+/// unsynced at that instant — on this corpus's `MemoryEngine` tier the
+/// state machine itself is a durable-standin, shared with the fresh node via
+/// engine `.clone()`, exactly as the original cell already relies on; only
+/// the node's own raw Raft-log disk bytes are actually torn/corrupted here),
+/// then `sim.restart` purely to clear the `crashed` flag `crash` sets (a
+/// `crashed` node's own sends/deliveries are dropped forever until
+/// `restart` clears it — leaving it set would permanently mute the fresh
+/// node below), then `sim.stop` to drop the (harmlessly re-armed, never
+/// actually re-polled — no `run_for` happens in between) old tasks and hand
+/// off to a truly fresh `RaftKvNode::start_hosted` on the same durable
+/// state, mirroring the original cell's own restart step exactly from there.
+fn scenario_capture_driver_wal_torn_on_restart(seed: u64) {
+    let mut sim = Simulator::new(seed);
+
+    let mut dcfg = DiskConfig::default();
+    dcfg.torn_tail_on_crash = true;
+    dcfg.corrupt_on_crash = true;
+    sim.set_disk_config(dcfg);
+
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let mut group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..18 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+
+    // Crash (applies the configured torn/corrupted-tail fault to whatever
+    // was buffered-but-unsynced on this node's own Raft-log disk at this
+    // instant), then restart-then-stop purely to clear the `crashed` flag
+    // before handing off to a genuinely fresh process on the same id and
+    // the same durable (post-tear) state — see the scenario's own doc.
+    let restarted_id = NODES[leader];
+    sim.crash(nid(restarted_id));
+    sim.restart(nid(restarted_id));
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        engines[&restarted_id].clone(),
+        StorageScope::new(group.range.clone()),
+        group.id.0,
+    );
+    group.nodes[leader] = fresh;
+    sim.run_for(Duration::from_secs(2));
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+}
+
+#[test]
+fn capture_driver_wal_torn_on_restart() {
+    for_each_seed(
+        "capture_driver_wal_torn_on_restart",
+        scenario_capture_driver_wal_torn_on_restart,
+    );
+}
+
+// --- cell 14: inplace_split_races_capture_and_replans_onto_descendants -----
+//
+// The in-place analog of cell 4 above
+// (`split_races_capture_and_replans_onto_descendants`): the identical §6
+// re-planning claim — a split cutting over while capture is still in
+// flight, the parent's own unfinished progress simply abandoned, each
+// child restarting its own capture from scratch over its own narrower
+// range — driven through the DEFAULT production split path (the in-place
+// atomic fork, ADR 0058) instead of the deprecated copy-based
+// `BeginSplit`/`CutoverSplit` cell 4 exercises. `--split-mode copy`'s own
+// cell 4 is untouched above; this repo's corpus doctrine keeps a scenario
+// forever once added.
+//
+// The §6 re-planning logic itself (`Metadata::backup_capture_target`/
+// `live_split_descendants`/`backup_ready_to_complete`/`backup_manifest_
+// tablet_progress`) is entirely split-mechanism-agnostic — it only reads
+// `Metadata::split_lineage` — so this is the lightest of the sibling ports
+// (`backfill_fault_corpus.rs`'s/`stream_lineage_corpus.rs`'s own in-place
+// cells): swap the trigger, drive the fork+materialize through
+// `animus_cp_data::host::Reconciler` (mirroring `inplace_split_reconciler.
+// rs`'s own harness shape via a local `tick_one`/`converge` pair, adapted
+// from those two sibling files' own identical adaptation), and reuse every
+// existing capture/completion/verification helper in this file completely
+// unmodified.
+//
+// **Real in-place fork+materialize clones+trims each child's own share of
+// the parent's data automatically** — unlike cell 4's manual per-row copy
+// loop (a stand-in for the copy-based split-build driver's own SeedBatch
+// mechanics, explicitly out of that cell's own scope) — so this cell needs
+// no equivalent: once fork+materialize converges, each child's engine
+// already holds exactly its own half-range's rows, verified indirectly by
+// `assert_backup_matches_model`'s own full round-trip against `model`.
+
+/// A dedicated node id for spawning the reconciler-driving futures below —
+/// distinct from every real replica id in [`NODES`], so a stray env mixup
+/// would be obvious rather than silently aliasing a real replica (mirrors
+/// `backfill_fault_corpus.rs`'s own `driver_id`/`stream_lineage_corpus.rs`'s
+/// own `inplace_driver_id`).
+fn driver_id() -> NodeId {
+    nid(997)
+}
+
+type Recon = Reconciler<SimEnv, MemoryEngine>;
+
+/// One node's tablet-host reconciler, standing in for the per-node loop
+/// `animusd::tablet_host_reconciler_loop` drives in production — mirrors
+/// the sibling corpora's own `Cluster`/`ClusterNode` (kept local here
+/// rather than shared: integration test binaries can't share private
+/// items).
+struct ClusterNode {
+    reconciler: Recon,
+}
+
+struct Cluster {
+    nodes: BTreeMap<NodeId, ClusterNode>,
+}
+
+impl Cluster {
+    fn new(sim: &Simulator) -> Self {
+        let mut nodes = BTreeMap::new();
+        for &n in &NODES {
+            let id = nid(n);
+            let reconciler: Recon = Reconciler::new(
+                sim.env(id.clone()),
+                MemoryTabletEngines::new(),
+                id.clone(),
+                |_, _| {},
+                |_| {},
+            );
+            nodes.insert(id, ClusterNode { reconciler });
+        }
+        Cluster { nodes }
+    }
+
+    fn node(&self, id: &NodeId) -> &Recon {
+        &self.nodes[id].reconciler
+    }
+
+    fn hosted_set(&self, id: &NodeId) -> BTreeSet<TabletId> {
+        self.node(id).local_state().hosted.clone()
+    }
+}
+
+fn metadata_view(meta: &Metadata) -> MetadataView {
+    MetadataView {
+        tablets: meta.tablets.clone(),
+        down: BTreeSet::new(),
+    }
+}
+
+/// Runs `fut` to completion by spawning it on `env` and driving `sim` in
+/// small steps until it resolves — `stream_lineage_corpus.rs`'s/
+/// `backfill_fault_corpus.rs`'s own `drive` helper, copied verbatim:
+/// `Reconciler::tick` polls internally via `env.sleep`, so a bare
+/// `block_on` would hang with nothing advancing the simulator
+/// concurrently.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let slot: std::sync::Arc<std::sync::Mutex<Option<T>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    for _ in 0..500 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("drive: future never completed")
+}
+
+/// Ticks one node's reconciler once against `view`. The node is moved out of
+/// `cluster` for the duration of the tick (`drive`'s spawned future must own
+/// what it touches) and put back once it resolves.
+fn tick_one(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    id: &NodeId,
+    view: &MetadataView,
+) {
+    let mut node = cluster.nodes.remove(id).expect("node exists");
+    let view = view.clone();
+    let ticked = drive(sim, env, async move {
+        node.reconciler.tick(&view).await;
+        node
+    });
+    cluster.nodes.insert(id.clone(), ticked);
+}
+
+/// Ticks every node in `ids` against `view` in a bounded loop until `check`
+/// holds — mirrors `inplace_split_reconciler.rs`'s own `converge`.
+fn converge(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    ids: &[NodeId],
+    view: &MetadataView,
+    mut check: impl FnMut(&Cluster) -> bool,
+) -> bool {
+    for _ in 0..300 {
+        for id in ids {
+            tick_one(sim, env, cluster, id, view);
+        }
+        if check(cluster) {
+            return true;
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    check(cluster)
+}
+
+fn leader_of<'a>(cluster: &'a Cluster, ids: &[NodeId], tablet: TabletId) -> Option<&'a KvNode> {
+    ids.iter().find_map(|id| {
+        cluster
+            .node(id)
+            .hosted_node(tablet)
+            .filter(|h| h.is_leader())
+    })
+}
+
+/// Clones a reconciler-hosted tablet's per-node handles into this file's own
+/// plain [`Group`] — see the section doc above for why. Node order matches
+/// `ids` (== [`NODES`]' own order), so the `live: [0, 1, 2]` index
+/// convention every other cell in this file uses still lines up.
+fn wrap_group(cluster: &Cluster, ids: &[NodeId], tablet: TabletId, range: KeyRange) -> Group {
+    Group {
+        id: tablet,
+        range,
+        nodes: ids
+            .iter()
+            .map(|replica_id| {
+                cluster
+                    .node(replica_id)
+                    .hosted_node(tablet)
+                    .expect("tablet hosted on every fork participant")
+                    .clone()
+            })
+            .collect(),
+    }
+}
+
+fn scenario_inplace_split_races_capture_and_replans_onto_descendants(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| leader_of(c, &node_ids, TabletId(1)).is_some()
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, TabletId(1), KeyRange::whole());
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    // Rows straddling the eventual split key `"m..."` — half fall left,
+    // half right (mirrors cell 4's own fixture).
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for pk in ["a001", "a002", "a003", "z001", "z002", "z003"] {
+        let value = format!("v-{pk}").into_bytes();
+        write_base_row(&mut sim, &parent.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // The parent makes SOME progress before the split lands.
+    let leader = elect(&mut sim, &parent, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &parent.nodes[leader],
+        &parent.range,
+        &store,
+        "backup-1",
+        parent.id,
+        seed,
+    );
+    assert!(
+        !meta
+            .backup_manifest_tablet_progress("backup-1")
+            .iter()
+            .any(|(_, p)| p.is_some()),
+        "[seed={seed}] the parent must not have finished before the split"
+    );
+
+    // Mint children at the SAME 3 replica homes as the parent (avoids
+    // learner catch-up — already covered by `inplace_split_reconciler.rs`;
+    // keeps this cell focused on the backup-capture race).
+    let split_key = b"m".to_vec();
+    let (left_id, right_id) = (TabletId(2), TabletId(3));
+    let parent_epoch = meta.tablets[&TabletId(1)].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: TabletId(1),
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(left_id, node_ids.clone()), (right_id, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(TabletId(1))
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&left_id) && hosted.contains(&right_id)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    // Cut over IMMEDIATELY — the in-place branch's own `CutoverSplit`
+    // carries no freeze/veto gate, deliberately before capture completes —
+    // the identical race cell 4 exercises on the copy-based path.
+    let parent_epoch = meta.tablets[&TabletId(1)].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: TabletId(1),
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 2_000,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+    assert!(!meta.tablets.contains_key(&TabletId(1)));
+    assert!(meta.backup_capture_target("backup-1", left_id));
+    assert!(meta.backup_capture_target("backup-1", right_id));
+    assert!(!meta.backup_capture_target("backup-1", TabletId(1)));
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(left_id).is_some()
+                        && c.node(id).hosted_node(right_id).is_some()
+                        && !c.hosted_set(id).contains(&TabletId(1))
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    let (left_range, right_range) = KeyRange::whole()
+        .split_at(&split_key)
+        .expect("split key must bisect the whole range");
+    let left = wrap_group(&cluster, &node_ids, left_id, left_range);
+    let right = wrap_group(&cluster, &node_ids, right_id, right_range);
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &left, &live, &store, "backup-1", seed);
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &right, &live, &store, "backup-1", seed);
+    assert!(meta.backup_ready_to_complete("backup-1"));
+
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+
+    let final_tablets: BTreeSet<u64> = meta
+        .backup_manifest_tablet_progress("backup-1")
+        .into_iter()
+        .map(|(t, _)| t.0)
+        .collect();
+    assert_eq!(
+        final_tablets,
+        BTreeSet::from([left_id.0, right_id.0]),
+        "[seed={seed}] the manifest's authoritative tablet list must be the two \
+         children, never the retired parent"
+    );
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+}
+
+#[test]
+fn inplace_split_races_capture_and_replans_onto_descendants() {
+    for_each_seed(
+        "inplace_split_races_capture_and_replans_onto_descendants",
+        scenario_inplace_split_races_capture_and_replans_onto_descendants,
     );
 }
