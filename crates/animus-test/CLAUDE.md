@@ -395,15 +395,40 @@ retrievable from git history.)
   coordinator-abandoned transaction still converges: `Workload::
   abandon_prepare_pct`/`abandon_commit_pct` model a coordinator that stops
   mid-2PC (after a successful prepare, or after a confirmed-but-unresolved
-  commit) — recorded `info`, never `fail` (house rule). ~25 frozen cells:
+  commit) — recorded `info`, never `fail` (house rule). ~33 frozen cells:
   3 baselines (default/rmw-heavy/read-heavy mix), 2 coordinator-abandon
   cells, participant/anchor leader-kill × 3 timings each, partition-during-
   prepare × 3 timings, lossy links, clock skew within/beyond
   `HLC_MAX_OFFSET` (beyond is a **liveness**-only knob — some reads may time
   out, `check_cycles` must stay green throughout, per the ADR's Decision
-  section), and 6 compound cells crossing abandonment/faults/workload mix.
-  Depth knob **`ANIMUS_TXN_SEEDS`** (default 1 = frozen; `seed_expand`'s
-  usual variant-0-keeps-the-canonical-seed convention).
+  section), 6 compound cells crossing abandonment/faults/workload mix, and
+  (ADR 0061 Decision 3) a second fault-primitives tier:
+  `ParticipantFsyncLie`/`AnchorFsyncLie` (`DiskConfig::set_fsync_lie_prob`,
+  scoped per-group via `set_disk_config_for` — this corpus's 3 independent
+  groups need per-group scoping the single-group `raftkv_linearizable.rs`
+  corpus didn't) each paired with a same-group leader kill shortly after
+  (`FSYNC_LIE_REVEAL_GAP`), so the crash's un-synced-bytes handling reveals
+  whatever the lie actually lost on a staged write — real teeth for 2PC's
+  own durability claim, compounding the existing coordinator-abandon
+  workload with a genuine durability lie instead of a clean crash; `Chaos`
+  (drop+duplicate folded into one `NetConfig`, standalone and read-heavy
+  cells — deliberately excludes `set_corrupt_prob`, same unfixed
+  `animus-cp-data::codec` allocator-abort gap `raftkv_linearizable.rs`'s own
+  `Chaos` excludes, see `docs/engineering-lessons.md`); and
+  `AnchorClockDrift` (`Simulator::set_clock_drift_for`, standalone and
+  compounded with a participant kill) — a clock that starts synced and
+  degrades *live* over the fault window rather than snapping to a fixed
+  skew instantly, same liveness-only discipline as `ClockSkewBeyond`.
+  `heal_all` resets both the per-node `DiskConfig` overrides and clock
+  drift alongside its pre-existing net-config/clock-skew resets (the
+  identical "a fired fault must not outlive its window" trap
+  `raftkv_linearizable.rs`'s own `heal_all` documents for its own,
+  globally-scoped `FsyncLie`). Depth knob **`ANIMUS_TXN_SEEDS`** (default 1
+  = frozen; `seed_expand`'s usual variant-0-keeps-the-canonical-seed
+  convention; held green at `=100` for the new fault-primitives cells in
+  isolation, `=15` for the full corpus — see the file's own history for why
+  full-corpus runs above `~s24` currently need the pre-existing
+  `compound_lossy_and_anchor_kill` finding below excluded first).
 - **A single-decider assumption in the recovery protocol itself, found by
   this corpus under real fault injection**: see the ADR 0018 PR6 amendment
   for the full account — the coordinator's own decide attempt and the
@@ -412,6 +437,22 @@ retrievable from git history.)
   the coordinator's own round trip is still genuinely in flight past
   `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
   is impossible by construction" assert does not tolerate that.
+- **A real, pre-existing, UNFIXED `check_kind_consistency` finding, found
+  incidentally while validating the ADR 0061 Decision 3 fault-primitives
+  tier at this corpus's own nightly CI depth** (`ANIMUS_TXN_SEEDS=40`,
+  matching `corpus-deep.yml`'s existing txn tier — no new fault involved):
+  `compound_lossy_and_anchor_kill_s25` (seed `8035380114809936673`)
+  reproduces identically on unmodified `main`, i.e. **before** any of the
+  fault-primitives-tier changes in this section — a `Lossy` + `AnchorLeaderKill`
+  cell whose `KIND_LSI` derived row diverges from its own base row
+  (`Some([1, 11])` vs `Some([1])`). Left unfixed and undiagnosed per this
+  repo's "an incidental bug gets its own PR" convention — it is unrelated to
+  the fault primitives this section documents, was simply never exercised
+  before (this corpus's default depth is 1; nightly CI's `=40` had not, as
+  of this finding, actually been run green end-to-end at that depth with
+  the `kind_consistency` check present). The new fault-primitives cells
+  themselves are clean through `ANIMUS_TXN_SEEDS=100` when run in isolation
+  from this cell (see the previous bullet's depth note).
 
 ### Elle-adjacent, but not Elle: the DynamoDB Streams lineage-walk corpus (ADR 0042/0043, round-3 PR8)
 
@@ -630,6 +671,32 @@ retrievable from git history.)
   `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
   (default 1 = the frozen cells; held green at `=100` for the restore cells,
   `=200` for the whole file, both in well under a second).
+- **Three `Env`-level fault-primitive cells (ADR 0061 Decision 3) add
+  genuinely new fault kinds this corpus hadn't exercised**, each a close
+  copy of an existing cell with one added fault call, never modifying the
+  originals: `wal_fsync_lie_leader_kill_mid_capture`
+  (`DiskConfig::set_fsync_lie_prob(0.3)` globally before the crash — proves
+  the capture cursor's durability claim survives a lied-to `sync` on the
+  crashing leader), `chaotic_network_capture_converges` (a compound
+  `NetConfig` — 5% drop, 10% duplicate — active for the group's whole
+  lifetime, proving ordinary Raft/2PC retry carries the capture driver and
+  completion aggregator through a lossy/duplicating network), and
+  `capture_driver_wal_torn_on_restart` (a global `DiskConfig{torn_tail_
+  on_crash: true, corrupt_on_crash: true, ..}` set before group startup,
+  combined with `capture_driver_node_crash_restart`'s fresh-process-restart
+  idiom — see `docs/engineering-lessons.md`'s entry on why that combination
+  needs `crash` → `restart` → `stop`, not `stop` alone, to actually exercise
+  the tear ahead of the fresh restart). `NetConfig::set_corrupt_prob` is
+  deliberately excluded from `chaotic_network_capture_converges`: as of
+  this corpus's own branch, `animus-cp-data::codec`'s
+  `Vec::with_capacity(n as usize)` call sites read an untrusted wire length
+  prefix with no upper-bound check, so corrupting a message risks an
+  allocator abort rather than a clean application-level error — safe to add
+  once that fix lands. `DiskConfig::set_enospc_prob`/`set_error_prob` stay
+  out of this whole file for a different, permanent reason: their error
+  branches in `persist_wal` are `assert!(halted.load(..), ..)`, and this
+  corpus's scenarios never call the per-node `shutdown()` that sets
+  `halted`, so firing either on a live node hard-panics the test process.
 
 ### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 
@@ -745,3 +812,33 @@ retrievable from git history.)
   first. All three are hand-scripted-`Metadata`-corpus pitfalls, not bugs
   in `pitr_replay_segments`/`pitr_seal_now` themselves; see
   `docs/engineering-lessons.md` for the general lessons.
+- **Train 3 PR③ wires in five of the ADR 0061 Decision 3 fault primitives**,
+  the same pass the sibling raftkv/txn/backup corpora already got:
+  `wal_fsync_lie_kill_sealing_leader` (`DiskConfig::set_fsync_lie_prob` on
+  cell 3's own crash-mid-seal shape — the crashing leader's recent syncs may
+  have lied about durability, so `crash`'s default whole-buffer-drop loses
+  more than an un-lied crash would; the retry still recovers the full
+  backlog, since Raft safety only ever needs a *majority* to have durably
+  persisted a committed entry), `chaotic_network_pitr_rollover` +
+  `chaotic_network_idle_group_never_proposes_a_pitr_seal` (a compound 5%
+  drop / 10% duplicate `NetConfig` over cells 1 and 2 — **never**
+  `set_corrupt_prob`: `animus-cp-data::codec`'s `Vec::with_capacity(n as
+  usize)` sites over an untrusted wire length prefix are still unbounded on
+  this branch, verified directly; sibling PR #485 fixes it but had not
+  landed here, so a corrupted length prefix near `u32::MAX` would abort the
+  process — same conservative exclusion the sibling corpora made),
+  `wal_torn_on_crash_kill_sealing_leader` (`DiskConfig::torn_tail_on_crash`/
+  `corrupt_on_crash` on cell 3's shape, but — unlike a bare copy — the
+  crashed node is brought all the way back via `crash` → `restart` → `stop`
+  → a fresh `RaftKvNode::start_hosted`, then driven through a further
+  write/seal round; see `docs/engineering-lessons.md`'s "crash-only disk
+  fault has zero test teeth" entry for why the restart is load-bearing here,
+  not optional — `current_open_pitr_epoch` is derived only from the
+  hand-scripted `Metadata`, so a tear nothing ever reads back proves
+  nothing), and `restore_to_random_second_under_clock_drift`
+  (`Simulator::set_clock_drift_for` on the sealing leader in place of cell
+  8's leader-kill nemesis — `wall_ms` is read live off that leader's own
+  drifted `env.wall_now()` at each seal rather than a synthetic counter, and
+  `assert_replay_matches_model` still has to hold at every recorded second).
+  Held green at `ANIMUS_PITR_SEEDS=40` alongside every other cell in this
+  file (same knob).
