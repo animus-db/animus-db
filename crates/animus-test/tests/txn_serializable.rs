@@ -107,6 +107,28 @@
 //! (recorded `info`, never `fail`) while the skew is in effect, but
 //! `check_cycles` must stay green throughout, exactly like
 //! `clock_skew_within_uncertainty`. See `assert_scenario_ok`'s doc.
+//!
+//! **A second fault-primitives tier (ADR 0061 Decision 3)**, wiring
+//! `animus-sim`'s fault vocabulary into this corpus (mirroring
+//! `raftkv_linearizable.rs`'s own wiring): `ParticipantFsyncLie`/
+//! `AnchorFsyncLie` (`DiskConfig::set_fsync_lie_prob`, scoped per-group via
+//! `set_disk_config_for` — this corpus's 3 independent groups need scoping
+//! `raftkv_linearizable.rs`'s single-group corpus didn't) each paired with a
+//! same-group leader kill shortly after, so the crash's un-synced-bytes
+//! handling reveals whatever the lie actually lost on a **staged, not yet
+//! resolved** write — real teeth for 2PC's own durability claim, compounding
+//! the existing coordinator-abandon workload with a genuine durability lie
+//! rather than a clean crash. `Chaos` folds independent per-message drop and
+//! duplication into one ambient `NetConfig` (deliberately excluding
+//! `NetConfig::set_corrupt_prob` — see `Nemesis::Chaos`'s own doc for the
+//! unfixed allocator-abort gap this shares with `raftkv_linearizable.rs`'s
+//! identical exclusion). `AnchorClockDrift` (`Simulator::
+//! set_clock_drift_for`) models a clock that starts synced and degrades
+//! *live* over the fault window, distinct from `ClockSkewWithin`/
+//! `ClockSkewBeyond`'s instant snap to a fixed offset — same liveness-only
+//! discipline as `ClockSkewBeyond` (see `Nemesis::AnchorClockDrift`'s own
+//! doc for the derivation): `check_cycles` must stay green even once the
+//! accumulated drift crosses `HLC_MAX_OFFSET`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -115,7 +137,7 @@ use std::time::Duration;
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{FastRead, RaftKvNode, StorageScope, TxnDecisionStatus, TxnId, TxnOutcome};
 use animus_env::{Clock, EnvExt, Rng, nid};
-use animus_sim::{NetConfig, SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::KeyRange;
 use animus_test::corpus::{self, SeedVariant};
@@ -224,6 +246,32 @@ fn lossy(p: f64) -> NetConfig {
     cfg
 }
 
+/// A compound, ambient network fault (ADR 0061 Decision 3): independent
+/// per-message drop **and** duplication (its own independent delay draw) on
+/// the same run, rather than the single-fault `Lossy` above — see
+/// `Nemesis::Chaos`'s own doc for why `NetConfig::set_corrupt_prob` is
+/// deliberately excluded.
+fn chaos(drop_p: f64, duplicate_p: f64) -> NetConfig {
+    let mut cfg = NetConfig::default();
+    cfg.set_drop_prob(drop_p);
+    cfg.set_duplicate_prob(duplicate_p);
+    cfg
+}
+
+/// `DiskConfig::set_fsync_lie_prob` (ADR 0061 Decision 3): every `sync`
+/// still returns `Ok`, but the bytes it would have moved into the durable
+/// image stay buffered — invisible until a later crash reveals the lie
+/// (`Simulator::crash` drops/tears whatever is still un-synced). Never
+/// errors, never panics, so it's safe to run on a live node; on its own it
+/// changes nothing observable, which is why every cell using this schedules
+/// it followed by a same-group leader kill (see `Nemesis::
+/// ParticipantFsyncLie`/`AnchorFsyncLie`'s own docs).
+fn fsync_lie(p: f64) -> DiskConfig {
+    let mut cfg = DiskConfig::default();
+    cfg.set_fsync_lie_prob(p);
+    cfg
+}
+
 struct Topology {
     /// `nodes[g]` is group `g`'s (`TABLES[g]`) fixed replica set. No node
     /// object is ever replaced (no `StopRestart`-style fault in this
@@ -325,7 +373,66 @@ enum Nemesis {
     /// (some `read_at`/prepare round trips may time out) may degrade. See
     /// the module doc.
     ClockSkewBeyond,
+    /// Fsync-acked-but-lost (`fsync_lie`, `DiskConfig::set_fsync_lie_prob`),
+    /// scoped to every replica of `group` — a participant tablet, not the
+    /// anchor. Targets 2PC's own durability claim: every corpus cell using
+    /// this schedules it followed (after a gap) by a same-group leader kill
+    /// (`ParticipantLeaderKill { group }`), so the crash's un-synced-bytes
+    /// handling reveals whatever the lie actually lost on a participant's
+    /// own stage-write — exactly the "coordinator abandons, resolver must
+    /// recover" shape `Workload::abandon_*_pct` already models, now
+    /// compounded with a genuine durability lie rather than a clean crash.
+    /// Reset by `heal_all` (a fired lie must not keep lying past its
+    /// intended window).
+    ParticipantFsyncLie { group: usize },
+    /// The anchor-group dual of `ParticipantFsyncLie` — same mechanism,
+    /// scoped to group 0 (the anchor for most transactions, see
+    /// `AnchorLeaderKill`'s doc), paired with a following `AnchorLeaderKill`
+    /// by the cells that use it. Targets the anchor's own commit-record
+    /// durability specifically, distinct from a participant's stage-write.
+    AnchorFsyncLie,
+    /// A compound, ambient network fault for the rest of the run: independent
+    /// per-message drop and duplication folded into one `NetConfig` (`chaos`,
+    /// ADR 0061 Decision 3) — particularly valuable for the stage-push retry
+    /// path (`stage_anchor_pushing`/`stage_participant_pushing`), since a
+    /// duplicated `TxnStage` proposal exercises the apply-time "writers
+    /// push, never overwrite" idempotency guard the module doc's issue #298
+    /// / ADR 0018 PR6 amendment already document.
+    ///
+    /// **Deliberately excludes `NetConfig::set_corrupt_prob`.** As of this
+    /// checkout, the fix for `animus-cp-data::codec`'s untrusted-wire-
+    /// length-prefix allocator-abort DoS (`Vec::with_capacity(n as usize)`
+    /// on an unvalidated `u32` count, at roughly a dozen `codec.rs` decoder
+    /// sites — SIGABRT, not a catchable panic) lives only on the
+    /// `fix/codec-unbounded-alloc` branch (commit `299693b`), which is not
+    /// yet an ancestor of this branch's `main`. This mirrors the identical,
+    /// already-documented exclusion `raftkv_linearizable.rs`'s own `Chaos`
+    /// variant applies for the same unfixed gap (see
+    /// `docs/engineering-lessons.md`) — re-add it here once that fix lands
+    /// on `main`.
+    Chaos,
+    /// Progressive clock drift (`Simulator::set_clock_drift_for`) on every
+    /// replica of the anchor group, layered on top of (not replacing) the
+    /// static `ClockSkewWithin`/`ClockSkewBeyond` model above: a clock that
+    /// starts synced and degrades *live* over the scenario's own `WINDOW`,
+    /// rather than snapping to a fixed offset instantly. `ANCHOR_DRIFT_PPM`
+    /// is chosen so the accumulated drift crosses `HLC_MAX_OFFSET` (500ms)
+    /// partway through `WINDOW` (2000ms) — see its own doc for the exact
+    /// derivation. Same liveness-not-safety discipline as `ClockSkewBeyond`:
+    /// `check_cycles` must stay green throughout even once the drift
+    /// exceeds the uncertainty interval; only some `read_at`/prepare round
+    /// trips may time out.
+    AnchorClockDrift,
 }
+
+/// `AnchorClockDrift`'s drift rate: `drift_ppm * elapsed_nanos /
+/// 1_000_000` reaches `HLC_MAX_OFFSET` (`animus-cp-data`'s private 500ms
+/// constant) after `elapsed = 500ms * 1_000_000 / drift_ppm`. Solving for a
+/// crossing at 1.25s — comfortably inside `WINDOW` (2000ms), leaving room
+/// both before (clean, in-uncertainty operation) and after (fully-beyond-
+/// uncertainty operation) within the same fault window — gives `drift_ppm =
+/// 500_000_000ns * 1_000_000 / 1_250_000_000ns = 400_000`.
+const ANCHOR_DRIFT_PPM: i64 = 400_000;
 
 /// The transaction-shape mix + coordinator-abandon probabilities a scenario
 /// drives. Percentages are of 100; `write_pct + read_pct` is the read/write
@@ -425,13 +532,23 @@ const LATE: Duration = Duration::from_millis(3200);
 const TIMINGS: [(&str, Duration); 3] = [("early", EARLY), ("mid", MID), ("late", LATE)];
 /// Real outage window every faulted cell rides out before healing.
 const WINDOW: Duration = Duration::from_millis(2000);
+/// Gap between a scheduled `ParticipantFsyncLie`/`AnchorFsyncLie` and the
+/// following same-group leader kill that reveals it — short enough to land
+/// well before `WINDOW` closes even at the `late` timing, long enough that a
+/// handful of ops land while the lie is in effect first (mirrors
+/// `raftkv_linearizable.rs`'s own `FSYNC_LIE_REVEAL_GAP`).
+const FSYNC_LIE_REVEAL_GAP: Duration = Duration::from_millis(500);
 
 /// The frozen, name-seeded scenario corpus (ADR 0014's doctrine, ported to
-/// the cross-tablet transaction protocol). ~25 cells: baselines, coordinator
+/// the cross-tablet transaction protocol). ~33 cells: baselines, coordinator
 /// abandonment (both flavors), the fault matrix (participant/anchor leader
 /// kill, partition-during-prepare, each at 3 timings), lossy links, clock
-/// skew within/beyond uncertainty, and 6 compound cells crossing
-/// abandonment/faults/workload mix.
+/// skew within/beyond uncertainty, 6 compound cells crossing
+/// abandonment/faults/workload mix, and a second fault-primitives tier
+/// (ADR 0061 Decision 3): `ParticipantFsyncLie`/`AnchorFsyncLie` each
+/// compounded with a same-group leader kill (`FSYNC_LIE_REVEAL_GAP` later),
+/// `Chaos` (drop+duplicate, standalone and read-heavy), and
+/// `AnchorClockDrift` (standalone and compounded with a participant kill).
 #[allow(clippy::vec_init_then_push)] // built incrementally across several loops below
 fn corpus_cells() -> Vec<Scenario> {
     let mut out = Vec::new();
@@ -565,6 +682,59 @@ fn corpus_cells() -> Vec<Scenario> {
         WINDOW,
     ));
 
+    // Fault-primitives tier (ADR 0061 Decision 3): fsync-lie durability,
+    // compound network chaos, and progressive clock drift.
+    for (tname, at) in TIMINGS {
+        out.push(cell(
+            &format!("participant_fsync_lie_then_kill_{tname}"),
+            Workload::default_mix(),
+            vec![
+                (at, Nemesis::ParticipantFsyncLie { group: 1 }),
+                (
+                    at + FSYNC_LIE_REVEAL_GAP,
+                    Nemesis::ParticipantLeaderKill { group: 1 },
+                ),
+            ],
+            WINDOW,
+        ));
+    }
+    out.push(cell(
+        "anchor_fsync_lie_then_kill_mid",
+        Workload::default_mix(),
+        vec![
+            (MID, Nemesis::AnchorFsyncLie),
+            (MID + FSYNC_LIE_REVEAL_GAP, Nemesis::AnchorLeaderKill),
+        ],
+        WINDOW,
+    ));
+    out.push(cell(
+        "chaos_links",
+        Workload::default_mix(),
+        vec![(EARLY, Nemesis::Chaos)],
+        WINDOW,
+    ));
+    out.push(cell(
+        "chaos_read_heavy",
+        Workload::read_heavy(),
+        vec![(EARLY, Nemesis::Chaos)],
+        WINDOW,
+    ));
+    out.push(cell(
+        "anchor_clock_drift",
+        Workload::default_mix(),
+        vec![(EARLY, Nemesis::AnchorClockDrift)],
+        WINDOW,
+    ));
+    out.push(cell(
+        "compound_clock_drift_and_participant_kill",
+        Workload::default_mix(),
+        vec![
+            (EARLY, Nemesis::AnchorClockDrift),
+            (MID, Nemesis::ParticipantLeaderKill { group: 1 }),
+        ],
+        WINDOW,
+    ));
+
     out
 }
 
@@ -620,6 +790,22 @@ fn apply_nemesis(sim: &Simulator, topo: &Topology, nem: Nemesis, crashed: &mut B
                 sim.set_clock_skew_for(nid(id), SKEW_BEYOND_NANOS);
             }
         }
+        Nemesis::ParticipantFsyncLie { group } => {
+            for &id in &GROUP_IDS[group] {
+                sim.set_disk_config_for(nid(id), fsync_lie(0.3));
+            }
+        }
+        Nemesis::AnchorFsyncLie => {
+            for &id in &GROUP_IDS[0] {
+                sim.set_disk_config_for(nid(id), fsync_lie(0.3));
+            }
+        }
+        Nemesis::Chaos => sim.set_net_config(chaos(0.05, 0.1)),
+        Nemesis::AnchorClockDrift => {
+            for &id in &GROUP_IDS[0] {
+                sim.set_clock_drift_for(nid(id), ANCHOR_DRIFT_PPM);
+            }
+        }
     }
 }
 
@@ -637,6 +823,16 @@ fn heal_all(sim: &Simulator, crashed: &mut BTreeSet<u64>) {
     sim.set_net_config(NetConfig::default());
     for &id in &all_ids {
         sim.set_clock_skew_for(nid(id), 0);
+        // Re-anchoring cancels further drift (`AnchorClockDrift`).
+        sim.set_clock_drift_for(nid(id), 0);
+        // A fired `ParticipantFsyncLie`/`AnchorFsyncLie` is a per-node
+        // override (`set_disk_config_for`), never the global `DiskConfig` —
+        // so, unlike `set_net_config` above, there is no single global reset
+        // that clears it; every node's own override must be reset
+        // individually, or a fired lie would keep lying past its intended
+        // fault window (the identical trap `raftkv_linearizable.rs`'s own
+        // `heal_all` documents for its global-`DiskConfig`-scoped `FsyncLie`).
+        sim.set_disk_config_for(nid(id), DiskConfig::default());
     }
 }
 
@@ -2292,6 +2488,10 @@ fn txn_corpus_covers_the_fault_matrix() {
         Nemesis::Lossy,
         Nemesis::ClockSkewWithin,
         Nemesis::ClockSkewBeyond,
+        Nemesis::ParticipantFsyncLie { group: 1 },
+        Nemesis::AnchorFsyncLie,
+        Nemesis::Chaos,
+        Nemesis::AnchorClockDrift,
     ] {
         assert!(
             seen_faults.contains(&f),
@@ -2324,8 +2524,8 @@ fn txn_corpus_covers_the_fault_matrix() {
         cells.len()
     );
     assert!(
-        cells.len() <= 30,
-        "corpus grew past the documented ~20-30 cell budget: {} cells",
+        cells.len() <= 40,
+        "corpus grew past the documented ~20-40 cell budget: {} cells",
         cells.len()
     );
 
