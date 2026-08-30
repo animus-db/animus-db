@@ -256,6 +256,23 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   *second* recovery would then lose it (regression:
   `lsm_disk_faults.rs::acked_writes_after_torn_tail_recovery_survive_second_restart`).
   Corruption regression: `lsm_disk_faults.rs::corrupted_durable_wal_record_surfaces_loudly`.
+- **Every length-prefixed element count this codec (and the manifest codec
+  right below it) reads off disk pre-sizes its `Vec` with a capped
+  requested capacity (`.min(1 << 20)`), never the raw untrusted count.**
+  Bounds-checking each individual read is not the same guarantee as
+  allocation safety: `Vec::with_capacity(n)` fed directly from a corrupted
+  count can demand a many-GB allocation before a single element is
+  validated, which Rust's allocator handles by aborting the whole process
+  (`handle_alloc_error`), not a catchable error. The WAL record decoder's
+  own reads happen only after a passing CRC-32 (`try_parse_wal_frame`),
+  which makes an undetected corrupted count astronomically unlikely from
+  ordinary bit rot but not impossible in principle (CRC-32 isn't
+  adversary-resistant), so it's capped as defense in depth; the
+  **manifest** decoder has no CRC at all, so a corrupted on-disk manifest
+  byte was a real instance of the same abort, not merely theoretical. See
+  `docs/engineering-lessons.md`'s "untrusted length-prefix pre-sizing a
+  `Vec`" entry (found and fixed first in `animus-cp-data::codec`) for the
+  full account.
 - **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
   window, not just its own read path.** `LsmSnapshot` used to be a bare
   `(engine, version)` pair with no registration anywhere — a long-held snapshot

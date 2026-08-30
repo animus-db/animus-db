@@ -110,7 +110,15 @@
 //! Decode functions here treat malformed bytes as a hard bug (this crate
 //! only ever reads back what it itself wrote) rather than a recoverable
 //! error, mirroring `seal.rs`/`ceiling.rs`'s "an engine-internal marker
-//! should never be malformed" doctrine.
+//! should never be malformed" doctrine. **That doctrine covers panics, not
+//! allocator aborts**: a length-prefixed count nested inside a stored
+//! envelope (`kind_writes`'s own `n`) could in principle still arrive via a
+//! corrupted/adversarial `InstallSnapshot` image, bypassing the
+//! `KvCommand` decode path entirely — so, like `codec.rs`'s own wire
+//! decoder, a collection pre-sized from such a count caps its requested
+//! capacity (`.min(1 << 20)`) rather than trusting it outright. See
+//! `codec.rs`'s module doc for the full account of the DoS class this
+//! guards against.
 
 use animus_env::NodeId;
 use animus_tablet::{KeyRange, TOKEN_BYTES};
@@ -586,7 +594,18 @@ impl<'a> Cursor<'a> {
     /// ADR 0046 A1: the exact inverse of [`put_kind_writes`].
     fn kind_writes(&mut self) -> Option<Vec<crate::KindWrite>> {
         let n = self.u32()?;
-        let mut out = Vec::with_capacity(n as usize);
+        // `n` is a length prefix read before any element is validated
+        // against the remaining buffer. This module's own values are
+        // normally only ever this crate's own committed writes (see the
+        // module doc), but a corrupted/adversarial `InstallSnapshot` image
+        // could still smuggle a crafted envelope straight into the engine
+        // without ever passing through `codec.rs`'s `KvCommand` decode —
+        // cap the requested capacity so a hostile `n` near `u32::MAX`
+        // can't demand a many-GB allocation and trigger an allocator
+        // abort. Mirrors the `.min(1 << 20)` idiom `codec.rs`/`backup.rs`/
+        // `segment.rs` already use for the identical untrusted-length
+        // pre-allocation shape.
+        let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
         for _ in 0..n {
             out.push((self.u8()?, self.bytes()?, self.opt_bytes()?));
         }
@@ -750,7 +769,9 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Option<TxnRecord> {
         _ => return None,
     };
     let n = c.u32()?;
-    let mut intent_spans = Vec::with_capacity(n as usize);
+    // Capped pre-allocation against an untrusted length prefix — see
+    // `Cursor::kind_writes`'s comment above for why.
+    let mut intent_spans = Vec::with_capacity(n.min(1 << 20) as usize);
     for _ in 0..n {
         intent_spans.push(c.table_span()?);
     }
