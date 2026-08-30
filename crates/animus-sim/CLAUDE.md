@@ -153,7 +153,17 @@ function of one seed. This is the substrate every distributed test runs on.
   un-synced disk), keeping durable disk. Start a fresh node on the same id
   afterward and it recovers from disk — the real restart-and-rejoin path (see
   `animus-control/tests/restart.rs`). `crash` keeps the tasks running but mute;
-  `stop` ends them.
+  `stop` ends them. **`stop` does NOT clear a prior `crash`'s `crashed` flag**
+  (only `restart` does) — a test that wants `crash` (to arm `torn_tail_on_
+  crash`/`corrupt_on_crash` for that one crash instant) immediately followed
+  by a genuine `stop`+reconstruct restart must call `restart(node)` in
+  between (before constructing the fresh node) purely to clear `crashed`;
+  `restart`'s own re-arm step is a harmless no-op at that point since `stop`
+  already removed every task it would have re-armed. Skipping this silently
+  mutes the reconstructed node's network traffic in both directions for the
+  rest of the run — no panic, no error, just a replica that never sends or
+  receives again (see `docs/engineering-lessons.md`'s entry on this, found
+  writing `animus-cp-data/tests/quiescence.rs`'s fault-primitives cells).
 - Determinism invariants to preserve when editing: only `BTreeMap`/`BTreeSet`,
   RNG drawn only in deterministic order, no wall clock. Disk ops add no timeline
   events and — under the **default** `DiskConfig` — draw no RNG, so they don't

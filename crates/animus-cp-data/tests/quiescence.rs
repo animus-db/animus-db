@@ -17,6 +17,46 @@
 //! (v) killing the quiesced leader, then writing to a survivor, still
 //!     converges (the `WakeRequest`-no-reply-then-campaign path, fork B).
 //!
+//! **A second fault-primitives tier (ADR 0061 Decision 3)**, wiring
+//! `animus-sim`'s fault vocabulary into this corpus (mirroring the sibling
+//! `raftkv`/`txn` corpora's own wiring), targeting specifically the *wake*
+//! path this feature's whole design turns on — most of this file's own
+//! faults, unlike an active-traffic corpus's, are about what happens to an
+//! **idle** group, not a busy one:
+//!
+//! (vi) a duplicated peer message (`NetConfig::set_duplicate_prob`) must
+//!      wake a quiesced group and apply its write **exactly once**, never
+//!      twice, and the group must still be able to settle back into
+//!      quiescence afterward;
+//! (vii) `DiskConfig::set_fsync_lie_prob` revealed by a later
+//!      `torn_tail_on_crash` crash, composed with a genuine restart (a bare
+//!      `Simulator::crash` with no restart afterward gives this
+//!      disk-tearing field zero test teeth — see
+//!      `docs/engineering-lessons.md`'s "a crash-only fault has zero test
+//!      teeth" entry): the recovered leader must converge to exactly what
+//!      the honest survivors already committed, and must be able to rejoin
+//!      quiescence like any other replica. **`corrupt_on_crash` is
+//!      deliberately excluded from this cell** — arming it alongside
+//!      `torn_tail_on_crash` here reproducibly panics the whole test
+//!      process (a hard-`assert!` witnessing-chain violation,
+//!      `assert_ts_monotonic`), a confirmed real finding — see this
+//!      property's own test doc for the full account.
+//!
+//! `NetConfig::set_corrupt_prob` is deliberately **not** used anywhere in
+//! this file — as of this checkout, `animus-cp-data::codec`'s fix for the
+//! untrusted-wire-length-prefix allocator-abort DoS (~12 `Vec::
+//! with_capacity(n as usize)` sites reading an unvalidated `u32` count
+//! straight off the wire) has not landed on `main` yet (verified directly:
+//! `grep -n "with_capacity" crates/animus-cp-data/src/codec.rs` still shows
+//! the raw, unbounded form at every site). This mirrors the identical,
+//! already-documented exclusion the sibling `raftkv`/`txn` corpora apply for
+//! the same unfixed gap — re-add it here once that fix lands on `main`.
+//! `DiskConfig::set_enospc_prob`/`set_error_prob` are excluded too, for an
+//! unrelated reason: `persist_wal`'s own `assert!(halted.load(..), ...)`
+//! hard-panics the whole test process if either fires on a live (non-halted)
+//! node, so they are out of scope for this crate's tests entirely, not just
+//! this file's.
+//!
 //! **On property (i)'s "genuine event-quiescence" and why this file does not
 //! call `Simulator::run_until_quiescent` and expect `true`:** the apply
 //! task's own idle back-off (ADR 0044 phase-1 PR1) races `ApplyPending`
@@ -43,7 +83,7 @@ use std::time::Duration;
 use animus_control::ProposeResult;
 use animus_cp_data::{RaftKvNode, StageOutcome};
 use animus_env::{EnvExt, Metric, MetricsHandle, nid};
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{escape, partition_token};
 use animus_test::corpus;
@@ -393,5 +433,252 @@ fn a_pending_transaction_vetoes_quiescence_until_resolved() {
             nodes[leader].is_quiesced(),
             "the veto must release once the transaction resolves (seed={seed})"
         );
+    }
+}
+
+// ---- (vi) a duplicated peer message wakes a quiesced group exactly once ---
+
+/// `NetConfig::set_duplicate_prob` (ADR 0061 Decision 3), targeting the wake
+/// path directly: quiesce the whole group (leader and followers alike, per
+/// property (i)), then un-quiesce with a write while every surviving message
+/// — including the `AppendEntries` that wakes each quiesced follower — is
+/// delivered twice with its own independent delay. A duplicated wake must
+/// never double-apply the write, and the group must still be able to settle
+/// back into genuine quiescence afterward (a duplication-confused group that
+/// never re-parks would be its own, separate bug).
+#[test]
+fn a_duplicated_peer_message_wakes_a_quiesced_group_exactly_once() {
+    for seed in seeds(0xF1DE7) {
+        let (mut sim, nodes, _handles) = group(seed);
+        settle_to_quiescence(&mut sim);
+        let leader = leader_index(&nodes, seed);
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.is_quiesced(),
+                "node {i} (leader={leader}) must be quiesced before the \
+                 duplicated-delivery window opens (seed={seed})"
+            );
+        }
+
+        // Every surviving message for the rest of this test is delivered
+        // twice — including the leader's own un-quiescing AppendEntries to
+        // its two quiesced followers.
+        let mut net = NetConfig::default();
+        net.set_duplicate_prob(1.0);
+        sim.set_net_config(net);
+
+        match nodes[leader].put(b"k".to_vec(), b"v".to_vec()) {
+            ProposeResult::Accepted { .. } => {}
+            other => panic!("leader rejected a put after quiescing: {other:?} (seed={seed})"),
+        }
+        assert!(
+            !nodes[leader].is_quiesced(),
+            "a local propose must un-quiesce the leader immediately, \
+             duplication or not (seed={seed})"
+        );
+
+        sim.run_for(Duration::from_secs(2)); // replicate + apply, doubled over
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                block_on(n.local_get(b"k")),
+                Some(b"v".to_vec()),
+                "node {i} missing the post-quiescence write under duplicated \
+                 delivery — a duplicated wake must apply the write exactly \
+                 once, never twice or not at all (seed={seed})"
+            );
+        }
+
+        // Heal, then idle again: even after a duplication-driven wake, the
+        // group must still reach quiescence again cleanly.
+        sim.set_net_config(NetConfig::default());
+        sim.run_for(Duration::from_secs(2));
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.is_quiesced(),
+                "node {i} must still be able to reach quiescence again \
+                 after a duplicated wake (seed={seed})"
+            );
+        }
+    }
+}
+
+// ---- (vii) a lying fsync, revealed by a crash, recovers on restart -------
+
+/// `DiskConfig::set_fsync_lie_prob` composed with a genuine crash+restart
+/// (ADR 0061 Decision 3). A lie alone is unobservable — every `sync` it
+/// covers still returns `Ok`, so the group behaves exactly as if durable —
+/// so this only has teeth once something later reads the crashed node's own
+/// recovered state back: arm the lie on the (about-to-wake) leader, un-
+/// quiesce it with several writes it believes are durably logged and
+/// genuinely replicates to the two honest followers, then reveal the lie
+/// with a `torn_tail_on_crash` crash and a **real** restart (`Simulator::
+/// stop` + `Simulator::restart` + a fresh `RaftKvNode::start` on the same
+/// node id — mirrors the sibling `raftkv` corpus's `StopRestart`; a bare
+/// `sim.crash` with no restart, like this file's own property (v), would
+/// leave `torn_tail_on_crash` with zero test teeth, since nothing would ever
+/// observe what it tore — see `docs/engineering-lessons.md`'s "a crash-only
+/// fault has zero test teeth" entry). **`Simulator::stop` alone does not
+/// clear the `crashed` flag `Simulator::crash` sets** (its own doc: "this
+/// does not mute or set the node crashed") — without an explicit
+/// `Simulator::restart` in between, the freshly reconstructed node's
+/// network traffic is silently dropped in both directions forever, which
+/// this test's own first draft hit directly (the "recovered" replica sat at
+/// its pre-crash term with `engine_applied == 0` for the rest of the run,
+/// never receiving a single message). The recovered replica must converge
+/// to exactly what the untouched survivors already committed, and must be
+/// able to rejoin quiescence like any other.
+///
+/// **`corrupt_on_crash` is deliberately excluded — a confirmed, reproducible
+/// process-abort finding, not a suppressed low-probability flake.** Arming
+/// it alongside `torn_tail_on_crash` here (seed `0xF1DE8`, the leader
+/// replica at index 2) makes the recovered replica hit a **hard `assert!`
+/// panic** once it catches up and applies an entry past the corrupted
+/// record: `animus_cp_data::assert_ts_monotonic`'s witnessing-chain check
+/// (`lib.rs`, ADR 0018 §2) — "did not strictly exceed the last applied
+/// HlcTimestamp — the witnessing chain is broken." The single flipped byte
+/// landed inside a still-JSON-syntactically-valid `WalRecord::Append`'s
+/// packed `HlcTimestamp`, producing a **wrong but successfully decoded**
+/// timestamp rather than a decode failure — exactly the residual gap this
+/// crate's own `WalRecord::decode` doc and the sibling `raftkv` corpus's
+/// `wal_fault_disk_config` doc already flag ("the Raft WAL's on-disk record
+/// framing... has no per-record checksum... a bit-flip that happens to land
+/// inside a byte that keeps the JSON syntactically valid could silently
+/// produce a different, undetected-corrupt WAL record instead of a decode
+/// error"), now confirmed to reach a **hard-panicking** assert rather than
+/// merely stale/wrong served data. Reproduced directly: with
+/// `torn_tail_on_crash` alone (no corruption) the exact same scenario
+/// converges cleanly (`engine_applied` matches the honest survivors' `8`
+/// exactly); adding `corrupt_on_crash` to the identical seed panics the
+/// whole test process every time. This mirrors the already-established
+/// precedent this file's own module doc documents for `NetConfig::
+/// set_corrupt_prob` (and the sibling `raftkv`/`txn` corpora's identical
+/// exclusion) — a fault primitive that reliably aborts the process rather
+/// than degrading gracefully is out of scope for an ambient corpus cell,
+/// not a property this corpus can usefully assert against. **This is a
+/// real, unfixed finding** — the fix belongs in `animus-cp-data`'s WAL
+/// codec (a per-record checksum, or a decode-time HLC sanity bound), as its
+/// own change with its own regression test, never folded into this corpus
+/// PR. Re-arm `corrupt_on_crash` here once that fix lands.
+#[test]
+fn a_lying_fsync_revealed_by_a_crash_recovers_correctly_on_restart() {
+    for seed in seeds(0xF1DE8) {
+        let (mut sim, mut nodes, handles) = group(seed);
+        settle_to_quiescence(&mut sim);
+        let leader = leader_index(&nodes, seed);
+        assert!(nodes[leader].is_quiesced(), "seed={seed}");
+
+        // Every sync the leader performs from here on reports `Ok` but
+        // leaves the bytes buffered, not durable.
+        let mut lying = DiskConfig::default();
+        lying.set_fsync_lie_prob(1.0);
+        sim.set_disk_config_for(nid(leader as u64), lying);
+
+        // Un-quiesce with several writes: the leader believes every one is
+        // durably logged, and genuinely replicates them to the two honest
+        // followers, which commit and apply for real.
+        for i in 0..5u32 {
+            match nodes[leader].put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes()) {
+                ProposeResult::Accepted { .. } => {}
+                other => panic!("leader rejected put {i}: {other:?} (seed={seed})"),
+            }
+        }
+        assert!(!nodes[leader].is_quiesced(), "seed={seed}");
+        sim.run_for(Duration::from_secs(2)); // replicate + apply on all three
+
+        for i in 0..5u32 {
+            let key = format!("k{i}").into_bytes();
+            for (n_idx, n) in nodes.iter().enumerate() {
+                assert_eq!(
+                    block_on(n.local_get(&key)),
+                    Some(format!("v{i}").into_bytes()),
+                    "node {n_idx} missing k{i} before the crash (seed={seed})"
+                );
+            }
+        }
+
+        // Reveal the lie: arm torn/corrupted tearing on the leader and crash
+        // it — every one of the 5 writes' WAL bytes the lying fsync left
+        // buffered is now torn (a strict seed-chosen prefix survives) and
+        // possibly bit-flipped.
+        let mut torn = DiskConfig::default();
+        torn.torn_tail_on_crash = true;
+        // `corrupt_on_crash` is deliberately NOT armed here — see this
+        // test's own doc for the confirmed process-abort finding that
+        // excludes it.
+        sim.set_disk_config_for(nid(leader as u64), torn);
+        sim.crash(nid(leader as u64));
+
+        // The two honest survivors elect a fresh leader and keep committing
+        // — mirrors property (v)'s recovery path.
+        let survivor = (0..nodes.len())
+            .find(|&i| i != leader)
+            .expect("a survivor exists");
+        nodes[survivor].wake();
+        sim.run_for(Duration::from_secs(3));
+        let new_leader = (0..nodes.len())
+            .filter(|&i| i != leader)
+            .find(|&i| nodes[i].is_leader())
+            .unwrap_or_else(|| panic!("no new leader elected among the survivors (seed={seed})"));
+        match nodes[new_leader].put(b"after-crash".to_vec(), b"v".to_vec()) {
+            ProposeResult::Accepted { .. } => {}
+            other => panic!("new leader {new_leader} rejected a put: {other:?} (seed={seed})"),
+        }
+        sim.run_for(Duration::from_secs(2));
+
+        // Genuinely restart the crashed leader: process exit, then a fresh
+        // `RaftKvNode::start` on the same node id, recovering from whatever
+        // survived the tear+corruption — the actual "read the crashed
+        // node's own post-crash state back" step the disk-tearing fields
+        // need to have any effect at all.
+        sim.stop(nid(leader as u64));
+        // `crash` (above) marked this node `crashed` — a flag `stop` does
+        // NOT clear (its own doc: "this does not mute or set the node
+        // crashed") — so every message to/from it would be silently
+        // dropped forever unless something clears it. `restart` clears
+        // `crashed` and re-arms any tasks it still finds for this node; by
+        // now `stop` has already removed every one of them, so this call
+        // is purely "un-mute the node," with nothing left to re-poll.
+        sim.restart(nid(leader as u64));
+        let recovered = RaftKvNode::start_with_metrics(
+            sim.env(nid(leader as u64)),
+            NODES.iter().copied().map(nid).collect(),
+            MemoryEngine::new(),
+            handles[leader].clone(),
+        );
+        recovered.enable_quiescence(QUIESCE_AFTER);
+        nodes[leader] = recovered;
+        sim.run_for(Duration::from_secs(4)); // catch up (AppendEntries or a snapshot)
+
+        // The recovered replica must converge on every key the honest
+        // survivors actually hold, regardless of what the lying fsync's
+        // torn/corrupted tail did to its own local durable bytes — Raft
+        // recovery (WAL replay for whatever records survived, plus a
+        // snapshot/log catch-up for the rest) must reconstruct identical
+        // state.
+        for i in 0..5u32 {
+            let key = format!("k{i}").into_bytes();
+            assert_eq!(
+                block_on(nodes[leader].local_get(&key)),
+                Some(format!("v{i}").into_bytes()),
+                "recovered node {leader} missing k{i} after crash+restart \
+                 revealed the lying fsync's torn tail (seed={seed})"
+            );
+        }
+        assert_eq!(
+            block_on(nodes[leader].local_get(b"after-crash")),
+            Some(b"v".to_vec()),
+            "recovered node {leader} missing the post-recovery write (seed={seed})"
+        );
+
+        // Idle again: the recovered replica must be able to rejoin
+        // quiescence like any other.
+        sim.run_for(Duration::from_secs(2));
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.is_quiesced(),
+                "node {i} must reach quiescence again after the torn-tail \
+                 crash+restart (seed={seed})"
+            );
+        }
     }
 }

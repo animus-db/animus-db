@@ -12696,6 +12696,91 @@ this same failure mode: a set-returning primitive whose membership changes
 mid-lifecycle needs every caller to state its own filter, because the
 primitive can't know which callers only want the settled members.
 
+## `Simulator::stop` does not clear the `crashed` flag `Simulator::crash` set — composing them silently mutes the reconstructed node forever (quiescence corpus fault-primitives wiring)
+
+Writing a crash-based test cell for `animus-cp-data/tests/quiescence.rs`
+(ADR 0061 Decision 3, giving `DiskConfig::torn_tail_on_crash`/
+`corrupt_on_crash` real teeth — see the next entry) needed the genuine
+process-restart shape the sibling `raftkv` corpus's `StopRestart` nemesis
+already uses: `Simulator::stop` (kills tasks + volatile state, keeps
+durable disk) followed by a fresh `RaftKvNode::start` on the same node id,
+which recovers from the durable WAL. But `torn_tail_on_crash`/
+`corrupt_on_crash` only fire inside `Simulator::crash`, not `stop` (see the
+"a crash-only fault has zero test teeth" pattern this composition exists to
+avoid) — so the natural-looking sequence is `crash` (to tear/corrupt the
+un-synced tail) → `stop` (to kill the task so a fresh one can be
+constructed) → reconstruct. That sequence silently breaks: `crash` inserts
+the node into `Simulator`'s shared `crashed: BTreeSet<NodeId>`, and `stop`'s
+own doc says outright "Unlike `crash`, this does not mute or set the node
+`crashed`" — meaning it also doesn't **clear** it. Every message to or from
+a node still in `crashed` is dropped (`DROP ... (crashed)` /
+`DROP ... (sender-crashed)` in the trace), so the freshly reconstructed
+node — despite having brand-new tasks and a live env — never sends or
+receives a single message for the rest of the run. This is genuinely quiet:
+no panic, no error, just a replica that sits at its pre-crash term with
+`engine_applied_index() == 0` forever, which reads exactly like "the
+recovered WAL was empty" rather than "the network is silently muted" — the
+first draft of this test's own failure looked like a WAL-recovery bug for
+several debugging passes before an `eprintln!` of `is_leader`/`term`/
+`engine_applied_index` plus the trace tail made the all-drops pattern
+obvious. The fix is one extra call: `sim.crash(id); sim.stop(id);
+sim.restart(id);` (clears `crashed`; `restart`'s own re-arm step finds
+nothing to re-arm, since `stop` already removed every task it owned) —
+*then* construct the fresh node. **General rule**: two fault primitives
+that individually look composable (each has its own clear, narrow doc)
+should still be traced through each other's state machine before combining
+them in a new way no existing test does — `crash`+`stop` is exactly the
+kind of pairing where each method's doc is accurate in isolation but their
+combined effect on a third piece of shared state (`crashed`) is only
+obvious from reading both source bodies side by side, not from either doc
+comment alone.
+
+## `corrupt_on_crash`'s single-byte WAL corruption can produce a syntactically-valid-but-wrong `HlcTimestamp` that hard-panics a later apply — a fresh, reproducible instance of the "no per-record WAL checksum" gap (quiescence corpus fault-primitives wiring)
+
+Composing `DiskConfig::set_fsync_lie_prob` (accumulate several writes'
+worth of un-synced WAL bytes on a live leader) with a later
+`torn_tail_on_crash`+`corrupt_on_crash` crash and a genuine restart (see
+the entry above) — the only way to give either disk-tearing field real
+teeth — reliably reproduces a **hard `assert!` panic**, not just stale or
+wrong served data: `animus_cp_data::assert_ts_monotonic` (`lib.rs`, ADR
+0018 §2), "HLC ts ... did not strictly exceed the last applied ... the
+witnessing chain is broken," once the recovered replica catches up and
+applies an entry past the corrupted record. Isolated directly: the
+identical scenario and seed with `torn_tail_on_crash` alone (no corruption)
+converges cleanly (`engine_applied_index` matches the honest survivors'
+exactly); adding `corrupt_on_crash` to that same seed panics the whole test
+process every time. The mechanism is exactly what `WalRecord::decode`'s own
+doc and the sibling `raftkv` corpus's `wal_fault_disk_config` doc already
+name as a residual gap, now confirmed to reach further than either
+anticipated: the Raft WAL's on-disk record framing is plain
+newline-terminated `serde_json` with **no per-record checksum**, so a
+single flipped byte that happens to land inside a numeric JSON field (here,
+a packed `HlcTimestamp`) can produce a record that still **decodes
+successfully** — just with the wrong value — rather than the torn/
+unparseable trailing line `decode` is built to tolerate. The already-known
+version of this gap (the sibling `raftkv`/`txn` corpora's own documented,
+unfixed `NetConfig::set_corrupt_prob` finding, an allocator-abort `SIGABRT`
+in `animus-cp-data::codec`'s wire decoder) is the *wire* half of this same
+root cause; this is the *WAL* half, a different call site with a different
+failure shape (a hard-panicking safety assert instead of an OOM abort) but
+the identical missing-checksum cause. **Handled the same way the wire half
+already is**: excluded from the corpus cell (`corrupt_on_crash` stays
+armed-off, `torn_tail_on_crash` alone still gives the cell real, working
+teeth), documented in full in the test's own doc comment, and left as a
+named, unfixed, real finding for its own follow-up issue/PR rather than
+folded into the corpus PR — a fault primitive that reliably hard-panics the
+process is out of scope for an ambient corpus cell's assertions the same
+way `set_enospc_prob`/`set_error_prob` already are for a different reason
+(they hit this crate's own `persist_wal` `halted` assert). **General
+lesson**: when a repo already has one documented, unfixed "no checksum on
+this framing" finding for one call site of a shared codec/record format,
+treat every *other* call site of that same un-checksummed framing as a
+credible candidate for the identical class of bug before assuming a
+freshly-discovered hard panic under `corrupt_on_crash`/`set_corrupt_prob`
+is a coincidence or a test-harness mistake — reach for isolating which
+disk/net-fault knob actually causes it (toggle one off, keep the seed
+fixed, re-run) before suspecting the new test code itself.
+
 ## `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` were never actually exercised against a `RaftCore`-backed WAL before (ADR 0061 Decision 3, `stream_lineage_corpus.rs` fault wiring)
 
 Both fields are documented and unit-tested in `animus-sim` itself
