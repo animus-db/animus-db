@@ -2009,6 +2009,7 @@ fn restore_after_source_drop() {
         scenario_restore_after_source_drop,
     );
 }
+
 // ============================================================================
 // `Env`-level fault-primitive cells (ADR 0061 Decision 3) — new cells only,
 // each a close copy of an existing one above with ONE added fault call. Per
@@ -2338,10 +2339,6 @@ fn capture_driver_wal_torn_on_restart() {
     for_each_seed(
         "capture_driver_wal_torn_on_restart",
         scenario_capture_driver_wal_torn_on_restart,
-    );
-}
-
-        scenario_restore_after_source_drop,
     );
 }
 
