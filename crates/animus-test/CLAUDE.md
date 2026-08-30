@@ -501,6 +501,38 @@ retrievable from git history.)
   here is ever expected to answer `TrimmedDataAccess`. Depth knob
   `ANIMUS_STREAM_SEEDS` (default 1 = the frozen cells; held green at
   `=40`, matching `corpus-deep.yml`'s nightly tier).
+- **Cells 11/12 (ADR 0058 Train 2 rung 3) rebuild the SAME lineage/
+  durability claims on the DEFAULT production split path — the in-place
+  atomic fork — alongside (never replacing) the copy-based cells above**:
+  `inplace_split_lineage_frozen_at_fork` (sealed history + backlog, sealed
+  in FULL before the fork — the fork is atomic, so there is no
+  "meanwhile" window to interleave a seal into the way the copy-based
+  workflow's build/freeze phases have — then `BeginSplitInPlace` →
+  fork+materialize converge → `CutoverSplit`, proposed immediately since
+  the in-place branch carries no freeze/veto gate of its own → both
+  children EMPTY change logs, sealing their own epoch 0, exactly-once
+  across the walk) and `inplace_split_races_an_open_seal` (the identical
+  seal-crash/store-outage/healed-retry fault sequence
+  `copy_split_endgame_survives_seal_faults` injects, applied to the
+  parent's FINAL seal right before `BeginSplitInPlace` — the retried
+  seal's epoch is what the frozen `split_lineage` names). Unlike the
+  copy-based cells (a control-metadata-only `BeginSplit`/`CutoverSplit`,
+  the parent hosted directly via this file's own `start_group`), the
+  in-place fork is materialized by `animus_cp_data::host::Reconciler`, so
+  both cells build a small `InplaceCluster` of `Reconciler<SimEnv,
+  MemoryEngine>` instances and drive it to convergence at each stage via a
+  local `tick_one`/`converge` pair (adapted from this file's own
+  pre-existing `drive`, mirroring `animus-cp-data/tests/
+  inplace_split_reconciler.rs`'s and `backfill_fault_corpus.rs`'s own
+  identical harness shape for the SAME mechanism) — `wrap_group` then
+  clones the reconciler-hosted `RaftKvNode` handles back into this file's
+  own plain `Group` so every pre-existing helper
+  (`elect`/`write_and_journal`/`seal_now`/`verify_lineage`, …) runs on the
+  reconciler-hosted parent or a split child completely unmodified. Both
+  cells held clean at `ANIMUS_STREAM_SEEDS=300` with no regression to the
+  other ten cells in the file — no exactly-once/ordering/lineage violation
+  surfaced; the in-place split's interaction with stream sealing behaves
+  exactly as designed.
 - **A real bug this corpus found while being built** (not in the streams
   subsystem — in the corpus's own test harness): `RaftKvNode::start_scoped`
   pins every group to `PRIMARY_STREAM`, so two tablet groups sharing the
