@@ -1,17 +1,20 @@
 //! A fault-injected, seed-reproducible **corpus for the control plane's own
 //! machinery** — the ADR 0038 async apply task, the replicated schema
-//! catalog's exclusivity guarantee (ADR 0013), and (PR②/③ to come) tablet-id
-//! allocation and apply-task crash recovery.
+//! catalog's exclusivity guarantee (ADR 0013), the tablet-id/`RegisterNode`
+//! allocator-shaped counters, and (PR③ to come) apply-task crash recovery.
 //!
 //! `learner_corpus.rs` already covers the learner/membership-class fault
 //! vocabulary at seed depth (ADR 0058 Train 1); this corpus is the sibling
 //! that exercises everything else about `Metadata`/`RaftNode` under real
 //! fault injection instead of the ~30 fixed-single-seed acceptance tests
-//! this crate otherwise has. **This is PR① of a 3-4 PR stacked series: the
-//! harness architecture + a baseline + a schema-catalog-race workload.**
-//! PR②/③ extend the fault vocabulary (learner faults, `StopRestart`) and add
-//! two more workloads (allocator-race, apply-task-recovery) — see the
-//! "Future invariants" section near the bottom for the hooks left for them.
+//! this crate otherwise has. **PR① built the harness architecture + a
+//! baseline + a schema-catalog-race workload. This is PR② of a 3-4 PR
+//! stacked series: an `AllocatorRace` workload (invariant #4), a
+//! `RegisterCas` workload lifting `register_node_cas.rs`'s fixed-single-seed
+//! CAS proof into this corpus's fault matrix, and a fuller fault vocabulary
+//! (`Duplicate`/`FsyncLie`/`TornTail`).** PR③ is expected to add
+//! `StopRestart` and the apply-task-no-double-apply invariant — see the
+//! "Future invariants" section near the bottom for the hook left for it.
 //!
 //! **Harness shape**, deliberately mirroring
 //! `crates/animus-test/tests/raftkv_linearizable.rs` (the flagship corpus in
@@ -34,8 +37,7 @@
 //! this plane has no client-visible read/write history to build an Elle
 //! dependency graph over: a single Raft log total-orders every `MetaCommand`,
 //! so the interesting property is **convergence + safety invariants**, not
-//! serializability. Three checks, asserted on every scenario
-//! (`assert_scenario_ok`):
+//! serializability. Checks, asserted on every scenario (`assert_scenario_ok`):
 //!
 //! 1. **Convergence** — `nodes[i].metadata() == nodes[j].metadata()` for
 //!    every pair of replicas, via a converged-or-timeout poll (mirroring
@@ -48,7 +50,9 @@
 //!    minus the `info`-recording machinery this plane doesn't need (a
 //!    proposer that never confirms simply contributes nothing to this
 //!    check, rather than needing an explicit indeterminate outcome
-//!    recorded).
+//!    recorded). Covers `SchemaRace`/`PlainChurn` effects, and (PR②)
+//!    `AllocatorRace`'s confirmed tablet ids and `RegisterCas`'s confirmed
+//!    registrations too.
 //! 3. **Schema-catalog exclusivity** (a *safety* property, checked
 //!    unconditionally on every scenario, fault or not) — for every table
 //!    name two or more racers proposed, `MetaCommand::CreateTableSchema`'s
@@ -60,30 +64,69 @@
 //!    the racing proposals — never a hybrid — and it is never absent if any
 //!    racer's proposal was ever durably confirmed by that racer's own retry
 //!    loop.
+//! 4. **Allocator injectivity** (PR②, a *safety* property, checked
+//!    unconditionally) — `AllocatorRace`'s `check_allocator_injectivity`:
+//!    every `TabletId` observed in any replica's tablet map at any sampled
+//!    point in the run has a stable identity (never two different
+//!    `CreateTablet`/`BeginSplit` calls assigned the same id), and every id
+//!    a proposer's own confirm loop reported as applied is pairwise
+//!    distinct. Sampled at every convergence poll AND every fault-schedule
+//!    step (`Shared::sample_tablets`), not just the final state, so a
+//!    transient double-assignment a later poll happens to "correct" is
+//!    still caught.
+//! 5. **`RegisterNode` CAS integrity** (PR②, a *safety* property, checked
+//!    unconditionally) — `RegisterCas`'s `check_register_cas_integrity`,
+//!    mirroring check 3's shape over `Metadata::node_addrs` instead of
+//!    `Metadata::schemas`: for a node id two or more DIFFERING address books
+//!    were ever attempted for (this workload's own deterministic
+//!    differing-re-registration collision), the final address book (if
+//!    present) on every replica must byte-match exactly one attempt, never
+//!    a hybrid, and must be present if any attempt was ever confirmed.
 //!
-//! **Nemesis set for this PR** (a subset of the eventual vocabulary — PR②
-//! adds learner-class faults, PR③ adds `StopRestart`): `LeaderKill`
-//! (`sim.crash` the current leader), `FollowerKill` (`sim.crash` a
-//! non-leader), `PartitionLeader` (isolate the leader from the rest),
-//! `SplitBrain` (full-mesh partition, no majority anywhere), `Lossy`
-//! (`NetConfig::set_drop_prob`). **`StopRestart` is deliberately NOT here**
-//! — it needs `RaftNode::start` to reopen the *same* `StorageEngine` handle
-//! the crashed node used (this plane always needs one, unlike raftkv's
-//! simpler always-`MemoryEngine`-is-fine shape when the tier itself is
-//! `MemoryEngine`) plus the apply-task-recovery invariant (#5 below) it
-//! exists to probe — both deferred to PR③.
+//! **Nemesis set**: `LeaderKill` (`sim.crash` the current leader),
+//! `FollowerKill` (`sim.crash` a non-leader), `PartitionLeader` (isolate the
+//! leader from the rest), `SplitBrain` (full-mesh partition, no majority
+//! anywhere), `Lossy` (`NetConfig::set_drop_prob`), and (PR②) `Duplicate`
+//! (`NetConfig::set_duplicate_prob`), `FsyncLie`
+//! (`DiskConfig::set_fsync_lie_prob`), `TornTail`
+//! (`DiskConfig::torn_tail_on_crash`, composed with a crash). **`StopRestart`
+//! is deliberately NOT here** — it needs `RaftNode::start` to reopen the
+//! *same* `StorageEngine` handle the crashed node used (this plane always
+//! needs one, unlike raftkv's simpler always-`MemoryEngine`-is-fine shape
+//! when the tier itself is `MemoryEngine`) plus the apply-task-recovery
+//! invariant (#6 below) it exists to probe — both deferred to PR③.
+//! **`CorruptOnCrash` is also deliberately NOT a `Nemesis` variant** — this
+//! shared WAL codec (`animus-control::persist::WalRecord`, no per-record
+//! checksum) has an open, confirmed, unfixed hard-panic finding in the CP
+//! data plane when it's composed with `TornTail` (issue #495); the one cell
+//! exercising the identical composition here is a dedicated `#[ignore]`d
+//! test (`control_corrupt_on_crash_may_hard_panic_issue_495`), never part
+//! of the asserted `corpus_cells()` set — see that test's own doc for why
+//! (this plane's own sweep found no reproduction: `Metadata::apply` has no
+//! invariant as strict as cp-data's `assert_ts_monotonic` for a
+//! wrong-but-decodable field to trip). `heal_all` resets **both**
+//! `NetConfig` and `DiskConfig` to default — required for
+//! `FsyncLie`/`TornTail`, which
+//! are armed globally with no auto-expiry (PR① never used `DiskConfig` at
+//! all, so this reset is new here).
 //!
-//! **Workloads for this PR**: [`Workload::SchemaRace`] — 2-3 concurrent
-//! proposers each racing `MetaCommand::CreateTableSchema`, either for the
-//! SAME table name with distinct schemas (`same_table: true`, the exclusivity
-//! teeth) or for distinct names each (`same_table: false`, a
-//! lower-contention baseline where every racer should win its own name); and
-//! [`Workload::PlainChurn`] — trivial no-contention `UpsertMember` proposals,
-//! the non-vacuity floor every corpus in this repo needs (mirroring
-//! `control_raft.rs`'s own baseline style). Every proposer retries against
-//! whichever node currently reports itself leader, exactly the
-//! `propose`/`NotLeader`-hint retry idiom `register_node_cas.rs` already
-//! uses in this crate.
+//! **Workloads**: [`Workload::SchemaRace`] — 2-3 concurrent proposers each
+//! racing `MetaCommand::CreateTableSchema`, either for the SAME table name
+//! with distinct schemas (`same_table: true`, the exclusivity teeth) or for
+//! distinct names each (`same_table: false`, a lower-contention baseline
+//! where every racer should win its own name); [`Workload::PlainChurn`] —
+//! trivial no-contention `UpsertMember` proposals, the non-vacuity floor
+//! every corpus in this repo needs (mirroring `control_raft.rs`'s own
+//! baseline style); (PR②) [`Workload::AllocatorRace`] — several proposers
+//! racing `CreateTablet`/`BeginSplit` against ONE shared table/tablet,
+//! hammering `Metadata::next_tablet_id`/`next_free_tablet_id()`; and (PR②)
+//! [`Workload::RegisterCas`] — several proposers each claiming a distinct
+//! node id then attempting one deterministic differing-re-registration
+//! collision against their own claim, lifting `register_node_cas.rs`'s
+//! fixed-single-seed CAS proof into this corpus's fault matrix. Every
+//! proposer retries against whichever node currently reports itself leader,
+//! exactly the `propose`/`NotLeader`-hint retry idiom `register_node_cas.rs`
+//! already uses in this crate.
 //!
 //! **Depth knob**: `ANIMUS_CONTROL_SEEDS` (default 1 = the frozen cells,
 //! byte-identical run-to-run), wired via `animus_test::corpus`'s
@@ -94,10 +137,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_control::{ColumnType, MetaCommand, Metadata, NodeStatus, RaftNode, TableSchema};
+use animus_control::{
+    ColumnType, MetaCommand, Metadata, NodeAddrs, NodeStatus, RaftNode, TableSchema,
+};
 use animus_env::{Clock, EnvExt, NodeId, nid};
-use animus_sim::{NetConfig, SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
+use animus_tablet::{KeyRange, TabletId};
 use animus_test::corpus::{self, SeedVariant};
 
 /// A control-group node under `SimEnv`.
@@ -168,6 +214,35 @@ enum Nemesis {
     /// Inject lossy links (independent per-message drop) for the rest of the
     /// run.
     Lossy,
+    /// Inject wire-message duplication (`NetConfig::set_duplicate_prob`) for
+    /// the rest of the run — a delivered message is redelivered a second
+    /// time. Tests idempotency of `RegisterNode`'s CAS and
+    /// `CreateTableSchema`'s reject-on-repeat apply-time logic under a
+    /// literally duplicated wire message, distinct from a proposer's own
+    /// duplicated *proposal* (already covered by every racing workload's
+    /// blind retry loop).
+    Duplicate,
+    /// Arm **fsync-acked-but-lost** (`DiskConfig::set_fsync_lie_prob`,
+    /// global) for the rest of the run: a `sync` call still returns `Ok`,
+    /// but the bytes it claims to have made durable stay buffered — only a
+    /// later crash (this PR composes it with `LeaderKill`/`FollowerKill` in
+    /// the same fault schedule) reveals the lie by losing them. **Must be
+    /// paired with resetting `DiskConfig` in `heal_all`** — see that
+    /// method's own doc for why a fired `FsyncLie` would otherwise keep
+    /// lying past its intended window.
+    FsyncLie,
+    /// Arm `DiskConfig::torn_tail_on_crash` (global) for the rest of the
+    /// run: the **next** `Simulator::crash` on any node keeps only a
+    /// seed-chosen strict prefix of that node's un-synced buffered WAL
+    /// bytes instead of dropping the whole tail atomically — modelling a
+    /// write torn mid-record by a power loss. Has no effect by itself; a
+    /// scenario using this schedules a `LeaderKill`/`FollowerKill` after it.
+    /// Deliberately **not** paired with `corrupt_on_crash` here — see the
+    /// dedicated, `#[ignore]`d `control_corrupt_on_crash_may_hard_panic_
+    /// issue_495` test near the bottom of this file for why that
+    /// composition is a separate, deliberately-unasserted case (issue
+    /// #495).
+    TornTail,
 }
 
 /// Which workload shape a scenario drives — this plane's own reason for a
@@ -185,6 +260,35 @@ enum Workload {
     /// `proposers` concurrent, non-contending `UpsertMember` proposers — the
     /// non-vacuity floor.
     PlainChurn { proposers: usize },
+    /// `proposers` concurrent racers hammering `Metadata::next_tablet_id`/
+    /// `next_free_tablet_id()` (`crates/animus-control/src/meta.rs`) — the
+    /// genuinely allocator-shaped counter `CreateTablet`/`BeginSplit` race.
+    /// Two phases per scenario, both against ONE shared table/tablet (the
+    /// "same parent range/table" this workload's own doc promises): first
+    /// every racer proposes `CreateTablet` for the identical table name
+    /// (only one can ever win — ADR 0023's one-tablet-per-table rule — so a
+    /// loser must recompute a fresh candidate id and retry against a
+    /// *different* table name-shaped collision, i.e. an id another racer's
+    /// `CreateTablet` already claimed); then, once any racer observes the
+    /// shared tablet exists, every racer repeatedly proposes `BeginSplit`
+    /// against it with a freshly-recomputed split key and freshly-recomputed
+    /// child ids (again racing the same counter) until the parent leaves
+    /// `Active` (someone won) or the budget expires. See invariant #4
+    /// (allocator injectivity) and `check_allocator_injectivity` below.
+    AllocatorRace { proposers: usize },
+    /// `registrants` concurrent clients, each claiming its OWN distinct new
+    /// node id via `MetaCommand::RegisterNode` (lifting
+    /// `tests/register_node_cas.rs`'s fixed-single-seed CAS proof — distinct
+    /// concurrent registrations, leader-kill-mid-registration retry,
+    /// follower relay, differing-re-registration rejection — into this
+    /// corpus's seed-depth fault matrix, since the underlying apply logic is
+    /// already proven correct at a single seed and only needs fault-matrix
+    /// depth, not new logic). After a client's own claim is durably
+    /// confirmed, it makes exactly ONE follow-up "collision" attempt: the
+    /// SAME node id with a DIFFERENT address book — a deterministic,
+    /// guaranteed-second `RegisterNode` for an already-claimed id, proving
+    /// the CAS rejects it outright rather than overwriting.
+    RegisterCas { registrants: usize },
 }
 
 /// A seed-reproducible scenario: a named group size + workload + an explicit
@@ -263,12 +367,44 @@ fn plain_churn_scenario(
     }
 }
 
-/// The structural cells of this PR's corpus. Every `Nemesis` variant and
-/// every `Workload` variant appears at least once (checked by
-/// `control_corpus_covers_the_fault_matrix`, below) — `FollowerKill`/`Lossy`
-/// get a single spot-check cell each here; PR② is expected to deepen those
-/// into their own early/mid/late/5-replica grids the way raftkv's corpus
-/// does for its own fault set.
+fn allocator_race_scenario(
+    name: &str,
+    replicas: usize,
+    proposers: usize,
+    faults: Vec<(Duration, Nemesis)>,
+) -> Scenario {
+    Scenario {
+        seed: corpus::name_seed(name),
+        name: name.to_string(),
+        replicas,
+        workload: Workload::AllocatorRace { proposers },
+        faults,
+        window: Duration::ZERO,
+    }
+}
+
+fn register_cas_scenario(
+    name: &str,
+    replicas: usize,
+    registrants: usize,
+    faults: Vec<(Duration, Nemesis)>,
+) -> Scenario {
+    Scenario {
+        seed: corpus::name_seed(name),
+        name: name.to_string(),
+        replicas,
+        workload: Workload::RegisterCas { registrants },
+        faults,
+        window: Duration::ZERO,
+    }
+}
+
+/// The structural cells of this corpus. Every `Nemesis` variant and every
+/// `Workload` variant appears at least once (checked by
+/// `control_corpus_covers_the_fault_matrix`, below) — some fault/workload
+/// combinations get only a single spot-check cell; PR③ is expected to keep
+/// deepening these into fuller early/mid/late/5-replica grids the way
+/// raftkv's corpus does for its own fault set.
 fn corpus_cells() -> Vec<Scenario> {
     let mut out = Vec::new();
 
@@ -333,6 +469,117 @@ fn corpus_cells() -> Vec<Scenario> {
         vec![(Duration::from_millis(2200), Nemesis::SplitBrain)],
     ));
 
+    // --- PR② additions below: AllocatorRace + RegisterCas workloads, and
+    //     the fuller fault vocabulary (Duplicate/FsyncLie/TornTail). ---
+
+    // --- AllocatorRace: fault-free baseline. ---
+    out.push(allocator_race_scenario(
+        "allocator_race_baseline_3",
+        3,
+        3,
+        vec![],
+    ));
+
+    // --- AllocatorRace under a mid-race leader kill (phase-agnostic — may
+    //     land during either the CreateTablet or the BeginSplit phase). ---
+    out.push(allocator_race_scenario(
+        "allocator_race_leader_kill_mid_3",
+        3,
+        3,
+        vec![(Duration::from_millis(2200), Nemesis::LeaderKill)],
+    ));
+
+    // --- AllocatorRace with a LATER leader kill, timed to land once the
+    //     shared tablet is already created and racers are contending
+    //     specifically over `BeginSplit`'s child-id allocation. ---
+    out.push(allocator_race_scenario(
+        "allocator_race_split_leader_kill_3",
+        3,
+        3,
+        vec![(Duration::from_millis(3800), Nemesis::LeaderKill)],
+    ));
+
+    // --- AllocatorRace under a full partition, 5 replicas. ---
+    out.push(allocator_race_scenario(
+        "allocator_race_partition_5",
+        5,
+        4,
+        vec![(Duration::from_millis(2200), Nemesis::PartitionLeader)],
+    ));
+
+    // --- AllocatorRace crossed with FsyncLie (new nemesis) + LeaderKill:
+    //     the leader's own un-synced tail is lied-about-durable, then lost
+    //     on crash — survivors must still keep every confirmed id unique
+    //     and durable. ---
+    out.push(allocator_race_scenario(
+        "allocator_race_fsync_lie_leader_kill_3",
+        3,
+        3,
+        vec![
+            (Duration::from_millis(700), Nemesis::FsyncLie),
+            (Duration::from_millis(2200), Nemesis::LeaderKill),
+        ],
+    ));
+
+    // --- RegisterCas: fault-free baseline. ---
+    out.push(register_cas_scenario(
+        "register_cas_baseline_3",
+        3,
+        3,
+        vec![],
+    ));
+
+    // --- RegisterCas under a mid-registration leader kill — the seed-depth
+    //     generalization of `register_node_cas.rs`'s
+    //     `leader_killed_mid_registration_identical_retry_converges`. ---
+    out.push(register_cas_scenario(
+        "register_cas_leader_kill_mid_3",
+        3,
+        3,
+        vec![(Duration::from_millis(2200), Nemesis::LeaderKill)],
+    ));
+
+    // --- RegisterCas crossed with the new Duplicate nemesis: a duplicated
+    //     wire message must never double-claim or corrupt a registration. ---
+    out.push(register_cas_scenario(
+        "register_cas_duplicate_mid_3",
+        3,
+        3,
+        vec![(Duration::from_millis(2200), Nemesis::Duplicate)],
+    ));
+
+    // --- RegisterCas under a lossy network AND a leader partition, 5
+    //     replicas — the CAS's collision-rejection path must hold even when
+    //     both the collision retry and the original claim are racing a
+    //     degraded, partitioned network. ---
+    out.push(register_cas_scenario(
+        "register_cas_lossy_partition_5",
+        5,
+        4,
+        vec![
+            (Duration::from_millis(700), Nemesis::Lossy),
+            (Duration::from_millis(2200), Nemesis::PartitionLeader),
+        ],
+    ));
+
+    // --- TornTail composed with a crash (LeaderKill): the crashed node's
+    //     un-synced WAL tail is torn (a seed-chosen strict prefix kept, the
+    //     rest lost) on restart. Only the *surviving* replicas' convergence
+    //     is asserted here (the existing convergence check already proves
+    //     it) — checking the torn-tailed node's own recovered state needs
+    //     `StopRestart`, deferred to PR③ (see this file's top doc). Reuses
+    //     `PlainChurn` (a plain workload is enough teeth for a WAL-tear
+    //     regression; nothing about the tear is workload-specific). ---
+    out.push(plain_churn_scenario(
+        "torn_tail_leader_kill_3",
+        3,
+        3,
+        vec![
+            (Duration::from_millis(1500), Nemesis::TornTail),
+            (Duration::from_millis(2200), Nemesis::LeaderKill),
+        ],
+    ));
+
     out
 }
 
@@ -351,6 +598,14 @@ fn corpus() -> Vec<Scenario> {
 fn lossy(p: f64) -> NetConfig {
     let mut cfg = NetConfig::default();
     cfg.set_drop_prob(p);
+    cfg
+}
+
+/// A duplicated-message net config — house convention `0.1`-`0.3` range (see
+/// `Nemesis::Duplicate`'s own doc).
+fn duplicate(p: f64) -> NetConfig {
+    let mut cfg = NetConfig::default();
+    cfg.set_duplicate_prob(p);
     cfg
 }
 
@@ -375,7 +630,48 @@ struct Shared {
     /// same durability obligation, over `Metadata::members` instead of
     /// `Metadata::schemas`.
     confirmed_members: Mutex<BTreeSet<NodeId>>,
+    /// `AllocatorRace`: every `TabletId` a proposer's own confirm loop
+    /// actually observed committed (either the shared table's `CreateTablet`
+    /// or a `BeginSplit`'s own child id) — the durability obligation over
+    /// `Metadata::tablets`, and the set invariant #4's "no two calls were
+    /// ever assigned the same id" check is over (see
+    /// `check_allocator_injectivity`).
+    confirmed_tablet_ids: Mutex<Vec<TabletId>>,
+    /// `AllocatorRace`: a running fingerprint (`table`, `range.start`,
+    /// `range.end`) of every `TabletId` observed in ANY replica's tablet map
+    /// at ANY sampled point in the run (`Shared::sample_tablets`, called at
+    /// every convergence poll and fault-schedule step — see this file's top
+    /// doc). A later sample disagreeing with an earlier one for the same id
+    /// is a transient double-assignment, caught even if a later poll
+    /// "corrects" it back to one identity. Violations are recorded directly
+    /// into `injectivity_violations` at sample time, not re-derived at check
+    /// time, precisely so a transient mismatch a later sample overwrites is
+    /// never silently lost.
+    tablet_fingerprints: Mutex<BTreeMap<TabletId, TabletFingerprint>>,
+    /// Violations `sample_tablets` has ever recorded — see
+    /// `tablet_fingerprints`'s own doc for why this must accumulate rather
+    /// than being derived fresh from the final state alone.
+    injectivity_violations: Mutex<Vec<String>>,
+    /// `RegisterCas`: every `RegisterNode` attempt any client ever made
+    /// (its own original claim, and its own deterministic differing-
+    /// re-registration collision attempt against that same id), recorded at
+    /// attempt time regardless of outcome — mirrors `schema_attempts`'
+    /// role for `check_register_cas_integrity`.
+    register_attempts: Mutex<Vec<(NodeId, NodeAddrs)>>,
+    /// `RegisterCas`: `(node, addrs)` pairs whose ORIGINAL claim a client's
+    /// own confirm loop actually observed committed — its own proposed
+    /// address book, byte-identical, durably visible on a read after
+    /// proposing. Invariant #2 (durability) requires each to still be
+    /// present, byte-identical, in `Metadata::node_addrs` in the final
+    /// converged state.
+    confirmed_registrations: Mutex<Vec<(NodeId, NodeAddrs)>>,
 }
+
+/// `(table, range.start, range.end)` — a tablet's identity for the
+/// allocator-injectivity sampler; cheap to clone/compare, and exactly the
+/// fields two different `CreateTablet`/`BeginSplit` calls minting the same
+/// id could plausibly disagree on.
+type TabletFingerprint = (Option<String>, Vec<u8>, Option<Vec<u8>>);
 
 impl Shared {
     fn new() -> Self {
@@ -383,6 +679,11 @@ impl Shared {
             schema_attempts: Mutex::new(Vec::new()),
             confirmed_schemas: Mutex::new(Vec::new()),
             confirmed_members: Mutex::new(BTreeSet::new()),
+            confirmed_tablet_ids: Mutex::new(Vec::new()),
+            tablet_fingerprints: Mutex::new(BTreeMap::new()),
+            injectivity_violations: Mutex::new(Vec::new()),
+            register_attempts: Mutex::new(Vec::new()),
+            confirmed_registrations: Mutex::new(Vec::new()),
         }
     }
 
@@ -404,8 +705,57 @@ impl Shared {
         self.confirmed_members.lock().unwrap().insert(node);
     }
 
+    fn confirm_tablet_id(&self, id: TabletId) {
+        self.confirmed_tablet_ids.lock().unwrap().push(id);
+    }
+
+    fn record_register_attempt(&self, node: NodeId, addrs: &NodeAddrs) {
+        self.register_attempts
+            .lock()
+            .unwrap()
+            .push((node, addrs.clone()));
+    }
+
+    fn confirm_registration(&self, node: NodeId, addrs: &NodeAddrs) {
+        self.confirmed_registrations
+            .lock()
+            .unwrap()
+            .push((node, addrs.clone()));
+    }
+
     fn confirmed_count(&self) -> usize {
-        self.confirmed_schemas.lock().unwrap().len() + self.confirmed_members.lock().unwrap().len()
+        self.confirmed_schemas.lock().unwrap().len()
+            + self.confirmed_members.lock().unwrap().len()
+            + self.confirmed_tablet_ids.lock().unwrap().len()
+            + self.confirmed_registrations.lock().unwrap().len()
+    }
+
+    /// Sample every replica's current tablet map into `tablet_fingerprints`,
+    /// recording a violation the instant a `TabletId` is observed with a
+    /// fingerprint that disagrees with an earlier sample. Called at every
+    /// convergence-poll iteration and fault-schedule step (see this file's
+    /// top doc + `run_scenario`) so a transient double-assignment is caught
+    /// even if a later poll happens to "correct" back to one identity.
+    fn sample_tablets(&self, metas: &[Metadata]) {
+        let mut fp = self.tablet_fingerprints.lock().unwrap();
+        let mut violations = self.injectivity_violations.lock().unwrap();
+        for (ri, m) in metas.iter().enumerate() {
+            for (id, t) in &m.tablets {
+                let fingerprint: TabletFingerprint =
+                    (t.table.clone(), t.range.start.clone(), t.range.end.clone());
+                match fp.get(id) {
+                    None => {
+                        fp.insert(*id, fingerprint);
+                    }
+                    Some(existing) if *existing == fingerprint => {}
+                    Some(existing) => violations.push(format!(
+                        "tablet id {id:?} observed with two different identities (replica \
+                         {ri}): {existing:?} then {fingerprint:?} — a transient \
+                         double-assignment"
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -460,6 +810,8 @@ impl Group {
                 same_table,
             } => self.spawn_schema_race_workload(proposers, same_table),
             Workload::PlainChurn { proposers } => self.spawn_plain_churn_workload(proposers),
+            Workload::AllocatorRace { proposers } => self.spawn_allocator_race_workload(proposers),
+            Workload::RegisterCas { registrants } => self.spawn_register_cas_workload(registrants),
         }
     }
 
@@ -501,6 +853,45 @@ impl Group {
         }
     }
 
+    /// `proposers` concurrent racers, all hammering ONE shared table/tablet
+    /// — see [`Workload::AllocatorRace`]'s own doc for the two-phase shape
+    /// each `allocator_race_client` drives.
+    fn spawn_allocator_race_workload(&mut self, proposers: usize) {
+        let group_ids: Vec<NodeId> = GROUP_IDS[..self.replicas]
+            .iter()
+            .copied()
+            .map(nid)
+            .collect();
+        for (p, &client_id) in CLIENT_IDS.iter().enumerate().take(proposers) {
+            let env = self.sim.env(nid(client_id));
+            let nodes = Arc::clone(&self.nodes);
+            let shared = Arc::clone(&self.shared);
+            let replicas = group_ids.clone();
+            env.clone().spawn_task(async move {
+                allocator_race_client(env, nodes, shared, p, replicas).await;
+            });
+        }
+    }
+
+    /// `registrants` concurrent clients, each on its own never-faulted
+    /// driver env, each claiming a distinct node id then attempting one
+    /// deterministic differing-re-registration collision against its own
+    /// claim — see [`Workload::RegisterCas`]'s own doc.
+    fn spawn_register_cas_workload(&mut self, registrants: usize) {
+        for (r, &client_id) in CLIENT_IDS.iter().enumerate().take(registrants) {
+            let env = self.sim.env(nid(client_id));
+            let nodes = Arc::clone(&self.nodes);
+            let shared = Arc::clone(&self.shared);
+            // Distinct from every `PlainChurn`/`AllocatorRace` id range this
+            // file mints (900+ / tablet ids), and distinct per registrant.
+            let target = nid(950 + r as u64);
+            let suffix = 40 + r as u16;
+            env.clone().spawn_task(async move {
+                register_cas_client(env, nodes, shared, target, suffix).await;
+            });
+        }
+    }
+
     fn apply(&mut self, nem: Nemesis) {
         let ids: Vec<u64> = GROUP_IDS[..self.replicas].to_vec();
         match nem {
@@ -538,11 +929,32 @@ impl Group {
             Nemesis::Lossy => {
                 self.sim.set_net_config(lossy(0.1));
             }
+            Nemesis::Duplicate => {
+                self.sim.set_net_config(duplicate(0.2));
+            }
+            Nemesis::FsyncLie => {
+                let mut cfg = DiskConfig::default();
+                cfg.set_fsync_lie_prob(0.2);
+                self.sim.set_disk_config(cfg);
+            }
+            Nemesis::TornTail => {
+                let mut cfg = DiskConfig::default();
+                cfg.torn_tail_on_crash = true;
+                self.sim.set_disk_config(cfg);
+            }
         }
     }
 
     /// Heal every partition, restart every crashed node, restore default
-    /// links.
+    /// links **and default disk behavior**. The `DiskConfig` reset is
+    /// required, not cosmetic: `FsyncLie`/`TornTail` are armed globally
+    /// (`Simulator::set_disk_config`, no per-scenario auto-expiry), so
+    /// without resetting it here a fired fault keeps lying/tearing past its
+    /// intended window — including into a LATER scenario in the same
+    /// process if a future PR ever reused a `Simulator` across scenarios
+    /// (this file doesn't, but the discipline is what stops that from
+    /// becoming a footgun later). PR① never used `DiskConfig` at all, so
+    /// this reset is new in PR②.
     fn heal_all(&mut self) {
         let ids: Vec<u64> = GROUP_IDS[..self.replicas].to_vec();
         for i in 0..ids.len() {
@@ -556,6 +968,7 @@ impl Group {
         }
         self.crashed.clear();
         self.sim.set_net_config(NetConfig::default());
+        self.sim.set_disk_config(DiskConfig::default());
     }
 }
 
@@ -629,6 +1042,188 @@ async fn plain_churn_client(env: SimEnv, nodes: Nodes, shared: Arc<Shared>, base
     }
 }
 
+/// The one shared table name every `AllocatorRace` client races
+/// `CreateTablet` against — see [`Workload::AllocatorRace`]'s own doc.
+const ALLOCATOR_RACE_TABLE: &str = "ks.alloc_race";
+
+/// One `AllocatorRace` proposer. Phase 1: repeatedly recomputes a candidate
+/// tablet id from the current leader's own `next_free_tablet_id()` and
+/// proposes `CreateTablet` for the ONE shared table (`ALLOCATOR_RACE_TABLE`)
+/// — every racer's proposal is byte-identical except for the candidate id,
+/// so whichever one commits establishes the shared parent for everyone
+/// (there is no "whose literal call won" ambiguity to resolve, unlike phase
+/// 2 below: content besides the id is identical by construction). A racer
+/// only calls `confirm_tablet_id` when the tablet that landed carries its
+/// OWN most recently proposed id. Phase 2 starts once ANY racer observes the
+/// shared table has a tablet (own win or not): every racer repeatedly
+/// recomputes a fresh `(left, right)` child id pair from the current
+/// `next_free_tablet_id()` and proposes `BeginSplit` against the shared
+/// parent, with `p`'s own fixed, structurally distinct split key (so a
+/// content check — not mere id presence — can tell a genuine own-win apart
+/// from a same-id coincidence with a different racer's proposal, the exact
+/// "confirm by content, not presence" discipline `schema_race_client`'s own
+/// doc and `docs/engineering-lessons.md` already establish). Stops the
+/// instant the parent leaves `Active` (someone won; nothing left to retry)
+/// or the budget expires.
+async fn allocator_race_client(
+    env: SimEnv,
+    nodes: Nodes,
+    shared: Arc<Shared>,
+    p: usize,
+    replicas: Vec<NodeId>,
+) {
+    let table = ALLOCATOR_RACE_TABLE.to_string();
+    let split_key = format!("k{p}").into_bytes();
+
+    // --- Phase 1: race CreateTablet for the shared table. ---
+    let phase1_deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
+    let mut parent: Option<TabletId> = None;
+    while env.now().0 < phase1_deadline && parent.is_none() {
+        let Some((_, node)) = leader_slot(&nodes) else {
+            env.sleep(POLL).await;
+            continue;
+        };
+        let candidate = node.metadata().next_free_tablet_id();
+        node.propose(MetaCommand::CreateTablet {
+            tablet: candidate,
+            table: Some(table.clone()),
+            range: KeyRange::whole(),
+            replicas: replicas.clone(),
+        });
+        env.sleep(POLL).await;
+        if let Some((_, node)) = leader_slot(&nodes) {
+            let meta = node.metadata();
+            if let Some((&id, _)) = meta.tablets_for_table(&table).next() {
+                if id == candidate {
+                    shared.confirm_tablet_id(id);
+                }
+                parent = Some(id);
+            }
+        }
+    }
+    let Some(parent) = parent else {
+        return; // the shared table never got a tablet within budget
+    };
+
+    // --- Phase 2: race BeginSplit against the shared parent. ---
+    let phase2_deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
+    while env.now().0 < phase2_deadline {
+        let Some((_, node)) = leader_slot(&nodes) else {
+            env.sleep(POLL).await;
+            continue;
+        };
+        let meta = node.metadata();
+        let Some(source) = meta.tablets.get(&parent) else {
+            return; // the parent tablet is gone — nothing left to race
+        };
+        if source.state != animus_tablet::TabletState::Active {
+            return; // some racer already won the split
+        }
+        let left = meta.next_free_tablet_id();
+        let right = TabletId(left.0 + 1);
+        let source_replicas = source.replicas.clone();
+        node.propose(MetaCommand::BeginSplit {
+            parent,
+            expected_epoch: source.epoch,
+            split_key: split_key.clone(),
+            children: [(left, source_replicas.clone()), (right, source_replicas)],
+        });
+        env.sleep(POLL).await;
+        if let Some((_, node)) = leader_slot(&nodes) {
+            let meta = node.metadata();
+            // Confirm by CONTENT, not presence: `left`'s own range must end
+            // exactly at THIS racer's split key — a different racer whose
+            // BeginSplit happened to compute the identical (left, right) id
+            // pair from an equally-stale read (a real possibility early in
+            // the race, before either has committed) used a DIFFERENT split
+            // key, so its child's range would disagree with ours here.
+            if meta
+                .tablets
+                .get(&left)
+                .is_some_and(|t| t.range.end.as_deref() == Some(split_key.as_slice()))
+            {
+                shared.confirm_tablet_id(left);
+                shared.confirm_tablet_id(right);
+                return;
+            }
+        }
+    }
+}
+
+/// Deterministic address book for a `RegisterCas` client's claim, keyed off
+/// `suffix` exactly like `register_node_cas.rs`'s own `register()` helper
+/// (this workload's fixed-single-seed ancestor).
+fn register_cas_addrs(suffix: u16) -> NodeAddrs {
+    NodeAddrs {
+        internal: format!("127.0.0.1:{}", 9300 + suffix),
+        client: format!("127.0.0.1:{}", 9000 + suffix),
+        admin: format!("127.0.0.1:{}", 9500 + suffix),
+        intra: format!("127.0.0.1:{}", 9600 + suffix),
+        role: "combined".to_string(),
+    }
+}
+
+/// One `RegisterCas` client: claims `target` with its own address book,
+/// retried against the current leader until durably confirmed (its own
+/// address book, byte-identical, observed on a read after proposing — never
+/// merely `ProposeResult::Accepted`). Once confirmed, makes exactly ONE
+/// deterministic follow-up collision attempt: the SAME `target` id with a
+/// DIFFERENT address book — the seed-depth generalization of
+/// `register_node_cas.rs`'s
+/// `a_different_registration_for_an_already_claimed_id_is_rejected`. That
+/// second attempt can never confirm (the CAS must reject it), so it is only
+/// retried a bounded number of rounds — enough for the rejection to settle
+/// on whatever leader is currently reachable before the scenario's drain
+/// window closes, not an indefinite wait for an outcome that will never
+/// come.
+async fn register_cas_client(
+    env: SimEnv,
+    nodes: Nodes,
+    shared: Arc<Shared>,
+    target: NodeId,
+    suffix: u16,
+) {
+    let addrs = register_cas_addrs(suffix);
+    shared.record_register_attempt(target.clone(), &addrs);
+    let cmd = MetaCommand::RegisterNode {
+        node: target.clone(),
+        addrs: addrs.clone(),
+        labels: BTreeMap::new(),
+    };
+    let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
+    let mut confirmed = false;
+    while env.now().0 < deadline && !confirmed {
+        if let Some((_, node)) = leader_slot(&nodes) {
+            node.propose(cmd.clone());
+        }
+        env.sleep(POLL).await;
+        if let Some((_, node)) = leader_slot(&nodes)
+            && node.metadata().node_addrs.get(&target) == Some(&addrs)
+        {
+            confirmed = true;
+        }
+    }
+    if !confirmed {
+        return; // never landed — nothing to collide against
+    }
+    shared.confirm_registration(target.clone(), &addrs);
+
+    // The deterministic collision: same id, a DIFFERENT address book.
+    let colliding_addrs = register_cas_addrs(suffix + 1000);
+    shared.record_register_attempt(target.clone(), &colliding_addrs);
+    let collide_cmd = MetaCommand::RegisterNode {
+        node: target.clone(),
+        addrs: colliding_addrs,
+        labels: BTreeMap::new(),
+    };
+    for _ in 0..5 {
+        if let Some((_, node)) = leader_slot(&nodes) {
+            node.propose(collide_cmd.clone());
+        }
+        env.sleep(POLL).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Checks. No `check_cycles` here (see this file's top doc for why) — plain,
 // self-contained verdicts over `Metadata` equality/presence instead of
@@ -679,6 +1274,25 @@ fn check_durability_meta(shared: &Shared, reference: &Metadata) -> Verdict {
     for member in shared.confirmed_members.lock().unwrap().iter() {
         if !reference.members.contains_key(member) {
             violations.push(format!("confirmed member {member:?} lost from final state"));
+        }
+    }
+    for id in shared.confirmed_tablet_ids.lock().unwrap().iter() {
+        if !reference.tablets.contains_key(id) {
+            violations.push(format!(
+                "confirmed tablet id {id:?} (AllocatorRace) lost from final state"
+            ));
+        }
+    }
+    for (node, addrs) in shared.confirmed_registrations.lock().unwrap().iter() {
+        match reference.node_addrs.get(node) {
+            Some(existing) if existing == addrs => {}
+            Some(other) => violations.push(format!(
+                "confirmed registration for {node:?} lost: final state holds a DIFFERENT \
+                 address book ({other:?} != {addrs:?})"
+            )),
+            None => violations.push(format!(
+                "confirmed registration for {node:?} lost: absent from final state"
+            )),
         }
     }
     verdict(violations)
@@ -736,6 +1350,89 @@ fn check_schema_exclusivity(shared: &Shared, metas: &[Metadata]) -> Verdict {
     verdict(violations)
 }
 
+/// Invariant #4 (allocator injectivity — `AllocatorRace`): every violation
+/// `Shared::sample_tablets` ever recorded while the scenario ran — a
+/// `TabletId` observed with two disagreeing identities (table/range) at
+/// different sample points, catching a transient double-assignment even if
+/// a later poll "corrected" it back — see `sample_tablets`'s own doc.
+///
+/// **Deliberately not** a second check over raw `confirmed_tablet_ids`
+/// pairwise distinctness: phase 1's `CreateTablet` proposals are
+/// content-identical across every racer except for the candidate id itself
+/// (same shared table, range, replicas — see `allocator_race_client`'s own
+/// doc), so it is entirely legitimate for TWO OR MORE racers who happened
+/// to read the same stale `next_free_tablet_id()` to each correctly
+/// recognize "the tablet that now exists carries my own candidate id" —
+/// that is one real assignment multiply (and correctly) confirmed, not a
+/// double-assignment. `sample_tablets`' fingerprint comparison is the
+/// content-aware check that actually distinguishes a benign shared
+/// confirmation from a genuine same-id-different-content collision, so it
+/// alone is invariant #4's teeth.
+fn check_allocator_injectivity(shared: &Shared) -> Verdict {
+    verdict(shared.injectivity_violations.lock().unwrap().clone())
+}
+
+/// `RegisterCas` integrity, mirroring `check_schema_exclusivity`'s shape
+/// over `Metadata::node_addrs`/`RegisterNode` instead of
+/// `Metadata::schemas`/`CreateTableSchema` — the CAS is
+/// idempotent-on-identical rather than first-committer-wins-outright, but
+/// the "never a hybrid, never absent after a confirmed win" shape is
+/// identical. Groups every attempted registration by node id; an id only
+/// one attempt ever targeted has nothing to check here (durability above
+/// already covers it). For an id with **two or more** DIFFERING attempted
+/// address books (this workload's own deterministic collision, but written
+/// generally): on every replica, the id's address book (if present) must
+/// byte-match exactly one of the attempts, and must be present if any
+/// attempt for it was ever durably confirmed.
+fn check_register_cas_integrity(shared: &Shared, metas: &[Metadata]) -> Verdict {
+    let attempts = shared.register_attempts.lock().unwrap();
+    let confirmed_nodes: BTreeSet<NodeId> = shared
+        .confirmed_registrations
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut by_node: BTreeMap<NodeId, Vec<&NodeAddrs>> = BTreeMap::new();
+    for (node, addrs) in attempts.iter() {
+        let bucket = by_node.entry(node.clone()).or_default();
+        if !bucket.iter().any(|a| **a == *addrs) {
+            bucket.push(addrs);
+        }
+    }
+
+    let mut violations = Vec::new();
+    for (node, addr_books) in &by_node {
+        if addr_books.len() < 2 {
+            continue; // no genuine collision attempted for this id
+        }
+        for (i, meta) in metas.iter().enumerate() {
+            match meta.node_addrs.get(node) {
+                None => {
+                    if confirmed_nodes.contains(node) {
+                        violations.push(format!(
+                            "node {node:?} raced by {} differing registrations but ABSENT on \
+                             replica {i}, though one was durably confirmed",
+                            addr_books.len()
+                        ));
+                    }
+                }
+                Some(winner) => {
+                    if !addr_books.contains(&winner) {
+                        violations.push(format!(
+                            "node {node:?} on replica {i} holds an address book matching NONE \
+                             of the {} attempted registrations (a hybrid/corrupted result): \
+                             {winner:?}",
+                            addr_books.len()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    verdict(violations)
+}
+
 // ---------------------------------------------------------------------------
 // The scenario runner + result.
 // ---------------------------------------------------------------------------
@@ -744,6 +1441,8 @@ struct ScenarioResult {
     convergence: Verdict,
     durability: Verdict,
     exclusivity: Verdict,
+    allocator_injectivity: Verdict,
+    register_cas_integrity: Verdict,
     final_metas: Vec<Metadata>,
     schema_attempts: Vec<(String, TableSchema)>,
     confirmed_count: usize,
@@ -759,8 +1458,15 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     // Let the group elect a leader, then start the concurrent workload.
     group.sim.run_for(SETTLE);
     group.spawn_workload(&scenario.workload);
+    group
+        .shared
+        .sample_tablets(&read_all_metadata(&group.nodes));
 
-    // Walk the fault schedule in virtual-time order.
+    // Walk the fault schedule in virtual-time order, sampling the tablet map
+    // at every step (invariant #4 wants samples throughout the run, not
+    // just at the end — see `Shared::sample_tablets`'s own doc — and every
+    // scenario already pays for a metadata read here regardless of
+    // workload, so this is free for non-`AllocatorRace` scenarios).
     let mut faults = scenario.faults.clone();
     faults.sort_by_key(|(at, _)| *at);
     let base = group.sim.now().0;
@@ -769,6 +1475,9 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
         if target > group.sim.now().0 {
             group.sim.run_until(animus_env::Nanos(target));
         }
+        group
+            .shared
+            .sample_tablets(&read_all_metadata(&group.nodes));
         group.apply(nem);
     }
 
@@ -784,18 +1493,23 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
 
     // Converged-or-timeout poll for cross-replica agreement: a lagging
     // replica may still be catching up at the fixed drain, so re-read in
-    // bounded increments and stop early once convergence holds.
+    // bounded increments and stop early once convergence holds. Each poll
+    // also feeds `sample_tablets`.
     let mut metas = read_all_metadata(&group.nodes);
+    group.shared.sample_tablets(&metas);
     let mut convergence = check_convergence_meta(&metas);
     let poll_deadline = group.sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
     while !convergence.ok && group.sim.now().0 < poll_deadline {
         group.sim.run_for(CONVERGENCE_POLL_STEP);
         metas = read_all_metadata(&group.nodes);
+        group.shared.sample_tablets(&metas);
         convergence = check_convergence_meta(&metas);
     }
 
     let durability = check_durability_meta(&group.shared, &metas[0]);
     let exclusivity = check_schema_exclusivity(&group.shared, &metas);
+    let allocator_injectivity = check_allocator_injectivity(&group.shared);
+    let register_cas_integrity = check_register_cas_integrity(&group.shared, &metas);
     let schema_attempts = group.shared.schema_attempts.lock().unwrap().clone();
     let confirmed_count = group.shared.confirmed_count();
 
@@ -803,17 +1517,19 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
         convergence,
         durability,
         exclusivity,
+        allocator_injectivity,
+        register_cas_integrity,
         final_metas: metas,
         schema_attempts,
         confirmed_count,
     }
 }
 
-/// Assert all three checks on one scenario result, labelling the scenario in
-/// the failure message. Exclusivity + convergence are **safety** properties
-/// (hard assert at any depth); durability is already behind the
-/// converged-or-timeout poll, so a failure here means the budget was
-/// genuinely exhausted.
+/// Assert all checks on one scenario result, labelling the scenario in the
+/// failure message. Exclusivity/convergence/allocator-injectivity/
+/// register-CAS-integrity are **safety** properties (hard assert at any
+/// depth); durability is already behind the converged-or-timeout poll, so a
+/// failure there means the budget was genuinely exhausted.
 fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
     assert!(
         r.convergence.ok,
@@ -830,18 +1546,22 @@ fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
         "scenario {} violated schema-catalog exclusivity: {:?} (seed={})",
         s.name, r.exclusivity.violations, s.seed
     );
+    assert!(
+        r.allocator_injectivity.ok,
+        "scenario {} violated allocator injectivity: {:?} (seed={})",
+        s.name, r.allocator_injectivity.violations, s.seed
+    );
+    assert!(
+        r.register_cas_integrity.ok,
+        "scenario {} violated RegisterNode CAS integrity: {:?} (seed={})",
+        s.name, r.register_cas_integrity.violations, s.seed
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Future invariants (PR②/③) — not implemented here, deliberately left as
-// hooks so this harness doesn't need reshaping to add them:
+// Future invariants (PR③) — not implemented here, deliberately left as a
+// hook so this harness doesn't need reshaping to add it:
 //
-// - **#4 allocator injectivity.** Every id one of `Metadata`'s monotonic
-//   allocators hands out (tablet ids via `CreateTablet`/`BeginSplit`, the
-//   `RegisterNode` claim path) stays globally unique even when two
-//   proposers race the allocator concurrently under fault injection. PR②
-//   is expected to add a dedicated `Workload::AllocatorRace` variant plus a
-//   `check_allocator_injectivity` alongside the three checks above.
 // - **#5 apply-task no-double-apply (ADR 0038).** The async apply task never
 //   re-applies the same committed log index twice after a crash-recovery
 //   cycle. This needs the `StopRestart` nemesis (a true process restart:
@@ -952,22 +1672,38 @@ fn control_corpus_covers_the_fault_matrix() {
         seen_workloads.insert(match s.workload {
             Workload::SchemaRace { .. } => "schema_race",
             Workload::PlainChurn { .. } => "plain_churn",
+            Workload::AllocatorRace { .. } => "allocator_race",
+            Workload::RegisterCas { .. } => "register_cas",
         });
     }
 
+    // Every `Nemesis` variant must appear in some asserted cell — EXCEPT
+    // there is no `Nemesis::CorruptOnCrash` to enumerate here at all (see
+    // this file's top doc for why: issue #495, the composition is
+    // deliberately confined to the dedicated `#[ignore]`d
+    // `control_corrupt_on_crash_may_hard_panic_issue_495` test below, which
+    // this guard must never require to be part of the asserted set).
     for f in [
         Nemesis::LeaderKill,
         Nemesis::FollowerKill,
         Nemesis::PartitionLeader,
         Nemesis::SplitBrain,
         Nemesis::Lossy,
+        Nemesis::Duplicate,
+        Nemesis::FsyncLie,
+        Nemesis::TornTail,
     ] {
         assert!(
             seen_faults.contains(&f),
             "fault {f:?} is not covered by any corpus scenario"
         );
     }
-    for w in ["schema_race", "plain_churn"] {
+    for w in [
+        "schema_race",
+        "plain_churn",
+        "allocator_race",
+        "register_cas",
+    ] {
         assert!(
             seen_workloads.contains(w),
             "workload {w} is not covered by any corpus scenario"
@@ -1034,4 +1770,99 @@ fn control_run_is_deterministic() {
         "schema-attempt log not reproducible for seed {}",
         scenario.seed
     );
+}
+
+#[test]
+fn control_allocator_race_baseline_is_injective() {
+    let scenario = corpus_cells()
+        .into_iter()
+        .find(|s| s.name == "allocator_race_baseline_3")
+        .expect("allocator_race_baseline_3 exists");
+    let r = run_scenario(&scenario);
+    assert_scenario_ok(&scenario, &r);
+    assert!(
+        r.confirmed_count > 0,
+        "no confirmed tablet id — vacuous run (seed={})",
+        scenario.seed
+    );
+}
+
+#[test]
+fn control_register_cas_baseline_holds_integrity() {
+    let scenario = corpus_cells()
+        .into_iter()
+        .find(|s| s.name == "register_cas_baseline_3")
+        .expect("register_cas_baseline_3 exists");
+    let r = run_scenario(&scenario);
+    assert_scenario_ok(&scenario, &r);
+    assert!(
+        r.confirmed_count > 0,
+        "no confirmed registration — vacuous run (seed={})",
+        scenario.seed
+    );
+}
+
+/// **Deliberately `#[ignore]`d — exercises the same shared-WAL-codec gap
+/// tracked by issue #495**, `animus-cp-data`'s confirmed, reproducible
+/// hard-panic when `DiskConfig::torn_tail_on_crash` is composed with
+/// `corrupt_on_crash`: this shared codec
+/// (`animus-control::persist::WalRecord`, no per-record checksum) lets a
+/// corrupted-but-still-JSON-valid record decode successfully with a wrong
+/// value instead of failing gracefully like a torn/unparseable record does.
+/// #495 confirmed the panic via `animus-cp-data/tests/quiescence.rs`'s
+/// `assert_ts_monotonic` — a downstream invariant over HLC timestamps that
+/// plane's `KvState` machine has and this one does not.
+///
+/// **This test's own result, run against this plane** (default single seed
+/// below, plus an 80-combination sweep — seeds × `PlainChurn`/
+/// `AllocatorRace` × `LeaderKill`/`FollowerKill` × with/without an
+/// `FsyncLie`-accumulated un-synced buffer before the crash — done during
+/// this test's own development and not committed as code): **no panic
+/// reproduced anywhere in this plane.** The underlying codec gap is real
+/// (the corruption fires — `DiskCorrupt`/`DiskTear` trace events are
+/// emitted, confirmed by inspection during development) but `Metadata::
+/// apply`/the recovery path have no invariant as strict as
+/// `assert_ts_monotonic` for a wrong-but-decodable numeric field to trip —
+/// this plane's commands carry no HLC timestamp at all, and its CAS/epoch
+/// checks reject a mismatch rather than asserting on one. That is useful
+/// information in its own right (see #495 and this session's PR② report),
+/// not a reason to delete this test: it stays as a standing regression
+/// probe for whichever future `MetaCommand` field or replay-path invariant
+/// eventually becomes strict enough for this exact composition to reach it.
+///
+/// Deliberately NOT a `Nemesis` variant (see `Nemesis`'s own doc: adding
+/// `CorruptOnCrash` there would put this composition one cell away from
+/// running in the normal, asserted suite) and NOT in `corpus_cells()` — a
+/// hard process abort cannot be an ordinary scenario assertion, so this
+/// test drives a `Group` directly instead of going through
+/// `run_scenario`/`assert_scenario_ok`.
+///
+/// Run explicitly: `cargo test -p animus-control --test control_corpus
+/// control_corrupt_on_crash_may_hard_panic_issue_495 -- --ignored`.
+#[test]
+#[ignore = "probes the open WAL-corruption gap tracked by issue #495 — see this test's own doc for why it does not currently panic in this plane"]
+fn control_corrupt_on_crash_may_hard_panic_issue_495() {
+    let seed = corpus::name_seed("corrupt_on_crash_issue_495");
+    let mut group = Group::start(seed, 3);
+    group.sim.run_for(SETTLE);
+    group.spawn_workload(&Workload::PlainChurn { proposers: 3 });
+    group.sim.run_for(Duration::from_millis(1500));
+
+    // Arm BOTH torn-tail and corrupt-on-crash — the exact composition #495
+    // isolated as the trigger (torn-tail alone converges cleanly).
+    let mut cfg = DiskConfig::default();
+    cfg.torn_tail_on_crash = true;
+    cfg.corrupt_on_crash = true;
+    group.sim.set_disk_config(cfg);
+
+    group.apply(Nemesis::LeaderKill);
+    group.sim.run_for(Duration::from_millis(500));
+    // Restarting replays the crashed node's (possibly corrupted) WAL —
+    // #495's own account: the panic fires once the recovered replica
+    // catches up and applies an entry past the corrupted record. In this
+    // plane, this line runs clean (see this test's own doc above).
+    group.heal_all();
+    group.sim.run_for(DRAIN);
+
+    let _ = read_all_metadata(&group.nodes);
 }

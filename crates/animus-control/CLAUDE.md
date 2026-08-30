@@ -926,27 +926,70 @@ rejects outright on an existing table name (first-committer-wins, **not**
 idempotent-on-identical the way `RegisterNode`'s CAS is), so for every table
 name two or more racers proposed, the surviving schema (if any) must be
 byte-identical to exactly one of the racing proposals on every replica, and
-never absent if any racer's proposal was ever durably confirmed.
+never absent if any racer's proposal was ever durably confirmed; (4)
+**allocator injectivity** (PR②, safety, unconditional) —
+`Workload::AllocatorRace`'s `check_allocator_injectivity`: every `TabletId`
+observed in any replica's tablet map, at every convergence poll AND every
+fault-schedule step (not just the final state — `Shared::sample_tablets`),
+must carry one stable identity (table + range) throughout the run, catching
+a transient double-assignment even if a later poll happens to "correct" it
+back; (5) **`RegisterNode` CAS integrity** (PR②, safety, unconditional) —
+`Workload::RegisterCas`'s `check_register_cas_integrity`, mirroring check 3's
+shape over `Metadata::node_addrs` instead of `Metadata::schemas`.
 
-**Gotcha this corpus's own build found**: a racing proposer's confirm loop
-must decide "won" vs. "lost" by **content**, never by presence — since
+**Gotchas this corpus's own build found** (see `docs/engineering-lessons.md`
+for the full write-ups): (a) a racing proposer's confirm loop must decide
+"won" vs. "lost" by **content**, never by presence — since
 `CreateTableSchema` rejects rather than no-ops on an existing name, "the
 table now exists" is true for every racer the instant *any* of them wins,
-so a presence-only check makes a losing racer misreport itself as a winner.
-See `docs/engineering-lessons.md`'s matching entry for the general lesson.
+so a presence-only check makes a losing racer misreport itself as a winner
+(`SchemaRace`, PR①; `AllocatorRace`'s `BeginSplit` phase reuses the same
+discipline, PR②). (b) The inverse trap for a workload whose racing
+proposals are content-**identical** except for the field being raced
+(`AllocatorRace`'s `CreateTablet` phase — same shared table/range/replicas
+for every racer, only the candidate id differs): a raw "confirmed at most
+once" assertion over that field is checking a *stronger, false* property,
+since several racers legitimately and correctly agreeing "the tablet that
+landed carries my own candidate id" is expected, not a bug — only a
+content/fingerprint comparison (`sample_tablets`), never an occurrence
+count, states injectivity correctly. (c) An open fault-finding confirmed in
+one plane over a shared codec (issue #495, the WAL-corruption gap in
+`animus-control::persist::WalRecord`, confirmed reproducible in
+`animus-cp-data`) does **not** automatically reproduce in a sibling plane
+that shares the codec but not the downstream invariant the corruption has
+to trip — confirmed absent here across an 80-combination sweep (this
+plane's commands carry no HLC timestamp, and its CAS/epoch checks reject a
+mismatch rather than asserting on one); see
+`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc.
 
-**PR① scope** (this file's current state): a `Workload::SchemaRace`
-(2-3 concurrent proposers racing `CreateTableSchema`, same-table or
-distinct-name) and a `Workload::PlainChurn` (non-contending `UpsertMember`,
-the non-vacuity floor) over a nemesis subset —
-`LeaderKill`/`FollowerKill`/`PartitionLeader`/`SplitBrain`/`Lossy`.
-Deliberately **not yet included**: `StopRestart` (needs `RaftNode::start` to
-reopen the *same* `StorageEngine` handle a crashed node used, deferred
-alongside the apply-task-no-double-apply invariant it exists to probe) and
-an allocator-injectivity check (needs a dedicated `Workload::AllocatorRace`)
-— both are explicit hooks left in the file's own "Future invariants" comment
-for the next PRs in this stack to fill in without reshaping the harness.
-Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen cells; held
-green at `=40` during this PR's own validation). A structural
-`control_corpus_covers_the_fault_matrix` guard keeps the nemesis/workload
-matrix honest, mirroring `raftkv_corpus_covers_the_fault_matrix`.
+**Scope as of PR②** (`AllocatorRace` + `RegisterCas` workloads,
+`Duplicate`/`FsyncLie`/`TornTail` nemeses): `Workload::SchemaRace` (2-3
+concurrent proposers racing `CreateTableSchema`, same-table or
+distinct-name), `Workload::PlainChurn` (non-contending `UpsertMember`, the
+non-vacuity floor), `Workload::AllocatorRace` (several proposers racing
+`CreateTablet`/`BeginSplit` against ONE shared table/tablet, hammering
+`Metadata::next_tablet_id`/`next_free_tablet_id()`), and
+`Workload::RegisterCas` (several proposers each claiming a distinct node id
+then attempting one deterministic differing-re-registration collision
+against their own claim — lifts `register_node_cas.rs`'s fixed-single-seed
+CAS proof into this corpus's fault matrix) — over a nemesis set:
+`LeaderKill`/`FollowerKill`/`PartitionLeader`/`SplitBrain`/`Lossy`/
+`Duplicate` (`NetConfig::set_duplicate_prob`)/`FsyncLie`
+(`DiskConfig::set_fsync_lie_prob`)/`TornTail` (`DiskConfig::
+torn_tail_on_crash`, composed with a crash). `heal_all` resets **both**
+`NetConfig` and `DiskConfig` to default now — required for
+`FsyncLie`/`TornTail`, which are armed globally with no auto-expiry (PR①
+never used `DiskConfig` at all). `CorruptOnCrash` is deliberately **not** a
+`Nemesis` variant (issue #495 above); the one cell exercising that
+composition is a dedicated, always-`#[ignore]`d test, never part of the
+asserted `corpus_cells()` set. Deliberately **not yet included**:
+`StopRestart` (needs `RaftNode::start` to reopen the *same* `StorageEngine`
+handle a crashed node used, deferred alongside the apply-task-no-double-apply
+invariant it exists to probe) — an explicit hook left in the file's own
+"Future invariants" comment for PR③ to fill in without reshaping the
+harness. Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen
+cells; held green at `=15` and `=40` during PR②'s own validation). A
+structural `control_corpus_covers_the_fault_matrix` guard keeps the
+nemesis/workload matrix honest, mirroring `raftkv_corpus_covers_the_fault_
+matrix` — it deliberately does not (and must not) require the `#[ignore]`d
+corrupt-on-crash cell to be part of the asserted set.
