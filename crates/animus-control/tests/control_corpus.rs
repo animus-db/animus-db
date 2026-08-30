@@ -1,20 +1,26 @@
 //! A fault-injected, seed-reproducible **corpus for the control plane's own
-//! machinery** — the ADR 0038 async apply task, the replicated schema
-//! catalog's exclusivity guarantee (ADR 0013), the tablet-id/`RegisterNode`
-//! allocator-shaped counters, and (PR③ to come) apply-task crash recovery.
+//! machinery** — the ADR 0038 async apply task (including its real
+//! crash-recovery path), the replicated schema catalog's exclusivity
+//! guarantee (ADR 0013), the tablet-id/`RegisterNode` allocator-shaped
+//! counters, and a genuine multi-chunk `InstallSnapshot` transfer under a
+//! mid-transfer fault.
 //!
 //! `learner_corpus.rs` already covers the learner/membership-class fault
 //! vocabulary at seed depth (ADR 0058 Train 1); this corpus is the sibling
 //! that exercises everything else about `Metadata`/`RaftNode` under real
 //! fault injection instead of the ~30 fixed-single-seed acceptance tests
-//! this crate otherwise has. **PR① built the harness architecture + a
-//! baseline + a schema-catalog-race workload. This is PR② of a 3-4 PR
-//! stacked series: an `AllocatorRace` workload (invariant #4), a
-//! `RegisterCas` workload lifting `register_node_cas.rs`'s fixed-single-seed
-//! CAS proof into this corpus's fault matrix, and a fuller fault vocabulary
-//! (`Duplicate`/`FsyncLie`/`TornTail`).** PR③ is expected to add
-//! `StopRestart` and the apply-task-no-double-apply invariant — see the
-//! "Future invariants" section near the bottom for the hook left for it.
+//! this crate otherwise has. **Built as a 3-PR stacked series: PR① the
+//! harness architecture + a baseline + a schema-catalog-race workload; PR②
+//! an `AllocatorRace` workload (invariant #4), a `RegisterCas` workload
+//! lifting `register_node_cas.rs`'s fixed-single-seed CAS proof into this
+//! corpus's fault matrix, and a fuller fault vocabulary
+//! (`Duplicate`/`FsyncLie`/`TornTail`); PR③ (this one, final) a
+//! `StopRestart` nemesis (a REAL process restart, not a muted-and-resumed
+//! crash), invariant #5 (apply-task liveness), a `SustainedChurn` workload
+//! for a crash-timing sweep under real load, and two bespoke
+//! chunked-snapshot-under-fault tests exercising a genuine multi-chunk
+//! `InstallSnapshot` transfer composed with a mid-transfer fault** — see the
+//! "Nemesis set" and "Chunked-snapshot-under-fault" sections below.
 //!
 //! **Harness shape**, deliberately mirroring
 //! `crates/animus-test/tests/raftkv_linearizable.rs` (the flagship corpus in
@@ -82,20 +88,46 @@
 //!    differing-re-registration collision), the final address book (if
 //!    present) on every replica must byte-match exactly one attempt, never
 //!    a hybrid, and must be present if any attempt was ever confirmed.
+//! 6. **Apply-task liveness / no-permanent-stall** (PR③, a *safety*
+//!    property, checked unconditionally on EVERY scenario — cheap: two
+//!    atomic reads per node) — `poll_apply_task_caught_up`: after
+//!    convergence, `engine_applied_index()` must catch up to
+//!    `commit_index()` on every live replica within the same
+//!    converged-or-timeout budget check 1 uses. This is deliberately
+//!    **not** the same property as check 1: a uniformly-stalled apply task
+//!    (every replica stuck at the same stale-but-consistent `Metadata`)
+//!    still looks "converged" to check 1, which only ever compares
+//!    replicas against each other, never against the group's own
+//!    `commit_index`. Especially relevant after `StopRestart` — see that
+//!    nemesis's own doc. **No separate double-apply probe** — see the
+//!    "Nemesis set" section's `StopRestart` entry for why checks 3/4 above
+//!    already catch a double-apply if one ever happened.
 //!
 //! **Nemesis set**: `LeaderKill` (`sim.crash` the current leader),
 //! `FollowerKill` (`sim.crash` a non-leader), `PartitionLeader` (isolate the
 //! leader from the rest), `SplitBrain` (full-mesh partition, no majority
-//! anywhere), `Lossy` (`NetConfig::set_drop_prob`), and (PR②) `Duplicate`
+//! anywhere), `Lossy` (`NetConfig::set_drop_prob`), (PR②) `Duplicate`
 //! (`NetConfig::set_duplicate_prob`), `FsyncLie`
 //! (`DiskConfig::set_fsync_lie_prob`), `TornTail`
-//! (`DiskConfig::torn_tail_on_crash`, composed with a crash). **`StopRestart`
-//! is deliberately NOT here** — it needs `RaftNode::start` to reopen the
-//! *same* `StorageEngine` handle the crashed node used (this plane always
-//! needs one, unlike raftkv's simpler always-`MemoryEngine`-is-fine shape
-//! when the tier itself is `MemoryEngine`) plus the apply-task-recovery
-//! invariant (#6 below) it exists to probe — both deferred to PR③.
-//! **`CorruptOnCrash` is also deliberately NOT a `Nemesis` variant** — this
+//! (`DiskConfig::torn_tail_on_crash`, composed with a crash), and (PR③)
+//! `StopRestart` — a REAL process restart: `sim.stop` (tasks + volatile
+//! state gone; durable engine survives) on a non-leader victim, then, at
+//! `heal_all` time, a FRESH `RaftNode::start` reopening the SAME retained
+//! `MemoryEngine` handle (`Group::engines`, mirroring `tests/restart.rs`'s
+//! idiomatic pattern exactly). This is categorically different from
+//! `LeaderKill`/`FollowerKill`'s `sim.crash` — a crash mutes the SAME
+//! still-live tasks (`RaftCore`, the driver loop, the apply task all stay
+//! in memory) and `sim.restart` merely re-arms them, never touching
+//! `meta_apply_loop`'s restart-recovery path (`rebuild_metadata_from_
+//! engine` + reseeding `engine_applied` from the engine's own `syskv::
+//! applied_index_key()`, ADR 0038) at all. **Gotcha** (`docs/engineering-
+//! lessons.md`): `Simulator::stop` does NOT clear a `crashed` flag a prior
+//! `Simulator::crash` on the same node set — composing the two on one id
+//! needs `crash; stop; restart` (restart clears the mute) *before*
+//! reconstructing the fresh node, or its network traffic is silently
+//! dropped forever; `Group::stop_node` defensively does this even though no
+//! cell in this file currently composes the two. **`CorruptOnCrash` is also
+//! deliberately NOT a `Nemesis` variant** — this
 //! shared WAL codec (`animus-control::persist::WalRecord`, no per-record
 //! checksum) has an open, confirmed, unfixed hard-panic finding in the CP
 //! data plane when it's composed with `TornTail` (issue #495); the one cell
@@ -123,15 +155,45 @@
 //! [`Workload::RegisterCas`] — several proposers each claiming a distinct
 //! node id then attempting one deterministic differing-re-registration
 //! collision against their own claim, lifting `register_node_cas.rs`'s
-//! fixed-single-seed CAS proof into this corpus's fault matrix. Every
-//! proposer retries against whichever node currently reports itself leader,
-//! exactly the `propose`/`NotLeader`-hint retry idiom `register_node_cas.rs`
-//! already uses in this crate.
+//! fixed-single-seed CAS proof into this corpus's fault matrix; and (PR③)
+//! [`Workload::SustainedChurn`] — like `PlainChurn` but `SUSTAINED_CHURN_
+//! ROUNDS` (50, not `CHURN_ROUNDS`'s 3) per proposer, driving the committed
+//! log well past `SNAPSHOT_THRESHOLD` so a swept `StopRestart` has real
+//! in-flight apply-task/compaction state to interrupt at every point in the
+//! sweep (generalizes `wal_compaction.rs`'s single-fixed-instant `crash_
+//! during_sustained_compaction_recovers_to_the_uninterrupted_reference_
+//! state` across an early/mid/late window — that test's own module doc
+//! calls out the single-instant limitation this workload/nemesis pairing
+//! closes). Every proposer retries against whichever node currently reports
+//! itself leader, exactly the `propose`/`NotLeader`-hint retry idiom
+//! `register_node_cas.rs` already uses in this crate.
+//!
+//! **Chunked-snapshot-under-fault** (PR③, two bespoke tests near the bottom
+//! of this file, NOT part of `corpus_cells()`/`Workload`/`Nemesis` at all):
+//! `chunked_snapshot_source_crash_mid_transfer_3` and `chunked_snapshot_
+//! receiver_stop_restart_3` grow a REAL `Metadata` image (never a
+//! hand-supplied synthetic blob, unlike `install_snapshot.rs`'s own
+//! chunk-mechanics tests) through the actual `meta_apply_and_compact`/
+//! `syskv_image` path until it forces a genuine multi-chunk
+//! `InstallSnapshot` transfer, then inject a fault — a source-leader crash,
+//! or a receiver `StopRestart` — while chunks are demonstrably still in
+//! flight (`wait_for_snapshot_transfer_in_flight`, a condition-based poll,
+//! not a duration guess — see that function's own doc for why: an
+//! exploratory run found the whole multi-chunk transfer completes within
+//! roughly 3ms of virtual time once shipping starts, far too narrow a
+//! window for this harness's usual `Vec<(Duration, Nemesis)>` fault
+//! schedule to land inside reliably). No existing fixed test in this crate
+//! composes a mid-transfer fault with a real multi-chunk transfer.
 //!
 //! **Depth knob**: `ANIMUS_CONTROL_SEEDS` (default 1 = the frozen cells,
 //! byte-identical run-to-run), wired via `animus_test::corpus`'s
 //! `seeds_from_env`/`seed_expand` exactly like every other corpus in this
-//! repo.
+//! repo — covers `corpus_cells()`; the two chunked-snapshot tests are
+//! fixed-single-seed regressions in the same style as `install_snapshot.rs`'s
+//! own tests, not seed-expanded (see those tests' own doc for why: their
+//! setup targets one specific follower rather than a generic `Nemesis`-
+//! selected victim, which doesn't fit `Scenario`'s shape without a
+//! disproportionate harness change for two cells).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -187,6 +249,11 @@ const CONVERGENCE_BUDGET: Duration = Duration::from_secs(120);
 /// Rounds a `PlainChurn` proposer runs — small, since the point is a
 /// non-vacuity floor, not a stress test.
 const CHURN_ROUNDS: u64 = 3;
+/// Rounds a `SustainedChurn` proposer runs (PR③) — with 3 proposers this
+/// drives ~150 committed entries, comfortably past `SNAPSHOT_THRESHOLD`
+/// (64) so compaction/apply-task activity is genuinely in flight across the
+/// whole `early`/`mid`/`late` sweep window, not just at one instant.
+const SUSTAINED_CHURN_ROUNDS: u64 = 50;
 
 // ---------------------------------------------------------------------------
 // Declarative scenario model.
@@ -243,6 +310,28 @@ enum Nemesis {
     /// composition is a separate, deliberately-unasserted case (issue
     /// #495).
     TornTail,
+    /// PR③: a **real process restart** — `sim.stop` (tasks + volatile state
+    /// gone; durable engine survives) followed, at `heal_all` time, by a
+    /// FRESH `RaftNode::start` reopening the SAME retained `MemoryEngine`
+    /// handle (`Group::engines`) — never merely `sim.crash`+`sim.restart`
+    /// (which re-arms the SAME still-live tasks and never touches
+    /// `meta_apply_loop`'s restart-recovery path at all: `rebuild_metadata_
+    /// from_engine` + reseeding `engine_applied` from the engine's own
+    /// `syskv::applied_index_key()`, ADR 0038). This is what actually
+    /// exercises the apply-task crash-recovery contract `LeaderKill`/
+    /// `FollowerKill` cannot: those crash the *process* only figuratively
+    /// (the driver loop, apply task, and `RaftCore` all stay in memory,
+    /// merely muted). Picks a **non-leader** victim (mirrors `FollowerKill`'s
+    /// selection — restarting the leader would also force a re-election,
+    /// confounding what this nemesis is meant to isolate). Defensively
+    /// clears any stale `crashed` mute before stopping
+    /// (`Group::stop_node`) — **gotcha** (`docs/engineering-lessons.md`):
+    /// `Simulator::stop` does NOT clear a `crashed` flag a prior
+    /// `Simulator::crash` on the same node set, so a cell that ever composed
+    /// this with an earlier crash on the same id would silently blackhole
+    /// the reconstructed node's traffic without this. Healed/reconstructed
+    /// by `heal_all`, same as every other nemesis here.
+    StopRestart,
 }
 
 /// Which workload shape a scenario drives — this plane's own reason for a
@@ -289,6 +378,17 @@ enum Workload {
     /// guaranteed-second `RegisterNode` for an already-claimed id, proving
     /// the CAS rejects it outright rather than overwriting.
     RegisterCas { registrants: usize },
+    /// PR③: like `PlainChurn`, but `SUSTAINED_CHURN_ROUNDS` (not `CHURN_ROUNDS`)
+    /// per proposer — enough non-contending `UpsertMember`s to reliably drive
+    /// the committed log well past `SNAPSHOT_THRESHOLD` (64), so a
+    /// `StopRestart` landing mid-run has real in-flight apply-task/compaction
+    /// state to interrupt. `PlainChurn`'s own `CHURN_ROUNDS = 3` is far too
+    /// light for this (mirrors `wal_compaction.rs`'s `crash_during_sustained_
+    /// compaction_recovers_to_the_uninterrupted_reference_state`'s load shape,
+    /// generalized across a swept crash instant instead of that file's one
+    /// fixed instant — see that test's own module doc, which calls out the
+    /// single-fixed-instant gap this workload/nemesis pairing closes).
+    SustainedChurn { proposers: usize },
 }
 
 /// A seed-reproducible scenario: a named group size + workload + an explicit
@@ -362,6 +462,22 @@ fn plain_churn_scenario(
         name: name.to_string(),
         replicas,
         workload: Workload::PlainChurn { proposers },
+        faults,
+        window: Duration::ZERO,
+    }
+}
+
+fn sustained_churn_scenario(
+    name: &str,
+    replicas: usize,
+    proposers: usize,
+    faults: Vec<(Duration, Nemesis)>,
+) -> Scenario {
+    Scenario {
+        seed: corpus::name_seed(name),
+        name: name.to_string(),
+        replicas,
+        workload: Workload::SustainedChurn { proposers },
         faults,
         window: Duration::ZERO,
     }
@@ -580,6 +696,49 @@ fn corpus_cells() -> Vec<Scenario> {
         ],
     ));
 
+    // --- PR③ additions below: StopRestart (a real process restart —
+    //     `sim.stop` + a fresh `RaftNode::start` reopening the SAME retained
+    //     engine handle) and invariant #5 (apply-task liveness). ---
+
+    // --- SchemaRace under a mid-race StopRestart: proves the apply task
+    //     correctly rebuilds `shadow: Metadata` from `mirror::
+    //     rebuild_metadata_from_engine` and reseeds its watermark from the
+    //     engine's own `syskv::applied_index_key()` after a REAL restart
+    //     (ADR 0038), not merely a muted/re-armed `sim.crash`. ---
+    out.push(schema_race_scenario(
+        "schema_race_stop_restart_mid_3",
+        3,
+        2,
+        true,
+        vec![(Duration::from_millis(2200), Nemesis::StopRestart)],
+    ));
+
+    // --- AllocatorRace under a mid-race StopRestart: the same real-restart
+    //     recovery proof, over the allocator-shaped counter instead of the
+    //     schema catalog. ---
+    out.push(allocator_race_scenario(
+        "allocator_race_stop_restart_mid_3",
+        3,
+        3,
+        vec![(Duration::from_millis(2200), Nemesis::StopRestart)],
+    ));
+
+    // --- SustainedChurn x early/mid/late StopRestart: a crash-timing sweep
+    //     under genuinely sustained load (SUSTAINED_CHURN_ROUNDS, well past
+    //     SNAPSHOT_THRESHOLD), generalizing `wal_compaction.rs`'s single
+    //     fixed-instant `crash_during_sustained_compaction_recovers_to_the_
+    //     uninterrupted_reference_state` across the swept window that test's
+    //     own module doc calls out as a gap. ---
+    for (tname, at) in CORPUS_TIMINGS {
+        let name = format!("apply_task_stop_restart_under_load_{tname}_3");
+        out.push(sustained_churn_scenario(
+            &name,
+            3,
+            3,
+            vec![(at, Nemesis::StopRestart)],
+        ));
+    }
+
     out
 }
 
@@ -777,6 +936,21 @@ struct Group {
     shared: Arc<Shared>,
     /// Group ids crashed and not yet restarted.
     crashed: BTreeSet<u64>,
+    /// PR③: each node's own durable `StorageEngine` handle, index-aligned
+    /// with `GROUP_IDS[..replicas]`/`nodes` — kept alive **outside** the
+    /// node itself (mirroring `tests/restart.rs`'s idiomatic pattern
+    /// exactly) so `Nemesis::StopRestart`/`stop_node` can construct a FRESH
+    /// `RaftNode::start` that reopens the SAME handle a stopped node used,
+    /// rather than a fresh, empty one. `MemoryEngine` clones share state, so
+    /// re-cloning this handle at reconstruction time is what actually models
+    /// "the durable disk survives a process restart".
+    engines: Vec<MemoryEngine>,
+    /// Group ids `sim.stop`ped and not yet reconstructed — disjoint in
+    /// practice from `crashed` (this file never composes the two on the same
+    /// id), but tracked separately since the two need different `heal_all`
+    /// treatment: `crashed` just needs `sim.restart`, `stopped` needs a
+    /// brand-new `RaftNode`.
+    stopped: BTreeSet<u64>,
 }
 
 impl Group {
@@ -784,13 +958,15 @@ impl Group {
         assert!((3..=5).contains(&replicas));
         let sim = Simulator::new(seed);
         let ids: Vec<u64> = GROUP_IDS[..replicas].to_vec();
+        let engines: Vec<MemoryEngine> = ids.iter().map(|_| MemoryEngine::new()).collect();
         let nodes: Vec<Arc<Node>> = ids
             .iter()
-            .map(|&id| {
+            .zip(engines.iter())
+            .map(|(&id, engine)| {
                 Arc::new(RaftNode::start(
                     sim.env(nid(id)),
                     ids.iter().copied().map(nid).collect(),
-                    MemoryEngine::new(),
+                    engine.clone(),
                 ))
             })
             .collect();
@@ -800,6 +976,8 @@ impl Group {
             replicas,
             shared: Arc::new(Shared::new()),
             crashed: BTreeSet::new(),
+            engines,
+            stopped: BTreeSet::new(),
         }
     }
 
@@ -812,6 +990,9 @@ impl Group {
             Workload::PlainChurn { proposers } => self.spawn_plain_churn_workload(proposers),
             Workload::AllocatorRace { proposers } => self.spawn_allocator_race_workload(proposers),
             Workload::RegisterCas { registrants } => self.spawn_register_cas_workload(registrants),
+            Workload::SustainedChurn { proposers } => {
+                self.spawn_sustained_churn_workload(proposers)
+            }
         }
     }
 
@@ -848,7 +1029,25 @@ impl Group {
             let shared = Arc::clone(&self.shared);
             let base = 900 + (p as u64) * 10;
             env.clone().spawn_task(async move {
-                plain_churn_client(env, nodes, shared, base).await;
+                plain_churn_client(env, nodes, shared, base, CHURN_ROUNDS).await;
+            });
+        }
+    }
+
+    /// PR③: `proposers` concurrent, non-contending `UpsertMember` proposers,
+    /// `SUSTAINED_CHURN_ROUNDS` each — see [`Workload::SustainedChurn`]'s own
+    /// doc. Uses a member-id range (`3000+`) disjoint from `PlainChurn`'s
+    /// (`900+`) — harmless in practice since only one workload ever runs per
+    /// scenario, but keeping the ranges disjoint costs nothing and rules out
+    /// a collision if a future PR ever combines workloads in one scenario.
+    fn spawn_sustained_churn_workload(&mut self, proposers: usize) {
+        for (p, &client_id) in CLIENT_IDS.iter().enumerate().take(proposers) {
+            let env = self.sim.env(nid(client_id));
+            let nodes = Arc::clone(&self.nodes);
+            let shared = Arc::clone(&self.shared);
+            let base = 3000 + (p as u64) * 100;
+            env.clone().spawn_task(async move {
+                plain_churn_client(env, nodes, shared, base, SUSTAINED_CHURN_ROUNDS).await;
             });
         }
     }
@@ -942,7 +1141,39 @@ impl Group {
                 cfg.torn_tail_on_crash = true;
                 self.sim.set_disk_config(cfg);
             }
+            Nemesis::StopRestart => {
+                let leader = leader_slot(&self.nodes).map(|(i, _)| i);
+                let victim = (0..self.replicas).find(|&i| {
+                    Some(i) != leader
+                        && !self.crashed.contains(&ids[i])
+                        && !self.stopped.contains(&ids[i])
+                });
+                if let Some(i) = victim {
+                    self.stop_node(ids[i]);
+                }
+            }
         }
+    }
+
+    /// `sim.stop` a specific node id (a real process exit: tasks + volatile
+    /// state gone, durable engine kept) and remember it for `heal_all` to
+    /// reconstruct. Shared by `Nemesis::StopRestart`'s own auto-selected
+    /// victim above and the chunked-snapshot fault-injection tests near the
+    /// bottom of this file, which need to target a SPECIFIC node (the one
+    /// mid-transfer) rather than whichever victim `apply`'s own leader-aware
+    /// selection would pick.
+    ///
+    /// Defensively clears any stale `crashed` mute first — **gotcha**
+    /// (`docs/engineering-lessons.md`): `Simulator::stop` does NOT clear a
+    /// `crashed` flag a prior `Simulator::crash` on the same node set, so a
+    /// cell that ever composed this with an earlier crash on the same id
+    /// would otherwise silently blackhole the reconstructed node's traffic
+    /// forever. No cell in this file currently does that, but the guard is
+    /// free and rules the whole hazard class out by construction.
+    fn stop_node(&mut self, id: u64) {
+        self.sim.restart(nid(id));
+        self.sim.stop(nid(id));
+        self.stopped.insert(id);
     }
 
     /// Heal every partition, restart every crashed node, restore default
@@ -967,6 +1198,31 @@ impl Group {
             self.sim.restart(nid(v));
         }
         self.crashed.clear();
+
+        // PR③: a `StopRestart` victim needs a FRESH `RaftNode` reopening the
+        // SAME retained engine handle — `sim.restart` alone (as used for
+        // `crashed` above) would be a no-op here, since `sim.stop` removed
+        // the node's tasks entirely instead of merely muting them (see
+        // `Nemesis::StopRestart`'s own doc).
+        if !self.stopped.is_empty() {
+            let all_ids: Vec<NodeId> = ids.iter().copied().map(nid).collect();
+            let stopped: Vec<u64> = self.stopped.iter().copied().collect();
+            let mut guard = self.nodes.lock().unwrap();
+            for v in stopped {
+                let idx = ids
+                    .iter()
+                    .position(|&x| x == v)
+                    .expect("stopped id is a member of this group");
+                guard[idx] = Arc::new(RaftNode::start(
+                    self.sim.env(nid(v)),
+                    all_ids.clone(),
+                    self.engines[idx].clone(),
+                ));
+            }
+            drop(guard);
+            self.stopped.clear();
+        }
+
         self.sim.set_net_config(NetConfig::default());
         self.sim.set_disk_config(DiskConfig::default());
     }
@@ -1012,11 +1268,19 @@ async fn schema_race_client(
     }
 }
 
-/// One `PlainChurn` proposer: `CHURN_ROUNDS` distinct `UpsertMember`
-/// proposals, each retried against the current leader and confirmed via a
-/// subsequent read before moving to the next.
-async fn plain_churn_client(env: SimEnv, nodes: Nodes, shared: Arc<Shared>, base: u64) {
-    for i in 0..CHURN_ROUNDS {
+/// One `PlainChurn`/`SustainedChurn` proposer: `rounds` distinct
+/// `UpsertMember` proposals, each retried against the current leader and
+/// confirmed via a subsequent read before moving to the next. `rounds` is
+/// `CHURN_ROUNDS` for `PlainChurn` and `SUSTAINED_CHURN_ROUNDS` for
+/// `SustainedChurn` (PR③) — same client logic, just how much of it runs.
+async fn plain_churn_client(
+    env: SimEnv,
+    nodes: Nodes,
+    shared: Arc<Shared>,
+    base: u64,
+    rounds: u64,
+) {
+    for i in 0..rounds {
         let member = nid(base + i);
         let cmd = MetaCommand::UpsertMember {
             node: member.clone(),
@@ -1433,6 +1697,56 @@ fn check_register_cas_integrity(shared: &Shared, metas: &[Metadata]) -> Verdict 
     verdict(violations)
 }
 
+/// Invariant #5 (PR③, apply-task liveness / no-permanent-stall — ADR 0038).
+/// Checked on **every** scenario (cheap: two atomic reads per node, no
+/// locking beyond the existing `nodes` mutex) rather than only
+/// `StopRestart`-using ones: after (would-be) convergence,
+/// [`RaftNode::engine_applied_index`] must catch up to
+/// [`RaftNode::commit_index`] on every live replica — the async apply task
+/// (`meta_apply_loop`/`meta_apply_and_compact`) must never permanently stall
+/// behind consensus. This is a genuinely **separate** property from
+/// `check_convergence_meta`: a uniformly-stalled apply task (every replica
+/// stuck at the same stale-but-consistent `Metadata`) still looks
+/// "converged" to that check, since it only compares replicas against each
+/// other, never against the group's own `commit_index`. Especially relevant
+/// post-`StopRestart`: a freshly reconstructed node's apply task reseeds its
+/// watermark from the engine's own `syskv::applied_index_key()`, not
+/// `core.last_applied()` (`meta_apply_loop`'s own doc) — a bug in that
+/// reseed (e.g. losing the watermark, or re-deriving writes for an index the
+/// engine already durably reflects) would show up here as a permanent gap,
+/// not as a `Metadata` mismatch.
+///
+/// A converged-or-timeout poll of its own, mirroring `check_convergence_meta`'s
+/// shape exactly (same constants), since a node whose apply task is merely
+/// still catching up — not stalled — needs the same grace ordinary
+/// cross-replica convergence gets. `sim` is an owned `Simulator` clone (see
+/// `animus-sim`'s own doc: cloning hands out another handle to the SAME
+/// shared world, not a fork) so this can advance virtual time without
+/// needing `&mut Group`.
+fn poll_apply_task_caught_up(nodes: &Nodes, mut sim: Simulator) -> Verdict {
+    let check = || -> Verdict {
+        let mut violations = Vec::new();
+        for (i, n) in nodes.lock().unwrap().iter().enumerate() {
+            let applied = n.engine_applied_index();
+            let commit = n.commit_index();
+            if applied < commit {
+                violations.push(format!(
+                    "replica {i} apply task behind consensus: engine_applied_index={applied} \
+                     < commit_index={commit}"
+                ));
+            }
+        }
+        verdict(violations)
+    };
+    let mut v = check();
+    let poll_deadline = sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
+    while !v.ok && sim.now().0 < poll_deadline {
+        sim.run_for(CONVERGENCE_POLL_STEP);
+        v = check();
+    }
+    v
+}
+
 // ---------------------------------------------------------------------------
 // The scenario runner + result.
 // ---------------------------------------------------------------------------
@@ -1443,6 +1757,7 @@ struct ScenarioResult {
     exclusivity: Verdict,
     allocator_injectivity: Verdict,
     register_cas_integrity: Verdict,
+    apply_task_progress: Verdict,
     final_metas: Vec<Metadata>,
     schema_attempts: Vec<(String, TableSchema)>,
     confirmed_count: usize,
@@ -1450,6 +1765,27 @@ struct ScenarioResult {
 
 fn read_all_metadata(nodes: &Nodes) -> Vec<Metadata> {
     nodes.lock().unwrap().iter().map(|n| n.metadata()).collect()
+}
+
+/// Converged-or-timeout poll for cross-replica `Metadata` agreement — the
+/// same shape/constants `run_scenario`'s own inline loop uses, factored out
+/// here so the bespoke chunked-snapshot tests (PR③, near the bottom of this
+/// file — they don't go through `run_scenario`/`Workload` at all, since their
+/// setup needs to target one SPECIFIC follower rather than a generic
+/// `Nemesis`-selected victim) can reuse it instead of re-deriving the poll
+/// loop. Doesn't assert; the caller checks `check_convergence_meta` on the
+/// result, exactly like `run_scenario` does.
+fn converge_or_timeout(group: &Group) -> Vec<Metadata> {
+    let mut sim = group.sim.clone();
+    let mut metas = read_all_metadata(&group.nodes);
+    let mut convergence = check_convergence_meta(&metas);
+    let poll_deadline = sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
+    while !convergence.ok && sim.now().0 < poll_deadline {
+        sim.run_for(CONVERGENCE_POLL_STEP);
+        metas = read_all_metadata(&group.nodes);
+        convergence = check_convergence_meta(&metas);
+    }
+    metas
 }
 
 fn run_scenario(scenario: &Scenario) -> ScenarioResult {
@@ -1510,6 +1846,7 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     let exclusivity = check_schema_exclusivity(&group.shared, &metas);
     let allocator_injectivity = check_allocator_injectivity(&group.shared);
     let register_cas_integrity = check_register_cas_integrity(&group.shared, &metas);
+    let apply_task_progress = poll_apply_task_caught_up(&group.nodes, group.sim.clone());
     let schema_attempts = group.shared.schema_attempts.lock().unwrap().clone();
     let confirmed_count = group.shared.confirmed_count();
 
@@ -1519,6 +1856,7 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
         exclusivity,
         allocator_injectivity,
         register_cas_integrity,
+        apply_task_progress,
         final_metas: metas,
         schema_attempts,
         confirmed_count,
@@ -1556,20 +1894,12 @@ fn assert_scenario_ok(s: &Scenario, r: &ScenarioResult) {
         "scenario {} violated RegisterNode CAS integrity: {:?} (seed={})",
         s.name, r.register_cas_integrity.violations, s.seed
     );
+    assert!(
+        r.apply_task_progress.ok,
+        "scenario {} apply task stalled behind consensus: {:?} (seed={})",
+        s.name, r.apply_task_progress.violations, s.seed
+    );
 }
-
-// ---------------------------------------------------------------------------
-// Future invariants (PR③) — not implemented here, deliberately left as a
-// hook so this harness doesn't need reshaping to add it:
-//
-// - **#5 apply-task no-double-apply (ADR 0038).** The async apply task never
-//   re-applies the same committed log index twice after a crash-recovery
-//   cycle. This needs the `StopRestart` nemesis (a true process restart:
-//   `sim.stop` + a fresh `RaftNode::start` reopening the SAME
-//   `StorageEngine` handle the crashed node used — see this file's top doc
-//   for why that's deferred to PR③) plus a way to observe the apply task's
-//   own idempotency, not just `Metadata`'s converged end state.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -1674,6 +2004,7 @@ fn control_corpus_covers_the_fault_matrix() {
             Workload::PlainChurn { .. } => "plain_churn",
             Workload::AllocatorRace { .. } => "allocator_race",
             Workload::RegisterCas { .. } => "register_cas",
+            Workload::SustainedChurn { .. } => "sustained_churn",
         });
     }
 
@@ -1692,6 +2023,7 @@ fn control_corpus_covers_the_fault_matrix() {
         Nemesis::Duplicate,
         Nemesis::FsyncLie,
         Nemesis::TornTail,
+        Nemesis::StopRestart,
     ] {
         assert!(
             seen_faults.contains(&f),
@@ -1703,6 +2035,7 @@ fn control_corpus_covers_the_fault_matrix() {
         "plain_churn",
         "allocator_race",
         "register_cas",
+        "sustained_churn",
     ] {
         assert!(
             seen_workloads.contains(w),
@@ -1865,4 +2198,259 @@ fn control_corrupt_on_crash_may_hard_panic_issue_495() {
     group.sim.run_for(DRAIN);
 
     let _ = read_all_metadata(&group.nodes);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked-snapshot-under-fault (PR③).
+//
+// `install_snapshot.rs` already has a genuine multi-chunk transfer test
+// (`follower_catches_up_via_multi_chunk_snapshot`, using a synthetic image)
+// and a re-ship-after-catch-up regression, but neither composes a mid-
+// transfer fault. These two tests do, over a REAL `Metadata` image grown
+// through the actual `meta_apply_and_compact`/`syskv_image` path (never a
+// hand-supplied synthetic blob) — driving real `RaftNode`s under `Simulator`,
+// mirroring `partitioned_follower_catches_up_via_install_snapshot`'s own
+// end-to-end setup rather than `install_snapshot.rs`'s hand-driven
+// `RaftCore`-level tests.
+//
+// **Timing.** This harness's usual fault schedule
+// (`Scenario::faults: Vec<(Duration, Nemesis)>`) is far too coarse for this:
+// an exploratory run (this PR's own development, not committed as code)
+// found the WHOLE multi-chunk transfer — first chunk received through fully
+// reassembled — completes within roughly 3ms of virtual time once the
+// leader starts shipping (no artificial per-chunk delay in this plane's
+// replication path), while a fixed `Duration` schedule targets a fault to
+// land within an early/mid/late window measured in *seconds*. So instead of
+// guessing a duration, `wait_for_snapshot_transfer_in_flight` **polls** at a
+// fine (200µs) step until the receiving follower has demonstrably started
+// (`snapshot_index() > 0`, the core has the base index from at least one
+// received chunk) but not finished (`members` not yet fully reassembled) —
+// a condition-based wait, not a duration guess, so it lands inside the real
+// window regardless of exactly how many microseconds of virtual time that
+// window occupies for a given seed. Both cells assert they actually caught
+// the window (not raced past it) before injecting their fault, so a future
+// change that made the transfer instantaneous (0 virtual time) would fail
+// loudly here instead of silently degrading into a fault-free no-op cell.
+// ---------------------------------------------------------------------------
+
+/// Enough real `UpsertMember` commits to force a genuine multi-chunk
+/// `InstallSnapshot` transfer through the REAL `meta_apply_and_compact`/
+/// `syskv_image` engine-scan path — this PR's own exploratory run measured
+/// a resulting several-hundred-KB syskv image at this count, many multiples
+/// of `SNAPSHOT_CHUNK_BYTES` (1024 bytes).
+const CHUNKED_SNAPSHOT_MEMBERS: u64 = 400;
+
+/// Growth-load command for the chunked-snapshot tests below — a distinct,
+/// high node-id range so it can never collide with any other workload's own
+/// member-id range in this file (not load-bearing here, since these tests
+/// never run concurrently with another workload, but costs nothing and
+/// matches this file's existing convention of disjoint ranges per
+/// workload).
+fn chunk_growth_member(i: u64) -> MetaCommand {
+    MetaCommand::UpsertMember {
+        node: nid(50_000 + i),
+        labels: BTreeMap::new(),
+        status: NodeStatus::Active,
+    }
+}
+
+/// Shared setup for both chunked-snapshot cells: elect, isolate ONE follower
+/// from both other replicas (before any compaction touches it — mirrors
+/// `partitioned_follower_catches_up_via_install_snapshot`'s own setup, one
+/// specific follower rather than a generic `Nemesis`-selected victim, since
+/// these tests need to know exactly which replica will receive the transfer),
+/// grow real state on the healthy majority (leader + the third replica) past
+/// several multiples of `SNAPSHOT_CHUNK_BYTES`, then heal the isolation so
+/// the leader starts shipping `InstallSnapshot` chunks. Returns the running
+/// `Group` plus the leader/follower/third-replica indices at the moment of
+/// return (the leader index is which replica *started* the transfer — a
+/// caller injecting `LeaderKill`-shaped source crash below is what may
+/// change who leads next).
+fn setup_chunked_snapshot_transfer(seed: u64) -> (Group, usize, usize, usize) {
+    let mut group = Group::start(seed, 3);
+    group.sim.run_for(SETTLE);
+    let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+    let (li, _) = leader_slot(&group.nodes).expect("group elected a leader");
+    let leader_id = nid(ids[li]);
+    let follower_idx = (0..3).find(|&i| i != li).expect("a follower exists");
+    let follower_id = nid(ids[follower_idx]);
+    let other_idx = (0..3)
+        .find(|&i| i != li && i != follower_idx)
+        .expect("a third replica exists");
+    let other_id = nid(ids[other_idx]);
+
+    group
+        .sim
+        .partition_pair(follower_id.clone(), leader_id.clone());
+    group
+        .sim
+        .partition_pair(follower_id.clone(), other_id.clone());
+
+    for i in 0..CHUNKED_SNAPSHOT_MEMBERS {
+        if let Some((_, leader)) = leader_slot(&group.nodes) {
+            leader.propose(chunk_growth_member(i));
+        }
+    }
+    // Let the healthy majority (leader + third replica) commit, apply, and
+    // compact — the isolated follower learns nothing.
+    group.sim.run_for(Duration::from_secs(3));
+
+    group.sim.heal(follower_id.clone(), leader_id);
+    group.sim.heal(follower_id, other_id);
+
+    (group, li, follower_idx, other_idx)
+}
+
+/// Poll in fine (`STEP`) increments of virtual time until the receiving
+/// follower has demonstrably started but not finished its `InstallSnapshot`
+/// transfer — see this section's own top doc for why a fixed-duration
+/// schedule can't reliably land inside this window. Returns `true` if it
+/// caught the window; `false` if the transfer either never started or had
+/// already fully completed by `max_wait` (a caller must treat `false` as a
+/// failure to exercise the fault window, not silently proceed).
+fn wait_for_snapshot_transfer_in_flight(
+    group: &Group,
+    follower_idx: usize,
+    target_members: usize,
+    max_wait: Duration,
+) -> bool {
+    const STEP: Duration = Duration::from_micros(200);
+    let mut sim = group.sim.clone();
+    let deadline = sim.now().0 + max_wait.as_nanos() as u64;
+    while sim.now().0 < deadline {
+        let (started, done) = {
+            let nodes = group.nodes.lock().unwrap();
+            let f = &nodes[follower_idx];
+            (
+                f.snapshot_index() > 0,
+                f.metadata().members.len() >= target_members,
+            )
+        };
+        if started && !done {
+            return true;
+        }
+        if done {
+            return false; // raced past the window before this poll caught it
+        }
+        sim.run_for(STEP);
+    }
+    false
+}
+
+/// Isolate a follower before compaction, grow real `Metadata` past
+/// `SNAPSHOT_CHUNK_BYTES`'s multi-chunk threshold, heal, and — while chunks
+/// are demonstrably still in flight to the follower — crash the SOURCE
+/// leader (`Nemesis::LeaderKill`'s own `sim.crash`, muted-and-resumable, not
+/// `StopRestart`: what matters here is that the group re-elects and a
+/// DIFFERENT node becomes leader mid-transfer, not that the old leader's
+/// engine specifically survives a real process exit — `chunked_snapshot_
+/// receiver_stop_restart_3` below is the cell that exercises a genuine
+/// engine-reopening restart). Proves the "lazy, on-demand, dropped-when-idle"
+/// snapshot-blob contract (`node.rs`'s `meta_apply_and_compact` doc) survives
+/// a leadership change mid-transfer: the fresh leader must rebuild its own
+/// image on demand and resume shipping correctly rather than leaving the
+/// follower stuck on a base it can never complete. No existing fixed test in
+/// this crate covers this composition.
+#[test]
+fn chunked_snapshot_source_crash_mid_transfer_3() {
+    let seed = corpus::name_seed("chunked_snapshot_source_crash_mid_transfer_3");
+    let (mut group, _li, follower_idx, _other_idx) = setup_chunked_snapshot_transfer(seed);
+
+    let caught = wait_for_snapshot_transfer_in_flight(
+        &group,
+        follower_idx,
+        CHUNKED_SNAPSHOT_MEMBERS as usize,
+        Duration::from_secs(2),
+    );
+    assert!(
+        caught,
+        "never caught the InstallSnapshot transfer in flight — the fault \
+         window was missed entirely (seed={seed})"
+    );
+
+    // Crash the CURRENT source leader mid-transfer (`Nemesis::LeaderKill`'s
+    // own selection re-derives the leader fresh, so this is correct even if
+    // it's no longer `ids[li]` for some other reason by this point).
+    group.apply(Nemesis::LeaderKill);
+
+    group.sim.run_for(Duration::from_secs(4)); // re-elect + fresh leader resumes shipping
+    group.heal_all();
+    group.sim.run_for(DRAIN);
+
+    let metas = converge_or_timeout(&group);
+    let convergence = check_convergence_meta(&metas);
+    assert!(
+        convergence.ok,
+        "did not converge after a source-leader crash mid-InstallSnapshot-transfer: {:?} \
+         (seed={seed})",
+        convergence.violations
+    );
+    assert_eq!(
+        metas[0].members.len(),
+        CHUNKED_SNAPSHOT_MEMBERS as usize,
+        "converged state lost members across the mid-transfer leader crash (seed={seed})"
+    );
+    let apply_progress = poll_apply_task_caught_up(&group.nodes, group.sim.clone());
+    assert!(
+        apply_progress.ok,
+        "apply task stalled after a mid-transfer source-leader crash: {:?} (seed={seed})",
+        apply_progress.violations
+    );
+}
+
+/// Same setup as the source-crash cell above, but `StopRestart`s the
+/// RECEIVING follower itself mid-chunk-transfer instead of the source
+/// leader: a genuine `sim.stop` (tasks + volatile state, including
+/// whatever partial chunks `RaftCore` had assembled in memory, all gone) +
+/// fresh `RaftNode::start` reopening the SAME retained engine handle.
+/// Proves a partially-received image is safely discarded on a real restart
+/// — the reconstructed node starts from a clean `meta_apply_loop` rebuild
+/// (`rebuild_metadata_from_engine` + the engine's own `syskv::
+/// applied_index_key()` watermark) and simply re-requests the snapshot from
+/// scratch, rather than the partial in-flight chunk state ever leaking into
+/// `shadow`/`cache`.
+#[test]
+fn chunked_snapshot_receiver_stop_restart_3() {
+    let seed = corpus::name_seed("chunked_snapshot_receiver_stop_restart_3");
+    let (mut group, _li, follower_idx, _other_idx) = setup_chunked_snapshot_transfer(seed);
+    let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+
+    let caught = wait_for_snapshot_transfer_in_flight(
+        &group,
+        follower_idx,
+        CHUNKED_SNAPSHOT_MEMBERS as usize,
+        Duration::from_secs(2),
+    );
+    assert!(
+        caught,
+        "never caught the InstallSnapshot transfer in flight — the fault \
+         window was missed entirely (seed={seed})"
+    );
+
+    // A real process restart of the RECEIVER, mid-chunk-transfer.
+    group.stop_node(ids[follower_idx]);
+
+    group.sim.run_for(Duration::from_secs(4)); // the fresh node re-requests + re-catches-up
+    group.heal_all();
+    group.sim.run_for(DRAIN);
+
+    let metas = converge_or_timeout(&group);
+    let convergence = check_convergence_meta(&metas);
+    assert!(
+        convergence.ok,
+        "did not converge after a receiver StopRestart mid-InstallSnapshot-transfer: {:?} \
+         (seed={seed})",
+        convergence.violations
+    );
+    assert_eq!(
+        metas[0].members.len(),
+        CHUNKED_SNAPSHOT_MEMBERS as usize,
+        "converged state lost members across the mid-transfer receiver restart (seed={seed})"
+    );
+    let apply_progress = poll_apply_task_caught_up(&group.nodes, group.sim.clone());
+    assert!(
+        apply_progress.ok,
+        "apply task stalled after a mid-transfer receiver StopRestart: {:?} (seed={seed})",
+        apply_progress.violations
+    );
 }

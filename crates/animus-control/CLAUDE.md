@@ -935,7 +935,21 @@ must carry one stable identity (table + range) throughout the run, catching
 a transient double-assignment even if a later poll happens to "correct" it
 back; (5) **`RegisterNode` CAS integrity** (PR②, safety, unconditional) —
 `Workload::RegisterCas`'s `check_register_cas_integrity`, mirroring check 3's
-shape over `Metadata::node_addrs` instead of `Metadata::schemas`.
+shape over `Metadata::node_addrs` instead of `Metadata::schemas`; (6)
+**apply-task liveness / no-permanent-stall** (PR③, safety, unconditional on
+EVERY scenario) — `poll_apply_task_caught_up`: after convergence,
+`RaftNode::engine_applied_index()` must catch up to `RaftNode::commit_index()`
+on every live replica within the same converged-or-timeout budget check (1)
+uses. Deliberately a **separate** property from (1): a uniformly-stalled
+apply task (every replica stuck at the same stale-but-consistent `Metadata`)
+still looks "converged" to (1), which only ever compares replicas against
+each other, never against the group's own `commit_index`. No separate
+double-apply probe was added — checks (3)/(4) already catch a double-apply
+if one ever happened (a double-applied `CreateTablet` would violate
+injectivity or be naturally idempotent; a double-applied `CreateTableSchema`
+would violate exclusivity if it somehow un-rejected on replay), so
+`StopRestart`'s own cells just need to actually exercise those existing
+checks post-recovery, which they do (`assert_scenario_ok` runs unconditionally).
 
 **Gotchas this corpus's own build found** (see `docs/engineering-lessons.md`
 for the full write-ups): (a) a racing proposer's confirm loop must decide
@@ -960,36 +974,67 @@ that shares the codec but not the downstream invariant the corruption has
 to trip — confirmed absent here across an 80-combination sweep (this
 plane's commands carry no HLC timestamp, and its CAS/epoch checks reject a
 mismatch rather than asserting on one); see
-`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc.
+`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc. (d) PR③:
+`Simulator::crash`+`Simulator::restart` (mutes/re-arms the SAME still-live
+tasks) is **not** a stand-in for a real process restart — proving the ADR
+0038 apply task's restart-recovery path (`meta_apply_loop`'s engine rebuild
++ watermark reseed) needs `Simulator::stop` (removes the tasks entirely)
+followed by a genuinely fresh `RaftNode::start` reopening the SAME retained
+engine handle; see `docs/engineering-lessons.md` for the general form of
+this lesson. (e) PR③: a real multi-chunk `InstallSnapshot` transfer, once
+shipping starts, completes in on the order of single-digit milliseconds of
+virtual time in this plane (no artificial per-chunk delay) — a
+fixed-`Duration` fault schedule aimed at "mid-transfer" will usually miss
+entirely; a condition-based poll (has the receiver started but not
+finished) is what actually lands inside the window regardless of a given
+seed's exact timing (`wait_for_snapshot_transfer_in_flight`).
 
-**Scope as of PR②** (`AllocatorRace` + `RegisterCas` workloads,
-`Duplicate`/`FsyncLie`/`TornTail` nemeses): `Workload::SchemaRace` (2-3
-concurrent proposers racing `CreateTableSchema`, same-table or
+**Scope as of PR③ (final — the stack is complete)**: `Workload::SchemaRace`
+(2-3 concurrent proposers racing `CreateTableSchema`, same-table or
 distinct-name), `Workload::PlainChurn` (non-contending `UpsertMember`, the
 non-vacuity floor), `Workload::AllocatorRace` (several proposers racing
 `CreateTablet`/`BeginSplit` against ONE shared table/tablet, hammering
-`Metadata::next_tablet_id`/`next_free_tablet_id()`), and
-`Workload::RegisterCas` (several proposers each claiming a distinct node id
-then attempting one deterministic differing-re-registration collision
-against their own claim — lifts `register_node_cas.rs`'s fixed-single-seed
-CAS proof into this corpus's fault matrix) — over a nemesis set:
+`Metadata::next_tablet_id`/`next_free_tablet_id()`), `Workload::RegisterCas`
+(several proposers each claiming a distinct node id then attempting one
+deterministic differing-re-registration collision against their own claim —
+lifts `register_node_cas.rs`'s fixed-single-seed CAS proof into this
+corpus's fault matrix), and (PR③) `Workload::SustainedChurn` (like
+`PlainChurn` but 50 rounds/proposer instead of 3, driving the log well past
+`SNAPSHOT_THRESHOLD` so a swept `StopRestart` has real in-flight
+apply-task/compaction state to interrupt) — over a nemesis set:
 `LeaderKill`/`FollowerKill`/`PartitionLeader`/`SplitBrain`/`Lossy`/
 `Duplicate` (`NetConfig::set_duplicate_prob`)/`FsyncLie`
 (`DiskConfig::set_fsync_lie_prob`)/`TornTail` (`DiskConfig::
-torn_tail_on_crash`, composed with a crash). `heal_all` resets **both**
-`NetConfig` and `DiskConfig` to default now — required for
-`FsyncLie`/`TornTail`, which are armed globally with no auto-expiry (PR①
-never used `DiskConfig` at all). `CorruptOnCrash` is deliberately **not** a
-`Nemesis` variant (issue #495 above); the one cell exercising that
-composition is a dedicated, always-`#[ignore]`d test, never part of the
-asserted `corpus_cells()` set. Deliberately **not yet included**:
-`StopRestart` (needs `RaftNode::start` to reopen the *same* `StorageEngine`
-handle a crashed node used, deferred alongside the apply-task-no-double-apply
-invariant it exists to probe) — an explicit hook left in the file's own
-"Future invariants" comment for PR③ to fill in without reshaping the
-harness. Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen
-cells; held green at `=15` and `=40` during PR②'s own validation). A
-structural `control_corpus_covers_the_fault_matrix` guard keeps the
-nemesis/workload matrix honest, mirroring `raftkv_corpus_covers_the_fault_
-matrix` — it deliberately does not (and must not) require the `#[ignore]`d
+torn_tail_on_crash`, composed with a crash)/(PR③) `StopRestart` (a REAL
+process restart — `sim.stop` + a fresh `RaftNode::start` reopening the SAME
+retained `MemoryEngine` handle, `Group::engines` — categorically different
+from `LeaderKill`/`FollowerKill`'s `sim.crash`, which mutes the SAME
+still-live tasks and never exercises `meta_apply_loop`'s restart-recovery
+path at all). `heal_all` resets **both** `NetConfig` and `DiskConfig` to
+default — required for `FsyncLie`/`TornTail`, which are armed globally with
+no auto-expiry (PR① never used `DiskConfig` at all). `CorruptOnCrash` is
+deliberately **not** a `Nemesis` variant (issue #495 above); the one cell
+exercising that composition is a dedicated, always-`#[ignore]`d test, never
+part of the asserted `corpus_cells()` set.
+
+**PR③'s two chunked-snapshot-under-fault tests** (`chunked_snapshot_
+source_crash_mid_transfer_3`, `chunked_snapshot_receiver_stop_restart_3`) are
+deliberately **outside** `corpus_cells()`/`Workload`/`Nemesis` — they grow a
+REAL `Metadata` image through the actual `meta_apply_and_compact`/
+`syskv_image` path until it forces a genuine multi-chunk `InstallSnapshot`
+transfer, then inject a source-leader crash or a receiver `StopRestart`
+while chunks are demonstrably still in flight
+(`wait_for_snapshot_transfer_in_flight`, a condition-based poll rather than
+a duration guess — an exploratory run found the whole transfer completes
+within ~3ms of virtual time once shipping starts, too narrow a window for
+this harness's `Vec<(Duration, Nemesis)>` schedule to land inside
+reliably). Fixed-single-seed regressions (like `install_snapshot.rs`'s own
+tests), not part of the `ANIMUS_CONTROL_SEEDS` seed-expansion.
+
+Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen cells; held
+green at `=15` and `=40` during both PR②'s and PR③'s own validation; now
+wired into CI's nightly `corpus-deep.yml`, default `40`). A structural
+`control_corpus_covers_the_fault_matrix` guard keeps the nemesis/workload
+matrix honest, mirroring `raftkv_corpus_covers_the_fault_matrix` — it
+deliberately does not (and must not) require the `#[ignore]`d
 corrupt-on-crash cell to be part of the asserted set.
