@@ -12,6 +12,10 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
+      raftkv_wal_faults_seeds:
+        description: "Seeds per single-crash cell (ANIMUS_RAFTKV_SEEDS with ANIMUS_RAFTKV_WAL_FAULTS=1, ADR 0017 raftkv linearizability corpus, torn/corrupt-on-crash WAL tier)"
+        required: false
+        default: "40"
       txn_seeds:
         description: "Seeds per structural cell (ANIMUS_TXN_SEEDS, ADR 0018 multi-tablet txn corpus)"
         required: false
@@ -78,6 +82,22 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      # ADR 0017's raftkv corpus, WAL-faults tier: a second full pass of the
+      # corpus's single-crash cells (LeaderKill/FollowerKill) over
+      # MemoryEngine, with torn_tail_on_crash + corrupt_on_crash armed for
+      # the whole run — a new engine-tier axis alongside ANIMUS_RAFTKV_LSM
+      # (this crate's sibling nightly steps for the plain MemoryEngine/LSM
+      # tiers land alongside this one as this stack's other PRs merge). Off
+      # by default (ANIMUS_RAFTKV_WAL_FAULTS=1 required); the WAL's on-disk
+      # record framing has no per-record checksum, so a genuine failure
+      # surfacing here at depth is a real finding, not a flaky test — see
+      # `wal_fault_disk_config`'s doc in `raftkv_linearizable.rs`.
+      - name: deep raftkv linearizability corpus (ADR 0017 WAL faults)
+        env:
+          ANIMUS_RAFTKV_WAL_FAULTS: "1"
+          ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_wal_faults_seeds || '40' }}
+        run: cargo test -p animus-test --test raftkv_linearizable raftkv_wal_faults_corpus_is_linearizable -- --nocapture
 
       # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
       # (stage/commit/resolve + the recovery push) under fault injection,

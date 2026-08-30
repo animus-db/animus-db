@@ -116,6 +116,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SEED` | unset | replay one sim run from its printed seed |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | raftkv-corpus depth (`animus-test`) |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
+| `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |

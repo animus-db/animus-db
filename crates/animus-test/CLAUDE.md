@@ -48,6 +48,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_SEED` | unset | replay one failed sim run from its printed seed (repo-wide convention) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
+| `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's `LeaderKill`/`FollowerKill` cells with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
@@ -204,32 +205,72 @@ retrievable from git history.)
   *eventual* (a lagging follower catches up via log/snapshot), so they use the same
   **converged-or-timeout** poll every corpus in this crate does (see "What's
   non-obvious" above).
-- Frozen, name-seeded scenario set (29 cells): baselines + leader-kill /
+- Frozen, name-seeded scenario set (37 cells): baselines + leader-kill /
   follower-kill / partition-leader / lossy × early/mid/late × 3- and 5-replica,
   **plus a deepened tier** — `stop_restart`
   (a true process restart: `sim.stop` + a fresh `RaftKvNode::start` on the same
   id, recovering from the durable WAL — the CP recovery path), `split_brain`
-  (full-mesh partition, no majority anywhere), `leader_minority` (5-replica:
-  leader isolated *with* a minority — the stale-read window), and compound
-  `lossy`+`stop_restart`. Deepened cells carry a non-zero `Scenario::window`
+  (full-mesh partition, no majority anywhere), `chaos` (ADR 0061 Decision 3's
+  compound ambient network fault, below — folded into the same
+  `CORPUS_FAULTS_DEEP` early/mid/late × 3-/5-replica grid the other two use),
+  `leader_minority` (5-replica: leader isolated *with* a minority — the
+  stale-read window), compound `lossy`+`stop_restart`, `fsync_lie`+
+  `stop_restart` (below) × early/mid/late, and `heavy_tail`+`leader_minority`
+  (below). Deepened cells carry a non-zero `Scenario::window`
   (the runner holds the fault open before healing, so the group rides out a real
   outage); the original cells keep `window == 0` and their runs are
   **byte-identical** to the pre-deepening corpus (verified against captured
   histories when the tier landed). Depth knob **`ANIMUS_RAFTKV_SEEDS`** (default
-  1 = byte-identical frozen set; held green at depth 20 / 580 scenarios). A
+  1 = byte-identical frozen set; held green at depth 20). A
   structural `raftkv_corpus_covers_the_fault_matrix` guard keeps the matrix
   honest. The teeth-proof is the shared `negative_control.rs` (same
   `check_cycles`).
+- **`animus-sim`'s fault-injection vocabulary wired in (ADR 0061 Decision 3,
+  the first corpus to use it)**: three new `Nemesis` variants apply
+  `animus-sim`'s proven-but-previously-unused primitives. `FsyncLie`
+  (`DiskConfig::set_fsync_lie_prob`, global) is on its own an observable
+  no-op — a lied-to `sync` is transparent to `read` — so it is only ever
+  scheduled composed with a following `StopRestart` (`fsync_lie_stop_restart_
+  {early,mid,late}_3`), the crash that reveals whatever the lie actually
+  lost. `Chaos` (`NetConfig`, global: drop 5% + duplicate 10% + corrupt 5%
+  folded together) probes several degraded-network modes landing on one run
+  at once, rather than `Lossy`'s single fault. `HeavyTail`
+  (`NetConfig::set_heavy_tail_prob` + `heavy_tail_max_jitter`, global) models
+  occasional multi-second delivery and is only ever scheduled composed with
+  `LeaderMinority` (`heavy_tail_leader_minority_mid_5`), to check the
+  ReadIndex read-timeout path doesn't misclassify under episodic extreme
+  latency. **`Group::heal_all` gained a `DiskConfig::default()` reset
+  alongside its pre-existing `NetConfig::default()` one** — required the
+  moment a `Nemesis` variant could set a global `DiskConfig` at all
+  (`FsyncLie`), else a fired lie would keep lying for the rest of the
+  scenario past its intended fault window, silently invalidating every cell
+  that runs after it in the same scenario (see
+  `docs/engineering-lessons.md`'s entry on this).
 - **Engine tiers:** the corpus runs on `MemoryEngine` (always-on) and on
   **`LsmEngine<SimEnv>`** — the durable path (real WAL/SSTable recovery through
   the deterministic disk seam) that production actually runs; no corpus drove it
   under faults before. A 4-scenario representative LSM subset (baseline, a kill,
   the WAL-recovering `stop_restart`, the compound) runs by default;
   **`ANIMUS_RAFTKV_LSM=1`** runs the *whole* corpus over the LSM engine
-  (composable with `ANIMUS_RAFTKV_SEEDS`; held green at ×10 / 290 scenarios).
+  (composable with `ANIMUS_RAFTKV_SEEDS`).
   A `StopRestart` on this tier re-opens the engine via `LsmEngine::open_with`
   on the same per-node prefix — engine recovery *plus* Raft-WAL re-apply
-  (idempotent).
+  (idempotent). **`ANIMUS_RAFTKV_WAL_FAULTS=1`** is a third, orthogonal axis
+  (default off): a second full pass of just the corpus's single-crash cells
+  (`LeaderKill`/`FollowerKill`) over `MemoryEngine`, with
+  `DiskConfig{torn_tail_on_crash: true, corrupt_on_crash: true, ..}` armed
+  globally once at group start (not scheduled/reset by `Nemesis`/`heal_all`
+  the way `FsyncLie` is — it stays armed for the whole run, since the point
+  is that *every* crash the scenario's own schedule triggers tears/corrupts
+  its un-synced WAL tail). **Caveat**: the Raft WAL's on-disk record framing
+  (`animus_control::persist::PersistedState::encode_record`, reused by this
+  plane's own `raftkv.wal`) is plain newline-terminated `serde_json` with no
+  per-record checksum — a bit-flip landing inside a byte that keeps the JSON
+  syntactically valid could produce an undetected-corrupt record rather than
+  a decode error, so a `check_cycles`/`check_durability`/`check_convergence`
+  failure surfacing from this pass at depth is a **real finding**, not a
+  reason to weaken the fault rate or the assertion (see
+  `wal_fault_disk_config`'s own doc in `raftkv_linearizable.rs`).
 - **`ANIMUS_SHRINK` wiring (ADR 0061 rung B4)** — this is the worked example
   the "Failure minimization" section above points to. `Scenario`/`Nemesis`
   derive `Serialize`/`Deserialize`; `scenario_candidates` reduces the fault
