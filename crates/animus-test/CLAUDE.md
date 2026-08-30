@@ -529,13 +529,36 @@ retrievable from git history.)
   split_during_backfill_converges_with_correct_final_gsi`.
 - **Frozen named cells**: `single_tablet_backfill_converges`,
   `live_writes_race_the_sweep`, `leader_kill_mid_sweep`,
-  `two_indexes_creating_independently`, `drop_table_mid_backfill` (the two
+  `two_indexes_creating_independently`, `drop_table_mid_backfill`,
+  `streamed_mid_backfill_seed_flag_never_misclassified` (the original two
   zero-copy-split cells — `concurrent_split_during_backfill`,
   `split_after_tablet_already_reported_done` — died in ADR 0050 Train B
-  rung 2, see the file's tombstone; split-during-backfill returns on the
-  copy-based mechanism in the cutover rungs). Depth knob `ANIMUS_BACKFILL_SEEDS` (default
-  1 = the frozen cells; held green at `=40` in well under a second,
-  matching `corpus-deep.yml`'s nightly tier).
+  rung 2, modeling a split mechanism that no longer exists; see the file's
+  own tombstone comment for the historical account). **Rebuilt on the
+  in-place atomic fork (ADR 0058), the DEFAULT production split path**:
+  `split_during_backfill_converges` (cutover fired deliberately BEFORE the
+  parent's own backfill sweep finishes — `CutoverSplit`'s in-place branch
+  carries no drain/backfill veto of its own, so this is a real race a
+  production split can hit; both children converge their own sweep
+  independently afterward, from the EMPTY `KIND_CURSOR` scope
+  `trim_split_child` unconditionally leaves them with) and
+  `split_after_tablet_already_reported_done` (the G1 orphan-report case:
+  the parent already reported completion before the split even began;
+  `CutoverSplit` leaves that stale `index_backfill` row behind as a
+  harmless orphan, and the completion aggregator must wait for both
+  children's own independent reports instead of counting it). Both drive
+  the whole fork/materialize/cutover sequence through
+  `animus_cp_data::host::Reconciler`, mirroring
+  `animus-cp-data/tests/inplace_split_reconciler.rs`'s own harness shape
+  (a local `drive`/`tick_one`/`converge` trio, since `Reconciler::tick`
+  polls internally via `env.sleep` and integration test binaries can't
+  share private items) — then wrap the converged children's `RaftKvNode`
+  handles back into this file's own plain `Group` so every pre-existing
+  helper (`elect`/`backfill_seed_tick`/`drive_sweep_to_completion`/
+  `mark_backfilled`/`maybe_flip_active`/`assert_full_coverage`, …) runs on
+  a split child completely unmodified. Depth knob `ANIMUS_BACKFILL_SEEDS`
+  (default 1 = the frozen cells; held green at `=300` in ~1.5s, well past
+  `corpus-deep.yml`'s nightly `=40` tier).
 - **A real, previously-undetected bug this corpus found on its very first
   run, at every seed** (not just under fault injection — a structural
   defect, reproducible without any injected fault at all): the backfill
