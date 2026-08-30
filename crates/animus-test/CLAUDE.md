@@ -752,6 +752,29 @@ retrievable from git history.)
   branches in `persist_wal` are `assert!(halted.load(..), ..)`, and this
   corpus's scenarios never call the per-node `shutdown()` that sets
   `halted`, so firing either on a live node hard-panics the test process.
+- **Cell 14 (ADR 0058 Train 2 rung 3) rebuilds the §6 re-planning claim on
+  the DEFAULT production split path — the in-place atomic fork — alongside
+  (never replacing) `split_races_capture_and_replans_onto_descendants`'s
+  own copy-based cell above**: `inplace_split_races_capture_and_replans_
+  onto_descendants` cuts over deliberately before the parent's own capture
+  finishes (`CutoverSplit`'s in-place branch carries no freeze/veto gate of
+  its own), then proves the identical §6 claim — the manifest's authoritative
+  tablet list ends up naming exactly the two children, never the retired
+  parent, with no row ever double-counted. **The lightest of the three
+  in-place ports** (mirroring `backfill_fault_corpus.rs`'s/`stream_lineage_
+  corpus.rs`'s own pair): the §6 re-planning logic under test
+  (`Metadata::backup_capture_target`/`live_split_descendants`/
+  `backup_ready_to_complete`/`backup_manifest_tablet_progress`) only ever
+  reads `Metadata::split_lineage`, entirely split-mechanism-agnostic, so
+  swapping the trigger for `BeginSplitInPlace`/`CutoverSplit` driven through
+  `animus_cp_data::host::Reconciler` (the same local `tick_one`/`converge`
+  pair the two sibling ports use) is the whole port — and real in-place
+  fork+materialize clones+trims each child's own share of the parent's data
+  automatically, eliminating the copy-based cell's manual per-row copy loop
+  entirely rather than merely relocating it. Held clean at
+  `ANIMUS_BACKUP_SEEDS=300` with no regression to the other twelve cells in
+  the file — no §6/double-count violation surfaced; the in-place split's
+  interaction with backup capture behaves exactly as designed.
 
 ### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 
