@@ -66,7 +66,7 @@ use animus_cp_data::{KIND_BASE, KIND_CURSOR, RaftKvNode};
 use animus_dynamo::index as dynamo_index;
 use animus_dynamo::{AttributeValue, ChangeRecord, storage_key};
 use animus_env::nid;
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, partition_token};
 use animus_test::corpus;
@@ -1056,5 +1056,421 @@ fn streamed_mid_backfill_seed_flag_never_misclassified() {
     for_each_seed(
         "streamed_mid_backfill_seed_flag_never_misclassified",
         scenario_streamed_mid_backfill_seed_flag_never_misclassified,
+    );
+}
+
+// ============================================================================
+// `Env`-level fault-primitive cells (ADR 0061 Decision 3) — new cells only,
+// each a close copy of an existing one above with one or two added fault
+// calls. Per this corpus's own doctrine (ADR 0014), none of the cells above
+// are modified; these are purely additive. `NetConfig::set_corrupt_prob` is
+// deliberately never used here: as of this branch, `animus-cp-data::codec`'s
+// `Vec::with_capacity(n as usize)` call sites read an untrusted wire length
+// prefix with no upper-bound check, so a corrupted message near `u32::MAX`
+// risks an allocator abort rather than a clean application-level error — out
+// of scope until that fix lands (mirrors the conservative choice every
+// sibling corpus made for the identical reason). `DiskConfig::
+// set_enospc_prob`/`set_error_prob` are excluded for a different reason:
+// their error branches in `persist_wal` are `assert!(halted.load(..), ..)`,
+// and this corpus's scenarios never call the per-node `shutdown()` that sets
+// `halted` — firing either on a live node hard-panics the whole test
+// process.
+// ============================================================================
+
+// --- cell 8: duplicate_proposals_leader_kill_mid_sweep ----------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`] with one added fault: a global
+/// [`NetConfig::set_duplicate_prob`] of 0.15, active from before the first
+/// write — every surviving message may be delivered twice, each copy with
+/// its own independent delay draw. Proves the seeder's own coverage
+/// tracking and the completion aggregator's tally are correct under
+/// duplicated Raft traffic, not just a clean network: a duplicated
+/// `AppendEntries`/vote/proposal message must never double-seed a partition
+/// (the cursor's own forward-only advance already makes re-scanning a
+/// covered partition a no-op) and must never corrupt the final tally the
+/// aggregator flips `Active` on.
+fn scenario_duplicate_proposals_leader_kill_mid_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_duplicate_prob(0.15);
+    sim.set_net_config(net_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded_before_kill, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded_before_kill, SEED_BATCH);
+
+    // Kill the exact leader just written through, same discipline as
+    // `leader_kill_mid_sweep`.
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let _new_leader = elect(&mut sim, &group, &live, seed);
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "duplicate proposals + leader kill",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        24,
+        "[seed={seed}] duplicated Raft traffic must never manufacture or drop a partition"
+    );
+}
+
+#[test]
+fn duplicate_proposals_leader_kill_mid_sweep() {
+    for_each_seed(
+        "duplicate_proposals_leader_kill_mid_sweep",
+        scenario_duplicate_proposals_leader_kill_mid_sweep,
+    );
+}
+
+// --- cell 9: wal_fsync_lie_leader_kill_mid_sweep ----------------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`] with one added fault: a global
+/// [`DiskConfig::set_fsync_lie_prob`] of 0.3, active from before the first
+/// write. `sync` on any node may now return `Ok` while silently leaving the
+/// synced bytes un-synced — transparent to every read until a crash reveals
+/// it. Proves the backfill cursor's own durability claim survives a
+/// lied-to `sync` on the crashing leader: `confirm` only ever treats a
+/// write as durable via the tablet's own *applied* index, which only
+/// advances once a majority holds the entry, so a lie on the crashing node
+/// alone (the survivors never crash in this scenario, so their own
+/// tails — lied to or not — are never revealed) can at most delay
+/// convergence, never leave backfill progress ahead of what is actually
+/// durable.
+fn scenario_wal_fsync_lie_leader_kill_mid_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.set_fsync_lie_prob(0.3);
+    sim.set_disk_config(disk_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded_before_kill, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded_before_kill, SEED_BATCH);
+
+    let cursor_key_bytes = cursor::cursor_key(&group.range.start, &tag);
+    let cursor_before_kill =
+        block_on(group.nodes[leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+    assert!(cursor_before_kill.is_some());
+
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+    let mut cursor_after_kill = None;
+    for _ in 0..200 {
+        cursor_after_kill =
+            block_on(group.nodes[new_leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+        if cursor_after_kill == cursor_before_kill {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert_eq!(
+        cursor_after_kill, cursor_before_kill,
+        "[seed={seed}] the newly-elected leader must converge to the identical durably-committed \
+         cursor even under a lied-to fsync on the crashing leader"
+    );
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(&group.nodes[leader], seed, "fsync lie + leader kill");
+}
+
+#[test]
+fn wal_fsync_lie_leader_kill_mid_sweep() {
+    for_each_seed(
+        "wal_fsync_lie_leader_kill_mid_sweep",
+        scenario_wal_fsync_lie_leader_kill_mid_sweep,
+    );
+}
+
+// --- cell 10: backfill_cursor_wal_torn_on_restart ---------------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`]'s crash technique, but a true
+/// process restart under a torn/corrupted WAL tail rather than a live
+/// crash-and-failover: a global `DiskConfig{torn_tail_on_crash: true,
+/// corrupt_on_crash: true, ..}`, set right after `Simulator::new`, in effect
+/// for every node's disk throughout.
+///
+/// `torn_tail_on_crash`/`corrupt_on_crash` only fire inside
+/// [`Simulator::crash`], never [`Simulator::stop`] (`stop` unconditionally
+/// drops any un-synced buffer with no tear/corrupt consideration), so
+/// getting an actual torn/corrupted tail on the node's Raft-log WAL ahead of
+/// a genuine fresh-process restart needs one extra step versus a pure
+/// `stop`-based restart: `sim.crash` first (applies the tear/corruption to
+/// whatever was buffered-but-unsynced at that instant — this corpus's
+/// `MemoryEngine` tier makes the state machine itself a durable stand-in,
+/// shared with the fresh node via `.clone()`, exactly as every other
+/// restart cell in this crate already relies on; only the node's own raw
+/// Raft-log disk bytes are torn/corrupted here), then `sim.restart` purely
+/// to clear the `crashed` flag `crash` sets (a `crashed` node's sends/
+/// deliveries are dropped forever until `restart` clears it), then
+/// `sim.stop` to drop the harmlessly re-armed (never re-polled — no
+/// `run_for` happens in between) old tasks before handing off to a
+/// genuinely fresh `RaftKvNode::start_hosted` on the same id and the same
+/// durable (post-tear) engine state. Crucially, the restarted node itself
+/// goes on to serve the remainder of the sweep and is the node
+/// [`assert_full_coverage`] reads from at the end — the cursor recovery
+/// this cell exists to prove is read back by continuing real work, not
+/// merely asserted once and abandoned (a crash-only fault otherwise has
+/// zero test teeth).
+fn scenario_backfill_cursor_wal_torn_on_restart(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.torn_tail_on_crash = true;
+    disk_cfg.corrupt_on_crash = true;
+    sim.set_disk_config(disk_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let mut group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded, SEED_BATCH);
+
+    // Crash (applies the configured torn/corrupted-tail fault to whatever
+    // was buffered-but-unsynced on this node's own Raft-log disk at this
+    // instant), then restart-then-stop purely to clear the `crashed` flag
+    // before handing off to a genuinely fresh process on the same id and
+    // the same durable (post-tear) state — see the scenario's own doc.
+    let restarted_id = NODES[leader];
+    sim.crash(nid(restarted_id));
+    sim.restart(nid(restarted_id));
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        engines[&restarted_id].clone(),
+        animus_cp_data::StorageScope::new(group.range.clone()),
+        group.id.0,
+    );
+    group.nodes[leader] = fresh;
+    sim.run_for(Duration::from_secs(2));
+
+    // Post-recovery activity that actually reads the restarted node's own
+    // state back: drive the sweep to completion (which re-elects a leader
+    // every tick — possibly the restarted node itself, possibly a
+    // survivor — and always reads `KIND_CURSOR` from whichever node wins),
+    // then confirm full coverage directly from the restarted node.
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "post torn/corrupted-WAL restart, read directly from the restarted node",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        24,
+        "[seed={seed}] the restarted node's own recovered state must see every partition"
+    );
+}
+
+#[test]
+fn backfill_cursor_wal_torn_on_restart() {
+    for_each_seed(
+        "backfill_cursor_wal_torn_on_restart",
+        scenario_backfill_cursor_wal_torn_on_restart,
+    );
+}
+
+// --- cell 11: chaotic_network_live_writes_race_the_sweep --------------------
+
+/// Near-copy of [`live_writes_race_the_sweep`] with one added fault: a
+/// compound [`NetConfig`] (5% drop, 10% duplicate — [`NetConfig::
+/// set_duplicate_prob`]'s own independent-delay-draw-per-copy semantics)
+/// active for the group's entire lifetime, not just during the sweep.
+/// Proves the seeder's own coverage claim — "every partition that ever held
+/// a row gets at least one dirty marker" — holds under a genuinely lossy,
+/// duplicating network, not just the near-reliable default every other cell
+/// in this file runs under, through ordinary Raft retry alone (nothing
+/// backfill-specific).
+fn scenario_chaotic_network_live_writes_race_the_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_drop_prob(0.05);
+    net_cfg.set_duplicate_prob(0.1);
+    sim.set_net_config(net_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..12 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("pre{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    for round in 0..4 {
+        let leader = elect(&mut sim, &group, &live, seed);
+        backfill_seed_tick(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &tag,
+            SEED_BATCH,
+            seed,
+        );
+        let leader = elect(&mut sim, &group, &live, seed);
+        write_base_row_live(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("live{round:03}"),
+            seed,
+        );
+    }
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks >= 1);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "chaotic network, live writes racing the sweep",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        16,
+        "[seed={seed}] 12 pre-existing + 4 live == 16 total partitions, even under a lossy/\
+         duplicating network"
+    );
+}
+
+#[test]
+fn chaotic_network_live_writes_race_the_sweep() {
+    for_each_seed(
+        "chaotic_network_live_writes_race_the_sweep",
+        scenario_chaotic_network_live_writes_race_the_sweep,
     );
 }
