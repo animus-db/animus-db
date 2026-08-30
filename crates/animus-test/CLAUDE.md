@@ -486,6 +486,38 @@ retrievable from git history.)
   engine-global markers already rely on. See
   `docs/engineering-lessons.md` for the general lesson and
   `advance_backfill_cursor`'s own doc for the full account.
+- **Four `Env`-level fault-primitive cells (ADR 0061 Decision 3)** add
+  genuinely new fault kinds this corpus hadn't exercised, each a close copy
+  of an existing cell with one or two added fault calls, never modifying
+  the originals: `duplicate_proposals_leader_kill_mid_sweep`
+  (`NetConfig::set_duplicate_prob(0.15)` globally, on top of
+  `leader_kill_mid_sweep` — proves the seeder's coverage tracking and the
+  completion aggregator's tally are correct under duplicated Raft traffic,
+  not just a clean network), `wal_fsync_lie_leader_kill_mid_sweep`
+  (`DiskConfig::set_fsync_lie_prob(0.3)` globally, on top of the same base
+  cell — proves the backfill cursor's durability claim survives a lied-to
+  `sync` on the crashing leader), `backfill_cursor_wal_torn_on_restart` (a
+  global `DiskConfig{torn_tail_on_crash: true, corrupt_on_crash: true, ..}`
+  combined with the `crash` → `restart` → `stop` → fresh-`RaftKvNode`
+  idiom `backup_fault_corpus.rs`'s own fault-primitive cells and
+  `docs/engineering-lessons.md` document — the restarted node itself goes
+  on to serve the rest of the sweep and is read directly at the end, so the
+  cell has real teeth rather than crashing-and-moving-on), and
+  `chaotic_network_live_writes_race_the_sweep` (a compound `NetConfig` — 5%
+  drop, 10% duplicate — active for the group's whole lifetime, on top of
+  `live_writes_race_the_sweep`). `NetConfig::set_corrupt_prob` is
+  deliberately excluded throughout: as of this corpus's own branch,
+  `animus-cp-data::codec`'s `Vec::with_capacity(n as usize)` call sites
+  read an untrusted wire length prefix with no upper-bound check, so
+  corrupting a message risks an allocator abort rather than a clean
+  application-level error — safe to add once that fix lands.
+  `DiskConfig::set_enospc_prob`/`set_error_prob` stay out of this whole
+  file for a different, permanent reason: their error branches in
+  `persist_wal` are `assert!(halted.load(..), ..)`, and this corpus's
+  scenarios never call the per-node `shutdown()` that sets `halted`, so
+  firing either on a live node hard-panics the test process. All four hold
+  clean at default depth and `ANIMUS_BACKFILL_SEEDS=40` (nightly CI's own
+  depth for this file), with no regression to any existing scenario.
 
 ### Elle-adjacent, but not Elle: the on-demand backup capture fault corpus (ADR 0059 Train 1 PR③)
 
