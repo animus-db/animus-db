@@ -51,7 +51,20 @@ the wire edges, the remaining background loops, and the test/bench targets.
 **Narrow it further as more of this crate becomes seam-clean; never widen
 it back to make a change compile** — that is precisely the hole this rung
 closes. A module that has no live `tokio`/real-clock sites left earns its
-own `#[deny(...)]` line.
+own `#[deny(...)]` line. Five more leaf background-loop wrappers earned
+theirs this way: `backup_completion`, `backup_janitor`, `index_backfill`,
+`pitr_janitor`, `ttl_reaper` — each had its loop body moved to
+`animus_node` in rung C2 (see each module's own map entry below) and is now
+a thin, logic-free wrapper with zero `Instant::now`/`SystemTime::now`/
+`tokio::time::*`/`tokio::spawn` sites of its own, verified by direct
+inspection before the `#[deny(...)]` line was added. `segment_janitor`
+deliberately did **not** get one — its replica-repair phase is real
+placement/membership orchestration (a live `tokio::time::sleep`), not a
+thin delegation — and stays under the package-level allow along with
+`admin`, `backup_capture`, `backup_restore`, `client_ctx_host`, `console`,
+`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, and `http`. Ten
+modules now carry the narrower `#[deny(...)]`: the original five (`schema`,
+`read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus these five.
 
 **`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
 step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/

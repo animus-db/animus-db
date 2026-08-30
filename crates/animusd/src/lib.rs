@@ -60,23 +60,33 @@ pub use animus_node::{
 use animus_node::control_handle::ControlHandle as GenericControlHandle;
 use animus_node::host::RelayClient;
 
-// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): these
-// five modules are the `E: Env`-generic, `tokio`-free client path. The
-// package-level `disallowed_methods = "allow"` in this crate's `Cargo.toml`
-// is the pre-Phase-C process-boundary exemption (rung B5) and still applies
-// to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply here. Since C5
-// step 3b converted every `tokio::time`/`tokio::spawn`/`tokio::select!` site
-// in these files to the `Env` seam, the workspace default is re-enabled for
-// them explicitly — which is what makes the determinism constraint
-// compiler-enforced in place, rather than the crate boundary the ADR
-// originally planned and the orphan rule blocked. A `deny` on the `mod`
-// declaration applies to the whole module body, so a reintroduced
-// `Instant::now`/`tokio::spawn`/`tokio::time::sleep` in any of them is a
-// build failure, not a review miss. Do not widen this back to `allow` to
-// make a change compile — that is the hole this rung closes.
+// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): five
+// of these modules are the original `E: Env`-generic, `tokio`-free client
+// path. The package-level `disallowed_methods = "allow"` in this crate's
+// `Cargo.toml` is the pre-Phase-C process-boundary exemption (rung B5) and
+// still applies to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply
+// here. Since C5 step 3b converted every `tokio::time`/`tokio::spawn`/
+// `tokio::select!` site in these files to the `Env` seam, the workspace
+// default is re-enabled for them explicitly — which is what makes the
+// determinism constraint compiler-enforced in place, rather than the crate
+// boundary the ADR originally planned and the orphan rule blocked. Five
+// more leaf background-loop wrappers (`backup_completion`, `backup_janitor`,
+// `index_backfill`, `pitr_janitor`, `ttl_reaper`) earned the same `deny`
+// later, per `crates/animusd/CLAUDE.md`'s stated bar: each has had its loop
+// body moved to `animus_node` (rung C2) and is now a thin, logic-free
+// wrapper with no live `tokio`/real-clock site of its own —
+// `segment_janitor` deliberately did NOT move and stays under the
+// package-level allow, since its replica-repair phase is real orchestration
+// logic, not a thin delegation. A `deny` on the `mod` declaration applies to
+// the whole module body, so a reintroduced `Instant::now`/`tokio::spawn`/
+// `tokio::time::sleep` in any of them is a build failure, not a review
+// miss. Do not widen this back to `allow` to make a change compile — that
+// is the hole this rung closes.
 mod admin;
 mod backup_capture;
+#[deny(clippy::disallowed_methods)]
 mod backup_completion;
+#[deny(clippy::disallowed_methods)]
 mod backup_janitor;
 mod backup_restore;
 mod client_ctx_host;
@@ -88,13 +98,16 @@ mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
+#[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
 #[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
+#[deny(clippy::disallowed_methods)]
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
@@ -108,8 +121,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
-    TxnRecordView,
+    FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
+    TxnOutcome, TxnRecordView,
 };
 use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -1436,14 +1449,16 @@ impl<E: Env> CpGroup<E> {
     }
 
     /// **Resolve** intents on this group given an already-decided outcome.
-    /// See [`RaftKvNode::txn_resolve`].
+    /// See [`RaftKvNode::txn_resolve`] — the caller must check the returned
+    /// [`ResolveOutcome`] (`Fenced`/`OutcomeMismatch` mean nothing here
+    /// actually resolved; only `Resolved` does).
     async fn txn_resolve(
         &self,
         txn_id: TxnId,
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: TxnOutcome,
-    ) -> Option<HlcTimestamp> {
+    ) -> Option<(HlcTimestamp, ResolveOutcome)> {
         match self {
             CpGroup::Lsm(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
             CpGroup::Mem(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
@@ -1873,6 +1888,17 @@ const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
 /// plain transaction's async resolve always could race a follow-up read on
 /// its own participant tables.
 const TXN_RESOLVE_ALL_AWAIT_BUDGET: Duration = Duration::from_secs(2);
+/// Bounded attempts [`ClientCtx::txn_resolve_participant_retrying`] gives a
+/// resolve that comes back `Fenced` (or a transient routing/leadership
+/// error) before giving up for this call — ADR 0018 §2 write-loss amendment
+/// §3/§6's fix for the "resolve reports success but the intent stays live"
+/// residual: a concurrent split can move a key's range between one
+/// `cp_route` call and the next, so a bounded number of fresh re-routes
+/// gives the split a realistic window to finish converging before this
+/// caller gives up (the passive `txn_resolver_loop` sweep, or an on-demand
+/// foreign-intent read-path push, remain the safety net either way — this
+/// is a liveness improvement, not the sole correctness mechanism).
+const TXN_RESOLVE_FENCED_RETRY_ATTEMPTS: u32 = 3;
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.

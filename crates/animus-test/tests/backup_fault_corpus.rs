@@ -1222,6 +1222,171 @@ fn split_races_capture_and_replans_onto_descendants() {
     );
 }
 
+// --- cell 4b: backup_started_mid_copy_split_build_pins_only_the_parent -----
+//
+// A regression for the bug fixed alongside this cell: `BeginBackup`'s apply
+// arm used to derive `pinned_tablets` from `Metadata::tablets_for_table`
+// with no state filter, so a backup started while a copy-based split
+// (`BeginSplit`, ADR 0050) was still in its build window — parent
+// `Splitting`, both children already minted `Building`, well before
+// `CutoverSplit` ever runs — pinned all THREE overlapping rows at once. The
+// two `Building` children are never authoritative (unroutable, an
+// incomplete copy — see `animus_control::Metadata::apply`'s `BeginBackup`
+// arm doc), so this cell proves the fixed behavior directly: only the
+// still-serving `Splitting` parent is pinned, its own capture alone
+// completes and matches the full model (nothing lost by excluding the
+// children), and a restore from that backup reproduces the model exactly —
+// all BEFORE `CutoverSplit` ever applies, unlike cell 4 above (which starts
+// its backup before the split and only observes re-planning onto
+// descendants after a completed cutover).
+fn scenario_backup_started_mid_copy_split_build_pins_only_the_parent(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let parent_engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let parent = start_group(&sim, &parent_engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    // Rows straddling the eventual split key `"m..."` — half fall left,
+    // half right — all written and captured entirely through the PARENT,
+    // which never stops serving during the build window.
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for pk in ["a001", "a002", "a003", "z001", "z002", "z003"] {
+        let value = format!("v-{pk}").into_bytes();
+        write_base_row(&mut sim, &parent.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+
+    // `BeginSplit` only — deliberately never `CutoverSplit` in this cell
+    // (that's `split_tablet`'s job, and cell 4's own scenario) — mints the
+    // build-window shape the bug lived in: parent `Splitting`, both
+    // children `Building`, all three still in `meta.tablets` at once.
+    let split_key = b"m".to_vec();
+    let (left_id, right_id) = (TabletId(2), TabletId(3));
+    let expected_epoch = meta.tablets[&TabletId(1)].epoch;
+    let replicas = meta.tablets[&TabletId(1)].replicas.clone();
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplit {
+            parent: TabletId(1),
+            expected_epoch,
+            split_key,
+            children: [(left_id, replicas.clone()), (right_id, replicas)],
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        meta.tablets[&TabletId(1)].state,
+        animus_tablet::TabletState::Splitting
+    );
+    assert_eq!(
+        meta.tablets[&left_id].state,
+        animus_tablet::TabletState::Building
+    );
+    assert_eq!(
+        meta.tablets[&right_id].state,
+        animus_tablet::TabletState::Building
+    );
+
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // The fix under test: only the parent is pinned. Pre-fix, this vec
+    // held all three tablet ids and the assertions below would fail
+    // (either a missing key — the un-driven `Building` children never
+    // report — or, if driven, a duplicated/inflated manifest).
+    let pinned: Vec<u64> = meta
+        .backup("backup-1")
+        .expect("backup row exists")
+        .manifest
+        .pinned_tablets
+        .iter()
+        .map(|p| p.tablet.0)
+        .collect();
+    assert_eq!(
+        pinned,
+        vec![TabletId(1).0],
+        "[seed={seed}] a backup started mid-build must pin only the still-\
+         authoritative Splitting parent, never its Building children"
+    );
+    assert!(
+        meta.backup_capture_target("backup-1", TabletId(1)),
+        "[seed={seed}] the parent is a capture target"
+    );
+    assert!(
+        !meta.backup_capture_target("backup-1", left_id),
+        "[seed={seed}] a Building child must never be a capture target — \
+         it isn't pinned and traces to no pinned ancestor"
+    );
+    assert!(
+        !meta.backup_capture_target("backup-1", right_id),
+        "[seed={seed}] a Building child must never be a capture target — \
+         it isn't pinned and traces to no pinned ancestor"
+    );
+
+    // Drive only the parent's own capture — the children are never touched,
+    // proving their exclusion costs nothing (the parent alone still holds
+    // every row in its still-unnarrowed range).
+    drive_tablet_capture_to_reported(
+        &mut sim, &mut meta, &parent, &live, &store, "backup-1", seed,
+    );
+    assert!(meta.backup_ready_to_complete("backup-1"));
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+
+    let final_tablets: Vec<u64> = meta
+        .backup_manifest_tablet_progress("backup-1")
+        .into_iter()
+        .map(|(t, _)| t.0)
+        .collect();
+    assert_eq!(
+        final_tablets,
+        vec![TabletId(1).0],
+        "[seed={seed}] the completed manifest must name only the parent — \
+         no duplication with either Building child"
+    );
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+
+    // Restore round-trips the model exactly — the split never even reached
+    // cutover, so this also proves the fix didn't lose or corrupt anything
+    // the still-in-flight split workflow would later have needed.
+    begin_restore(
+        &mut meta,
+        "restore-1",
+        "backup-1",
+        "widgets_restored_midbuild",
+        TabletId(4),
+    );
+    let dest_engines = engines();
+    let dest = start_group(&sim, &dest_engines, TabletId(4), KeyRange::whole());
+    sim.run_for(Duration::from_secs(2));
+    drive_restore_to_done(
+        &mut sim,
+        &mut meta,
+        &dest,
+        &live,
+        &store,
+        "restore-1",
+        "backup-1",
+        seed,
+    );
+    let dest_leader = elect(&mut sim, &dest, &live, seed);
+    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
+    assert_eq!(
+        restored, model,
+        "[seed={seed}] restored table content does not match the model"
+    );
+}
+
+#[test]
+fn backup_started_mid_copy_split_build_pins_only_the_parent() {
+    for_each_seed(
+        "backup_started_mid_copy_split_build_pins_only_the_parent",
+        scenario_backup_started_mid_copy_split_build_pins_only_the_parent,
+    );
+}
+
 // --- cell 5: store_faults_ack_lost_puts_still_converge ----------------------
 
 fn scenario_store_faults_ack_lost_puts_still_converge(seed: u64) {

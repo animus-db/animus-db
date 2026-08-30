@@ -325,10 +325,13 @@ truth; this map is just for navigation.
   is dropped — and a control-plane-leader janitor
   (`animusd::backup_janitor`) reclaims a deleted/failed backup's objects
   two-phase (mark, then reclaim, then remove the row). **`RestoreTable-
-  FromBackup` (Train 2) and PITR (`UpdateContinuousBackups`/
-  `RestoreTableToPointInTime`, sealing continuously as a fifth change-log
-  consumer beside periodic base snapshots, Train 3) are not yet built.** S3
-  export/import and an S3 `SegmentStore` backend are deferred follow-ups.
+  FromBackup` (Train 2) and PITR (Train 3 — `UpdateContinuousBackups`/
+  `DescribeContinuousBackups`/`RestoreTableToPointInTime`, sealing
+  continuously as a fifth change-log consumer beside periodic base
+  snapshots) are also implemented and green** (`ANIMUS_PITR_SEEDS`, default
+  1, held at `=300` in CI; see ADR 0059's Train 2/3 as-built amendments).
+  The backup/restore/PITR feature train is complete. S3 export/import and
+  an S3 `SegmentStore` backend are deferred follow-ups.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure

@@ -448,19 +448,39 @@ State once here; cross-referenced from the sections below.
   key's *current committed* value and compares to `expected`; equal → merge
   at `index`, else no-op. Every replica applies the same order against the
   same state with no clock/RNG, so every replica makes the **identical**
-  decision. Outcome is stashed in driver `CasResults` keyed by the log index.
+  decision. Outcome is stashed in driver `CasResults`, keyed by the log index
+  **and paired with the entry's own Raft term** (fixed alongside
+  `StageOutcomes` below — see that bullet's term-identity paragraph, which
+  applies here identically): `cas_result(index, term)`/`compare_and_swap`
+  require the caller's own `ProposeResult::Accepted`'s `term` to match before
+  ever trusting a recorded outcome as this proposer's own, and
+  `compare_and_swap`'s own poll loop also checks `is_leader()` every
+  iteration (previously it did not, despite a comment implying it did — see
+  `wait_applied`/`wait_stage_outcome`'s identical guard). Regression:
+  `tests/cas_outcome_identity.rs`.
 - **`TxnStage`'s own-key conditions are decided at *apply* time too, the
   identical CAS-style discipline** — evaluated against each key's current
   committed value inside the same apply arm that decides the pre-existing
   fence/seal/foreign-intent gates, recording a `StageOutcome` per Raft log
   index (`StageOutcomes`, mirroring `CasResults`). **`wait_applied(index)
-  .await == true` does NOT imply `stage_outcome(index)` is `Some`** — a
+  .await == true` does NOT imply `stage_outcome(index, term)` is `Some`** — a
   snapshot install can advance `engine_applied` past `index` without this
   replica individually applying (hence recording an outcome for) that exact
   entry, since an install globs many commands together. `txn_stage_anchor`/
   `_participant` poll `stage_outcome` directly instead (`wait_stage_outcome`)
   — `None` on timeout, never a hard-`expect`ed fact that turns out not to be
-  guaranteed. See `docs/engineering-lessons.md` for the general lesson.
+  guaranteed. **`StageOutcomes` (like `CasResults`) is keyed by index and
+  paired with the entry's own term** (closed 2026-08-29, mirroring the fix
+  `KindBatchOutcomes` got first — see `docs/engineering-lessons.md`'s
+  amendment to the `KindBatchOutcome` entry): an uncommitted `TxnStage`
+  entry's index can be reoccupied by a different command after a leadership
+  change, so `stage_outcome`/`wait_stage_outcome` require the caller's own
+  accepted term to match, propagating `None` ("not confirmed as mine, retry")
+  rather than ever returning a stale entry's outcome as this proposer's own.
+  `txn_stage_anchor`/`txn_stage_participant` thread the accepted `term`
+  through unchanged in their own public shape (still `Option<(..,
+  StageOutcome)>`, `None` on ambiguity same as before). See
+  `docs/engineering-lessons.md` for the general lesson.
 - **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
   "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
@@ -741,7 +761,40 @@ State once here; cross-referenced from the sections below.
   (ADR 0028), permanently breaking the owning tablet's future LWW. See
   the amendment and `docs/engineering-lessons.md`'s "every key-writing
   command variant must carry AND enforce the apply-time fence" entry for
-  the general lesson.
+  the general lesson. **`TxnResolve` gained the identical `StageOutcome`-
+  shaped outcome channel `TxnStage` already had, closing a second,
+  independent gap the fence alone didn't (ADR 0018 §2 write-loss amendment
+  §3/§6, closed 2026-08-29)**: a fence-miss no-op and a genuine resolve
+  used to be indistinguishable to the caller — `wait_applied(index).await`
+  is `true` either way. `ResolveOutcome` (`Resolved`/`Fenced`/
+  `OutcomeMismatch`), recorded per apply in `ResolveOutcomes` (keyed by
+  Raft log index, paired with the entry's own term — the identical
+  `CasResults`/`StageOutcomes` term-identity discipline; see this file's
+  `StageOutcomes` bullet above), is what a proposer now polls via
+  `resolve_outcome`/`wait_resolve_outcome`; `RaftKvNode::txn_resolve`
+  returns `Option<(HlcTimestamp, ResolveOutcome)>`, and **every caller must
+  check the outcome** — only `Resolved` means the intent(s) actually
+  changed. A second, independent bug surfaced fixing this: the apply arm
+  used to clear `TxnTracker::unresolved_decided` (the entry
+  `txn_resolver_loop`'s passive sweep reads to find decided-but-unresolved
+  transactions) **unconditionally**, before this outcome was even computed
+  — so a Fenced resolve erased this group's own memory that the
+  transaction still needed resolving, even though nothing was actually
+  written. Now cleared only on `ResolveOutcome::Resolved`. `animusd::
+  ClientCtx::txn_resolve_participant` returns `Result<ResolveOutcome,
+  String>` (a `CpRoute::None` is now a genuine `Err`, never a silent
+  `Ok(())`); `txn_resolve_participant_retrying` is the bounded-retry
+  wrapper (fresh `cp_route` every attempt) every production caller
+  (`resolve_all`/`resolve_all_parallel`/`recovery_resolve`/
+  `push_resolution_if_decided`) now goes through instead of the raw
+  one-shot primitive — the actual fix for the acknowledged-write-loss bug:
+  a fenced resolve now triggers a re-route-and-retry rather than being
+  silently treated as done. See ADR 0018's 2026-08-29 amendment for the
+  full account (including why `txn_decide`'s single-tablet convenience
+  path deliberately still discards the outcome — it has no routing layer
+  of its own to retry through) and `tests/txn_resolve_outcome.rs` for the
+  primitive-level regression (a genuine fence-miss via a real in-place
+  split, proven distinct from an ordinary resolve).
 - **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
   mechanism (a merge survivor's `WidenScope` deferred on the absorbed
   group's own committed-log drain, closing a data-loss window

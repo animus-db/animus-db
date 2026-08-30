@@ -2476,8 +2476,34 @@ impl Metadata {
                 // never from anything the proposer carried beyond the three
                 // fields above — so every replica computes an identical
                 // stub deterministically (see `BackupManifest`'s own doc).
+                //
+                // **State-filtered, unlike `tablets_for_table`'s other
+                // callers**: during the ADR 0050 copy-based split's
+                // build/tail window there are up to THREE live rows
+                // covering one key range at once — the still-authoritative
+                // `Splitting` parent, plus its two not-yet-cutover
+                // `Building` children (minted immediately by `BeginSplit`,
+                // long before `CutoverSplit` ever runs). A `Building`
+                // tablet is never routable (`topology::tablet_for_key`
+                // excludes it — see `animusd/CLAUDE.md`'s "Write fences are
+                // GONE" entry) and is not yet a complete copy, so pinning
+                // it here would either double-count its range (parent also
+                // pinned) or pin an incomplete copy as if it were
+                // authoritative. Only `Active` and `Splitting` tablets are
+                // ever the CURRENT authoritative owner of their range — a
+                // `Splitting` parent keeps serving reads/writes throughout
+                // the whole build/tail window (only `CutoverSplit` flips
+                // authority, atomically, to the two now-`Active` children
+                // and removes the parent), so this stays correct for the
+                // default in-place split too (ADR 0058: no `Building` rows
+                // are ever minted there, so this filter is a no-op on that
+                // path). See `docs/engineering-lessons.md`'s entry on this
+                // for the general "a read site with a `tablets_for_table`-
+                // shaped scan must filter to the current authoritative
+                // owner explicitly" rule.
                 let pinned_tablets: Vec<BackupPinnedTablet> = self
                     .tablets_for_table(table)
+                    .filter(|(_, t)| t.state != TabletState::Building)
                     .map(|(&tablet, t)| BackupPinnedTablet {
                         tablet,
                         range: t.range.clone(),
