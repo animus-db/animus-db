@@ -501,6 +501,38 @@ retrievable from git history.)
   here is ever expected to answer `TrimmedDataAccess`. Depth knob
   `ANIMUS_STREAM_SEEDS` (default 1 = the frozen cells; held green at
   `=40`, matching `corpus-deep.yml`'s nightly tier).
+- **Cells 11/12 (ADR 0058 Train 2 rung 3) rebuild the SAME lineage/
+  durability claims on the DEFAULT production split path — the in-place
+  atomic fork — alongside (never replacing) the copy-based cells above**:
+  `inplace_split_lineage_frozen_at_fork` (sealed history + backlog, sealed
+  in FULL before the fork — the fork is atomic, so there is no
+  "meanwhile" window to interleave a seal into the way the copy-based
+  workflow's build/freeze phases have — then `BeginSplitInPlace` →
+  fork+materialize converge → `CutoverSplit`, proposed immediately since
+  the in-place branch carries no freeze/veto gate of its own → both
+  children EMPTY change logs, sealing their own epoch 0, exactly-once
+  across the walk) and `inplace_split_races_an_open_seal` (the identical
+  seal-crash/store-outage/healed-retry fault sequence
+  `copy_split_endgame_survives_seal_faults` injects, applied to the
+  parent's FINAL seal right before `BeginSplitInPlace` — the retried
+  seal's epoch is what the frozen `split_lineage` names). Unlike the
+  copy-based cells (a control-metadata-only `BeginSplit`/`CutoverSplit`,
+  the parent hosted directly via this file's own `start_group`), the
+  in-place fork is materialized by `animus_cp_data::host::Reconciler`, so
+  both cells build a small `InplaceCluster` of `Reconciler<SimEnv,
+  MemoryEngine>` instances and drive it to convergence at each stage via a
+  local `tick_one`/`converge` pair (adapted from this file's own
+  pre-existing `drive`, mirroring `animus-cp-data/tests/
+  inplace_split_reconciler.rs`'s and `backfill_fault_corpus.rs`'s own
+  identical harness shape for the SAME mechanism) — `wrap_group` then
+  clones the reconciler-hosted `RaftKvNode` handles back into this file's
+  own plain `Group` so every pre-existing helper
+  (`elect`/`write_and_journal`/`seal_now`/`verify_lineage`, …) runs on the
+  reconciler-hosted parent or a split child completely unmodified. Both
+  cells held clean at `ANIMUS_STREAM_SEEDS=300` with no regression to the
+  other ten cells in the file — no exactly-once/ordering/lineage violation
+  surfaced; the in-place split's interaction with stream sealing behaves
+  exactly as designed.
 - **A real bug this corpus found while being built** (not in the streams
   subsystem — in the corpus's own test harness): `RaftKvNode::start_scoped`
   pins every group to `PRIMARY_STREAM`, so two tablet groups sharing the
@@ -529,13 +561,36 @@ retrievable from git history.)
   split_during_backfill_converges_with_correct_final_gsi`.
 - **Frozen named cells**: `single_tablet_backfill_converges`,
   `live_writes_race_the_sweep`, `leader_kill_mid_sweep`,
-  `two_indexes_creating_independently`, `drop_table_mid_backfill` (the two
+  `two_indexes_creating_independently`, `drop_table_mid_backfill`,
+  `streamed_mid_backfill_seed_flag_never_misclassified` (the original two
   zero-copy-split cells — `concurrent_split_during_backfill`,
   `split_after_tablet_already_reported_done` — died in ADR 0050 Train B
-  rung 2, see the file's tombstone; split-during-backfill returns on the
-  copy-based mechanism in the cutover rungs). Depth knob `ANIMUS_BACKFILL_SEEDS` (default
-  1 = the frozen cells; held green at `=40` in well under a second,
-  matching `corpus-deep.yml`'s nightly tier).
+  rung 2, modeling a split mechanism that no longer exists; see the file's
+  own tombstone comment for the historical account). **Rebuilt on the
+  in-place atomic fork (ADR 0058), the DEFAULT production split path**:
+  `split_during_backfill_converges` (cutover fired deliberately BEFORE the
+  parent's own backfill sweep finishes — `CutoverSplit`'s in-place branch
+  carries no drain/backfill veto of its own, so this is a real race a
+  production split can hit; both children converge their own sweep
+  independently afterward, from the EMPTY `KIND_CURSOR` scope
+  `trim_split_child` unconditionally leaves them with) and
+  `split_after_tablet_already_reported_done` (the G1 orphan-report case:
+  the parent already reported completion before the split even began;
+  `CutoverSplit` leaves that stale `index_backfill` row behind as a
+  harmless orphan, and the completion aggregator must wait for both
+  children's own independent reports instead of counting it). Both drive
+  the whole fork/materialize/cutover sequence through
+  `animus_cp_data::host::Reconciler`, mirroring
+  `animus-cp-data/tests/inplace_split_reconciler.rs`'s own harness shape
+  (a local `drive`/`tick_one`/`converge` trio, since `Reconciler::tick`
+  polls internally via `env.sleep` and integration test binaries can't
+  share private items) — then wrap the converged children's `RaftKvNode`
+  handles back into this file's own plain `Group` so every pre-existing
+  helper (`elect`/`backfill_seed_tick`/`drive_sweep_to_completion`/
+  `mark_backfilled`/`maybe_flip_active`/`assert_full_coverage`, …) runs on
+  a split child completely unmodified. Depth knob `ANIMUS_BACKFILL_SEEDS`
+  (default 1 = the frozen cells; held green at `=300` in ~1.5s, well past
+  `corpus-deep.yml`'s nightly `=40` tier).
 - **A real, previously-undetected bug this corpus found on its very first
   run, at every seed** (not just under fault injection — a structural
   defect, reproducible without any injected fault at all): the backfill
@@ -697,6 +752,29 @@ retrievable from git history.)
   branches in `persist_wal` are `assert!(halted.load(..), ..)`, and this
   corpus's scenarios never call the per-node `shutdown()` that sets
   `halted`, so firing either on a live node hard-panics the test process.
+- **Cell 14 (ADR 0058 Train 2 rung 3) rebuilds the §6 re-planning claim on
+  the DEFAULT production split path — the in-place atomic fork — alongside
+  (never replacing) `split_races_capture_and_replans_onto_descendants`'s
+  own copy-based cell above**: `inplace_split_races_capture_and_replans_
+  onto_descendants` cuts over deliberately before the parent's own capture
+  finishes (`CutoverSplit`'s in-place branch carries no freeze/veto gate of
+  its own), then proves the identical §6 claim — the manifest's authoritative
+  tablet list ends up naming exactly the two children, never the retired
+  parent, with no row ever double-counted. **The lightest of the three
+  in-place ports** (mirroring `backfill_fault_corpus.rs`'s/`stream_lineage_
+  corpus.rs`'s own pair): the §6 re-planning logic under test
+  (`Metadata::backup_capture_target`/`live_split_descendants`/
+  `backup_ready_to_complete`/`backup_manifest_tablet_progress`) only ever
+  reads `Metadata::split_lineage`, entirely split-mechanism-agnostic, so
+  swapping the trigger for `BeginSplitInPlace`/`CutoverSplit` driven through
+  `animus_cp_data::host::Reconciler` (the same local `tick_one`/`converge`
+  pair the two sibling ports use) is the whole port — and real in-place
+  fork+materialize clones+trims each child's own share of the parent's data
+  automatically, eliminating the copy-based cell's manual per-row copy loop
+  entirely rather than merely relocating it. Held clean at
+  `ANIMUS_BACKUP_SEEDS=300` with no regression to the other twelve cells in
+  the file — no §6/double-count violation surfaced; the in-place split's
+  interaction with backup capture behaves exactly as designed.
 
 ### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 

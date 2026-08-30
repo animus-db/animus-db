@@ -55,6 +55,7 @@
 //! full knob table.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection};
@@ -62,10 +63,11 @@ use animus_control::{
     ApplyOutcome, ColumnType, IndexStatus, MetaCommand, Metadata, ProposeResult, TableSchema,
 };
 use animus_cp_data::cursor;
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{KIND_BASE, KIND_CURSOR, RaftKvNode};
 use animus_dynamo::index as dynamo_index;
 use animus_dynamo::{AttributeValue, ChangeRecord, storage_key};
-use animus_env::nid;
+use animus_env::{EnvExt, NodeId, nid};
 use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, partition_token};
@@ -576,17 +578,620 @@ fn single_tablet_backfill_converges() {
     );
 }
 
-// TOMBSTONE (ADR 0050 Train B rung 2): two split cells died here —
-// `concurrent_split_during_backfill` (Fork A: the left child's cursor row
-// byte-identical across the split, the right child reading empty) and
-// `split_after_tablet_already_reported_done`. Both modeled the ZERO-COPY
-// split (`narrow_scope` + a sibling group inheriting the same physical
-// rows in place) — inexpressible under per-tablet engines with immutable
-// ranges. Split-during-backfill remains a REAL scenario class under the
-// copy-based split (ADR 0050): children restart their sweeps from scratch
-// over their own copied rows — its corpus cells are rebuilt on the new
-// mechanism in the cutover rungs, where a split can actually run again.
-// Pre-pivot cells retrievable from git history.
+// --- in-place split + backfill harness (ADR 0058 Train 2 rung 3) ----------
+//
+// The two cells below replace the ADR 0050 Train B rung 2 tombstone that
+// used to sit here: the original `concurrent_split_during_backfill`/
+// `split_after_tablet_already_reported_done` pair modeled the ZERO-COPY
+// split (`narrow_scope` + a sibling group inheriting the same physical rows
+// in place) and died with that mechanism — inexpressible under per-tablet
+// engines with immutable ranges. Split-during-backfill is rebuilt here on
+// the mechanism that actually replaced it: the DEFAULT production split
+// path, the in-place atomic fork (ADR 0058), driven end to end through
+// `animus_cp_data::host::Reconciler` exactly like
+// `animus-cp-data/tests/inplace_split_reconciler.rs` does — this is the
+// production split path's own interaction with GSI backfill, previously
+// untested by any corpus at seed depth. (The copy-based mechanism,
+// `--split-mode copy`, is deprecated pending deletion, ADR 0058's own
+// remaining rung 4 layer — it gets no corpus coverage here.)
+//
+// `Reconciler::tick`/`teardown` `.await` internally (`env.sleep`), so they
+// must be driven via spawn+poll (`drive`/`tick_one`/`converge` below,
+// adapted from `stream_lineage_corpus.rs`'s own `drive` — integration test
+// binaries can't share private items) rather than a bare `block_on`. Once
+// a split's children converge, [`wrap_group`] clones their reconciler-
+// hosted `RaftKvNode` handles back into this file's own plain [`Group`] —
+// the whole point being that every pre-existing helper in this file
+// (`elect`/`confirm`/`backfill_seed_tick`/`drive_sweep_to_completion`/
+// `mark_backfilled`/`maybe_flip_active`/`assert_full_coverage`, …) then
+// works on a split child completely unmodified.
+
+/// The parent tablet id every cell in this file already hardcodes as
+/// `TabletId(1)`, named here only because these two cells also need to name
+/// its two children.
+const PARENT: TabletId = TabletId(1);
+const LEFT: TabletId = TabletId(2);
+const RIGHT: TabletId = TabletId(3);
+
+/// A dedicated node id for spawning the reconciler-driving futures below —
+/// distinct from every real id in [`NODES`]. Any live `SimEnv` handle works
+/// for `spawn_task` (the executor is shared across the whole `Simulator`,
+/// not per-node — `inplace_split_reconciler.rs`'s own `driver_id()` relies
+/// on the identical fact) — this exists only so a stray env mixup would be
+/// obvious rather than accidentally aliasing a real replica.
+fn driver_id() -> NodeId {
+    nid(999)
+}
+
+type Recon = Reconciler<SimEnv, MemoryEngine>;
+
+/// One node's tablet-host reconciler, standing in for the per-node loop
+/// `animusd::tablet_host_reconciler_loop` drives in production — mirrors
+/// `inplace_split_reconciler.rs`'s own `ClusterNode`/`Cluster`, kept local
+/// here rather than shared (that file's own doc: "integration test
+/// binaries can't share private items").
+struct ClusterNode {
+    reconciler: Recon,
+}
+
+struct Cluster {
+    nodes: BTreeMap<NodeId, ClusterNode>,
+}
+
+impl Cluster {
+    fn new(sim: &Simulator) -> Self {
+        let mut nodes = BTreeMap::new();
+        for &n in &NODES {
+            let id = nid(n);
+            let reconciler: Recon = Reconciler::new(
+                sim.env(id.clone()),
+                MemoryTabletEngines::new(),
+                id.clone(),
+                |_, _| {},
+                |_| {},
+            );
+            nodes.insert(id, ClusterNode { reconciler });
+        }
+        Cluster { nodes }
+    }
+
+    fn node(&self, id: &NodeId) -> &Recon {
+        &self.nodes[id].reconciler
+    }
+
+    fn hosted_set(&self, id: &NodeId) -> BTreeSet<TabletId> {
+        self.node(id).local_state().hosted.clone()
+    }
+}
+
+fn metadata_view(meta: &Metadata) -> MetadataView {
+    MetadataView {
+        tablets: meta.tablets.clone(),
+        down: BTreeSet::new(),
+    }
+}
+
+/// Runs `fut` to completion by spawning it on `env` and driving `sim` in
+/// small steps until it resolves — `stream_lineage_corpus.rs`'s own `drive`
+/// helper, copied verbatim: `Reconciler::tick`/`teardown` poll internally
+/// via `env.sleep`, so a bare `block_on` would hang with nothing advancing
+/// the simulator concurrently.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    for _ in 0..500 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("drive: future never completed")
+}
+
+/// Ticks one node's reconciler once against `view`. The node is moved out of
+/// `cluster` for the duration of the tick (`drive`'s spawned future must own
+/// what it touches) and put back once it resolves.
+fn tick_one(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    id: &NodeId,
+    view: &MetadataView,
+) {
+    let mut node = cluster.nodes.remove(id).expect("node exists");
+    let view = view.clone();
+    let ticked = drive(sim, env, async move {
+        node.reconciler.tick(&view).await;
+        node
+    });
+    cluster.nodes.insert(id.clone(), ticked);
+}
+
+/// Ticks every node in `ids` against `view` in a bounded loop until `check`
+/// holds — mirrors `inplace_split_reconciler.rs`'s own `converge`.
+fn converge(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    ids: &[NodeId],
+    view: &MetadataView,
+    mut check: impl FnMut(&Cluster) -> bool,
+) -> bool {
+    for _ in 0..300 {
+        for id in ids {
+            tick_one(sim, env, cluster, id, view);
+        }
+        if check(cluster) {
+            return true;
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    check(cluster)
+}
+
+fn leader_of<'a>(cluster: &'a Cluster, ids: &[NodeId], tablet: TabletId) -> Option<&'a KvNode> {
+    ids.iter().find_map(|id| {
+        cluster
+            .node(id)
+            .hosted_node(tablet)
+            .filter(|h| h.is_leader())
+    })
+}
+
+/// Clones a reconciler-hosted tablet's per-node handles into this file's own
+/// plain [`Group`] — see the section doc above for why. Node order matches
+/// `ids` (== [`NODES`]' own order), so the `live: [0, 1, 2]` index
+/// convention every other cell in this file uses still lines up.
+fn wrap_group(cluster: &Cluster, ids: &[NodeId], tablet: TabletId, range: KeyRange) -> Group {
+    Group {
+        id: tablet,
+        range,
+        nodes: ids
+            .iter()
+            .map(|replica_id| {
+                cluster
+                    .node(replica_id)
+                    .hosted_node(tablet)
+                    .expect("tablet hosted on every fork participant")
+                    .clone()
+            })
+            .collect(),
+    }
+}
+
+// --- cell 2: split_during_backfill_converges -------------------------------
+
+/// The production split path (in-place atomic fork) racing an in-flight GSI
+/// backfill sweep: `CutoverSplit`'s in-place branch carries no drain/
+/// backfill veto of its own (`animus-control/CLAUDE.md`'s "G1" note — "the
+/// GSI-drain/backfill-seeder cutover vetoes stay PRE-cutover, caller-side"),
+/// so this cell deliberately cuts over BEFORE the parent's sweep finishes —
+/// exactly the race a real production split can hit. Both children must
+/// independently converge their own coverage sweep afterward (each is born
+/// with an EMPTY `KIND_CURSOR` scope, `trim_split_child`'s unconditional
+/// wipe — `animus-cp-data/CLAUDE.md`'s "In-place split" section), and the
+/// completion aggregator must wait for BOTH before flipping the index
+/// `Active`.
+fn scenario_split_during_backfill_converges(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, PARENT, KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| { leader_of(c, &node_ids, PARENT).is_some() }
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, PARENT, KeyRange::whole());
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for i in 0..20 {
+        write_pre_existing_row(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    // A couple of ticks, deliberately not to completion (SEED_BATCH=3 over
+    // 20 partitions needs ~7) — leaves the cursor mid-sweep going into the
+    // split.
+    for _ in 0..2 {
+        let leader = elect(&mut sim, &parent, &live, seed);
+        backfill_seed_tick(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &tag,
+            SEED_BATCH,
+            seed,
+        );
+    }
+
+    // The split key: the median of the physical keys actually present,
+    // roughly bisecting the 20 written rows (their hashed partition
+    // tokens, not `pk` order, is what determines physical placement).
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let mut base_keys: Vec<Vec<u8>> = block_on(parent.nodes[leader].local_scan(&[], None, None))
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    base_keys.sort();
+    let split_key = base_keys[base_keys.len() / 2].clone();
+
+    // Both children get the SAME 3 replica homes as the parent (avoids
+    // learner catch-up — already covered by `inplace_split_reconciler.rs`;
+    // keeps this cell focused on the backfill race).
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(LEFT, node_ids.clone()), (RIGHT, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    // Cut over IMMEDIATELY — before the backfill sweep finishes — the race
+    // this cell exists to exercise.
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 0,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(LEFT).is_some()
+                        && c.node(id).hosted_node(RIGHT).is_some()
+                        && !c.hosted_set(id).contains(&PARENT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    let (left_range, right_range) = KeyRange::whole()
+        .split_at(&split_key)
+        .expect("split key must bisect the whole range");
+    let left = wrap_group(&cluster, &node_ids, LEFT, left_range);
+    let right = wrap_group(&cluster, &node_ids, RIGHT, right_range);
+
+    // Both children are born with EMPTY cursor state, regardless of the
+    // parent's own mid-sweep cursor position.
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    let left_cursor_key = cursor::cursor_key(&left.range.start, &tag);
+    assert!(
+        block_on(left.nodes[left_leader].local_get_kind(KIND_CURSOR, &left_cursor_key)).is_none(),
+        "[seed={seed}] LEFT child was not born with an empty backfill cursor"
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    let right_cursor_key = cursor::cursor_key(&right.range.start, &tag);
+    assert!(
+        block_on(right.nodes[right_leader].local_get_kind(KIND_CURSOR, &right_cursor_key))
+            .is_none(),
+        "[seed={seed}] RIGHT child was not born with an empty backfill cursor"
+    );
+
+    drive_sweep_to_completion(&mut sim, &left, &live, &left.range, &tag, seed);
+    drive_sweep_to_completion(&mut sim, &right, &live, &right.range, &tag, seed);
+
+    mark_backfilled(&mut meta, TABLE, "by-email", LEFT);
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must not flip while RIGHT has not yet reported"
+    );
+    mark_backfilled(&mut meta, TABLE, "by-email", RIGHT);
+    assert!(
+        maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must flip once both split children report"
+    );
+    assert_eq!(
+        index_status(&meta, TABLE, "by-email"),
+        Some(IndexStatus::Active)
+    );
+
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    assert_full_coverage(
+        &left.nodes[left_leader],
+        seed,
+        "LEFT child post in-place split",
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    assert_full_coverage(
+        &right.nodes[right_leader],
+        seed,
+        "RIGHT child post in-place split",
+    );
+}
+
+#[test]
+fn split_during_backfill_converges() {
+    for_each_seed(
+        "split_during_backfill_converges",
+        scenario_split_during_backfill_converges,
+    );
+}
+
+// --- cell 3: split_after_tablet_already_reported_done -----------------------
+
+/// The named G1 orphan-report scenario: the PARENT already finished its own
+/// sweep and reported completion BEFORE the split even begins.
+/// `CutoverSplit` removes the parent from the tablet map without pruning its
+/// stale `index_backfill` row (only the drop-table path prunes that — see
+/// `drop_table_mid_backfill` above) — the completion aggregator must still
+/// wait for BOTH children's own independent reports, correctly ignoring the
+/// parent's now-orphaned one once `tablets_for_table` no longer yields it.
+fn scenario_split_after_tablet_already_reported_done(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, PARENT, KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| { leader_of(c, &node_ids, PARENT).is_some() }
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, PARENT, KeyRange::whole());
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for i in 0..20 {
+        write_pre_existing_row(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    // Run the parent's own sweep all the way to completion and report it —
+    // BEFORE the split even begins.
+    drive_sweep_to_completion(&mut sim, &parent, &live, &parent.range, &tag, seed);
+    mark_backfilled(&mut meta, TABLE, "by-email", PARENT);
+    assert!(
+        meta.index_backfill
+            .contains_key(&(PARENT, "by-email".to_owned())),
+        "[seed={seed}] the parent's own report must be visible before the split"
+    );
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let mut base_keys: Vec<Vec<u8>> = block_on(parent.nodes[leader].local_scan(&[], None, None))
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    base_keys.sort();
+    let split_key = base_keys[base_keys.len() / 2].clone();
+
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(LEFT, node_ids.clone()), (RIGHT, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 0,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(LEFT).is_some()
+                        && c.node(id).hosted_node(RIGHT).is_some()
+                        && !c.hosted_set(id).contains(&PARENT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    assert!(
+        meta.index_backfill
+            .contains_key(&(PARENT, "by-email".to_owned())),
+        "[seed={seed}] the parent's stale report is a harmless orphan, not pruned by CutoverSplit"
+    );
+    assert_eq!(
+        meta.tablets_for_table(TABLE).count(),
+        2,
+        "[seed={seed}] the table's own tablet map now holds exactly the two children"
+    );
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] the parent's stale report must not count toward completion once its \
+         tablet is gone from `tablets_for_table` — the aggregator must wait for both children's \
+         own independent reports"
+    );
+
+    let (left_range, right_range) = KeyRange::whole()
+        .split_at(&split_key)
+        .expect("split key must bisect the whole range");
+    let left = wrap_group(&cluster, &node_ids, LEFT, left_range);
+    let right = wrap_group(&cluster, &node_ids, RIGHT, right_range);
+
+    drive_sweep_to_completion(&mut sim, &left, &live, &left.range, &tag, seed);
+    drive_sweep_to_completion(&mut sim, &right, &live, &right.range, &tag, seed);
+    mark_backfilled(&mut meta, TABLE, "by-email", LEFT);
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must not flip while RIGHT has not yet reported"
+    );
+    mark_backfilled(&mut meta, TABLE, "by-email", RIGHT);
+    assert!(
+        maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must flip once both split children independently report"
+    );
+    assert_eq!(
+        index_status(&meta, TABLE, "by-email"),
+        Some(IndexStatus::Active)
+    );
+
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    assert_full_coverage(
+        &left.nodes[left_leader],
+        seed,
+        "LEFT child, parent already reported",
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    assert_full_coverage(
+        &right.nodes[right_leader],
+        seed,
+        "RIGHT child, parent already reported",
+    );
+}
+
+#[test]
+fn split_after_tablet_already_reported_done() {
+    for_each_seed(
+        "split_after_tablet_already_reported_done",
+        scenario_split_after_tablet_already_reported_done,
+    );
+}
 
 // --- cell 4: live_writes_race_the_sweep --------------------------------------
 
