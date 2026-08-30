@@ -30,6 +30,13 @@ fn print_crd() {
 
 async fn run() {
     tracing_subscriber::fmt::init();
+    // rustls 0.23 has no process-level default CryptoProvider unless exactly
+    // one of its provider features is enabled across the whole dependency
+    // graph; kube's `rustls-tls` leaves that choice to the application, so
+    // building the client below panics without an explicit install.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other CryptoProvider is installed before this");
     let client = match kube::Client::try_default().await {
         Ok(c) => c,
         Err(e) => {
