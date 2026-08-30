@@ -672,3 +672,33 @@ retrievable from git history.)
   first. All three are hand-scripted-`Metadata`-corpus pitfalls, not bugs
   in `pitr_replay_segments`/`pitr_seal_now` themselves; see
   `docs/engineering-lessons.md` for the general lessons.
+- **Train 3 PR③ wires in five of the ADR 0061 Decision 3 fault primitives**,
+  the same pass the sibling raftkv/txn/backup corpora already got:
+  `wal_fsync_lie_kill_sealing_leader` (`DiskConfig::set_fsync_lie_prob` on
+  cell 3's own crash-mid-seal shape — the crashing leader's recent syncs may
+  have lied about durability, so `crash`'s default whole-buffer-drop loses
+  more than an un-lied crash would; the retry still recovers the full
+  backlog, since Raft safety only ever needs a *majority* to have durably
+  persisted a committed entry), `chaotic_network_pitr_rollover` +
+  `chaotic_network_idle_group_never_proposes_a_pitr_seal` (a compound 5%
+  drop / 10% duplicate `NetConfig` over cells 1 and 2 — **never**
+  `set_corrupt_prob`: `animus-cp-data::codec`'s `Vec::with_capacity(n as
+  usize)` sites over an untrusted wire length prefix are still unbounded on
+  this branch, verified directly; sibling PR #485 fixes it but had not
+  landed here, so a corrupted length prefix near `u32::MAX` would abort the
+  process — same conservative exclusion the sibling corpora made),
+  `wal_torn_on_crash_kill_sealing_leader` (`DiskConfig::torn_tail_on_crash`/
+  `corrupt_on_crash` on cell 3's shape, but — unlike a bare copy — the
+  crashed node is brought all the way back via `crash` → `restart` → `stop`
+  → a fresh `RaftKvNode::start_hosted`, then driven through a further
+  write/seal round; see `docs/engineering-lessons.md`'s "crash-only disk
+  fault has zero test teeth" entry for why the restart is load-bearing here,
+  not optional — `current_open_pitr_epoch` is derived only from the
+  hand-scripted `Metadata`, so a tear nothing ever reads back proves
+  nothing), and `restore_to_random_second_under_clock_drift`
+  (`Simulator::set_clock_drift_for` on the sealing leader in place of cell
+  8's leader-kill nemesis — `wall_ms` is read live off that leader's own
+  drifted `env.wall_now()` at each seal rather than a synthetic counter, and
+  `assert_replay_matches_model` still has to hold at every recorded second).
+  Held green at `ANIMUS_PITR_SEEDS=40` alongside every other cell in this
+  file (same knob).
