@@ -12,6 +12,14 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
+      raftkv_seeds:
+        description: "Seeds per structural cell (ANIMUS_RAFTKV_SEEDS, ADR 0017 raftkv linearizability corpus, MemoryEngine)"
+        required: false
+        default: "40"
+      raftkv_lsm_seeds:
+        description: "Seeds per structural cell (ANIMUS_RAFTKV_SEEDS with ANIMUS_RAFTKV_LSM=1, ADR 0017 raftkv linearizability corpus, LsmEngine<SimEnv>)"
+        required: false
+        default: "40"
       txn_seeds:
         description: "Seeds per structural cell (ANIMUS_TXN_SEEDS, ADR 0018 multi-tablet txn corpus)"
         required: false
@@ -52,6 +60,14 @@ on:
         description: "Seeds per scenario (ANIMUS_PITR_SEEDS, ADR 0059 Train 3 PITR sealing fault corpus)"
         required: false
         default: "40"
+      lsm_crash_seeds:
+        description: "Seeds per scenario (ANIMUS_LSM_CRASH_SEEDS, LsmEngine crash-safety corpus)"
+        required: false
+        default: "40"
+      lsm_disk_fault_seeds:
+        description: "Seeds per scenario (ANIMUS_LSM_DISK_FAULT_SEEDS, LsmEngine DiskConfig fault-injection corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -88,6 +104,36 @@ jobs:
       # back into one overall job failure, so CI still goes red on a real
       # regression, but only after every corpus has actually had a chance
       # to run and be seen.
+
+      # ADR 0017's flagship Elle-checked linearizability corpus for the
+      # leaderful per-tablet CP data plane: baselines + leader-kill/
+      # follower-kill/partition-leader/lossy x early/mid/late x 3- and
+      # 5-replica, plus the deepened tier (stop_restart, split_brain,
+      # leader_minority, compound lossy+stop_restart), scaled to depth over
+      # MemoryEngine. Each cell is a pure function of its seed, so a failure
+      # names one cell + seed and is replayable.
+      - name: deep raftkv linearizability corpus (ADR 0017 MemoryEngine)
+        id: raftkv
+        continue-on-error: true
+        env:
+          ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_seeds || '40' }}
+        run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
+
+      # The identical corpus over LsmEngine<SimEnv> instead of MemoryEngine —
+      # the durable path (real WAL/SSTable recovery through the deterministic
+      # disk seam) that production actually runs. A distinct code path (the
+      # storage engine), not just a deeper version of the MemoryEngine run
+      # above, so it gets its own nightly entry. Off by default
+      # (ANIMUS_RAFTKV_LSM=1 required to run the full corpus on this tier;
+      # unset, only a small always-on representative subset runs);
+      # composable with ANIMUS_RAFTKV_SEEDS for depth.
+      - name: deep raftkv linearizability corpus (ADR 0017 LsmEngine)
+        id: raftkv_lsm
+        continue-on-error: true
+        env:
+          ANIMUS_RAFTKV_LSM: "1"
+          ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_lsm_seeds || '40' }}
+        run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
 
       # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
       # (stage/commit/resolve + the recovery push) under fault injection,
@@ -199,6 +245,30 @@ jobs:
           ANIMUS_PITR_SEEDS: ${{ github.event.inputs.pitr_seeds || '40' }}
         run: cargo test -p animus-test --test pitr_fault_corpus -- --nocapture
 
+      # LsmEngine crash-safety corpus: synced writes / a flushed SSTable /
+      # crash mid-flush / crash mid-compaction / flush+compaction all surviving
+      # a crash + reopen through the deterministic SimEnv disk model, scaled to
+      # depth. Each scenario is a pure function of its seed, so a failure names
+      # one scenario + seed and is replayable.
+      - name: deep LSM crash-safety corpus
+        id: lsm_crash
+        continue-on-error: true
+        env:
+          ANIMUS_LSM_CRASH_SEEDS: ${{ github.event.inputs.lsm_crash_seeds || '40' }}
+        run: cargo test -p animus-storage --test lsm_crash -- --nocapture
+
+      # LsmEngine DiskConfig fault-injection corpus: injected I/O errors, torn
+      # WAL tails on crash, and at-rest byte corruption (WAL records, SSTable
+      # blocks, the MANIFEST), scaled to depth. Each scenario is a pure
+      # function of its seed, so a failure names one scenario + seed and is
+      # replayable.
+      - name: deep LSM disk-fault corpus
+        id: lsm_disk_fault
+        continue-on-error: true
+        env:
+          ANIMUS_LSM_DISK_FAULT_SEEDS: ${{ github.event.inputs.lsm_disk_fault_seeds || '40' }}
+        run: cargo test -p animus-storage --test lsm_disk_faults -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -208,6 +278,8 @@ jobs:
         if: always()
         run: |
           declare -A outcomes=(
+            [raftkv]="${{ steps.raftkv.outcome }}"
+            [raftkv_lsm]="${{ steps.raftkv_lsm.outcome }}"
             [txn]="${{ steps.txn.outcome }}"
             [streams]="${{ steps.streams.outcome }}"
             [backfill]="${{ steps.backfill.outcome }}"
@@ -218,9 +290,11 @@ jobs:
             [inplace_split]="${{ steps.inplace_split.outcome }}"
             [backup]="${{ steps.backup.outcome }}"
             [pitr]="${{ steps.pitr.outcome }}"
+            [lsm_crash]="${{ steps.lsm_crash.outcome }}"
+            [lsm_disk_fault]="${{ steps.lsm_disk_fault.outcome }}"
           )
           failed=0
-          for name in txn streams backfill split reconciler quiesce learner inplace_split backup pitr; do
+          for name in raftkv raftkv_lsm txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

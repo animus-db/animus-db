@@ -12815,3 +12815,72 @@ message. A doc comment claiming a decoder "never panics" or is
 never as a claim about allocation safety, unless it says so explicitly —
 `codec.rs`'s own doc comment now does, and is the template for any other
 decoder's doc that makes a similar claim.
+
+## A depth knob's existence in `CLAUDE.md` doesn't mean CI ever runs it deep — `corpus-deep.yml` needs its own explicit entry per corpus (2026-08-30, `ANIMUS_RAFTKV_SEEDS`)
+
+`raftkv_linearizable.rs` — the flagship Elle-checked linearizability corpus
+for the per-tablet CP data plane (ADR 0017) — had a documented
+`ANIMUS_RAFTKV_SEEDS` depth knob (and a second, `ANIMUS_RAFTKV_LSM=1`, for
+the `LsmEngine<SimEnv>` tier) held green at depth 20/×10 in
+`crates/animus-test/CLAUDE.md`, but `.github/workflows/corpus-deep.yml`'s
+nightly job never referenced either env var. Every push still ran the
+corpus at its default depth (1 = the frozen byte-identical set) via the
+normal `gates` job, so the deep-seed proof this corpus exists for was
+simply never exercised in CI — the crate guide's "held green at depth N"
+line documents a `cargo test` invocation someone ran by hand at some point,
+not a standing CI guarantee. **A corpus's env-var depth knob and its
+`corpus-deep.yml` matrix entry are two separate things that must both
+exist** — adding the knob (and proving it works locally) is not the same
+as wiring it into the nightly tier, and nothing fails loudly when the
+wiring is missing; the gap is silent unless someone reads the workflow
+file against the crate guide's knob table. When adding a new
+fault-injection corpus with a depth knob, add its `corpus-deep.yml` step
+in the same change (or a tracked follow-up), not "later." Also worth
+naming: a corpus that gates an entire alternate code path behind an
+off-by-default env var (`ANIMUS_RAFTKV_LSM=1`, the durable
+`LsmEngine<SimEnv>` tier vs. the always-on `MemoryEngine` one) needs its
+own nightly step distinct from that corpus's plain depth-scaled step, not
+just a deeper seed count on the same invocation — the two exercise
+different storage-engine code, not just "more of the same" scenarios.
+
+## Promoting a hardcoded-seed-loop test to the house corpus shape: the seed's literal value was never load-bearing, and default-depth coverage is *expected* to shrink (`lsm_crash.rs`/`lsm_disk_faults.rs`, ADR 0061 rung B1)
+
+Converting `animus-storage`'s two `LsmEngine` fault tests
+(`tests/lsm_crash.rs`, `tests/lsm_disk_faults.rs`) from hand-rolled
+`for seed in [0xA1u64, 0xB2, ...]` loops onto `animus_test::corpus`'s
+standard `Scenario`/`seed_expand` shape surfaced two things worth stating
+plainly, since both look like regressions at a glance and aren't.
+
+**The specific magic-number seeds were never part of what the tests
+prove.** Every scenario in both files asserts a generic invariant ("every
+acked write survives a crash", "a corrupted block/record surfaces a clean
+error, never silent loss") that must hold for *any* interleaving — none of
+them compare against an expected value computed from that particular seed.
+So replacing `[0xA1, 0xB2, 0xC3, 7, 42, 1337]` with `corpus::name_seed(name)`
+per newly-named cell changes which specific interleavings get exercised but
+proves exactly the same thing; there was no need to preserve the literal
+hex constants, and doing so would have fought the house doctrine ("a
+scenario's seed is always a deterministic function of its own name," see
+`animus-test/src/corpus.rs`'s module doc) for no benefit. Where the
+original loop crossed a real *structural* axis with its own seed list
+(`torn_wal_tail_crash_recovers_all_acked_writes`'s `corrupt: bool`,
+`corrupted_manifest_fails_open_cleanly`'s corruption `offset`), each
+combination became its own named cell (`..._corrupt`, `..._offset_4`, …)
+sharing one extracted body function — the axis is what deserves a name,
+the seed list crossing it doesn't.
+
+**Converting a file that unconditionally ran N seeds every push into a
+corpus at default depth 1 is a deliberate reduction in per-push seed count,
+not a coverage regression** — it's the entire point of the house corpus
+doctrine, whose default is *always* 1 (see the root `CLAUDE.md`'s
+knob table and every existing corpus in this repo), with seed-sweeping
+depth pushed to `corpus-deep.yml`'s nightly tier (`=40`) instead of paid on
+every push. Before this conversion, `injected_wal_errors_surface_and_
+lose_no_acked_write` ran 6 seeds unconditionally on every `cargo test`;
+after, it runs 1 by default and 40 nightly — fewer per-push runs, far more
+nightly ones, exactly like every other corpus in the repo. A task framed as
+"preserve current behavior/coverage, must not regress existing CI" is
+about outcomes (the test still builds, still passes, still exercises the
+same fault-injection mechanism), not about the literal per-push seed count
+— conflating the two would mean no hardcoded-seed-loop test could ever be
+promoted to the standard shape without also being read as a downgrade.
