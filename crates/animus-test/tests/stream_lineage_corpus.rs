@@ -61,7 +61,7 @@ use animus_control::{
 };
 use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, segment};
 use animus_env::{Env, EnvExt, Nanos, Rng, SegmentStore, nid};
-use animus_sim::{SimEnv, SimSegmentStore, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId, TabletState};
 use animus_test::corpus;
@@ -1299,6 +1299,351 @@ fn transactional_writes_exactly_once_and_ordered() {
     for_each_seed(
         "transactional_writes_exactly_once_and_ordered",
         scenario_transactional_writes_exactly_once_and_ordered,
+    );
+}
+
+// --- fault-primitive cells (ADR 0061 Decision 3) --------------------------
+//
+// `animus-sim`'s fault vocabulary wired directly into this corpus, mirroring
+// the sibling PRs that did the same for `raftkv_linearizable.rs`/
+// `txn_serializable.rs`/`backup_fault_corpus.rs`/`pitr_fault_corpus.rs`.
+// **`NetConfig::set_corrupt_prob` is deliberately NOT used anywhere below**:
+// as of this branch, `animus-cp-data::codec.rs` still has several sites
+// reading an untrusted wire length-prefix straight into
+// `Vec::with_capacity(n as usize)` with no upper bound — a corrupted message
+// landing near `u32::MAX` there is an allocator abort (SIGABRT) of the whole
+// test process, not a recoverable error a scenario could assert against. The
+// fix (sibling PR #485) hadn't landed on this branch at the time these cells
+// were written; verify with `grep Vec::with_capacity
+// crates/animus-cp-data/src/codec.rs` before ever re-enabling it here.
+
+// --- cell 13: duplicate_delivery_under_leader_kill ------------------------
+
+/// `NetConfig::set_duplicate_prob` — a surviving message is delivered
+/// **twice**, each copy with its own independent delay draw — mixed with
+/// `kill_sealing_leader`'s own leader-kill nemesis. Duplication is the
+/// direct network-level probe of this corpus's whole point ("exactly-once"
+/// stream delivery, ADR 0042 §2): if the dedup this corpus's own
+/// `verify_lineage` checks (packed-HLC uniqueness) were ever accidentally
+/// resting on the network never duplicating a Raft/apply message rather than
+/// on real application-layer idempotency, this is where that gap would
+/// show — and mixed with a leadership change (duplicated
+/// vote/`AppendEntries`/snapshot traffic racing a real election) is where
+/// such a gap is most likely to hide.
+fn scenario_duplicate_delivery_under_leader_kill(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(40), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_duplicate_prob(0.3);
+    sim.set_net_config(net_cfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..5 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+
+    // Kill whichever replica currently leads mid-stream, exactly like
+    // `kill_sealing_leader` — but now every surviving Raft message is also
+    // being duplicated at p=0.3.
+    let dying = elect(&mut sim, &group, &live, seed);
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+
+    for i in 5..10 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v1", seed);
+    }
+    let sealed = seal_now(&mut meta, &store, &group, new_leader, 1_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the post-election leader must still seal correctly under duplicated \
+         network traffic"
+    );
+
+    verify_lineage(&meta, &store, &[(&group, new_leader)], &journal, seed);
+}
+
+#[test]
+fn duplicate_delivery_under_leader_kill() {
+    for_each_seed(
+        "duplicate_delivery_under_leader_kill",
+        scenario_duplicate_delivery_under_leader_kill,
+    );
+}
+
+// --- cell 14: fsync_lie_survives_replica_crash ----------------------------
+
+/// `DiskConfig::set_fsync_lie_prob` — a `sync` call returns `Ok` while
+/// leaving its buffered bytes un-synced, a lie revealed only by a LATER
+/// crash on that same node (never an error, so — unlike the enospc/error
+/// faults this file's own header note excludes — it is safe for ambient use
+/// throughout a scenario). Configured on every replica's own disk config (so
+/// the lie can land on whichever one happens to crash) and combined with the
+/// same leader-kill idiom the cell above and `kill_sealing_leader` use:
+/// crashing exactly ONE of three replicas can never threaten a
+/// majority-committed write regardless of which node lied or whether it was
+/// the leader itself — the durability invariant (ADR 0042 §9) rests on
+/// Raft's quorum, never on any single node's own disk honesty, and this cell
+/// is the direct probe of that: a stream shard's sealed/committed state must
+/// never advance past what the surviving majority can actually prove
+/// durable.
+fn scenario_fsync_lie_survives_replica_crash(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(41), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.set_fsync_lie_prob(0.3);
+    for &n in &NODES {
+        sim.set_disk_config_for(nid(n), disk_cfg.clone());
+    }
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..5 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &group, leader, 1_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the first seal must commit despite ambient fsync lies"
+    );
+
+    // Crash whichever replica currently leads — its own un-synced (possibly
+    // lied-about) WAL tail is torn now, but with only ONE of three replicas
+    // ever lost at a time, the surviving majority's genuinely-durable copies
+    // are what the invariant actually depends on.
+    let dying = elect(&mut sim, &group, &live, seed);
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+
+    for i in 5..10 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v1", seed);
+    }
+    let sealed = seal_now(&mut meta, &store, &group, new_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(1),
+        "[seed={seed}] the post-crash leader must still seal correctly under ambient fsync \
+         lies"
+    );
+
+    verify_lineage(&meta, &store, &[(&group, new_leader)], &journal, seed);
+}
+
+#[test]
+fn fsync_lie_survives_replica_crash() {
+    for_each_seed(
+        "fsync_lie_survives_replica_crash",
+        scenario_fsync_lie_survives_replica_crash,
+    );
+}
+
+// --- cell 15: torn_tail_crash_survives_a_true_restart ---------------------
+
+/// `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` only ever fire inside
+/// [`Simulator::crash`], never [`Simulator::stop`] — and a crash-only fault
+/// has zero test teeth unless something later reads the crashed node's OWN
+/// post-crash state back. This cell does both halves: a genuine process
+/// restart (`crash` to apply the tear -> `restart` to re-arm the muted tasks
+/// -> `stop` to drop them again while KEEPING the now-torn durable state ->
+/// a fresh [`RaftKvNode::start_hosted`] on the same node id, recovering from
+/// whatever survived the tear — mirroring `raftkv_linearizable.rs`'s own
+/// `StopRestart` nemesis idiom, adapted to this file's per-scenario-function
+/// shape) — then drives the recovered replica back into the live set, lets
+/// it catch up via ordinary Raft replication, and explicitly reads its OWN
+/// state back (`verify_lineage` with the recovered replica as the serving
+/// leader) rather than only ever reading from a survivor, so a
+/// silently-lost-and-never-caught-up write on the recovered replica would
+/// actually fail this test rather than pass unnoticed.
+///
+/// `MemoryEngine` is never disk-backed (`animus-storage/CLAUDE.md`: "cheap
+/// to clone; clones share state"), so the tear can only ever touch this
+/// node's own Raft WAL — its already-applied engine content survives the
+/// crash untouched, and what a real restart must re-derive via ordinary
+/// replication is only whatever the group committed *after* this node's own
+/// crash instant.
+fn scenario_torn_tail_crash_survives_a_true_restart(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let mut group = start_group(&sim, &engines, TabletId(42), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.torn_tail_on_crash = true;
+    disk_cfg.corrupt_on_crash = true;
+    let victim = elect(&mut sim, &group, &live, seed);
+    sim.set_disk_config_for(nid(NODES[victim]), disk_cfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..5 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let sealed = seal_now(&mut meta, &store, &group, victim, 1_000, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] the first seal must commit");
+
+    // The crash tears the victim's own un-synced WAL tail (and, with
+    // `corrupt_on_crash`, garbles one byte of what's retained). Per the
+    // fault's own doc, the composition that both applies the tear AND
+    // reaches a true fresh-process restart is crash -> restart (clears the
+    // mute flag) -> stop (drops the just-re-armed tasks, keeping the durable
+    // state exactly as the crash left it).
+    sim.crash(nid(NODES[victim]));
+    sim.restart(nid(NODES[victim]));
+    sim.stop(nid(NODES[victim]));
+    live.retain(|&i| i != victim);
+
+    // Meanwhile the surviving majority keeps making progress.
+    let new_leader = elect(&mut sim, &group, &live, seed);
+    for i in 5..10 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v1", seed);
+    }
+    let sealed = seal_now(&mut meta, &store, &group, new_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(1),
+        "[seed={seed}] the surviving majority must still seal correctly"
+    );
+    let caught_up_target = group.nodes[new_leader].engine_applied_index();
+
+    // A fresh process on the SAME node id, recovering from whatever
+    // survived the tear.
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh = RaftKvNode::start_hosted(
+        sim.env(nid(NODES[victim])),
+        ids,
+        engines[&NODES[victim]].clone(),
+        StorageScope::new(KeyRange::whole()),
+        group.id.0,
+    );
+    group.nodes[victim] = fresh;
+    live.push(victim);
+    live.sort_unstable();
+
+    // Let the recovered replica catch up via ordinary Raft replication — no
+    // special recovery path, the same convergence every restart in this
+    // codebase relies on.
+    for _ in 0..300 {
+        if group.nodes[victim].engine_applied_index() >= caught_up_target {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    assert!(
+        group.nodes[victim].engine_applied_index() >= caught_up_target,
+        "[seed={seed}] the recovered replica never caught up to the surviving leader"
+    );
+
+    for i in 10..12 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v2", seed);
+    }
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = seal_now(&mut meta, &store, &group, leader, 3_000, false);
+    assert_eq!(
+        sealed,
+        Some(2),
+        "[seed={seed}] a post-recovery seal must still commit"
+    );
+    let final_target = group.nodes[leader].engine_applied_index();
+    for _ in 0..300 {
+        if group.nodes[victim].engine_applied_index() >= final_target {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    assert!(
+        group.nodes[victim].engine_applied_index() >= final_target,
+        "[seed={seed}] the recovered replica never caught up to the final write batch"
+    );
+
+    // Read the recovered replica's OWN state back directly, not just a
+    // survivor's — the "zero test teeth" caveat this fault otherwise has.
+    verify_lineage(&meta, &store, &[(&group, victim)], &journal, seed);
+}
+
+#[test]
+fn torn_tail_crash_survives_a_true_restart() {
+    for_each_seed(
+        "torn_tail_crash_survives_a_true_restart",
+        scenario_torn_tail_crash_survives_a_true_restart,
+    );
+}
+
+// --- cell 16: lossy_and_duplicate_network_chaos ---------------------------
+
+/// A compound network-chaos cell: dropped AND duplicated messages ambient
+/// throughout a multi-round write/seal schedule, no crash at all — proving
+/// exactly-once/per-item-order survives a noisy network entirely on its
+/// own, independent of any node failure. `set_corrupt_prob` is deliberately
+/// NOT part of this mix — see this section's own header note for why.
+fn scenario_lossy_and_duplicate_network_chaos(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    let group = start_group(&sim, &engines, TabletId(43), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_drop_prob(0.1);
+    net_cfg.set_duplicate_prob(0.2);
+    sim.set_net_config(net_cfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for round in 0..3u64 {
+        for i in 0..5 {
+            let payload = format!("round{round}").into_bytes();
+            write_and_journal(
+                &mut sim,
+                &group,
+                &live,
+                &mut journal,
+                &key(i),
+                &payload,
+                seed,
+            );
+        }
+        let leader = elect(&mut sim, &group, &live, seed);
+        seal_now(
+            &mut meta,
+            &store,
+            &group,
+            leader,
+            1_000 + round * 100,
+            false,
+        );
+    }
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    verify_lineage(&meta, &store, &[(&group, leader)], &journal, seed);
+}
+
+#[test]
+fn lossy_and_duplicate_network_chaos() {
+    for_each_seed(
+        "lossy_and_duplicate_network_chaos",
+        scenario_lossy_and_duplicate_network_chaos,
     );
 }
 
