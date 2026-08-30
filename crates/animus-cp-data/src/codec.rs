@@ -20,6 +20,30 @@
 //! (`tracing::warn!`) before dropping the message — never a silent
 //! misinterpretation (the magic/version check rejects a stray JSON payload
 //! outright).
+//!
+//! **Decoding untrusted input is bounds-checked *and* allocation-safe** —
+//! two distinct guarantees, not one. Every individual field read
+//! (`Cursor::take` and everything built on it) is bounds-checked against
+//! the remaining buffer, so a truncated or malformed frame is always a
+//! clean `Err`, never an out-of-bounds panic. That alone is not enough: a
+//! `u32`/`u64` **count** read off the wire (an `AppendEntries` entry count,
+//! a `KindBatch`'s write count, …) used to be handed straight to
+//! `Vec::with_capacity(n as usize)` to pre-size the collection *before* any
+//! of its `n` elements were validated against the buffer — a single
+//! corrupted or adversarial length-prefix byte could set `n` to a value
+//! near `u32::MAX`, and the resulting many-GB-or-more allocation request
+//! makes Rust's global allocator **abort the whole process**
+//! (`handle_alloc_error`), which is not a catchable panic and therefore not
+//! something a bounds-checked-reads guarantee alone prevents. Every such
+//! site in this module (and its sibling engine-marker decoders in
+//! `txn.rs`/`split.rs`) now caps the *requested capacity* at `.min(1 << 20)`
+//! — the actual number of elements decoded is still governed solely by what
+//! the buffer holds, so a legitimate message's cost is unchanged; only a
+//! hostile/corrupted count's pre-allocation is bounded. See
+//! `docs/engineering-lessons.md`'s "untrusted length-prefixed collection
+//! pre-allocation" entry for the general pattern, and this module's own
+//! `corrupted_append_entries_count_returns_a_graceful_error_not_an_alloc_abort`
+//! / `decode_wire_never_panics_or_aborts_*` tests for the regression guard.
 
 use std::collections::BTreeSet;
 
@@ -202,7 +226,13 @@ fn put_opt_node_set(out: &mut Vec<u8>, s: &Option<BTreeSet<NodeId>>) {
 // ---- primitive reader ------------------------------------------------------
 
 /// A forward-only cursor over frame bytes; any short read is a loud decode
-/// error (mirrors the storage manifest codec's `Cursor`).
+/// error (mirrors the storage manifest codec's `Cursor`). Bounds-checks
+/// every individual read against the remaining buffer — but a caller that
+/// reads a count via [`Cursor::u32`]/[`Cursor::u64`] and then pre-sizes a
+/// collection with it must still cap that pre-allocation itself (see this
+/// module's own doc comment above): this cursor alone cannot stop an
+/// untrusted count from driving an oversized `Vec::with_capacity` before a
+/// single element has been validated.
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -395,7 +425,14 @@ fn put_kind_writes(out: &mut Vec<u8>, writes: &[crate::KindWrite]) {
 
 fn read_kind_writes(c: &mut Cursor<'_>) -> Result<Vec<crate::KindWrite>, DecodeError> {
     let n = c.u32()?;
-    let mut writes = Vec::with_capacity(n as usize);
+    // `n` is an untrusted wire count read before any of its elements are
+    // validated against the remaining buffer — cap the *requested
+    // capacity* (never the number of elements actually decoded, which
+    // stays governed solely by what the buffer holds) so a corrupted/
+    // hostile `n` near `u32::MAX` can't demand a many-GB allocation and
+    // trigger an allocator abort. Mirrors the `.min(1 << 20)` idiom this
+    // crate's `backup.rs`/`segment.rs` decoders already use.
+    let mut writes = Vec::with_capacity(n.min(1 << 20) as usize);
     for _ in 0..n {
         writes.push((c.u8()?, c.bytes()?, c.opt_bytes()?));
     }
@@ -440,7 +477,9 @@ fn put_change_logs(out: &mut Vec<u8>, change_log: &[(Vec<u8>, Vec<u8>)]) {
 #[allow(clippy::type_complexity)]
 fn read_change_logs(c: &mut Cursor<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DecodeError> {
     let n = c.u32()?;
-    let mut out = Vec::with_capacity(n as usize);
+    // Capped pre-allocation against an untrusted wire count — see
+    // `read_kind_writes`'s comment above for why.
+    let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
     for _ in 0..n {
         out.push((c.bytes()?, c.bytes()?));
     }
@@ -625,7 +664,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         },
         1 => {
             let n = c.u32()?;
-            let mut puts = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut puts = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 puts.push((c.bytes()?, c.bytes()?));
             }
@@ -638,7 +679,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             let writes = read_kind_writes(c)?;
             let change_log = read_change_logs(c)?;
             let n = c.u32()?;
-            let mut conditions = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut conditions = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 conditions.push((c.bytes()?, c.opt_bytes()?));
             }
@@ -668,7 +711,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             for _ in 0..2 {
                 let id = TabletId(c.u64()?);
                 let n = c.u32()?;
-                let mut replicas = Vec::with_capacity(n as usize);
+                // Capped pre-allocation against an untrusted wire count —
+                // see `read_kind_writes`'s comment for why.
+                let mut replicas = Vec::with_capacity(n.min(1 << 20) as usize);
                 for _ in 0..n {
                     replicas.push(c.node_id()?);
                 }
@@ -690,7 +735,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 .map_err(|_| "TxnStage record_table not utf8".to_string())?;
             let is_anchor = c.bool()?;
             let n = c.u32()?;
-            let mut writes = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut writes = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 let key = c.bytes()?;
                 let value = c.opt_bytes()?;
@@ -706,14 +753,16 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 });
             }
             let n = c.u32()?;
-            let mut spans = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut spans = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 let table = String::from_utf8(c.bytes()?)
                     .map_err(|_| "TxnStage span table not utf8".to_string())?;
                 spans.push((table, read_key_range(c)?));
             }
             let n = c.u32()?;
-            let mut conditions = Vec::with_capacity(n as usize);
+            let mut conditions = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 conditions.push((c.bytes()?, c.opt_bytes()?));
             }
@@ -743,7 +792,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             let txn_id = read_txn_id(c)?;
             let record_key = c.bytes()?;
             let n = c.u32()?;
-            let mut keys = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut keys = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 keys.push(c.bytes()?);
             }
@@ -758,7 +809,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         }
         13 => {
             let n = c.u32()?;
-            let mut rows = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why.
+            let mut rows = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 let kind = c.u8()?;
                 let logical = c.bytes()?;
@@ -945,7 +998,12 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             let prev_log_index = c.u64()?;
             let prev_log_term = c.u64()?;
             let n = c.u32()?;
-            let mut entries = Vec::with_capacity(n as usize);
+            // Capped pre-allocation against an untrusted wire count — see
+            // `read_kind_writes`'s comment for why. This is the exact site
+            // a corrupted `AppendEntries` entry-count field once reached to
+            // trigger `SIGABRT` via `handle_alloc_error` (reproduced via
+            // `cargo test -p animus-test --test raftkv_linearizable`).
+            let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 entries.push(read_entry(c)?);
             }
@@ -1076,7 +1134,9 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError>
         return Err(format!("unsupported codec version {version}"));
     }
     let n = c.u32()?;
-    let mut entries = Vec::with_capacity(n as usize);
+    // Capped pre-allocation against an untrusted wire count — see
+    // `read_kind_writes`'s comment for why.
+    let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
     for _ in 0..n {
         entries.push((c.u8()?, c.bytes()?, c.opt_bytes()?, c.u64()?));
     }
@@ -1086,6 +1146,8 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Vec<ImageEntry>, DecodeError>
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn roundtrip(w: &KvWire) {
@@ -1454,6 +1516,83 @@ mod tests {
         // Image: same loud contract.
         let err = decode_image(b"[]").unwrap_err();
         assert!(err.contains("bad magic"), "got: {err}");
+    }
+
+    /// Regression for the process-abort DoS this module's `with_capacity`
+    /// fix closes: a corrupted `AppendEntries` entry-count field pushed to
+    /// just under `u32::MAX`, with none of the (nonexistent) declared
+    /// entries actually present in the buffer. Before the fix,
+    /// `read_raft`'s `Vec::with_capacity(n as usize)` would request an
+    /// allocation of ~`n * size_of::<LogEntry<KvCommand>>()` bytes —
+    /// hundreds of GB — which Rust's global allocator handles by aborting
+    /// the whole process (`handle_alloc_error`, not a catchable panic).
+    /// This exact shape (`read_raft`'s entry-count field) was reproduced
+    /// live via `cargo test -p animus-test --test raftkv_linearizable`
+    /// before the fix; now it must return a graceful `Err`.
+    #[test]
+    fn corrupted_append_entries_count_returns_a_graceful_error_not_an_alloc_abort() {
+        let mut bytes = vec![
+            MAGIC, VERSION, 0, /* KvWire::Raft */
+            4, /* RaftMsg::AppendEntries */
+        ];
+        bytes.extend_from_slice(&7u64.to_be_bytes()); // term
+        put_node_id(&mut bytes, &nid(1)); // leader
+        bytes.extend_from_slice(&16u64.to_be_bytes()); // prev_log_index
+        bytes.extend_from_slice(&3u64.to_be_bytes()); // prev_log_term
+        bytes.extend_from_slice(&(u32::MAX - 1).to_be_bytes()); // corrupted entry count
+        // No entry bytes follow at all — the declared count vastly exceeds
+        // what the buffer actually holds.
+        let err = decode_wire(&bytes).unwrap_err();
+        assert!(err.contains("truncated"), "got: {err}");
+    }
+
+    proptest! {
+        /// Fuzz `decode_wire`/`decode_image` over arbitrary byte sequences.
+        /// The only contract that matters here: every input decodes to
+        /// `Ok` or `Err`, and nothing panics or aborts the process.
+        /// `proptest` turns a panic into a shrunk, reported failing case;
+        /// an allocator abort would instead kill the whole test binary —
+        /// exactly the failure mode this guards against, so a green run of
+        /// this test is itself part of the regression proof.
+        #[test]
+        fn decode_wire_never_panics_or_aborts_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let _ = decode_wire(&bytes);
+        }
+
+        #[test]
+        fn decode_image_never_panics_or_aborts_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let _ = decode_image(&bytes);
+        }
+
+        /// A sharper-targeted fuzz than pure random bytes: a syntactically
+        /// valid frame prefix through `AppendEntries`' own entry-count
+        /// field, that field forced into the "would have demanded a
+        /// many-GB pre-fix allocation" range, followed by a short,
+        /// always-insufficient tail — the exact untrusted-length-prefix
+        /// shape the process-abort bug lived in, swept over a wide range
+        /// of counts and trailing-byte shapes rather than one fixed case.
+        #[test]
+        fn decode_wire_never_panics_or_aborts_with_a_huge_declared_entry_count(
+            n in 1_000_000u32..=u32::MAX,
+            tail in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut bytes = vec![MAGIC, VERSION, 0 /* KvWire::Raft */, 4 /* AppendEntries */];
+            bytes.extend_from_slice(&7u64.to_be_bytes()); // term
+            put_node_id(&mut bytes, &nid(1)); // leader
+            bytes.extend_from_slice(&16u64.to_be_bytes()); // prev_log_index
+            bytes.extend_from_slice(&3u64.to_be_bytes()); // prev_log_term
+            bytes.extend_from_slice(&n.to_be_bytes()); // declared entry count
+            bytes.extend_from_slice(&tail); // never enough bytes for `n` real entries
+            let result = decode_wire(&bytes);
+            prop_assert!(
+                result.is_err(),
+                "a huge declared entry count with insufficient trailing bytes must fail gracefully"
+            );
+        }
     }
 
     #[test]

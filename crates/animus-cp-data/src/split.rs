@@ -123,7 +123,16 @@ pub(crate) fn decode_split_value(bytes: &[u8]) -> Option<DecodedSplit> {
         }
         fn node_list(&mut self) -> Option<Vec<NodeId>> {
             let n = self.u32()? as usize;
-            let mut out = Vec::with_capacity(n);
+            // `n` is a length prefix read before its elements are
+            // validated against the remaining buffer. This marker is
+            // normally only ever this crate's own write (see the doc
+            // above), but — like `txn.rs`'s envelope decoder — a
+            // corrupted/adversarial `InstallSnapshot` image could smuggle
+            // a crafted value straight into the engine, bypassing the
+            // `KvCommand` decode path entirely. Cap the requested
+            // capacity so a hostile `n` near `u32::MAX` can't demand a
+            // many-GB allocation and trigger an allocator abort.
+            let mut out = Vec::with_capacity(n.min(1 << 20));
             for _ in 0..n {
                 let len = self.u32()? as usize;
                 let raw = self.take(len)?;
