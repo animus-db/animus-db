@@ -85,7 +85,27 @@ amendment — the shape predates and outlives it.)
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
   rendering cost ~3–4x). Decode failures are loud. The Raft WAL keeps the
-  shared control-plane serde_json `PersistedState` format. **A field added
+  shared control-plane serde_json `PersistedState` format — which has **no
+  per-record checksum** (`WalRecord::decode`, `animus-control::persist`,
+  tolerates only a torn *trailing* line, never a mid-line bit-flip that
+  keeps the JSON syntactically valid). Confirmed reproducible: composing
+  `animus-sim`'s `DiskConfig::torn_tail_on_crash` with `corrupt_on_crash`
+  across a genuine crash+restart can flip a byte inside a still-decodable
+  `WalRecord::Append`'s packed `HlcTimestamp`, producing a **wrong but
+  successfully decoded** value that later hard-panics `assert_ts_monotonic`
+  once applied — see `tests/quiescence.rs`'s `a_lying_fsync_revealed_by_a_
+  crash_recovers_correctly_on_restart` (which deliberately excludes
+  `corrupt_on_crash` for exactly this reason) and `docs/engineering-
+  lessons.md`'s matching entry for the full account; a real, unfixed
+  finding — the WAL-side sibling of this same crate's own `codec.rs` wire
+  decoder's separately-known, also-unfixed untrusted-length-prefix
+  allocator-abort gap (`Vec::with_capacity(n as usize)` on an unvalidated
+  `u32`, at roughly a dozen sites — see the sibling `raftkv`/`txn` corpora's
+  own `Nemesis::Chaos` doc for that finding's own account). Both share the
+  same root cause, "no checksum/bound on untrusted framing," just on
+  opposite sides of this crate (WAL read-back vs wire receive).
+
+  **A field added
   to the shared `LogEntry`/`RaftMsg` types (`animus-control::raft`) needs an
   explicit encode/decode arm here too** — `#[serde(default)]` only protects
   the `serde_json` WAL path, not this hand-rolled one (version `22`, ADR
