@@ -12842,3 +12842,45 @@ off-by-default env var (`ANIMUS_RAFTKV_LSM=1`, the durable
 own nightly step distinct from that corpus's plain depth-scaled step, not
 just a deeper seed count on the same invocation — the two exercise
 different storage-engine code, not just "more of the same" scenarios.
+
+## Promoting a hardcoded-seed-loop test to the house corpus shape: the seed's literal value was never load-bearing, and default-depth coverage is *expected* to shrink (`lsm_crash.rs`/`lsm_disk_faults.rs`, ADR 0061 rung B1)
+
+Converting `animus-storage`'s two `LsmEngine` fault tests
+(`tests/lsm_crash.rs`, `tests/lsm_disk_faults.rs`) from hand-rolled
+`for seed in [0xA1u64, 0xB2, ...]` loops onto `animus_test::corpus`'s
+standard `Scenario`/`seed_expand` shape surfaced two things worth stating
+plainly, since both look like regressions at a glance and aren't.
+
+**The specific magic-number seeds were never part of what the tests
+prove.** Every scenario in both files asserts a generic invariant ("every
+acked write survives a crash", "a corrupted block/record surfaces a clean
+error, never silent loss") that must hold for *any* interleaving — none of
+them compare against an expected value computed from that particular seed.
+So replacing `[0xA1, 0xB2, 0xC3, 7, 42, 1337]` with `corpus::name_seed(name)`
+per newly-named cell changes which specific interleavings get exercised but
+proves exactly the same thing; there was no need to preserve the literal
+hex constants, and doing so would have fought the house doctrine ("a
+scenario's seed is always a deterministic function of its own name," see
+`animus-test/src/corpus.rs`'s module doc) for no benefit. Where the
+original loop crossed a real *structural* axis with its own seed list
+(`torn_wal_tail_crash_recovers_all_acked_writes`'s `corrupt: bool`,
+`corrupted_manifest_fails_open_cleanly`'s corruption `offset`), each
+combination became its own named cell (`..._corrupt`, `..._offset_4`, …)
+sharing one extracted body function — the axis is what deserves a name,
+the seed list crossing it doesn't.
+
+**Converting a file that unconditionally ran N seeds every push into a
+corpus at default depth 1 is a deliberate reduction in per-push seed count,
+not a coverage regression** — it's the entire point of the house corpus
+doctrine, whose default is *always* 1 (see the root `CLAUDE.md`'s
+knob table and every existing corpus in this repo), with seed-sweeping
+depth pushed to `corpus-deep.yml`'s nightly tier (`=40`) instead of paid on
+every push. Before this conversion, `injected_wal_errors_surface_and_
+lose_no_acked_write` ran 6 seeds unconditionally on every `cargo test`;
+after, it runs 1 by default and 40 nightly — fewer per-push runs, far more
+nightly ones, exactly like every other corpus in the repo. A task framed as
+"preserve current behavior/coverage, must not regress existing CI" is
+about outcomes (the test still builds, still passes, still exercises the
+same fault-injection mechanism), not about the literal per-push seed count
+— conflating the two would mean no hardcoded-seed-loop test could ever be
+promoted to the standard shape without also being read as a downgrade.

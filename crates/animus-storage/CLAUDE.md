@@ -432,6 +432,22 @@ the **admin actions** `flush_now`/`compact_now`. `open_with_metrics`/
 `with_metrics` is the sim-readable seam every metrics test opens the
 engine through (`SimEnv`'s metrics sink, not `ProdEnv`'s).
 
+**`tests/lsm_crash.rs` (plain crash/recovery) and `tests/lsm_disk_faults.rs`
+(`DiskConfig` fault injection) follow the house corpus doctrine** (ADR 0061
+rung B1 — the same `animus_test::corpus` scaffolding `raftkv_linearizable.rs`/
+`reconciler_corpus.rs` use, see those files and `animus-test/CLAUDE.md` for
+the canonical shape): a frozen, name-seeded scenario list per file, with a
+depth knob apiece — **`ANIMUS_LSM_CRASH_SEEDS`**/**`ANIMUS_LSM_DISK_FAULT_
+SEEDS`** (default 1 = the frozen cells; both held green at `=40`, matching
+`corpus-deep.yml`'s nightly tier). Kept as two separate knobs rather than one
+shared one since the two files probe genuinely different fault dimensions
+(crash-safety invariants vs. `DiskConfig`-driven torn tails/corruption/
+injected I/O errors). None of these scenarios' properties are tied to a
+*specific* seed value (no test asserts an exact byte-identical output keyed
+to a magic number), so — unlike a corpus whose frozen cells encode a real
+regression's own literal seed — converting the pre-existing hardcoded seed
+lists to name-derived ones changed no test's outcome.
+
 `lsm_concurrent.rs` is a **real multi-threaded** regression
 (`#[tokio::test(flavor = "multi_thread")]` over `ProdEnv`, timeout-guarded):
 the deterministic single-threaded `SimEnv` cannot exercise a preemptive
