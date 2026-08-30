@@ -1,0 +1,90 @@
+name: e2e-kind
+
+# End-to-end smoke of the animus-operator + AnimusCluster CRD against a real
+# `kind` cluster (ADR 0060, scripts/e2e-kind.sh). Path-filtered to the
+# operator/deploy/image surfaces this actually exercises — a change to,
+# say, an unrelated ADR doesn't need a real cluster spun up to prove
+# nothing regressed here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/animus-operator/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "scripts/e2e-kind.sh"
+      - ".github/workflows/e2e-kind.yml"
+  pull_request:
+    paths:
+      - "crates/animus-operator/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - "scripts/e2e-kind.sh"
+      - ".github/workflows/e2e-kind.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  KIND_VERSION: v0.30.0
+
+jobs:
+  e2e:
+    name: e2e-kind
+    runs-on: ubuntu-latest
+    # kubeadm bring-up, an animusd release build, and a real 3-then-4-node
+    # cluster bootstrap comfortably fit inside 30 minutes on a shared
+    # runner (see this repo's own local run for a timing baseline), but
+    # this is real wall-clock work, not a deterministic SimEnv suite —
+    # generous on purpose, matching the style of the corpus-deep workflow.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same free-disk step as CI's own `gates` job — a release build of
+      # animusd's dependency tree plus a kind node image plus a docker
+      # build's own layers doesn't fit in the runner's default free space
+      # otherwise.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      # Pin to the workspace rust-version (Cargo.toml [workspace.package])
+      # — the operator runs via `cargo run`, so this toolchain matters at
+      # e2e-run time, not just at image-build time.
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Default build args (plain Docker Hub) — CI has no egress-proxy
+      # constraint, unlike the sandboxed local dev flow this script's own
+      # header documents.
+      - name: Build animusd image
+        run: docker build -t animusd:e2e .
+
+      - name: Run the e2e smoke
+        env:
+          ANIMUSD_IMAGE: animusd:e2e
+        run: bash scripts/e2e-kind.sh

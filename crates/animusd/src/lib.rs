@@ -10030,7 +10030,18 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
+    // The node's own identity is `RoleAddrs::id` — the id this same config's
+    // `control_ids()`/`peer_book()` already used to build the voter set and
+    // peer book every node (including this one) was handed. `config::
+    // node_id(index)` mints the unrelated "n{index}" convention, which only
+    // coincides with `addrs.id` for a `generate`d config; a hand-written or
+    // operator-generated config (e.g. the Kubernetes operator's `"{cluster}-
+    // {ordinal}"` ids) diverges, and binding under the wrong id makes
+    // `RaftCore::is_voter()` (`self.config.contains(&self.id)`) false forever
+    // — this node can never see itself as a member of its own genesis
+    // config, so it never campaigns and the group never elects a leader. See
+    // `docs/engineering-lessons.md` for the incident this fixes.
+    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
@@ -10190,7 +10201,10 @@ pub async fn run_node_control_with_orphan_sweep_after(
             "node index does not run the control role",
         ));
     }
-    let bound = Node::bind_control(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind_control(addrs.id.clone(), addrs, dir).await?;
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -10282,7 +10296,10 @@ pub async fn run_node_data(
             "config has no control-role node for this data node to mirror",
         ));
     }
-    let bound = Node::bind_data(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind_data(addrs.id.clone(), addrs, dir).await?;
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -10406,7 +10423,10 @@ pub async fn run_node_growth(
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(

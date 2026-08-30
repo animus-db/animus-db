@@ -3520,6 +3520,23 @@ debugging anything that feels like it might have happened before.
   independent" convention — see that file's identical helpers for the
   general pattern any GSI-`Query`-asserting test should follow).
   (`crates/animusd/tests/update_table_drop_index.rs`.)
+- **A rare, load-sensitive flake needs a matched A/B, not a bigger N on one
+  side.** "6/6 clean on base, 1/3 failing on the branch" from small samples
+  on a shared, variably-loaded machine is exactly the pattern ambient
+  contention produces; the discriminating test is running the same stress
+  harness (e.g. 4 parallel copies of the compiled test binary) back-to-back
+  on both trees and comparing rates. Concrete case: `animusd`'s
+  `dynamo_query_pagination::final_page_carries_no_last_evaluated_key`
+  looked train-caused at small N, then reproduced at ~0.6% on both trees
+  under the matched harness — the real mechanism was the ADR 0055
+  `ConsistentRead: false` replica-local read racing the last write's apply,
+  i.e. a pre-existing race, not the refactor under suspicion.
+- **`cargo test`'s printed `Executable tests/foo.rs (/path/foo-HASH)` line
+  is the only reliable way to name the binary that matches current
+  source** — the deps-dir filename hash derives from package id/deps/
+  profile, not source content, so the same hash is silently overwritten on
+  rebuild; hardcoding a previously-seen hash in a bisection/stress script
+  can run stale code with zero indication.
 
 - **`prop_assume!` with a coin-flip-odds filter is a time bomb the moment
   anyone raises the case count — generate the dependent value directly
@@ -8620,6 +8637,51 @@ debugging anything that feels like it might have happened before.
   catches every miss — but only if each intermediate build is actually
   run, since a batch of moves without an intervening build can mask one
   widening behind another's cascading errors.
+- **`Cargo.lock` is deliberately gitignored (`.gitignore`, present since the
+  repo's initial commit, no lockfile ever tracked in history) — a container
+  build or any other recipe that assumes a committed lockfile breaks
+  (ADR 0060 e2e work).** The Dockerfile's own builder stage says as much
+  (`COPY Cargo.toml` only, never `Cargo.lock` — "cargo build mints its own
+  lock file from the registry cache mount"), and this is exactly what a
+  real build does: `docker build`'s first line is `Locking N packages to
+  latest Rust <version>-compatible versions`, freshly resolved every build,
+  not reproduced from a checked-in file. The repo carries no separate
+  written rationale for the choice beyond that comment; treat it as "this
+  workspace resolves dependencies per-checkout, not pinned across commits"
+  and design any new build/CI recipe around that — never add a `COPY
+  Cargo.lock` step or a lockfile-presence check expecting one to exist, and
+  don't be surprised when two builds an hour apart pull a different patch
+  version of some transitive dependency.
+- **A sandboxed dev/build host can lack `CAP_SYS_RESOURCE` at the
+  kernel/hypervisor level, and no per-container `--cap-add` can restore
+  it** (ADR 0060 e2e work, ~3 hours root-causing a `kind create cluster`
+  failure). Every `kind` node's own Kubernetes control plane (`etcd`/
+  `kube-apiserver`/`kube-scheduler`/`kube-controller-manager`, static pods)
+  gets a **negative** `oom_score_adj` from kubelet unconditionally — not
+  configurable via pod spec or kind config, standard "protect the critical
+  pods from the OOM killer" behavior. Applying a negative value needs
+  `CAP_SYS_RESOURCE` at container-create time inside `runc`'s own `nsexec`,
+  and a capability absent from the outermost privilege domain can never be
+  regranted to a nested/privileged container — confirmed here by `docker
+  run --cap-add SYS_RESOURCE` being flatly rejected as "not supported by
+  your kernel or not available in the current environment," not merely
+  denied at use. The symptom at the `kubectl`/kubelet layer gives almost no
+  hint of this: containerd launders the real error into the generic `can't
+  get final child's PID from pipe: EOF`, which looks exactly like a cgroup-
+  driver mismatch, a containerd-version regression, or a seccomp profile
+  issue — all three were tried and ruled out (`SystemdCgroup` true/false,
+  two node images spanning containerd 1.7 and 2.1, an unconfined seccomp
+  profile) before a direct `runc create --debug` reproduction against a
+  hand-built OCI bundle isolated the actual line: `nsexec: failed to update
+  /proc/self/oom_score_adj: Permission denied`. **General rule**: when a
+  nested-container workload fails identically across every runtime-version/
+  cgroup-driver/seccomp permutation you can think to vary, stop varying
+  *its* configuration and check the *host's own* capability set directly
+  (`capsh --print`, or `docker run --cap-add <X> ... true` for the specific
+  capability) — a wrapped, generic runtime error can be hiding a single
+  missing capability that no amount of downstream reconfiguration can work
+  around. See `crates/animus-operator/CLAUDE.md`'s e2e section for the full
+  diagnosis and the exact log signature to grep for.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
@@ -13176,6 +13238,28 @@ about outcomes (the test still builds, still passes, still exercises the
 same fault-injection mechanism), not about the literal per-push seed count
 — conflating the two would mean no hardcoded-seed-loop test could ever be
 promoted to the standard shape without also being read as a downgrade.
+- **When a value can be produced two ways — an explicit config field and a
+  positional/minted default — grep the field's read sites and make sure at
+  least one fixture in the suite actually diverges the two.** The
+  `--config FILE --node I` entry points bound each node under the minted
+  `config::node_id(index)` (`"n{index}"`) instead of the config entry's own
+  `id` field; every fixture in the repo built ids with the same minting
+  convention, so `addrs.id == node_id(index)` held everywhere by
+  coincidence and the wrong read was invisible. The first config with
+  operator-style ids (`"{cluster}-{ordinal}"`) then failed in the most
+  silent way possible: each node's *claimed* identity was absent from its
+  own genesis voter set, `is_voter()` was false on every node, and no one
+  ever *started* an election — nothing to log, nothing to time out, just a
+  cluster that never elects. Regression:
+  `crates/animusd/tests/config_node_identity.rs` (a config whose ids
+  deliberately do not follow the minting convention).
+- **An accept loop must never treat a transient `accept()` error as
+  fatal.** `ProdEnv`'s listener task returned on any `accept()` error —
+  one transient `EMFILE`/`ECONNABORTED` during a bootstrap burst and the
+  node was permanently deaf to inbound connections while looking otherwise
+  healthy (observed live: 2 of 3 nodes deafened during a DNS-lag
+  bootstrap window). Retry with a short backoff instead; any future accept
+  loop at a process boundary gets the same review scrutiny.
 
 ## A shared `CARGO_TARGET_DIR` across worktree sessions can silently serve a stale test binary missing newly-added `#[test]` fns — `--list` (or a forced `touch`) before trusting a count (2026-08-30, `pitr_fault_corpus.rs` merge validation)
 

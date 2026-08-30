@@ -233,11 +233,11 @@
         <li>On-demand backup and restore, plus continuous backups (point-in-time recovery) to any second</li>
         <li>Metrics endpoint, admin API and a built-in dashboard</li>
         <li>Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</li>
+        <li>A Kubernetes operator (an <code>AnimusCluster</code> custom resource, one <code>StatefulSet</code> per cluster), with a CI-gated <code>kind</code> cluster smoke test — create, bootstrap, scale, delete</li>
       </ul></div>
       <div class="lcard"><h3>Planned</h3><ul>
         <li>TLS on every port; authentication beyond the client port's opt-in SigV4</li>
         <li>On-disk format stability, then rolling upgrades</li>
-        <li>A Kubernetes operator</li>
         <li>Published benchmarks with disclosed methodology</li>
       </ul></div>
       <div class="lcard"><h3>Not yet</h3><ul>
