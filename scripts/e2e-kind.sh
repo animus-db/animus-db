@@ -250,7 +250,9 @@ kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
 phase "run operator out-of-cluster"
 (
     cd "$REPO_ROOT"
-    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/home/user/shared-cargo-target}"
+    # A caller-provided CARGO_TARGET_DIR is respected; otherwise cargo's own
+    # default applies. Incremental compilation and debuginfo are off — a
+    # smoke run never reuses this build, so smaller/faster wins.
     export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
     export KUBECONFIG="$KIND_KUBECONFIG"
     exec cargo run -p animus-operator -- run
