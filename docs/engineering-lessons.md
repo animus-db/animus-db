@@ -12696,6 +12696,32 @@ this same failure mode: a set-returning primitive whose membership changes
 mid-lifecycle needs every caller to state its own filter, because the
 primitive can't know which callers only want the settled members.
 
+## A crash-only disk fault has zero test teeth unless something later reads the crashed node's own post-crash state back (`pitr_fault_corpus.rs`, ADR 0061 Decision 3 wiring)
+
+Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a new
+`scenario_wal_torn_on_crash_kill_sealing_leader` cell surfaced a design trap
+worth naming on its own, separate from the already-documented `crash` →
+`restart` → `stop` sequencing gotcha (see the entries this generalizes from,
+found by the sibling backup-corpus PR): in this corpus,
+`current_open_pitr_epoch` — the very value the new cell exists to protect —
+is derived **only** from the hand-scripted `Metadata` struct the test drives
+directly with `.apply()` calls, never from anything read off the crashing
+node's own Raft WAL or storage engine. Copying `scenario_kill_sealing_leader`
+verbatim (crash a node, fail over to the two survivors, never look at the
+crashed node again) and simply turning on the torn-tail disk config would
+have compiled, run green, and proven **nothing**: the tear sits on a file
+nothing in the scenario ever reads again. The fault only gets real teeth once
+the crashed node is brought all the way back — `crash` → `restart` → `stop` →
+a fresh `RaftKvNode::start_hosted` on the same id/engine — and made to
+participate in a *further* round of writes and a second seal, so its own
+recovery from the torn/corrupted tail can actually influence what the next
+`pending_changes()` scan (and therefore the next epoch number) sees. The
+general check this generalizes to: before wiring a disk- or network-fault
+primitive into an existing scenario as a "near-copy plus one fault call",
+trace where the property-under-test's own inputs actually come from — a
+fault that lands on state nothing downstream ever reads is a no-op with a
+green checkmark, not a stronger test.
+
 ## Getting a torn/corrupted WAL tail ahead of a *fresh-process* restart needs `crash` → `restart` → `stop`, not `stop` alone (`backup_fault_corpus.rs`, ADR 0061 Decision 3)
 
 Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a
@@ -12844,6 +12870,7 @@ either drop the `with_capacity` hint for array decoders entirely (a
 take`'s own check, just without the allocation being *pre*-sized) or cap
 the hint at some cheap function of the cursor's actual remaining byte
 length before ever calling `with_capacity`.
+
 ## A nightly CI job's sequential steps without `continue-on-error` let the first failure hide every corpus after it (`corpus-deep.yml`)
 
 `corpus-deep.yml` ran all ten deep-seed fault-injection corpora as
@@ -13032,3 +13059,43 @@ about outcomes (the test still builds, still passes, still exercises the
 same fault-injection mechanism), not about the literal per-push seed count
 — conflating the two would mean no hardcoded-seed-loop test could ever be
 promoted to the standard shape without also being read as a downgrade.
+
+## A shared `CARGO_TARGET_DIR` across worktree sessions can silently serve a stale test binary missing newly-added `#[test]` fns — `--list` (or a forced `touch`) before trusting a count (2026-08-30, `pitr_fault_corpus.rs` merge validation)
+
+Resolving PR #490's `docs/engineering-lessons.md` merge conflict and then
+validating with `CARGO_TARGET_DIR=/home/user/animus-db-shared-target cargo
+test -p animus-test --test pitr_fault_corpus` (as instructed, to avoid
+duplicating multi-GB build artifacts across worktrees) first reported **"12
+passed; 0 failed"** — a clean-looking green run — even though the checked-out
+file on disk plainly had 17 `#[test]` functions (confirmed by `grep -c
+'^#\[test\]'`) and the PR's own commit message and crate-guide entry both
+say "17 tests". `cargo test`'s own summary line only ever counts what its
+test binary actually contains; it has no way to notice that the binary
+itself is stale, so a naive "did the count match expectations and did
+everything pass" check would have reported a false clean bill of health
+while silently missing the five tests this very PR exists to add
+(`wal_fsync_lie_kill_sealing_leader`,
+`chaotic_network_pitr_rollover`/`chaotic_network_idle_group_never_
+proposes_a_pitr_seal`, `wal_torn_on_crash_kill_sealing_leader`,
+`restore_to_random_second_under_clock_drift`) — the exact set most likely to
+carry a real bug, being new. `cargo test -- --list` against the same
+un-touched binary reproducibly showed the same wrong 12; `touch`-ing the
+source file to force a fresh `rustc` invocation (visible via `-v`) made the
+list jump to the correct 17, all passing. The mechanism was never fully
+isolated (candidates include a leftover fingerprint/object from an earlier
+build of an older revision of this same file at this same worktree path,
+whose mtime cargo's fingerprint check treated as not-older-than the fresh
+checkout's), but the shared-target-dir setup itself is exactly the
+precondition that makes a stale-fingerprint hit both possible and likely: the
+same crate/test-target combination gets rebuilt from this same worktree path
+across many separate sessions over time, all landing in one directory tree
+cargo's own dep-graph fingerprinting was never designed to be shared this
+widely. **The general check going forward**: whenever a validation run's
+result matters (a merge/rebase gate, a "should be N/N" acceptance check) and
+`CARGO_TARGET_DIR` points at a directory shared across worktrees/sessions,
+don't trust the bare pass count — run `cargo test -- --list` (or diff the
+printed test names against a `grep -c '^#\[test\]'` of the file) at least
+once to confirm the binary's test set actually matches the source before
+reading a "N passed" line as proof of anything; a stale binary reports
+green precisely because it silently tests less, never because it tests the
+same thing and fails to notice a problem.
