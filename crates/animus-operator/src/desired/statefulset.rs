@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, EmptyDirVolumeSource, HTTPGetAction, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-    SecretVolumeSource, Volume, VolumeMount,
+    ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, HTTPGetAction,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, SecretVolumeSource, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -41,6 +41,21 @@ const LIVENESS_FAILURE_THRESHOLD: i32 = 6;
 /// on purpose, matching this deployment's own graceful-shutdown contract
 /// rather than the Kubernetes 30s default.
 const TERMINATION_GRACE_PERIOD_SECS: i64 = 90;
+
+/// Default `RUST_LOG` every pod starts with (`animusd::otel::init_tracing`
+/// falls back to this same level when the env var is absent, so this is
+/// belt-and-suspenders — the point is making the value an explicit,
+/// visible pod env var rather than an implicit fallback baked into a
+/// library nobody reconciling a stuck cluster thinks to go read). A cluster
+/// that never elects a control-plane leader (the failure mode this exists
+/// for — see `animus_env::prod::spawn_accept`'s own doc for a concrete
+/// instance) produces zero diagnostic signal at `animusd`'s default level
+/// otherwise: `kubectl logs` on every pod shows only the one-line startup
+/// banner forever, with no indication why. Overridable per cluster by
+/// setting `RUST_LOG` through `spec.resources`'s container env is not
+/// exposed by the CRD today (no live use case yet); bump this constant (or
+/// add a CRD field) if one shows up.
+const DEFAULT_RUST_LOG: &str = "info";
 
 const CONFIG_VOLUME: &str = "config";
 const DATA_VOLUME: &str = "data";
@@ -155,6 +170,11 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
             "/bin/sh".to_string(),
             format!("{CONFIG_MOUNT_DIR}/{ENTRYPOINT_FILE_NAME}"),
         ]),
+        env: Some(vec![EnvVar {
+            name: "RUST_LOG".to_string(),
+            value: Some(DEFAULT_RUST_LOG.to_string()),
+            ..Default::default()
+        }]),
         volume_mounts: Some(volume_mounts),
         resources: spec
             .resources
@@ -236,6 +256,19 @@ mod tests {
         assert_eq!(spec.replicas, Some(5));
         assert_eq!(spec.service_name.as_deref(), Some("c-internal"));
         assert_eq!(spec.pod_management_policy.as_deref(), Some("Parallel"));
+    }
+
+    #[test]
+    fn rust_log_defaults_to_info_so_a_stuck_cluster_leaves_a_trail() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let c = container(&sts);
+        let env = c.env.expect("container sets an env list");
+        let rust_log = env
+            .iter()
+            .find(|e| e.name == "RUST_LOG")
+            .expect("RUST_LOG is set");
+        assert_eq!(rust_log.value.as_deref(), Some(DEFAULT_RUST_LOG));
     }
 
     #[test]
