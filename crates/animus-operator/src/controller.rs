@@ -384,8 +384,11 @@ async fn finish_reconcile(
 
     let cluster_api = Api::<AnimusCluster>::namespaced(ctx.client.clone(), ns);
     let patch = json!({ "status": status });
+    // A merge patch, not server-side apply: `PatchParams::force` is only
+    // valid with `Patch::Apply`, and the API client rejects the combination
+    // before the request is even sent.
     cluster_api
-        .patch_status(&name, &apply_params(), &Patch::Merge(&patch))
+        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
 
     Ok(Action::requeue(REQUEUE_OK))
