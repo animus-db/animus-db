@@ -12728,3 +12728,192 @@ to parse" — not just a trailing-partial-write answer, since `corrupt_on_
 crash` can in principle land its flipped byte anywhere inside the retained
 (non-dropped) tail, not only in what would otherwise have been a clean
 trailing partial line.
+
+## A nightly CI job's sequential steps without `continue-on-error` let the first failure hide every corpus after it (`corpus-deep.yml`)
+
+`corpus-deep.yml` ran all ten deep-seed fault-injection corpora as
+sequential steps inside one job, with no `continue-on-error` and no
+`if: always()` on any step. GitHub Actions' default behavior for a
+plain sequential step list is: the first failing step aborts the job and
+skips every step after it. Since the multi-tablet transaction corpus
+(ADR 0018) happened to be listed first and was failing a real assertion at
+nightly depth (`ANIMUS_TXN_SEEDS=40`, `check_kind_consistency` on
+`compound_lossy_and_anchor_kill` — see the sibling lesson on that bug once
+filed), every one of the other nine corpora was silently skipped on every
+single nightly run since the workflow's creation — 13 consecutive runs,
+all reporting "failure" for the same first-step reason, without a single
+one of the other nine corpora ever actually executing at depth. The
+workflow's own `conclusion: failure` status looked like a signal, but a
+human (or an agent) glancing at "corpus-deep is red" would reasonably
+assume the *listed* failing step was the whole story, not that nine other
+tests never ran at all — the gap was invisible without opening the job's
+step list and noticing the `skipped` conclusions.
+
+The general lesson: a CI job whose value comes from *reporting on N
+independent things* (here, ten unrelated corpora) must not let any one of
+them gate whether the others get a chance to report. `continue-on-error:
+true` + a per-step `id:` + a final `if: always()` aggregation step that
+turns the recorded per-step outcomes back into one job-level pass/fail is
+the fix — CI still goes red on a real regression, but only after every
+corpus has actually run and had its result recorded, so `skipped` never
+silently substitutes for a genuine result. Worth checking any other
+multi-step job in this repo's CI for the same pattern before assuming its
+"only some things are failing" read of a red run is complete.
+
+## An untrusted length-prefix pre-sizing a `Vec` is a distinct DoS class from an unbounded-panic one — bounds-checked reads don't close it (`animus-cp-data::codec`, `animus-storage::lsm`)
+
+`codec.rs`'s own doc comment claimed decoding untrusted wire input was
+"bounds-checked... never panics," and every individual field read really
+was: `Cursor::take` checks `pos + n <= bytes.len()` before every slice, so
+a truncated or malformed frame always surfaces as a clean `Err`, never an
+out-of-bounds panic or a raw slice-index abort. What that guarantee does
+**not** cover is a different failure mode entirely: about a dozen call
+sites read an untrusted `u32`/`u64` **count** off the wire (an
+`AppendEntries` entry count, a `KindBatch`/`TxnStage` write count, …) and
+handed it straight to `Vec::with_capacity(n as usize)` **before** a single
+one of its `n` elements had been validated against the remaining buffer.
+For a multi-byte element type (`(Vec<u8>, Vec<u8>)`, a `LogEntry<KvCommand>`,
+…), a single corrupted or adversarial length-prefix byte setting `n` near
+`u32::MAX` turns into a request for hundreds of GB to several TB. Rust's
+global allocator does not return an `Err` or unwind a panic for an
+allocation that large or that exceeds `isize::MAX` — it calls
+`handle_alloc_error`, which **aborts the whole process** (`SIGABRT`), not a
+catchable failure at any level above it. Reproduced live: corrupting
+`read_raft`'s `AppendEntries` entry-count field crashed
+`cargo test -p animus-test --test raftkv_linearizable` outright — the whole
+test binary, not one failing assertion. Since this reads off real
+inter-node Raft/Kv wire traffic, it was a process-wide denial-of-service
+vector reachable from any peer able to send a corrupted or crafted message
+to a node, not a theoretical concern.
+
+**The fix is not "validate `n` before allocating"** — there is no cheap way
+to validate an element *count* against a buffer when each element's own
+encoded size is variable (a byte string, a nested struct, …); the only
+honest validation is decoding the elements themselves, which is exactly
+what the loop right after the allocation already does. The fix instead
+**caps the requested capacity**, never the actual number of elements
+decoded: `Vec::with_capacity(n.min(1 << 20) as usize)`. A legitimate
+message's cost is completely unchanged (a real `n` is always far below the
+cap); a hostile/corrupted `n` can now request at most `1 << 20 *
+size_of::<T>()` bytes up front — large enough to never matter for any real
+message, small enough to never abort — and the *actual* loop below still
+only ever pushes as many elements as the buffer genuinely contains, since
+each element read still fails with a graceful `DecodeError` the moment the
+buffer runs out (an attacker gets at most O(remaining buffer bytes) worth
+of pushes/reallocations, never O(n) for an unbounded `n`). This was
+already the house convention in two sibling decoders in the same crate
+(`backup.rs`'s `declared.min(1 << 20)`, `segment.rs`'s
+`declared_count.min(1 << 20)`) that simply hadn't been applied to
+`codec.rs` yet — worth grepping for by name (`with_capacity(n as usize)`,
+`with_capacity(len as usize)`, `with_capacity(count as usize)`, and their
+`u64`/`usize`-cast siblings) whenever adding or reviewing a new hand-rolled
+wire/WAL/manifest decoder, since nothing about this shape triggers a
+compiler warning or a clippy lint — it looks like an ordinary, idiomatic
+size-hint optimization.
+
+**The same shape existed one layer down, in `animus-storage`'s WAL record
+decoder and its manifest decoder** (`lsm.rs`) — found only by a deliberate
+workspace-wide grep for the pattern once it was clear `codec.rs` wasn't the
+only hand-rolled length-prefixed decoder in the tree. The WAL record
+decoder's own count reads happen only after a CRC-32 check on the whole
+frame (`try_parse_wal_frame`), which makes the "one corrupted byte survives
+undetected" case astronomically unlikely for ordinary bit rot — but CRC-32
+is not cryptographically adversary-resistant, and the shape is identical
+either way, so it got the identical `.min(1 << 20)` cap as defense in
+depth. The **manifest** decoder has no CRC protecting it at all (a plain
+`Disk::replace`-swapped file), so a corrupted on-disk manifest byte was a
+real, not merely theoretical, instance of the same abort — fixed
+identically. `animus-cp-data`'s `txn.rs` (the value-envelope decoder) and
+`split.rs` (the in-place-split fork marker) had the same shape too, in code
+whose own doc comments describe it as "this crate only ever reads back
+what it itself wrote" (a hard-bug, not a recoverable-error, doctrine) — but
+both are engine-marker values that ride inside a tablet's `InstallSnapshot`
+image, which is untrusted wire content until it's actually been applied;
+"this crate wrote it" is true of the *normal* path, not a guarantee against
+a corrupted/adversarial snapshot from a peer, so both got the same cap
+rather than being left on the "assumed trusted" side of the line.
+
+**General rule for reviewing (or writing) any hand-rolled length-prefixed
+decoder — wire, WAL, or manifest — going forward**: bounds-checking every
+individual read (via a `Cursor`-style `take` that checks the remaining
+buffer) is necessary but not sufficient for allocation safety. Grep
+specifically for `with_capacity` fed by any value that was itself just read
+from the buffer being decoded, and cap it — dropping the pre-allocation
+entirely (falling back to `Vec::new()`/organic `push` growth) is an equally
+valid fix where performance doesn't matter enough to justify the extra
+literal; this repo's own precedent leans toward the capped form since it
+preserves the fast path's zero-realloc behavior for every legitimate
+message. A doc comment claiming a decoder "never panics" or is
+"bounds-checked" should be read as a claim about individual reads only,
+never as a claim about allocation safety, unless it says so explicitly —
+`codec.rs`'s own doc comment now does, and is the template for any other
+decoder's doc that makes a similar claim.
+
+## A depth knob's existence in `CLAUDE.md` doesn't mean CI ever runs it deep — `corpus-deep.yml` needs its own explicit entry per corpus (2026-08-30, `ANIMUS_RAFTKV_SEEDS`)
+
+`raftkv_linearizable.rs` — the flagship Elle-checked linearizability corpus
+for the per-tablet CP data plane (ADR 0017) — had a documented
+`ANIMUS_RAFTKV_SEEDS` depth knob (and a second, `ANIMUS_RAFTKV_LSM=1`, for
+the `LsmEngine<SimEnv>` tier) held green at depth 20/×10 in
+`crates/animus-test/CLAUDE.md`, but `.github/workflows/corpus-deep.yml`'s
+nightly job never referenced either env var. Every push still ran the
+corpus at its default depth (1 = the frozen byte-identical set) via the
+normal `gates` job, so the deep-seed proof this corpus exists for was
+simply never exercised in CI — the crate guide's "held green at depth N"
+line documents a `cargo test` invocation someone ran by hand at some point,
+not a standing CI guarantee. **A corpus's env-var depth knob and its
+`corpus-deep.yml` matrix entry are two separate things that must both
+exist** — adding the knob (and proving it works locally) is not the same
+as wiring it into the nightly tier, and nothing fails loudly when the
+wiring is missing; the gap is silent unless someone reads the workflow
+file against the crate guide's knob table. When adding a new
+fault-injection corpus with a depth knob, add its `corpus-deep.yml` step
+in the same change (or a tracked follow-up), not "later." Also worth
+naming: a corpus that gates an entire alternate code path behind an
+off-by-default env var (`ANIMUS_RAFTKV_LSM=1`, the durable
+`LsmEngine<SimEnv>` tier vs. the always-on `MemoryEngine` one) needs its
+own nightly step distinct from that corpus's plain depth-scaled step, not
+just a deeper seed count on the same invocation — the two exercise
+different storage-engine code, not just "more of the same" scenarios.
+
+## Promoting a hardcoded-seed-loop test to the house corpus shape: the seed's literal value was never load-bearing, and default-depth coverage is *expected* to shrink (`lsm_crash.rs`/`lsm_disk_faults.rs`, ADR 0061 rung B1)
+
+Converting `animus-storage`'s two `LsmEngine` fault tests
+(`tests/lsm_crash.rs`, `tests/lsm_disk_faults.rs`) from hand-rolled
+`for seed in [0xA1u64, 0xB2, ...]` loops onto `animus_test::corpus`'s
+standard `Scenario`/`seed_expand` shape surfaced two things worth stating
+plainly, since both look like regressions at a glance and aren't.
+
+**The specific magic-number seeds were never part of what the tests
+prove.** Every scenario in both files asserts a generic invariant ("every
+acked write survives a crash", "a corrupted block/record surfaces a clean
+error, never silent loss") that must hold for *any* interleaving — none of
+them compare against an expected value computed from that particular seed.
+So replacing `[0xA1, 0xB2, 0xC3, 7, 42, 1337]` with `corpus::name_seed(name)`
+per newly-named cell changes which specific interleavings get exercised but
+proves exactly the same thing; there was no need to preserve the literal
+hex constants, and doing so would have fought the house doctrine ("a
+scenario's seed is always a deterministic function of its own name," see
+`animus-test/src/corpus.rs`'s module doc) for no benefit. Where the
+original loop crossed a real *structural* axis with its own seed list
+(`torn_wal_tail_crash_recovers_all_acked_writes`'s `corrupt: bool`,
+`corrupted_manifest_fails_open_cleanly`'s corruption `offset`), each
+combination became its own named cell (`..._corrupt`, `..._offset_4`, …)
+sharing one extracted body function — the axis is what deserves a name,
+the seed list crossing it doesn't.
+
+**Converting a file that unconditionally ran N seeds every push into a
+corpus at default depth 1 is a deliberate reduction in per-push seed count,
+not a coverage regression** — it's the entire point of the house corpus
+doctrine, whose default is *always* 1 (see the root `CLAUDE.md`'s
+knob table and every existing corpus in this repo), with seed-sweeping
+depth pushed to `corpus-deep.yml`'s nightly tier (`=40`) instead of paid on
+every push. Before this conversion, `injected_wal_errors_surface_and_
+lose_no_acked_write` ran 6 seeds unconditionally on every `cargo test`;
+after, it runs 1 by default and 40 nightly — fewer per-push runs, far more
+nightly ones, exactly like every other corpus in the repo. A task framed as
+"preserve current behavior/coverage, must not regress existing CI" is
+about outcomes (the test still builds, still passes, still exercises the
+same fault-injection mechanism), not about the literal per-push seed count
+— conflating the two would mean no hardcoded-seed-loop test could ever be
+promoted to the standard shape without also being read as a downgrade.

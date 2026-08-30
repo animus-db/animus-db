@@ -35,6 +35,12 @@ serde_json.workspace = true
 # here, not on the `[dependencies]` entry above (ADR 0061 rung C0).
 animus-env = { workspace = true, features = ["prod"] }
 animus-sim.workspace = true
+# Shared corpus seed-management scaffolding (ADR 0061 rung B1,
+# `animus_test::corpus`). This is a dev-dependency cycle (animus-test's own
+# dev-dependencies include animus-storage), which Cargo permits: a dev-dep
+# cycle only needs to resolve for `cargo test`, never for building either
+# crate's library.
+animus-test.workspace = true
 futures.workspace = true
 proptest.workspace = true
 tokio = { workspace = true }
