@@ -91,29 +91,17 @@ amendment — the shape predates and outlives it.)
   the `serde_json` WAL path, not this hand-rolled one (version `22`, ADR
   0058 Train 1's `learners: Option<BTreeSet<NodeId>>` field, is the
   regression: see `docs/engineering-lessons.md`'s Code-patterns entry for
-  the general lesson).
-
-  **Known open finding, not yet fixed (found by `animus-test`'s
-  `raftkv_linearizable.rs` corpus exercising `NetConfig::set_corrupt_prob`
-  at depth, 2026-08-30)**: at least a dozen array decoders here — including
-  `read_raft`'s `AppendEntries` arm, `read_kind_writes`, `read_change_logs`,
-  and every other `let n = c.u32()?; ... Vec::with_capacity(n as usize)`
-  site — pre-allocate a `Vec` sized by an **untrusted** wire-supplied count
-  before validating that count against the cursor's remaining bytes. A
-  single corrupted length byte can turn `n` into something near `u32::MAX`,
-  making `with_capacity` request on the order of a terabyte — which aborts
-  the whole process via Rust's OOM handler (`handle_alloc_error`), not a
-  catchable panic or the graceful `Err`/`warn!`/drop this module's own doc
-  above promises. Reproduced deterministically:
-  `raftkv_linearizable::chaos_early_3_s09` (seed 422907917505132688,
-  `ANIMUS_RAFTKV_SEEDS=20`), `SIGABRT`. See `docs/engineering-lessons.md`'s
-  entry ("Wiring `animus-sim`'s fault primitives...") for the full account
-  and the fix sketch (cap the pre-allocation, or drop the `with_capacity`
-  hint and let the per-iteration `Cursor::take` bounds check do the work);
-  `raftkv_linearizable.rs`'s `Nemesis::Chaos` deliberately excludes
-  `set_corrupt_prob` until this is fixed. This is real production-wire
-  exposure, not merely a test-fault artifact — any peer (or a mid-flight bit
-  error) that corrupts one of these count fields hits the identical abort.
+  the general lesson). **Every untrusted wire-count read (`c.u32()?`/
+  `c.u64()?`) that pre-sizes a `Vec` is capped (`.min(1 << 20)`)** — a
+  bounds-checked-per-element read alone doesn't stop a corrupted/hostile
+  count from driving an oversized `Vec::with_capacity` before any element
+  is validated, which Rust's allocator handles by aborting the whole
+  process (`handle_alloc_error`), not a catchable panic; reproduced live via
+  a corrupted `AppendEntries` entry count. `txn.rs`'s/`split.rs`'s own
+  engine-marker decoders (reachable via a corrupted/adversarial
+  `InstallSnapshot` image) got the identical cap. See `docs/engineering-
+  lessons.md`'s "untrusted length-prefix pre-sizing a `Vec`" entry for the
+  full account and the general rule for any future hand-rolled decoder.
 - **`hlc.rs`** (ADR 0018 §2) — a pure, I/O-free Hybrid Logical Clock:
   `HlcTimestamp { wall_ms, logical }` and the per-node `Hlc` (`mint`/
   `witness`, both take the caller-sampled `Nanos` — `Hlc` never touches an

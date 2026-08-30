@@ -3171,6 +3171,21 @@ fn encode_merge_rec(out: &mut Vec<u8>, rec: &MergeRec) {
 /// bytes left after decoding are also rejected (the payload must be exactly
 /// consumed — leftover bytes mean the length didn't match the content, which a
 /// passing CRC makes vanishingly unlikely but is still checked).
+///
+/// "Never a panic" is not quite the whole story: a length-prefixed count
+/// read off the payload (a `DeleteRange`/`Batch`/`MergeBatch` element count)
+/// used to pre-size its `Vec` with that untrusted count directly
+/// (`Vec::with_capacity(n)`) before a single element was bounds-checked —
+/// which, for a corrupted count near `u32::MAX`, makes Rust's global
+/// allocator **abort the whole process** (`handle_alloc_error`), a distinct
+/// failure mode no amount of bounds-checked reads prevents. This frame's
+/// CRC check (above, in [`try_parse_wal_frame`]) already makes that shape
+/// astronomically unlikely from ordinary bit rot, but every such
+/// pre-allocation here is capped (`.min(1 << 20)`) as defense in depth
+/// regardless — see `animus-cp-data::codec`'s module doc for the full
+/// account of this DoS class (found and fixed there first; the same shape
+/// exists here, decoding from disk rather than the network, so the identical
+/// fix applies even though the practical exposure differs).
 fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord> {
     let mut c = Cursor::new(bytes);
     let tag = c.u8()?;
@@ -3194,7 +3209,14 @@ fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord> {
             let start = c.bytes()?;
             let end = c.bytes()?;
             let n = c.u32()? as usize;
-            let mut keys = Vec::with_capacity(n);
+            // `n` is a length prefix read before its elements are
+            // validated against the remaining buffer. This frame already
+            // passed a CRC check before reaching here (see
+            // `try_parse_wal_frame`), but cap the requested capacity
+            // anyway as defense in depth against the same allocator-abort
+            // DoS class `codec.rs` was fixed for — a corrupted/adversarial
+            // `n` near `u32::MAX` must never demand a many-GB allocation.
+            let mut keys = Vec::with_capacity(n.min(1 << 20));
             for _ in 0..n {
                 keys.push(c.bytes()?);
             }
@@ -3209,7 +3231,9 @@ fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord> {
         3 => {
             let version = c.u64()?;
             let n = c.u32()? as usize;
-            let mut ops = Vec::with_capacity(n);
+            // Capped pre-allocation against an untrusted length prefix —
+            // see `WalRecord::DeleteRange`'s decode arm above for why.
+            let mut ops = Vec::with_capacity(n.min(1 << 20));
             for _ in 0..n {
                 ops.push(decode_batch_op(&mut c)?);
             }
@@ -3217,7 +3241,9 @@ fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord> {
         }
         4 => {
             let n = c.u32()? as usize;
-            let mut ops = Vec::with_capacity(n);
+            // Capped pre-allocation against an untrusted length prefix —
+            // see `WalRecord::DeleteRange`'s decode arm above for why.
+            let mut ops = Vec::with_capacity(n.min(1 << 20));
             for _ in 0..n {
                 ops.push(decode_merge_rec(&mut c)?);
             }
@@ -3243,7 +3269,10 @@ fn decode_batch_op(c: &mut Cursor<'_>) -> Result<BatchOp> {
         1 => BatchOp::Delete { key: c.bytes()? },
         2 => {
             let n = c.u32()? as usize;
-            let mut keys = Vec::with_capacity(n);
+            // Capped pre-allocation against an untrusted length prefix —
+            // see `WalRecord::DeleteRange`'s decode arm (above, this file)
+            // for why.
+            let mut keys = Vec::with_capacity(n.min(1 << 20));
             for _ in 0..n {
                 keys.push(c.bytes()?);
             }
@@ -3422,7 +3451,13 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     let next_seq = c.u64()?;
     let max_version = c.u64()?;
     let table_count = c.u32()? as usize;
-    let mut tables = Vec::with_capacity(table_count);
+    // `table_count` is an on-disk length prefix with no CRC protecting it
+    // (unlike the WAL frame codec above) — a corrupted manifest byte could
+    // set it near `u32::MAX`. Cap the requested capacity so that can't
+    // demand a many-GB allocation and trigger an allocator abort; the
+    // actual number of tables decoded is still governed solely by what
+    // the buffer holds.
+    let mut tables = Vec::with_capacity(table_count.min(1 << 20));
     for _ in 0..table_count {
         let seq = c.u64()?;
         let level = c.u32()?;
@@ -3456,7 +3491,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     // falls back to the legacy single-file WAL path.
     let wal_segments = if version >= 2 {
         let count = c.u32()? as usize;
-        let mut segs = Vec::with_capacity(count);
+        // Capped pre-allocation against an untrusted on-disk length prefix
+        // — see `table_count`'s decode above for why.
+        let mut segs = Vec::with_capacity(count.min(1 << 20));
         for _ in 0..count {
             segs.push(c.u64()?);
         }
