@@ -54,6 +54,13 @@ animus-test.workspace = true
 # between minting a ts and appending it to the log for two tasks to
 # interleave at), so this one test needs genuine OS-thread parallelism.
 tokio.workspace = true
+# `codec.rs`'s never-panics/never-aborts fuzz property (arbitrary byte
+# sequences, including deliberately huge length prefixes, must always decode
+# to `Ok`/`Err`, never abort the process via an untrusted-length
+# pre-allocation) — the same dependency `animus-storage`/`animus-tablet`/
+# `animus-placement`/`animus-dynamo` already use for their own codec/policy
+# property tests.
+proptest.workspace = true
 
 # Real-thread `ProdEnv` test (issue #286/#280): an explicit `[[test]]` stanza
 # so `required-features` can gate it off the default `cargo test` run. Adding

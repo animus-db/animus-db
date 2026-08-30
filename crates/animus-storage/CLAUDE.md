@@ -256,6 +256,23 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   *second* recovery would then lose it (regression:
   `lsm_disk_faults.rs::acked_writes_after_torn_tail_recovery_survive_second_restart`).
   Corruption regression: `lsm_disk_faults.rs::corrupted_durable_wal_record_surfaces_loudly`.
+- **Every length-prefixed element count this codec (and the manifest codec
+  right below it) reads off disk pre-sizes its `Vec` with a capped
+  requested capacity (`.min(1 << 20)`), never the raw untrusted count.**
+  Bounds-checking each individual read is not the same guarantee as
+  allocation safety: `Vec::with_capacity(n)` fed directly from a corrupted
+  count can demand a many-GB allocation before a single element is
+  validated, which Rust's allocator handles by aborting the whole process
+  (`handle_alloc_error`), not a catchable error. The WAL record decoder's
+  own reads happen only after a passing CRC-32 (`try_parse_wal_frame`),
+  which makes an undetected corrupted count astronomically unlikely from
+  ordinary bit rot but not impossible in principle (CRC-32 isn't
+  adversary-resistant), so it's capped as defense in depth; the
+  **manifest** decoder has no CRC at all, so a corrupted on-disk manifest
+  byte was a real instance of the same abort, not merely theoretical. See
+  `docs/engineering-lessons.md`'s "untrusted length-prefix pre-sizing a
+  `Vec`" entry (found and fixed first in `animus-cp-data::codec`) for the
+  full account.
 - **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
   window, not just its own read path.** `LsmSnapshot` used to be a bare
   `(engine, version)` pair with no registration anywhere — a long-held snapshot
@@ -414,6 +431,22 @@ the admin/debug interface (ADR 0020, consumed by `animusd`) —
 the **admin actions** `flush_now`/`compact_now`. `open_with_metrics`/
 `with_metrics` is the sim-readable seam every metrics test opens the
 engine through (`SimEnv`'s metrics sink, not `ProdEnv`'s).
+
+**`tests/lsm_crash.rs` (plain crash/recovery) and `tests/lsm_disk_faults.rs`
+(`DiskConfig` fault injection) follow the house corpus doctrine** (ADR 0061
+rung B1 — the same `animus_test::corpus` scaffolding `raftkv_linearizable.rs`/
+`reconciler_corpus.rs` use, see those files and `animus-test/CLAUDE.md` for
+the canonical shape): a frozen, name-seeded scenario list per file, with a
+depth knob apiece — **`ANIMUS_LSM_CRASH_SEEDS`**/**`ANIMUS_LSM_DISK_FAULT_
+SEEDS`** (default 1 = the frozen cells; both held green at `=40`, matching
+`corpus-deep.yml`'s nightly tier). Kept as two separate knobs rather than one
+shared one since the two files probe genuinely different fault dimensions
+(crash-safety invariants vs. `DiskConfig`-driven torn tails/corruption/
+injected I/O errors). None of these scenarios' properties are tied to a
+*specific* seed value (no test asserts an exact byte-identical output keyed
+to a magic number), so — unlike a corpus whose frozen cells encode a real
+regression's own literal seed — converting the pre-existing hardcoded seed
+lists to name-derived ones changed no test's outcome.
 
 `lsm_concurrent.rs` is a **real multi-threaded** regression
 (`#[tokio::test(flavor = "multi_thread")]` over `ProdEnv`, timeout-guarded):

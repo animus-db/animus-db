@@ -14,11 +14,29 @@
 //! 4. A crash *mid-compaction* (merged SSTable written but the manifest not yet
 //!    swapped) loses nothing and reads no torn table: recovery keeps the old
 //!    inputs, the orphan merged file is ignored.
+//!
+//! **Corpus shape** (ADR 0061 rung B1, house corpus doctrine): follows the
+//! standard `animus_test::corpus` scaffolding every fault-injection corpus in
+//! this repo uses (see `raftkv_linearizable.rs`/`reconciler_corpus.rs` for the
+//! canonical worked examples) — a frozen, name-seeded scenario list (one cell
+//! per property above, each a `fn(seed: u64)`), depth knob
+//! **`ANIMUS_LSM_CRASH_SEEDS`** (default 1 = the 5 frozen cells, byte-identical
+//! to this file's own pre-corpus form — none of these scenarios' outcomes
+//! depend on the sim seed at all, since none of them spawn concurrent tasks or
+//! touch `DiskConfig`'s randomness, but the seed is threaded through anyway to
+//! match house convention and so a future scenario that DOES need seed
+//! diversity fits the same shape). See `lsm_disk_faults.rs` for the sibling
+//! corpus over the *fault-injection* dimension (torn tails, corruption,
+//! injected I/O errors) — kept as a separate knob, since the two files probe
+//! genuinely different fault classes (plain crash/recovery correctness here,
+//! vs. `DiskConfig`-driven fault injection there).
 
 use animus_env::nid;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
+use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
+use std::collections::BTreeSet;
 
 const PREFIX: &str = "db/";
 
@@ -44,9 +62,7 @@ fn open(sim: &Simulator) -> LsmEngine<SimEnv> {
 
 /// 1. Writes that returned (so were WAL-synced) survive a crash; the engine
 ///    reopens from its disk and reads them all back.
-#[test]
-fn synced_writes_survive_crash() {
-    let seed = 0xC0FFEE;
+fn scenario_synced_writes_survive_crash(seed: u64) {
     let sim = Simulator::new(seed);
     {
         let e = open(&sim);
@@ -82,9 +98,7 @@ fn synced_writes_survive_crash() {
 ///    referenced by a synced manifest; a fresh WAL is empty. Reopen and confirm
 ///    everything is still readable (proves recovery reads SSTables, not only the
 ///    WAL).
-#[test]
-fn flushed_sstable_survives_crash() {
-    let seed = 0xBEEF;
+fn scenario_flushed_sstable_survives_crash(seed: u64) {
     let sim = Simulator::new(seed);
     let count = 50u64;
     {
@@ -122,9 +136,7 @@ fn flushed_sstable_survives_crash() {
 /// 3. Crash *mid-flush*: write the SSTable bytes (append, no sync) but **do not**
 ///    swap the manifest, then crash. Recovery must fall back to the intact WAL —
 ///    no data loss — and ignore the orphan partial SSTable file.
-#[test]
-fn crash_mid_flush_recovers_via_wal() {
-    let seed = 0xF1;
+fn scenario_crash_mid_flush_recovers_via_wal(seed: u64) {
     let sim = Simulator::new(seed);
     {
         let e = open(&sim);
@@ -171,9 +183,7 @@ fn crash_mid_flush_recovers_via_wal() {
 ///    SSTable file without swapping the manifest, then crash. Recovery must keep
 ///    the original inputs (the manifest still names them, all intact) and ignore
 ///    the orphan merged file — no loss, no torn-table read.
-#[test]
-fn crash_mid_compaction_keeps_old_tables() {
-    let seed = 0xC0;
+fn scenario_crash_mid_compaction_keeps_old_tables(seed: u64) {
     let sim = Simulator::new(seed);
     {
         let e = open(&sim);
@@ -211,9 +221,7 @@ fn crash_mid_compaction_keeps_old_tables() {
 /// trigger repeated flushes, L0→L1(+) compaction fires repeatedly, the L0 (flush)
 /// tier never exceeds its trigger, the live table count stays far below the flush
 /// count, every level ≥1 stays non-overlapping, and data is intact throughout.
-#[test]
-fn flush_then_compaction_happen_and_keep_data() {
-    let seed = 0xABCD;
+fn scenario_flush_then_compaction_happen_and_keep_data(seed: u64) {
     let sim = Simulator::new(seed);
     let e = open(&sim);
     block_on(async {
@@ -281,4 +289,146 @@ fn flush_then_compaction_happen_and_keep_data() {
             );
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The frozen corpus: a committed, deterministic generator (ADR 0061 rung B1 —
+// mirrors `raftkv_linearizable.rs`/`reconciler_corpus.rs`'s own shape exactly).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Scenario {
+    name: String,
+    seed: u64,
+    run: fn(u64),
+}
+
+impl SeedVariant for Scenario {
+    fn scenario_name(&self) -> &str {
+        &self.name
+    }
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        Scenario {
+            name,
+            seed,
+            run: self.run,
+        }
+    }
+}
+
+/// Depth knob (`ANIMUS_LSM_CRASH_SEEDS`, default 1) — mirrors
+/// `ANIMUS_RAFTKV_SEEDS`/`ANIMUS_RECONCILER_SEEDS`.
+fn seeds_per_cell() -> usize {
+    corpus::seeds_from_env("ANIMUS_LSM_CRASH_SEEDS")
+}
+
+macro_rules! scenario {
+    ($name:expr, $f:ident) => {
+        Scenario {
+            name: $name.to_string(),
+            seed: corpus::name_seed($name),
+            run: $f,
+        }
+    };
+}
+
+fn scenario_cells() -> Vec<Scenario> {
+    vec![
+        scenario!(
+            "synced_writes_survive_crash",
+            scenario_synced_writes_survive_crash
+        ),
+        scenario!(
+            "flushed_sstable_survives_crash",
+            scenario_flushed_sstable_survives_crash
+        ),
+        scenario!(
+            "crash_mid_flush_recovers_via_wal",
+            scenario_crash_mid_flush_recovers_via_wal
+        ),
+        scenario!(
+            "crash_mid_compaction_keeps_old_tables",
+            scenario_crash_mid_compaction_keeps_old_tables
+        ),
+        scenario!(
+            "flush_then_compaction_happen_and_keep_data",
+            scenario_flush_then_compaction_happen_and_keep_data
+        ),
+    ]
+}
+
+fn corpus() -> Vec<Scenario> {
+    corpus::seed_expand(scenario_cells(), seeds_per_cell())
+}
+
+// ---------------------------------------------------------------------------
+// The tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lsm_crash_corpus_runs_every_scenario() {
+    for s in corpus() {
+        (s.run)(s.seed);
+    }
+}
+
+/// Coverage/structural guard: names + seeds are unique, the frozen cells keep
+/// their canonical name-derived seeds, and the corpus has not silently shrunk.
+#[test]
+fn lsm_crash_corpus_names_and_seeds_are_unique_and_frozen() {
+    let cells = scenario_cells();
+    assert!(
+        cells.len() >= 5,
+        "corpus shrank unexpectedly to {} cells",
+        cells.len()
+    );
+
+    let names: BTreeSet<&str> = cells.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names.len(), cells.len(), "corpus names must be unique");
+    let seeds: BTreeSet<u64> = cells.iter().map(|s| s.seed).collect();
+    assert_eq!(seeds.len(), cells.len(), "corpus seeds must be unique");
+
+    for cell in &cells {
+        assert_eq!(
+            cell.seed,
+            corpus::name_seed(&cell.name),
+            "frozen seed moved for {}",
+            cell.name
+        );
+    }
+}
+
+/// Seed-depth lever (`ANIMUS_LSM_CRASH_SEEDS`): expanding by `k` yields exactly
+/// `k×` scenarios, all uniquely named/seeded, and **variant 0 preserves the
+/// canonical (frozen) name+seed** — growing depth never moves a regression
+/// seed. Structural only (mirrors the sibling corpora's guard).
+#[test]
+fn lsm_crash_corpus_seed_expansion_is_additive_and_unique() {
+    let base = scenario_cells();
+    let k = 3;
+    let expanded = corpus::seed_expand(scenario_cells(), k);
+    assert_eq!(expanded.len(), base.len() * k);
+
+    let names: BTreeSet<&str> = expanded.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names.len(), expanded.len(), "expanded names must be unique");
+    let seeds: BTreeSet<u64> = expanded.iter().map(|s| s.seed).collect();
+    assert_eq!(seeds.len(), expanded.len(), "expanded seeds must be unique");
+
+    for b in &base {
+        let kept = expanded
+            .iter()
+            .find(|s| s.name == b.name)
+            .unwrap_or_else(|| panic!("base scenario {} missing after expansion", b.name));
+        assert_eq!(kept.seed, b.seed, "seed moved for {}", b.name);
+    }
+    assert_eq!(corpus::seed_expand(scenario_cells(), 1).len(), base.len());
+}
+
+/// A single deterministic replay of one scenario twice must behave identically
+/// (ADR 0003).
+#[test]
+fn lsm_crash_scenario_is_reproducible_from_its_seed() {
+    let seed = corpus::name_seed("synced_writes_survive_crash");
+    scenario_synced_writes_survive_crash(seed);
+    scenario_synced_writes_survive_crash(seed);
 }
