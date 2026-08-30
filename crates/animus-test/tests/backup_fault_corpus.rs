@@ -71,7 +71,7 @@ use animus_cp_data::{
     KIND_BASE, KIND_CURSOR, KIND_LSI, RaftKvNode, SeedRow, StorageScope, TxnWrite,
 };
 use animus_env::{Clock, EnvExt, SegmentStore, nid};
-use animus_sim::{SegmentFaultConfig, SimEnv, SimSegmentStore, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SegmentFaultConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId, escape, partition_token};
 use animus_test::corpus;
@@ -2006,5 +2006,337 @@ fn restore_after_source_drop() {
     for_each_seed(
         "restore_after_source_drop",
         scenario_restore_after_source_drop,
+    );
+}
+
+// ============================================================================
+// `Env`-level fault-primitive cells (ADR 0061 Decision 3) — new cells only,
+// each a close copy of an existing one above with ONE added fault call. Per
+// this corpus's own doctrine (ADR 0014), none of the cells above are
+// modified; these are additive. `NetConfig::set_corrupt_prob` is
+// deliberately never used here: as of this branch,
+// `animus-cp-data::codec`'s `Vec::with_capacity(n as usize)` call sites read
+// an untrusted wire length prefix with no upper-bound check, so a corrupted
+// message near `u32::MAX` risks an allocator abort rather than a clean
+// application-level error — out of scope until that fix lands (mirrors the
+// conservative choice sibling corpora made for the identical reason).
+// `DiskConfig::set_enospc_prob`/`set_error_prob` are excluded for a
+// different reason: their error branches in `persist_wal` are
+// `assert!(halted.load(..), ..)`, and this corpus's scenarios never call the
+// per-node `shutdown()` that sets `halted` — firing either on a live node
+// hard-panics the whole test process.
+// ============================================================================
+
+// --- cell 11: wal_fsync_lie_leader_kill_mid_capture -------------------------
+
+/// Near-copy of [`leader_kill_mid_capture`] with one added fault: a global
+/// [`DiskConfig::set_fsync_lie_prob`] of 0.3, active from before the first
+/// write. `sync` on any node may now return `Ok` while silently leaving the
+/// synced bytes un-synced — transparent to every read until a crash reveals
+/// it ([`DiskConfig::set_fsync_lie_prob`]'s own doc). Proves the capture
+/// cursor's own durability claim survives a lied-to `sync` on the crashing
+/// leader: `confirm` only ever observes a write as durable via the
+/// *applied* index, which Raft only advances once a majority holds the
+/// entry, so a lie on the crashing node alone (the other two replicas never
+/// crash in this scenario, so their own un-synced tails — lied to or not —
+/// are never revealed/lost) can delay convergence but never surface as a
+/// gap in the model-matched backup; there is nothing here for a lied-to
+/// write to silently drop, because this scenario never treats an
+/// unconfirmed write as committed in the first place.
+fn scenario_wal_fsync_lie_leader_kill_mid_capture(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let mut dcfg = DiskConfig::default();
+    dcfg.set_fsync_lie_prob(0.3);
+    sim.set_disk_config(dcfg);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // A couple of ticks under the first leader, then kill it mid-sweep.
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+    let cursor_key_bytes = cursor::cursor_key(&group.range.start, &backup_cursor_tag("backup-1"));
+    let cursor_before =
+        block_on(group.nodes[leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+    assert!(
+        cursor_before.is_some(),
+        "[seed={seed}] a cursor must exist by now"
+    );
+
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+    let mut cursor_after = None;
+    for _ in 0..200 {
+        cursor_after =
+            block_on(group.nodes[new_leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+        if cursor_after == cursor_before {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert_eq!(
+        cursor_after, cursor_before,
+        "[seed={seed}] the newly-elected leader must converge to the identical \
+         durably-committed cursor even under a lied-to fsync on the crashing \
+         leader"
+    );
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+}
+
+#[test]
+fn wal_fsync_lie_leader_kill_mid_capture() {
+    for_each_seed(
+        "wal_fsync_lie_leader_kill_mid_capture",
+        scenario_wal_fsync_lie_leader_kill_mid_capture,
+    );
+}
+
+// --- cell 12: chaotic_network_capture_converges -----------------------------
+
+/// Near-copy of [`single_tablet_backup_converges_under_concurrent_writes`]
+/// with one added fault: a compound [`NetConfig`] (5% drop, 10% duplicate,
+/// with its own independent delay draw per [`NetConfig::
+/// set_duplicate_prob`]'s doc) active for the group's entire lifetime, not
+/// just during capture. Proves the capture driver's write-once discipline
+/// and the completion aggregator's manifest assembly both converge —
+/// through ordinary Raft/2PC retry, not anything backup-specific — under a
+/// genuinely lossy, duplicating network, not just the near-reliable default
+/// every other cell in this file runs under.
+fn scenario_chaotic_network_capture_converges(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+
+    let mut ncfg = NetConfig::default();
+    ncfg.set_drop_prob(0.05);
+    ncfg.set_duplicate_prob(0.1);
+    sim.set_net_config(ncfg);
+
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..10 {
+        let pk = format!("pre{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+
+    // A pending, never-resolved transaction intent — its staged value must
+    // never surface anywhere in the backup (ADR 0059 §5).
+    let staged_key = logical(b"pending-intent");
+    let staged_value = b"never-committed".to_vec();
+    let write = TxnWrite {
+        key: staged_key,
+        value: Some(staged_value.clone()),
+        kind_writes: Vec::new(),
+        change_log: None,
+        stage_marker: None,
+    };
+    let n = group.nodes[leader].clone();
+    let env = n.env().clone();
+    let slot: std::sync::Arc<std::sync::Mutex<Option<_>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.spawn_task(async move {
+        let r = n
+            .txn_stage_anchor("t", vec![write], Vec::new(), Vec::new())
+            .await;
+        *s.lock().unwrap() = Some(r);
+    });
+    // A wider window than the fault-free original — a lossy/duplicating
+    // link can cost the stage attempt an extra retry round trip.
+    for _ in 0..200 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert!(
+        slot.lock().unwrap().take().flatten().is_some(),
+        "[seed={seed}] the intent must stage even under a lossy/duplicating network"
+    );
+
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    // Pin the capture (first tick) BEFORE any post-pin write lands.
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+
+    // Concurrent writes AFTER the pin: must never appear in the backup.
+    for i in 0..5 {
+        let leader = elect(&mut sim, &group, &live, seed);
+        write_base_row(
+            &mut sim,
+            &group.nodes[leader],
+            format!("post{i:03}").as_bytes(),
+            b"late",
+        );
+    }
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+
+    assert_backup_matches_model(&store, "backup-1", &model, &[staged_value], seed);
+}
+
+#[test]
+fn chaotic_network_capture_converges() {
+    for_each_seed(
+        "chaotic_network_capture_converges",
+        scenario_chaotic_network_capture_converges,
+    );
+}
+
+// --- cell 13: capture_driver_wal_torn_on_restart ----------------------------
+
+/// Near-copy of [`capture_driver_node_crash_restart`]'s true-process-restart
+/// technique, with one added fault: a global `DiskConfig{torn_tail_on_crash:
+/// true, corrupt_on_crash: true, ..}`, set right after `Simulator::new`, so
+/// it's in effect for every node's disk throughout. The highest-value new
+/// cell — it proves capture-cursor recovery tolerates a torn/corrupted last
+/// WAL record on the exact node whose cursor the capture driver depends on
+/// for resumability, not just a clean process restart.
+///
+/// `torn_tail_on_crash`/`corrupt_on_crash` only fire inside
+/// [`Simulator::crash`], never [`Simulator::stop`] (`stop` unconditionally
+/// drops any un-synced buffer with no tear/corrupt consideration — see both
+/// methods' own docs), so getting an actual torn/corrupted tail on the
+/// node's Raft-log WAL ahead of a genuine fresh-process restart needs one
+/// extra step versus the pure-`stop`-based original: `sim.crash` first (this
+/// is what applies the tear/corruption to whatever was buffered-but-
+/// unsynced at that instant — on this corpus's `MemoryEngine` tier the
+/// state machine itself is a durable-standin, shared with the fresh node via
+/// engine `.clone()`, exactly as the original cell already relies on; only
+/// the node's own raw Raft-log disk bytes are actually torn/corrupted here),
+/// then `sim.restart` purely to clear the `crashed` flag `crash` sets (a
+/// `crashed` node's own sends/deliveries are dropped forever until
+/// `restart` clears it — leaving it set would permanently mute the fresh
+/// node below), then `sim.stop` to drop the (harmlessly re-armed, never
+/// actually re-polled — no `run_for` happens in between) old tasks and hand
+/// off to a truly fresh `RaftKvNode::start_hosted` on the same durable
+/// state, mirroring the original cell's own restart step exactly from there.
+fn scenario_capture_driver_wal_torn_on_restart(seed: u64) {
+    let mut sim = Simulator::new(seed);
+
+    let mut dcfg = DiskConfig::default();
+    dcfg.torn_tail_on_crash = true;
+    dcfg.corrupt_on_crash = true;
+    sim.set_disk_config(dcfg);
+
+    let engines = engines();
+    let mut meta = base_meta();
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
+    let mut group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let mut model = BTreeMap::new();
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..18 {
+        let pk = format!("p{i:03}");
+        let value = format!("v{i}").into_bytes();
+        write_base_row(&mut sim, &group.nodes[leader], pk.as_bytes(), &value);
+        model.insert(logical(pk.as_bytes()), value);
+    }
+    begin_backup(&mut meta, "backup-1", 1_000);
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    backup_capture_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &store,
+        "backup-1",
+        group.id,
+        seed,
+    );
+
+    // Crash (applies the configured torn/corrupted-tail fault to whatever
+    // was buffered-but-unsynced on this node's own Raft-log disk at this
+    // instant), then restart-then-stop purely to clear the `crashed` flag
+    // before handing off to a genuinely fresh process on the same id and
+    // the same durable (post-tear) state — see the scenario's own doc.
+    let restarted_id = NODES[leader];
+    sim.crash(nid(restarted_id));
+    sim.restart(nid(restarted_id));
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        engines[&restarted_id].clone(),
+        StorageScope::new(group.range.clone()),
+        group.id.0,
+    );
+    group.nodes[leader] = fresh;
+    sim.run_for(Duration::from_secs(2));
+
+    drive_tablet_capture_to_reported(&mut sim, &mut meta, &group, &live, &store, "backup-1", seed);
+    let env = sim.env(nid(NODES[0]));
+    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
+    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
+}
+
+#[test]
+fn capture_driver_wal_torn_on_restart() {
+    for_each_seed(
+        "capture_driver_wal_torn_on_restart",
+        scenario_capture_driver_wal_torn_on_restart,
     );
 }
