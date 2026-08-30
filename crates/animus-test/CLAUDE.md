@@ -557,6 +557,32 @@ retrievable from git history.)
   `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
   (default 1 = the frozen cells; held green at `=100` for the restore cells,
   `=200` for the whole file, both in well under a second).
+- **Three `Env`-level fault-primitive cells (ADR 0061 Decision 3) add
+  genuinely new fault kinds this corpus hadn't exercised**, each a close
+  copy of an existing cell with one added fault call, never modifying the
+  originals: `wal_fsync_lie_leader_kill_mid_capture`
+  (`DiskConfig::set_fsync_lie_prob(0.3)` globally before the crash — proves
+  the capture cursor's durability claim survives a lied-to `sync` on the
+  crashing leader), `chaotic_network_capture_converges` (a compound
+  `NetConfig` — 5% drop, 10% duplicate — active for the group's whole
+  lifetime, proving ordinary Raft/2PC retry carries the capture driver and
+  completion aggregator through a lossy/duplicating network), and
+  `capture_driver_wal_torn_on_restart` (a global `DiskConfig{torn_tail_
+  on_crash: true, corrupt_on_crash: true, ..}` set before group startup,
+  combined with `capture_driver_node_crash_restart`'s fresh-process-restart
+  idiom — see `docs/engineering-lessons.md`'s entry on why that combination
+  needs `crash` → `restart` → `stop`, not `stop` alone, to actually exercise
+  the tear ahead of the fresh restart). `NetConfig::set_corrupt_prob` is
+  deliberately excluded from `chaotic_network_capture_converges`: as of
+  this corpus's own branch, `animus-cp-data::codec`'s
+  `Vec::with_capacity(n as usize)` call sites read an untrusted wire length
+  prefix with no upper-bound check, so corrupting a message risks an
+  allocator abort rather than a clean application-level error — safe to add
+  once that fix lands. `DiskConfig::set_enospc_prob`/`set_error_prob` stay
+  out of this whole file for a different, permanent reason: their error
+  branches in `persist_wal` are `assert!(halted.load(..), ..)`, and this
+  corpus's scenarios never call the per-node `shutdown()` that sets
+  `halted`, so firing either on a live node hard-panics the test process.
 
 ### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 
