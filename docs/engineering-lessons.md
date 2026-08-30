@@ -2999,6 +2999,25 @@ debugging anything that feels like it might have happened before.
   proactively before a from-scratch `--all-targets` gate run in a
   disk-constrained sandbox; reach for (1) if a run has already ballooned
   `target/` and a full `cargo clean` would be too slow to recover from.
+  **Addendum (2026-08-29): the disk is shared across sibling worktree
+  agents, not just your own crate's `target/`.** A gate run flip-flopped
+  between ENOSPC and 12GB free within minutes with zero commands run in
+  between — `du -sh /home/user/animus-db/.claude/worktrees/*/target
+  /home/user/animus-db/target` showed 12–17GB apiece in *other* agents'
+  worktrees and the base checkout, ballooning and draining on their own
+  schedule as those agents built and cleaned. `cargo clean` in your own
+  worktree is necessary but can be insufficient — check sibling worktrees'
+  sizes before concluding the sandbox itself is out of room, and retry a
+  failed gate once or twice before escalating, since a neighbor's build
+  finishing can free multiple GB with no action on your part. `cargo
+  check --workspace --all-targets` (type-checks everything the `#[deny]`
+  lint machinery cares about, no linking) is a much cheaper stand-in than
+  `cargo build --workspace --all-targets` when only verifying that a
+  lint-attribute or type-level change compiles, and `cargo test -p <crate>
+  --lib -j 1` (low parallelism caps peak concurrent temp-file usage) plus
+  a handful of `--test <name>`s targeted at the changed modules is a
+  reasonable substitute for a full per-crate integration suite (84+ test
+  binaries here) when the disk is this contended.
 - **"Converges slowly" and "never converges" produce the same panic message
   and need different investigation methods — instrument the poll itself
   before theorizing** (2026-08-22, `streams_e2e.rs::multi_split_soak_

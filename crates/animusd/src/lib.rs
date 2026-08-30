@@ -60,23 +60,33 @@ pub use animus_node::{
 use animus_node::control_handle::ControlHandle as GenericControlHandle;
 use animus_node::host::RelayClient;
 
-// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): these
-// five modules are the `E: Env`-generic, `tokio`-free client path. The
-// package-level `disallowed_methods = "allow"` in this crate's `Cargo.toml`
-// is the pre-Phase-C process-boundary exemption (rung B5) and still applies
-// to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply here. Since C5
-// step 3b converted every `tokio::time`/`tokio::spawn`/`tokio::select!` site
-// in these files to the `Env` seam, the workspace default is re-enabled for
-// them explicitly — which is what makes the determinism constraint
-// compiler-enforced in place, rather than the crate boundary the ADR
-// originally planned and the orphan rule blocked. A `deny` on the `mod`
-// declaration applies to the whole module body, so a reintroduced
-// `Instant::now`/`tokio::spawn`/`tokio::time::sleep` in any of them is a
-// build failure, not a review miss. Do not widen this back to `allow` to
-// make a change compile — that is the hole this rung closes.
+// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): five
+// of these modules are the original `E: Env`-generic, `tokio`-free client
+// path. The package-level `disallowed_methods = "allow"` in this crate's
+// `Cargo.toml` is the pre-Phase-C process-boundary exemption (rung B5) and
+// still applies to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply
+// here. Since C5 step 3b converted every `tokio::time`/`tokio::spawn`/
+// `tokio::select!` site in these files to the `Env` seam, the workspace
+// default is re-enabled for them explicitly — which is what makes the
+// determinism constraint compiler-enforced in place, rather than the crate
+// boundary the ADR originally planned and the orphan rule blocked. Five
+// more leaf background-loop wrappers (`backup_completion`, `backup_janitor`,
+// `index_backfill`, `pitr_janitor`, `ttl_reaper`) earned the same `deny`
+// later, per `crates/animusd/CLAUDE.md`'s stated bar: each has had its loop
+// body moved to `animus_node` (rung C2) and is now a thin, logic-free
+// wrapper with no live `tokio`/real-clock site of its own —
+// `segment_janitor` deliberately did NOT move and stays under the
+// package-level allow, since its replica-repair phase is real orchestration
+// logic, not a thin delegation. A `deny` on the `mod` declaration applies to
+// the whole module body, so a reintroduced `Instant::now`/`tokio::spawn`/
+// `tokio::time::sleep` in any of them is a build failure, not a review
+// miss. Do not widen this back to `allow` to make a change compile — that
+// is the hole this rung closes.
 mod admin;
 mod backup_capture;
+#[deny(clippy::disallowed_methods)]
 mod backup_completion;
+#[deny(clippy::disallowed_methods)]
 mod backup_janitor;
 mod backup_restore;
 mod client_ctx_host;
@@ -88,13 +98,16 @@ mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
+#[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
 #[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
+#[deny(clippy::disallowed_methods)]
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
