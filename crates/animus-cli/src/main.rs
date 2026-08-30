@@ -688,6 +688,11 @@ fn print_response(response: &ClientResponse) {
             }
         }
         ClientResponse::ConditionFailed => println!("condition failed"),
+        // Internal TxnResolve RPC reply (ADR 0018 §3/§6, torn-pair-fix
+        // stack PR2): consumed programmatically by `txn_resolve_participant_retrying`,
+        // not requested by any CLI subcommand of its own — printed raw if
+        // one ever surfaces here, mirroring `KindWriteOk` above.
+        ClientResponse::TxnResolved { outcome } => println!("txn resolved: {outcome:?}"),
         // Join discovery (ADR 0032 PR2): consumed programmatically by
         // `animusd join`'s startup, not requested by any CLI subcommand —
         // printed raw if one ever surfaces here.

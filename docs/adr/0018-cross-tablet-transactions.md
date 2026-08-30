@@ -3676,3 +3676,140 @@ this class, per §3's own finding, is giving `KvCommand::TxnResolve` a
 resolve, rather than continuing to patch each individually-discovered
 symptom. See `docs/engineering-lessons.md`'s
 matching entry for the full tally and the next round's starting point.
+
+## Amendment (2026-08-29): `KvCommand::TxnResolve` gains a `ResolveOutcome` channel, closing §3
+
+This round builds exactly the fix §3/§6 above named and left for later:
+`KvCommand::TxnResolve`'s apply arm now records a `ResolveOutcome`
+(`Resolved` / `Fenced` / `OutcomeMismatch`) per Raft log index, paired with
+the entry's own term — the identical shape and term-identity discipline
+`StageOutcome`/`StageOutcomes` already established for `TxnStage`, and
+`CasResults`/`KindBatchOutcomes` before that (see this repo's
+`animus-cp-data/CLAUDE.md` "Key invariants" section for the shared
+doctrine: an *accepted* entry is not yet a *committed* one, so an index
+alone can be reoccupied by a different command after a leadership change —
+only `(index, term)` together identify one entry). `RaftKvNode::
+txn_resolve` now returns `Option<(HlcTimestamp, ResolveOutcome)>` instead
+of the old, ambiguous `Option<HlcTimestamp>` — every in-crate and
+`animusd` caller was updated to check the outcome explicitly rather than
+treating `Some(ts)` alone as success.
+
+### 1. The fix's actual shape
+
+- **`ResolveOutcome`** (`animus-cp-data::txn`): `Resolved` (every key in
+  `keys` fell inside this entry's fence and was resolved, or had already
+  been resolved — an idempotent replay is not a failure); `Fenced` (the
+  whole entry no-op'd because a key fell outside the group's live fence or
+  into a sealed range — the exact "target tablet's range shifted between
+  `cp_route` and apply" case §1 above traces the write-loss symptom to);
+  `OutcomeMismatch` (the pre-existing PR6 defense-in-depth check — the
+  carried `outcome` didn't match the anchor's own decided record —
+  reported as its own variant rather than folded into `Fenced`, since
+  re-routing would not help a mismatch the way it helps a genuine
+  fence-miss).
+- **A real, independent bug found and fixed while wiring this in**: the
+  apply arm used to call `txn_tracker.unresolved_decided.remove(&txn_id)`
+  **unconditionally**, before ever computing whether the resolve actually
+  fenced or mismatched. Since `unresolved_decided` is exactly what
+  `txn_resolver_loop`'s passive per-second sweep uses to find
+  decided-but-unresolved transactions to keep pushing, a Fenced resolve
+  used to erase this group's own memory that the transaction still needed
+  resolving — even though nothing was actually written. This is a
+  concrete, previously-silent contributor to the "resolve reports success
+  but the intent stays live" shape §1 captured: on the specific group that
+  fence-missed, the passive safety net had already given up, by
+  construction, the very same tick the fence-miss happened. Fixed:
+  the removal now runs only when `resolve_outcome == ResolveOutcome::
+  Resolved`. Caught by this round's own regression before it ever reached
+  a live soak — `animus-cp-data/tests/txn_recovery.rs::
+  pending_txns_reflects_applies_across_restart` (pre-existing) started
+  failing the moment the conditional-clear landed, because it resolved
+  with a stale `commit_ts` (`txn_id.ts` — the pre-decision candidate, not
+  the actual decided value `commit_at_least` returns) that no longer
+  matched the record's real status, an `OutcomeMismatch` this fix now
+  correctly refuses to treat as done. The test's own pre-existing
+  assumption ("resolving always clears the tracker") was itself masking
+  this exact class of bug; fixed by resolving with the real decided
+  `commit_ts` instead, restoring the property under test.
+- **The coordinator-side fix** (`animusd::ClientCtx`): `txn_resolve_
+  participant` now returns `Result<ResolveOutcome, String>` instead of
+  `Result<(), String>` — a `CpRoute::None` (nowhere to route this to right
+  now) is now a genuine `Err`, never silently `Ok(())`, since that used to
+  be indistinguishable from "resolved." A new bounded-retry wrapper,
+  `txn_resolve_participant_retrying` (`TXN_RESOLVE_FENCED_RETRY_ATTEMPTS`
+  = 3, backed off by the existing `TXN_STAGE_PUSH_BACKOFF`), re-resolves
+  `cp_route` **fresh** on every attempt — the actual fix for the
+  acknowledged-write-loss bug: a fenced resolve now triggers a re-route
+  and retry against whatever tablet currently owns the key, instead of
+  being silently swallowed. Every existing best-effort caller
+  (`resolve_all`, `resolve_all_parallel`, `recovery_resolve`,
+  `push_resolution_if_decided`) now goes through this wrapper instead of
+  the raw one-shot primitive. The wire reply for a forwarded
+  `ClientRequest::TxnResolve` changed from a bare `ClientResponse::PutOk`
+  (indistinguishable success) to `ClientResponse::TxnResolved { outcome:
+  ResolveOutcome }`, carrying the real outcome across the forwarded hop
+  too.
+- **`txn_decide`'s single-tablet convenience path is deliberately
+  unchanged** (`animus-cp-data`): it has no routing/metadata layer of its
+  own to re-route through on a `Fenced` outcome (that facility only exists
+  in `animusd`), so its own internal resolve call still discards the
+  outcome — the background resolver loop and the on-demand foreign-intent
+  push remain its safety net, exactly as they already were for a resolve
+  that never applies at all.
+
+### 2. Tests
+
+`animus-cp-data/tests/txn_resolve_outcome.rs` (new): two deterministic
+`SimEnv` scenarios reproducing the exact ambiguity and its fix directly at
+the primitive level, using the same two-group anchor/participant harness
+shape `tests/txn_multi.rs` already uses (a single-group anchor-only
+transaction's own resolve can reconstruct its value on a plain read purely
+from the locally-held decided record + intent even when the physical
+resolve never lands — `RaftKvNode::resolve_decided`'s own read-time
+reconstruction — which would mask the symptom under test; a genuine
+participant, holding no local copy of the anchor's record, cannot):
+
+- `an_ordinary_resolve_reports_resolved_and_the_value_lands` — the negative
+  control: no split racing it, `ResolveOutcome::Resolved`, value visible.
+- `a_participants_resolve_racing_a_split_reports_fenced_not_a_false_success`
+  — a real in-place split fork (`KvCommand::SplitTablet`, reusing
+  `Freeze`'s whole-range seal) on the **participant**'s own tablet,
+  between the anchor's commit and the participant's own resolve call:
+  asserts `ResolveOutcome::Fenced`, and that the participant's own key
+  stays genuinely unreachable (`local_get` reports `None` on every
+  replica, since the group holds no local record to reconstruct the value
+  from) — the "looks lost" shape a caller must not mistake for done —
+  while the anchor's own decision stays durably `Committed` throughout.
+
+**What this does NOT include, and why**: a full end-to-end `animusd`-level
+reproduction (a real coordinator racing a real `TransactWriteItems` against
+a real cluster mid-split, asserting the write survives via a
+`ConsistentRead: true` follow-up read) was considered but not built as a
+new test. `animusd` has no `SimEnv`-driven cluster harness capable of
+driving a real split (see that crate's own CLAUDE.md, "SimEnv `ClientCtx`
+harness" section — schema DDL and `trigger_split` are named, documented
+blockers of that specific harness), so a deterministic version isn't
+possible today; a real `ProdEnv` version would have to reproduce the same
+kind of timing race this ADR's own soak needed many runs to hit reliably,
+which is a poor fit for a single, fast, always-green CI regression. Instead,
+`animusd/tests/cp_txn.rs::decided_but_unresolved_record_survives_its_own_
+tablet_splitting_before_resolve` (pre-existing, unmodified, and reverified
+green under this change) already covers the equivalent real-cluster
+end-to-end property with a deliberately engineered (not racy) split
+ordering, and the coordinator-side retry logic this round adds
+(`txn_resolve_participant_retrying`) is exercised by that same suite plus
+every other `animusd` transaction/split integration test (`cp_txn.rs`,
+`dynamo_txn.rs`, `dynamo_txn_cancellation.rs`,
+`txn_recovery_participant_spans.rs`, `inplace_split_e2e.rs`,
+`split_lifecycle.rs`, `split_build.rs`), all reverified green.
+
+### 3. Effect on the `SplitMode::InPlace` un-pin (ADR 0058)
+
+**This round does not attempt the mandated un-pin soak, and does not touch
+`--split-mode`'s default.** It closes the specific structural gap §3/§6
+named as blocking a categorical fix, and independently fixes one concrete,
+previously-silent contributor to the write-loss symptom (the unconditional
+`unresolved_decided` clear, above) — but per this file's own "any failure
+keeps the pin" mandate, only a fresh, clean 30-run un-pinned soak (ADR
+0058's own gate) can actually move the pin, and that soak was not run this
+round. See ADR 0058's matching note.

@@ -108,8 +108,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
-    TxnRecordView,
+    FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
+    TxnOutcome, TxnRecordView,
 };
 use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -1436,14 +1436,16 @@ impl<E: Env> CpGroup<E> {
     }
 
     /// **Resolve** intents on this group given an already-decided outcome.
-    /// See [`RaftKvNode::txn_resolve`].
+    /// See [`RaftKvNode::txn_resolve`] — the caller must check the returned
+    /// [`ResolveOutcome`] (`Fenced`/`OutcomeMismatch` mean nothing here
+    /// actually resolved; only `Resolved` does).
     async fn txn_resolve(
         &self,
         txn_id: TxnId,
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: TxnOutcome,
-    ) -> Option<HlcTimestamp> {
+    ) -> Option<(HlcTimestamp, ResolveOutcome)> {
         match self {
             CpGroup::Lsm(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
             CpGroup::Mem(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
@@ -1873,6 +1875,17 @@ const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
 /// plain transaction's async resolve always could race a follow-up read on
 /// its own participant tables.
 const TXN_RESOLVE_ALL_AWAIT_BUDGET: Duration = Duration::from_secs(2);
+/// Bounded attempts [`ClientCtx::txn_resolve_participant_retrying`] gives a
+/// resolve that comes back `Fenced` (or a transient routing/leadership
+/// error) before giving up for this call — ADR 0018 §2 write-loss amendment
+/// §3/§6's fix for the "resolve reports success but the intent stays live"
+/// residual: a concurrent split can move a key's range between one
+/// `cp_route` call and the next, so a bounded number of fresh re-routes
+/// gives the split a realistic window to finish converging before this
+/// caller gives up (the passive `txn_resolver_loop` sweep, or an on-demand
+/// foreign-intent read-path push, remain the safety net either way — this
+/// is a liveness improvement, not the sole correctness mechanism).
+const TXN_RESOLVE_FENCED_RETRY_ATTEMPTS: u32 = 3;
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.

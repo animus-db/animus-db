@@ -976,7 +976,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
-                    Some(_) => ClientResponse::PutOk,
+                    Some((_, outcome)) => ClientResponse::TxnResolved { outcome },
                     None => {
                         ClientResponse::Error("CP group leader moved during resolve; retry".into())
                     }

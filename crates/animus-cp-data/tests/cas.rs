@@ -77,18 +77,22 @@ fn concurrent_cas_has_exactly_one_winner() {
     // Propose both CAS *before* either applies — they are concurrent: each is
     // ordered by Raft; the first to apply moves the committed value, so the
     // second's compare against the (now-changed) value fails.
-    let a = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
-        ProposeResult::Accepted { index, .. } => index,
+    let (a, term_a) = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
+        ProposeResult::Accepted { index, term } => (index, term),
         other => panic!("CAS A rejected: {other:?} (seed={seed})"),
     };
-    let b = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
-        ProposeResult::Accepted { index, .. } => index,
+    let (b, term_b) = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
+        ProposeResult::Accepted { index, term } => (index, term),
         other => panic!("CAS B rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(3)); // commit + apply both
 
-    let oa = nodes[l].cas_result(a).expect("CAS A applied (seed)");
-    let ob = nodes[l].cas_result(b).expect("CAS B applied (seed)");
+    let oa = nodes[l]
+        .cas_result(a, term_a)
+        .expect("CAS A applied (seed)");
+    let ob = nodes[l]
+        .cas_result(b, term_b)
+        .expect("CAS B applied (seed)");
     assert!(
         oa ^ ob,
         "exactly one CAS must win: A={oa}, B={ob} (seed={seed})"
@@ -111,12 +115,12 @@ fn concurrent_cas_has_exactly_one_winner() {
             "node {i} disagrees on the CAS winner (seed={seed})"
         );
         assert_eq!(
-            n.cas_result(a),
+            n.cas_result(a, term_a),
             Some(oa),
             "node {i} disagrees on CAS A outcome (seed={seed})"
         );
         assert_eq!(
-            n.cas_result(b),
+            n.cas_result(b, term_b),
             Some(ob),
             "node {i} disagrees on CAS B outcome (seed={seed})"
         );
@@ -190,26 +194,26 @@ fn cas_if_absent() {
     let l = leader(&nodes, &[0, 1, 2], seed);
 
     // Empty key: CAS-if-absent succeeds.
-    let first = match nodes[l].cas(b"k".to_vec(), None, b"v1".to_vec()) {
-        ProposeResult::Accepted { index, .. } => index,
+    let (first, term_first) = match nodes[l].cas(b"k".to_vec(), None, b"v1".to_vec()) {
+        ProposeResult::Accepted { index, term } => (index, term),
         other => panic!("CAS-if-absent rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[l].cas_result(first),
+        nodes[l].cas_result(first, term_first),
         Some(true),
         "CAS-if-absent must succeed on an empty key (seed={seed})"
     );
     assert_eq!(block_on(nodes[l].local_get(b"k")), Some(b"v1".to_vec()));
 
     // Now a value exists: a second CAS-if-absent fails (no overwrite).
-    let second = match nodes[l].cas(b"k".to_vec(), None, b"v2".to_vec()) {
-        ProposeResult::Accepted { index, .. } => index,
+    let (second, term_second) = match nodes[l].cas(b"k".to_vec(), None, b"v2".to_vec()) {
+        ProposeResult::Accepted { index, term } => (index, term),
         other => panic!("CAS-if-absent rejected: {other:?} (seed={seed})"),
     };
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[l].cas_result(second),
+        nodes[l].cas_result(second, term_second),
         Some(false),
         "CAS-if-absent must fail once the key has a value (seed={seed})"
     );
@@ -244,13 +248,14 @@ fn successful_cas_survives_restart() {
     sim.run_for(Duration::from_secs(2));
 
     let l = leader(&nodes, &[0, 1, 2], seed);
-    let idx = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"swapped".to_vec()) {
-        ProposeResult::Accepted { index, .. } => index,
-        other => panic!("CAS rejected: {other:?} (seed={seed})"),
-    };
+    let (idx, idx_term) =
+        match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"swapped".to_vec()) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => panic!("CAS rejected: {other:?} (seed={seed})"),
+        };
     sim.run_for(Duration::from_secs(2));
     assert_eq!(
-        nodes[l].cas_result(idx),
+        nodes[l].cas_result(idx, idx_term),
         Some(true),
         "CAS must succeed before restart (seed={seed})"
     );
@@ -292,18 +297,18 @@ fn cas_winner_consistent_across_seeds() {
         sim.run_for(Duration::from_secs(2));
 
         let l = leader(&nodes, &[0, 1, 2], seed);
-        let a = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
-            ProposeResult::Accepted { index, .. } => index,
+        let (a, term_a) = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"A".to_vec()) {
+            ProposeResult::Accepted { index, term } => (index, term),
             other => panic!("CAS A rejected: {other:?} (seed={seed})"),
         };
-        let b = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
-            ProposeResult::Accepted { index, .. } => index,
+        let (b, term_b) = match nodes[l].cas(b"k".to_vec(), Some(b"v0".to_vec()), b"B".to_vec()) {
+            ProposeResult::Accepted { index, term } => (index, term),
             other => panic!("CAS B rejected: {other:?} (seed={seed})"),
         };
         sim.run_for(Duration::from_secs(3));
 
-        let oa = nodes[l].cas_result(a).expect("CAS A applied");
-        let ob = nodes[l].cas_result(b).expect("CAS B applied");
+        let oa = nodes[l].cas_result(a, term_a).expect("CAS A applied");
+        let ob = nodes[l].cas_result(b, term_b).expect("CAS B applied");
         assert!(oa ^ ob, "exactly one winner (seed={seed})");
         let winner = if a < b { b"A".to_vec() } else { b"B".to_vec() };
         for (i, n) in nodes.iter().enumerate() {

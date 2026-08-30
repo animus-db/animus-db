@@ -9849,6 +9849,40 @@ debugging anything that feels like it might have happened before.
   suite for the extracted `classify_kind_batch_outcome` predicate
   `poll_probe` now calls, including the term-mismatch case — proven red
   pre-fix by dropping the predicate's term-equality guard).
+  **Amendment (2026-08-29): the two siblings this entry's own "audit every
+  sibling" rule pointed at — `Cas`'s `CasResults` and `TxnStage`'s
+  `StageOutcomes` — turned out to have the identical gap, and this entry's
+  own earlier claim that `CasResults`' shape was "sound for CAS" is
+  corrected here rather than left to mislead a future reader.** That claim
+  reasoned `compare_and_swap` only ever consulted `cas_result` "after
+  confirming the entry applied via a value/ceiling read that already
+  implies commit" — but the actual code never did any such confirming read:
+  `compare_and_swap`'s own poll loop called `cas_result(index)` directly,
+  with no value/ceiling check and (worse) no `is_leader()` guard either,
+  despite a comment claiming a step-down check existed. `stage_outcome`/
+  `wait_stage_outcome` had the `is_leader()` guard but the identical
+  index-only lookup. Both are now fixed exactly like `KindBatchOutcomes`:
+  `CasResults`/`StageOutcomes` store `(term, outcome)`, and
+  `cas_result`/`stage_outcome` take the caller's own accepted `term`,
+  returning `None` (never a stale `Some`) on a mismatch — propagating up
+  through `wait_stage_outcome`, `txn_stage_anchor`/`txn_stage_participant`,
+  and `compare_and_swap` (which also gained the missing `is_leader()` check
+  its own comment had wrongly implied was already there). Regression:
+  `animus-cp-data/tests/cas_outcome_identity.rs`, the `Cas` mirror of
+  `kind_batch_outcome_identity.rs` — same isolate/accept/elect/collide/heal
+  shape, proven red pre-fix by reverting `cas_result` to its index-only
+  form, plus an end-to-end check that the public `compare_and_swap` async
+  entry point itself never surfaces a false `Some(_)` for a truncated
+  attempt. **`TxnResolve` has a related but distinct gap — it has no
+  outcome channel at all, not a term-unsafe one — tracked separately, not
+  closed by this round** (see this file's "A resolve's silent no-op is
+  invisible to its own proposer" entry). **The generalizable lesson,
+  restated**: "audit every sibling" is not satisfied by naming the siblings
+  in a doc comment — it means actually reading each sibling's own call
+  chain down to its lowest-level accessor before asserting any one of them
+  is safe by a different mechanism; an assumption of safety that isn't
+  independently verified is exactly as dangerous as the missing fix itself,
+  because it makes a future auditor skip the very sibling that needed it.
 - **A `CARGO_TARGET_DIR` shared across concurrently-running agent
   worktrees can silently link one session's build against ANOTHER
   session's stale source** (2026-08-23, discovered mid-fix on the
@@ -11659,6 +11693,81 @@ tested narrowing of the residual's reachable surface, not a categorical
 close of it; `TxnResolve`'s own missing outcome channel is the more
 durable fix a future round should reach for instead of another
 individually-discovered-symptom patch.
+
+**Amendment (2026-08-29): the outcome channel above shipped, and it surfaced
+a SECOND, independent bug hiding behind the same missing signal.**
+`KvCommand::TxnResolve` now records a `ResolveOutcome` (`Resolved`/
+`Fenced`/`OutcomeMismatch`) per apply, keyed by Raft log index and paired
+with the entry's own term — the exact `StageOutcome`-shaped channel this
+entry's own closing paragraph named as the durable fix, built the same way
+`CasResults`/`StageOutcomes`/`KindBatchOutcomes` already are (see this
+file's own entries on those three for the shared term-identity doctrine).
+`RaftKvNode::txn_resolve` now returns `Option<(HlcTimestamp,
+ResolveOutcome)>`; `animusd::ClientCtx::txn_resolve_participant` returns
+`Result<ResolveOutcome, String>`; a new bounded-retry wrapper
+(`txn_resolve_participant_retrying`) re-resolves routing **fresh** on every
+attempt when the outcome comes back `Fenced`, instead of the old behavior
+of treating any applied entry as done.
+
+**The second bug, found wiring the channel in, not in a soak**: the apply
+arm's own `TxnTracker::unresolved_decided.remove(&txn_id)` call — which is
+exactly what `txn_resolver_loop`'s passive per-second sweep reads to find
+a decided-but-still-unresolved transaction to keep pushing — ran
+**unconditionally**, before the entry's own fence/mismatch outcome was even
+computed. A `Fenced` resolve therefore erased this group's own memory that
+the transaction still needed resolving, in the identical tick the fence-miss
+happened — the passive safety net had already given up on exactly the
+transaction it exists to rescue, with no way to tell from the outside. This
+is a second, independent, concrete mechanism behind the "resolve reports
+success but the intent stays live" shape this whole entry chases, found
+purely by reading the apply arm's own code once the new outcome value gave
+something to condition the clear on — **the general lesson: adding an
+outcome channel to an apply arm is also the moment to re-audit every OTHER
+side effect that same arm already performs unconditionally, since "this
+entry applied" and "this entry did what it meant to" were conflated
+everywhere in that arm, not just in the one return value with a name**.
+Fixed by gating the `remove` on `resolve_outcome == ResolveOutcome::
+Resolved`.
+
+**A pre-existing regression test's own unstated assumption broke the moment
+this landed, which is the correct outcome, not a regression to work
+around.** `animus-cp-data/tests/txn_recovery.rs::
+pending_txns_reflects_applies_across_restart` resolved with `TxnOutcome::
+Committed { commit_ts: txn_id.ts }` — the pre-decision *candidate*
+timestamp, not the real decided value `commit_at_least` actually returns
+(`mint_at_least` mints strictly above the candidate, so the two are
+essentially never equal) — and asserted `unresolved_decided` cleared
+afterward. Before this fix, the resolve's own `outcome_mismatch` no-op
+still got treated as "done" by the then-unconditional clear, so the test
+passed for the wrong reason: it never actually exercised a genuine resolve
+at all. After the fix, the same stale value correctly no-ops
+(`OutcomeMismatch`) and leaves the tracker untouched, failing the
+assertion — not because the fix is wrong, but because the test was
+silently relying on the exact bug this round closed. **The general lesson,
+sharpened from this file's own recurring theme: a test asserting an
+eventual-consistency-shaped postcondition ("X eventually clears") can pass
+for years on a value that's subtly wrong, as long as something ELSE
+(here, an unconditional side effect one call away) makes the postcondition
+true regardless of whether the call under test actually did its job —
+fixing the masking bug is what makes the test start asserting what it was
+always supposed to.** Fixed by resolving with `commit_at_least`'s own
+returned ts (sound specifically because this test's own scenario has no
+concurrent recovery decider to race — the general rule the crate's own
+docs already state, that a caller must re-read the record's *actual*
+status rather than trust a propose call's own return, still applies
+everywhere a second decider is possible).
+
+New regression at the primitive level: `animus-cp-data/tests/
+txn_resolve_outcome.rs` (a real in-place split forking the **participant's**
+own tablet between the anchor's commit and the participant's resolve,
+proving `Fenced` and — since the participant holds no local copy of the
+anchor's record to reconstruct the value from — that the key stays
+genuinely unreachable, not silently marked done). **Still not attempted**:
+the mandated fresh 30-run un-pinned `SplitMode::InPlace` soak — this round
+closes the structural gap the soak's own investigation named as the
+clearest path forward, but per this file's own "any failure keeps the pin"
+discipline, only that soak can actually move the pin. See ADR 0018's
+2026-08-29 amendment and ADR 0058's matching note.
 
 ## A converged-or-timeout poll can still race if its condition is weaker than what the assertion after it needs (issue #421)
 
