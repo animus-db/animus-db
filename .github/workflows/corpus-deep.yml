@@ -79,11 +79,23 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # Every corpus step below carries `continue-on-error: true` and an
+      # `id:`. Without both, a step's own failure aborts the job and skips
+      # every step after it — GitHub Actions' default sequential-steps
+      # behavior — so a single broken corpus silently hides whatever the
+      # other nine were going to report, night after night. The trailing
+      # "Report corpus results" step turns each step's recorded outcome
+      # back into one overall job failure, so CI still goes red on a real
+      # regression, but only after every corpus has actually had a chance
+      # to run and be seen.
+
       # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
       # (stage/commit/resolve + the recovery push) under fault injection,
       # scaled to depth. Each scenario is a pure function of its seed, so a
       # failure names one scenario + seed and is replayable.
       - name: deep multi-tablet transaction corpus (ADR 0018 serializability)
+        id: txn
+        continue-on-error: true
         env:
           ANIMUS_TXN_SEEDS: ${{ github.event.inputs.txn_seeds || '40' }}
         run: cargo test -p animus-test --test txn_serializable -- --nocapture
@@ -93,6 +105,8 @@ jobs:
       # store faults, scaled to depth. Each cell is a pure function of its
       # seed, so a failure names one cell + seed and is replayable.
       - name: deep streams lineage corpus (ADR 0042/0043 exactly-once + lineage)
+        id: streams
+        continue-on-error: true
         env:
           ANIMUS_STREAM_SEEDS: ${{ github.event.inputs.stream_seeds || '40' }}
         run: cargo test -p animus-test --test stream_lineage_corpus -- --nocapture
@@ -103,6 +117,8 @@ jobs:
       # is a pure function of its seed, so a failure names one cell + seed
       # and is replayable.
       - name: deep backfill fault corpus (ADR 0045 coverage + convergence)
+        id: backfill
+        continue-on-error: true
         env:
           ANIMUS_BACKFILL_SEEDS: ${{ github.event.inputs.backfill_seeds || '40' }}
         run: cargo test -p animus-test --test backfill_fault_corpus -- --nocapture
@@ -111,6 +127,8 @@ jobs:
       # child-replica crash/partition/duplicate-delivery during a build,
       # scaled to depth. Each cell is a pure function of its seed.
       - name: deep split-build corpus (ADR 0050 seed/convergence)
+        id: split
+        continue-on-error: true
         env:
           ANIMUS_SPLIT_SEEDS: ${{ github.event.inputs.split_seeds || '40' }}
         run: cargo test -p animus-cp-data --test seed_batch -- --nocapture
@@ -119,12 +137,16 @@ jobs:
       # scenarios: Building host, cutover, reclaim, crash/restart over
       # per-tablet engines), scaled to depth.
       - name: deep reconciler lifecycle corpus (ADR 0031/0050)
+        id: reconciler
+        continue-on-error: true
         env:
           ANIMUS_RECONCILER_SEEDS: ${{ github.event.inputs.reconciler_seeds || '40' }}
         run: cargo test -p animus-cp-data --test reconciler_corpus -- --nocapture
 
       # ADR 0048's quiescence property corpus, scaled to depth.
       - name: deep quiescence corpus (ADR 0048)
+        id: quiesce
+        continue-on-error: true
         env:
           ANIMUS_QUIESCE_SEEDS: ${{ github.event.inputs.quiesce_seeds || '40' }}
         run: cargo test -p animus-cp-data --test quiescence -- --nocapture
@@ -134,6 +156,8 @@ jobs:
       # snapshot race, scaled to depth. Each scenario is a pure function of
       # its seed, so a failure names one scenario + seed and is replayable.
       - name: deep learner membership corpus (ADR 0058 Train 1)
+        id: learner
+        continue-on-error: true
         env:
           ANIMUS_LEARNER_SEEDS: ${{ github.event.inputs.learner_seeds || '40' }}
         run: cargo test -p animus-control --test learner_corpus -- --nocapture
@@ -145,6 +169,8 @@ jobs:
       # depth. Each scenario is a pure function of its seed, so a failure
       # names one scenario + seed and is replayable.
       - name: deep in-place split corpus (ADR 0058 Train 2 rung 3)
+        id: inplace_split
+        continue-on-error: true
         env:
           ANIMUS_INPLACE_SPLIT_SEEDS: ${{ github.event.inputs.inplace_split_seeds || '40' }}
         run: cargo test -p animus-cp-data --test inplace_split_reconciler -- --nocapture
@@ -156,6 +182,8 @@ jobs:
       # of its seed, so a failure names one scenario + seed and is
       # replayable.
       - name: deep backup capture corpus (ADR 0059 Train 1)
+        id: backup
+        continue-on-error: true
         env:
           ANIMUS_BACKUP_SEEDS: ${{ github.event.inputs.backup_seeds || '40' }}
         run: cargo test -p animus-test --test backup_fault_corpus -- --nocapture
@@ -165,6 +193,38 @@ jobs:
       # retention janitor's own keep-anchor predicate under randomized
       # interleavings, scaled to depth.
       - name: deep PITR sealing corpus (ADR 0059 Train 3)
+        id: pitr
+        continue-on-error: true
         env:
           ANIMUS_PITR_SEEDS: ${{ github.event.inputs.pitr_seeds || '40' }}
         run: cargo test -p animus-test --test pitr_fault_corpus -- --nocapture
+
+      # Turns each corpus step's individually-recorded outcome back into one
+      # overall job failure. `if: always()` makes this step run even though
+      # every step above may have failed; without it, this step itself would
+      # be skipped by the same default sequential-steps behavior this whole
+      # continue-on-error scheme exists to route around.
+      - name: Report corpus results
+        if: always()
+        run: |
+          declare -A outcomes=(
+            [txn]="${{ steps.txn.outcome }}"
+            [streams]="${{ steps.streams.outcome }}"
+            [backfill]="${{ steps.backfill.outcome }}"
+            [split]="${{ steps.split.outcome }}"
+            [reconciler]="${{ steps.reconciler.outcome }}"
+            [quiesce]="${{ steps.quiesce.outcome }}"
+            [learner]="${{ steps.learner.outcome }}"
+            [inplace_split]="${{ steps.inplace_split.outcome }}"
+            [backup]="${{ steps.backup.outcome }}"
+            [pitr]="${{ steps.pitr.outcome }}"
+          )
+          failed=0
+          for name in txn streams backfill split reconciler quiesce learner inplace_split backup pitr; do
+            outcome="${outcomes[$name]}"
+            echo "${name}: ${outcome}"
+            if [ "${outcome}" != "success" ]; then
+              failed=1
+            fi
+          done
+          exit "${failed}"
