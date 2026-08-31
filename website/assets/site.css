@@ -3,10 +3,11 @@
  * Design tokens come from the shared base, `assets/tokens.css`, which is
  * byte-identical to the copy the in-product consoles embed; a test in
  * `animusd` fails if the two drift. Only the *skin* lives here: the geometry
- * that makes this surface roomy and read-at-leisure — ruled, sharp-cornered,
- * ledger-like, with no drop shadows except the ink plates and diagram frame,
- * and no rounded pills except tight status chips. Faces load from Google
- * Fonts (allowed on the marketing site); no build step.
+ * that makes this surface roomy and read-at-leisure — ruled, plain-bordered,
+ * softly rounded (6px controls, 8px panels), with no drop shadows anywhere,
+ * not even the ink plates (that exception is gone — see the ADR's newest
+ * amendment), and no rounded pills except tight status chips. Faces load
+ * from Google Fonts (allowed on the marketing site); no build step.
  */
 :root {
   /* site skin — roomy: read at leisure, often on a phone */
