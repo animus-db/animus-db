@@ -843,8 +843,9 @@ class of fix ADR 0058's own in-place cutover driver already used
 incident writeup, including the follow-up hardening of the test itself
 (a one-shot assert on an eventually-converging value, fixed in `645fbb5`):
 `docs/engineering-lessons.md`'s "A 'just compare live state to the target'
-convergence check races the very proposer that sets the target" entry and
-its "Follow-up hardening" successor (both filed under this ADR's rung 6).
+convergence check races the very proposer that sets the target" entry
+(filed under this ADR's rung 6, and covering both the product race and its
+test-hardening follow-up in one place).
 
 **Known limitation, not closed here (issue #513).** Validating the fix
 above surfaced a second, **pre-existing**, unrelated defect in

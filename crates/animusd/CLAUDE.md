@@ -1263,13 +1263,15 @@ inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
 `Metadata` row, set only by `BeginSplitInPlace`): a node can be configured
 `InPlace` while driving a tablet someone else split with `BeginSplit`
 before the flag flipped, and vice versa. Everything upstream of this —
-adding the fork's learners, catching them up, proposing the single-entry
-`KvCommand::SplitTablet` fork itself, and materializing both children's
-engines on every fork participant — is entirely `animus_cp_data::host`'s
-own reconciler (ADR 0058 Train 2 rung 3, unmodified by this driver); this
-function has nothing to do until `CpGroup::pending_split()` answers `Some`
-on this replica. Once forked, there is no build, no freeze, no tail, no
-convergence bound — Stage 3's atomic mint already fully formed both
+proposing the single-entry `KvCommand::SplitTablet` fork itself (**since
+ADR 0062, immediately, with no learner-add-and-wait phase to run first —
+every replica the fork touches already hosts the parent as an ordinary
+voter**) and materializing both children's engines on every fork
+participant — is entirely `animus_cp_data::host`'s own reconciler (ADR
+0058 Train 2 rung 3; fork-first per ADR 0062 rung 5, unmodified by this
+driver); this function has nothing to do until `CpGroup::pending_split()`
+answers `Some` on this replica. Once forked, there is no build, no freeze,
+no tail, no convergence bound — the atomic mint already fully formed both
 children — so what is left is exactly the copy-based endgame's own two
 pre-cutover vetoes (GSI-drain, accelerated identically via
 `gsi_caught_up`/`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`; backfill-seeder) run
@@ -1289,7 +1291,7 @@ a fresh read off durable/replicated state.
 `CutoverSplit` the instant `pending_split()` is `Some` races
 `animus_cp_data::host`'s own reconciler, which is a *different*,
 independently-scheduled per-node loop (`tablet_host_reconciler_loop`).
-Stages 1–3 commit nothing on the control plane, so that reconciler's
+The fork itself commits nothing on the control plane, so that reconciler's
 `metadata_watch` wakes once (at `BeginSplitInPlace`'s own commit) and not
 again until `CutoverSplit`'s — leaving its `RECONCILE_FALLBACK_INTERVAL`
 (500ms) fallback as the only thing that can make it discover a completed
@@ -2663,7 +2665,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   only (`start_with_growth`'s two call sites — mirrors `backup_capture.rs`/
   `backup_restore.rs`'s own scope: no control-plane-leader dependency of
   its own, so a control-only node, which hosts no CP-data tablet, gets
-  nothing from spawning it).
+  nothing from spawning it). **Status surface**: no new admin/dashboard
+  code — `admin.rs`'s `status_json` already serializes `effective_metadata()`
+  directly, so a live `split_placing` entry (and its `done` flag) is
+  visible for free, the same "derive from already-replicated state, don't
+  build a bespoke view" discipline every other diagnostic here follows.
+  **Known limitation carried forward, not this loop's to fix** (issue
+  #513): the loop's own convergence predicate is correct, but the
+  `reconfigure_step` convergence it observes can itself oscillate
+  indefinitely for a two-(or-more)-replica-difference target — so a child
+  whose fresh `select_replicas` target differs from its fork-inherited
+  replicas by more than one replica may never reach `done` at all, not
+  just slowly.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

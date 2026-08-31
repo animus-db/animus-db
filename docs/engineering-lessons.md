@@ -8430,7 +8430,10 @@ debugging anything that feels like it might have happened before.
   tablet at all" were both written before any workflow needed a node to
   host a tablet for a reason OTHER than being in its own `replicas`.
   (`crates/animus-cp-data/src/host.rs`'s `plan` phase 1's second
-  host-candidate branch and phase 3's `recruited_for_split` exclusion.)
+  host-candidate branch and phase 3's `recruited_for_split` exclusion —
+  both later deleted, along with the rest of Train 2 Stage 1/2, by ADR
+  0062 rung 5; the general rule above still applies to any future
+  membership-change call site.)
 - **A "clone this engine" primitive must take the caller's own already-open
   source handle, never a bare identity it re-opens itself — re-opening the
   same on-disk state from two independent in-process instances is a
@@ -13666,26 +13669,27 @@ was to compensate for a mechanism that's gone is exactly as dead as the
 mechanism itself, and is easy to miss because it doesn't share a name or an
 import with what got deleted.
 
-## A "just compare live state to the target" convergence check races the very proposer that sets the target — and the failure mode is silent, not a crash (ADR 0062 rung 6, the completion loop's settle window)
+## A "just compare live state to the target" convergence check races the very proposer that sets the target — and hardening the regression test found two more independent races behind it (ADR 0062 rung 6, the completion loop's settle window)
 
-Rung 6's own completion loop (`animusd::split_placing_completion`) was
-first written exactly as the ADR's own minimal pseudocode: each tick, for
-every led tablet with an un-`done` `split_placing` entry, propose
-`MarkSplitPlacingDone` the instant `group.config() == t.replicas` (the
-live Raft voter set matches `Metadata`'s own current desired replicas).
-This looks obviously correct — it's the literal "is there anything left
-for `reconfigure_step` to do" predicate. It is also racy in a way a code
-reader (including the ADR author) would not obviously catch: **immediately
-after `CutoverSplit` commits, a freshly-forked child's live group already
-sits on exactly its fork-inherited `t.replicas`** (ADR 0062's own
-fork-first design), so `group.config() == t.replicas` is **trivially true
-from the very first tick** — before the control-plane leader's OWN
-reconcile loop (`RECONCILE_INTERVAL`, 500ms) has had a single chance to
-bump `t.replicas` toward the *real*, differing target `CutoverSplit`
-already recorded as `split_placing[child].target`. A completion-loop tick
-landing in that (near-guaranteed, since this loop's own cadence is well
-under 500ms) window observes "already converged" and marks `done` before
-any placement move ever happens.
+**The product race.** Rung 6's own completion loop
+(`animusd::split_placing_completion`) was first written exactly as the
+ADR's own minimal pseudocode: each tick, for every led tablet with an
+un-`done` `split_placing` entry, propose `MarkSplitPlacingDone` the instant
+`group.config() == t.replicas` (the live Raft voter set matches
+`Metadata`'s own current desired replicas). This looks obviously correct —
+it's the literal "is there anything left for `reconfigure_step` to do"
+predicate. It is also racy in a way a code reader (including the ADR
+author) would not obviously catch: **immediately after `CutoverSplit`
+commits, a freshly-forked child's live group already sits on exactly its
+fork-inherited `t.replicas`** (ADR 0062's own fork-first design), so
+`group.config() == t.replicas` is **trivially true from the very first
+tick** — before the control-plane leader's OWN reconcile loop
+(`RECONCILE_INTERVAL`, 500ms) has had a single chance to bump `t.replicas`
+toward the *real*, differing target `CutoverSplit` already recorded as
+`split_placing[child].target`. A completion-loop tick landing in that
+(near-guaranteed, since this loop's own cadence is well under 500ms)
+window observes "already converged" and marks `done` before any placement
+move ever happens.
 
 **Why this wasn't caught by reasoning alone, and had to be found by
 running the real thing**: the failure mode is not a crash or a rejected
@@ -13724,60 +13728,27 @@ fast, independently-scheduled loop's own read can observe a slower loop's
 (never a one-shot check) is the fix, and the settle duration is set by the
 *slower* loop's own worst-case cadence, not the fast loop's own tick rate.
 
-**General lesson**: "a premature/wrong observation is harmless because a
-slower fallback mechanism will eventually correct it" is not the same
-claim as "a premature/wrong observation is cheap" — trace the fallback's
-own actual speed and its own actual target-selection algorithm before
-accepting that argument, especially when the fallback is a *different*
-mechanism (here, generic load-balancing rebalance vs. directed,
-target-specific placing) that was never designed to reproduce the fast
-path's specific outcome, only some outcome eventually. A convergence check
-comparing live state to a *just-written, not-yet-widely-observed* target
-needs to ask not just "do these two values match" but "could they match
-merely because the target hasn't moved yet, not because the mover has
-caught up" — the two are indistinguishable from a single snapshot and only
-separable by requiring the match to persist.
+**General lesson (the product race)**: "a premature/wrong observation is
+harmless because a slower fallback mechanism will eventually correct it"
+is not the same claim as "a premature/wrong observation is cheap" — trace
+the fallback's own actual speed and its own actual target-selection
+algorithm before accepting that argument, especially when the fallback is
+a *different* mechanism (here, generic load-balancing rebalance vs.
+directed, target-specific placing) that was never designed to reproduce
+the fast path's specific outcome, only some outcome eventually. A
+convergence check comparing live state to a *just-written,
+not-yet-widely-observed* target needs to ask not just "do these two values
+match" but "could they match merely because the target hasn't moved yet,
+not because the mover has caught up" — the two are indistinguishable from
+a single snapshot and only separable by requiring the match to persist.
 
-## An unrelated, pre-existing `reconfigure_step` instability was found (not fixed) while validating the above: a 2-of-3-replica-swap target can make live Raft membership oscillate instead of converge (ADR 0062 rung 6)
-
-While building the real end-to-end test for the settle-window fix above, a
-target requiring the reconfigure sequence to replace **two** of a tablet's
-three replicas at once (grow a 3-node cluster by two lower-sorting-id
-nodes, so `select_replicas` prefers both new nodes over two of the
-parent's three) reliably made the live CP-data Raft group's own voter set
-**oscillate** under a real `ProdEnv` cluster: it would reach the transient,
-genuinely-over-replicated 5-member intermediate state
-`reconfigure_step`'s add-before-remove sequencing produces (add both new
-learners, promote both, only then remove the two extras), then revert
-partway back toward the original 3-replica set, repeating indefinitely —
-never settling within a 60s budget. **This is provably unrelated to the
-completion loop above**: it reproduces with zero `MarkSplitPlacingDone`
-proposes ever having fired (confirmed by instrumenting the loop and
-observing the oscillation begin before the loop's own settle window had
-even elapsed once), so the cause sits in `host::Reconciler`/
-`reconfigure_step` itself (`animus-cp-data`, ADR 0058 Train 1), pre-dating
-and unmodified by ADR 0062. A target that replaces only **one** of three
-replicas (a strictly simpler add-one/remove-one sequence, never reaching a
-5-voter intermediate state) converged cleanly and quickly on every run.
-
-Not investigated further or fixed — out of this rung's own scope, and
-worth a dedicated investigation rather than a guess folded into an
-unrelated change (this repo's own "an incidental bug gets its own PR"
-rule). `tests/split_placing_completion.rs` deliberately exercises only the
-one-replica-difference shape, with its own doc comment explaining why, so
-a future investigation of the two-replica case has a name, a reproduction
-recipe (grow-by-two, RF3, real `ProdEnv`), and a already-written
-regression-in-waiting to flip on once the underlying issue is found. Filed
-here rather than silently worked around, per this repo's own "record a
-generalizable lesson, including one you didn't chase to the end" practice.
-
-## Follow-up hardening of the above: the test itself, not the loop, was asserting a one-shot snapshot of an eventually-converging value (ADR 0062 rung 6, `tests/split_placing_completion.rs`)
-
-The settle-window fix above closed a real product race. It did not, on its
-own, make `tests/split_placing_completion.rs` reliably green — a second
-pass, run to a 15-consecutive-green bar (`for i in $(seq 15); do cargo test
--p animusd --test split_placing_completion || break; done`), surfaced two
-more failure modes, both root-caused rather than papered over with a wider
+**Follow-up hardening: the test itself, not the loop, was ALSO asserting a
+one-shot snapshot of an eventually-converging value.** The settle-window
+fix above closed the real product race. It did not, on its own, make
+`tests/split_placing_completion.rs` reliably green — a second pass, run to
+a 15-consecutive-green bar (`for i in $(seq 15); do cargo test -p animusd
+--test split_placing_completion || break; done`), surfaced two more
+failure modes, both root-caused rather than papered over with a wider
 timeout:
 
 1. **`assert_eq!(fork_inherited, [n0, n1, n2])` right after
@@ -13828,16 +13799,50 @@ condition that makes the race worse) ran clean end to end, run in the
 foreground so a failure stops the loop immediately rather than being
 averaged away in a summary count.
 
-**General lesson**: when hardening a flaky real-cluster test, audit *every*
-assertion for whether the value it checks is a converging (eventual) one
-or a written-once (stable) one — not just the assertion that produced the
-original failure. A test built by iterating on whichever assertion just
-failed will fix them one at a time and keep discovering new ones on each
-subsequent run, because a racy assertion on a fast-converging system fails
-probabilistically, not deterministically — the fix that actually stops the
-bleeding is a pass over the whole test asking "which of these could this
-system have already finished by the time I check it," not a reactive
-timeout bump on whichever line the last failure happened to name.
+**General lesson (the test hardening)**: when hardening a flaky
+real-cluster test, audit *every* assertion for whether the value it checks
+is a converging (eventual) one or a written-once (stable) one — not just
+the assertion that produced the original failure. A test built by
+iterating on whichever assertion just failed will fix them one at a time
+and keep discovering new ones on each subsequent run, because a racy
+assertion on a fast-converging system fails probabilistically, not
+deterministically — the fix that actually stops the bleeding is a pass
+over the whole test asking "which of these could this system have already
+finished by the time I check it," not a reactive timeout bump on whichever
+line the last failure happened to name.
+
+## An unrelated, pre-existing `reconfigure_step` instability was found (not fixed) while validating the above: a 2-of-3-replica-swap target can make live Raft membership oscillate instead of converge (ADR 0062 rung 6)
+
+While building the real end-to-end test for the settle-window fix above, a
+target requiring the reconfigure sequence to replace **two** of a tablet's
+three replicas at once (grow a 3-node cluster by two lower-sorting-id
+nodes, so `select_replicas` prefers both new nodes over two of the
+parent's three) reliably made the live CP-data Raft group's own voter set
+**oscillate** under a real `ProdEnv` cluster: it would reach the transient,
+genuinely-over-replicated 5-member intermediate state
+`reconfigure_step`'s add-before-remove sequencing produces (add both new
+learners, promote both, only then remove the two extras), then revert
+partway back toward the original 3-replica set, repeating indefinitely —
+never settling within a 60s budget. **This is provably unrelated to the
+completion loop above**: it reproduces with zero `MarkSplitPlacingDone`
+proposes ever having fired (confirmed by instrumenting the loop and
+observing the oscillation begin before the loop's own settle window had
+even elapsed once), so the cause sits in `host::Reconciler`/
+`reconfigure_step` itself (`animus-cp-data`, ADR 0058 Train 1), pre-dating
+and unmodified by ADR 0062. A target that replaces only **one** of three
+replicas (a strictly simpler add-one/remove-one sequence, never reaching a
+5-voter intermediate state) converged cleanly and quickly on every run.
+
+Not investigated further or fixed — out of this rung's own scope, and
+worth a dedicated investigation rather than a guess folded into an
+unrelated change (this repo's own "an incidental bug gets its own PR"
+rule). `tests/split_placing_completion.rs` deliberately exercises only the
+one-replica-difference shape, with its own doc comment explaining why, so
+a future investigation of the two-replica case has a name, a reproduction
+recipe (grow-by-two, RF3, real `ProdEnv`), and a already-written
+regression-in-waiting to flip on once the underlying issue is found. Filed
+here rather than silently worked around, per this repo's own "record a
+generalizable lesson, including one you didn't chase to the end" practice.
 
 ## A bench whose cluster size equals RF cannot exercise a design change whose whole benefit is "fewer/cheaper cross-node catch-ups" (ADR 0062 rung 7, bench re-validation)
 
@@ -13875,3 +13880,36 @@ not automatically sound for a *different* mechanism's improvement claim
 substitute for asking whether that bench can see the thing being measured;
 report the mismatch plainly rather than let a flat or adverse number pass
 silently as if it settled the question either way.
+
+## Before designing new movement machinery for "get this thing onto a different set of nodes," check whether a declared-state convergence loop already provides it (ADR 0062's own central finding, generalized)
+
+ADR 0062's whole design reduces to one recognition, worth stating outside
+its own split-specific frame because it recurs: `reconfigure_step` (ADR
+0058 Train 1's learner-phased membership-change sequencing) plus its
+production caller (`host::Reconciler::execute`'s `HostAction::Reconfigure`
+arm) already converges a tablet's *live* Raft membership toward whatever
+*declared* target `Metadata.tablets[t].replicas` names — with no
+availability dip, on every tick, for every tablet, unconditionally. That
+is a **general-purpose "move this to there" primitive**, keyed off nothing
+more than a `CasTabletReplicas` write. ADR 0029's `rebalance_placement`
+already rides it for load-balancing; ADR 0062 recognized that a split
+child's post-fork relocation is not a new kind of problem needing its own
+bespoke fused-with-the-fork mechanism (ADR 0058 Train 2 Stage 1/2's own
+now-deleted learner-recruitment machinery) — it is the *same* problem,
+solved by computing one more kind of target and handing it to the exact
+same convergence loop.
+
+**General lesson**: before building new machinery to move, relocate, or
+converge some piece of state onto a different set of nodes/replicas/
+homes, ask whether an existing declared-state convergence loop in this
+codebase already does exactly that generic job — search for the pattern
+"a driver reads a `Metadata`-declared target every tick and proposes a CAS
+that nudges live state toward it," not just for a mechanism with a
+matching name. When one exists, the design work shrinks to "compute the
+right target, once, from already-agreed state" (this codebase's own
+repeated `BeginBackup`/`CutoverSplit`-at-apply-time discipline) plus
+"feed it into the loop" — not a parallel bespoke mover with its own
+readiness gates, its own over-provisioning accounting, and its own
+partial-progress-inheritance edge cases, all of which a fused
+design pays for even when the underlying convergence primitive was
+sitting there unused the whole time.

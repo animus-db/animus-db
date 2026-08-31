@@ -283,22 +283,23 @@
       <h2>Splits and rebalancing</h2>
       <h3>Splitting</h3>
       <p>
-        When a tablet passes its byte threshold, the cluster splits it in the background. Two
-        child tablets are created at placement-chosen homes and populated by copying from the
-        parent while it keeps serving; the driver then tails the parent's ongoing changes until
-        the children have caught up. A brief freeze stops writes, the children go live
-        atomically, and the parent is retired and its storage reclaimed.
+        When a tablet passes its byte threshold, it splits online, in place: a single log entry
+        mints both halves directly, already fully formed on every node that already holds the
+        parent, so there is no separate copy, freeze or tail phase. The write pause at cutover is
+        sub-second and masked by client retries. Both children start out on the parent's own
+        replicas and are then moved onto their ideal placement afterward by ordinary rebalancing
+        — the same mechanism that spreads a growing cluster.
       </p>
       <p>
-        The write pause at cutover is sub-second and masked by client retries. Tablets are
-        <strong>split-only</strong> — there is no merge operation, matching DynamoDB's own
-        behaviour — so a table that shrinks keeps its tablet count.
+        Tablets are <strong>split-only</strong> — there is no merge operation, matching
+        DynamoDB's own behaviour — so a table that shrinks keeps its tablet count.
       </p>
       <h3>Rebalancing</h3>
       <p>
         Replica counts across nodes converge on their own: the control-plane leader moves one
         replica at a time until the difference between the busiest and quietest node is at most
-        one tablet. Adding a node is therefore all it takes to get data onto it.
+        one tablet. Adding a node is therefore all it takes to get data onto it — the same
+        mechanism that relocates a freshly split tablet's children onto their final homes.
       </p>
     </section>
 

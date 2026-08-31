@@ -359,29 +359,88 @@ per-tablet CP data plane (`animus-cp-data`).
   `CutoverSplit` gained an in-place branch, selected by
   `source.inplace_split.is_some()`: instead of scanning the tablet map for
   `Building` children (none exist), it creates both children's tablet-map
-  rows DIRECTLY from the intent's own `(id, replicas)` pairs (each
-  `replicas` is that child's placement-chosen FINAL homes — the data
-  plane's own, larger `bootstrap_voters` bootstrap set is not this crate's
-  concern) and inherits the parent's policy **at this moment** — the
-  in-place workflow's only chance to, since there was no tablet row to
-  attach it to at `BeginSplitInPlace` time. Otherwise identical to the
-  copy-based branch: `split_lineage` written for both (fork F9, unchanged),
-  parent removed. **G1 (ADR 0058's own "Open forks" table, decided
-  2026-08-25, reversing that ADR's own Stage 4 draft text): the GSI-drain/
-  backfill-seeder cutover vetoes stay PRE-cutover, caller-side, exactly as
-  in the copy-based workflow** — this command's own apply never gated on
-  drain state in either branch, so nothing about this in-place branch
-  needed to change to honor that decision; the (not-yet-written)
-  `animusd`-level in-place split driver is what will run those vetoes
-  before ever proposing this command, mirroring `index_drain.rs::
-  split_driver_tick`'s existing shape for the copy-based endgame. Mirror
-  arms follow the usual per-entity conventions (`BeginSplitInPlace`:
-  parent row + allocator counter only; `CutoverSplit`'s existing arm
-  extended to also mirror each child's policy, unconditionally — a
-  harmless duplicate write for the copy-based branch, the only source for
-  the in-place one). Tests: `meta::tests::begin_split_in_place_*`/
-  `cutover_split_in_place_*`, mirroring the copy-based tests' own shape
-  scenario-for-scenario.
+  rows DIRECTLY from the intent's own `(id, replicas)` pairs. **Since ADR
+  0062 (superseding this paragraph's own original text), each `replicas`
+  is that child's FORK-TIME homes — the parent's own current replicas,
+  verbatim, identical for both children, never placement-chosen** — a
+  child's eventual *final* home is a separate decision this same apply arm
+  also makes (below), not something the intent carries. It also inherits
+  the parent's policy **at this moment** — the in-place workflow's only
+  chance to, since there was no tablet row to attach it to at
+  `BeginSplitInPlace` time. Otherwise identical to the copy-based branch:
+  `split_lineage` written for both (fork F9, unchanged), parent removed.
+  **G1 (ADR 0058's own "Open forks" table, decided 2026-08-25, reversing
+  that ADR's own Stage 4 draft text): the GSI-drain/backfill-seeder
+  cutover vetoes stay PRE-cutover, caller-side, exactly as in the
+  copy-based workflow** — this command's own apply never gated on drain
+  state in either branch, so nothing about this in-place branch needed to
+  change to honor that decision; `animusd`'s in-place split driver
+  (`index_drain.rs::inplace_split_driver_tick`) runs those vetoes before
+  ever proposing this command, mirroring `split_driver_tick`'s existing
+  shape for the copy-based endgame. Mirror arms follow the usual
+  per-entity conventions (`BeginSplitInPlace`: parent row + allocator
+  counter only; `CutoverSplit`'s existing arm extended to also mirror each
+  child's policy, unconditionally — a harmless duplicate write for the
+  copy-based branch, the only source for the in-place one). Tests:
+  `meta::tests::begin_split_in_place_*`/`cutover_split_in_place_*`,
+  mirroring the copy-based tests' own shape scenario-for-scenario.
+
+- **ADR 0062: directed Placing — `Metadata::split_placing` +
+  `MetaCommand::MarkSplitPlacingDone`.** A split child's *final* replica
+  placement is decided once, separately from the fork, as a pure function
+  of already-agreed `Metadata` — the same discipline `BeginBackup` already
+  established for its manifest stub (fork C). `CutoverSplit`'s in-place
+  branch (above) computes `select_replicas` over `active_candidates` for
+  each child, once, right after minting its fork-inherited-replicas row:
+  already-satisfying ⟹ no entry; a differing target ⟹
+  `Metadata::split_placing[child] = SplitPlacing{target: Some(wanted),
+  done: false}`; `select_replicas` erring (too few `Active`
+  candidates/domains) ⟹ still written, `SplitPlacing{target: None, done:
+  false}` (fork B — a visible, keep-retrying obligation, mirroring
+  `reconcile_placement`'s own stance rather than staying silent). A child
+  with no inherited policy gets no entry at all — nothing to place
+  against. `SplitPlacing::target` is a write-once diagnostic snapshot of
+  what cutover decided (or couldn't); the reconcile loop below never trusts
+  or rewrites it, always recomputing `select_replicas` fresh instead
+  (staleness avoidance, and it sidesteps needing a second command purely to
+  update a persisted target). `node.rs`'s `reconcile_loop` gains a
+  **third phase**, `Metadata::split_placing_reconcile`/`PlacementView::
+  split_placing_reconcile`, run unconditionally every tick (own cadence,
+  independent of repair/rebalance's gating — a split-triggered relief
+  obligation shouldn't wait behind `REBALANCE_EVERY_N_TICKS`): for every
+  un-`done` entry, recompute `select_replicas` fresh and propose a
+  `CasTabletReplicas` for whichever ones now differ from the tablet's
+  current replicas — one per entry per tick (deliberately not
+  rebalance's one-move-per-tick bound). It never proposes
+  `MarkSplitPlacingDone` itself — that observes *live Raft* convergence
+  (`RaftKvNode::config()`/`learners()`), which this pure metadata-level
+  view can't see; a leader-gated `animusd` background loop does, once a
+  led tablet's live group matches `Metadata`'s current `replicas` with no
+  dangling learners, held continuously for a settle window (see
+  `animusd/CLAUDE.md`). `MarkSplitPlacingDone` is epoch-CAS'd against the
+  **child's own** current epoch and idempotent on an already-`done` entry
+  (`MarkIndexBackfilled`/`RecordBackupTabletComplete`'s idiom exactly); on
+  `is_relayable_command`'s allowlist (`animus-node/src/wire.rs`), since a
+  tablet's leader is frequently not the control-plane leader.
+  `rebalance_placement`'s own eligibility filter (`meta.rs`) gains one more
+  exclusion alongside its existing `t.state != Active` skip: a tablet
+  carrying an un-`done` `split_placing` entry is skipped by ordinary
+  rebalance too, so the two convergence sources never compete for the same
+  tablet's epoch in the same tick. `DropTableTablets` prunes any
+  `split_placing` row for a tablet it removes (`mirror.rs`), the same
+  orphan-sweep `MarkIndexBackfilled`'s own doc describes for
+  `index_backfill`. `syskv::EntityKind::SplitPlacing` follows the usual
+  per-entity mirror conventions. Tests: `meta::tests::cutover_split_*` for
+  the apply-time decision (already-satisfying/differing-target/
+  unsatisfiable-at-cutover/no-policy shapes), `node::tests::` for the
+  reconcile-loop phase and the rebalance exclusion,
+  `drop_table_tablets_prunes_split_placing_rows_for_the_dropped_tablets`
+  for the cascade. **Known limitation** (issue #513, not closed by ADR
+  0062): the convergence primitive this phase drives —
+  `reconfigure_step`, ADR 0058 Train 1, unmodified — only reliably
+  converges a one-replica-difference target; a two-(or-more)-replica
+  target can oscillate indefinitely, so directed Placing today reliably
+  relocates a child only across that narrower gap.
 
 - **The backup catalog (ADR 0059 §3, Train 1 PR ①): `BeginBackup`/
   `RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/`DeleteBackup`.**
