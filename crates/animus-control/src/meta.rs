@@ -258,13 +258,14 @@ pub struct Metadata {
     /// row at all, mirroring `reconcile`/`rebalance`'s own "nothing to do,
     /// nothing proposed" convention. **Never rewritten after that one
     /// write** except by [`MetaCommand::MarkSplitPlacingDone`] flipping
-    /// `done` — the reconcile loop's own directed-Placing phase (a later
-    /// rung) always recomputes `select_replicas` fresh every tick rather
-    /// than trusting or updating `target`, so this field is a diagnostic
-    /// record of "what cutover itself decided," never the mechanism's own
-    /// source of truth (see [`SplitPlacing::target`]'s own doc). Never
-    /// pruned by anything in this rung except
-    /// [`MetaCommand::DropTableTablets`]'s existing drop-table cascade,
+    /// `done` — the reconcile loop's own directed-Placing phase
+    /// ([`Metadata::split_placing_reconcile`], wired into `node.rs`'s
+    /// `reconcile_loop`) always recomputes `select_replicas` fresh every
+    /// tick rather than trusting or
+    /// updating `target`, so this field is a diagnostic record of "what
+    /// cutover itself decided," never the mechanism's own source of truth
+    /// (see [`SplitPlacing::target`]'s own doc). Never pruned by anything
+    /// but [`MetaCommand::DropTableTablets`]'s existing drop-table cascade,
     /// which sweeps a row whose child tablet id no longer exists at all —
     /// the same orphan-prevention `index_backfill` already gets, since
     /// nothing else will ever revisit an orphaned row. `#[serde(default)]`
@@ -668,7 +669,8 @@ pub struct SplitPlacing {
     /// visible, keep-retrying obligation rather than silently skipping it,
     /// mirroring `reconcile`'s own "keep trying every tick, forever, until
     /// candidates recover" stance. **Diagnostic only** — the reconcile
-    /// loop's own directed-Placing phase (a later rung) never trusts or
+    /// loop's own directed-Placing phase ([`Metadata::split_placing_reconcile`],
+    /// wired into `node.rs`'s `reconcile_loop`) never trusts or
     /// rewrites this after this one write; it always recomputes
     /// `select_replicas` fresh, off current `Metadata`, exactly the way
     /// `reconcile`/`rebalance` already recompute their own decisions fresh
@@ -1895,6 +1897,10 @@ pub struct PlacementView {
     pub tablets: BTreeMap<TabletId, Tablet>,
     /// Per-tablet placement policies.
     pub policies: BTreeMap<TabletId, PlacementPolicy>,
+    /// The directed-Placing catalog (ADR 0062 §2) — the reconcile loop's
+    /// third phase needs it alongside `tablets`/`policies` to know which
+    /// un-`done` children still need converging.
+    pub split_placing: BTreeMap<TabletId, SplitPlacing>,
 }
 
 impl PlacementView {
@@ -1909,7 +1915,24 @@ impl PlacementView {
     /// [`Metadata::rebalance`] (both delegate to the same body).
     #[must_use]
     pub fn rebalance(&self) -> Option<MetaCommand> {
-        rebalance_placement(&self.members, &self.tablets, &self.policies)
+        rebalance_placement(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
+    }
+
+    /// The pure directed-Placing convergence decision (ADR 0062 §2) —
+    /// identical to [`Metadata::split_placing_reconcile`].
+    #[must_use]
+    pub fn split_placing_reconcile(&self) -> Vec<MetaCommand> {
+        split_placing_reconcile(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
     }
 }
 
@@ -1970,10 +1993,22 @@ fn reconcile_placement(
 /// per call; `None` when the cluster is already balanced or no policy-legal move
 /// exists. Deterministic (only `BTreeMap` iteration + the pure planner), so every
 /// replica agrees — though only the leader ever *proposes* the result.
+///
+/// **ADR 0062 §2's ordering exclusion**: a tablet carrying an un-`done`
+/// [`split_placing`](Metadata::split_placing) entry is skipped here too, the
+/// same way a non-`Active` tablet already is — a freshly-cutover child is
+/// already policy-satisfying on its inherited replicas (invisible to
+/// `reconcile_placement`'s violation-driven repair) but not yet at its
+/// directed-Placing target, so leaving it eligible for ordinary balance-driven
+/// rebalance would race the faster, dedicated Placing phase for the same
+/// tablet's epoch on the same tick — harmless (the loser's CAS just rejects),
+/// but avoidable churn. Once `done` flips, the tablet rejoins this population
+/// like any other.
 fn rebalance_placement(
     members: &BTreeMap<NodeId, Member>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
+    split_placing: &BTreeMap<TabletId, SplitPlacing>,
 ) -> Option<MetaCommand> {
     let candidates = active_candidates(members);
     let entries: Vec<(TabletId, &[NodeId], &PlacementPolicy)> = policies
@@ -1982,6 +2017,11 @@ fn rebalance_placement(
             let t = tablets.get(tablet)?;
             // ADR 0050: same mid-split placement freeze as `reconcile_placement`.
             if t.state != TabletState::Active {
+                return None;
+            }
+            // ADR 0062 §2: an un-done directed-Placing obligation owns this
+            // tablet's convergence exclusively until it finishes.
+            if split_placing.get(tablet).is_some_and(|entry| !entry.done) {
                 return None;
             }
             Some((*tablet, t.replicas.as_slice(), policy))
@@ -1996,6 +2036,54 @@ fn rebalance_placement(
     })
 }
 
+/// The shared body of [`Metadata::split_placing_reconcile`] /
+/// [`PlacementView::split_placing_reconcile`]: ADR 0062 §2's third
+/// reconcile-loop phase — for every un-`done` [`SplitPlacing`] entry,
+/// recompute [`select_replicas`] **fresh** off current membership (never
+/// trust or persist `SplitPlacing::target`, a diagnostic snapshot of what
+/// `CutoverSplit` decided at fork time — see that field's own doc for why)
+/// and, when the freshly-computed target differs from the tablet's current
+/// replicas, propose a `CasTabletReplicas` moving it there. A tablet whose
+/// row no longer exists (the table was dropped — `DropTableTablets` prunes
+/// the `split_placing` row itself, so this is likely unreachable in
+/// practice, but is guarded defensively anyway) or which inherited no policy
+/// is skipped outright — nothing to converge toward. A still-unsatisfiable
+/// recomputation (`select_replicas` errs) is silently skipped this tick and
+/// re-attempted next tick (fork B's own keep-retrying stance, restated at
+/// the convergence site) rather than treated as an error. Deterministic
+/// (only `BTreeMap` iteration + the pure planner), so every replica agrees —
+/// though only the leader ever *proposes* the result. Unlike
+/// [`rebalance_placement`], this returns **every** eligible move in one
+/// call, not just one — ADR 0062 §2's own pseudocode bounds churn per entry
+/// (at most one `CasTabletReplicas` per un-done entry per tick), not
+/// globally across entries, since a split-triggered relief obligation
+/// should not queue behind an unrelated split's own convergence.
+fn split_placing_reconcile(
+    members: &BTreeMap<NodeId, Member>,
+    tablets: &BTreeMap<TabletId, Tablet>,
+    policies: &BTreeMap<TabletId, PlacementPolicy>,
+    split_placing: &BTreeMap<TabletId, SplitPlacing>,
+) -> Vec<MetaCommand> {
+    let candidates = active_candidates(members);
+    split_placing
+        .iter()
+        .filter(|(_, entry)| !entry.done)
+        .filter_map(|(&child, _entry)| {
+            let t = tablets.get(&child)?;
+            let policy = policies.get(&child)?;
+            let wanted = select_replicas(&candidates, policy).ok()?;
+            if wanted == t.replicas {
+                return None;
+            }
+            Some(MetaCommand::CasTabletReplicas {
+                tablet: child,
+                expected_epoch: t.epoch,
+                replicas: wanted,
+            })
+        })
+        .collect()
+}
+
 impl Metadata {
     /// The narrow placement view ([`PlacementView`]) — clones only the
     /// placement-relevant maps, never the schema catalog / CP address book.
@@ -2005,6 +2093,7 @@ impl Metadata {
             members: self.members.clone(),
             tablets: self.tablets.clone(),
             policies: self.policies.clone(),
+            split_placing: self.split_placing.clone(),
         }
     }
 
@@ -2043,7 +2132,38 @@ impl Metadata {
     /// data-plane catch-up gate, not on the cadence.
     #[must_use]
     pub fn rebalance(&self) -> Option<MetaCommand> {
-        rebalance_placement(&self.members, &self.tablets, &self.policies)
+        rebalance_placement(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
+    }
+
+    /// The directed-Placing convergence phase (ADR 0062 §2): for every
+    /// un-`done` [`split_placing`](Self::split_placing) entry, recompute
+    /// [`select_replicas`] fresh off current membership and, when it now
+    /// differs from the tablet's current replicas, a
+    /// [`CasTabletReplicas`](MetaCommand::CasTabletReplicas) moving it
+    /// there. Also **pure + deterministic**; the leader's `reconcile_loop`
+    /// runs this every tick, unconditionally — no `REBALANCE_EVERY_N_TICKS`-
+    /// style throttle, since a split child's own relief obligation should
+    /// not wait behind a cadence meant for slow, cluster-wide balance churn.
+    /// Returns one command per eligible un-done entry (not capped to one
+    /// total per call, unlike [`rebalance`](Self::rebalance) — see
+    /// [`split_placing_reconcile`]'s own doc for why that's the correct
+    /// bound here). `MarkSplitPlacingDone` is never proposed from here — a
+    /// separate, later mechanism (ADR 0062 §3) observes live Raft
+    /// convergence, which this pure metadata-level function has no way to
+    /// see.
+    #[must_use]
+    pub fn split_placing_reconcile(&self) -> Vec<MetaCommand> {
+        split_placing_reconcile(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
     }
 
     /// Apply a command, returning the (deterministic) outcome.
