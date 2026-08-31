@@ -20,20 +20,27 @@
 //! target — the one genuine way to exercise the completion loop's own
 //! convergence-observing job rather than its vacuous "already done" case.
 //!
-//! **Deliberately a ONE-replica difference, not two.** A target replacing
-//! two of three replicas at once was found, empirically, to make the live
-//! Raft group's own membership oscillate under a real `ProdEnv` cluster
+//! **A ONE-replica difference here; a TWO-replica difference has its own
+//! dedicated e2e.** An early rung-6 investigation found what looked like a
+//! target replacing two of three replicas at once making the live Raft
+//! group's own membership oscillate under a real `ProdEnv` cluster
 //! (`reconfigure_step`'s add-before-remove sequencing passes through a
 //! genuinely over-replicated 5-member intermediate state before shrinking
-//! back to 3) rather than settling — a pre-existing `animus-cp-data`
-//! concern, unrelated to and unmodified by this rung's own completion loop
-//! (confirmed: the oscillation reproduces with zero `MarkSplitPlacingDone`
-//! proposes ever having fired), out of scope to fix here. See
-//! `split_placing_completion.rs`'s own module doc and
-//! `docs/engineering-lessons.md` for the fuller account. A one-replica
-//! target change is a fully sufficient, and far more stable, proof of this
-//! rung's own "placement's fresh target differs from the parent's homes"
-//! requirement.
+//! back to 3) rather than settling, filed as issue #513. **Re-investigated
+//! and NOT reproduced** (`crates/animusd/tests/
+//! split_placing_two_replica_diff_e2e.rs` — the exact grow-by-two-lower-
+//! sorting-nodes recipe this file's own growth technique inspired, run
+//! repeatedly including cases where the tablet's leader genuinely
+//! transfers mid-sequence): the group converges cleanly through the
+//! 5-voter intermediate every time. See that file's own module doc,
+//! `crates/animus-cp-data/tests/reconfigure_multi_replica_diff.rs` (the
+//! `SimEnv` side, many more seeds), `docs/engineering-lessons.md`, and ADR
+//! 0062's #513 amendment for the full account. This file keeps the
+//! one-replica shape anyway — it is a fully sufficient, and simpler, proof
+//! of this rung's own "placement's fresh target differs from the parent's
+//! homes" requirement; the two-replica shape has its own dedicated e2e
+//! rather than folding a second, unrelated concern into this file's
+//! assertions.
 //!
 //! Real TCP/time → converged-or-timeout polling throughout, never a fixed
 //! sleep for anything this file asserts on.

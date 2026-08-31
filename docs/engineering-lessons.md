@@ -14051,6 +14051,74 @@ regression-in-waiting to flip on once the underlying issue is found. Filed
 here rather than silently worked around, per this repo's own "record a
 generalizable lesson, including one you didn't chase to the end" practice.
 
+**Amendment (2026-08-31, issue #513 dedicated investigation): re-attempted
+and NOT reproduced.** A follow-up investigation drove the exact
+grow-by-two-lower-sorting-nodes/RF3/real-`ProdEnv` recipe named above —
+`crates/animusd/tests/split_placing_two_replica_diff_e2e.rs`, run 30+
+consecutive times, several with continuous write traffic and several
+where the tablet's own leader genuinely transferred mid-sequence (one of
+the two suspects named when the issue was filed) — plus a `SimEnv` side
+(`crates/animus-cp-data/tests/reconfigure_multi_replica_diff.rs`, 60
+seeds) across five harness shapes of increasing production-fidelity:
+calling `reconfigure_step` directly in a poll loop; `spawn_reconfigure_
+loop` with one shared static target; `spawn_reconfigure_loop` with EVERY
+group member (including the two about-to-be-removed originals)
+independently polling its OWN control-plane replica — genuinely
+Raft-replicated, not a shared closure — for `desired`/`down`; the real
+`host::Reconciler` driven uniformly across all group members each tick;
+and combinations of the above with continuous write traffic and forced
+leadership churn via network partition. **Every single run converged**:
+each reached the transient over-replicated 5-voter intermediate the
+original finding names, then shrank monotonically to the target with no
+reversion ever observed.
+
+**Likely explanation for the original finding, based on this
+investigation's own repeated experience**: building each of the five
+`SimEnv` harnesses above, the very first draft of the "did it converge"
+check independently made the SAME mistake three separate times before it
+was caught — checking `config()`/`voters` on a replica that HAD ALREADY
+BEEN EXCLUDED from the group's voter set (one of the two originals being
+replaced), not one of the surviving/target members. A removed replica
+stops receiving `AppendEntries` the instant it's excluded, so its own
+locally-cached config **freezes** at whatever it last observed rather
+than updating (there is nothing left to update it — that is what "removed
+from the group" means). Comparing that frozen value against a live,
+still-converging replica's value — or worse, alternating which replica an
+observer reads from over time (e.g. "whichever node currently answers a
+routing/admin query," which can itself change as a group's own admin
+routing state settles) — produces exactly the "grows to N, then reverts"
+shape the original finding described, without any defect in
+`reconfigure_step` or its caller: the group genuinely converged; the
+OBSERVATION read a stale snapshot and mistook it for regression. This is
+the same class of mistake as the "convergence check races the proposer
+that sets the target" entry immediately above this one in this file (a
+naive comparison against live/eventual state, on a system that is by
+design mid-flight), generalized to "and make sure which REPLICA you're
+reading the live state FROM is still a live member of the thing you're
+checking."
+
+**General lesson**: when a convergence check spans multiple replicas of a
+group whose membership itself is changing (not just its data), the check
+must pin its observations to replicas that will remain members of the
+final target set — reading from, or comparing against, a replica that's
+mid-removal produces a frozen/stale value that looks exactly like a live
+regression. This is a narrower instance of the "converging vs. stable
+value" audit already named in this file's `placing_relocates_a_child...`
+entry above, worth calling out on its own because it is easy to introduce
+by accident when a repro harness (rather than production code) polls
+"any" node's own admin/observability surface without checking whether
+that node is still supposed to be part of the answer.
+
+No code in `reconfigure_step`, `host::Reconciler`, or any of their
+production callers changed as a result of this investigation — there was
+no concrete defect to change. `crates/animus-cp-data/tests/
+reconfigure_multi_replica_diff.rs` and `crates/animusd/tests/
+split_placing_two_replica_diff_e2e.rs` are the two regressions this
+investigation leaves behind: if the oscillation is ever genuinely observed
+again (under conditions this investigation didn't hit, or because a future
+change reintroduces it), these are the first things that should catch it.
+ADR 0062 carries the matching amendment.
+
 ## A bench whose cluster size equals RF cannot exercise a design change whose whole benefit is "fewer/cheaper cross-node catch-ups" (ADR 0062 rung 7, bench re-validation)
 
 Re-running `animusd/tests/inplace_split_bench.rs` (byte-for-byte the same

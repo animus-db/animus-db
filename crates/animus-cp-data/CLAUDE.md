@@ -360,6 +360,14 @@ during_catchup`/`learner_move_survives_leader_change_mid_move`/
 `learner_crash_is_replaced_by_a_new_target` scenarios (the full
 `Reconciler`/`MetadataView`-driven path); `animusd/tests/
 learner_reconfigure.rs` is the real multi-process `ProdEnv` exercise.
+**A desired target differing from `current` by MORE than one replica**
+(e.g. two of three) was suspected (issue #513, filed during ADR 0062 rung
+6) of making this sequencing oscillate indefinitely instead of converging
+— investigated and closed as not reproducible; `tests/
+reconfigure_multi_replica_diff.rs` is the dedicated regression (60 seeds,
+several harness shapes) and `animusd/tests/
+split_placing_two_replica_diff_e2e.rs` its real `ProdEnv` sibling. See
+`docs/engineering-lessons.md` for the investigation writeup.
 **Eventually-consistent reads (ADR 0055)** are the second read path this
 crate serves, and the one whose budget is easiest to destroy by accident:
 `stale_read_ready()` (the gate), `stale_get_served()` (outer `None` =
