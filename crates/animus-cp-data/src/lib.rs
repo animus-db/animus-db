@@ -6596,16 +6596,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // why that work happens outside this apply path.
                     //
                     // `bootstrap_voters` is captured HERE, once, from the
-                    // core's own config+learners at this exact apply — see
+                    // core's own config at this exact apply — see
                     // `split.rs`'s module doc for why this read is
                     // guaranteed identical on every replica (Raft log order:
                     // every prior config-change entry has already applied by
-                    // the time THIS entry does).
+                    // the time THIS entry does). ADR 0062 rung 4 ("fork
+                    // first, always local"): this is the parent's own
+                    // current VOTER set only — no `.extend(core_guard.
+                    // learners())`. Both children bootstrap directly on it,
+                    // no over-replication, no Stage-5 trim step needed at
+                    // all (there is nothing left to trim down from). Fork D
+                    // (accepted, narrow residual): an unrelated, in-flight,
+                    // ordinary rebalance's learner on the parent at this
+                    // exact apply is no longer inherited by either child —
+                    // self-healed by the ordinary Placing convergence path
+                    // (ADR 0062 §2) re-running its own add-learner →
+                    // catch-up → promote sequence from scratch, at most one
+                    // extra `reconfigure_step` hop, bounded and
+                    // self-healing.
                     let bootstrap_voters = {
                         let core_guard = core.lock().expect("raftkv core poisoned");
-                        let mut voters = core_guard.config();
-                        voters.extend(core_guard.learners());
-                        voters
+                        core_guard.config()
                     };
                     let split_marker_key = split::split_marker_key(tablet);
                     storage

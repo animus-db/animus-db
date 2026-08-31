@@ -49,16 +49,25 @@ successor invariant).
   `animus-control`'s `MetaCommand::BeginSplitInPlace` and consumed by
   `animus-cp-data::host`'s reconciler. `InPlaceSplitIntent { split_key,
   children: [SplitChild; 2] }`, `SplitChild { id: TabletId, replicas:
-  Vec<NodeId> }` — a child's `replicas` is its placement-chosen FINAL
-  homes (what `CutoverSplit` later records as the tablet's own
-  `replicas`), not the larger `bootstrap_voters` set both children
-  actually start with (that set lives entirely in the data plane's own
-  `KvCommand::SplitTablet` fork marker, `animus-cp-data::split.rs` — this
-  crate has nothing to say about it, mirroring how `split_lineage` stays
-  out of this crate's own model). Unlike the copy-based workflow, an
-  in-place split mints **no** `Building` tablet-map rows at all — this
-  field IS the intent, with no physical placeholder tablets to route
-  around.
+  Vec<NodeId> }` — **since ADR 0062 rung 4** ("fork first, always local")
+  a child's `replicas` is its replica set **at fork time**: the parent's
+  own current replicas, identical for both children, never
+  placement-chosen (superseding fork F5's original in-place meaning, "the
+  child's placement-chosen FINAL homes" — a child's eventual final home is
+  now decided separately, once, at `CutoverSplit`'s own apply, and driven
+  there by the ordinary rebalance machinery, `animus-control`'s
+  `split_placing`). Not the (still-distinct) `bootstrap_voters` set both
+  children actually start their local Raft **voter config** with (that set
+  lives entirely in the data plane's own `KvCommand::SplitTablet` fork
+  marker, `animus-cp-data::split.rs` — this crate has nothing to say about
+  it, mirroring how `split_lineage` stays out of this crate's own model) —
+  the two coincide in the common case but `bootstrap_voters` is captured
+  independently, from the parent's live Raft config at apply time, and can
+  legitimately diverge from this field if the parent's membership changed
+  between `BeginSplitInPlace`'s propose and `SplitTablet`'s apply. Unlike
+  the copy-based workflow, an in-place split mints **no** `Building`
+  tablet-map rows at all — this field IS the intent, with no physical
+  placeholder tablets to route around.
 - `KeyRange`: `whole()`, `contains`, `contains_range` (subset containment),
   `split_at` (strictly-inside split into two half-open ranges). `abuts` —
   merge's contiguity test, production-caller-less since ADR 0044 — was

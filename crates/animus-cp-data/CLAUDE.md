@@ -167,16 +167,26 @@ amendment — the shape predates and outlives it.)
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
-- **`split.rs`** (ADR 0058 Train 2 rung 3) — the **in-place split fork
-  marker**: the durable half of `KvCommand::SplitTablet`, mirroring
-  `seal.rs`'s discipline exactly (engine-global key, survives compaction)
-  but keyed by `tablet` alone (a tablet forks AT MOST ONCE, unlike a seal's
-  per-range keying) and carrying a real payload — the split key, both
-  children's `(id, replicas)` pairs, and the `bootstrap_voters` set
-  captured once at apply from the parent's own `RaftCore::config() ∪
-  RaftCore::learners()` (see the module's own doc for why this read is
-  guaranteed identical across replicas). `RaftKvNode::pending_split()` is
-  the one accessor the host reconciler polls every tick.
+- **`split.rs`** (ADR 0058 Train 2 rung 3; ADR 0062 rung 4) — the
+  **in-place split fork marker**: the durable half of `KvCommand::
+  SplitTablet`, mirroring `seal.rs`'s discipline exactly (engine-global
+  key, survives compaction) but keyed by `tablet` alone (a tablet forks AT
+  MOST ONCE, unlike a seal's per-range keying) and carrying a real payload
+  — the split key, both children's `(id, replicas)` pairs (since ADR 0062
+  rung 4: the parent's own current replicas, identical for both children,
+  never placement-chosen — see `animus-tablet`'s `SplitChild::replicas`
+  doc), and the `bootstrap_voters` set captured once at apply from the
+  parent's own `RaftCore::config()` **only** — no more `.extend(
+  RaftCore::learners())` (rung 4 dropped the learner union: both children
+  now bootstrap directly on the parent's own current voter set, no
+  over-replication, no Stage-5 trim step needed at fork time; see the
+  module's own doc for the accepted fork-D residual this leaves — an
+  unrelated in-flight rebalance's own learner on the parent is no longer
+  inherited by either child, self-healed by an ordinary post-cutover
+  reconfigure). This read is still guaranteed identical across replicas
+  for the same reason as before (Raft log order). `RaftKvNode::
+  pending_split()` is the one accessor the host reconciler polls every
+  tick.
 - **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
   sealed shard's `SegmentStore` object format, pure and I/O-free. The
   module's own 50-line `//!` doc has the codec/validation list
@@ -924,10 +934,21 @@ own `desired` — and try to remove them mid-catch-up).
 - **Already forked here** (`pending_split()` answers `Some`):
   `HostAction::MaterializeSplitChild` fires for BOTH children on EVERY
   fork participant — not filtered by either child's own final `replicas` —
-  since `pending_split().bootstrap_voters` (the parent's full
-  voter-plus-learner set at the fork, captured once in the data-plane's
-  own apply) is what both children actually bootstrap with, a deliberate
-  superset Stage 5's ordinary `Reconfigure` trims down afterward. Claimed
+  since `pending_split().bootstrap_voters` (the parent's own current voter
+  set — **no longer** a voter-plus-learner union, ADR 0062 rung 4 —
+  captured once in the data-plane's own apply) is what both children
+  actually bootstrap with. Under the pre-rung-4 fork-F5 shape a child's
+  `replicas` could be placement-chosen and disjoint from the parent's own,
+  which made `bootstrap_voters` a deliberate superset Stage 5's ordinary
+  `Reconfigure` trimmed down afterward; a child minted via `trigger_split`
+  today never has that shape (`SplitChild::replicas` IS the parent's own
+  current replicas, see `animus-tablet`'s doc), so in practice there is
+  nothing left to trim at fork time on that path — this whole Stage 1/2
+  mechanism (below) still exists unmodified and still fires exactly as
+  described for a hand-built intent naming disjoint homes (the
+  `inplace_split_reconciler.rs` corpus's own fixtures, pending its own
+  ADR 0062 rung 5 rework), it is simply never exercised by the real
+  proposer any more. Claimed
   into `LocalState::hosted` optimistically (the same discipline `Host`
   uses) AND into `LocalState::split_forming`, which exempts a pre-cutover
   child from phase 3's reclaim check (it is `hosted` but, by design,
@@ -1006,11 +1027,12 @@ child's leadership immediately, instead of waiting out the timeout.
   - **A learner never campaigns, and the safety belt is structural, not
     conventional.** The self-nominating replica is a voter of the PARENT
     by construction (`start_election`/`become_leader` gate on
-    `is_voter()`), and every child's `bootstrap_voters` is the parent's
-    own full voter-**and**-learner union at the fork — a strict superset
-    — so it is always a voter of the child too; there are, in fact, no
-    learners at all on a freshly-bootstrapped child (every
-    `bootstrap_voters` member starts as a voter). `drive` additionally
+    `is_voter()`), and every child's `bootstrap_voters` IS the parent's
+    own voter config at the fork (ADR 0062 rung 4 — no longer a
+    voter-**and**-learner union) — so it is always a voter of the child
+    too; there are, in fact, no learners at all on a freshly-bootstrapped
+    child (every `bootstrap_voters` member starts as a voter). `drive`
+    additionally
     `assert!`s `core.config().contains(&self_id)` immediately before
     calling `campaign_now`, as a second, structural line of defense
     against the upstream wiring ever computing `campaign` for the wrong

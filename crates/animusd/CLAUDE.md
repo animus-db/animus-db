@@ -1240,13 +1240,21 @@ driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
 relying on `SplitMode::default()`/`run_node` — see
 `docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
 two test files this caught. `ClientCtx::trigger_split` is still the ONE
-choke point both workflows share (see its own doc, `lib.rs`): `self.
+choke point both workflows share (see its own doc, `schema.rs`): `self.
 split_mode` is the sole branch point between proposing `MetaCommand::
-BeginSplit` or `BeginSplitInPlace`, with identical children (same shape,
-same fields), the identical idempotent already-`Splitting` handling, the
-identical confirm loop, and identical F11 alignment — `auto_split_loop`/
-`admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
-whichever mode is configured automatically, with no fork of their own.
+BeginSplit` or `BeginSplitInPlace`, the identical idempotent
+already-`Splitting` handling, the identical confirm loop, and identical
+F11 alignment — `auto_split_loop`/`admin::action_split`/
+`ClientRequest::SplitTablet` all fall in behind whichever mode is
+configured automatically, with no fork of their own. **Since ADR 0062
+rung 4, the two branches' `children` computation itself is where they
+diverge**: `Copy` still mints its two children at placement-chosen final
+homes (`split_child_placement`/fork F5, unchanged); `InPlace` no longer
+does — both children carry the parent's own current `replicas`, verbatim
+and identical to each other, read from the same already-fetched `meta`
+the confirm loop already holds. The wire *shape* of `children:
+[(TabletId, Vec<NodeId>); 2]` is still identical between the two
+`MetaCommand`s — only the values a proposer computes for it differ.
 
 **The in-place cutover driver** (`index_drain.rs::
 inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
