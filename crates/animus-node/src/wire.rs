@@ -930,7 +930,17 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // included, for the identical reason `ExpireStreamShards` isn't:
         // its only intended caller (`pitr_janitor::pitr_janitor_loop`)
         // already proposes directly off its own live `RaftNode` handle.
-        | MetaCommand::MarkBackupPitrBase { .. } => true,
+        | MetaCommand::MarkBackupPitrBase { .. }
+        // Directed-Placing completion record (ADR 0062 §3): a tablet
+        // leader's own "my locally-driven Raft membership has converged
+        // to this child's placement target" report, from wherever that
+        // leader actually runs — the identical relay reasoning as
+        // `MarkIndexBackfilled`/`SealStreamShard` above. The aggregating
+        // side of this catalog is the reconcile loop's own directed-Placing
+        // phase (a later rung), which is control-plane-leader-only and
+        // proposes `CasTabletReplicas` directly off its own live
+        // `RaftNode` handle, so it needs no relay path of its own.
+        | MetaCommand::MarkSplitPlacingDone { .. } => true,
 
         // Online growth (ADR 0030): admin add-member registers a new raftkv
         // id as `Down` — see the doc above for why this is safe to relay
@@ -1381,6 +1391,10 @@ mod tests {
             },
             MetaCommand::MarkBackupPitrBase {
                 backup_id: "b1".to_string(),
+            },
+            MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
             },
         ];
         for cmd in &true_cases {

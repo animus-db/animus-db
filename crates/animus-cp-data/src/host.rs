@@ -174,15 +174,6 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
 /// cancels a release part-way confirmed.
 pub const RELEASE_CONFIRM_TICKS: u8 = 3;
 
-/// Catch-up threshold (log entries behind the leader's `last_index`) for a
-/// learner added for an **in-place split** (ADR 0058 Train 2 rung 3, Stage
-/// 2) to count as ready — the same shape as `lib.rs`'s
-/// `RECONFIGURE_LEARNER_CATCH_UP_THRESHOLD`, kept as its own constant since
-/// the two learner-add purposes (an ordinary replica move vs. a split's
-/// union-of-children's-homes) are conceptually distinct even though they
-/// share the identical primitive (`RaftKvNode::learner_caught_up`).
-pub(crate) const INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD: u64 = 4;
-
 /// An owned, minimal projection of replicated `Metadata` — *not* the whole
 /// `animus_control::Metadata` (this crate stays decoupled from the control
 /// plane's full state shape; only what a host-reconcile decision needs).
@@ -237,23 +228,6 @@ pub struct TabletFacts {
     /// non-voter start). Ignored once a tablet is already in
     /// [`LocalState::hosted`] — narrow-only from then on.
     pub has_data: bool,
-    /// This node's own **durable Raft voter config** for this tablet's
-    /// group (`RaftKvNode::config()`) — `Default::default()` (empty) when
-    /// `hosted` is `false`. Only consulted for a parent tablet carrying an
-    /// [`animus_tablet::InPlaceSplitIntent`] (ADR 0058 Train 2 rung 3): the
-    /// in-place-split-advancement phase needs the FULL voter set (not just
-    /// `config_excludes_me`) to decide which of the intent's children's
-    /// homes still need adding as learners.
-    pub config: BTreeSet<NodeId>,
-    /// This node's own current learner set for this tablet's group
-    /// (`RaftKvNode::learners()`) — see [`config`](Self::config)'s doc for
-    /// why this is gathered.
-    pub learners: BTreeSet<NodeId>,
-    /// The subset of [`learners`](Self::learners) that have caught up
-    /// (`RaftKvNode::learner_caught_up`, threshold
-    /// [`INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`]) as of this tick's
-    /// gather — see [`config`](Self::config)'s doc.
-    pub learners_caught_up: BTreeSet<NodeId>,
     /// This node's own view of a pending (or already-applied) in-place
     /// split fork on this hosted tablet (`RaftKvNode::pending_split`, ADR
     /// 0058 Train 2 Stage 3) — `None` for every ordinary tablet and for one
@@ -485,24 +459,13 @@ pub enum HostAction {
         /// The tablet to reclaim.
         tablet: TabletId,
     },
-    /// **In-place split, Stage 1** (ADR 0058 Train 2 rung 3): add `home` as
-    /// a learner to `tablet`'s own group — one union-of-children's-homes
-    /// member per call, mirroring `Reconfigure`'s own "one single-server
-    /// step per call" discipline. Only the tablet's LEADER's execution of
-    /// this action actually proposes (every other replica's attempt
-    /// harmlessly no-ops via `RaftKvNode::add_learner`'s own leader gate);
-    /// `plan` still only emits it when `is_leader`, mirroring
-    /// [`Reconfigure`](Self::Reconfigure)'s own convention.
-    AddSplitLearner {
-        /// The parent tablet whose group gains a learner.
-        tablet: TabletId,
-        /// The node to add.
-        home: NodeId,
-    },
-    /// **In-place split, Stage 3** (ADR 0058 Train 2 rung 3): the parent's
-    /// leader proposes the single-entry atomic fork
-    /// (`RaftKvNode::propose_split_tablet`) once every learner added for
-    /// this split has caught up. Leader-only, idempotent — see
+    /// **In-place split fork** (ADR 0058 Train 2 rung 3; ADR 0062 rung 5):
+    /// the parent's leader proposes the single-entry atomic fork
+    /// (`RaftKvNode::propose_split_tablet`) as soon as the intent is
+    /// observed and no fork is already pending — no learner-catch-up gate
+    /// (ADR 0062: every replica named in the intent's children already
+    /// hosts the parent as an ordinary voter, so there is nothing left to
+    /// recruit or wait on before forking). Leader-only, idempotent — see
     /// `KvCommand::SplitTablet`'s own doc.
     ProposeSplitFork {
         /// The parent tablet to fork.
@@ -536,9 +499,11 @@ pub enum HostAction {
         /// `trim_split_child`).
         drop_range: KeyRange,
         /// The initial voter config both children bootstrap with — the
-        /// parent's own full voter-plus-learner set captured at the fork
-        /// (`PendingSplit::bootstrap_voters`), NOT `child.replicas` (see
-        /// `split.rs`'s module doc).
+        /// parent's own current voter set captured at the fork
+        /// (`PendingSplit::bootstrap_voters`), independently of
+        /// `child.replicas` even though the two coincide in the common case
+        /// (see `split.rs`'s module doc for why they're still distinct
+        /// fields).
         bootstrap_voters: BTreeSet<NodeId>,
         /// **ADR 0058 Train 2 rung 4**: whether this replica should
         /// campaign for the child's leadership immediately instead of
@@ -598,26 +563,6 @@ pub fn plan(
         }
         if let Some(join_plan) = plan_join_host(base_id.clone(), &t.replicas, t.epoch) {
             to_host.push((tablet, t, join_plan.initial_formation));
-            continue;
-        }
-        // ADR 0058 Train 2 rung 3: a node named in EITHER child's own
-        // `replicas` of a parent's in-place split intent must host the
-        // PARENT too, as a quiet non-voter — even though it is not (and
-        // never becomes) a member of the parent's own `replicas`. Without
-        // this, the parent leader's Stage 1 `add_learner(home)` targets a
-        // node with no local `RaftKvNode` running for this tablet at all —
-        // there is nothing there to receive the resulting `AppendEntries`.
-        // Exactly `plan_join_host`'s own "joining an already-led group"
-        // branch (`initial_formation: false`), just reached by a different
-        // membership test than plain `replicas` containment.
-        if let Some(intent) = &t.inplace_split {
-            let recruited = intent
-                .children
-                .iter()
-                .any(|c| c.replicas.contains(&base_id));
-            if recruited {
-                to_host.push((tablet, t, false));
-            }
         }
     }
     for (tablet, t, initial_formation) in to_host {
@@ -631,13 +576,13 @@ pub fn plan(
     }
 
     // --- Phase 1.5: advance an in-place split intent this node is hosting
-    // the parent of (ADR 0058 Train 2 rung 3, Stages 1/3/materialization).
-    // A tablet with `inplace_split.is_some()` takes THIS branch instead of
-    // phase 2's ordinary `Reconfigure` for the duration of the split — the
-    // two must never both fire for the same tablet in the same tick (an
-    // ordinary reconfigure would see the split's added learners as
-    // `current_learners.iter().find(|n| !desired.contains(*n))` — i.e.
-    // stale — and remove them out from under Stage 2's catch-up).
+    // the parent of (ADR 0058 Train 2 rung 3, Stage 3/materialization; ADR
+    // 0062 rung 5). A tablet with `inplace_split.is_some()` takes THIS
+    // branch instead of phase 2's ordinary `Reconfigure` for the duration of
+    // the split (the fork itself, plus each participant's own
+    // materialization — both settle within a tick or two, so the exclusion
+    // window is short-lived, not the multi-tick learner-catch-up window this
+    // phase used to gate on).
     for (&tablet, t) in &view.tablets {
         let Some(intent) = &t.inplace_split else {
             continue;
@@ -646,20 +591,14 @@ pub fn plan(
             continue;
         };
         let [left, right] = &intent.children;
-        let union_homes: BTreeSet<NodeId> = left
-            .replicas
-            .iter()
-            .chain(right.replicas.iter())
-            .cloned()
-            .collect();
 
         if let Some(pending) = &fact.pending_split {
             // Stage 3 already forked HERE — materialize any of the two
             // children not yet hosted on this node. Emitted for BOTH
             // children on EVERY fork participant (see
             // `HostAction::MaterializeSplitChild`'s own doc for why —
-            // Stage 5's post-cutover trim is what narrows each child back
-            // to its own final placement, not this gate).
+            // the post-cutover trim to final placement is what narrows each
+            // child back to its own final placement, not this gate).
             let Some((left_range, right_range)) = t.range.split_at(&pending.split_key) else {
                 // Structurally unreachable (the control plane validated this
                 // exact split at `BeginSplitInPlace` time) — nothing to do
@@ -692,27 +631,15 @@ pub fn plan(
             continue;
         }
 
-        // Not forked here yet — Stage 1 (add missing learners) or Stage 3's
-        // trigger (propose the fork once every one is caught up). Leader-
-        // only, mirroring phase 2's own `Reconfigure` convention (a
-        // non-leader's `add_learner`/`propose_split_tablet` call would
-        // harmlessly no-op anyway, but emitting only on the leader keeps
-        // this phase's actions as churn-free as `Reconfigure`'s).
-        if !fact.is_leader {
-            continue;
-        }
-        let present: BTreeSet<NodeId> = fact.config.union(&fact.learners).cloned().collect();
-        if let Some(missing) = union_homes.difference(&present).next() {
-            actions.push(HostAction::AddSplitLearner {
-                tablet,
-                home: missing.clone(),
-            });
-            continue;
-        }
-        let all_ready = union_homes
-            .iter()
-            .all(|h| fact.config.contains(h) || fact.learners_caught_up.contains(h));
-        if all_ready {
+        // Not forked here yet — propose immediately (ADR 0062 rung 5: no
+        // learner-catch-up gate; every replica named in the intent's
+        // children already hosts the parent as an ordinary voter, so there
+        // is nothing to recruit or wait on). Leader-only, mirroring phase
+        // 2's own `Reconfigure` convention (a non-leader's
+        // `propose_split_tablet` call would harmlessly no-op anyway, but
+        // emitting only on the leader keeps this phase's actions as
+        // churn-free as `Reconfigure`'s).
+        if fact.is_leader {
             actions.push(HostAction::ProposeSplitFork {
                 tablet,
                 split_key: intent.split_key.clone(),
@@ -751,36 +678,16 @@ pub fn plan(
         next.pending_release.remove(&tablet);
     }
 
-    // ADR 0058 Train 2 rung 3: a node recruited to host a splitting parent
-    // ONLY because it's named in one of the intent's children (never a
-    // member of the parent's own `replicas` — see phase 1's own comment) is
-    // never a release candidate for that tablet either, by the identical
-    // reasoning: `tablets_to_release_set`'s `!replicas.contains(&base_id)`
-    // trigger would otherwise fire on it immediately (it is never in
-    // `replicas`), and worse, `config_excludes_me` is trivially TRUE for a
-    // still-a-learner recruit (a learner is never in `config()` — see
-    // `RaftCore`'s own "peers/cluster_size derive from voters alone"
-    // invariant), so without this exclusion the safety anchor a few lines
-    // down would immediately wave the release through too.
-    let recruited_for_split: BTreeSet<TabletId> = mine
-        .iter()
-        .filter(|&&t| {
-            view.tablets.get(&t).is_some_and(|tab| {
-                tab.inplace_split.as_ref().is_some_and(|intent| {
-                    intent
-                        .children
-                        .iter()
-                        .any(|c| c.replicas.contains(&base_id))
-                })
-            })
-        })
-        .copied()
-        .collect();
+    // ADR 0062 rung 5: no node is ever recruited to host a splitting parent
+    // solely via a child's own `replicas` any more (deleted with phase 1's
+    // matching branch) — `SplitChild::replicas` IS the parent's own
+    // `replicas` at `BeginSplitInPlace` propose time, and a `Splitting`
+    // parent's `replicas` cannot change for the intent's whole lifetime
+    // (`reconcile_placement`/`rebalance_placement` both skip non-`Active`
+    // tablets), so a release candidate here is never a member of any
+    // in-flight split intent's children either. No exclusion needed.
     let release_candidates: BTreeSet<TabletId> =
-        tablets_to_release_set(&mine, &view.tablets, base_id)
-            .into_iter()
-            .filter(|t| !recruited_for_split.contains(t))
-            .collect();
+        tablets_to_release_set(&mine, &view.tablets, base_id);
     // Drop confirm state for anything no longer a candidate (condition
     // flipped — re-added to the replica set, or reclaimed): its counter must
     // restart from scratch if it becomes a candidate again later.
@@ -1096,11 +1003,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 HostAction::Reclaim { tablet } => {
                     self.teardown(tablet).await;
                 }
-                HostAction::AddSplitLearner { tablet, home } => {
-                    if let Some(node) = self.hosted.get(&tablet) {
-                        node.add_learner(home);
-                    }
-                }
                 HostAction::ProposeSplitFork {
                     tablet,
                     split_key,
@@ -1148,34 +1050,19 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let mut facts = BTreeMap::new();
         for (&tablet, node) in &self.hosted {
             let scope_range = node.scope_range();
-            let config = node.config();
-            let config_excludes_me = !config.contains(&self.base_id);
-            // ADR 0058 Train 2 rung 3: the extra learner/fork bookkeeping is
-            // only ever consulted for a tablet the control plane currently
-            // shows an in-place split intent for — gated here so an
-            // ordinary tablet's tick pays no extra work (in particular, no
-            // extra `pending_split()` engine read).
-            let (config, learners, learners_caught_up, pending_split) = if view
+            let config_excludes_me = !node.config().contains(&self.base_id);
+            // ADR 0062 rung 5: `pending_split()` is only ever consulted for
+            // a tablet the control plane currently shows an in-place split
+            // intent for — gated here so an ordinary tablet's tick pays no
+            // extra engine read.
+            let pending_split = if view
                 .tablets
                 .get(&tablet)
                 .is_some_and(|t| t.inplace_split.is_some())
             {
-                let learners = node.learners();
-                let learners_caught_up = learners
-                    .iter()
-                    .filter(|id| {
-                        node.learner_caught_up(id, INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD)
-                    })
-                    .cloned()
-                    .collect();
-                (
-                    config,
-                    learners,
-                    learners_caught_up,
-                    node.pending_split().await,
-                )
+                node.pending_split().await
             } else {
-                (config, BTreeSet::new(), BTreeSet::new(), None)
+                None
             };
             facts.insert(
                 tablet,
@@ -1185,9 +1072,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     config_excludes_me,
                     scope_range: Some(scope_range),
                     has_data: false,
-                    config,
-                    learners,
-                    learners_caught_up,
                     pending_split,
                 },
             );
@@ -1298,16 +1182,18 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     ///
     /// **Every fork participant materializes BOTH children, unconditionally
     /// — not just the one(s) it belongs to.** `bootstrap_voters` (the
-    /// parent's own full voter-plus-learner set at the fork, captured once
-    /// in `KvCommand::SplitTablet`'s apply — see `split.rs`'s module doc)
-    /// is what each child's local group actually bootstraps with, which is
-    /// a SUPERSET of either child's own final `replicas`. This is
-    /// deliberate: it is what makes Stage 5's "each child is
-    /// over-replicated relative to its own final RF immediately after the
-    /// fork" true by construction, trimmed down afterward by the ordinary
-    /// `Reconfigure` action once `CutoverSplit` records each child's real
-    /// `replicas` into `Metadata` — no new trim mechanism, `reconfigure_step`
-    /// verified, not rebuilt (its own module doc, rung 1's amendment).
+    /// parent's own current voter set at the fork, captured once in
+    /// `KvCommand::SplitTablet`'s apply — see `split.rs`'s module doc) is
+    /// what each child's local group actually bootstraps with. Since ADR
+    /// 0062 rung 4 this is no longer a superset of either child's own
+    /// `replicas` — `SplitChild::replicas` IS the parent's own current
+    /// replicas (never a disjoint, placement-chosen home), so
+    /// `bootstrap_voters` and both children's target replica set coincide
+    /// in the common case and there is nothing left to trim at fork time
+    /// (see `split.rs`'s "No more learner union" doc for the accepted
+    /// fork-D residual this leaves — an unrelated in-flight rebalance's own
+    /// learner on the parent, self-healed by an ordinary post-cutover
+    /// `Reconfigure` exactly like any other placement drift).
     ///
     /// **G4 crash-idempotency contract** (ADR 0058 Train 2 rung 3's own
     /// load-bearing detail): two commit points, checked and skipped

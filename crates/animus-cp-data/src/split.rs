@@ -12,24 +12,44 @@
 //! 4) — so this marker is keyed by `tablet` alone, and a point [`get`] suffices
 //! to read it back; no scan is needed the way `seal.rs`'s does.
 //!
-//! **`bootstrap_voters` vs. `SplitChild::replicas`.** A child's own
-//! `replicas` field is its placement-chosen **final** homes — what
-//! `MetaCommand::CutoverSplit` (Stage 4) records as the tablet's `replicas`
-//! in `Metadata`, driving the ordinary reconciler's trim (Stage 5).
-//! `bootstrap_voters` is a DIFFERENT, larger set: the parent's own full
-//! voter-plus-learner config at the exact moment `SplitTablet` applies,
-//! captured once by the apply arm (`RaftCore::config() ∪ RaftCore::
-//! learners()`, read while holding the core lock) — deterministic because
-//! every replica that reaches this apply has, by Raft log order, already
-//! applied every earlier config-change entry, so this read produces the
-//! IDENTICAL set on every replica. Both children bootstrap their own local
-//! `RaftKvNode` with `bootstrap_voters` as the initial **voter** config —
-//! every node that has the parent's fully-replicated data (original voter
-//! or caught-up learner) can safely vote for both new groups immediately,
-//! which is what makes Stage 5's "each child is over-replicated relative to
-//! its own final RF" true by construction: a node in `bootstrap_voters` but
-//! NOT in a given child's own `replicas` is exactly what the ordinary
-//! reconciler's `reconfigure_step` trims off afterward, no new mechanism.
+//! **`bootstrap_voters` vs. `SplitChild::replicas` (ADR 0062 rung 4:
+//! "fork first, always local").** Both fields carry the SAME set now — the
+//! parent's own current replicas, verbatim — but they still mean different
+//! things and neither is derived from the other: `SplitChild::replicas` is
+//! `trigger_split`'s own proposer-side computation (`meta.tablets[parent]
+//! .replicas.clone()`, ADR 0062 §1), captured at `BeginSplitInPlace`
+//! propose time and carried unchanged through to this apply; `bootstrap_
+//! voters` is captured once HERE, independently, from the parent's own
+//! live `RaftCore::config()` at the exact moment `SplitTablet` applies
+//! (deterministic because every replica that reaches this apply has, by
+//! Raft log order, already applied every earlier config-change entry, so
+//! this read produces the IDENTICAL set on every replica). The two values
+//! coincide in the common case (nothing reconfigured the parent's voters
+//! between propose and apply) and can legitimately diverge if an ordinary
+//! rebalance/repair committed a membership change on the parent in that
+//! window — `bootstrap_voters`, not `SplitChild::replicas`, is what both
+//! children's local `RaftKvNode`s actually bootstrap their **voter** config
+//! from, since it is the freshest agreed answer to "who has the parent's
+//! data right now."
+//!
+//! **No more learner union (ADR 0062 rung 4, fork D — accepted residual).**
+//! `bootstrap_voters` used to be `RaftCore::config() ∪ RaftCore::
+//! learners()` — a strict superset of the parent's own voters, engineered
+//! so both children could start over-replicated relative to their
+//! (placement-chosen, possibly off-parent) final homes, with the ordinary
+//! reconciler's `reconfigure_step` trimming the rest afterward (ADR 0058's
+//! Stage 5). Since a child's replicas are now the parent's own replicas —
+//! never a disjoint placement-chosen home — there is nothing left to
+//! recruit or trim: `bootstrap_voters` is the parent's voter set ONLY, both
+//! children bootstrap directly onto it, and Stage 5's trim step never has
+//! anything to do at fork time. The accepted cost: an unrelated,
+//! in-flight, ordinary rebalance's own learner on the parent at this exact
+//! apply is no longer inherited by either child (it used to ride along in
+//! the union as a bonus, half-caught-up member) — it is simply absent from
+//! both, and a fresh Placing/reconcile pass re-adds it to whichever child
+//! it still belongs on via the ordinary add-learner → catch-up → promote
+//! sequence, from scratch, self-healing at the cost of at most one extra
+//! `reconfigure_step` hop.
 //!
 //! [`get`]: animus_storage::StorageEngine::get
 

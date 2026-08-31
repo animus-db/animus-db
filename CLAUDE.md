@@ -264,7 +264,14 @@ truth; this map is just for navigation.
   (ADR 0058, default since rung 4 layer 2): a single Raft entry on the
   parent's own log mints both children directly `Active`, materialized on
   every fork participant from the committed entry, with no separate
-  build/freeze phase. The original **copy-based background workflow** (ADR
+  build/freeze phase. **Since ADR 0062 the fork is placement-blind**: both
+  children inherit the parent's own current replicas verbatim, and a
+  child's actual final home is a separate, directed **Placing** decision
+  (`Metadata::split_placing`, computed once at cutover) driven, after
+  cutover, by the same replica-rebalancing convergence machinery
+  (`reconfigure_step`/`CasTabletReplicas`) that already moves any other
+  tablet's placement — never fused into the fork itself. The original
+  **copy-based background workflow** (ADR
   0050 — `BeginSplit` mints two `Building` children at placement-chosen
   homes, a driver on the parent's leader copies + tails, a terminal
   `Freeze` stops writes, `CutoverSplit` activates the children and retires

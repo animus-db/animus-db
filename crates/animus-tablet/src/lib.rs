@@ -261,10 +261,19 @@ pub struct SplitChild {
     /// copy-based `Building` child) no [`Tablet`] map entry exists for it
     /// until `MetaCommand::CutoverSplit` activates it.
     pub id: TabletId,
-    /// The child's placement-chosen final replica set (fork F5, preserved
-    /// from the copy-based design) — the **union** of both children's
-    /// replica sets is what the parent's own group adds as learners
-    /// (ADR 0058 Train 2 Stage 1).
+    /// The child's replica set **at fork time** (ADR 0062 rung 4,
+    /// "fork first, always local") — the parent's own current replicas,
+    /// identical for both children, never placement-chosen. This
+    /// superseded fork F5's original meaning ("the child's placement-chosen
+    /// FINAL replica set", inherited from the copy-based design, where the
+    /// **union** of both children's replica sets was what the parent's own
+    /// group added as learners, ADR 0058 Train 2 Stage 1) — there is no
+    /// learner union any more; every replica named here already hosts the
+    /// parent, so nothing needs recruiting before the fork can proceed.
+    /// Where a child eventually *ends up* is decided separately, once, at
+    /// `MetaCommand::CutoverSplit`'s own apply (ADR 0062 §2's directed
+    /// Placing phase), and driven there by the ordinary rebalance
+    /// machinery — not by this field, which never changes after the fork.
     pub replicas: Vec<NodeId>,
 }
 

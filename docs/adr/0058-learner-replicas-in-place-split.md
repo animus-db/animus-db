@@ -10,7 +10,25 @@
   workflow explicitly. **Rung 4's remaining layer** (delete the ADR 0050
   build driver, the freeze-as-outage path, and the cutover vetoes now that
   the copy path is no longer the default) is this ADR's only unimplemented
-  piece.
+  piece. **(2026-08-31 amendment) Train 2 Stage 1/2 — the fused split+move
+  half of fork F5, where `BeginSplitInPlace` recruits both children's
+  *final* homes as learners on the parent before it can ever fork — is
+  superseded by [ADR 0062](0062-fork-first-split-directed-placing.md)**:
+  `HostAction::AddSplitLearner`, `host::plan`'s phase-1.5 learner-recruitment
+  loop, and the `bootstrap_voters` learner-union capture described in Train
+  2 below are **deleted**; a split now forks directly onto the parent's own
+  current replicas, with a child's real final placement decided separately,
+  once, at `CutoverSplit`'s own apply (`Metadata::split_placing`) and driven
+  there afterward by ordinary rebalance-style convergence. Kept below
+  verbatim as the historical record of Stage 1/2's original design; **Train
+  1** (the learner membership class, `reconfigure_step`'s learner-phased add
+  sequencing) and **Train 2's remaining stages** (the single-entry
+  `SplitTablet` atomic mint, local SSTable-clone-and-trim materialization,
+  the G4 crash-recovery contract, the deterministic-first-leader campaign
+  fix, the eager-materialization wake, and G1's pre-cutover drain-gate
+  placement) are **not** superseded — ADR 0062 depends on and reuses all of
+  them unmodified. See ADR 0062's own "Relationship to ADR 0050/0058's fork
+  F5" section for the full account of what changed and why.
 - **Date:** 2026-08-24 (accepted 2026-08-25)
 - **Proposes superseding:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)'s
   **Decision 2** (the `BeginSplit`/build/freeze/`CutoverSplit`/retire

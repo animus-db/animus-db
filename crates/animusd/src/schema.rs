@@ -525,14 +525,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
                 }
                 tracing::Span::current().record("new_id", left_id.0);
-                // Fork F5: children are minted at placement-chosen final
-                // homes — the one data movement of a copy-based split is the
-                // build itself, so the mint must pick the real destinations.
-                let children_replicas = match split_child_placement(&meta, tablet) {
-                    Ok(sets) => sets,
-                    Err(e) => return ClientResponse::Error(e),
-                };
-                let [left_replicas, right_replicas] = children_replicas;
                 // ADR 0058 Train 2 rung 3 residue: `self.split_mode` is the
                 // ONE branch point between the two workflows — both
                 // commands share the identical `{parent, expected_epoch,
@@ -540,20 +532,53 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // doc), the idempotent already-`Splitting` handling and the
                 // confirm loop above are unchanged either way, and neither
                 // `auto_split_loop` nor any other caller of `trigger_split`
-                // needs to know which one ran.
+                // needs to know which one ran. What DOES differ between the
+                // two branches, since ADR 0062 rung 4: where each child's
+                // *own* replica set comes from.
                 let cmd = match self.split_mode {
-                    SplitMode::Copy => MetaCommand::BeginSplit {
-                        parent: tablet,
-                        expected_epoch: initial_epoch,
-                        split_key: aligned_key,
-                        children: [(left_id, left_replicas), (right_id, right_replicas)],
-                    },
-                    SplitMode::InPlace => MetaCommand::BeginSplitInPlace {
-                        parent: tablet,
-                        expected_epoch: initial_epoch,
-                        split_key: aligned_key,
-                        children: [(left_id, left_replicas), (right_id, right_replicas)],
-                    },
+                    SplitMode::Copy => {
+                        // Fork F5 (ADR 0050, unchanged): children are minted
+                        // at placement-chosen final homes — the one data
+                        // movement of a copy-based split is the build
+                        // itself, so the mint must pick the real
+                        // destinations.
+                        let [left_replicas, right_replicas] =
+                            match split_child_placement(&meta, tablet) {
+                                Ok(sets) => sets,
+                                Err(e) => return ClientResponse::Error(e),
+                            };
+                        MetaCommand::BeginSplit {
+                            parent: tablet,
+                            expected_epoch: initial_epoch,
+                            split_key: aligned_key,
+                            children: [(left_id, left_replicas), (right_id, right_replicas)],
+                        }
+                    }
+                    SplitMode::InPlace => {
+                        // ADR 0062 rung 4 ("fork first, always local"):
+                        // both children get the parent's own CURRENT
+                        // replica set, verbatim, identical for both —
+                        // never a placement-computed final home. Every
+                        // replica already hosting the parent already has
+                        // everything the fork needs (Stage 3 clones the
+                        // parent's own already-open engine locally), so
+                        // there is nothing to recruit/catch-up before the
+                        // fork can proceed. Where a child *ends up* is
+                        // decided later, once, at `CutoverSplit`'s own
+                        // apply (ADR 0062 §2's directed Placing phase) —
+                        // not here.
+                        let replicas = meta
+                            .tablets
+                            .get(&tablet)
+                            .map(|t| t.replicas.clone())
+                            .unwrap_or_default();
+                        MetaCommand::BeginSplitInPlace {
+                            parent: tablet,
+                            expected_epoch: initial_epoch,
+                            split_key: aligned_key,
+                            children: [(left_id, replicas.clone()), (right_id, replicas)],
+                        }
+                    }
                 };
                 let sent = self.propose_schema(&cmd).await;
                 next_propose_at = self.env.now().saturating_add(if sent {
