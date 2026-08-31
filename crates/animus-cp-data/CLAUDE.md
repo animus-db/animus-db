@@ -903,57 +903,51 @@ ADR 0050 Train B rung-7 sweep.
   live control-plane `RaftNode` read this crate has no business taking)
   both stay in `animusd::tablet_host_reconciler_loop`.
 
-### In-place split (ADR 0058 Train 2 rung 3)
+### In-place split (ADR 0058 Train 2 rung 3; fork-first per ADR 0062)
 
 `plan`'s phase 1.5, between `Host` and `Reconfigure`: a tablet whose
 `Metadata` row carries `Tablet::inplace_split` (the control plane's
 `MetaCommand::BeginSplitInPlace`) takes this branch INSTEAD of the
 ordinary `Reconfigure` action for as long as the intent exists — the two
 must never both fire for the same tablet in the same tick (an ordinary
-reconfigure would see the split's added learner(s) as stale — not in its
-own `desired` — and try to remove them mid-catch-up).
+reconfigure would see the fork's own children as a foreign membership
+change and try to interfere). **The Stage 1/2 learner-add-and-wait phase
+(ADR 0058 Train 2) is deleted (ADR 0062 rung 5)** — `HostAction::
+AddSplitLearner`, `INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`, and the
+`TabletFacts::config`/`learners`/`learners_caught_up` fields that fed it
+are all gone, along with phase 1's "recruited via a child's own replicas"
+host-candidate branch and phase 3's matching release exclusion — both
+provably dead under the ADR 0062 rung 4 invariant (`SplitChild::replicas`
+IS the parent's own replicas at propose time, and a `Splitting` parent's
+`replicas` cannot change for the intent's whole lifetime —
+`reconcile_placement`/`rebalance_placement` both skip non-`Active`
+tablets — so nothing is ever named in a child's `replicas` that isn't
+already a member of the parent's own).
 
 - **Not yet forked here** (`RaftKvNode::pending_split()` answers `None`):
-  the leader adds the next missing member of the union of both children's
-  `replicas` as a learner (`HostAction::AddSplitLearner`, one per tick,
-  mirroring `reconfigure_step`'s own one-step-per-call discipline but as
-  its own action — this does NOT reuse `reconfigure_step` itself, since
-  that function's own stale-learner-removal step would fight a split's
-  learners the moment they're not in the PARENT's own `desired`). Once
-  every union member is present and caught up (a voter is trivially
-  ready), the leader proposes the fork (`HostAction::ProposeSplitFork` →
-  `RaftKvNode::propose_split_tablet`).
-- **A node named only in a CHILD's `replicas`, never the parent's own**,
-  still needs to host the PARENT (as a quiet non-voter) before it can ever
-  be added as a learner to it — phase 1 gained a second host-candidate
-  test for exactly this (a node recruited via either child's `replicas` of
-  an in-place split intent), and phase 3's release check is correspondingly
-  taught to never fire on the SAME recruited set (it is never in the
-  parent's own `replicas`, and — a learner is never in `RaftCore::config()`
-  by construction — `config_excludes_me` reads trivially true for it too).
+  the leader proposes the fork immediately (`HostAction::ProposeSplitFork`
+  → `RaftKvNode::propose_split_tablet`) — no gate beyond ordinary Raft
+  agreement on the fork entry itself. Every replica named in the intent's
+  children already hosts the parent as an ordinary voter (ADR 0062 rung 4),
+  so there is nothing left to recruit or wait on before forking.
 - **Already forked here** (`pending_split()` answers `Some`):
   `HostAction::MaterializeSplitChild` fires for BOTH children on EVERY
   fork participant — not filtered by either child's own final `replicas` —
   since `pending_split().bootstrap_voters` (the parent's own current voter
-  set — **no longer** a voter-plus-learner union, ADR 0062 rung 4 —
-  captured once in the data-plane's own apply) is what both children
-  actually bootstrap with. Under the pre-rung-4 fork-F5 shape a child's
-  `replicas` could be placement-chosen and disjoint from the parent's own,
-  which made `bootstrap_voters` a deliberate superset Stage 5's ordinary
-  `Reconfigure` trimmed down afterward; a child minted via `trigger_split`
-  today never has that shape (`SplitChild::replicas` IS the parent's own
-  current replicas, see `animus-tablet`'s doc), so in practice there is
-  nothing left to trim at fork time on that path — this whole Stage 1/2
-  mechanism (below) still exists unmodified and still fires exactly as
-  described for a hand-built intent naming disjoint homes (the
-  `inplace_split_reconciler.rs` corpus's own fixtures, pending its own
-  ADR 0062 rung 5 rework), it is simply never exercised by the real
-  proposer any more. Claimed
-  into `LocalState::hosted` optimistically (the same discipline `Host`
-  uses) AND into `LocalState::split_forming`, which exempts a pre-cutover
-  child from phase 3's reclaim check (it is `hosted` but, by design,
-  absent from `Metadata` until `CutoverSplit` runs) — pruned the instant
-  the child appears in `Metadata` as a real `Active` entry.
+  set, captured once in the data-plane's own apply) is what both children
+  actually bootstrap with. Since ADR 0062 rung 4 this is no longer a
+  superset of either child's own `replicas` (`SplitChild::replicas` IS the
+  parent's own current replicas, see `animus-tablet`'s doc), so
+  `bootstrap_voters` and both children's target replica set coincide in
+  the common case and there is nothing left to trim at fork time — see
+  `split.rs`'s "No more learner union" doc for the accepted fork-D
+  residual this leaves (an unrelated in-flight rebalance's own learner on
+  the parent, self-healed by an ordinary post-cutover `Reconfigure`).
+  Claimed into `LocalState::hosted` optimistically (the same discipline
+  `Host` uses) AND into `LocalState::split_forming`, which exempts a
+  pre-cutover child from phase 3's reclaim check (it is `hosted` but, by
+  design, absent from `Metadata` until `CutoverSplit` runs) — pruned the
+  instant the child appears in `Metadata` as a real `Active` entry.
 - **`Reconciler::materialize_split_child`** implements the G4
   crash-idempotency contract (see the ADR's own "Open forks" table,
   decided as of this rung): `EngineFactory::probe(child)` before ever
@@ -989,7 +983,7 @@ child's leadership immediately, instead of waiting out the timeout.
   local facts** — `HostAction::MaterializeSplitChild` gained a `campaign:
   bool` field, set to that tick's `TabletFacts::is_leader` **for the
   PARENT** (the same fact phase 1.5 already reads to gate
-  `AddSplitLearner`/`ProposeSplitFork`). No new coordination, no new
+  `ProposeSplitFork`). No new coordination, no new
   replicated state: every replica decides "was I the parent's leader just
   now" independently, and in the common case exactly one replica per
   child answers `true`.
@@ -1049,12 +1043,14 @@ Tests: `tests/split_tablet.rs` (the data-plane mint's own fence/idempotency/
 restart suite) and `tests/inplace_split_reconciler.rs` (a self-contained
 `SimEnv` corpus, depth knob `ANIMUS_INPLACE_SPLIT_SEEDS`, mirroring
 `reconciler_corpus.rs`'s own harness shape — held green through
-`ANIMUS_INPLACE_SPLIT_SEEDS=200`): the full happy path (real learner
-catch-up, over-replication on every fork participant, exact per-child data
-partitioning, empty change/cursor scopes at birth, the post-cutover trim to
-final placement, parent reclaim), a leader crash mid-catch-up, the G4
-crash window itself, a concurrent unrelated rebalance racing the split's
-own learner-add, the immediate-campaign **fast path**
+`ANIMUS_INPLACE_SPLIT_SEEDS=200`, and past `=1000` locally): the fork-first
+happy path (ADR 0062 rung 5 — the fork proposes immediately, no learner
+phase; exact per-child data partitioning, empty change/cursor scopes at
+birth, each child's bootstrap voter set exactly the parent's own voters —
+no over-replication, no trim step needed — post-cutover convergence, parent
+reclaim), the G4 crash window itself, a concurrent unrelated rebalance
+proving non-interference in both directions with the split's own parent
+handling, the immediate-campaign **fast path**
 (`campaigning_replica_wins_leadership_almost_immediately` — a leader
 within a handful of virtual ms of materializing, far short of a fresh
 group's own 150ms election-timeout base) and its **fallback**
@@ -1144,11 +1140,11 @@ table.
 
 ### HostAction
 
-**Emitted in this fixed order: `Host` → (`AddSplitLearner`/
-`ProposeSplitFork`/`MaterializeSplitChild`) → `Reconfigure` →
-`Release`/`Reclaim`.** The parenthesized trio (ADR 0058 Train 2 rung 3) is
-mutually exclusive with `Reconfigure` per tablet — see "In-place split"
-above. `Release`/`Reclaim` tear down a tablet moved off or
+**Emitted in this fixed order: `Host` → (`ProposeSplitFork`/
+`MaterializeSplitChild`) → `Reconfigure` → `Release`/`Reclaim`.** The
+parenthesized pair (ADR 0058 Train 2 rung 3; `AddSplitLearner` deleted by
+ADR 0062 rung 5) is mutually exclusive with `Reconfigure` per tablet — see
+"In-place split" above. `Release`/`Reclaim` tear down a tablet moved off or
 dropped/retired, respectively. Tablets are split-only (ADR 0044) and
 ranges immutable (ADR 0050): the zero-copy `ProposeSeal`/`NarrowScope`
 actions were deleted in the rung-7 sweep, as merge's `WidenScope`/`Absorb`
