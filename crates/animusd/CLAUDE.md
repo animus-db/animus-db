@@ -1431,6 +1431,41 @@ regardless of whose entry occupies the index). See
 `animus-cp-data/tests/kind_batch_outcome_identity.rs` for the seed-
 reproducible truncation regression that proves it end to end.
 
+**`poll_probe`'s value-equality fallback is idempotency-gated (issue #469).**
+When `classify_kind_batch_outcome` is `Inconclusive` (not yet applied, aged
+out of the bounded outcome map, or applied-but-not-yet-readable), `poll_probe`
+used to fall back to plain value equality — "does the key already hold the
+bytes I proposed?" — at both sites in its loop, unconditionally. That fallback
+proves the bytes are *visible*, never that *this proposer's entry* put them
+there, and for a **non-idempotent** write (a numeric `ADD`) that distinction
+is load-bearing, not academic: `kind_write_item_at_leader` reads `old` under
+`ctx.data().rmw_lock`, which is released *before* proposing (issue #285), so
+two concurrent evaluators of the same key can read the identical stale `old`
+and compute byte-identical `new` (a pure function of `(cur, delta)`) —
+nothing downstream disambiguates them. Each proposes an entry carrying those
+same bytes guarded by an own-key OCC seatbelt keyed to that same stale `old`;
+the first to apply wins the seatbelt and writes the bytes, every later one
+legitimately `ConditionFailed`s. In the window after the winner's bytes are
+visible and before a *loser* entry's own outcome is recorded, the old
+ungated fallback matched on value alone and returned `Confirmed` for the
+loser — acking an increment that never applied. Fixed by threading
+`ProbeIdentity` (`ValueProves`/`RequiresOwnEntry`) down from whichever caller
+already knows `dynamo::kind_write_is_idempotent`'s answer
+(`kind_write_item_at_leader` for `cp_kind_local`; `cp_batch_local` hardcodes
+`ValueProves` since the raw `Batch` command only ever carries Put semantics,
+never `ADD`) — `poll_probe` never recomputes idempotency itself. A
+non-idempotent write's `Inconclusive` branch now never consults `local_get`
+at all, at either site; it keeps polling `classify_kind_batch_outcome` for
+its own (index, term) until that resolves or the deadline ends the wait in
+`TimedOut`. Idempotent writes (Put/Delete/SET/REMOVE, a set union or
+difference) keep both fallbacks exactly as they were — any entry landing
+those exact bytes is a legitimate success regardless of whose entry it was.
+Regression: `write_path.rs`'s in-crate `poll_probe_identity_tests` (a
+`SimEnv`-driven single-voter `RaftKvNode` harness that proposes a second
+`KindBatch` with the same bytes as an already-applied first entry, engineered
+to legitimately `ConditionFailed`, and drives `poll_probe` directly for the
+second entry's own accepted-but-unapplied window).
+
 **`cp_scan_kind` (ADR 0041)** is `cp_scan`'s single-tablet, kind-scoped
 sibling — the LSI `Query` read primitive: unlike `cp_scan`'s per-table
 fan-out, `start`/`end` must resolve to the *same* tablet (an LSI query is

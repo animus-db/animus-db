@@ -188,7 +188,7 @@ use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http;
-use crate::{ClientCtx, CpGroup, KindWriteOp, ReadConsistency, SnapshotRead};
+use crate::{ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
 /// the replicated catalog before giving up.
@@ -5807,11 +5807,23 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     };
     #[cfg(test)]
     rmw285_confirm_gate::wait_if_armed(table).await;
+    // `identity` (issue #469): whether `poll_probe`'s value-equality
+    // fallback may run for this write. A numeric `ADD` is not idempotent —
+    // two evaluators reading the same stale `old` under this function's own
+    // released-before-propose lock (issue #285, above) compute
+    // byte-identical `new`, so bytes landing at `base_key` prove nothing
+    // about which entry put them there. See `ProbeIdentity`'s doc for the
+    // full hazard.
+    let identity = if kind_write_is_idempotent(&op) {
+        ProbeIdentity::ValueProves
+    } else {
+        ProbeIdentity::RequiresOwnEntry
+    };
     // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local` takes no
     // `self`/`R`-typed argument, so nothing here pins down `R` for the
     // now-generic `ClientCtx<E, R>` path — both `E`/`R` are already this
     // function's own generic parameters.
-    ClientCtx::<E, R>::cp_kind_local(leader, writes, vec![change_log], seatbelt)
+    ClientCtx::<E, R>::cp_kind_local(leader, writes, vec![change_log], seatbelt, identity)
         .await
         .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
     let collection_bytes = collection_bytes_at_leader(leader).await;
