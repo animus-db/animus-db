@@ -13770,3 +13770,71 @@ recipe (grow-by-two, RF3, real `ProdEnv`), and a already-written
 regression-in-waiting to flip on once the underlying issue is found. Filed
 here rather than silently worked around, per this repo's own "record a
 generalizable lesson, including one you didn't chase to the end" practice.
+
+## Follow-up hardening of the above: the test itself, not the loop, was asserting a one-shot snapshot of an eventually-converging value (ADR 0062 rung 6, `tests/split_placing_completion.rs`)
+
+The settle-window fix above closed a real product race. It did not, on its
+own, make `tests/split_placing_completion.rs` reliably green — a second
+pass, run to a 15-consecutive-green bar (`for i in $(seq 15); do cargo test
+-p animusd --test split_placing_completion || break; done`), surfaced two
+more failure modes, both root-caused rather than papered over with a wider
+timeout:
+
+1. **`assert_eq!(fork_inherited, [n0, n1, n2])` right after
+   `await_cutover_of` returns is itself a one-shot assert on an eventual
+   property** — the exact mistake this repo's own Testing-section rule
+   warns against, just relocated from the production loop into the test
+   that was supposed to be proving the loop correct. The directed-Placing
+   reconcile phase (`animus-control::node`'s 500ms `RECONCILE_INTERVAL`)
+   and this rung's own completion loop are BOTH independently-scheduled
+   background processes with no synchronization to `await_cutover_of`'s own
+   100ms poll granularity — nothing stops either or both from having
+   already finished by the exact instant the test's very next line reads
+   `/admin/status`, especially under `cargo test --workspace`'s CPU
+   contention (many test binaries competing for scheduler time slices makes
+   a "slow" background loop tick *faster relative to* a test's own
+   `sleep`-paced poll far less rare than a quiet single-binary run would
+   suggest). Observed directly: a captured failure showed child 2 already
+   sitting on `[m0, n0, n1]` — the fully-converged target — one line after
+   `await_cutover_of` returned, well before the test's own "prove the
+   convergence loop moves it" section had even started polling. **Fix**:
+   stopped asserting on the tablet's own *current* `replicas` (converging,
+   racy) and on `split_placing[child].done` (also converging, also racy)
+   in that spot entirely; kept only the assertion on `split_placing[child]
+   .target`, which `CutoverSplit` writes exactly once and the reconcile
+   loop is contractually forbidden from ever rewriting (ADR 0062 §2) — the
+   one field in the whole structure that is safe to assert on
+   synchronously, precisely because it is not an eventual property at all.
+2. **`join_extra`'s 30s outer retry deadline was a guessed constant, not
+   derived from the mechanism it retries** — `run_node_join`'s own internal
+   discovery poll (`JOIN_DISCOVERY_BUDGET`, 10s) means a single failed
+   attempt can itself cost most of a 10s slice before the outer loop even
+   gets to retry, so 30s bought only ~3 attempts under contention. Widened
+   to 60s (six attempts' worth) with the reasoning written down against the
+   actual constant it derives from, and the swallowed `Err` is now printed
+   (`eprintln!`) so a future failure names its own cause instead of a bare
+   "could not join after retries." This is remedy-class 4 from this
+   incident's own review ("is the budget derived from the mechanism's
+   actual worst-case, or a guess") applied to a *setup* step, not just the
+   convergence poll it was easy to think of first.
+
+**Verification discipline worth naming explicitly**: a single green run (or
+even ten) of a real multi-process `ProdEnv` e2e test proves far less than
+it feels like it does when the failure mode is a race with a probability
+in the 10-20% range — the fix here was only trusted once a *sequential*
+`for i in $(seq 15); do cargo test ... || break; done` loop (never a
+background/parallel batch, which can mask exactly the CPU-contention
+condition that makes the race worse) ran clean end to end, run in the
+foreground so a failure stops the loop immediately rather than being
+averaged away in a summary count.
+
+**General lesson**: when hardening a flaky real-cluster test, audit *every*
+assertion for whether the value it checks is a converging (eventual) one
+or a written-once (stable) one — not just the assertion that produced the
+original failure. A test built by iterating on whichever assertion just
+failed will fix them one at a time and keep discovering new ones on each
+subsequent run, because a racy assertion on a fast-converging system fails
+probabilistically, not deterministically — the fix that actually stops the
+bleeding is a pass over the whole test asking "which of these could this
+system have already finished by the time I check it," not a reactive
+timeout bump on whichever line the last failure happened to name.

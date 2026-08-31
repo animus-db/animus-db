@@ -294,9 +294,17 @@ async fn await_cutover_of(node: &Node, table: &str, parent: u64, budget: Duratio
 /// proves), each with an EXPLICIT id from `ids` — the whole reason this test
 /// doesn't just use `tests/support::grow_deadline` (which always assigns
 /// the grown nodes ids that sort ABOVE every original one). Retries the
-/// whole batch on a port-TOCTOU bind failure, the standard idiom.
+/// whole batch on a port-TOCTOU bind failure OR a discovery timeout, the
+/// standard idiom — deadline derived from the actual mechanism, not a
+/// guess: `run_node_join`'s own internal discovery poll is bounded by
+/// `JOIN_DISCOVERY_BUDGET` (10s, `animusd::lib`'s own private constant,
+/// == `SCHEMA_COMMIT_TIMEOUT`), so one failed attempt can itself cost up to
+/// that much before this loop ever gets to retry — six such attempts'
+/// worth of budget comfortably absorbs a slow/contended `cargo test
+/// --workspace` run (many test binaries competing for CPU) without masking
+/// a genuine hang, since a real hang still exhausts it and fails loudly.
 async fn join_extra(core_intra: &[SocketAddr], ids: &[&str], dir: &Path) -> Vec<Node> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let addrs = support::free_addrs(ids.len() * 6);
         let mut nodes = Vec::new();
@@ -325,7 +333,8 @@ async fn join_extra(core_intra: &[SocketAddr], ids: &[&str], dir: &Path) -> Vec<
             .await
             {
                 Ok(node) => nodes.push(node),
-                Err(_) => {
+                Err(e) => {
+                    eprintln!("DIAG join_extra: run_node_join({id}) failed: {e}");
                     failed = true;
                     break;
                 }
@@ -462,23 +471,26 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
         kickoff_tablet(&nodes[0], parent, split_key).await;
         let (left, right) = await_cutover_of(&nodes[0], "t", parent, Duration::from_secs(60)).await;
 
-        // Both children fork onto the parent's ORIGINAL (now-suboptimal)
-        // three nodes, and `CutoverSplit`'s own apply recorded a REAL,
-        // differing target — the premise this whole test depends on,
-        // asserted explicitly rather than assumed.
+        // `CutoverSplit`'s own apply recorded a REAL, differing target — the
+        // premise this whole test depends on, asserted explicitly rather
+        // than assumed. Checked ONLY against `split_placing[child].target`,
+        // never against the tablet's own CURRENT `replicas` or `done` here:
+        // both of those are live, converging state — the directed-Placing
+        // reconcile phase (500ms cadence) and this rung's own completion
+        // loop can legitimately have already moved/finished a child by the
+        // time this line runs (their combined worst-case latency is not
+        // bounded below `await_cutover_of`'s own 100ms poll granularity),
+        // so asserting a "not yet moved"/"not yet done" snapshot here would
+        // be exactly the one-shot-assert-on-an-eventual-property mistake
+        // this file's own module doc warns against. `target`, by contrast,
+        // is written ONCE at cutover and never rewritten (ADR 0062 §2's own
+        // "never trusts or rewrites `target`" rule) — the one piece of
+        // `split_placing` state that is safe to assert on synchronously.
         let want_target = vec!["m0".to_string(), "n0".to_string(), "n1".to_string()];
         let (_, status) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
         for child in [left, right] {
-            let mut fork_inherited = tablet_replicas(&status, child);
-            fork_inherited.sort();
-            assert_eq!(
-                fork_inherited,
-                vec!["n0", "n1", "n2"],
-                "child {child} did not fork onto the parent's original replicas"
-            );
-            let (target, done) = split_placing_entry(&status, child)
+            let (target, _done) = split_placing_entry(&status, child)
                 .unwrap_or_else(|| panic!("no split_placing entry for child {child}: {status}"));
-            assert!(!done, "child {child} reported done before any convergence");
             assert_eq!(
                 target.map(|mut t| {
                     t.sort();
