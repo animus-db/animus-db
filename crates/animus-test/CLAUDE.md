@@ -48,6 +48,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_SEED` | unset | replay one failed sim run from its printed seed (repo-wide convention) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
+| `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's `LeaderKill`/`FollowerKill` cells with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_TXN_SEEDS=K` | 1 | K seed variants per multi-tablet transaction-corpus cell (ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | K seed variants per DynamoDB Streams lineage-walk cell (ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
@@ -204,32 +205,77 @@ retrievable from git history.)
   *eventual* (a lagging follower catches up via log/snapshot), so they use the same
   **converged-or-timeout** poll every corpus in this crate does (see "What's
   non-obvious" above).
-- Frozen, name-seeded scenario set (29 cells): baselines + leader-kill /
+- Frozen, name-seeded scenario set (37 cells): baselines + leader-kill /
   follower-kill / partition-leader / lossy × early/mid/late × 3- and 5-replica,
   **plus a deepened tier** — `stop_restart`
   (a true process restart: `sim.stop` + a fresh `RaftKvNode::start` on the same
   id, recovering from the durable WAL — the CP recovery path), `split_brain`
-  (full-mesh partition, no majority anywhere), `leader_minority` (5-replica:
-  leader isolated *with* a minority — the stale-read window), and compound
-  `lossy`+`stop_restart`. Deepened cells carry a non-zero `Scenario::window`
+  (full-mesh partition, no majority anywhere), `chaos` (ADR 0061 Decision 3's
+  compound ambient network fault, below — folded into the same
+  `CORPUS_FAULTS_DEEP` early/mid/late × 3-/5-replica grid the other two use),
+  `leader_minority` (5-replica: leader isolated *with* a minority — the
+  stale-read window), compound `lossy`+`stop_restart`, `fsync_lie`+
+  `stop_restart` (below) × early/mid/late, and `heavy_tail`+`leader_minority`
+  (below). Deepened cells carry a non-zero `Scenario::window`
   (the runner holds the fault open before healing, so the group rides out a real
   outage); the original cells keep `window == 0` and their runs are
   **byte-identical** to the pre-deepening corpus (verified against captured
   histories when the tier landed). Depth knob **`ANIMUS_RAFTKV_SEEDS`** (default
-  1 = byte-identical frozen set; held green at depth 20 / 580 scenarios). A
+  1 = byte-identical frozen set; held green at depth 20). A
   structural `raftkv_corpus_covers_the_fault_matrix` guard keeps the matrix
   honest. The teeth-proof is the shared `negative_control.rs` (same
   `check_cycles`).
+- **`animus-sim`'s fault-injection vocabulary wired in (ADR 0061 Decision 3,
+  the first corpus to use it)**: three new `Nemesis` variants apply
+  `animus-sim`'s proven-but-previously-unused primitives. `FsyncLie`
+  (`DiskConfig::set_fsync_lie_prob`, global) is on its own an observable
+  no-op — a lied-to `sync` is transparent to `read` — so it is only ever
+  scheduled composed with a following `StopRestart` (`fsync_lie_stop_restart_
+  {early,mid,late}_3`), the crash that reveals whatever the lie actually
+  lost. `Chaos` (`NetConfig`, global: drop 5% + duplicate 10% + corrupt 5%
+  folded together) probes several degraded-network modes landing on one run
+  at once, rather than `Lossy`'s single fault. `HeavyTail`
+  (`NetConfig::set_heavy_tail_prob` + `heavy_tail_max_jitter`, global) models
+  occasional multi-second delivery and is only ever scheduled composed with
+  `LeaderMinority` (`heavy_tail_leader_minority_mid_5`), to check the
+  ReadIndex read-timeout path doesn't misclassify under episodic extreme
+  latency. **`Group::heal_all` gained a `DiskConfig::default()` reset
+  alongside its pre-existing `NetConfig::default()` one** — required the
+  moment a `Nemesis` variant could set a global `DiskConfig` at all
+  (`FsyncLie`), else a fired lie would keep lying for the rest of the
+  scenario past its intended fault window, silently invalidating every cell
+  that runs after it in the same scenario (see
+  `docs/engineering-lessons.md`'s entry on this).
 - **Engine tiers:** the corpus runs on `MemoryEngine` (always-on) and on
   **`LsmEngine<SimEnv>`** — the durable path (real WAL/SSTable recovery through
   the deterministic disk seam) that production actually runs; no corpus drove it
   under faults before. A 4-scenario representative LSM subset (baseline, a kill,
   the WAL-recovering `stop_restart`, the compound) runs by default;
   **`ANIMUS_RAFTKV_LSM=1`** runs the *whole* corpus over the LSM engine
-  (composable with `ANIMUS_RAFTKV_SEEDS`; held green at ×10 / 290 scenarios).
+  (composable with `ANIMUS_RAFTKV_SEEDS`).
   A `StopRestart` on this tier re-opens the engine via `LsmEngine::open_with`
   on the same per-node prefix — engine recovery *plus* Raft-WAL re-apply
-  (idempotent).
+  (idempotent). **`ANIMUS_RAFTKV_WAL_FAULTS=1`** is a third, orthogonal axis
+  (default off): a second full pass of just the corpus's single-crash cells
+  (`LeaderKill`/`FollowerKill`) over `MemoryEngine`, with
+  `DiskConfig{torn_tail_on_crash: true, corrupt_on_crash: true, ..}` armed
+  globally once at group start (not scheduled/reset by `Nemesis`/`heal_all`
+  the way `FsyncLie` is — it stays armed for the whole run, since the point
+  is that *every* crash the scenario's own schedule triggers tears/corrupts
+  its un-synced WAL tail). **Caveat (issue #495, fixed)**: the Raft WAL's
+  on-disk record framing (`animus_control::persist::
+  PersistedState::encode_record`, reused by this plane's own `raftkv.wal`)
+  used to be plain newline-terminated `serde_json` with no per-record
+  checksum — a bit-flip landing inside a byte that kept the JSON
+  syntactically valid could produce an undetected-corrupt record rather
+  than a decode error. Every WAL line now carries a CRC32 checksum over its
+  JSON payload, so a corrupted-but-parseable record is caught and dropped
+  (along with everything after it in the file) instead of silently
+  decoding into a wrong value. If a `check_cycles`/`check_durability`/
+  `check_convergence` failure still surfaces from this pass at depth, that
+  remains a **real finding**, not a reason to weaken the fault rate or the
+  assertion (see `wal_fault_disk_config`'s own doc in
+  `raftkv_linearizable.rs`).
 - **`ANIMUS_SHRINK` wiring (ADR 0061 rung B4)** — this is the worked example
   the "Failure minimization" section above points to. `Scenario`/`Nemesis`
   derive `Serialize`/`Deserialize`; `scenario_candidates` reduces the fault
@@ -354,15 +400,40 @@ retrievable from git history.)
   coordinator-abandoned transaction still converges: `Workload::
   abandon_prepare_pct`/`abandon_commit_pct` model a coordinator that stops
   mid-2PC (after a successful prepare, or after a confirmed-but-unresolved
-  commit) — recorded `info`, never `fail` (house rule). ~25 frozen cells:
+  commit) — recorded `info`, never `fail` (house rule). ~33 frozen cells:
   3 baselines (default/rmw-heavy/read-heavy mix), 2 coordinator-abandon
   cells, participant/anchor leader-kill × 3 timings each, partition-during-
   prepare × 3 timings, lossy links, clock skew within/beyond
   `HLC_MAX_OFFSET` (beyond is a **liveness**-only knob — some reads may time
   out, `check_cycles` must stay green throughout, per the ADR's Decision
-  section), and 6 compound cells crossing abandonment/faults/workload mix.
-  Depth knob **`ANIMUS_TXN_SEEDS`** (default 1 = frozen; `seed_expand`'s
-  usual variant-0-keeps-the-canonical-seed convention).
+  section), 6 compound cells crossing abandonment/faults/workload mix, and
+  (ADR 0061 Decision 3) a second fault-primitives tier:
+  `ParticipantFsyncLie`/`AnchorFsyncLie` (`DiskConfig::set_fsync_lie_prob`,
+  scoped per-group via `set_disk_config_for` — this corpus's 3 independent
+  groups need per-group scoping the single-group `raftkv_linearizable.rs`
+  corpus didn't) each paired with a same-group leader kill shortly after
+  (`FSYNC_LIE_REVEAL_GAP`), so the crash's un-synced-bytes handling reveals
+  whatever the lie actually lost on a staged write — real teeth for 2PC's
+  own durability claim, compounding the existing coordinator-abandon
+  workload with a genuine durability lie instead of a clean crash; `Chaos`
+  (drop+duplicate folded into one `NetConfig`, standalone and read-heavy
+  cells — deliberately excludes `set_corrupt_prob`, same unfixed
+  `animus-cp-data::codec` allocator-abort gap `raftkv_linearizable.rs`'s own
+  `Chaos` excludes, see `docs/engineering-lessons.md`); and
+  `AnchorClockDrift` (`Simulator::set_clock_drift_for`, standalone and
+  compounded with a participant kill) — a clock that starts synced and
+  degrades *live* over the fault window rather than snapping to a fixed
+  skew instantly, same liveness-only discipline as `ClockSkewBeyond`.
+  `heal_all` resets both the per-node `DiskConfig` overrides and clock
+  drift alongside its pre-existing net-config/clock-skew resets (the
+  identical "a fired fault must not outlive its window" trap
+  `raftkv_linearizable.rs`'s own `heal_all` documents for its own,
+  globally-scoped `FsyncLie`). Depth knob **`ANIMUS_TXN_SEEDS`** (default 1
+  = frozen; `seed_expand`'s usual variant-0-keeps-the-canonical-seed
+  convention; held green at `=40`, `corpus-deep.yml`'s full nightly depth,
+  end to end including `check_kind_consistency` — see the `#488` bullet
+  below for the harness bug that used to make full-corpus runs above
+  `~s24` non-convergent).
 - **A single-decider assumption in the recovery protocol itself, found by
   this corpus under real fault injection**: see the ADR 0018 PR6 amendment
   for the full account — the coordinator's own decide attempt and the
@@ -371,6 +442,38 @@ retrievable from git history.)
   the coordinator's own round trip is still genuinely in flight past
   `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
   is impossible by construction" assert does not tolerate that.
+- **Issue #488 — `check_kind_consistency` finding, diagnosed as a
+  test-harness-only bug, not a production gap.** First found incidentally
+  while validating the ADR 0061 Decision 3 fault-primitives tier at this
+  corpus's own nightly CI depth (`ANIMUS_TXN_SEEDS=40`, matching
+  `corpus-deep.yml`'s existing txn tier): `compound_lossy_and_anchor_kill_s25`
+  (seed `8035380114809936673`), a `Lossy` + `AnchorLeaderKill` cell, produced
+  a `KIND_LSI` derived row permanently diverging from its own base row
+  (`Some([1, 11])` vs `Some([1])`). Root cause: `Topology::start` used to
+  build **one `MemoryEngine` per group and `.clone()` it into all 3
+  replicas** — `MemoryEngine` clones share state (`Arc<Mutex<Inner>>`), so
+  the corpus's "replicas" secretly shared one physical store. A faster
+  replica's apply could durably write the shared engine before a slower
+  replica's own, separate `apply_and_compact` call for the *same* log index
+  read it back — steering that replica's `TxnCommit`/`TxnStage` apply into
+  an already-decided/idempotent-replay no-op branch that (correctly, for a
+  genuine replay) skips the `TxnTracker` update. When the two replicas that
+  never took the genuine `Pending -> Committed` transition are exactly the
+  two that survive the anchor's leader kill, neither has a populated
+  `TxnTracker::unresolved_decided` for the transaction, so
+  `resolver_tick`'s proactive resolve never fires and the `KIND_LSI` row
+  (only ever materialized inside a genuine local `TxnResolve` apply, never
+  re-derived from engine state) is orphaned forever — while the base row
+  keeps reading correctly everywhere, because its own visibility comes from
+  on-the-fly intent resolution keyed off the (shared, so already-correct)
+  engine status. `animus-cp-data`'s apply arm, `TxnTracker`, and the
+  commit-confirmation path are all sound; production gives every tablet
+  replica its own private engine (ADR 0050) and has no equivalent exposure.
+  **Fixed** by giving each replica its own `MemoryEngine::new()` in
+  `Topology::start`, matching `raftkv_linearizable.rs`'s `Group::start`
+  (`factory(&sim, id)` per node id) — full account in the issue and in
+  `docs/engineering-lessons.md`'s entry on shared-state test doubles. The
+  corpus is green end-to-end at `ANIMUS_TXN_SEEDS=40` with this fix.
 
 ### Elle-adjacent, but not Elle: the DynamoDB Streams lineage-walk corpus (ADR 0042/0043, round-3 PR8)
 
@@ -419,6 +522,38 @@ retrievable from git history.)
   here is ever expected to answer `TrimmedDataAccess`. Depth knob
   `ANIMUS_STREAM_SEEDS` (default 1 = the frozen cells; held green at
   `=40`, matching `corpus-deep.yml`'s nightly tier).
+- **Cells 11/12 (ADR 0058 Train 2 rung 3) rebuild the SAME lineage/
+  durability claims on the DEFAULT production split path — the in-place
+  atomic fork — alongside (never replacing) the copy-based cells above**:
+  `inplace_split_lineage_frozen_at_fork` (sealed history + backlog, sealed
+  in FULL before the fork — the fork is atomic, so there is no
+  "meanwhile" window to interleave a seal into the way the copy-based
+  workflow's build/freeze phases have — then `BeginSplitInPlace` →
+  fork+materialize converge → `CutoverSplit`, proposed immediately since
+  the in-place branch carries no freeze/veto gate of its own → both
+  children EMPTY change logs, sealing their own epoch 0, exactly-once
+  across the walk) and `inplace_split_races_an_open_seal` (the identical
+  seal-crash/store-outage/healed-retry fault sequence
+  `copy_split_endgame_survives_seal_faults` injects, applied to the
+  parent's FINAL seal right before `BeginSplitInPlace` — the retried
+  seal's epoch is what the frozen `split_lineage` names). Unlike the
+  copy-based cells (a control-metadata-only `BeginSplit`/`CutoverSplit`,
+  the parent hosted directly via this file's own `start_group`), the
+  in-place fork is materialized by `animus_cp_data::host::Reconciler`, so
+  both cells build a small `InplaceCluster` of `Reconciler<SimEnv,
+  MemoryEngine>` instances and drive it to convergence at each stage via a
+  local `tick_one`/`converge` pair (adapted from this file's own
+  pre-existing `drive`, mirroring `animus-cp-data/tests/
+  inplace_split_reconciler.rs`'s and `backfill_fault_corpus.rs`'s own
+  identical harness shape for the SAME mechanism) — `wrap_group` then
+  clones the reconciler-hosted `RaftKvNode` handles back into this file's
+  own plain `Group` so every pre-existing helper
+  (`elect`/`write_and_journal`/`seal_now`/`verify_lineage`, …) runs on the
+  reconciler-hosted parent or a split child completely unmodified. Both
+  cells held clean at `ANIMUS_STREAM_SEEDS=300` with no regression to the
+  other ten cells in the file — no exactly-once/ordering/lineage violation
+  surfaced; the in-place split's interaction with stream sealing behaves
+  exactly as designed.
 - **A real bug this corpus found while being built** (not in the streams
   subsystem — in the corpus's own test harness): `RaftKvNode::start_scoped`
   pins every group to `PRIMARY_STREAM`, so two tablet groups sharing the
@@ -447,13 +582,36 @@ retrievable from git history.)
   split_during_backfill_converges_with_correct_final_gsi`.
 - **Frozen named cells**: `single_tablet_backfill_converges`,
   `live_writes_race_the_sweep`, `leader_kill_mid_sweep`,
-  `two_indexes_creating_independently`, `drop_table_mid_backfill` (the two
+  `two_indexes_creating_independently`, `drop_table_mid_backfill`,
+  `streamed_mid_backfill_seed_flag_never_misclassified` (the original two
   zero-copy-split cells — `concurrent_split_during_backfill`,
   `split_after_tablet_already_reported_done` — died in ADR 0050 Train B
-  rung 2, see the file's tombstone; split-during-backfill returns on the
-  copy-based mechanism in the cutover rungs). Depth knob `ANIMUS_BACKFILL_SEEDS` (default
-  1 = the frozen cells; held green at `=40` in well under a second,
-  matching `corpus-deep.yml`'s nightly tier).
+  rung 2, modeling a split mechanism that no longer exists; see the file's
+  own tombstone comment for the historical account). **Rebuilt on the
+  in-place atomic fork (ADR 0058), the DEFAULT production split path**:
+  `split_during_backfill_converges` (cutover fired deliberately BEFORE the
+  parent's own backfill sweep finishes — `CutoverSplit`'s in-place branch
+  carries no drain/backfill veto of its own, so this is a real race a
+  production split can hit; both children converge their own sweep
+  independently afterward, from the EMPTY `KIND_CURSOR` scope
+  `trim_split_child` unconditionally leaves them with) and
+  `split_after_tablet_already_reported_done` (the G1 orphan-report case:
+  the parent already reported completion before the split even began;
+  `CutoverSplit` leaves that stale `index_backfill` row behind as a
+  harmless orphan, and the completion aggregator must wait for both
+  children's own independent reports instead of counting it). Both drive
+  the whole fork/materialize/cutover sequence through
+  `animus_cp_data::host::Reconciler`, mirroring
+  `animus-cp-data/tests/inplace_split_reconciler.rs`'s own harness shape
+  (a local `drive`/`tick_one`/`converge` trio, since `Reconciler::tick`
+  polls internally via `env.sleep` and integration test binaries can't
+  share private items) — then wrap the converged children's `RaftKvNode`
+  handles back into this file's own plain `Group` so every pre-existing
+  helper (`elect`/`backfill_seed_tick`/`drive_sweep_to_completion`/
+  `mark_backfilled`/`maybe_flip_active`/`assert_full_coverage`, …) runs on
+  a split child completely unmodified. Depth knob `ANIMUS_BACKFILL_SEEDS`
+  (default 1 = the frozen cells; held green at `=300` in ~1.5s, well past
+  `corpus-deep.yml`'s nightly `=40` tier).
 - **A real, previously-undetected bug this corpus found on its very first
   run, at every seed** (not just under fault injection — a structural
   defect, reproducible without any injected fault at all): the backfill
@@ -486,6 +644,38 @@ retrievable from git history.)
   engine-global markers already rely on. See
   `docs/engineering-lessons.md` for the general lesson and
   `advance_backfill_cursor`'s own doc for the full account.
+- **Four `Env`-level fault-primitive cells (ADR 0061 Decision 3)** add
+  genuinely new fault kinds this corpus hadn't exercised, each a close copy
+  of an existing cell with one or two added fault calls, never modifying
+  the originals: `duplicate_proposals_leader_kill_mid_sweep`
+  (`NetConfig::set_duplicate_prob(0.15)` globally, on top of
+  `leader_kill_mid_sweep` — proves the seeder's coverage tracking and the
+  completion aggregator's tally are correct under duplicated Raft traffic,
+  not just a clean network), `wal_fsync_lie_leader_kill_mid_sweep`
+  (`DiskConfig::set_fsync_lie_prob(0.3)` globally, on top of the same base
+  cell — proves the backfill cursor's durability claim survives a lied-to
+  `sync` on the crashing leader), `backfill_cursor_wal_torn_on_restart` (a
+  global `DiskConfig{torn_tail_on_crash: true, corrupt_on_crash: true, ..}`
+  combined with the `crash` → `restart` → `stop` → fresh-`RaftKvNode`
+  idiom `backup_fault_corpus.rs`'s own fault-primitive cells and
+  `docs/engineering-lessons.md` document — the restarted node itself goes
+  on to serve the rest of the sweep and is read directly at the end, so the
+  cell has real teeth rather than crashing-and-moving-on), and
+  `chaotic_network_live_writes_race_the_sweep` (a compound `NetConfig` — 5%
+  drop, 10% duplicate — active for the group's whole lifetime, on top of
+  `live_writes_race_the_sweep`). `NetConfig::set_corrupt_prob` is
+  deliberately excluded throughout: as of this corpus's own branch,
+  `animus-cp-data::codec`'s `Vec::with_capacity(n as usize)` call sites
+  read an untrusted wire length prefix with no upper-bound check, so
+  corrupting a message risks an allocator abort rather than a clean
+  application-level error — safe to add once that fix lands.
+  `DiskConfig::set_enospc_prob`/`set_error_prob` stay out of this whole
+  file for a different, permanent reason: their error branches in
+  `persist_wal` are `assert!(halted.load(..), ..)`, and this corpus's
+  scenarios never call the per-node `shutdown()` that sets `halted`, so
+  firing either on a live node hard-panics the test process. All four hold
+  clean at default depth and `ANIMUS_BACKFILL_SEEDS=40` (nightly CI's own
+  depth for this file), with no regression to any existing scenario.
 
 ### Elle-adjacent, but not Elle: the on-demand backup capture fault corpus (ADR 0059 Train 1 PR③)
 
@@ -557,6 +747,55 @@ retrievable from git history.)
   `animusd/tests/dynamo_restore.rs`'s job. Depth knob `ANIMUS_BACKUP_SEEDS`
   (default 1 = the frozen cells; held green at `=100` for the restore cells,
   `=200` for the whole file, both in well under a second).
+- **Three `Env`-level fault-primitive cells (ADR 0061 Decision 3) add
+  genuinely new fault kinds this corpus hadn't exercised**, each a close
+  copy of an existing cell with one added fault call, never modifying the
+  originals: `wal_fsync_lie_leader_kill_mid_capture`
+  (`DiskConfig::set_fsync_lie_prob(0.3)` globally before the crash — proves
+  the capture cursor's durability claim survives a lied-to `sync` on the
+  crashing leader), `chaotic_network_capture_converges` (a compound
+  `NetConfig` — 5% drop, 10% duplicate — active for the group's whole
+  lifetime, proving ordinary Raft/2PC retry carries the capture driver and
+  completion aggregator through a lossy/duplicating network), and
+  `capture_driver_wal_torn_on_restart` (a global `DiskConfig{torn_tail_
+  on_crash: true, corrupt_on_crash: true, ..}` set before group startup,
+  combined with `capture_driver_node_crash_restart`'s fresh-process-restart
+  idiom — see `docs/engineering-lessons.md`'s entry on why that combination
+  needs `crash` → `restart` → `stop`, not `stop` alone, to actually exercise
+  the tear ahead of the fresh restart). `NetConfig::set_corrupt_prob` is
+  deliberately excluded from `chaotic_network_capture_converges`: as of
+  this corpus's own branch, `animus-cp-data::codec`'s
+  `Vec::with_capacity(n as usize)` call sites read an untrusted wire length
+  prefix with no upper-bound check, so corrupting a message risks an
+  allocator abort rather than a clean application-level error — safe to add
+  once that fix lands. `DiskConfig::set_enospc_prob`/`set_error_prob` stay
+  out of this whole file for a different, permanent reason: their error
+  branches in `persist_wal` are `assert!(halted.load(..), ..)`, and this
+  corpus's scenarios never call the per-node `shutdown()` that sets
+  `halted`, so firing either on a live node hard-panics the test process.
+- **Cell 14 (ADR 0058 Train 2 rung 3) rebuilds the §6 re-planning claim on
+  the DEFAULT production split path — the in-place atomic fork — alongside
+  (never replacing) `split_races_capture_and_replans_onto_descendants`'s
+  own copy-based cell above**: `inplace_split_races_capture_and_replans_
+  onto_descendants` cuts over deliberately before the parent's own capture
+  finishes (`CutoverSplit`'s in-place branch carries no freeze/veto gate of
+  its own), then proves the identical §6 claim — the manifest's authoritative
+  tablet list ends up naming exactly the two children, never the retired
+  parent, with no row ever double-counted. **The lightest of the three
+  in-place ports** (mirroring `backfill_fault_corpus.rs`'s/`stream_lineage_
+  corpus.rs`'s own pair): the §6 re-planning logic under test
+  (`Metadata::backup_capture_target`/`live_split_descendants`/
+  `backup_ready_to_complete`/`backup_manifest_tablet_progress`) only ever
+  reads `Metadata::split_lineage`, entirely split-mechanism-agnostic, so
+  swapping the trigger for `BeginSplitInPlace`/`CutoverSplit` driven through
+  `animus_cp_data::host::Reconciler` (the same local `tick_one`/`converge`
+  pair the two sibling ports use) is the whole port — and real in-place
+  fork+materialize clones+trims each child's own share of the parent's data
+  automatically, eliminating the copy-based cell's manual per-row copy loop
+  entirely rather than merely relocating it. Held clean at
+  `ANIMUS_BACKUP_SEEDS=300` with no regression to the other twelve cells in
+  the file — no §6/double-count violation surfaced; the in-place split's
+  interaction with backup capture behaves exactly as designed.
 
 ### Elle-adjacent, but not Elle: the PITR sealing + restore corpus (ADR 0059 §9/§10, Train 3)
 
@@ -672,3 +911,33 @@ retrievable from git history.)
   first. All three are hand-scripted-`Metadata`-corpus pitfalls, not bugs
   in `pitr_replay_segments`/`pitr_seal_now` themselves; see
   `docs/engineering-lessons.md` for the general lessons.
+- **Train 3 PR③ wires in five of the ADR 0061 Decision 3 fault primitives**,
+  the same pass the sibling raftkv/txn/backup corpora already got:
+  `wal_fsync_lie_kill_sealing_leader` (`DiskConfig::set_fsync_lie_prob` on
+  cell 3's own crash-mid-seal shape — the crashing leader's recent syncs may
+  have lied about durability, so `crash`'s default whole-buffer-drop loses
+  more than an un-lied crash would; the retry still recovers the full
+  backlog, since Raft safety only ever needs a *majority* to have durably
+  persisted a committed entry), `chaotic_network_pitr_rollover` +
+  `chaotic_network_idle_group_never_proposes_a_pitr_seal` (a compound 5%
+  drop / 10% duplicate `NetConfig` over cells 1 and 2 — **never**
+  `set_corrupt_prob`: `animus-cp-data::codec`'s `Vec::with_capacity(n as
+  usize)` sites over an untrusted wire length prefix are still unbounded on
+  this branch, verified directly; sibling PR #485 fixes it but had not
+  landed here, so a corrupted length prefix near `u32::MAX` would abort the
+  process — same conservative exclusion the sibling corpora made),
+  `wal_torn_on_crash_kill_sealing_leader` (`DiskConfig::torn_tail_on_crash`/
+  `corrupt_on_crash` on cell 3's shape, but — unlike a bare copy — the
+  crashed node is brought all the way back via `crash` → `restart` → `stop`
+  → a fresh `RaftKvNode::start_hosted`, then driven through a further
+  write/seal round; see `docs/engineering-lessons.md`'s "crash-only disk
+  fault has zero test teeth" entry for why the restart is load-bearing here,
+  not optional — `current_open_pitr_epoch` is derived only from the
+  hand-scripted `Metadata`, so a tear nothing ever reads back proves
+  nothing), and `restore_to_random_second_under_clock_drift`
+  (`Simulator::set_clock_drift_for` on the sealing leader in place of cell
+  8's leader-kill nemesis — `wall_ms` is read live off that leader's own
+  drifted `env.wall_now()` at each seal rather than a synthetic counter, and
+  `assert_replay_matches_model` still has to hold at every recorded second).
+  Held green at `ANIMUS_PITR_SEEDS=40` alongside every other cell in this
+  file (same knob).

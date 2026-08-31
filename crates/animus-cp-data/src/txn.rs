@@ -110,7 +110,15 @@
 //! Decode functions here treat malformed bytes as a hard bug (this crate
 //! only ever reads back what it itself wrote) rather than a recoverable
 //! error, mirroring `seal.rs`/`ceiling.rs`'s "an engine-internal marker
-//! should never be malformed" doctrine.
+//! should never be malformed" doctrine. **That doctrine covers panics, not
+//! allocator aborts**: a length-prefixed count nested inside a stored
+//! envelope (`kind_writes`'s own `n`) could in principle still arrive via a
+//! corrupted/adversarial `InstallSnapshot` image, bypassing the
+//! `KvCommand` decode path entirely — so, like `codec.rs`'s own wire
+//! decoder, a collection pre-sized from such a count caps its requested
+//! capacity (`.min(1 << 20)`) rather than trusting it outright. See
+//! `codec.rs`'s module doc for the full account of the DoS class this
+//! guards against.
 
 use animus_env::NodeId;
 use animus_tablet::{KeyRange, TOKEN_BYTES};
@@ -247,6 +255,49 @@ pub enum StageOutcome {
     /// already decided by a concurrent recovery push before this genuine
     /// stage arrived (see `KvCommand::TxnStage`'s resurrection-guard doc).
     Fenced,
+}
+
+/// The result of one **apply-time `TxnResolve`** attempt (ADR 0018 §2
+/// write-loss amendment, §3/§6 of the 2026-08-27 amendment) — the
+/// `TxnResolve` analogue of [`StageOutcome`], closing the gap that
+/// amendment names: `RaftKvNode::txn_resolve`'s only signal used to be
+/// "did this entry apply," which a **fence-miss no-op** (a concurrent split
+/// moved the target key's range out from under the caller's routing
+/// decision between `cp_route` and this entry's actual apply) satisfies
+/// exactly as well as a genuine resolve — the proposer had no way to learn
+/// its own resolve never took effect, and (per the amendment's §4) this is
+/// the leading hypothesis for a real captured "acked write lost, no error
+/// anywhere" trace. Recorded per apply, keyed by Raft log index and paired
+/// with the entry's own term (mirroring [`StageOutcome`]/`CasResults`), so
+/// every replica records the identical value and a proposer can poll for
+/// it once its own entry applies.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolveOutcome {
+    /// Every key in `keys` fell inside this group's live fence and was
+    /// resolved (or had already been resolved — an idempotent WAL-replay
+    /// or retried resolve is not a failure). The carried `outcome`, if this
+    /// group anchors the record, also matched the record's own decided
+    /// status.
+    Resolved,
+    /// The whole entry no-op'd, whole-or-nothing, because at least one key
+    /// in `keys` (or a derived kind-write key a commit was about to
+    /// materialize) fell outside this group's current fence or into an
+    /// already-sealed range — a concurrent split or freeze moved the
+    /// key(s) out from under the caller's routing decision between
+    /// `cp_route` and this entry's actual apply. **The caller must
+    /// re-route with fresh metadata and retry the resolve against
+    /// whichever tablet(s) now actually own these keys — never treat this
+    /// as done**, since nothing here touched the stored intent(s) at all.
+    Fenced,
+    /// Defense-in-depth (ADR 0018 §2/PR6): this group anchors `txn_id`'s
+    /// record, and the carried `outcome` did not match that record's own
+    /// already-decided status — the whole entry no-op'd. No known live
+    /// violator as of this variant's introduction (see
+    /// `KvCommand::TxnResolve`'s doc); re-routing would not help, since the
+    /// mismatch is against this group's own record, not a stale route —
+    /// reported distinctly from `Fenced` so a caller (or an investigator)
+    /// never conflates the two causes.
+    OutcomeMismatch,
 }
 
 /// A transaction's status as observed by a caller with **no local record
@@ -543,7 +594,18 @@ impl<'a> Cursor<'a> {
     /// ADR 0046 A1: the exact inverse of [`put_kind_writes`].
     fn kind_writes(&mut self) -> Option<Vec<crate::KindWrite>> {
         let n = self.u32()?;
-        let mut out = Vec::with_capacity(n as usize);
+        // `n` is a length prefix read before any element is validated
+        // against the remaining buffer. This module's own values are
+        // normally only ever this crate's own committed writes (see the
+        // module doc), but a corrupted/adversarial `InstallSnapshot` image
+        // could still smuggle a crafted envelope straight into the engine
+        // without ever passing through `codec.rs`'s `KvCommand` decode —
+        // cap the requested capacity so a hostile `n` near `u32::MAX`
+        // can't demand a many-GB allocation and trigger an allocator
+        // abort. Mirrors the `.min(1 << 20)` idiom `codec.rs`/`backup.rs`/
+        // `segment.rs` already use for the identical untrusted-length
+        // pre-allocation shape.
+        let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
         for _ in 0..n {
             out.push((self.u8()?, self.bytes()?, self.opt_bytes()?));
         }
@@ -707,7 +769,9 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Option<TxnRecord> {
         _ => return None,
     };
     let n = c.u32()?;
-    let mut intent_spans = Vec::with_capacity(n as usize);
+    // Capped pre-allocation against an untrusted length prefix — see
+    // `Cursor::kind_writes`'s comment above for why.
+    let mut intent_spans = Vec::with_capacity(n.min(1 << 20) as usize);
     for _ in 0..n {
         intent_spans.push(c.table_span()?);
     }

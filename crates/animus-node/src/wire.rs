@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::{SeedRow, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView};
+use animus_cp_data::{
+    ResolveOutcome, SeedRow, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+};
 use animus_env::NodeId;
 use animus_tablet::KeyRange;
 
@@ -928,7 +930,17 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // included, for the identical reason `ExpireStreamShards` isn't:
         // its only intended caller (`pitr_janitor::pitr_janitor_loop`)
         // already proposes directly off its own live `RaftNode` handle.
-        | MetaCommand::MarkBackupPitrBase { .. } => true,
+        | MetaCommand::MarkBackupPitrBase { .. }
+        // Directed-Placing completion record (ADR 0062 §3): a tablet
+        // leader's own "my locally-driven Raft membership has converged
+        // to this child's placement target" report, from wherever that
+        // leader actually runs — the identical relay reasoning as
+        // `MarkIndexBackfilled`/`SealStreamShard` above. The aggregating
+        // side of this catalog is the reconcile loop's own directed-Placing
+        // phase (a later rung), which is control-plane-leader-only and
+        // proposes `CasTabletReplicas` directly off its own live
+        // `RaftNode` handle, so it needs no relay path of its own.
+        | MetaCommand::MarkSplitPlacingDone { .. } => true,
 
         // Online growth (ADR 0030): admin add-member registers a new raftkv
         // id as `Down` — see the doc above for why this is safe to relay
@@ -1171,6 +1183,21 @@ pub enum ClientResponse {
     /// does the answering tablet still hold a live intent for the queried
     /// `txn_id` over the queried span?
     TxnVerifyReply { staged: bool },
+    /// Reply to [`TxnResolve`](ClientRequest::TxnResolve) (ADR 0018 §2
+    /// write-loss amendment §3/§6): the resolve entry committed and
+    /// applied, carrying the actual [`ResolveOutcome`] it produced.
+    ///
+    /// **A caller must check `outcome` before treating this as done** —
+    /// `Resolved` is the only success case; `Fenced`/`OutcomeMismatch`
+    /// mean nothing here actually resolved (most commonly a concurrent
+    /// split moved the target key's range out from under the caller's
+    /// routing decision between `cp_route` and this entry's actual apply),
+    /// and the caller must re-route with fresh metadata and retry against
+    /// whichever tablet(s) now actually own these keys. Before this
+    /// variant existed, every case here (including a fence-miss no-op)
+    /// replied `ClientResponse::PutOk`, indistinguishable from a genuine
+    /// resolve — the exact gap the amendment names.
+    TxnResolved { outcome: ResolveOutcome },
 }
 
 #[cfg(test)]
@@ -1364,6 +1391,10 @@ mod tests {
             },
             MetaCommand::MarkBackupPitrBase {
                 backup_id: "b1".to_string(),
+            },
+            MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
             },
         ];
         for cmd in &true_cases {

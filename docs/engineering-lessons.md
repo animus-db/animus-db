@@ -32,6 +32,30 @@ debugging anything that feels like it might have happened before.
 > citation needs chasing.
 
 ### Testing
+- **A `dynamo_retry`+`CreateTable` fixture helper must tolerate
+  `ResourceInUseException` on the retry, not just retry 500s (2026-08-31,
+  issue #461).** `create_table` (`crates/animusd/src/schema.rs`) calls the
+  blocking `await_table_serveable` before it acks 200 — a real wait that can
+  itself time out server-side and surface as a retryable 500, *after* the
+  schema commit it was waiting on already landed durably. A test's
+  `dynamo_retry` helper that retries only on `status == 500` then replays
+  the identical `CreateTable` into the duplicate-name check ahead of that
+  wait, which correctly answers `400 ResourceInUseException` — a legitimate
+  outcome of retrying a non-idempotent-from-the-client's-view operation, not
+  a test failure. `dynamo_expression_surface.rs`'s `setup()` hard-asserted
+  200 and had no such tolerance, so it flaked under exactly this timing.
+  Fixed by treating a `ResourceInUseException` `CreateTable` reply as
+  success **and** re-probing serveability explicitly in that branch (a
+  `ConsistentRead` `GetItem` run through the same `dynamo_retry` helper) —
+  the 400 path skips the server's own `await_table_serveable` wait, so
+  "the table exists" and "the table is serveable" are not the same fact
+  once you take that branch. A repo-wide grep at fix time
+  (`ResourceInUseException` in `crates/animusd/tests/`) found no existing
+  shared helper doing this — every other hit was a test deliberately
+  asserting the *rejection* case — so there was nothing to reuse; if a
+  second `setup()` trips the same race, factor the tolerant-CreateTable +
+  readiness-reprobe pair into `tests/support/mod.rs` rather than hand-rolling
+  a third copy.
 - **Adding a new AWS-documented request-shape limit needs a workspace-wide
   sweep for pre-existing test helpers that already build a request past it,
   not just a decode-level unit test (2026-08-23, DynamoDB batch/transaction
@@ -2999,6 +3023,25 @@ debugging anything that feels like it might have happened before.
   proactively before a from-scratch `--all-targets` gate run in a
   disk-constrained sandbox; reach for (1) if a run has already ballooned
   `target/` and a full `cargo clean` would be too slow to recover from.
+  **Addendum (2026-08-29): the disk is shared across sibling worktree
+  agents, not just your own crate's `target/`.** A gate run flip-flopped
+  between ENOSPC and 12GB free within minutes with zero commands run in
+  between — `du -sh /home/user/animus-db/.claude/worktrees/*/target
+  /home/user/animus-db/target` showed 12–17GB apiece in *other* agents'
+  worktrees and the base checkout, ballooning and draining on their own
+  schedule as those agents built and cleaned. `cargo clean` in your own
+  worktree is necessary but can be insufficient — check sibling worktrees'
+  sizes before concluding the sandbox itself is out of room, and retry a
+  failed gate once or twice before escalating, since a neighbor's build
+  finishing can free multiple GB with no action on your part. `cargo
+  check --workspace --all-targets` (type-checks everything the `#[deny]`
+  lint machinery cares about, no linking) is a much cheaper stand-in than
+  `cargo build --workspace --all-targets` when only verifying that a
+  lint-attribute or type-level change compiles, and `cargo test -p <crate>
+  --lib -j 1` (low parallelism caps peak concurrent temp-file usage) plus
+  a handful of `--test <name>`s targeted at the changed modules is a
+  reasonable substitute for a full per-crate integration suite (84+ test
+  binaries here) when the disk is this contended.
 - **"Converges slowly" and "never converges" produce the same panic message
   and need different investigation methods — instrument the poll itself
   before theorizing** (2026-08-22, `streams_e2e.rs::multi_split_soak_
@@ -3501,6 +3544,23 @@ debugging anything that feels like it might have happened before.
   independent" convention — see that file's identical helpers for the
   general pattern any GSI-`Query`-asserting test should follow).
   (`crates/animusd/tests/update_table_drop_index.rs`.)
+- **A rare, load-sensitive flake needs a matched A/B, not a bigger N on one
+  side.** "6/6 clean on base, 1/3 failing on the branch" from small samples
+  on a shared, variably-loaded machine is exactly the pattern ambient
+  contention produces; the discriminating test is running the same stress
+  harness (e.g. 4 parallel copies of the compiled test binary) back-to-back
+  on both trees and comparing rates. Concrete case: `animusd`'s
+  `dynamo_query_pagination::final_page_carries_no_last_evaluated_key`
+  looked train-caused at small N, then reproduced at ~0.6% on both trees
+  under the matched harness — the real mechanism was the ADR 0055
+  `ConsistentRead: false` replica-local read racing the last write's apply,
+  i.e. a pre-existing race, not the refactor under suspicion.
+- **`cargo test`'s printed `Executable tests/foo.rs (/path/foo-HASH)` line
+  is the only reliable way to name the binary that matches current
+  source** — the deps-dir filename hash derives from package id/deps/
+  profile, not source content, so the same hash is silently overwritten on
+  rebuild; hardcoding a previously-seen hash in a bisection/stress script
+  can run stale code with zero indication.
 
 - **`prop_assume!` with a coin-flip-odds filter is a time bomb the moment
   anyone raises the case count — generate the dependent value directly
@@ -3569,6 +3629,46 @@ debugging anything that feels like it might have happened before.
   should check whether the reference's equality is value- or
   representation-based before writing the assertion, not after a spurious
   failure sends them chasing a phantom bug in the code under test.
+
+- **A "cheap to clone, clones share state" test double handed to code that
+  models independent replicas silently collapses replica independence —
+  and the symptom looks exactly like a production consensus/tracking bug
+  (issue #488, `crates/animus-test/tests/txn_serializable.rs`).**
+  `Topology::start` built **one `MemoryEngine` per tablet group and
+  `.clone()`d it into all 3 replica `RaftKvNode`s**; `MemoryEngine`'s own
+  doc comment says outright "cheap to clone; clones share state"
+  (`Arc<Mutex<Inner>>`), so the corpus's "3 independent replicas" secretly
+  read and wrote one physical store. Only the Raft layer (log, term,
+  leadership) and each replica's own in-memory `TxnTracker` were genuinely
+  per-replica. Consequence: whichever replica's apply task happened to run
+  first for a log index durably wrote the shared engine, so a *different*
+  replica's own, separately-sequenced `apply_and_compact` call for the
+  identical index could read back a status its own log processing hadn't
+  actually decided yet — silently steering it into an already-decided/
+  idempotent-replay no-op branch that (correctly, for a genuine replay)
+  skips the real `Pending -> Committed` transition and the `TxnTracker`
+  update that transition performs. When the two replicas that happened to
+  take that no-op path were exactly the two that survived a leader kill,
+  neither had a populated `TxnTracker::unresolved_decided` for the
+  transaction, so the resolver's proactive re-propose never fired and a
+  `KIND_LSI` derived row (materialized only inside a genuine local
+  `TxnResolve` apply, never re-derived from engine state) was orphaned
+  forever — a permanent, reproducible-at-depth divergence that looked
+  exactly like a leader-only/liveness gap in `animus-cp-data`'s apply
+  pipeline, and cost a full investigation to clear the production code
+  before the harness was even suspected. Fix: one `MemoryEngine::new()`
+  **per replica**, matching the sibling `raftkv_linearizable.rs` corpus's
+  `Group::start` (`factory(&sim, id)` per node id), which never shared an
+  engine across replicas. **General rule**: before handing the same
+  instance of a "cheap to clone" test double (an `Arc`-backed fake store,
+  an `Rc<RefCell<_>>` counter, anything whose `Clone` impl is documented or
+  obviously implemented as a shared-handle copy) to code meant to model N
+  independent participants, verify the sharing is what you actually
+  intend — a fixture that looks like "one engine per group, replicated
+  normally" reads as correct at a glance and only misbehaves under real
+  timing skew between replicas' own apply rates, exactly the kind of thing
+  fault-injection depth (not the default-depth corpus run) is what
+  actually exposes it.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -8354,7 +8454,10 @@ debugging anything that feels like it might have happened before.
   tablet at all" were both written before any workflow needed a node to
   host a tablet for a reason OTHER than being in its own `replicas`.
   (`crates/animus-cp-data/src/host.rs`'s `plan` phase 1's second
-  host-candidate branch and phase 3's `recruited_for_split` exclusion.)
+  host-candidate branch and phase 3's `recruited_for_split` exclusion —
+  both later deleted, along with the rest of Train 2 Stage 1/2, by ADR
+  0062 rung 5; the general rule above still applies to any future
+  membership-change call site.)
 - **A "clone this engine" primitive must take the caller's own already-open
   source handle, never a bare identity it re-opens itself — re-opening the
   same on-disk state from two independent in-process instances is a
@@ -8601,6 +8704,51 @@ debugging anything that feels like it might have happened before.
   catches every miss — but only if each intermediate build is actually
   run, since a batch of moves without an intervening build can mask one
   widening behind another's cascading errors.
+- **`Cargo.lock` is deliberately gitignored (`.gitignore`, present since the
+  repo's initial commit, no lockfile ever tracked in history) — a container
+  build or any other recipe that assumes a committed lockfile breaks
+  (ADR 0060 e2e work).** The Dockerfile's own builder stage says as much
+  (`COPY Cargo.toml` only, never `Cargo.lock` — "cargo build mints its own
+  lock file from the registry cache mount"), and this is exactly what a
+  real build does: `docker build`'s first line is `Locking N packages to
+  latest Rust <version>-compatible versions`, freshly resolved every build,
+  not reproduced from a checked-in file. The repo carries no separate
+  written rationale for the choice beyond that comment; treat it as "this
+  workspace resolves dependencies per-checkout, not pinned across commits"
+  and design any new build/CI recipe around that — never add a `COPY
+  Cargo.lock` step or a lockfile-presence check expecting one to exist, and
+  don't be surprised when two builds an hour apart pull a different patch
+  version of some transitive dependency.
+- **A sandboxed dev/build host can lack `CAP_SYS_RESOURCE` at the
+  kernel/hypervisor level, and no per-container `--cap-add` can restore
+  it** (ADR 0060 e2e work, ~3 hours root-causing a `kind create cluster`
+  failure). Every `kind` node's own Kubernetes control plane (`etcd`/
+  `kube-apiserver`/`kube-scheduler`/`kube-controller-manager`, static pods)
+  gets a **negative** `oom_score_adj` from kubelet unconditionally — not
+  configurable via pod spec or kind config, standard "protect the critical
+  pods from the OOM killer" behavior. Applying a negative value needs
+  `CAP_SYS_RESOURCE` at container-create time inside `runc`'s own `nsexec`,
+  and a capability absent from the outermost privilege domain can never be
+  regranted to a nested/privileged container — confirmed here by `docker
+  run --cap-add SYS_RESOURCE` being flatly rejected as "not supported by
+  your kernel or not available in the current environment," not merely
+  denied at use. The symptom at the `kubectl`/kubelet layer gives almost no
+  hint of this: containerd launders the real error into the generic `can't
+  get final child's PID from pipe: EOF`, which looks exactly like a cgroup-
+  driver mismatch, a containerd-version regression, or a seccomp profile
+  issue — all three were tried and ruled out (`SystemdCgroup` true/false,
+  two node images spanning containerd 1.7 and 2.1, an unconfined seccomp
+  profile) before a direct `runc create --debug` reproduction against a
+  hand-built OCI bundle isolated the actual line: `nsexec: failed to update
+  /proc/self/oom_score_adj: Permission denied`. **General rule**: when a
+  nested-container workload fails identically across every runtime-version/
+  cgroup-driver/seccomp permutation you can think to vary, stop varying
+  *its* configuration and check the *host's own* capability set directly
+  (`capsh --print`, or `docker run --cap-add <X> ... true` for the specific
+  capability) — a wrapped, generic runtime error can be hiding a single
+  missing capability that no amount of downstream reconfiguration can work
+  around. See `crates/animus-operator/CLAUDE.md`'s e2e section for the full
+  diagnosis and the exact log signature to grep for.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
@@ -9849,6 +9997,40 @@ debugging anything that feels like it might have happened before.
   suite for the extracted `classify_kind_batch_outcome` predicate
   `poll_probe` now calls, including the term-mismatch case — proven red
   pre-fix by dropping the predicate's term-equality guard).
+  **Amendment (2026-08-29): the two siblings this entry's own "audit every
+  sibling" rule pointed at — `Cas`'s `CasResults` and `TxnStage`'s
+  `StageOutcomes` — turned out to have the identical gap, and this entry's
+  own earlier claim that `CasResults`' shape was "sound for CAS" is
+  corrected here rather than left to mislead a future reader.** That claim
+  reasoned `compare_and_swap` only ever consulted `cas_result` "after
+  confirming the entry applied via a value/ceiling read that already
+  implies commit" — but the actual code never did any such confirming read:
+  `compare_and_swap`'s own poll loop called `cas_result(index)` directly,
+  with no value/ceiling check and (worse) no `is_leader()` guard either,
+  despite a comment claiming a step-down check existed. `stage_outcome`/
+  `wait_stage_outcome` had the `is_leader()` guard but the identical
+  index-only lookup. Both are now fixed exactly like `KindBatchOutcomes`:
+  `CasResults`/`StageOutcomes` store `(term, outcome)`, and
+  `cas_result`/`stage_outcome` take the caller's own accepted `term`,
+  returning `None` (never a stale `Some`) on a mismatch — propagating up
+  through `wait_stage_outcome`, `txn_stage_anchor`/`txn_stage_participant`,
+  and `compare_and_swap` (which also gained the missing `is_leader()` check
+  its own comment had wrongly implied was already there). Regression:
+  `animus-cp-data/tests/cas_outcome_identity.rs`, the `Cas` mirror of
+  `kind_batch_outcome_identity.rs` — same isolate/accept/elect/collide/heal
+  shape, proven red pre-fix by reverting `cas_result` to its index-only
+  form, plus an end-to-end check that the public `compare_and_swap` async
+  entry point itself never surfaces a false `Some(_)` for a truncated
+  attempt. **`TxnResolve` has a related but distinct gap — it has no
+  outcome channel at all, not a term-unsafe one — tracked separately, not
+  closed by this round** (see this file's "A resolve's silent no-op is
+  invisible to its own proposer" entry). **The generalizable lesson,
+  restated**: "audit every sibling" is not satisfied by naming the siblings
+  in a doc comment — it means actually reading each sibling's own call
+  chain down to its lowest-level accessor before asserting any one of them
+  is safe by a different mechanism; an assumption of safety that isn't
+  independently verified is exactly as dangerous as the missing fix itself,
+  because it makes a future auditor skip the very sibling that needed it.
 - **A `CARGO_TARGET_DIR` shared across concurrently-running agent
   worktrees can silently link one session's build against ANOTHER
   session's stale source** (2026-08-23, discovered mid-fix on the
@@ -11660,6 +11842,81 @@ close of it; `TxnResolve`'s own missing outcome channel is the more
 durable fix a future round should reach for instead of another
 individually-discovered-symptom patch.
 
+**Amendment (2026-08-29): the outcome channel above shipped, and it surfaced
+a SECOND, independent bug hiding behind the same missing signal.**
+`KvCommand::TxnResolve` now records a `ResolveOutcome` (`Resolved`/
+`Fenced`/`OutcomeMismatch`) per apply, keyed by Raft log index and paired
+with the entry's own term — the exact `StageOutcome`-shaped channel this
+entry's own closing paragraph named as the durable fix, built the same way
+`CasResults`/`StageOutcomes`/`KindBatchOutcomes` already are (see this
+file's own entries on those three for the shared term-identity doctrine).
+`RaftKvNode::txn_resolve` now returns `Option<(HlcTimestamp,
+ResolveOutcome)>`; `animusd::ClientCtx::txn_resolve_participant` returns
+`Result<ResolveOutcome, String>`; a new bounded-retry wrapper
+(`txn_resolve_participant_retrying`) re-resolves routing **fresh** on every
+attempt when the outcome comes back `Fenced`, instead of the old behavior
+of treating any applied entry as done.
+
+**The second bug, found wiring the channel in, not in a soak**: the apply
+arm's own `TxnTracker::unresolved_decided.remove(&txn_id)` call — which is
+exactly what `txn_resolver_loop`'s passive per-second sweep reads to find
+a decided-but-still-unresolved transaction to keep pushing — ran
+**unconditionally**, before the entry's own fence/mismatch outcome was even
+computed. A `Fenced` resolve therefore erased this group's own memory that
+the transaction still needed resolving, in the identical tick the fence-miss
+happened — the passive safety net had already given up on exactly the
+transaction it exists to rescue, with no way to tell from the outside. This
+is a second, independent, concrete mechanism behind the "resolve reports
+success but the intent stays live" shape this whole entry chases, found
+purely by reading the apply arm's own code once the new outcome value gave
+something to condition the clear on — **the general lesson: adding an
+outcome channel to an apply arm is also the moment to re-audit every OTHER
+side effect that same arm already performs unconditionally, since "this
+entry applied" and "this entry did what it meant to" were conflated
+everywhere in that arm, not just in the one return value with a name**.
+Fixed by gating the `remove` on `resolve_outcome == ResolveOutcome::
+Resolved`.
+
+**A pre-existing regression test's own unstated assumption broke the moment
+this landed, which is the correct outcome, not a regression to work
+around.** `animus-cp-data/tests/txn_recovery.rs::
+pending_txns_reflects_applies_across_restart` resolved with `TxnOutcome::
+Committed { commit_ts: txn_id.ts }` — the pre-decision *candidate*
+timestamp, not the real decided value `commit_at_least` actually returns
+(`mint_at_least` mints strictly above the candidate, so the two are
+essentially never equal) — and asserted `unresolved_decided` cleared
+afterward. Before this fix, the resolve's own `outcome_mismatch` no-op
+still got treated as "done" by the then-unconditional clear, so the test
+passed for the wrong reason: it never actually exercised a genuine resolve
+at all. After the fix, the same stale value correctly no-ops
+(`OutcomeMismatch`) and leaves the tracker untouched, failing the
+assertion — not because the fix is wrong, but because the test was
+silently relying on the exact bug this round closed. **The general lesson,
+sharpened from this file's own recurring theme: a test asserting an
+eventual-consistency-shaped postcondition ("X eventually clears") can pass
+for years on a value that's subtly wrong, as long as something ELSE
+(here, an unconditional side effect one call away) makes the postcondition
+true regardless of whether the call under test actually did its job —
+fixing the masking bug is what makes the test start asserting what it was
+always supposed to.** Fixed by resolving with `commit_at_least`'s own
+returned ts (sound specifically because this test's own scenario has no
+concurrent recovery decider to race — the general rule the crate's own
+docs already state, that a caller must re-read the record's *actual*
+status rather than trust a propose call's own return, still applies
+everywhere a second decider is possible).
+
+New regression at the primitive level: `animus-cp-data/tests/
+txn_resolve_outcome.rs` (a real in-place split forking the **participant's**
+own tablet between the anchor's commit and the participant's resolve,
+proving `Fenced` and — since the participant holds no local copy of the
+anchor's record to reconstruct the value from — that the key stays
+genuinely unreachable, not silently marked done). **Still not attempted**:
+the mandated fresh 30-run un-pinned `SplitMode::InPlace` soak — this round
+closes the structural gap the soak's own investigation named as the
+clearest path forward, but per this file's own "any failure keeps the pin"
+discipline, only that soak can actually move the pin. See ADR 0018's
+2026-08-29 amendment and ADR 0058's matching note.
+
 ## A converged-or-timeout poll can still race if its condition is weaker than what the assertion after it needs (issue #421)
 
 `cluster.rs`/`per_process.rs`'s `await_bootstrap` helpers polled for
@@ -12620,3 +12877,1373 @@ before `poll_probe`'s own task ever took a turn, silently passing for the
 wrong reason. Proven genuinely red pre-fix (removing just the two
 `identity == ProbeIdentity::ValueProves` guards, keeping everything else
 unchanged, reproduces `Some(Confirmed)` on every seed) and green post-fix.
+## A hinted-retry forward's "unreachable candidate" case is not the same case its own fix already covers — and a race a sandbox's own fast localhost never widens is still a real bug (issue #316)
+
+`tests/split_build.rs::split_survives_losing_one_childs_leader_mid_build`
+(the copy-based split-build driver, ADR 0050, kills a `Building` child's own
+leader mid-build) was reported hanging its full 180s budget on `main`,
+nondeterministically. Root cause: `ClientCtx::forward_to_tablet_leader`
+(`animusd/src/forwarding.rs`) — the one hint-chasing forward implementation
+shared by every tablet-id-addressed internal RPC, including the split-build
+driver's own `seed_child_rows` — only chases past a candidate that replies
+with a parseable "not the leader here" refusal. A **transport** failure
+(the candidate is simply unreachable — a killed node) folds into one
+generic sentinel string (`relay_request_with_timeout`'s `"relay to peer
+node failed"`), which doesn't parse as that refusal shape, so the pre-fix
+code took the `else { return resp; }` branch and gave up on the very first
+unreachable hop — never trying `other_tablet_replica_addr`'s fallback to
+either of the tablet's other two live replicas. Because the first guess
+itself is **deterministic** (`resolve_cp_route`'s no-local-replica fallback
+always picks the tablet's first replica in `Metadata` order, a plain read,
+never a liveness check), every subsequent call from the same caller —
+including the split-build driver's own next 200ms tick — reproduced the
+identical dead end forever, which is exactly the reported symptom: full
+budget burned, both children stuck. The fix treats a transport failure the
+same way the function already treats a refusal carrying no hint (mid-
+election): try another known replica, never a terminal return — three
+lines at the one shared choke point, reusing the existing (already-tested)
+candidate-selection/backoff machinery unchanged.
+
+**This function's own doc already named and fixed the *sibling* case** (a
+wrong-but-*reachable* first guess) and even quotes the split-build driver
+as the motivating incident for *that* fix. Reading a doc comment that says
+"this bug is fixed, here's the regression test that proves it" is not the
+same as verifying the fix actually covers the failure mode currently being
+investigated — the earlier fix's own regression test only ever kills the
+*parent's* leader, never a *child's*, so it could not have exercised this
+half of the space at all. Two structurally similar failures (wrong-guess-
+but-alive vs. right-guess-but-dead) sharing one symptom (spins forever)
+are not automatically the same bug with the same fix already applied;
+read the actual branch that fires for the *specific* error string observed,
+not just the nearest doc comment that looks like it already explains the
+shape.
+
+**Reproduction note, useful for calibrating how hard to try before
+concluding "can't repro, ship on code-reading confidence alone":** over 30
+real runs of the target test in this sandbox (single and under 6x CPU
+oversubscription via six `yes` busy-loops), it never failed — localhost
+`TcpStream::connect` to an already-closed listener refuses near-instantly
+here, and this workflow's `N=400` seed rows ship in a single bulk pass
+fast enough that the test's own 30s victim-detection poll usually lands
+*after* the vulnerable shipping window has already closed (the test's own
+doc calls this out: "the kill may land before the build starts or after it
+finishes"). CPU contention widens the window but doesn't reliably land the
+kill *inside* it. **The fix was still provable red-before/green-after
+without ever reproducing the original hang**, by isolating the exact
+mechanism into a new, fully deterministic regression
+(`forward_transport_failure_tests::
+forward_to_tablet_leader_survives_a_dead_first_guess`, `animusd/src/
+lib.rs`): pin RF to a known tablet, kill the *specific*, deterministically-
+computable "first guess" replica (not whichever node the test happens to
+catch leading), call the forwarding primitive directly from a caller with
+zero local replicas, and assert prompt recovery. This is a general
+technique worth reaching for before spending unbounded time chasing a
+racy repro: once a root cause is understood precisely enough to name the
+*exact* deterministic trigger, a narrow test that forces that trigger
+every time is both cheaper to prove red/green with and a more precise
+regression than widening the original racy test's odds of catching it.
+
+**Test-authoring gotcha this surfaced**: `animusd`'s five `E: Env`-generic
+client-path modules (`schema`/`read_path`/`write_path`/`txn_coordinator`/
+`forwarding`, ADR 0061 Phase C's closing rung) carry a hard `#[deny(
+clippy::disallowed_methods)]` on their `mod` declaration in `lib.rs` — this
+covers the module's entire body, **including a `#[cfg(test)] mod` nested
+inside it**. A real-socket `ProdEnv` integration test living in one of
+these five files (the same in-crate-test idiom `lib.rs`'s own
+`confirm_futility_tests`/`index_drain.rs`'s `gsi_drain_cursor_tests` already
+use, needing a private `pub(crate)` handle no external `tests/` binary can
+reach) cannot use `tokio::time::sleep`/`timeout`/`Instant::now` at all —
+`cargo build` fails outright, not just clippy. Since `pub(crate)` is
+crate-visible regardless of which file a test module lives in, the fix is
+simply to put the test in a file that isn't one of the five deny-gated
+ones (`lib.rs` itself, or another ordinary module) rather than beside the
+function it tests — a reminder to check for a module-level `#[deny(...)]`
+before writing a first `#[cfg(test)]` real-socket test into one of these
+five files specifically, not just into `animusd` generally (whose
+package-level `Cargo.toml` override is what makes `tokio::time` fine
+*everywhere else* in this crate).
+
+**A second, more mundane timing lesson from the same new test**: giving a
+test's own outer `timeout(...)` a bound close to the *production* timeout
+the code under test is itself internally bounded by (`CLIENT_TIMEOUT`,
+10s) leaves too little margin — an 8s outer bound raced a legitimately-
+succeeding-but-slightly-slow (occasional CI/sandbox jitter) inner call and
+fired first, misreporting a real pass as `Err(Elapsed(()))`. The fix:
+separate the two jobs. The outer `timeout` only needs to be safely *above*
+every internal ceiling the code under test could legitimately hit (15s,
+comfortably over the 10s internal budget) so it can never fire first and
+be mistaken for the thing under test; the actual "did this stay fast"
+assertion is a separate, tighter elapsed-time check against the *observed*
+duration once the call has already resolved (5s here, well under the
+internal ceiling but with real margin over the normal sub-second case).
+Conflating "don't hang the test suite forever" with "prove this recovered
+quickly" in one bound produces exactly this kind of rare, confusing false
+red.
+
+## A read site with a `tablets_for_table`-shaped scan must filter to the current authoritative owner explicitly (ADR 0059/0050, `BeginBackup` pinning)
+
+`BeginBackup`'s apply arm derived its `pinned_tablets` list from
+`self.tablets_for_table(table)` with no state filter — reasonable-looking,
+since for an in-place-split table (ADR 0058, the default) every row
+`tablets_for_table` returns really is the current authoritative owner of
+its slice of the key range. It stops being true the moment a *copy-based*
+split (ADR 0050, still selectable via `--split-mode copy`) is mid-flight:
+`BeginSplit` mints both children as `Building` rows in `meta.tablets`
+immediately, long before `CutoverSplit` ever flips authority to them, and
+the parent stays `Splitting` — still serving every read/write — for the
+whole build/tail window. A `tablets_for_table` scan during that window
+returns THREE rows covering one range at once, and a caller that doesn't
+know to filter treats the `Building` children as if they were as
+authoritative as the parent: pinning (or otherwise processing) all three
+double-counts the range and points at rows that are both unroutable
+(`topology::tablet_for_key` excludes `Building`) and an incomplete copy.
+The general rule this generalizes to: any new read site built on
+`tablets_for_table` (or an equivalent whole-table tablet scan) must decide,
+explicitly, which `TabletState`s are "the current authoritative owner" for
+its purpose — for split lineage that's `Active`/`Splitting`, never
+`Building` — rather than assuming the scan itself already excludes
+not-yet-live rows. The existing `is_relayable_command`/`cp_serve_forwarded`
+"grep every gating match site" lesson above is the write-side sibling of
+this same failure mode: a set-returning primitive whose membership changes
+mid-lifecycle needs every caller to state its own filter, because the
+primitive can't know which callers only want the settled members.
+
+## `Simulator::stop` does not clear the `crashed` flag `Simulator::crash` set — composing them silently mutes the reconstructed node forever (quiescence corpus fault-primitives wiring)
+
+Writing a crash-based test cell for `animus-cp-data/tests/quiescence.rs`
+(ADR 0061 Decision 3, giving `DiskConfig::torn_tail_on_crash`/
+`corrupt_on_crash` real teeth — see the next entry) needed the genuine
+process-restart shape the sibling `raftkv` corpus's `StopRestart` nemesis
+already uses: `Simulator::stop` (kills tasks + volatile state, keeps
+durable disk) followed by a fresh `RaftKvNode::start` on the same node id,
+which recovers from the durable WAL. But `torn_tail_on_crash`/
+`corrupt_on_crash` only fire inside `Simulator::crash`, not `stop` (see the
+"a crash-only fault has zero test teeth" pattern this composition exists to
+avoid) — so the natural-looking sequence is `crash` (to tear/corrupt the
+un-synced tail) → `stop` (to kill the task so a fresh one can be
+constructed) → reconstruct. That sequence silently breaks: `crash` inserts
+the node into `Simulator`'s shared `crashed: BTreeSet<NodeId>`, and `stop`'s
+own doc says outright "Unlike `crash`, this does not mute or set the node
+`crashed`" — meaning it also doesn't **clear** it. Every message to or from
+a node still in `crashed` is dropped (`DROP ... (crashed)` /
+`DROP ... (sender-crashed)` in the trace), so the freshly reconstructed
+node — despite having brand-new tasks and a live env — never sends or
+receives a single message for the rest of the run. This is genuinely quiet:
+no panic, no error, just a replica that sits at its pre-crash term with
+`engine_applied_index() == 0` forever, which reads exactly like "the
+recovered WAL was empty" rather than "the network is silently muted" — the
+first draft of this test's own failure looked like a WAL-recovery bug for
+several debugging passes before an `eprintln!` of `is_leader`/`term`/
+`engine_applied_index` plus the trace tail made the all-drops pattern
+obvious. The fix is one extra call: `sim.crash(id); sim.stop(id);
+sim.restart(id);` (clears `crashed`; `restart`'s own re-arm step finds
+nothing to re-arm, since `stop` already removed every task it owned) —
+*then* construct the fresh node. **General rule**: two fault primitives
+that individually look composable (each has its own clear, narrow doc)
+should still be traced through each other's state machine before combining
+them in a new way no existing test does — `crash`+`stop` is exactly the
+kind of pairing where each method's doc is accurate in isolation but their
+combined effect on a third piece of shared state (`crashed`) is only
+obvious from reading both source bodies side by side, not from either doc
+comment alone.
+
+## `corrupt_on_crash`'s single-byte WAL corruption can produce a syntactically-valid-but-wrong `HlcTimestamp` that hard-panics a later apply — a fresh, reproducible instance of the "no per-record WAL checksum" gap (quiescence corpus fault-primitives wiring)
+
+Composing `DiskConfig::set_fsync_lie_prob` (accumulate several writes'
+worth of un-synced WAL bytes on a live leader) with a later
+`torn_tail_on_crash`+`corrupt_on_crash` crash and a genuine restart (see
+the entry above) — the only way to give either disk-tearing field real
+teeth — reliably reproduces a **hard `assert!` panic**, not just stale or
+wrong served data: `animus_cp_data::assert_ts_monotonic` (`lib.rs`, ADR
+0018 §2), "HLC ts ... did not strictly exceed the last applied ... the
+witnessing chain is broken," once the recovered replica catches up and
+applies an entry past the corrupted record. Isolated directly: the
+identical scenario and seed with `torn_tail_on_crash` alone (no corruption)
+converges cleanly (`engine_applied_index` matches the honest survivors'
+exactly); adding `corrupt_on_crash` to that same seed panics the whole test
+process every time. The mechanism is exactly what `WalRecord::decode`'s own
+doc and the sibling `raftkv` corpus's `wal_fault_disk_config` doc already
+name as a residual gap, now confirmed to reach further than either
+anticipated: the Raft WAL's on-disk record framing is plain
+newline-terminated `serde_json` with **no per-record checksum**, so a
+single flipped byte that happens to land inside a numeric JSON field (here,
+a packed `HlcTimestamp`) can produce a record that still **decodes
+successfully** — just with the wrong value — rather than the torn/
+unparseable trailing line `decode` is built to tolerate. The already-known
+version of this gap (the sibling `raftkv`/`txn` corpora's own documented,
+unfixed `NetConfig::set_corrupt_prob` finding, an allocator-abort `SIGABRT`
+in `animus-cp-data::codec`'s wire decoder) is the *wire* half of this same
+root cause; this is the *WAL* half, a different call site with a different
+failure shape (a hard-panicking safety assert instead of an OOM abort) but
+the identical missing-checksum cause. **Handled the same way the wire half
+already is**: excluded from the corpus cell (`corrupt_on_crash` stays
+armed-off, `torn_tail_on_crash` alone still gives the cell real, working
+teeth), documented in full in the test's own doc comment, and left as a
+named, unfixed, real finding for its own follow-up issue/PR rather than
+folded into the corpus PR — a fault primitive that reliably hard-panics the
+process is out of scope for an ambient corpus cell's assertions the same
+way `set_enospc_prob`/`set_error_prob` already are for a different reason
+(they hit this crate's own `persist_wal` `halted` assert). **General
+lesson**: when a repo already has one documented, unfixed "no checksum on
+this framing" finding for one call site of a shared codec/record format,
+treat every *other* call site of that same un-checksummed framing as a
+credible candidate for the identical class of bug before assuming a
+freshly-discovered hard panic under `corrupt_on_crash`/`set_corrupt_prob`
+is a coincidence or a test-harness mistake — reach for isolating which
+disk/net-fault knob actually causes it (toggle one off, keep the seed
+fixed, re-run) before suspecting the new test code itself.
+
+## `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` were never actually exercised against a `RaftCore`-backed WAL before (ADR 0061 Decision 3, `stream_lineage_corpus.rs` fault wiring)
+
+Both fields are documented and unit-tested in `animus-sim` itself
+(`tests/disk_faults.rs`) and exercised against `animus-storage`'s
+`LsmEngine` (`tests/lsm_disk_faults.rs`), but grepping the whole workspace
+for either name turned up no use anywhere in `animus-control` or
+`animus-cp-data` — meaning the shared Raft consensus WAL format
+(`animus_control::persist::{WalRecord, PersistedState}`, used by *both* the
+control plane's own `RaftCore<MetaCommand, Metadata>` and every per-tablet
+`RaftKvNode`'s `RaftCore<KvCommand, KvState>`) had never actually been
+crashed-and-torn under simulation before this corpus's own
+`torn_tail_crash_survives_a_true_restart` cell. Worth confirming *why* it's
+safe before assuming so: `PersistedState::decode`/`decode_tagged`
+(`persist.rs`) frame the WAL as newline-delimited JSON and recover via
+`bytes.split(b'\n').filter_map(|line| serde_json::from_slice(line).ok())`
+— any line that fails to parse, not merely a strict trailing partial one,
+is silently dropped. This is a *more* permissive recovery contract than
+`animus-storage`'s own length-prefixed-plus-CRC WAL format (`lsm/wal.rs`),
+which goes out of its way to distinguish a genuinely torn trailing record
+from mid-file corruption by position (`wal_resync_point`) and hard-errors
+on the latter — but it's still sound for this WAL's own recovery
+discipline (an un-replayed record's effect was, by definition, never acted
+on), so `torn_tail_on_crash`/`corrupt_on_crash` compose safely with it with
+no risk of a hard panic or silent divergence, unlike the LSM format's own
+stricter contract. The general check before wiring either fault into a new
+corpus: confirm which WAL/durable-record codec the crashed component
+actually uses, and whether that codec's own recovery already documents (or
+can be shown to have) a total, non-panicking answer for "this record failed
+to parse" — not just a trailing-partial-write answer, since `corrupt_on_
+crash` can in principle land its flipped byte anywhere inside the retained
+(non-dropped) tail, not only in what would otherwise have been a clean
+trailing partial line.
+## A crash-only disk fault has zero test teeth unless something later reads the crashed node's own post-crash state back (`pitr_fault_corpus.rs`, ADR 0061 Decision 3 wiring)
+
+Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a new
+`scenario_wal_torn_on_crash_kill_sealing_leader` cell surfaced a design trap
+worth naming on its own, separate from the already-documented `crash` →
+`restart` → `stop` sequencing gotcha (see the entries this generalizes from,
+found by the sibling backup-corpus PR): in this corpus,
+`current_open_pitr_epoch` — the very value the new cell exists to protect —
+is derived **only** from the hand-scripted `Metadata` struct the test drives
+directly with `.apply()` calls, never from anything read off the crashing
+node's own Raft WAL or storage engine. Copying `scenario_kill_sealing_leader`
+verbatim (crash a node, fail over to the two survivors, never look at the
+crashed node again) and simply turning on the torn-tail disk config would
+have compiled, run green, and proven **nothing**: the tear sits on a file
+nothing in the scenario ever reads again. The fault only gets real teeth once
+the crashed node is brought all the way back — `crash` → `restart` → `stop` →
+a fresh `RaftKvNode::start_hosted` on the same id/engine — and made to
+participate in a *further* round of writes and a second seal, so its own
+recovery from the torn/corrupted tail can actually influence what the next
+`pending_changes()` scan (and therefore the next epoch number) sees. The
+general check this generalizes to: before wiring a disk- or network-fault
+primitive into an existing scenario as a "near-copy plus one fault call",
+trace where the property-under-test's own inputs actually come from — a
+fault that lands on state nothing downstream ever reads is a no-op with a
+green checkmark, not a stronger test.
+
+## Getting a torn/corrupted WAL tail ahead of a *fresh-process* restart needs `crash` → `restart` → `stop`, not `stop` alone (`backup_fault_corpus.rs`, ADR 0061 Decision 3)
+
+Wiring `DiskConfig::torn_tail_on_crash`/`corrupt_on_crash` into a
+`RaftKvNode`-level corpus scenario that also wants a genuine fresh-process
+restart (the `sim.stop` + a brand-new `RaftKvNode::start_hosted` on the same
+id/engine idiom `capture_driver_node_crash_restart`/
+`raftkv_linearizable.rs`'s `StopRestart` nemesis both use) runs into a real
+mismatch between the two primitives: the tear/corrupt logic lives **only**
+inside `Simulator::crash` — `Simulator::stop`'s own disk handling
+unconditionally clears any buffered-but-unsynced bytes with no tear
+consideration at all (see both methods' doc comments), so a scenario that
+only ever calls `stop` can set `torn_tail_on_crash: true` all it wants and
+never actually exercise it. Reaching first is not enough either: `crash`
+also inserts the node into `Simulator`'s `crashed` set, which both the
+send and deliver paths check permanently — a node left in that set (nothing
+but `restart` ever removes it) has every future send and delivery silently
+dropped, including everything a freshly-constructed `RaftKvNode` on that
+same id would try to do, which reads as the fresh node being inexplicably
+unable to participate in Raft at all rather than as a leftover crashed-flag
+bug. The composed fix, safe because nothing drives the executor between
+these three synchronous calls (so `restart`'s re-armed old tasks are
+removed by the immediately-following `stop` before they're ever re-polled):
+`sim.crash(node)` (applies the configured tear/corruption to whatever was
+genuinely buffered at that instant), `sim.restart(node)` (clears the
+`crashed` flag — its task re-arming is a harmless no-op here), `sim.stop
+(node)` (drops those tasks, keeps the now-torn durable state), *then*
+construct the fresh node. Generalizes beyond this one corpus: any scenario
+combining a `DiskConfig` crash-only fault with a `stop`-based fresh-restart
+idiom needs this three-call sequence, not a straight substitution of
+`crash` for `stop`.
+## Wiring fault primitives into a per-group corpus needs `set_*_for` scoping, and running a corpus at its own nightly depth for the first time can surface an unrelated pre-existing failure (ADR 0061 Decision 3, `txn_serializable.rs`)
+
+Porting `raftkv_linearizable.rs`'s ADR 0061 Decision 3 fault-primitives
+wiring (`DiskConfig::set_fsync_lie_prob`, a compound `NetConfig`,
+`Simulator::set_clock_drift_for`) to `txn_serializable.rs` needed one real
+adaptation, not a copy-paste: the raftkv corpus is a single Raft group, so
+its `Nemesis::FsyncLie` sets `DiskConfig` **globally**
+(`Simulator::set_disk_config`); the txn corpus has 3 *independent* tablet
+groups sharing one `Simulator`, so a global disk fault would lie to every
+group at once regardless of which one a scenario means to target —
+`set_disk_config_for`/`set_clock_drift_for` (per-node, not the bare
+`set_disk_config`/no per-node clock-drift equivalent needed by the
+single-group corpus) are the right primitives once a corpus has more than
+one independently-faulted unit sharing a `Simulator`. The general form:
+when porting a fault-wiring pattern from a single-topology corpus to a
+multi-topology one, re-derive which scope (`_for`, whole-`Simulator`, or
+per-link) is correct for the *new* corpus's own shape — don't assume the
+source corpus's scope choice transfers, since a single-group corpus never
+had a reason to need anything narrower than global. `heal_all` resetting
+these per-node overrides individually (not just the global `NetConfig`) is
+the same "a fired fault must not outlive its window" trap the raftkv PR's
+own `heal_all` already documents, just for a `_for`-scoped fault instead of
+a global one — resetting the global default does nothing for a per-node
+override that was never routed through the global setter at all.
+
+Separately: `ANIMUS_TXN_SEEDS=40` (the depth `corpus-deep.yml`'s existing
+nightly tier already configures for this corpus) surfaced a **pre-existing,
+unrelated** `check_kind_consistency` divergence on `main`, with no new
+fault involved — `compound_lossy_and_anchor_kill_s25` (seed
+`8035380114809936673`, a `Lossy` + `AnchorLeaderKill` cell) reproduces
+identically on the unmodified checkout. This corpus's own default depth is
+1, so nightly's `=40` had evidently not actually been run to completion
+against this specific check before — a fault-primitives PR that happens to
+validate at that depth is not the same thing as nightly CI having done so.
+The general lesson: a corpus's documented "held green at depth K" claim is
+only as trustworthy as the last time someone actually ran it at K and
+looked at the result — treat validating a change at a corpus's own stated
+nightly depth as an opportunity to check that claim is still true, not just
+a formality for the change at hand, and when it turns out not to be, that
+is a real, separate finding (this repo's "incidental bug gets its own PR"
+convention) — report it plainly rather than quietly dropping the depth or
+excluding the offending cell to get a clean run.
+
+**Resolved (issue #488):** this divergence was diagnosed as a test-harness
+bug, not a production one — `Topology::start` shared one `MemoryEngine`
+across a group's 3 replicas; see the Testing section's "cheap to clone,
+clones share state" entry for the full mechanism and the fix. The corpus
+is green at `ANIMUS_TXN_SEEDS=40` (including `check_kind_consistency`)
+with each replica given its own engine.
+
+## Wiring `animus-sim`'s fault primitives into a real corpus for the first time (ADR 0061 Decision 3, `raftkv_linearizable.rs`)
+
+`animus-sim`'s deepened fault vocabulary (`NetConfig::set_duplicate_prob`/
+`set_corrupt_prob`/`set_heavy_tail_prob`, `DiskConfig::set_fsync_lie_prob`/
+`torn_tail_on_crash`/`corrupt_on_crash`) had been proven correct in its own
+meta-tests (`animus-sim/tests/net_faults.rs`, `disk_faults.rs`) but never
+actually driven through a real protocol-correctness corpus. Wiring it into
+the flagship raftkv linearizability corpus surfaced two lessons, one a
+harness trap and the other a real, still-open production finding.
+
+**1. A `Nemesis` that sets a global `Env` fault config for "the rest of the
+run" must be reset by the runner's heal step, or it silently keeps firing
+past its own scenario's intended fault window.** Every pre-existing
+`Nemesis` variant in this corpus only ever touched partitions/crashes
+(healed by `Simulator::heal`/`restart`) or `NetConfig` (reset by
+`heal_all`'s pre-existing `self.sim.set_net_config(NetConfig::default())`).
+The moment a variant (`FsyncLie`) set a global `DiskConfig` for the first
+time, `heal_all` needed the identical reset
+(`self.sim.set_disk_config(DiskConfig::default())`) or the lie would keep
+firing for every scenario cell that happens to run after it in the same
+process — invisible in this corpus's own harness (each scenario gets a
+fresh `Simulator`, so nothing here actually leaked), but exactly the trap a
+future corpus sharing one `Simulator` across cells (or a future `Nemesis`
+composing several fault-window phases within one scenario) would fall
+into silently. General rule: every new global-fault-setting `Nemesis`
+needs its own explicit line in whatever "return to steady state" step the
+harness already has for the fault classes that came before it — don't
+assume the existing reset call already covers a fault dimension it
+predates.
+
+**2. A wire codec that "never panics" can still abort the whole process —
+and this corpus caught a real instance of it within minutes of running at
+depth.** The task briefing (based on a prior investigation) asserted
+`NetConfig::set_corrupt_prob` was "verified safe" for this corpus because
+`animus_cp_data::codec::decode_wire` is bounds-checked and its
+`KvWire`/`RaftMsg` match sites `warn!`/drop on a decode `Err` rather than
+panicking. That's true for the primitive per-byte reads (`Cursor::u8`/`u32`/
+`u64`/`bytes` all bounds-check via `take()` before ever touching memory) but
+false for a whole class of *array* decoders: `read_raft`'s `AppendEntries`
+arm (`codec.rs`) reads an untrusted `n: u32` entry count straight off the
+wire and calls `Vec::with_capacity(n as usize)` **before** a single one of
+those `n` entries has been validated against the cursor's remaining bytes.
+A single bit-flip landing inside those 4 length bytes can turn `n` into
+something close to `u32::MAX`; since each `LogEntry<KvCommand>` is a
+multi-field struct, `with_capacity` then requests on the order of a
+terabyte, which Rust's allocator failure path (`handle_alloc_error`)
+**aborts the process on** — not a catchable panic, and nothing a
+`std::panic::catch_unwind` or a `Result`-based decode error contract can
+intercept. Reproduced deterministically at `ANIMUS_RAFTKV_SEEDS=20`:
+`chaos_early_3_s09`, seed `422907917505132688`, `SIGABRT`. Grepping
+`codec.rs` for the same `let n = c.u32()?; ... Vec::with_capacity(n as
+usize)` shape found **at least a dozen more sites** (`read_kind_writes`,
+`read_change_logs`, `TxnStage`'s `puts`/`conditions`, `SplitTablet`'s
+`replicas`, `TxnRecord`'s `spans`/`conditions`, `SeedBatch`'s `rows`, and
+`read_raft`'s own `AppendEntries`/`InstallSnapshot`-adjacent arms) — this is
+a **systemic gap in the codec's array-decoding pattern**, not a one-off in
+one match arm. Deliberately **not fixed as part of this corpus PR** (the
+repo's own "an incidental bug gets its own PR" rule, root `CLAUDE.md`
+Conventions) — `Nemesis::Chaos` ships without `set_corrupt_prob` instead
+(see its own doc in `raftkv_linearizable.rs`), the same "primitive excluded
+from this corpus, real fix deferred to its own crate/PR" treatment this
+corpus already gives `DiskConfig::set_enospc_prob`/`set_error_prob` for the
+identical hard-abort-vs-graceful-`Err` reason. **The general lesson**: when
+a decode path's own doc (or a fault-injection plan) claims "bounds-checked,
+never panics," verify that claim against every *array*-shaped decoder
+specifically — a scalar bounds check (`take(n)` before slicing) is not the
+same guarantee as a *count*-driven pre-allocation being bounded, and the
+difference is invisible until something (a corrupted wire byte, a
+malformed peer, a fuzzer) actually supplies an adversarial count. The real
+fix (tracked as a follow-up, not implemented here) is straightforward:
+either drop the `with_capacity` hint for array decoders entirely (a
+`push`-per-iteration loop already bounds itself correctly via `Cursor::
+take`'s own check, just without the allocation being *pre*-sized) or cap
+the hint at some cheap function of the cursor's actual remaining byte
+length before ever calling `with_capacity`.
+
+## A nightly CI job's sequential steps without `continue-on-error` let the first failure hide every corpus after it (`corpus-deep.yml`)
+
+`corpus-deep.yml` ran all ten deep-seed fault-injection corpora as
+sequential steps inside one job, with no `continue-on-error` and no
+`if: always()` on any step. GitHub Actions' default behavior for a
+plain sequential step list is: the first failing step aborts the job and
+skips every step after it. Since the multi-tablet transaction corpus
+(ADR 0018) happened to be listed first and was failing a real assertion at
+nightly depth (`ANIMUS_TXN_SEEDS=40`, `check_kind_consistency` on
+`compound_lossy_and_anchor_kill` — see the sibling lesson on that bug once
+filed), every one of the other nine corpora was silently skipped on every
+single nightly run since the workflow's creation — 13 consecutive runs,
+all reporting "failure" for the same first-step reason, without a single
+one of the other nine corpora ever actually executing at depth. The
+workflow's own `conclusion: failure` status looked like a signal, but a
+human (or an agent) glancing at "corpus-deep is red" would reasonably
+assume the *listed* failing step was the whole story, not that nine other
+tests never ran at all — the gap was invisible without opening the job's
+step list and noticing the `skipped` conclusions.
+
+The general lesson: a CI job whose value comes from *reporting on N
+independent things* (here, ten unrelated corpora) must not let any one of
+them gate whether the others get a chance to report. `continue-on-error:
+true` + a per-step `id:` + a final `if: always()` aggregation step that
+turns the recorded per-step outcomes back into one job-level pass/fail is
+the fix — CI still goes red on a real regression, but only after every
+corpus has actually run and had its result recorded, so `skipped` never
+silently substitutes for a genuine result. Worth checking any other
+multi-step job in this repo's CI for the same pattern before assuming its
+"only some things are failing" read of a red run is complete.
+
+## An untrusted length-prefix pre-sizing a `Vec` is a distinct DoS class from an unbounded-panic one — bounds-checked reads don't close it (`animus-cp-data::codec`, `animus-storage::lsm`)
+
+`codec.rs`'s own doc comment claimed decoding untrusted wire input was
+"bounds-checked... never panics," and every individual field read really
+was: `Cursor::take` checks `pos + n <= bytes.len()` before every slice, so
+a truncated or malformed frame always surfaces as a clean `Err`, never an
+out-of-bounds panic or a raw slice-index abort. What that guarantee does
+**not** cover is a different failure mode entirely: about a dozen call
+sites read an untrusted `u32`/`u64` **count** off the wire (an
+`AppendEntries` entry count, a `KindBatch`/`TxnStage` write count, …) and
+handed it straight to `Vec::with_capacity(n as usize)` **before** a single
+one of its `n` elements had been validated against the remaining buffer.
+For a multi-byte element type (`(Vec<u8>, Vec<u8>)`, a `LogEntry<KvCommand>`,
+…), a single corrupted or adversarial length-prefix byte setting `n` near
+`u32::MAX` turns into a request for hundreds of GB to several TB. Rust's
+global allocator does not return an `Err` or unwind a panic for an
+allocation that large or that exceeds `isize::MAX` — it calls
+`handle_alloc_error`, which **aborts the whole process** (`SIGABRT`), not a
+catchable failure at any level above it. Reproduced live: corrupting
+`read_raft`'s `AppendEntries` entry-count field crashed
+`cargo test -p animus-test --test raftkv_linearizable` outright — the whole
+test binary, not one failing assertion. Since this reads off real
+inter-node Raft/Kv wire traffic, it was a process-wide denial-of-service
+vector reachable from any peer able to send a corrupted or crafted message
+to a node, not a theoretical concern.
+
+**The fix is not "validate `n` before allocating"** — there is no cheap way
+to validate an element *count* against a buffer when each element's own
+encoded size is variable (a byte string, a nested struct, …); the only
+honest validation is decoding the elements themselves, which is exactly
+what the loop right after the allocation already does. The fix instead
+**caps the requested capacity**, never the actual number of elements
+decoded: `Vec::with_capacity(n.min(1 << 20) as usize)`. A legitimate
+message's cost is completely unchanged (a real `n` is always far below the
+cap); a hostile/corrupted `n` can now request at most `1 << 20 *
+size_of::<T>()` bytes up front — large enough to never matter for any real
+message, small enough to never abort — and the *actual* loop below still
+only ever pushes as many elements as the buffer genuinely contains, since
+each element read still fails with a graceful `DecodeError` the moment the
+buffer runs out (an attacker gets at most O(remaining buffer bytes) worth
+of pushes/reallocations, never O(n) for an unbounded `n`). This was
+already the house convention in two sibling decoders in the same crate
+(`backup.rs`'s `declared.min(1 << 20)`, `segment.rs`'s
+`declared_count.min(1 << 20)`) that simply hadn't been applied to
+`codec.rs` yet — worth grepping for by name (`with_capacity(n as usize)`,
+`with_capacity(len as usize)`, `with_capacity(count as usize)`, and their
+`u64`/`usize`-cast siblings) whenever adding or reviewing a new hand-rolled
+wire/WAL/manifest decoder, since nothing about this shape triggers a
+compiler warning or a clippy lint — it looks like an ordinary, idiomatic
+size-hint optimization.
+
+**The same shape existed one layer down, in `animus-storage`'s WAL record
+decoder and its manifest decoder** (`lsm.rs`) — found only by a deliberate
+workspace-wide grep for the pattern once it was clear `codec.rs` wasn't the
+only hand-rolled length-prefixed decoder in the tree. The WAL record
+decoder's own count reads happen only after a CRC-32 check on the whole
+frame (`try_parse_wal_frame`), which makes the "one corrupted byte survives
+undetected" case astronomically unlikely for ordinary bit rot — but CRC-32
+is not cryptographically adversary-resistant, and the shape is identical
+either way, so it got the identical `.min(1 << 20)` cap as defense in
+depth. The **manifest** decoder has no CRC protecting it at all (a plain
+`Disk::replace`-swapped file), so a corrupted on-disk manifest byte was a
+real, not merely theoretical, instance of the same abort — fixed
+identically. `animus-cp-data`'s `txn.rs` (the value-envelope decoder) and
+`split.rs` (the in-place-split fork marker) had the same shape too, in code
+whose own doc comments describe it as "this crate only ever reads back
+what it itself wrote" (a hard-bug, not a recoverable-error, doctrine) — but
+both are engine-marker values that ride inside a tablet's `InstallSnapshot`
+image, which is untrusted wire content until it's actually been applied;
+"this crate wrote it" is true of the *normal* path, not a guarantee against
+a corrupted/adversarial snapshot from a peer, so both got the same cap
+rather than being left on the "assumed trusted" side of the line.
+
+**General rule for reviewing (or writing) any hand-rolled length-prefixed
+decoder — wire, WAL, or manifest — going forward**: bounds-checking every
+individual read (via a `Cursor`-style `take` that checks the remaining
+buffer) is necessary but not sufficient for allocation safety. Grep
+specifically for `with_capacity` fed by any value that was itself just read
+from the buffer being decoded, and cap it — dropping the pre-allocation
+entirely (falling back to `Vec::new()`/organic `push` growth) is an equally
+valid fix where performance doesn't matter enough to justify the extra
+literal; this repo's own precedent leans toward the capped form since it
+preserves the fast path's zero-realloc behavior for every legitimate
+message. A doc comment claiming a decoder "never panics" or is
+"bounds-checked" should be read as a claim about individual reads only,
+never as a claim about allocation safety, unless it says so explicitly —
+`codec.rs`'s own doc comment now does, and is the template for any other
+decoder's doc that makes a similar claim.
+
+## A depth knob's existence in `CLAUDE.md` doesn't mean CI ever runs it deep — `corpus-deep.yml` needs its own explicit entry per corpus (2026-08-30, `ANIMUS_RAFTKV_SEEDS`)
+
+`raftkv_linearizable.rs` — the flagship Elle-checked linearizability corpus
+for the per-tablet CP data plane (ADR 0017) — had a documented
+`ANIMUS_RAFTKV_SEEDS` depth knob (and a second, `ANIMUS_RAFTKV_LSM=1`, for
+the `LsmEngine<SimEnv>` tier) held green at depth 20/×10 in
+`crates/animus-test/CLAUDE.md`, but `.github/workflows/corpus-deep.yml`'s
+nightly job never referenced either env var. Every push still ran the
+corpus at its default depth (1 = the frozen byte-identical set) via the
+normal `gates` job, so the deep-seed proof this corpus exists for was
+simply never exercised in CI — the crate guide's "held green at depth N"
+line documents a `cargo test` invocation someone ran by hand at some point,
+not a standing CI guarantee. **A corpus's env-var depth knob and its
+`corpus-deep.yml` matrix entry are two separate things that must both
+exist** — adding the knob (and proving it works locally) is not the same
+as wiring it into the nightly tier, and nothing fails loudly when the
+wiring is missing; the gap is silent unless someone reads the workflow
+file against the crate guide's knob table. When adding a new
+fault-injection corpus with a depth knob, add its `corpus-deep.yml` step
+in the same change (or a tracked follow-up), not "later." Also worth
+naming: a corpus that gates an entire alternate code path behind an
+off-by-default env var (`ANIMUS_RAFTKV_LSM=1`, the durable
+`LsmEngine<SimEnv>` tier vs. the always-on `MemoryEngine` one) needs its
+own nightly step distinct from that corpus's plain depth-scaled step, not
+just a deeper seed count on the same invocation — the two exercise
+different storage-engine code, not just "more of the same" scenarios.
+
+## Promoting a hardcoded-seed-loop test to the house corpus shape: the seed's literal value was never load-bearing, and default-depth coverage is *expected* to shrink (`lsm_crash.rs`/`lsm_disk_faults.rs`, ADR 0061 rung B1)
+
+Converting `animus-storage`'s two `LsmEngine` fault tests
+(`tests/lsm_crash.rs`, `tests/lsm_disk_faults.rs`) from hand-rolled
+`for seed in [0xA1u64, 0xB2, ...]` loops onto `animus_test::corpus`'s
+standard `Scenario`/`seed_expand` shape surfaced two things worth stating
+plainly, since both look like regressions at a glance and aren't.
+
+**The specific magic-number seeds were never part of what the tests
+prove.** Every scenario in both files asserts a generic invariant ("every
+acked write survives a crash", "a corrupted block/record surfaces a clean
+error, never silent loss") that must hold for *any* interleaving — none of
+them compare against an expected value computed from that particular seed.
+So replacing `[0xA1, 0xB2, 0xC3, 7, 42, 1337]` with `corpus::name_seed(name)`
+per newly-named cell changes which specific interleavings get exercised but
+proves exactly the same thing; there was no need to preserve the literal
+hex constants, and doing so would have fought the house doctrine ("a
+scenario's seed is always a deterministic function of its own name," see
+`animus-test/src/corpus.rs`'s module doc) for no benefit. Where the
+original loop crossed a real *structural* axis with its own seed list
+(`torn_wal_tail_crash_recovers_all_acked_writes`'s `corrupt: bool`,
+`corrupted_manifest_fails_open_cleanly`'s corruption `offset`), each
+combination became its own named cell (`..._corrupt`, `..._offset_4`, …)
+sharing one extracted body function — the axis is what deserves a name,
+the seed list crossing it doesn't.
+
+**Converting a file that unconditionally ran N seeds every push into a
+corpus at default depth 1 is a deliberate reduction in per-push seed count,
+not a coverage regression** — it's the entire point of the house corpus
+doctrine, whose default is *always* 1 (see the root `CLAUDE.md`'s
+knob table and every existing corpus in this repo), with seed-sweeping
+depth pushed to `corpus-deep.yml`'s nightly tier (`=40`) instead of paid on
+every push. Before this conversion, `injected_wal_errors_surface_and_
+lose_no_acked_write` ran 6 seeds unconditionally on every `cargo test`;
+after, it runs 1 by default and 40 nightly — fewer per-push runs, far more
+nightly ones, exactly like every other corpus in the repo. A task framed as
+"preserve current behavior/coverage, must not regress existing CI" is
+about outcomes (the test still builds, still passes, still exercises the
+same fault-injection mechanism), not about the literal per-push seed count
+— conflating the two would mean no hardcoded-seed-loop test could ever be
+promoted to the standard shape without also being read as a downgrade.
+- **When a value can be produced two ways — an explicit config field and a
+  positional/minted default — grep the field's read sites and make sure at
+  least one fixture in the suite actually diverges the two.** The
+  `--config FILE --node I` entry points bound each node under the minted
+  `config::node_id(index)` (`"n{index}"`) instead of the config entry's own
+  `id` field; every fixture in the repo built ids with the same minting
+  convention, so `addrs.id == node_id(index)` held everywhere by
+  coincidence and the wrong read was invisible. The first config with
+  operator-style ids (`"{cluster}-{ordinal}"`) then failed in the most
+  silent way possible: each node's *claimed* identity was absent from its
+  own genesis voter set, `is_voter()` was false on every node, and no one
+  ever *started* an election — nothing to log, nothing to time out, just a
+  cluster that never elects. Regression:
+  `crates/animusd/tests/config_node_identity.rs` (a config whose ids
+  deliberately do not follow the minting convention).
+- **An accept loop must never treat a transient `accept()` error as
+  fatal.** `ProdEnv`'s listener task returned on any `accept()` error —
+  one transient `EMFILE`/`ECONNABORTED` during a bootstrap burst and the
+  node was permanently deaf to inbound connections while looking otherwise
+  healthy (observed live: 2 of 3 nodes deafened during a DNS-lag
+  bootstrap window). Retry with a short backoff instead; any future accept
+  loop at a process boundary gets the same review scrutiny.
+
+## A shared `CARGO_TARGET_DIR` across worktree sessions can silently serve a stale test binary missing newly-added `#[test]` fns — `--list` (or a forced `touch`) before trusting a count (2026-08-30, `pitr_fault_corpus.rs` merge validation)
+
+Resolving PR #490's `docs/engineering-lessons.md` merge conflict and then
+validating with `CARGO_TARGET_DIR=/home/user/animus-db-shared-target cargo
+test -p animus-test --test pitr_fault_corpus` (as instructed, to avoid
+duplicating multi-GB build artifacts across worktrees) first reported **"12
+passed; 0 failed"** — a clean-looking green run — even though the checked-out
+file on disk plainly had 17 `#[test]` functions (confirmed by `grep -c
+'^#\[test\]'`) and the PR's own commit message and crate-guide entry both
+say "17 tests". `cargo test`'s own summary line only ever counts what its
+test binary actually contains; it has no way to notice that the binary
+itself is stale, so a naive "did the count match expectations and did
+everything pass" check would have reported a false clean bill of health
+while silently missing the five tests this very PR exists to add
+(`wal_fsync_lie_kill_sealing_leader`,
+`chaotic_network_pitr_rollover`/`chaotic_network_idle_group_never_
+proposes_a_pitr_seal`, `wal_torn_on_crash_kill_sealing_leader`,
+`restore_to_random_second_under_clock_drift`) — the exact set most likely to
+carry a real bug, being new. `cargo test -- --list` against the same
+un-touched binary reproducibly showed the same wrong 12; `touch`-ing the
+source file to force a fresh `rustc` invocation (visible via `-v`) made the
+list jump to the correct 17, all passing. The mechanism was never fully
+isolated (candidates include a leftover fingerprint/object from an earlier
+build of an older revision of this same file at this same worktree path,
+whose mtime cargo's fingerprint check treated as not-older-than the fresh
+checkout's), but the shared-target-dir setup itself is exactly the
+precondition that makes a stale-fingerprint hit both possible and likely: the
+same crate/test-target combination gets rebuilt from this same worktree path
+across many separate sessions over time, all landing in one directory tree
+cargo's own dep-graph fingerprinting was never designed to be shared this
+widely. **The general check going forward**: whenever a validation run's
+result matters (a merge/rebase gate, a "should be N/N" acceptance check) and
+`CARGO_TARGET_DIR` points at a directory shared across worktrees/sessions,
+don't trust the bare pass count — run `cargo test -- --list` (or diff the
+printed test names against a `grep -c '^#\[test\]'` of the file) at least
+once to confirm the binary's test set actually matches the source before
+reading a "N passed" line as proof of anything; a stale binary reports
+green precisely because it silently tests less, never because it tests the
+same thing and fails to notice a problem.
+## A racing-proposers workload can't tell "won" from "lost" by presence alone — it has to confirm by content (`animus-control`'s `control_corpus.rs`, ADR 0061 rung B1 sibling)
+
+Building `control_corpus.rs` — a new seed-depth corpus for `animus-control`'s
+own machinery (the ADR 0038 apply task, the schema-catalog exclusivity
+guarantee), modeled on `raftkv_linearizable.rs`'s harness shape — the
+schema-race workload's first draft had each racer's confirm loop treat "the
+table now exists" as its own success signal. That's the exact
+`ProposeResult::Accepted`-isn't-apply-time-truth trap the entry above already
+names, but with an extra twist specific to a **race**: here `Accepted` isn't
+even ambiguous about *whether* the command took effect (a single proposer's
+own straggler command, `CreateTablet`-fixture-style) — it's ambiguous about
+*whose* content took effect, since `CreateTableSchema` rejects outright on an
+existing name (first-committer-wins, not idempotent-on-identical the way
+`RegisterNode`'s CAS is) and TWO different proposers can each see "yes, a
+schema for this table now exists" as true. A confirm loop that stops
+retrying the instant presence flips true will, for the losing racer, log a
+false "I won" — exactly the durability check's "this confirmed effect must
+survive" assertion firing on content that was never actually this
+proposer's own. The fix: read the table's *actual* schema back and compare
+it, structurally, against the exact value this proposer proposed —
+`Some(existing) if *existing == schema => won`, `Some(_) => lost, stop
+retrying (nothing left to retry against a name that already belongs to
+someone else)`, `None => keep trying`. General lesson: **when a workload
+races N proposers for one identity and the state machine's own accept rule
+is "first-committer-wins, reject the rest" rather than idempotent-on-match,
+"does the effect exist" is the wrong confirm predicate — it has to be "does
+the effect that exists match MINE," or a losing proposer misreports itself
+as a winner and a durability check built on that misreport is checking a
+claim nobody should have made.**
+
+## Don't copy a sibling corpus's engine-tiering generic ceremony without first checking whether the new node type is generic over the storage engine at all (`animus-control`'s `control_corpus.rs`)
+
+`raftkv_linearizable.rs` (the explicit template `control_corpus.rs` was
+told to copy the *architecture*, not the content, of) is generic over both
+`E: Env` and `S: StorageEngine` because `animus-cp-data::RaftKvNode<E, S>`
+itself is — its `EngineFactory<S>` type alias and the `Group<S>`/`Node<S>`
+plumbing exist to let the corpus run the identical scenario set over both
+`MemoryEngine` and `LsmEngine<SimEnv>`. A first draft of the new corpus
+started copying that same `<S: StorageEngine>` shape onto `Group`/`Node`
+before checking whether it was needed — it wasn't:
+`animus_control::RaftNode<E>` is generic **only** over `E`; `start<S:
+StorageEngine>(..)` is a generic *associated function*, not a type
+parameter of `RaftNode` itself, so the engine type is erased the moment a
+node is constructed and there is nothing for a second generic parameter to
+thread through. Carrying the extra `<S>` ceremony over unused would have
+meant a `PhantomData` or a spurious "this corpus supports engine tiers"
+claim the harness never actually exercises. General lesson: **before
+copying a template corpus's generic shape onto a new one, check whether the
+concrete type the new corpus actually drives is generic the same way the
+template's was — a sibling module's own genericity is a property of *that*
+module's dependency, not a fixed feature of "how a corpus harness in this
+repo looks."**
+
+## Not every "the same id was confirmed twice" is a double-assignment — check whether the racing proposals were content-identical first (`animus-control`'s `control_corpus.rs`, `AllocatorRace`, PR② of the control-corpus stack)
+
+Building `Workload::AllocatorRace`'s invariant #4 (allocator injectivity),
+the first draft's `check_allocator_injectivity` had two parts: (1) a
+content-aware sampler (`Shared::sample_tablets`) that flags a `TabletId`
+observed with two *disagreeing* fingerprints, and (2) a second check that
+every `TabletId` a client's own confirm loop reported as applied
+(`confirmed_tablet_ids`) was pairwise distinct. Part (2) immediately failed
+the fault-free baseline: every `AllocatorRace` client races
+`MetaCommand::CreateTablet` for the identical shared table, so every
+racer's proposal is byte-identical **except for the candidate tablet id**
+(same table name, same range, same replica set). Before any proposal has
+committed, several racers legitimately read the same stale
+`next_free_tablet_id()` and each proposes with that same candidate id — and
+once the tablet that actually lands carries that id, EVERY one of those
+racers correctly observes "the tablet that now exists carries my own
+candidate id" and calls `confirm_tablet_id`. That is not a bug: there is no
+meaningful sense in which "whose literal `CreateTablet` call committed" is
+distinguishable when the content besides the id is identical — multiple
+racers correctly recognizing the identical, single, real assignment is
+expected, not a double-assignment. The fix was to delete part (2) entirely
+and rely solely on the content-aware sampler, which is strictly the
+stronger and correct check (it only flags a *disagreeing* fingerprint for
+the same id, never a repeated agreement). Contrast this with
+`BeginSplit`'s own phase of the same workload, where each racer's split key
+is deliberately distinct per proposer index — there, a "confirm by content"
+check (the child's actual range boundary matching MY split key, not just
+presence of my candidate ids) is exactly right, and is what the racing-
+proposers lesson above (`won`-vs-`lost` by content, not presence) already
+prescribes. **General lesson: when a race's confirm signal is "this
+proposal's content == what committed," first ask whether every racer's
+proposal *could be* content-identical except for the field the race is
+actually about — if so, a raw "confirmed exactly once" assertion over that
+field alone is checking a stronger, false property; the real invariant is
+"no two DIFFERENT contents were ever attributed to the same identity,"
+which only a fingerprint/content comparison (not an occurrence count) can
+state correctly.**
+
+## An open cross-plane fault-finding (issue #495, the shared WAL-corruption gap) does not automatically reproduce in every plane that shares the vulnerable codec — confirm per-plane before assuming (`animus-control`'s `control_corpus.rs`, PR②)
+
+Issue #495 is a confirmed, reproducible hard panic in `animus-cp-data`:
+composing `DiskConfig::torn_tail_on_crash` with `corrupt_on_crash` lets a
+corrupted-but-still-JSON-valid WAL record (`animus-control::persist::
+WalRecord`, no per-record checksum — the codec `animus-control` and
+`animus-cp-data` **share**) decode successfully with a wrong value, which
+that plane's `assert_ts_monotonic` (an HLC-timestamp monotonicity invariant)
+then trips on once a later entry applies past it. Building `control_corpus.rs`'s
+own `#[ignore]`d regression probe for the identical composition, the natural
+assumption was "the codec is shared, so the panic should reproduce here
+too" — it did not, across a deliberate 80-combination sweep (many seeds ×
+`PlainChurn`/`AllocatorRace` workloads × `LeaderKill`/`FollowerKill` ×
+with/without an `FsyncLie`-accumulated un-synced buffer before the crash,
+done during development, not committed as code). The underlying codec gap
+is real in both places (the corruption fires identically — confirmed by
+inspecting `DiskCorrupt`/`DiskTear` trace events), but `animus-control`'s
+`Metadata::apply`/recovery path has no invariant as strict as
+`assert_ts_monotonic` for a wrong-but-decodable *numeric* field to trip —
+this plane's commands carry no HLC timestamp at all, and its epoch/CAS
+checks *reject* a mismatch rather than *asserting* on one, so a corrupted
+epoch or tablet id just fails a CAS instead of panicking. **General lesson:
+a fault-finding confirmed in one plane over a codec/primitive that plane
+shares with another does not transfer by assumption — the reproducing
+mechanism is downstream of the shared corruption (some specific invariant
+the corrupted-but-valid value eventually trips), and a sibling plane may
+share the corruption but not the invariant. Confirm (or rule out) the
+composition explicitly in each plane it could plausibly reach, and record a
+negative result as carefully as a positive one — it is what tells a future
+reader whether the standing regression probe is still watching for
+something that could happen, or has already been checked and cleared for
+that plane's current invariant set.**
+
+**Update**: issue #495's underlying codec gap (`animus-control::persist::
+WalRecord` having no per-record checksum) is now fixed — every WAL line
+carries a CRC32 checksum, and a corrupted-but-parseable record is dropped
+at decode time (along with everything physically after it in the file)
+instead of decoding into a wrong value. The methodology lesson above is
+unaffected by the fix (it's about how fault-findings do or don't transfer
+across planes, not about this specific bug's status); `control_corpus.rs`'s
+`control_corrupt_on_crash_may_hard_panic_issue_495` stays in place as a
+standing regression probe, now expected to stay clean.
+
+## `Simulator::crash`+`restart` is not a stand-in for a real process restart — a "does recovery actually rebuild from disk" test needs `stop` + a fresh constructor (`animus-control`'s `control_corpus.rs`, PR③)
+
+`animus-sim`'s `Simulator::crash` mutes a node (drops its un-synced disk +
+volatile inbox, keeps its tasks alive but silent) and `restart` un-mutes and
+re-arms those SAME still-live tasks — the node's `RaftCore`, driver loop,
+and (for `animus-control`) ADR 0038's async apply task never actually stop
+running; they just stop being able to send/receive for a while. This is the
+right primitive for "the node was briefly unreachable/froze," and it's what
+every pre-existing `LeaderKill`/`FollowerKill`-shaped nemesis in this
+repo's corpora uses. It is the WRONG primitive for proving a genuine
+crash-recovery code path — anything gated on "a fresh process just started
+and has to rebuild its in-memory state from durable disk" (here:
+`meta_apply_loop`'s `mirror::rebuild_metadata_from_engine` call plus
+reseeding its `engine_applied` watermark from the engine's own
+`syskv::applied_index_key()`, rather than trusting `core.last_applied()`)
+never runs at all under crash+restart, because the in-memory state that
+code path exists to rebuild was never actually destroyed. Proving that path
+needs `Simulator::stop` (removes the node's tasks entirely — genuinely
+nothing left running under that node id) followed by constructing a BRAND
+NEW driver/node that reopens the SAME retained durable-engine handle
+(mirroring `tests/restart.rs`'s pattern: keep the `MemoryEngine` alive in a
+variable outside the node so a later `RaftNode::start` can re-clone it,
+exactly like a real disk surviving a process exit). **General lesson: when
+a fault nemesis is meant to exercise "recovery from durable state after a
+restart," check whether the simulator primitive it uses actually destroys
+the in-memory state the recovery code is supposed to rebuild — a
+crash-and-resume primitive that merely mutes/re-arms the same live task
+will make the test pass for the wrong reason (nothing to recover, so
+nothing can prove the recovery path works) rather than for the right one.**
+
+A second, sharper gotcha discovered building this nemesis: `Simulator::stop`
+does **not** clear a `crashed` flag a prior `Simulator::crash` on the same
+node id set — the two are independent pieces of state (`crashed: BTreeSet`
+vs. simply having no owned tasks). A cell that ever crashes a node and then
+later `stop`s + reconstructs it on the same id, without an intervening
+`Simulator::restart` (which is what actually clears `crashed`), ends up with
+a fresh `RaftNode` whose every outbound send is silently swallowed forever
+by the stale mute — with no panic, no error, just an isolated node that
+looks alive but never converges, i.e. exactly the shape of bug this session
+already burned time on once before with a different composition (see the
+sibling entry on issue #421 above). The fix is a fixed compose order —
+`crash; stop; restart` (the `restart` call clears the mute even though
+there are no tasks left for it to re-arm) — *before* constructing the fresh
+node. This repo's `control_corpus.rs` has no cell that currently composes
+`StopRestart` with a prior crash on the same id, but the defensive order is
+applied unconditionally in `Group::stop_node` anyway, since it costs
+nothing and rules the entire hazard class out by construction rather than
+by "don't do that" convention.
+
+## A real multi-chunk `InstallSnapshot` transfer completes in single-digit milliseconds of virtual time — a coarse `Vec<(Duration, Nemesis)>` fault schedule cannot reliably land "mid-transfer" (`animus-control`'s `control_corpus.rs`, PR③)
+
+Composing a fault with an in-flight chunked snapshot transfer sounds like it
+should fit this repo's usual `faults: Vec<(Duration, Nemesis)>` scenario
+shape (schedule the fault at some duration into the run, mirroring every
+`LeaderKill`/`PartitionLeader` cell elsewhere in this corpus). An
+exploratory run (millisecond-granularity polling of a real, healed,
+multi-chunk transfer between two real `RaftNode`s) found this doesn't work:
+once the leader starts shipping chunks to a caught-up-eligible follower,
+the WHOLE transfer — first chunk received through fully reassembled
+`Metadata` — completes in roughly 3ms of virtual time, because this plane's
+replication path has no artificial per-chunk delay and virtual time costs
+no real wall-clock proportional to its size. A fault scheduled "2.2 seconds
+into the run" has essentially zero chance of landing inside a 3ms window
+whose START time itself isn't even known in advance (it depends on when
+the leader notices the follower is behind past its compacted prefix, which
+depends on heartbeat timing, election history, etc. — all seed-dependent).
+The fix was to replace the duration guess with a **condition-based poll**:
+step virtual time in small (200µs) increments, checking a directly
+observable proxy for "the transfer has started but not finished" (the
+receiving follower's `snapshot_index() > 0` — set from the FIRST chunk's
+base index — while its reassembled state, e.g. `metadata().members.len()`,
+is still short of the target), and inject the fault the instant that holds.
+This lands inside the real window regardless of a given seed's exact
+timing, and the test itself asserts it actually caught the window (rather
+than the transfer racing past a coarse poll entirely) before proceeding —
+so a future change that made the transfer effectively instantaneous would
+fail loudly here instead of silently degrading into a fault-free no-op
+cell. **General lesson: before reaching for a scenario harness's existing
+`Duration`-based fault-scheduling shape to hit a specific in-flight window,
+measure how long that window actually is in virtual time — a data-plane
+"lazy, on-demand, lasts-until-idle" mechanism can complete in microseconds
+to milliseconds once triggered, which no second-or-millisecond-granularity
+fixed schedule can reliably intersect; a condition-based poll on a directly
+observable proxy for "in progress" is the fix, and asserting the poll
+actually caught the window (not just that the scenario as a whole
+converged afterward) is what keeps the test honest about whether it
+exercised the fault window at all.**
+
+## A corpus that constructs its fixture by hand, bypassing the real proposer, keeps exercising a superseded code path even after the proposer's own invariant changes — and a convergence-tolerant assertion can silently absorb the resulting slowdown (ADR 0062 rung 4, fork-first in-place split)
+
+Implementing ADR 0062 rung 4 (`animusd::ClientCtx::trigger_split`'s
+`InPlace` arm stops calling `split_child_placement`; both children get the
+parent's own current `replicas` verbatim) also dropped the learner union
+from `animus-cp-data`'s `bootstrap_voters` capture at `SplitTablet`'s apply
+(`core_guard.config()` only, no more `.extend(core_guard.learners())`) —
+`host.rs`'s Stage 1/2 learner-recruitment machinery itself is untouched
+(its deletion is rung 5's job). The expectation going in, per the ADR's own
+"Testing plan" section, was that `animus-cp-data/tests/
+inplace_split_reconciler.rs`'s existing corpus — built around scenarios
+that hand-construct an `InPlaceSplitIntent` with placement-disjoint child
+homes (a node not among the parent's own current replicas) — would need
+real rework: that premise is exactly what rung 4 makes impossible through
+the real proposer. It did not fail at all, at `ANIMUS_INPLACE_SPLIT_SEEDS`
+up to 30.
+
+The reason is two independent facts compounding: (1) every scenario in
+that file builds its `InPlaceSplitIntent`/`MetadataView` **directly**,
+never through `trigger_split` — so `host.rs`'s Stage 1/2 (`AddSplitLearner`
+recruiting the disjoint node as a real parent learner, catching it up, then
+forking) runs exactly as it always did, completely unaffected by a
+proposer-side computation change three call layers away it never goes
+through; (2) removing the learner union from `bootstrap_voters` doesn't
+strand the recruited node — it just means that node, having already
+locally cloned the child's engine at fork time (as one of "every fork
+participant"), is no longer *born* a voter of the child; it converges into
+one anyway via the ordinary, unmodified Stage 5 `Reconfigure` (add-learner
+→ catch-up → promote) after cutover, one extra hop later. Since the
+scenario's own `converge()` helper polls to a bounded budget rather than
+asserting on the exact tick something happens, that one extra hop is
+invisible to the assertions — the scenario still reaches the identical
+final converged state it always did, just slightly slower in virtual ticks
+nobody was checking.
+
+**General lesson**: before predicting that a semantic change to a
+*proposer's* computation will break a corpus, check whether that corpus
+actually calls the proposer at all, or whether — like this one, which
+exists specifically to test the reconciler in isolation from
+`animus-control`/`animusd` — it hand-builds the intermediate state the
+proposer would have produced and hands it straight to the pure decision
+function. A corpus built that way is testing the **consumer** of an
+invariant, not the invariant's own production, and stays green regardless
+of how the real producer's logic changes, right up until someone deletes
+the consumer-side mechanism it was built around (which is a later rung's
+job here, not this one's). And separately: a convergence-polling assertion
+(the right shape for an eventually-consistent property, per this repo's
+own "eventual properties get a converged-or-timeout poll" rule) is
+*blind* to a regression that only adds latency within its own budget — if
+a change is expected to remove a fast path and add a hop, that specific
+claim needs its own timing-aware assertion (tick count, a tighter budget,
+or an explicit intermediate-state check) rather than trusting the same
+poll that already tolerated the fast path to also catch its absence.
+
+## Deleting a "recruit an external host" mechanism must also delete its downstream "don't release the recruit" exception — the second one doesn't announce itself as dead (ADR 0062 rung 5, Stage 1/2 deletion)
+
+Implementing ADR 0062 rung 5 (deleting `animus-cp-data::host`'s Stage 1/2
+learner-add-and-wait machinery: `HostAction::AddSplitLearner`, its tick
+arm, `INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`, and phase 1's "host a node
+recruited only via a child's own `replicas`" branch) found a second,
+un-named piece of the same mechanism the task's own scope list hadn't
+mentioned: phase 3's release check carried a matching `recruited_for_split`
+exclusion (`tablets_to_release_set(..).filter(|t| !recruited_for_split
+.contains(t))`), added in the same original rung specifically so a
+recruited-but-not-yet-promoted learner wouldn't be immediately released as
+a stray "not in `replicas`" tablet. Nothing named it as dead — it wasn't in
+the "delete this" list, and it doesn't reference `AddSplitLearner` or any
+of the symbols that list did name, so a literal grep for the named symbols
+would miss it entirely.
+
+It was provably dead by the exact same invariant chain that made phase 1's
+recruiting branch dead (ADR 0062 rung 4: `SplitChild::replicas` IS the
+parent's own `replicas` at propose time, and a `Splitting` parent's
+`replicas` cannot change for the intent's whole lifetime since
+`reconcile_placement`/`rebalance_placement` both skip non-`Active`
+tablets) — so a node named in a child's `replicas` is *always* already a
+member of the parent's own `replicas` too, meaning `tablets_to_release_set`
+(which only ever returns a tablet whose `replicas` do NOT contain
+`base_id`) can never produce a candidate `recruited_for_split` would need
+to protect. Verified independently before deleting it (traced
+`reconcile_placement`/`rebalance_placement`'s own `t.state != Active`
+guards in `animus-control::meta`), not assumed from the phase-1 finding
+alone — the two branches recruit/protect the same set for the same reason,
+but a "the cause is dead" argument for one branch doesn't automatically
+transfer to a different function reading different inputs without tracing
+it again.
+
+**General lesson**: when a task's scope names specific symbols/branches to
+delete because they're dead under some new invariant, that invariant
+usually kills more than the named list — grep for *every* place that reads
+the same condition the deleted branch produced (here: "is this tablet a
+recruited-via-child-replicas one"), not just the symbols explicitly named,
+before declaring the cleanup done. A downstream exception whose only job
+was to compensate for a mechanism that's gone is exactly as dead as the
+mechanism itself, and is easy to miss because it doesn't share a name or an
+import with what got deleted.
+
+## A "just compare live state to the target" convergence check races the very proposer that sets the target — and hardening the regression test found two more independent races behind it (ADR 0062 rung 6, the completion loop's settle window)
+
+**The product race.** Rung 6's own completion loop
+(`animusd::split_placing_completion`) was first written exactly as the
+ADR's own minimal pseudocode: each tick, for every led tablet with an
+un-`done` `split_placing` entry, propose `MarkSplitPlacingDone` the instant
+`group.config() == t.replicas` (the live Raft voter set matches
+`Metadata`'s own current desired replicas). This looks obviously correct —
+it's the literal "is there anything left for `reconfigure_step` to do"
+predicate. It is also racy in a way a code reader (including the ADR
+author) would not obviously catch: **immediately after `CutoverSplit`
+commits, a freshly-forked child's live group already sits on exactly its
+fork-inherited `t.replicas`** (ADR 0062's own fork-first design), so
+`group.config() == t.replicas` is **trivially true from the very first
+tick** — before the control-plane leader's OWN reconcile loop
+(`RECONCILE_INTERVAL`, 500ms) has had a single chance to bump `t.replicas`
+toward the *real*, differing target `CutoverSplit` already recorded as
+`split_placing[child].target`. A completion-loop tick landing in that
+(near-guaranteed, since this loop's own cadence is well under 500ms)
+window observes "already converged" and marks `done` before any placement
+move ever happens.
+
+**Why this wasn't caught by reasoning alone, and had to be found by
+running the real thing**: the failure mode is not a crash or a rejected
+command — `MarkSplitPlacingDone` happily applies (nothing about a
+premature-but-otherwise-well-formed CAS is wrong), and `done` flipping
+early doesn't strand the tablet (once `done` is true, `rebalance_placement`
+lifts its own exclusion and the tablet becomes eligible for ordinary,
+slower rebalance again) — so a first-order argument ("it self-heals, and
+`done` is a diagnostic only, never a serving gate per fork A") sounds
+airtight and is *wrong in practice*: `rebalance_step` moves one replica
+per tick, gated behind `REBALANCE_EVERY_N_TICKS` (~4s) and only when
+repair proposed nothing, and it optimizes cluster-wide balance, not "the
+same lowest-id candidates `select_replicas` would pick" — so the actual,
+observed outcome of losing this race was not "slightly delayed," it was
+"converges to a different, worse placement, an order of magnitude slower,
+reported done well before either of those things happened." A real
+end-to-end test (`tests/split_placing_completion.rs`, growing a cluster
+so a fresh `select_replicas` genuinely differs from a parent's fork-
+inherited homes) hit this race on essentially every run, because the
+race isn't a rare interleaving — it's the *default* ordering whenever the
+completion loop's own tick is faster than the control-plane's reconcile
+tick, which it always is.
+
+**The fix**: require the same converged observation to hold continuously
+for a settle window (`SPLIT_PLACING_DONE_SETTLE`, a small multiple of the
+control-plane's own `RECONCILE_INTERVAL`) before trusting it — a
+driver-local `BTreeMap<TabletId, Nanos>` of "first seen converged at",
+cleared the instant a tick observes non-convergence. This is the same
+"wait out a slower sibling loop's own worst-case reaction window before
+trusting an observation" shape `index_drain.rs`'s in-place cutover driver
+already uses (`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`, closing an analogous
+race against the tablet-host reconciler's own fallback cadence) — worth
+recognizing as a *recurring* pattern class in this codebase: whenever a
+fast, independently-scheduled loop's own read can observe a slower loop's
+"before" state and mistake it for the "after" state, a settle window
+(never a one-shot check) is the fix, and the settle duration is set by the
+*slower* loop's own worst-case cadence, not the fast loop's own tick rate.
+
+**General lesson (the product race)**: "a premature/wrong observation is
+harmless because a slower fallback mechanism will eventually correct it"
+is not the same claim as "a premature/wrong observation is cheap" — trace
+the fallback's own actual speed and its own actual target-selection
+algorithm before accepting that argument, especially when the fallback is
+a *different* mechanism (here, generic load-balancing rebalance vs.
+directed, target-specific placing) that was never designed to reproduce
+the fast path's specific outcome, only some outcome eventually. A
+convergence check comparing live state to a *just-written,
+not-yet-widely-observed* target needs to ask not just "do these two values
+match" but "could they match merely because the target hasn't moved yet,
+not because the mover has caught up" — the two are indistinguishable from
+a single snapshot and only separable by requiring the match to persist.
+
+**Follow-up hardening: the test itself, not the loop, was ALSO asserting a
+one-shot snapshot of an eventually-converging value.** The settle-window
+fix above closed the real product race. It did not, on its own, make
+`tests/split_placing_completion.rs` reliably green — a second pass, run to
+a 15-consecutive-green bar (`for i in $(seq 15); do cargo test -p animusd
+--test split_placing_completion || break; done`), surfaced two more
+failure modes, both root-caused rather than papered over with a wider
+timeout:
+
+1. **`assert_eq!(fork_inherited, [n0, n1, n2])` right after
+   `await_cutover_of` returns is itself a one-shot assert on an eventual
+   property** — the exact mistake this repo's own Testing-section rule
+   warns against, just relocated from the production loop into the test
+   that was supposed to be proving the loop correct. The directed-Placing
+   reconcile phase (`animus-control::node`'s 500ms `RECONCILE_INTERVAL`)
+   and this rung's own completion loop are BOTH independently-scheduled
+   background processes with no synchronization to `await_cutover_of`'s own
+   100ms poll granularity — nothing stops either or both from having
+   already finished by the exact instant the test's very next line reads
+   `/admin/status`, especially under `cargo test --workspace`'s CPU
+   contention (many test binaries competing for scheduler time slices makes
+   a "slow" background loop tick *faster relative to* a test's own
+   `sleep`-paced poll far less rare than a quiet single-binary run would
+   suggest). Observed directly: a captured failure showed child 2 already
+   sitting on `[m0, n0, n1]` — the fully-converged target — one line after
+   `await_cutover_of` returned, well before the test's own "prove the
+   convergence loop moves it" section had even started polling. **Fix**:
+   stopped asserting on the tablet's own *current* `replicas` (converging,
+   racy) and on `split_placing[child].done` (also converging, also racy)
+   in that spot entirely; kept only the assertion on `split_placing[child]
+   .target`, which `CutoverSplit` writes exactly once and the reconcile
+   loop is contractually forbidden from ever rewriting (ADR 0062 §2) — the
+   one field in the whole structure that is safe to assert on
+   synchronously, precisely because it is not an eventual property at all.
+2. **`join_extra`'s 30s outer retry deadline was a guessed constant, not
+   derived from the mechanism it retries** — `run_node_join`'s own internal
+   discovery poll (`JOIN_DISCOVERY_BUDGET`, 10s) means a single failed
+   attempt can itself cost most of a 10s slice before the outer loop even
+   gets to retry, so 30s bought only ~3 attempts under contention. Widened
+   to 60s (six attempts' worth) with the reasoning written down against the
+   actual constant it derives from, and the swallowed `Err` is now printed
+   (`eprintln!`) so a future failure names its own cause instead of a bare
+   "could not join after retries." This is remedy-class 4 from this
+   incident's own review ("is the budget derived from the mechanism's
+   actual worst-case, or a guess") applied to a *setup* step, not just the
+   convergence poll it was easy to think of first.
+
+**Verification discipline worth naming explicitly**: a single green run (or
+even ten) of a real multi-process `ProdEnv` e2e test proves far less than
+it feels like it does when the failure mode is a race with a probability
+in the 10-20% range — the fix here was only trusted once a *sequential*
+`for i in $(seq 15); do cargo test ... || break; done` loop (never a
+background/parallel batch, which can mask exactly the CPU-contention
+condition that makes the race worse) ran clean end to end, run in the
+foreground so a failure stops the loop immediately rather than being
+averaged away in a summary count.
+
+**General lesson (the test hardening)**: when hardening a flaky
+real-cluster test, audit *every* assertion for whether the value it checks
+is a converging (eventual) one or a written-once (stable) one — not just
+the assertion that produced the original failure. A test built by
+iterating on whichever assertion just failed will fix them one at a time
+and keep discovering new ones on each subsequent run, because a racy
+assertion on a fast-converging system fails probabilistically, not
+deterministically — the fix that actually stops the bleeding is a pass
+over the whole test asking "which of these could this system have already
+finished by the time I check it," not a reactive timeout bump on whichever
+line the last failure happened to name.
+
+## An unrelated, pre-existing `reconfigure_step` instability was found (not fixed) while validating the above: a 2-of-3-replica-swap target can make live Raft membership oscillate instead of converge (ADR 0062 rung 6)
+
+While building the real end-to-end test for the settle-window fix above, a
+target requiring the reconfigure sequence to replace **two** of a tablet's
+three replicas at once (grow a 3-node cluster by two lower-sorting-id
+nodes, so `select_replicas` prefers both new nodes over two of the
+parent's three) reliably made the live CP-data Raft group's own voter set
+**oscillate** under a real `ProdEnv` cluster: it would reach the transient,
+genuinely-over-replicated 5-member intermediate state
+`reconfigure_step`'s add-before-remove sequencing produces (add both new
+learners, promote both, only then remove the two extras), then revert
+partway back toward the original 3-replica set, repeating indefinitely —
+never settling within a 60s budget. **This is provably unrelated to the
+completion loop above**: it reproduces with zero `MarkSplitPlacingDone`
+proposes ever having fired (confirmed by instrumenting the loop and
+observing the oscillation begin before the loop's own settle window had
+even elapsed once), so the cause sits in `host::Reconciler`/
+`reconfigure_step` itself (`animus-cp-data`, ADR 0058 Train 1), pre-dating
+and unmodified by ADR 0062. A target that replaces only **one** of three
+replicas (a strictly simpler add-one/remove-one sequence, never reaching a
+5-voter intermediate state) converged cleanly and quickly on every run.
+
+Not investigated further or fixed — out of this rung's own scope, and
+worth a dedicated investigation rather than a guess folded into an
+unrelated change (this repo's own "an incidental bug gets its own PR"
+rule). `tests/split_placing_completion.rs` deliberately exercises only the
+one-replica-difference shape, with its own doc comment explaining why, so
+a future investigation of the two-replica case has a name, a reproduction
+recipe (grow-by-two, RF3, real `ProdEnv`), and a already-written
+regression-in-waiting to flip on once the underlying issue is found. Filed
+here rather than silently worked around, per this repo's own "record a
+generalizable lesson, including one you didn't chase to the end" practice.
+
+## A bench whose cluster size equals RF cannot exercise a design change whose whole benefit is "fewer/cheaper cross-node catch-ups" (ADR 0062 rung 7, bench re-validation)
+
+Re-running `animusd/tests/inplace_split_bench.rs` (byte-for-byte the same
+3-node/RF-3 workload ADR 0058's own rung-8 bench used) against fork-first
+(this ADR) and, side by side on the same host/session, against a worktree
+checked out at the commit immediately preceding it (ADR 0058's Stage 1/2
+F5-learner-recruitment in-place design) found **no** improvement in
+fork-to-Active wall clock or write blip — if anything, fork-first measured
+slightly *worse* on both (median 1.347s vs. 1.149s wall clock; 616ms vs.
+419ms write blip; N=3 each, one shared/contended host, load average ≈2.0).
+This is not a regression finding: at N=3 nodes with RF=3, `select_replicas`/
+`select_replicas_balanced` has no candidate node outside the parent's own
+current replica set to ever recruit, so the pre-ADR-0062 baseline's own
+Stage 1/2 learner-recruitment window is recruiting learners that are
+*already* existing, already-caught-up voters — it never pays the
+cross-cluster `InstallSnapshot` cost ADR 0062's own Context section names
+as F5's actual cost driver, and the bench that used to prove ADR 0050's
+own convergence-predicate-starvation problem for a *different* mechanism
+did not, and structurally could not, prove or disprove this one's central
+claim (see the ADR's rung-7 amendment for the full numbers and the honest
+"neither confirms nor refutes" verdict).
+
+**General lesson**: before trusting an existing bench to validate a new
+design just because its own Testing plan named that bench as "the one that
+should be pointed at this before it's trusted," check whether the bench's
+own fixed parameters (here: node count == replication factor) structurally
+foreclose the scenario the new design's benefit depends on — a bench
+proven sound for one mechanism's regression (ADR 0050's cutover-starvation
+problem, which ADR 0058's rung-8 bench genuinely does exercise at N=3) is
+not automatically sound for a *different* mechanism's improvement claim
+(ADR 0062's cross-cluster-catch-up-avoidance claim, which needs a cluster
+*wider than RF* to ever engage the code path the claim is about). A
+"re-run the existing bench and publish the numbers" instruction is not a
+substitute for asking whether that bench can see the thing being measured;
+report the mismatch plainly rather than let a flat or adverse number pass
+silently as if it settled the question either way.
+
+## Before designing new movement machinery for "get this thing onto a different set of nodes," check whether a declared-state convergence loop already provides it (ADR 0062's own central finding, generalized)
+
+ADR 0062's whole design reduces to one recognition, worth stating outside
+its own split-specific frame because it recurs: `reconfigure_step` (ADR
+0058 Train 1's learner-phased membership-change sequencing) plus its
+production caller (`host::Reconciler::execute`'s `HostAction::Reconfigure`
+arm) already converges a tablet's *live* Raft membership toward whatever
+*declared* target `Metadata.tablets[t].replicas` names — with no
+availability dip, on every tick, for every tablet, unconditionally. That
+is a **general-purpose "move this to there" primitive**, keyed off nothing
+more than a `CasTabletReplicas` write. ADR 0029's `rebalance_placement`
+already rides it for load-balancing; ADR 0062 recognized that a split
+child's post-fork relocation is not a new kind of problem needing its own
+bespoke fused-with-the-fork mechanism (ADR 0058 Train 2 Stage 1/2's own
+now-deleted learner-recruitment machinery) — it is the *same* problem,
+solved by computing one more kind of target and handing it to the exact
+same convergence loop.
+
+**General lesson**: before building new machinery to move, relocate, or
+converge some piece of state onto a different set of nodes/replicas/
+homes, ask whether an existing declared-state convergence loop in this
+codebase already does exactly that generic job — search for the pattern
+"a driver reads a `Metadata`-declared target every tick and proposes a CAS
+that nudges live state toward it," not just for a mechanism with a
+matching name. When one exists, the design work shrinks to "compute the
+right target, once, from already-agreed state" (this codebase's own
+repeated `BeginBackup`/`CutoverSplit`-at-apply-time discipline) plus
+"feed it into the loop" — not a parallel bespoke mover with its own
+readiness gates, its own over-provisioning accounting, and its own
+partial-progress-inheritance edge cases, all of which a fused
+design pays for even when the underlying convergence primitive was
+sitting there unused the whole time.
+## A CI check whose failure mode is "intermittent, unresolved root cause" doesn't need a diagnosis before it can be fixed — remove the risky mechanism instead (issue #466, `.github/workflows/dco.yml`)
+
+`tim-actions/get-pr-commits` + `tim-actions/dco` intermittently died with
+`Argument list too long` (`E2BIG`) on some PRs. The issue's own first theory
+— "our commit messages are unusually large, and that's what crosses
+`ARG_MAX`" — was directly disproved by an A/B comparison: a 37-commit/42KB
+PR failed twice while a 63-commit/73KB PR (~74% more payload) passed on the
+same runner fleet minutes apart. The true trigger inside the third-party
+action was never identified, and didn't need to be: the fix wasn't "explain
+the flake," it was "stop doing the thing that has this failure mode at
+all." Both actions round-trip every commit message through argv/env
+(`get-pr-commits`'s JSON output becomes `dco`'s `commits:` input, which the
+action re-serializes onto a command line internally) — replaced with an
+in-workflow script that walks `git rev-list --no-merges
+<merge-base>..<head>` and checks `git log -1
+--format='%(trailers:key=Signed-off-by,valueonly)' <sha>` per commit,
+capturing trailer content only into a shell variable that's compared/
+printed, never re-interpolated into another command or eval'd — commit
+SHAs (fixed-width hex from `rev-list`, never derived from message content)
+are the only thing that reaches a command line. **General lesson: when a CI
+failure is real, reproducible, but resists root-causing (especially inside
+a third-party action's own internals), don't burn more budget chasing the
+exact trigger before fixing it — if the failure mode has a known shape
+(here: "large untrusted content on argv/env can exceed `ARG_MAX`"), a
+local reimplementation that structurally can't hit that shape closes the
+bug regardless of which precise condition was tripping it, and is usually
+smaller than bisecting a dependency's black box.** Separately: computing the
+PR's commit range via `git merge-base "$BASE_SHA" "$HEAD_SHA"` (both
+supplied by the `pull_request` event, `head.sha`/`base.sha`) rather than
+diffing against the base branch tip works identically for same-repo and
+fork PRs, because GitHub mirrors a fork PR's commits into the base repo's
+own ref namespace — a plain `actions/checkout` with `fetch-depth: 0` and an
+explicit `ref: ${{ github.event.pull_request.head.sha }}` (not the default
+merge-ref checkout) is enough to fetch them all from `origin`.
+
+## A per-item lookup miss during an enumerate-then-await walk can mean "already accomplished by a concurrent actor," not "was never real" — check whether an earlier-caught version of the same race already has a skip to reuse (issue #454, `ClientCtx::grow_stream`)
+
+`grow_stream` (`animusd/src/schema.rs`) enumerates a table's tablets from a
+`Metadata` snapshot up front, then calls `grow_stream_tablet` on each —
+one real `await` per iteration (resolve leader → propose → poll), so wall
+time and Raft activity pass between the snapshot and any one tablet's own
+turn. A tablet snapshotted `Active` can be retired by a **cascade** split
+(a different tablet's cutover in the same walk, or a fully independent
+one) before its turn arrives; the lookup `grow_stream_tablet`'s own
+`trigger_split` call performs then returns the generic "no such tablet"
+message, and — before this fix — that flowed straight through as a hard
+`error`, even though the code already had an identical-shaped skip
+(`STREAM_GROW_MID_SPLIT`) for a tablet caught `Splitting`/`Building` a
+*beat earlier* in the very same up-front `match`. The fix is not a new
+concept, just recognizing that the vanished-tablet case is the SAME
+concurrent-completion race observed one step later: the tablet didn't stop
+existing, it finished being split, and its (now `Active`) children's
+lineage already covers stream continuity exactly as it does for any other
+split — so skipping this call's own attempt on it costs nothing (the
+children just wait for the *next* `grow_stream` call, same as a
+`Splitting` parent's own children do today).
+
+**General lesson**: whenever a loop enumerates a set from a stale
+snapshot and then does real (`await`-crossing) work per item, a per-item
+"this no longer exists" result during the walk is not automatically an
+error — it can be the exact same "someone else already finished this"
+signal an *earlier*-observed variant of the race already has a legitimate
+skip for. Before writing a new error/skip classification, grep the
+sibling code path that already classifies the same job's more-obviously-
+racy states (here, the up-front `Splitting`/`Building` match) and ask
+whether the missing case is really a later-observed instance of the same
+thing — reuse its outcome and its safety argument rather than inventing a
+parallel one. Keep the interception narrow: match the *exact* error
+message/variant produced by the specific call this walk makes, at the one
+call site that walk owns, not a blanket catch on that message everywhere
+it can be produced — `trigger_split`'s own "no such tablet" is a correct,
+unrelated hard error for its other two callers (`auto_split_loop`,
+`POST /admin/tablet/split`), which never enumerate a stale snapshot and so
+have no such race to excuse. A pure `ClientResponse -> ClientResponse`
+classifier extracted into its own function made this reclassification
+unit-testable without any `SimEnv`/`ProdEnv` harness at all — the existing
+regression coverage for this exact race
+(`cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`) is a
+real-thread `ProdEnv` e2e test whose relevant window is a small, non-
+deterministic timing race, unsuitable as the *only* proof the fix holds.
+
+## A branch-selection existence check needs the same read-your-writes barrier as a self-confirm — not just the proposer's own poll (issues #406/#450, `animusd::admin_add_control_member`)
+
+The general "confirm a just-proposed effect via `engine_applied_index()`,
+never a raw cache re-read" lesson is already logged several times over in
+this file (grep the term) — always framed as *a proposer confirming its own
+write*. `admin_add_control_member`'s bug is the same staleness hazard
+wearing a different hat: it isn't confirming anything it just proposed —
+it reads `metadata_cached()` once to decide **which branch to take**
+("is `node` already registered, or genuinely unclaimed?"), where the fact
+it's checking for is *someone else's* concurrent commit (the target
+control-only node's own self-registration, landing on this same leader
+just beforehand). Because a control-only registration never claims
+`Metadata::members` by design (ADR 0040 PR4's own carve-out — see
+`animus-control::meta.rs`'s `RegisterNode` doc), the old gate
+(`meta.members.contains_key`) was *structurally* always false for this
+node shape, so the "genuinely unclaimed" branch ran on **every** call and
+re-derived a fresh `NodeAddrs` from the same stale `metadata_cached()` —
+empty `client`/`intra`/`admin` fields whenever this leader's own ADR 0038
+apply task hadn't yet caught up to the real registration's own commit,
+producing a permanent CAS collision (or, worse, a durable blank address
+book if the malformed proposal won the race). Two independent fixes were
+needed, not one: (1) the gate itself must consult `node_addrs`, the
+command's *actual* CAS key, not `members` alone; (2) before evaluating
+either, the call must bound-wait for `engine_applied_index() >=
+commit_index()` **on this exact leader** — a local read-your-writes
+barrier against *this leader's own* Raft log, not the proposer's own
+command, closing the dominant race (a self-registration relayed to/
+proposed on this same leader moments earlier) outright, and narrowing what
+remains to the genuinely irreducible "hasn't reached this leader's log at
+all yet" case. Fix (1) alone measurably narrows the bug but does **not**
+close it: in the reproduction built to prove this, checking `node_addrs`
+without also adding the wait still collided reliably, because the leader's
+own cache had **no trace under either key** at read time — the commit
+itself, not just the label it's filed under, was the missing fact.
+**General lesson: any local snapshot read used to gate a decision about
+"has some other actor already done X" needs the identical staleness
+audit a self-confirm poll gets, even when the caller never proposed
+anything itself and has no `propose_and_await`-shaped call site to remind
+it** — the caller-doesn't-know-to-wait failure mode is easy to miss
+because nothing in the code *looks* like a write path. Reproducing this
+deterministically in a real `ProdEnv` test needed the same technique as
+the `InstallSnapshot`-window entry just above: not a fixed sleep or
+artificial load, but a condition-based search polling `GET /admin/raft`'s
+`commit_index`/`engine_applied_index` fields directly for the instant
+where commit has advanced but apply hasn't, then firing the racing call at
+exactly that reading.

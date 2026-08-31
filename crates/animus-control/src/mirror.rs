@@ -169,6 +169,21 @@ pub fn apply_and_derive_mirror(
         }
         _ => Vec::new(),
     };
+    // ADR 0062 §2: `DropTableTablets` also prunes any `split_placing` row
+    // for a tablet it is about to remove — the identical "identities gone
+    // by the time `apply` returns" hazard `pruned_index_backfill` is
+    // captured for, just above.
+    let pruned_split_placing: Vec<TabletId> = match command {
+        MetaCommand::DropTableTablets { table } => {
+            let dropped: Vec<TabletId> = meta.tablets_for_table(table).map(|(&id, _)| id).collect();
+            meta.split_placing
+                .keys()
+                .filter(|tablet| dropped.contains(tablet))
+                .copied()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     // ADR 0059 §3: `DeleteBackup` only carries the backup id — which
     // `(backup_id, tablet)` progress rows it is about to prune is only
     // knowable by looking at pre-apply state, the identical
@@ -267,6 +282,13 @@ pub fn apply_and_derive_mirror(
                 if let Some(policy) = meta.policies.get(child) {
                     writes.push(put_json(syskv::policy_key(*child), policy));
                 }
+                // ADR 0062 §2: the in-place branch's own directed-Placing
+                // decision, when cutover wrote one for this child (an
+                // already-satisfying child gets no row at all — see
+                // `Metadata::split_placing`'s own doc).
+                if let Some(entry) = meta.split_placing.get(child) {
+                    writes.push(put_json(syskv::split_placing_key(*child), entry));
+                }
             }
         }
         MetaCommand::SetTabletPolicy { tablet, policy } => match policy {
@@ -289,6 +311,9 @@ pub fn apply_and_derive_mirror(
             }
             for (tablet, index) in &pruned_index_backfill {
                 writes.push(KeyWrite::Delete(syskv::index_backfill_key(*tablet, index)));
+            }
+            for tablet in &pruned_split_placing {
+                writes.push(KeyWrite::Delete(syskv::split_placing_key(*tablet)));
             }
             for id in dead_cp_member_ids(&pre_cp_member_tablets, meta) {
                 writes.push(KeyWrite::Delete(syskv::cp_member_addr_key(&id)));
@@ -340,6 +365,12 @@ pub fn apply_and_derive_mirror(
             writes.push(KeyWrite::Put(
                 syskv::index_backfill_key(*tablet, index),
                 Vec::new(),
+            ));
+        }
+        MetaCommand::MarkSplitPlacingDone { tablet, .. } => {
+            writes.push(put_json(
+                syskv::split_placing_key(*tablet),
+                &meta.split_placing[tablet],
             ));
         }
         MetaCommand::RegisterCpAddr { id, addr, tablet } => {
@@ -671,6 +702,11 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             meta.split_lineage
                 .insert(TabletId(decode_u64(&id)), lineage);
         }
+        EntityKind::SplitPlacing => {
+            let entry: crate::meta::SplitPlacing =
+                serde_json::from_slice(value).expect("mirrored split-placing value decodes");
+            meta.split_placing.insert(TabletId(decode_u64(&id)), entry);
+        }
         EntityKind::Backup => {
             let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
             let row: crate::meta::BackupRow =
@@ -764,6 +800,12 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // Never deleted in practice (`split_lineage` is never pruned)
             // — listed for match exhaustiveness.
             meta.split_lineage.remove(&TabletId(decode_u64(&id)));
+        }
+        EntityKind::SplitPlacing => {
+            // Reachable in practice — `DropTableTablets` prunes an orphaned
+            // row for a tablet no longer in the live tablet map (ADR 0062
+            // §2), the identical `index_backfill` cascade above.
+            meta.split_placing.remove(&TabletId(decode_u64(&id)));
         }
         EntityKind::Backup => {
             // Reachable in practice — `DeleteBackup` tombstones a row

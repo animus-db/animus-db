@@ -577,9 +577,40 @@ async fn wait_all_finished(handles: &[tokio::task::AbortHandle]) {
     let _ = tokio::time::timeout(SHUTDOWN_WAIT_TIMEOUT, poll).await;
 }
 
+/// How long [`spawn_accept`]'s loop backs off after a failed `accept()`
+/// before retrying, so a *persistent* failure (e.g. the process pinned at
+/// its file-descriptor ulimit) degrades to a bounded retry rate instead of
+/// spinning the executor at 100% CPU re-entering `accept()` immediately.
+/// Deliberately short — the common case is a single transient blip (see
+/// this function's own doc) that should resume accepting within a fraction
+/// of an election timeout, not linger backed off while peers time out
+/// waiting to reach this node.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
 /// Spawn the accept loop for `listener` — one reader task per inbound connection,
 /// each demuxing length-prefixed frames into a fresh inbox channel. Returns the
 /// inbox receiver and the accept task's abort handle (for `shutdown`).
+///
+/// **A failed `accept()` never stops this loop.** `TcpListener::accept`'s
+/// error cases (`EMFILE`/`ENFILE` when the process or system is at its
+/// file-descriptor limit, `ECONNABORTED`/`ECONNRESET` from a peer that
+/// disconnected mid-handshake, and similar per-connection conditions) are
+/// ordinarily transient — the classic accept-loop hazard (well documented
+/// for `accept(2)`-style servers) is treating any of them as fatal and
+/// exiting, which silently and permanently deafens this node to every
+/// future inbound connection despite the process staying alive and
+/// otherwise healthy. That is exactly what starved a fresh 3-node
+/// control-plane election in practice: a short burst of concurrent
+/// DNS-resolution + connect attempts against not-yet-resolvable peer
+/// hostnames during cluster bootstrap (every voter re-running pre-vote every
+/// election timeout with no leader yet to quiet it) transiently pushed the
+/// process to its file-descriptor ulimit, one `accept()` observed `EMFILE`,
+/// the old code returned, and that node's Raft peers could never reach it
+/// again — with only the eventual `TcpListener` teardown itself as the
+/// (never-triggered) way out. This loop instead logs and backs off
+/// ([`ACCEPT_ERROR_BACKOFF`]) on every error and keeps accepting; the only
+/// way it stops is this env's own `AbortHandle` being aborted
+/// ([`ProdEnv::shutdown`]/[`ProdEnv::shutdown_and_wait`]).
 fn spawn_accept(
     listener: TcpListener,
 ) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
@@ -596,8 +627,8 @@ fn spawn_accept(
                     });
                 }
                 Err(err) => {
-                    tracing::warn!(?err, "accept failed");
-                    return;
+                    tracing::warn!(?err, "accept failed (retrying)");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             }
         }

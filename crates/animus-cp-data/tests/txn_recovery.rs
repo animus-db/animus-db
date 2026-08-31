@@ -200,6 +200,7 @@ fn resolve(
         n.txn_resolve(txn_id, record_key, keys, outcome).await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
 }
 
 fn status_local(
@@ -908,8 +909,17 @@ fn pending_txns_reflects_applies_across_restart() {
     );
 
     // Deciding it now clears it from `pending` (and moves it into
-    // `unresolved_decided` until resolved).
-    commit_at_least(
+    // `unresolved_decided` until resolved). `commit_at_least`'s own
+    // returned ts IS the record's real `commit_ts` here (single-node, no
+    // concurrent recovery decider racing it) — the resolve below must
+    // carry that *actual* decided value, never `txn_id.ts` (its own
+    // no-longer-valid candidate): `KvCommand::TxnResolve`'s apply arm
+    // rejects a carried outcome that doesn't match the anchor's own
+    // decided record (`outcome_mismatch`, ADR 0018 §2/PR6 defense-in-depth)
+    // as a whole-entry no-op, which — since the write-loss amendment §3/§6
+    // fix — correctly leaves `unresolved_decided` untouched rather than
+    // clearing it out from under a resolve that never actually landed.
+    let commit_ts = commit_at_least(
         &mut sim,
         &restarted,
         txn_id.clone(),
@@ -931,9 +941,7 @@ fn pending_txns_reflects_applies_across_restart() {
         txn_id.clone(),
         record_key,
         vec![ka],
-        TxnOutcome::Committed {
-            commit_ts: txn_id.ts,
-        },
+        TxnOutcome::Committed { commit_ts },
     );
     assert!(
         !restarted.unresolved_decided().contains_key(&txn_id),

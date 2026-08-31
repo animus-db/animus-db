@@ -41,7 +41,7 @@ use animus_control::ProposeResult;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, NodeId, nid};
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, Tablet, TabletId};
 use animus_test::corpus::{self, SeedVariant};
@@ -208,6 +208,34 @@ impl Cluster {
     /// [`add_node_with_storage`](Self::add_node_with_storage)'s doc).
     fn crash_restart(&mut self, id: NodeId) {
         self.sim.stop(id.clone());
+        let engines = self.nodes.remove(&id).expect("node exists").engines;
+        self.add_node_with_storage(id, engines);
+    }
+
+    /// Like [`crash_restart`](Self::crash_restart), but the crash itself may
+    /// TEAR `id`'s own un-synced WAL tail — `id`'s own [`DiskConfig`] must
+    /// carry [`DiskConfig::torn_tail_on_crash`] BEFORE this call. (A
+    /// bit-flip landing inside a still-JSON-valid packed `HlcTimestamp` —
+    /// what [`DiskConfig::corrupt_on_crash`] composed with the tear used to
+    /// risk, issue #495 — is now caught by a per-record WAL checksum
+    /// (`animus_control::persist`) instead of silently mis-decoding; this
+    /// corpus still doesn't compose the two here, since this helper's own
+    /// callers only need the tear, not an extra fault dimension this file
+    /// isn't otherwise exercising.) [`Simulator::stop`] alone (what
+    /// [`crash_restart`](Self::crash_restart) uses) never tears anything —
+    /// it drops a node's whole un-synced buffer atomically, unconditionally;
+    /// only [`Simulator::crash`] draws the tear-point/tear-content RNG.
+    /// `crash` sets the simulator's own `crashed` flag (muting the node's
+    /// OUTBOUND sends), which `stop` does **not** clear on its own — so this
+    /// composes as `crash` (apply the tear) → `stop` (model the process
+    /// actually exiting, freeing its tasks) → [`Simulator::restart`] (clear
+    /// `crashed`, so the fresh node this method constructs next isn't
+    /// silently muted forever) → rebuild fresh, reusing the SAME
+    /// [`MemoryTabletEngines`], exactly like `crash_restart`.
+    fn crash_torn_restart(&mut self, id: NodeId) {
+        self.sim.crash(id.clone());
+        self.sim.stop(id.clone());
+        self.sim.restart(id.clone());
         let engines = self.nodes.remove(&id).expect("node exists").engines;
         self.add_node_with_storage(id, engines);
     }
@@ -615,6 +643,19 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "learner_crash_is_replaced_by_a_new_target",
             scenario_learner_crash_is_replaced_by_a_new_target
+        ),
+        // --- ADR 0061 Decision 3 (detcov fault-primitive wiring) ---------------
+        scenario!(
+            "duplicate_delivery_during_down_replica_reconfigure_and_leader_kill",
+            scenario_duplicate_delivery_during_down_replica_reconfigure_and_leader_kill
+        ),
+        scenario!(
+            "fsync_lie_then_crash_follower_recovers_via_replication",
+            scenario_fsync_lie_then_crash_follower_recovers_via_replication
+        ),
+        scenario!(
+            "torn_tail_crash_restart_replica_recovers",
+            scenario_torn_tail_crash_restart_replica_recovers
         ),
     ]
 }
@@ -1982,6 +2023,281 @@ fn scenario_learner_crash_is_replaced_by_a_new_target(seed: u64) {
         );
         assert_hosted_converged(&c, node_e(), [TabletId(1)]);
         assert_present(&c.storage(node_e(), TabletId(1)), &physical(b"k0"), b"v0").await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0061 Decision 3: wiring `animus-sim`'s fault-injection vocabulary
+// (proven only in its own meta-tests until now) into this corpus.
+// ---------------------------------------------------------------------------
+
+/// Scenario 22: duplicated network delivery (`NetConfig::set_duplicate_prob`
+/// — every surviving message can be re-delivered a second time, with its
+/// own independently-drawn delay, so it can land before, at, or after the
+/// original) on EVERY real node's own outbound traffic, combined with a
+/// real leader-kill nemesis (`node_c()` dies outright mid-scenario, whether
+/// or not it happened to be leading). Proves `HostAction::Reconfigure`'s
+/// down-replica-removal lifecycle converges to the SAME final config
+/// exactly once — never double-removed, never corrupted — even when every
+/// RPC that drives it (`RequestVote`/`AppendEntries`/heartbeats, and the
+/// removal proposal itself) can arrive twice.
+fn scenario_duplicate_delivery_during_down_replica_reconfigure_and_leader_kill(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+
+        // `set_net_config_for` is keyed on the SENDER — every real node's
+        // own outbound traffic gets the identical duplicate-delivery
+        // treatment.
+        let mut dup = NetConfig::default();
+        dup.set_duplicate_prob(0.3);
+        for id in [a(), b(), node_c()] {
+            c.sim.set_net_config_for(id, dup.clone());
+        }
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(3)).await; // elect, tolerating duplicated vote traffic
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader0 = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        leader0.put(b"before".to_vec(), b"v0".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+
+        // The leader-kill nemesis: node_c() dies outright (a real process
+        // exit, whether or not it happened to lead) — duplicated traffic
+        // keeps landing on the two survivors while they elect (if needed)
+        // and reconfigure it away.
+        c.sim.stop(node_c());
+        let v2 = view_with_down([tablet(1, b"", None, vec![a(), b()])], [node_c()]);
+        let target: BTreeSet<NodeId> = [a(), b()].into_iter().collect();
+
+        for _ in 0..150 {
+            c.tick_all(&[a(), b()], &v2).await;
+            env.sleep(Duration::from_millis(100)).await;
+            if ha.config() == target && hb.config() == target {
+                break;
+            }
+        }
+        assert_eq!(
+            ha.config(),
+            target,
+            "the down replica was never cleanly removed from a()'s own durable config \
+             under duplicated delivery"
+        );
+        assert_eq!(
+            hb.config(),
+            target,
+            "the down replica was never cleanly removed from b()'s own durable config \
+             under duplicated delivery"
+        );
+
+        let leader = if ha.is_leader() { &ha } else { &hb };
+        leader.put(b"after".to_vec(), b"v1".to_vec());
+        env.sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            leader.linearizable_get(b"before").await,
+            Some(b"v0".to_vec())
+        );
+        assert_eq!(
+            leader.linearizable_get(b"after").await,
+            Some(b"v1".to_vec())
+        );
+
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_idempotent(&mut c, a(), &v2).await;
+        assert_idempotent(&mut c, b(), &v2).await;
+    });
+}
+
+/// Scenario 23: `DiskConfig::set_fsync_lie_prob` on a FOLLOWER's own disk
+/// (`sync` keeps returning `Ok` but leaves the buffered bytes un-synced,
+/// exposed to a later crash exactly like any other un-synced tail), then
+/// that same node crashes+restarts. Proves the reconciler-driven lifecycle
+/// never advances past what is ACTUALLY durable: durability here never
+/// depended on this one node's own (lying) local WAL — only on the OTHER
+/// two voters' genuinely-synced ones — so every write, including the ones
+/// proposed while the lie was in effect, must survive this node's own
+/// crash, and its restart must recover via ordinary Raft catch-up rather
+/// than trusting whatever its own un-synced tail happened to retain.
+fn scenario_fsync_lie_then_crash_follower_recovers_via_replication(seed: u64) {
+    run(seed, |sim| async move {
+        let env_a = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env_a.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader0 = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        for i in 0..5u64 {
+            leader0.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+        }
+        env_a.sleep(Duration::from_secs(2)).await;
+
+        // Every `sync` on node_c()'s own disk lies from here on. This ONLY
+        // perturbs node_c()'s own Raft WAL — its `MemoryEngine` (the
+        // corpus's durable-engine stand-in, per `add_node_with_storage`'s
+        // own doc) is untouched.
+        let mut lying_disk = DiskConfig::default();
+        lying_disk.set_fsync_lie_prob(1.0);
+        c.sim.set_disk_config_for(node_c(), lying_disk);
+
+        for i in 5..10u64 {
+            let leader = if ha.is_leader() {
+                &ha
+            } else if hb.is_leader() {
+                &hb
+            } else {
+                &hc
+            };
+            leader.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+        }
+        env_a.sleep(Duration::from_secs(2)).await;
+
+        // Crash+restart node_c() (`Simulator::stop` drops its whole
+        // un-synced buffer atomically — exactly what a lied-to `sync`
+        // leaves exposed) at a bumped epoch, mirroring
+        // `crash_restart_follower`'s own shape.
+        c.crash_restart(node_c());
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a(), b(), node_c()], 5)]);
+        c.tick(node_c(), &v2).await;
+        env_a.sleep(Duration::from_secs(1)).await;
+        c.tick_all(&[a(), b()], &v2).await;
+        env_a.sleep(Duration::from_secs(3)).await;
+
+        let hc2 = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        assert!(
+            wait_until(&env_a, 100, Duration::from_millis(100), || {
+                hc2.config().contains(&node_c())
+            })
+            .await,
+            "the restarted (fsync-lied) follower never rejoined as a real voter"
+        );
+        // The real teeth: every write, including the ones proposed WHILE
+        // node_c()'s own disk was lying, survived — durability never
+        // depended on node_c()'s own local WAL, only on the majority's.
+        for i in 0..10u64 {
+            assert_eq!(
+                hc2.local_get(format!("k{i}").as_bytes()).await,
+                Some(format!("v{i}").into_bytes()),
+                "a write must survive a follower's own fsync-lie-then-crash as long as \
+                 the majority durably committed it"
+            );
+        }
+
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_hosted_converged(&c, node_c(), [TabletId(1)]);
+    });
+}
+
+/// Scenario 24: `DiskConfig::torn_tail_on_crash` (WITHOUT
+/// `corrupt_on_crash` — see [`Cluster::crash_torn_restart`]'s own doc for
+/// why) on a replica's own disk, torn via the real `crash` → `stop` →
+/// `restart` composition ([`Cluster::crash_torn_restart`] — `Simulator::
+/// stop` alone, what every OTHER crash scenario in this file uses, never
+/// tears anything). Real post-recovery teeth, not just crash-and-move-on:
+/// pre-crash data must survive (via the majority's own durable WALs, never
+/// this replica's own possibly-torn one) AND a fresh post-recovery write
+/// must actually replicate to the recovered replica.
+fn scenario_torn_tail_crash_restart_replica_recovers(seed: u64) {
+    run(seed, |sim| async move {
+        let env = sim.env(a());
+        let mut c = Cluster::new(sim);
+        c.add_node(a());
+        c.add_node(b());
+        c.add_node(node_c());
+
+        let v1 = view([tablet(1, b"", None, vec![a(), b(), node_c()])]);
+        c.tick_all(&[a(), b(), node_c()], &v1).await;
+        env.sleep(Duration::from_secs(2)).await;
+
+        let ha = c.node(a()).hosted_node(TabletId(1)).unwrap().clone();
+        let hb = c.node(b()).hosted_node(TabletId(1)).unwrap().clone();
+        let hc = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        let leader0 = if ha.is_leader() {
+            &ha
+        } else if hb.is_leader() {
+            &hb
+        } else {
+            &hc
+        };
+        for i in 0..5u64 {
+            leader0.put(format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+        }
+        env.sleep(Duration::from_secs(2)).await;
+
+        // Torn-tail alone — `corrupt_on_crash` isn't composed alongside it
+        // here (a bit-flip landing inside a still-JSON-valid packed
+        // `HlcTimestamp` used to be a separate bug class, issue #495, now
+        // closed by a per-record WAL checksum, `animus_control::persist`;
+        // this scenario just isn't exercising that extra fault dimension).
+        let mut torn = DiskConfig::default();
+        torn.torn_tail_on_crash = true;
+        c.sim.set_disk_config_for(node_c(), torn);
+
+        c.crash_torn_restart(node_c());
+
+        let v2 = view([tablet_at_epoch(1, b"", None, vec![a(), b(), node_c()], 5)]);
+        c.tick(node_c(), &v2).await;
+        env.sleep(Duration::from_secs(1)).await;
+        c.tick_all(&[a(), b()], &v2).await;
+        env.sleep(Duration::from_secs(3)).await;
+
+        let hc2 = c.node(node_c()).hosted_node(TabletId(1)).unwrap().clone();
+        assert!(
+            wait_until(&env, 100, Duration::from_millis(100), || {
+                hc2.config().contains(&node_c())
+            })
+            .await,
+            "the torn-tail-restarted replica never rejoined as a real voter"
+        );
+
+        for i in 0..5u64 {
+            assert_eq!(
+                hc2.local_get(format!("k{i}").as_bytes()).await,
+                Some(format!("v{i}").into_bytes()),
+                "pre-crash data must survive a torn (not merely dropped) WAL tail"
+            );
+        }
+        let leader = if ha.is_leader() { &ha } else { &hb };
+        leader.put(b"post_recovery".to_vec(), b"still_replicates".to_vec());
+        assert!(
+            wait_until(&env, 50, Duration::from_millis(100), || {
+                block_on(hc2.local_get(b"post_recovery")) == Some(b"still_replicates".to_vec())
+            })
+            .await,
+            "the recovered replica never caught a fresh post-recovery write"
+        );
+
+        assert_hosted_converged(&c, a(), [TabletId(1)]);
+        assert_hosted_converged(&c, b(), [TabletId(1)]);
+        assert_hosted_converged(&c, node_c(), [TabletId(1)]);
     });
 }
 

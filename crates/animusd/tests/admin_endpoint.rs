@@ -1364,3 +1364,106 @@ async fn admin_split_kicks_off_the_copy_based_workflow() {
     .await
     .expect("test timed out");
 }
+
+/// ADR 0062 rung 4 ("fork first, always local") teeth: `trigger_split`'s
+/// `InPlace` arm no longer calls `split_child_placement` — both children's
+/// recorded replicas must be exactly the parent's own current replicas,
+/// never a placement-recomputed set. A 4-node cluster with `RF = 3`
+/// (`MAX_REPLICATION_FACTOR`) is the deliberate setup: node `n3` is never
+/// one of the table's tablet's replicas, so it is exactly the kind of
+/// currently-idle, would-balance-the-load candidate the OLD `split_
+/// child_placement`/fork F5 path would have been drawn to recruit for at
+/// least one child (a genuine differentiator, not just "the only replica
+/// set available"). This asserts the pre-fork `MetaCommand::
+/// BeginSplitInPlace` intent recorded on the STILL-`Splitting` parent
+/// (`Tablet::inplace_split`, visible on `/admin/status` before Stage 3's
+/// fork ever runs) — the proposer-side computation this rung changed —
+/// without needing the fork/cutover to actually complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (nodes, _config) =
+            bring_up_with_split_mode(4, dir.path(), animusd::SplitMode::InPlace).await;
+        await_bootstrap(&nodes).await;
+
+        // Provision the table's bootstrap tablet through the ordinary
+        // client write path — `provision_tablet` picks the first
+        // `min(N, MAX_REPLICATION_FACTOR)` = 3 of the 4 `Active` members in
+        // `NodeId` order (n0, n1, n2), leaving n3 unhosted and idle.
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect client port");
+        put(&mut stream, "t", b"k".to_vec(), b"v".to_vec()).await;
+
+        let (_, before) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+        let parent_replicas: Vec<String> = before["tablets"]["1"]["replicas"]
+            .as_array()
+            .expect("parent has a replica list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            parent_replicas.len(),
+            3,
+            "the bootstrap tablet's RF must be MAX_REPLICATION_FACTOR (3): {before}"
+        );
+        assert!(
+            !parent_replicas.iter().any(|n| n == "n3"),
+            "n3 must be idle (not one of the parent's replicas) for this test to \
+             distinguish fork-first from placement-chosen homes: {parent_replicas:?}"
+        );
+
+        let (status, body) = admin(
+            nodes[0].admin_addr(),
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"k"}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "kickoff must succeed, got: {body}");
+
+        // Poll for the parent reading `Splitting` with its `inplace_split`
+        // intent recorded — the in-place workflow mints no `Building` rows,
+        // so (unlike the copy-based test above) the intent's own `children`
+        // array, not the tablet map, is what carries each child's replicas.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let intent = loop {
+            let (_, status_body) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            let parent = &status_body["tablets"]["1"];
+            if parent["state"].as_str() == Some("Splitting") && !parent["inplace_split"].is_null() {
+                break parent["inplace_split"].clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "parent never recorded an in-place split intent; status: {status_body:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let children = intent["children"]
+            .as_array()
+            .expect("intent carries exactly two children");
+        assert_eq!(children.len(), 2, "intent must carry exactly two children");
+        for (i, child) in children.iter().enumerate() {
+            let child_replicas: Vec<String> = child["replicas"]
+                .as_array()
+                .unwrap_or_else(|| panic!("child {i} has a replica list: {child}"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                child_replicas, parent_replicas,
+                "child {i}'s replicas must be exactly the parent's own current \
+                 replicas (ADR 0062 rung 4), got {child_replicas:?} vs parent \
+                 {parent_replicas:?}"
+            );
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

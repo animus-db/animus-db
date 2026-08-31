@@ -28,6 +28,10 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 kube = { version = "4.2.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
+# kube's `rustls-tls` leaves the rustls CryptoProvider choice to the
+# application (rustls 0.23 panics at client build without exactly one
+# provider); main.rs installs ring explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 k8s-openapi = { version = "0.28.0", features = ["latest", "schemars"] }
 schemars = "1.2.2"
 hyper = { version = "1.11.0", features = ["client", "http1"] }

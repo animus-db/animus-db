@@ -85,13 +85,47 @@ amendment — the shape predates and outlives it.)
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
   rendering cost ~3–4x). Decode failures are loud. The Raft WAL keeps the
-  shared control-plane serde_json `PersistedState` format. **A field added
+  shared control-plane serde_json `PersistedState` format — which **used to
+  have no per-record checksum** (`WalRecord::decode`, `animus-control::
+  persist`, tolerated only a torn *trailing* line, never a mid-line
+  bit-flip that kept the JSON syntactically valid). Confirmed reproducible
+  (issue #495): composing `animus-sim`'s `DiskConfig::torn_tail_on_crash`
+  with `corrupt_on_crash` across a genuine crash+restart could flip a byte
+  inside a still-decodable `WalRecord::Append`'s packed `HlcTimestamp`,
+  producing a **wrong but successfully decoded** value that later
+  hard-panicked `assert_ts_monotonic` once applied — see
+  `tests/quiescence.rs`'s `a_lying_fsync_revealed_by_a_
+  crash_recovers_correctly_on_restart` (which now arms `corrupt_on_crash`
+  precisely because this is fixed) and `docs/engineering-lessons.md`'s
+  matching entry for the full account. **Fixed** by a per-record CRC32
+  checksum on every WAL line (`animus-control::persist`): a checksum
+  mismatch is now dropped exactly like a torn trailing line — along with
+  everything physically after it in the file — never decoded into a value,
+  never a panic. This was the WAL-side sibling of this same crate's own
+  `codec.rs` wire decoder's separately-known untrusted-length-prefix
+  allocator-abort gap (`Vec::with_capacity(n as usize)` on an unvalidated
+  `u32` — see the sibling `raftkv`/`txn` corpora's own `Nemesis::Chaos` doc
+  for that finding's own account); both shared the same root cause, "no
+  checksum/bound on untrusted framing," just on opposite sides of this
+  crate (WAL read-back vs wire receive).
+
+  **A field added
   to the shared `LogEntry`/`RaftMsg` types (`animus-control::raft`) needs an
   explicit encode/decode arm here too** — `#[serde(default)]` only protects
   the `serde_json` WAL path, not this hand-rolled one (version `22`, ADR
   0058 Train 1's `learners: Option<BTreeSet<NodeId>>` field, is the
   regression: see `docs/engineering-lessons.md`'s Code-patterns entry for
-  the general lesson).
+  the general lesson). **Every untrusted wire-count read (`c.u32()?`/
+  `c.u64()?`) that pre-sizes a `Vec` is capped (`.min(1 << 20)`)** — a
+  bounds-checked-per-element read alone doesn't stop a corrupted/hostile
+  count from driving an oversized `Vec::with_capacity` before any element
+  is validated, which Rust's allocator handles by aborting the whole
+  process (`handle_alloc_error`), not a catchable panic; reproduced live via
+  a corrupted `AppendEntries` entry count. `txn.rs`'s/`split.rs`'s own
+  engine-marker decoders (reachable via a corrupted/adversarial
+  `InstallSnapshot` image) got the identical cap. See `docs/engineering-
+  lessons.md`'s "untrusted length-prefix pre-sizing a `Vec`" entry for the
+  full account and the general rule for any future hand-rolled decoder.
 - **`hlc.rs`** (ADR 0018 §2) — a pure, I/O-free Hybrid Logical Clock:
   `HlcTimestamp { wall_ms, logical }` and the per-node `Hlc` (`mint`/
   `witness`, both take the caller-sampled `Nanos` — `Hlc` never touches an
@@ -133,16 +167,26 @@ amendment — the shape predates and outlives it.)
   lives under `animus_control::syskv::RESERVED_NAMESPACE` — engine-global,
   outside every `StorageScope` — see the module's own doc for the
   key-disjointness proof.
-- **`split.rs`** (ADR 0058 Train 2 rung 3) — the **in-place split fork
-  marker**: the durable half of `KvCommand::SplitTablet`, mirroring
-  `seal.rs`'s discipline exactly (engine-global key, survives compaction)
-  but keyed by `tablet` alone (a tablet forks AT MOST ONCE, unlike a seal's
-  per-range keying) and carrying a real payload — the split key, both
-  children's `(id, replicas)` pairs, and the `bootstrap_voters` set
-  captured once at apply from the parent's own `RaftCore::config() ∪
-  RaftCore::learners()` (see the module's own doc for why this read is
-  guaranteed identical across replicas). `RaftKvNode::pending_split()` is
-  the one accessor the host reconciler polls every tick.
+- **`split.rs`** (ADR 0058 Train 2 rung 3; ADR 0062 rung 4) — the
+  **in-place split fork marker**: the durable half of `KvCommand::
+  SplitTablet`, mirroring `seal.rs`'s discipline exactly (engine-global
+  key, survives compaction) but keyed by `tablet` alone (a tablet forks AT
+  MOST ONCE, unlike a seal's per-range keying) and carrying a real payload
+  — the split key, both children's `(id, replicas)` pairs (since ADR 0062
+  rung 4: the parent's own current replicas, identical for both children,
+  never placement-chosen — see `animus-tablet`'s `SplitChild::replicas`
+  doc), and the `bootstrap_voters` set captured once at apply from the
+  parent's own `RaftCore::config()` **only** — no more `.extend(
+  RaftCore::learners())` (rung 4 dropped the learner union: both children
+  now bootstrap directly on the parent's own current voter set, no
+  over-replication, no Stage-5 trim step needed at fork time; see the
+  module's own doc for the accepted fork-D residual this leaves — an
+  unrelated in-flight rebalance's own learner on the parent is no longer
+  inherited by either child, self-healed by an ordinary post-cutover
+  reconfigure). This read is still guaranteed identical across replicas
+  for the same reason as before (Raft log order). `RaftKvNode::
+  pending_split()` is the one accessor the host reconciler polls every
+  tick.
 - **`segment.rs`** (ADR 0042/0043) — the stream-shard **segment codec**: a
   sealed shard's `SegmentStore` object format, pure and I/O-free. The
   module's own 50-line `//!` doc has the codec/validation list
@@ -448,19 +492,39 @@ State once here; cross-referenced from the sections below.
   key's *current committed* value and compares to `expected`; equal → merge
   at `index`, else no-op. Every replica applies the same order against the
   same state with no clock/RNG, so every replica makes the **identical**
-  decision. Outcome is stashed in driver `CasResults` keyed by the log index.
+  decision. Outcome is stashed in driver `CasResults`, keyed by the log index
+  **and paired with the entry's own Raft term** (fixed alongside
+  `StageOutcomes` below — see that bullet's term-identity paragraph, which
+  applies here identically): `cas_result(index, term)`/`compare_and_swap`
+  require the caller's own `ProposeResult::Accepted`'s `term` to match before
+  ever trusting a recorded outcome as this proposer's own, and
+  `compare_and_swap`'s own poll loop also checks `is_leader()` every
+  iteration (previously it did not, despite a comment implying it did — see
+  `wait_applied`/`wait_stage_outcome`'s identical guard). Regression:
+  `tests/cas_outcome_identity.rs`.
 - **`TxnStage`'s own-key conditions are decided at *apply* time too, the
   identical CAS-style discipline** — evaluated against each key's current
   committed value inside the same apply arm that decides the pre-existing
   fence/seal/foreign-intent gates, recording a `StageOutcome` per Raft log
   index (`StageOutcomes`, mirroring `CasResults`). **`wait_applied(index)
-  .await == true` does NOT imply `stage_outcome(index)` is `Some`** — a
+  .await == true` does NOT imply `stage_outcome(index, term)` is `Some`** — a
   snapshot install can advance `engine_applied` past `index` without this
   replica individually applying (hence recording an outcome for) that exact
   entry, since an install globs many commands together. `txn_stage_anchor`/
   `_participant` poll `stage_outcome` directly instead (`wait_stage_outcome`)
   — `None` on timeout, never a hard-`expect`ed fact that turns out not to be
-  guaranteed. See `docs/engineering-lessons.md` for the general lesson.
+  guaranteed. **`StageOutcomes` (like `CasResults`) is keyed by index and
+  paired with the entry's own term** (closed 2026-08-29, mirroring the fix
+  `KindBatchOutcomes` got first — see `docs/engineering-lessons.md`'s
+  amendment to the `KindBatchOutcome` entry): an uncommitted `TxnStage`
+  entry's index can be reoccupied by a different command after a leadership
+  change, so `stage_outcome`/`wait_stage_outcome` require the caller's own
+  accepted term to match, propagating `None` ("not confirmed as mine, retry")
+  rather than ever returning a stale entry's outcome as this proposer's own.
+  `txn_stage_anchor`/`txn_stage_participant` thread the accepted `term`
+  through unchanged in their own public shape (still `Option<(..,
+  StageOutcome)>`, `None` on ambiguity same as before). See
+  `docs/engineering-lessons.md` for the general lesson.
 - **`KindBatch` gained the identical own-key `conditions` field (ADR 0046
   "evaluate at leader" seatbelt, codec version 15)** — modeled directly on
   `TxnStage.conditions`, `(key, expected)` byte-level OCC pairs checked
@@ -741,7 +805,40 @@ State once here; cross-referenced from the sections below.
   (ADR 0028), permanently breaking the owning tablet's future LWW. See
   the amendment and `docs/engineering-lessons.md`'s "every key-writing
   command variant must carry AND enforce the apply-time fence" entry for
-  the general lesson.
+  the general lesson. **`TxnResolve` gained the identical `StageOutcome`-
+  shaped outcome channel `TxnStage` already had, closing a second,
+  independent gap the fence alone didn't (ADR 0018 §2 write-loss amendment
+  §3/§6, closed 2026-08-29)**: a fence-miss no-op and a genuine resolve
+  used to be indistinguishable to the caller — `wait_applied(index).await`
+  is `true` either way. `ResolveOutcome` (`Resolved`/`Fenced`/
+  `OutcomeMismatch`), recorded per apply in `ResolveOutcomes` (keyed by
+  Raft log index, paired with the entry's own term — the identical
+  `CasResults`/`StageOutcomes` term-identity discipline; see this file's
+  `StageOutcomes` bullet above), is what a proposer now polls via
+  `resolve_outcome`/`wait_resolve_outcome`; `RaftKvNode::txn_resolve`
+  returns `Option<(HlcTimestamp, ResolveOutcome)>`, and **every caller must
+  check the outcome** — only `Resolved` means the intent(s) actually
+  changed. A second, independent bug surfaced fixing this: the apply arm
+  used to clear `TxnTracker::unresolved_decided` (the entry
+  `txn_resolver_loop`'s passive sweep reads to find decided-but-unresolved
+  transactions) **unconditionally**, before this outcome was even computed
+  — so a Fenced resolve erased this group's own memory that the
+  transaction still needed resolving, even though nothing was actually
+  written. Now cleared only on `ResolveOutcome::Resolved`. `animusd::
+  ClientCtx::txn_resolve_participant` returns `Result<ResolveOutcome,
+  String>` (a `CpRoute::None` is now a genuine `Err`, never a silent
+  `Ok(())`); `txn_resolve_participant_retrying` is the bounded-retry
+  wrapper (fresh `cp_route` every attempt) every production caller
+  (`resolve_all`/`resolve_all_parallel`/`recovery_resolve`/
+  `push_resolution_if_decided`) now goes through instead of the raw
+  one-shot primitive — the actual fix for the acknowledged-write-loss bug:
+  a fenced resolve now triggers a re-route-and-retry rather than being
+  silently treated as done. See ADR 0018's 2026-08-29 amendment for the
+  full account (including why `txn_decide`'s single-tablet convenience
+  path deliberately still discards the outcome — it has no routing layer
+  of its own to retry through) and `tests/txn_resolve_outcome.rs` for the
+  primitive-level regression (a genuine fence-miss via a real in-place
+  split, proven distinct from an ordinary resolve).
 - **Superseded by ADR 0044**: an `Absorb` teardown's drain-before-halt
   mechanism (a merge survivor's `WidenScope` deferred on the absorbed
   group's own committed-log drain, closing a data-loss window
@@ -806,46 +903,51 @@ ADR 0050 Train B rung-7 sweep.
   live control-plane `RaftNode` read this crate has no business taking)
   both stay in `animusd::tablet_host_reconciler_loop`.
 
-### In-place split (ADR 0058 Train 2 rung 3)
+### In-place split (ADR 0058 Train 2 rung 3; fork-first per ADR 0062)
 
 `plan`'s phase 1.5, between `Host` and `Reconfigure`: a tablet whose
 `Metadata` row carries `Tablet::inplace_split` (the control plane's
 `MetaCommand::BeginSplitInPlace`) takes this branch INSTEAD of the
 ordinary `Reconfigure` action for as long as the intent exists — the two
 must never both fire for the same tablet in the same tick (an ordinary
-reconfigure would see the split's added learner(s) as stale — not in its
-own `desired` — and try to remove them mid-catch-up).
+reconfigure would see the fork's own children as a foreign membership
+change and try to interfere). **The Stage 1/2 learner-add-and-wait phase
+(ADR 0058 Train 2) is deleted (ADR 0062 rung 5)** — `HostAction::
+AddSplitLearner`, `INPLACE_SPLIT_LEARNER_CATCH_UP_THRESHOLD`, and the
+`TabletFacts::config`/`learners`/`learners_caught_up` fields that fed it
+are all gone, along with phase 1's "recruited via a child's own replicas"
+host-candidate branch and phase 3's matching release exclusion — both
+provably dead under the ADR 0062 rung 4 invariant (`SplitChild::replicas`
+IS the parent's own replicas at propose time, and a `Splitting` parent's
+`replicas` cannot change for the intent's whole lifetime —
+`reconcile_placement`/`rebalance_placement` both skip non-`Active`
+tablets — so nothing is ever named in a child's `replicas` that isn't
+already a member of the parent's own).
 
 - **Not yet forked here** (`RaftKvNode::pending_split()` answers `None`):
-  the leader adds the next missing member of the union of both children's
-  `replicas` as a learner (`HostAction::AddSplitLearner`, one per tick,
-  mirroring `reconfigure_step`'s own one-step-per-call discipline but as
-  its own action — this does NOT reuse `reconfigure_step` itself, since
-  that function's own stale-learner-removal step would fight a split's
-  learners the moment they're not in the PARENT's own `desired`). Once
-  every union member is present and caught up (a voter is trivially
-  ready), the leader proposes the fork (`HostAction::ProposeSplitFork` →
-  `RaftKvNode::propose_split_tablet`).
-- **A node named only in a CHILD's `replicas`, never the parent's own**,
-  still needs to host the PARENT (as a quiet non-voter) before it can ever
-  be added as a learner to it — phase 1 gained a second host-candidate
-  test for exactly this (a node recruited via either child's `replicas` of
-  an in-place split intent), and phase 3's release check is correspondingly
-  taught to never fire on the SAME recruited set (it is never in the
-  parent's own `replicas`, and — a learner is never in `RaftCore::config()`
-  by construction — `config_excludes_me` reads trivially true for it too).
+  the leader proposes the fork immediately (`HostAction::ProposeSplitFork`
+  → `RaftKvNode::propose_split_tablet`) — no gate beyond ordinary Raft
+  agreement on the fork entry itself. Every replica named in the intent's
+  children already hosts the parent as an ordinary voter (ADR 0062 rung 4),
+  so there is nothing left to recruit or wait on before forking.
 - **Already forked here** (`pending_split()` answers `Some`):
   `HostAction::MaterializeSplitChild` fires for BOTH children on EVERY
   fork participant — not filtered by either child's own final `replicas` —
-  since `pending_split().bootstrap_voters` (the parent's full
-  voter-plus-learner set at the fork, captured once in the data-plane's
-  own apply) is what both children actually bootstrap with, a deliberate
-  superset Stage 5's ordinary `Reconfigure` trims down afterward. Claimed
-  into `LocalState::hosted` optimistically (the same discipline `Host`
-  uses) AND into `LocalState::split_forming`, which exempts a pre-cutover
-  child from phase 3's reclaim check (it is `hosted` but, by design,
-  absent from `Metadata` until `CutoverSplit` runs) — pruned the instant
-  the child appears in `Metadata` as a real `Active` entry.
+  since `pending_split().bootstrap_voters` (the parent's own current voter
+  set, captured once in the data-plane's own apply) is what both children
+  actually bootstrap with. Since ADR 0062 rung 4 this is no longer a
+  superset of either child's own `replicas` (`SplitChild::replicas` IS the
+  parent's own current replicas, see `animus-tablet`'s doc), so
+  `bootstrap_voters` and both children's target replica set coincide in
+  the common case and there is nothing left to trim at fork time — see
+  `split.rs`'s "No more learner union" doc for the accepted fork-D
+  residual this leaves (an unrelated in-flight rebalance's own learner on
+  the parent, self-healed by an ordinary post-cutover `Reconfigure`).
+  Claimed into `LocalState::hosted` optimistically (the same discipline
+  `Host` uses) AND into `LocalState::split_forming`, which exempts a
+  pre-cutover child from phase 3's reclaim check (it is `hosted` but, by
+  design, absent from `Metadata` until `CutoverSplit` runs) — pruned the
+  instant the child appears in `Metadata` as a real `Active` entry.
 - **`Reconciler::materialize_split_child`** implements the G4
   crash-idempotency contract (see the ADR's own "Open forks" table,
   decided as of this rung): `EngineFactory::probe(child)` before ever
@@ -881,7 +983,7 @@ child's leadership immediately, instead of waiting out the timeout.
   local facts** — `HostAction::MaterializeSplitChild` gained a `campaign:
   bool` field, set to that tick's `TabletFacts::is_leader` **for the
   PARENT** (the same fact phase 1.5 already reads to gate
-  `AddSplitLearner`/`ProposeSplitFork`). No new coordination, no new
+  `ProposeSplitFork`). No new coordination, no new
   replicated state: every replica decides "was I the parent's leader just
   now" independently, and in the common case exactly one replica per
   child answers `true`.
@@ -919,11 +1021,12 @@ child's leadership immediately, instead of waiting out the timeout.
   - **A learner never campaigns, and the safety belt is structural, not
     conventional.** The self-nominating replica is a voter of the PARENT
     by construction (`start_election`/`become_leader` gate on
-    `is_voter()`), and every child's `bootstrap_voters` is the parent's
-    own full voter-**and**-learner union at the fork — a strict superset
-    — so it is always a voter of the child too; there are, in fact, no
-    learners at all on a freshly-bootstrapped child (every
-    `bootstrap_voters` member starts as a voter). `drive` additionally
+    `is_voter()`), and every child's `bootstrap_voters` IS the parent's
+    own voter config at the fork (ADR 0062 rung 4 — no longer a
+    voter-**and**-learner union) — so it is always a voter of the child
+    too; there are, in fact, no learners at all on a freshly-bootstrapped
+    child (every `bootstrap_voters` member starts as a voter). `drive`
+    additionally
     `assert!`s `core.config().contains(&self_id)` immediately before
     calling `campaign_now`, as a second, structural line of defense
     against the upstream wiring ever computing `campaign` for the wrong
@@ -940,12 +1043,14 @@ Tests: `tests/split_tablet.rs` (the data-plane mint's own fence/idempotency/
 restart suite) and `tests/inplace_split_reconciler.rs` (a self-contained
 `SimEnv` corpus, depth knob `ANIMUS_INPLACE_SPLIT_SEEDS`, mirroring
 `reconciler_corpus.rs`'s own harness shape — held green through
-`ANIMUS_INPLACE_SPLIT_SEEDS=200`): the full happy path (real learner
-catch-up, over-replication on every fork participant, exact per-child data
-partitioning, empty change/cursor scopes at birth, the post-cutover trim to
-final placement, parent reclaim), a leader crash mid-catch-up, the G4
-crash window itself, a concurrent unrelated rebalance racing the split's
-own learner-add, the immediate-campaign **fast path**
+`ANIMUS_INPLACE_SPLIT_SEEDS=200`, and past `=1000` locally): the fork-first
+happy path (ADR 0062 rung 5 — the fork proposes immediately, no learner
+phase; exact per-child data partitioning, empty change/cursor scopes at
+birth, each child's bootstrap voter set exactly the parent's own voters —
+no over-replication, no trim step needed — post-cutover convergence, parent
+reclaim), the G4 crash window itself, a concurrent unrelated rebalance
+proving non-interference in both directions with the split's own parent
+handling, the immediate-campaign **fast path**
 (`campaigning_replica_wins_leadership_almost_immediately` — a leader
 within a handful of virtual ms of materializing, far short of a fresh
 group's own 150ms election-timeout base) and its **fallback**
@@ -1035,11 +1140,11 @@ table.
 
 ### HostAction
 
-**Emitted in this fixed order: `Host` → (`AddSplitLearner`/
-`ProposeSplitFork`/`MaterializeSplitChild`) → `Reconfigure` →
-`Release`/`Reclaim`.** The parenthesized trio (ADR 0058 Train 2 rung 3) is
-mutually exclusive with `Reconfigure` per tablet — see "In-place split"
-above. `Release`/`Reclaim` tear down a tablet moved off or
+**Emitted in this fixed order: `Host` → (`ProposeSplitFork`/
+`MaterializeSplitChild`) → `Reconfigure` → `Release`/`Reclaim`.** The
+parenthesized pair (ADR 0058 Train 2 rung 3; `AddSplitLearner` deleted by
+ADR 0062 rung 5) is mutually exclusive with `Reconfigure` per tablet — see
+"In-place split" above. `Release`/`Reclaim` tear down a tablet moved off or
 dropped/retired, respectively. Tablets are split-only (ADR 0044) and
 ranges immutable (ADR 0050): the zero-copy `ProposeSeal`/`NarrowScope`
 actions were deleted in the rung-7 sweep, as merge's `WidenScope`/`Absorb`

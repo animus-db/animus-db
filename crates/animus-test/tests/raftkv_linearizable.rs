@@ -49,6 +49,21 @@
 //!   must not serve from.
 //! - Compound `Lossy` + `StopRestart` — a WAL recovery racing a degraded
 //!   network; historically the class that surfaced real findings at depth.
+//! - `FsyncLie` + `StopRestart` — an fsync that lies (`sync` returns `Ok`
+//!   without actually persisting), revealed only by the following crash.
+//! - `Chaos` — drop + duplicate folded into one ambient network fault
+//!   (deliberately **not** `set_corrupt_prob`, see `Nemesis::Chaos`'s own
+//!   doc — a genuine, unfixed process-abort finding in `animus-cp-data`'s
+//!   wire codec, `docs/engineering-lessons.md`).
+//! - `HeavyTail` + `LeaderMinority` — episodic multi-second delivery crossed
+//!   with the sharpest stale-read hazard, probing the ReadIndex timeout path.
+//!
+//! **A fourth, orthogonal WAL-faults axis** (`ANIMUS_RAFTKV_WAL_FAULTS=1`,
+//! off by default): a second pass of the corpus's single-crash cells
+//! (`LeaderKill`/`FollowerKill`) with `DiskConfig::torn_tail_on_crash` +
+//! `corrupt_on_crash` armed for the whole run — see
+//! `raftkv_wal_faults_corpus_is_linearizable`'s and `wal_fault_disk_config`'s
+//! own docs for the mechanism and its checksum-gap caveat.
 //!
 //! The new cells also carry a non-zero **fault window** (`Scenario::window`): the
 //! runner holds the last fault open for that long before healing, so the group
@@ -69,7 +84,7 @@ use std::time::Duration;
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
 use animus_env::{Clock, EnvExt, Rng, nid};
-use animus_sim::{NetConfig, SimEnv, Simulator};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
 use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
@@ -154,6 +169,60 @@ enum Nemesis {
     /// leader side would *be* the majority, so the corpus only schedules this on
     /// 5 replicas.)
     LeaderMinority,
+    /// Fsync-acked-but-lost, globally, for the rest of the run
+    /// (`DiskConfig::set_fsync_lie_prob`, ADR 0061 Decision 3): every `sync`
+    /// still returns `Ok`, but the bytes it would have moved into the durable
+    /// image stay buffered — invisible until a later crash reveals the lie.
+    /// Never errors, never panics, so it's safe to run ambient on a live node;
+    /// on its own it changes nothing observable (a lied-to sync is
+    /// transparent to `read`), which is why the corpus only ever schedules it
+    /// composed with a following `StopRestart` (see `fsync_lie_stop_restart_*`
+    /// below) — the crash is what exposes whatever the lie actually lost.
+    /// Reset by `HealAll` (a fired lie must not keep lying past its intended
+    /// window).
+    FsyncLie,
+    /// A compound, ambient network fault for the rest of the run: independent
+    /// per-message drop (5%) and duplication (10%, its own independent delay
+    /// draw) folded together (ADR 0061 Decision 3) rather than the
+    /// single-fault `Lossy` above — the point is to probe more than one
+    /// degraded-network failure mode landing on the SAME run at once.
+    ///
+    /// **Deliberately excludes `NetConfig::set_corrupt_prob`, despite it
+    /// being one of the primitives this task set out to wire in.** It is
+    /// NOT safe to run ambient today: `chaos_early_3_s09` (seed
+    /// 422907917505132688, `ANIMUS_RAFTKV_SEEDS=20`) reproducibly **aborts
+    /// the whole test process** (`SIGABRT`, a ~1TB allocation request) when
+    /// a corrupted byte lands inside `read_raft`'s `AppendEntries` entry
+    /// count — `animus_cp_data::codec::read_raft` reads an untrusted `n:
+    /// u32` off the wire and calls `Vec::with_capacity(n as usize)` before
+    /// validating `n` against the remaining buffer, so a single flipped bit
+    /// can request an unbounded allocation Rust's OOM handler aborts on
+    /// (not a catchable panic, and not the `Err`/`warn!`/drop this file's
+    /// own header doc — and this variant's original design — assumed the
+    /// wire codec always degrades to). At least a dozen other `codec.rs`
+    /// sites share the identical `let n = c.u32()?; Vec::with_capacity(n as
+    /// usize)` shape, so this is a systemic gap, not a one-off. This is a
+    /// **real, unfixed finding** (see `docs/engineering-lessons.md`) — the
+    /// fix belongs in `animus-cp-data`, as its own change with its own
+    /// regression test, never folded into this corpus PR; excluding
+    /// `corrupt_prob` here is the same process-abort reasoning this repo
+    /// already applies to `DiskConfig::set_enospc_prob`/`set_error_prob`
+    /// (both excluded from this corpus entirely, for the identical
+    /// hard-abort-vs-graceful-`Err` distinction), now extended to a second
+    /// primitive. Re-add it to `Chaos` once the codec fix lands.
+    Chaos,
+    /// Heavy-tailed message delivery for the rest of the run
+    /// (`NetConfig::set_heavy_tail_prob` + `heavy_tail_max_jitter`): most
+    /// messages keep their ordinary jitter, but ~5% land in the tail and take
+    /// up to several seconds — an occasional GC-pause-shaped delay rather
+    /// than a raised common-case latency. On its own this is a liveness
+    /// probe, not much of a correctness one; the corpus only ever schedules
+    /// it composed with `PartitionLeader`/`LeaderMinority` (see
+    /// `heavy_tail_leader_minority_mid_5` below), to check that an
+    /// occasional multi-second delivery delay doesn't let a ReadIndex read
+    /// misclassify a genuinely-stale deposed leader as confirmed, or a
+    /// genuinely-committed read as `info` inside its `OP_BUDGET`.
+    HeavyTail,
 }
 
 /// A seed-reproducible scenario: a named group size + workload + an explicit fault
@@ -208,10 +277,15 @@ const CORPUS_FAULTS: [(&str, Nemesis); 4] = [
 /// Single-fault nemeses of the **deepened** tier (appended after the original
 /// cells; every cell carries a real outage window). `LeaderMinority` is not here
 /// because it is only meaningful on a 5-replica group — it gets a single explicit
-/// cell instead.
-const CORPUS_FAULTS_DEEP: [(&str, Nemesis); 2] = [
+/// cell instead. `Chaos` (ADR 0061 Decision 3's compound ambient network fault)
+/// joined this array rather than getting its own loop, since "early/mid/late ×
+/// 3-replica + a mid 5-replica spot-check" is exactly the grid it needs too —
+/// mirroring `CORPUS_FAULTS`'s own single-fault × timing × shape grid, just
+/// windowed like every other member of this deepened array.
+const CORPUS_FAULTS_DEEP: [(&str, Nemesis); 3] = [
     ("stop_restart", Nemesis::StopRestart),
     ("split_brain", Nemesis::SplitBrain),
+    ("chaos", Nemesis::Chaos),
 ];
 
 /// Fault timing relative to the workload's life: early / mid / late.
@@ -226,6 +300,12 @@ const CORPUS_TIMINGS: [(&str, Duration); 3] = [
 /// node's recovery racing live traffic), short enough that in-window ops stay
 /// inside their `OP_BUDGET` and resolve after heal.
 const DEEP_WINDOW: Duration = Duration::from_millis(2500);
+
+/// Gap between a scheduled `FsyncLie` and the following `StopRestart` that
+/// reveals it — short enough to land well before `DEEP_WINDOW` closes even at
+/// the `late` timing, long enough that a handful of ops land while the lie is
+/// in effect first.
+const FSYNC_LIE_REVEAL_GAP: Duration = Duration::from_millis(500);
 
 /// A small high-contention workload: enough clients to make a key hot, a tiny key
 /// space, a mix of reads and writes. Single-key ops (the plane is non-transactional).
@@ -318,6 +398,38 @@ fn corpus_cells() -> Vec<Scenario> {
             (Duration::from_millis(2200), Nemesis::StopRestart),
         ],
     ));
+    // A lied-to sync only matters once revealed by a subsequent crash+restart
+    // (`FsyncLie` on its own is observably a no-op — reads never see the
+    // difference), so every cell schedules the lie first and the crash
+    // `FSYNC_LIE_REVEAL_GAP` later, across early/mid/late timing (3-replica —
+    // the same shape `lossy_stop_restart_3` above uses for its own compound
+    // WAL-recovery-under-fault schedule).
+    for (tname, at) in CORPUS_TIMINGS {
+        let name = format!("fsync_lie_stop_restart_{tname}_3");
+        out.push(windowed_workload(
+            &name,
+            3,
+            vec![
+                (at, Nemesis::FsyncLie),
+                (at + FSYNC_LIE_REVEAL_GAP, Nemesis::StopRestart),
+            ],
+        ));
+    }
+    // Episodic extreme latency (heavy-tailed jitter) crossed with a leader
+    // isolated in the minority — probes the ReadIndex read-timeout path under
+    // the sharpest stale-read hazard the corpus has (5-replica
+    // `LeaderMinority`) with occasional multi-second delivery on top, so a
+    // slow-but-eventually-delivered message can't accidentally let the
+    // deposed leader's read look confirmed, and a genuinely-committed read
+    // must still resolve inside `OP_BUDGET` despite the tail.
+    out.push(windowed_workload(
+        "heavy_tail_leader_minority_mid_5",
+        5,
+        vec![
+            (Duration::from_millis(2100), Nemesis::HeavyTail),
+            (Duration::from_millis(2200), Nemesis::LeaderMinority),
+        ],
+    ));
     out
 }
 
@@ -346,6 +458,56 @@ fn lsm_full_enabled() -> bool {
 /// depth knob.
 fn corpus() -> Vec<Scenario> {
     corpus::seed_expand(corpus_cells(), seeds_per_cell())
+}
+
+/// Whether the WAL-faults pass (torn/corrupted un-synced tails on crash,
+/// `ANIMUS_RAFTKV_WAL_FAULTS`) is enabled — the identical non-empty/non-
+/// `0`/`false` parse [`lsm_full_enabled`] uses. Default off: the pass adds a
+/// second full run of the crash-based cells, so it stays opt-in like the LSM
+/// tier.
+fn wal_faults_enabled() -> bool {
+    match std::env::var("ANIMUS_RAFTKV_WAL_FAULTS") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// The global `DiskConfig` the WAL-faults pass arms once at group start (see
+/// [`run_scenario_on`]'s `wal_disk_config` doc): a crash keeps only a
+/// seed-chosen strict prefix of each un-synced file (`torn_tail_on_crash`)
+/// and additionally flips one byte inside the retained region
+/// (`corrupt_on_crash`) — modelling a real power loss mid-write, on top of
+/// the plain in-memory-state-loss `LeaderKill`/`FollowerKill` already
+/// exercise.
+///
+/// **Caveat, load-bearing for how to read a failure out of this pass**: the
+/// Raft WAL's on-disk record framing (`animus_control::persist::
+/// PersistedState::encode_record`, reused verbatim by this data plane's own
+/// `raftkv.wal`) used to be plain newline-terminated `serde_json` with **no
+/// per-record checksum** — a bit-flip that happened to land inside a byte
+/// that kept the JSON syntactically valid could silently produce a
+/// different, undetected-corrupt WAL record instead of a decode error
+/// (issue #495, confirmed reproducible via the sibling `animus-cp-data`
+/// quiescence corpus's `a_lying_fsync_revealed_by_a_crash_recovers_
+/// correctly_on_restart`). **Fixed**: every WAL line now carries a CRC32
+/// checksum over its JSON payload (`animus_control::persist`), so a
+/// corrupted-but-still-parseable record is now caught and dropped — along
+/// with everything physically after it in the file, exactly like a torn
+/// trailing line — instead of decoding into a wrong value. If a
+/// `check_cycles`/`check_durability`/`check_convergence` failure still
+/// surfaces from this pass at depth, that is a **real finding** — do not
+/// respond by lowering `corrupt_on_crash`'s effective rate or narrowing
+/// which cells run under it; leave the failing assertion in place and
+/// report it (see the root `CLAUDE.md`'s `ANIMUS_RAFTKV_WAL_FAULTS` row and
+/// this test's own doc).
+fn wal_fault_disk_config() -> DiskConfig {
+    let mut cfg = DiskConfig::default();
+    cfg.torn_tail_on_crash = true;
+    cfg.corrupt_on_crash = true;
+    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -600,10 +762,31 @@ impl<S: StorageEngine + 'static> Group<S> {
                     }
                 }
             }
+            Nemesis::FsyncLie => {
+                let mut cfg = DiskConfig::default();
+                cfg.set_fsync_lie_prob(0.3);
+                self.sim.set_disk_config(cfg);
+            }
+            Nemesis::Chaos => {
+                // No `set_corrupt_prob` here — see `Nemesis::Chaos`'s own
+                // doc for the reproducible process-abort finding that
+                // excludes it.
+                let mut cfg = NetConfig::default();
+                cfg.set_drop_prob(0.05);
+                cfg.set_duplicate_prob(0.1);
+                self.sim.set_net_config(cfg);
+            }
+            Nemesis::HeavyTail => {
+                let mut cfg = NetConfig::default();
+                cfg.set_heavy_tail_prob(0.05);
+                cfg.heavy_tail_max_jitter = Duration::from_secs(3);
+                self.sim.set_net_config(cfg);
+            }
         }
     }
 
-    /// Heal every partition, restart every crashed node, restore default links.
+    /// Heal every partition, restart every crashed node, restore default links
+    /// and disk behavior.
     fn heal_all(&mut self) {
         let ids: Vec<u64> = GROUP_IDS[..self.replicas].to_vec();
         for i in 0..ids.len() {
@@ -617,6 +800,13 @@ impl<S: StorageEngine + 'static> Group<S> {
         }
         self.crashed.clear();
         self.sim.set_net_config(NetConfig::default());
+        // A fired `FsyncLie` (or any future ambient disk fault) must not keep
+        // lying for the rest of the run past its intended fault window —
+        // mirrors the `NetConfig` reset immediately above, and is required
+        // now that a `Nemesis` variant can set a global `DiskConfig` (it
+        // previously only ever touched `NetConfig`/partitions/crashes, so
+        // this reset was a no-op by construction until `FsyncLie` existed).
+        self.sim.set_disk_config(DiskConfig::default());
     }
 }
 
@@ -800,12 +990,23 @@ fn final_state<S: StorageEngine + 'static>(
 
 /// Run `scenario` over the engine tier `factory` builds. The `MemoryEngine`
 /// wrapper [`run_scenario`] is the always-on default; [`lsm_engine`] is the
-/// durable tier.
+/// durable tier. `wal_disk_config`, when `Some`, is set globally once at
+/// group start — before `SETTLE`, before any fault fires — and stays in
+/// effect for the whole run (unlike a `Nemesis`-scheduled `DiskConfig`,
+/// `heal_all` does not reset it): the WAL-faults pass
+/// (`ANIMUS_RAFTKV_WAL_FAULTS=1`, see [`run_scenario_wal_faults`]) is the
+/// only caller that ever passes `Some`, and its whole point is that
+/// `torn_tail_on_crash`/`corrupt_on_crash` are armed for every crash the
+/// scenario's own fault schedule triggers, not just a scheduled window.
 fn run_scenario_on<S: StorageEngine + 'static>(
     scenario: &Scenario,
     factory: EngineFactory<S>,
+    wal_disk_config: Option<DiskConfig>,
 ) -> ScenarioResult {
     let mut group = Group::start(scenario.seed, scenario.replicas, factory);
+    if let Some(cfg) = wal_disk_config {
+        group.sim.set_disk_config(cfg);
+    }
 
     // Let the group elect a leader, then start the concurrent workload.
     group.sim.run_for(SETTLE);
@@ -895,7 +1096,16 @@ fn run_scenario_on<S: StorageEngine + 'static>(
 }
 
 fn run_scenario(scenario: &Scenario) -> ScenarioResult {
-    run_scenario_on(scenario, mem_engine)
+    run_scenario_on(scenario, mem_engine, None)
+}
+
+/// The WAL-faults pass: `scenario` over `MemoryEngine`, with
+/// `torn_tail_on_crash`/`corrupt_on_crash` armed globally for the whole run
+/// (see [`run_scenario_on`]'s doc on `wal_disk_config`). Only ever called from
+/// [`raftkv_wal_faults_corpus_is_linearizable`], itself gated on
+/// `ANIMUS_RAFTKV_WAL_FAULTS=1`.
+fn run_scenario_wal_faults(scenario: &Scenario) -> ScenarioResult {
+    run_scenario_on(scenario, mem_engine, Some(wal_fault_disk_config()))
 }
 
 /// Assert the three checks on one scenario result, labelling the engine tier in
@@ -1090,6 +1300,56 @@ fn raftkv_corpus_is_linearizable() {
     );
 }
 
+/// A second full pass of the corpus's crash-based cells (`LeaderKill`/
+/// `FollowerKill` only — the ones whose fault schedule is a single crash, not
+/// a compound one) with `torn_tail_on_crash`/`corrupt_on_crash` armed
+/// globally for the whole run (see [`wal_fault_disk_config`]'s doc for the
+/// exact fault and its checksum-gap caveat). A new **engine-tier axis**
+/// analogous to `ANIMUS_RAFTKV_LSM` — off by default (`ANIMUS_RAFTKV_WAL_
+/// FAULTS=1` required), so it changes nothing about default-depth CI. Reuses
+/// the existing named cells rather than minting new ones: their crash is
+/// already exactly the fault-injection point this pass wants to layer
+/// WAL-tear/corruption onto.
+#[test]
+fn raftkv_wal_faults_corpus_is_linearizable() {
+    if !wal_faults_enabled() {
+        eprintln!(
+            "raftkv_wal_faults_corpus_is_linearizable: skipped (set ANIMUS_RAFTKV_WAL_FAULTS=1)"
+        );
+        return;
+    }
+    let scenarios: Vec<Scenario> = corpus()
+        .into_iter()
+        .filter(|s| {
+            s.faults.len() == 1
+                && matches!(s.faults[0].1, Nemesis::LeaderKill | Nemesis::FollowerKill)
+        })
+        .collect();
+    assert!(
+        !scenarios.is_empty(),
+        "no single-fault leader/follower-kill cells found for the WAL-faults pass"
+    );
+    let mut ran = 0usize;
+    let mut ok_writes = 0usize;
+    for s in &scenarios {
+        let r = run_scenario_wal_faults(s);
+        // A failure here is a genuine finding, never a reason to weaken this
+        // pass (see `wal_fault_disk_config`'s doc) — the assertion stays
+        // exactly as hard as every other tier's.
+        assert_scenario_ok("mem+wal-faults", s, &r);
+        ran += 1;
+        ok_writes += r.ok_writes;
+    }
+    eprintln!(
+        "raftkv_wal_faults_corpus_is_linearizable: {ran} scenarios, {ok_writes} acked writes, \
+         under torn_tail_on_crash+corrupt_on_crash"
+    );
+    assert!(
+        ok_writes > ran,
+        "WAL-faults pass too vacuous: only {ok_writes} acked writes across {ran} scenarios"
+    );
+}
+
 /// Coverage guard:
 /// the generator must keep exercising every fault class, both group shapes,
 /// compound schedules, and real outage windows — otherwise a dimension silently
@@ -1129,6 +1389,9 @@ fn raftkv_corpus_covers_the_fault_matrix() {
         Nemesis::StopRestart,
         Nemesis::SplitBrain,
         Nemesis::LeaderMinority,
+        Nemesis::FsyncLie,
+        Nemesis::Chaos,
+        Nemesis::HeavyTail,
     ] {
         assert!(
             seen_faults.contains(&f),
@@ -1260,7 +1523,7 @@ fn raftkv_lsm_representative_is_linearizable() {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("representative LSM scenario {name} not in the corpus"));
-        let r = run_scenario_on(s, lsm_engine);
+        let r = run_scenario_on(s, lsm_engine, None);
         assert_scenario_ok("lsm", s, &r);
         ran += 1;
         ok_writes += r.ok_writes;
@@ -1285,7 +1548,7 @@ fn raftkv_lsm_full_corpus_is_linearizable() {
     let scenarios = corpus();
     let mut faulted_with_acks = 0usize;
     for s in &scenarios {
-        let r = run_scenario_on(s, lsm_engine);
+        let r = run_scenario_on(s, lsm_engine, None);
         assert_scenario_ok("lsm", s, &r);
         if !s.faults.is_empty() && r.ok_writes > 0 {
             faulted_with_acks += 1;
@@ -1306,8 +1569,8 @@ fn raftkv_lsm_run_is_deterministic() {
         .iter()
         .find(|s| s.name == "stop_restart_mid_3")
         .expect("stop_restart_mid_3 exists");
-    let a = run_scenario_on(scenario, lsm_engine);
-    let b = run_scenario_on(scenario, lsm_engine);
+    let a = run_scenario_on(scenario, lsm_engine, None);
+    let b = run_scenario_on(scenario, lsm_engine, None);
     assert_eq!(
         serde_json::to_string(&a.history).unwrap(),
         serde_json::to_string(&b.history).unwrap(),

@@ -185,6 +185,28 @@ per-tablet CP data plane (`animus-cp-data`).
   (`node.rs`'s `meta_apply_and_compact`) has only ever called plain
   `wal_image()`/`encode_record`.
 
+  **Every WAL line carries a per-record CRC32 checksum (issue #495)**:
+  `<crc32 as 8 lowercase hex chars>:<json>\n`, checked in
+  `verify_checksummed_line` before the JSON is ever parsed. Before this, the
+  newline-terminated-`serde_json` framing had no way to distinguish a
+  bit-flip that happened to keep a record's JSON syntactically valid (e.g.
+  a digit inside a packed numeric field) from a legitimate value — it
+  decoded successfully into a silently wrong record instead of a decode
+  error, confirmed to reach a hard panic once such a record applied past
+  `animus_cp_data::assert_ts_monotonic` (`docs/engineering-lessons.md` has
+  the full account). **A checksum failure is treated exactly like a torn
+  trailing line**: `decode`/`decode_tagged` stop at the first bad record
+  and drop it plus everything physically after it in the buffer — never
+  applied, never a panic. This is a deliberately simpler rule than
+  `animus-storage`'s own CRC-checked WAL framing, which additionally
+  distinguishes real mid-file corruption (hard error) from a torn tail
+  (tolerated) by checking whether a valid record follows; this WAL has no
+  invariant that needs that finer distinction, since a dropped tail-of-log
+  is always safe to recover from here. No back-compat/migration for a
+  pre-existing unchecksummed WAL file (root `CLAUDE.md`'s no-back-compat
+  stance) — an upgraded node needs a fresh WAL like any other format change
+  in this repo.
+
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
 
@@ -337,29 +359,88 @@ per-tablet CP data plane (`animus-cp-data`).
   `CutoverSplit` gained an in-place branch, selected by
   `source.inplace_split.is_some()`: instead of scanning the tablet map for
   `Building` children (none exist), it creates both children's tablet-map
-  rows DIRECTLY from the intent's own `(id, replicas)` pairs (each
-  `replicas` is that child's placement-chosen FINAL homes — the data
-  plane's own, larger `bootstrap_voters` bootstrap set is not this crate's
-  concern) and inherits the parent's policy **at this moment** — the
-  in-place workflow's only chance to, since there was no tablet row to
-  attach it to at `BeginSplitInPlace` time. Otherwise identical to the
-  copy-based branch: `split_lineage` written for both (fork F9, unchanged),
-  parent removed. **G1 (ADR 0058's own "Open forks" table, decided
-  2026-08-25, reversing that ADR's own Stage 4 draft text): the GSI-drain/
-  backfill-seeder cutover vetoes stay PRE-cutover, caller-side, exactly as
-  in the copy-based workflow** — this command's own apply never gated on
-  drain state in either branch, so nothing about this in-place branch
-  needed to change to honor that decision; the (not-yet-written)
-  `animusd`-level in-place split driver is what will run those vetoes
-  before ever proposing this command, mirroring `index_drain.rs::
-  split_driver_tick`'s existing shape for the copy-based endgame. Mirror
-  arms follow the usual per-entity conventions (`BeginSplitInPlace`:
-  parent row + allocator counter only; `CutoverSplit`'s existing arm
-  extended to also mirror each child's policy, unconditionally — a
-  harmless duplicate write for the copy-based branch, the only source for
-  the in-place one). Tests: `meta::tests::begin_split_in_place_*`/
-  `cutover_split_in_place_*`, mirroring the copy-based tests' own shape
-  scenario-for-scenario.
+  rows DIRECTLY from the intent's own `(id, replicas)` pairs. **Since ADR
+  0062 (superseding this paragraph's own original text), each `replicas`
+  is that child's FORK-TIME homes — the parent's own current replicas,
+  verbatim, identical for both children, never placement-chosen** — a
+  child's eventual *final* home is a separate decision this same apply arm
+  also makes (below), not something the intent carries. It also inherits
+  the parent's policy **at this moment** — the in-place workflow's only
+  chance to, since there was no tablet row to attach it to at
+  `BeginSplitInPlace` time. Otherwise identical to the copy-based branch:
+  `split_lineage` written for both (fork F9, unchanged), parent removed.
+  **G1 (ADR 0058's own "Open forks" table, decided 2026-08-25, reversing
+  that ADR's own Stage 4 draft text): the GSI-drain/backfill-seeder
+  cutover vetoes stay PRE-cutover, caller-side, exactly as in the
+  copy-based workflow** — this command's own apply never gated on drain
+  state in either branch, so nothing about this in-place branch needed to
+  change to honor that decision; `animusd`'s in-place split driver
+  (`index_drain.rs::inplace_split_driver_tick`) runs those vetoes before
+  ever proposing this command, mirroring `split_driver_tick`'s existing
+  shape for the copy-based endgame. Mirror arms follow the usual
+  per-entity conventions (`BeginSplitInPlace`: parent row + allocator
+  counter only; `CutoverSplit`'s existing arm extended to also mirror each
+  child's policy, unconditionally — a harmless duplicate write for the
+  copy-based branch, the only source for the in-place one). Tests:
+  `meta::tests::begin_split_in_place_*`/`cutover_split_in_place_*`,
+  mirroring the copy-based tests' own shape scenario-for-scenario.
+
+- **ADR 0062: directed Placing — `Metadata::split_placing` +
+  `MetaCommand::MarkSplitPlacingDone`.** A split child's *final* replica
+  placement is decided once, separately from the fork, as a pure function
+  of already-agreed `Metadata` — the same discipline `BeginBackup` already
+  established for its manifest stub (fork C). `CutoverSplit`'s in-place
+  branch (above) computes `select_replicas` over `active_candidates` for
+  each child, once, right after minting its fork-inherited-replicas row:
+  already-satisfying ⟹ no entry; a differing target ⟹
+  `Metadata::split_placing[child] = SplitPlacing{target: Some(wanted),
+  done: false}`; `select_replicas` erring (too few `Active`
+  candidates/domains) ⟹ still written, `SplitPlacing{target: None, done:
+  false}` (fork B — a visible, keep-retrying obligation, mirroring
+  `reconcile_placement`'s own stance rather than staying silent). A child
+  with no inherited policy gets no entry at all — nothing to place
+  against. `SplitPlacing::target` is a write-once diagnostic snapshot of
+  what cutover decided (or couldn't); the reconcile loop below never trusts
+  or rewrites it, always recomputing `select_replicas` fresh instead
+  (staleness avoidance, and it sidesteps needing a second command purely to
+  update a persisted target). `node.rs`'s `reconcile_loop` gains a
+  **third phase**, `Metadata::split_placing_reconcile`/`PlacementView::
+  split_placing_reconcile`, run unconditionally every tick (own cadence,
+  independent of repair/rebalance's gating — a split-triggered relief
+  obligation shouldn't wait behind `REBALANCE_EVERY_N_TICKS`): for every
+  un-`done` entry, recompute `select_replicas` fresh and propose a
+  `CasTabletReplicas` for whichever ones now differ from the tablet's
+  current replicas — one per entry per tick (deliberately not
+  rebalance's one-move-per-tick bound). It never proposes
+  `MarkSplitPlacingDone` itself — that observes *live Raft* convergence
+  (`RaftKvNode::config()`/`learners()`), which this pure metadata-level
+  view can't see; a leader-gated `animusd` background loop does, once a
+  led tablet's live group matches `Metadata`'s current `replicas` with no
+  dangling learners, held continuously for a settle window (see
+  `animusd/CLAUDE.md`). `MarkSplitPlacingDone` is epoch-CAS'd against the
+  **child's own** current epoch and idempotent on an already-`done` entry
+  (`MarkIndexBackfilled`/`RecordBackupTabletComplete`'s idiom exactly); on
+  `is_relayable_command`'s allowlist (`animus-node/src/wire.rs`), since a
+  tablet's leader is frequently not the control-plane leader.
+  `rebalance_placement`'s own eligibility filter (`meta.rs`) gains one more
+  exclusion alongside its existing `t.state != Active` skip: a tablet
+  carrying an un-`done` `split_placing` entry is skipped by ordinary
+  rebalance too, so the two convergence sources never compete for the same
+  tablet's epoch in the same tick. `DropTableTablets` prunes any
+  `split_placing` row for a tablet it removes (`mirror.rs`), the same
+  orphan-sweep `MarkIndexBackfilled`'s own doc describes for
+  `index_backfill`. `syskv::EntityKind::SplitPlacing` follows the usual
+  per-entity mirror conventions. Tests: `meta::tests::cutover_split_*` for
+  the apply-time decision (already-satisfying/differing-target/
+  unsatisfiable-at-cutover/no-policy shapes), `node::tests::` for the
+  reconcile-loop phase and the rebalance exclusion,
+  `drop_table_tablets_prunes_split_placing_rows_for_the_dropped_tablets`
+  for the cascade. **Known limitation** (issue #513, not closed by ADR
+  0062): the convergence primitive this phase drives —
+  `reconfigure_step`, ADR 0058 Train 1, unmodified — only reliably
+  converges a one-replica-difference target; a two-(or-more)-replica
+  target can oscillate indefinitely, so directed Placing today reliably
+  relocates a child only across that narrower gap.
 
 - **The backup catalog (ADR 0059 §3, Train 1 PR ①): `BeginBackup`/
   `RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/`DeleteBackup`.**
@@ -374,7 +455,12 @@ per-tablet CP data plane (`animus-cp-data`).
   time**, never from anything the proposer captured — the same
   determinism argument `BeginSplit`'s child ranges and `CutoverSplit`'s
   child recomputation already rest on (see `docs/engineering-lessons.md`'s
-  entry on this). `CompleteBackup` requires every pinned tablet to have a
+  entry on this). The tablet list feeding `pinned_tablets` filters out
+  `TabletState::Building` rows — during a copy-based split's (ADR 0050)
+  build/tail window `tablets_for_table` can return the `Splitting` parent
+  plus its two not-yet-cutover `Building` children all at once, and only
+  the parent is the current authoritative owner of the range (see
+  `docs/engineering-lessons.md`'s entry on this fix). `CompleteBackup` requires every pinned tablet to have a
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
@@ -591,6 +677,23 @@ per-tablet CP data plane (`animus-cp-data`).
     once per heartbeat interval — a belt the data plane does not have.
   Regression: `tests/slow_disk_no_livelock.rs` (verified red on the pre-fix
   driver across four seeds: 2/10 proposals accepted, the group leaderless).
+
+  **`node.rs`'s `persist_wal` has no halted-gate at all** (unlike
+  `animus-cp-data`'s own `persist_wal`/`flush_pending`, which tolerate a
+  live I/O error only while a group's `halted: AtomicBool` is set — see
+  `docs/engineering-lessons.md`'s "halted-gated durability assert" entry,
+  issues #282/#279): here `env.append(WAL, ..).await.expect("wal append")`
+  and `env.sync(WAL).await.expect("wal sync")` are bare, unconditional
+  `.expect()`s with no tolerated-error path whatsoever, on any node,
+  live or shutting down. **Test-authoring consequence**: never point
+  `DiskConfig::set_enospc_prob`/`set_error_prob` at a live node's disk in
+  this crate's tests (`SimEnv` or otherwise) — an injected disk error on
+  the consensus loop's own WAL append/sync panics the test process itself
+  rather than exercising any application-level fault handling, since there
+  is none to exercise. `DiskConfig::set_fsync_lie_prob` (never errors —
+  `sync` returns `Ok` and silently leaves the bytes buffered) and
+  `torn_tail_on_crash`/`corrupt_on_crash` (fire only at `Simulator::crash`,
+  not mid-`.expect()`) remain safe.
 
 - **One apply model, generic across both planes (ADR 0017, cut over to
   `Metadata` by ADR 0038 PR3).** `StateMachine::DRIVER_APPLIED = true` is now
@@ -871,3 +974,153 @@ every tick, flooding the log with hundreds of entries — the first draft of
 `slow_disk_no_livelock.rs` measured that churn's throughput instead of the
 property it meant to. `CreateTableSchema` is inert: nothing in the driver
 reacts to it.
+
+### The control-plane machinery fault-injection corpus (`tests/control_corpus.rs`)
+
+The seed-depth counterpart to this crate's ~30 fixed-single-seed acceptance
+tests above, proving the control-plane-*unique* machinery (the ADR 0038 async
+apply task, the replicated schema catalog's exclusivity guarantee) under a
+real fault matrix, not just at one hand-picked seed. `learner_corpus.rs`
+already covers the learner/membership-class vocabulary (ADR 0058 Train 1,
+`ANIMUS_LEARNER_SEEDS`) — this is its sibling for everything else.
+**Self-contained**, mirroring `animus-test`'s `raftkv_linearizable.rs`
+architecture (declarative `Scenario`/`Nemesis`/`Group::apply`/`run_scenario`/
+`assert_scenario_ok`) with one adaptation: a `Scenario::workload: Workload`
+field selects which bespoke `spawn_*_workload` function the runner drives
+(mirroring `animus-test`'s `txn_serializable.rs`'s own `Workload` struct),
+since this plane's interesting scenarios need genuinely different client
+shapes (concurrent schema proposers vs. plain no-contention churn), not just
+different parameters of one shared loop.
+
+**No `check_cycles` here** — a single Raft log total-orders every
+`MetaCommand`, so there is no client-visible read/write history to build an
+Elle dependency graph over. The property is convergence + safety invariants
+instead, checked on every scenario: (1) **convergence** —
+`nodes[i].metadata() == nodes[j].metadata()` for every replica pair, via the
+same converged-or-timeout poll shape every corpus in this repo uses; (2)
+**durability** — an effect a proposer's own retry loop actually *confirmed*
+(read back after proposing, never merely `ProposeResult::Accepted`, which
+only means "appended to the leader's log") must survive into the final
+converged state; (3) **schema-catalog exclusivity** (a safety property,
+checked unconditionally, fault or not) — `MetaCommand::CreateTableSchema`
+rejects outright on an existing table name (first-committer-wins, **not**
+idempotent-on-identical the way `RegisterNode`'s CAS is), so for every table
+name two or more racers proposed, the surviving schema (if any) must be
+byte-identical to exactly one of the racing proposals on every replica, and
+never absent if any racer's proposal was ever durably confirmed; (4)
+**allocator injectivity** (PR②, safety, unconditional) —
+`Workload::AllocatorRace`'s `check_allocator_injectivity`: every `TabletId`
+observed in any replica's tablet map, at every convergence poll AND every
+fault-schedule step (not just the final state — `Shared::sample_tablets`),
+must carry one stable identity (table + range) throughout the run, catching
+a transient double-assignment even if a later poll happens to "correct" it
+back; (5) **`RegisterNode` CAS integrity** (PR②, safety, unconditional) —
+`Workload::RegisterCas`'s `check_register_cas_integrity`, mirroring check 3's
+shape over `Metadata::node_addrs` instead of `Metadata::schemas`; (6)
+**apply-task liveness / no-permanent-stall** (PR③, safety, unconditional on
+EVERY scenario) — `poll_apply_task_caught_up`: after convergence,
+`RaftNode::engine_applied_index()` must catch up to `RaftNode::commit_index()`
+on every live replica within the same converged-or-timeout budget check (1)
+uses. Deliberately a **separate** property from (1): a uniformly-stalled
+apply task (every replica stuck at the same stale-but-consistent `Metadata`)
+still looks "converged" to (1), which only ever compares replicas against
+each other, never against the group's own `commit_index`. No separate
+double-apply probe was added — checks (3)/(4) already catch a double-apply
+if one ever happened (a double-applied `CreateTablet` would violate
+injectivity or be naturally idempotent; a double-applied `CreateTableSchema`
+would violate exclusivity if it somehow un-rejected on replay), so
+`StopRestart`'s own cells just need to actually exercise those existing
+checks post-recovery, which they do (`assert_scenario_ok` runs unconditionally).
+
+**Gotchas this corpus's own build found** (see `docs/engineering-lessons.md`
+for the full write-ups): (a) a racing proposer's confirm loop must decide
+"won" vs. "lost" by **content**, never by presence — since
+`CreateTableSchema` rejects rather than no-ops on an existing name, "the
+table now exists" is true for every racer the instant *any* of them wins,
+so a presence-only check makes a losing racer misreport itself as a winner
+(`SchemaRace`, PR①; `AllocatorRace`'s `BeginSplit` phase reuses the same
+discipline, PR②). (b) The inverse trap for a workload whose racing
+proposals are content-**identical** except for the field being raced
+(`AllocatorRace`'s `CreateTablet` phase — same shared table/range/replicas
+for every racer, only the candidate id differs): a raw "confirmed at most
+once" assertion over that field is checking a *stronger, false* property,
+since several racers legitimately and correctly agreeing "the tablet that
+landed carries my own candidate id" is expected, not a bug — only a
+content/fingerprint comparison (`sample_tablets`), never an occurrence
+count, states injectivity correctly. (c) A fault-finding confirmed in one
+plane over a shared codec (issue #495, the WAL-corruption gap in
+`animus-control::persist::WalRecord` — since fixed by a per-record CRC32
+checksum, see that module's own doc — confirmed reproducible at the time
+in `animus-cp-data`) does **not** automatically reproduce in a sibling
+plane that shares the codec but not the downstream invariant the
+corruption has to trip — confirmed absent here across an 80-combination
+sweep (this plane's commands carry no HLC timestamp, and its CAS/epoch
+checks reject a mismatch rather than asserting on one); see
+`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc — still a
+useful standing regression probe post-fix, now for whichever future
+`MetaCommand` field or replay-path invariant might one day become strict
+enough for a merely-dropped (rather than wrong-valued) tail record to
+matter. (d) PR③:
+`Simulator::crash`+`Simulator::restart` (mutes/re-arms the SAME still-live
+tasks) is **not** a stand-in for a real process restart — proving the ADR
+0038 apply task's restart-recovery path (`meta_apply_loop`'s engine rebuild
++ watermark reseed) needs `Simulator::stop` (removes the tasks entirely)
+followed by a genuinely fresh `RaftNode::start` reopening the SAME retained
+engine handle; see `docs/engineering-lessons.md` for the general form of
+this lesson. (e) PR③: a real multi-chunk `InstallSnapshot` transfer, once
+shipping starts, completes in on the order of single-digit milliseconds of
+virtual time in this plane (no artificial per-chunk delay) — a
+fixed-`Duration` fault schedule aimed at "mid-transfer" will usually miss
+entirely; a condition-based poll (has the receiver started but not
+finished) is what actually lands inside the window regardless of a given
+seed's exact timing (`wait_for_snapshot_transfer_in_flight`).
+
+**Scope as of PR③ (final — the stack is complete)**: `Workload::SchemaRace`
+(2-3 concurrent proposers racing `CreateTableSchema`, same-table or
+distinct-name), `Workload::PlainChurn` (non-contending `UpsertMember`, the
+non-vacuity floor), `Workload::AllocatorRace` (several proposers racing
+`CreateTablet`/`BeginSplit` against ONE shared table/tablet, hammering
+`Metadata::next_tablet_id`/`next_free_tablet_id()`), `Workload::RegisterCas`
+(several proposers each claiming a distinct node id then attempting one
+deterministic differing-re-registration collision against their own claim —
+lifts `register_node_cas.rs`'s fixed-single-seed CAS proof into this
+corpus's fault matrix), and (PR③) `Workload::SustainedChurn` (like
+`PlainChurn` but 50 rounds/proposer instead of 3, driving the log well past
+`SNAPSHOT_THRESHOLD` so a swept `StopRestart` has real in-flight
+apply-task/compaction state to interrupt) — over a nemesis set:
+`LeaderKill`/`FollowerKill`/`PartitionLeader`/`SplitBrain`/`Lossy`/
+`Duplicate` (`NetConfig::set_duplicate_prob`)/`FsyncLie`
+(`DiskConfig::set_fsync_lie_prob`)/`TornTail` (`DiskConfig::
+torn_tail_on_crash`, composed with a crash)/(PR③) `StopRestart` (a REAL
+process restart — `sim.stop` + a fresh `RaftNode::start` reopening the SAME
+retained `MemoryEngine` handle, `Group::engines` — categorically different
+from `LeaderKill`/`FollowerKill`'s `sim.crash`, which mutes the SAME
+still-live tasks and never exercises `meta_apply_loop`'s restart-recovery
+path at all). `heal_all` resets **both** `NetConfig` and `DiskConfig` to
+default — required for `FsyncLie`/`TornTail`, which are armed globally with
+no auto-expiry (PR① never used `DiskConfig` at all). `CorruptOnCrash` is
+deliberately **not** a `Nemesis` variant (issue #495 above); the one cell
+exercising that composition is a dedicated, always-`#[ignore]`d test, never
+part of the asserted `corpus_cells()` set.
+
+**PR③'s two chunked-snapshot-under-fault tests** (`chunked_snapshot_
+source_crash_mid_transfer_3`, `chunked_snapshot_receiver_stop_restart_3`) are
+deliberately **outside** `corpus_cells()`/`Workload`/`Nemesis` — they grow a
+REAL `Metadata` image through the actual `meta_apply_and_compact`/
+`syskv_image` path until it forces a genuine multi-chunk `InstallSnapshot`
+transfer, then inject a source-leader crash or a receiver `StopRestart`
+while chunks are demonstrably still in flight
+(`wait_for_snapshot_transfer_in_flight`, a condition-based poll rather than
+a duration guess — an exploratory run found the whole transfer completes
+within ~3ms of virtual time once shipping starts, too narrow a window for
+this harness's `Vec<(Duration, Nemesis)>` schedule to land inside
+reliably). Fixed-single-seed regressions (like `install_snapshot.rs`'s own
+tests), not part of the `ANIMUS_CONTROL_SEEDS` seed-expansion.
+
+Depth knob **`ANIMUS_CONTROL_SEEDS`** (default 1 = the frozen cells; held
+green at `=15` and `=40` during both PR②'s and PR③'s own validation; now
+wired into CI's nightly `corpus-deep.yml`, default `40`). A structural
+`control_corpus_covers_the_fault_matrix` guard keeps the nemesis/workload
+matrix honest, mirroring `raftkv_corpus_covers_the_fault_matrix` — it
+deliberately does not (and must not) require the `#[ignore]`d
+corrupt-on-crash cell to be part of the asserted set.

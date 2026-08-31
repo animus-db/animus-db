@@ -83,6 +83,7 @@ the relevant one before working in a crate:
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
+| `animus-operator` | [crates/animus-operator/CLAUDE.md](crates/animus-operator/CLAUDE.md) |
 
 ## Commands
 
@@ -116,6 +117,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SEED` | unset | replay one sim run from its printed seed |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | raftkv-corpus depth (`animus-test`) |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
+| `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
@@ -123,9 +125,12 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
+| `ANIMUS_CONTROL_SEEDS=K` | 1 | control-plane machinery (apply task, schema-catalog exclusivity) fault-injection corpus depth (`animus-control`) |
 | `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | on-demand backup capture fault-injection corpus depth (`animus-test`, ADR 0059 Train 1) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | PITR sealing fault-injection corpus depth (`animus-test`, ADR 0059 Train 3) |
+| `ANIMUS_LSM_CRASH_SEEDS=K` | 1 | `LsmEngine` crash-safety corpus depth (`animus-storage`, `tests/lsm_crash.rs`) |
+| `ANIMUS_LSM_DISK_FAULT_SEEDS=K` | 1 | `LsmEngine` `DiskConfig` fault-injection corpus depth (`animus-storage`, `tests/lsm_disk_faults.rs`) |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
@@ -259,7 +264,14 @@ truth; this map is just for navigation.
   (ADR 0058, default since rung 4 layer 2): a single Raft entry on the
   parent's own log mints both children directly `Active`, materialized on
   every fork participant from the committed entry, with no separate
-  build/freeze phase. The original **copy-based background workflow** (ADR
+  build/freeze phase. **Since ADR 0062 the fork is placement-blind**: both
+  children inherit the parent's own current replicas verbatim, and a
+  child's actual final home is a separate, directed **Placing** decision
+  (`Metadata::split_placing`, computed once at cutover) driven, after
+  cutover, by the same replica-rebalancing convergence machinery
+  (`reconfigure_step`/`CasTabletReplicas`) that already moves any other
+  tablet's placement — never fused into the fork itself. The original
+  **copy-based background workflow** (ADR
   0050 — `BeginSplit` mints two `Building` children at placement-chosen
   homes, a driver on the parent's leader copies + tails, a terminal
   `Freeze` stops writes, `CutoverSplit` activates the children and retires
@@ -325,10 +337,13 @@ truth; this map is just for navigation.
   is dropped — and a control-plane-leader janitor
   (`animusd::backup_janitor`) reclaims a deleted/failed backup's objects
   two-phase (mark, then reclaim, then remove the row). **`RestoreTable-
-  FromBackup` (Train 2) and PITR (`UpdateContinuousBackups`/
-  `RestoreTableToPointInTime`, sealing continuously as a fifth change-log
-  consumer beside periodic base snapshots, Train 3) are not yet built.** S3
-  export/import and an S3 `SegmentStore` backend are deferred follow-ups.
+  FromBackup` (Train 2) and PITR (Train 3 — `UpdateContinuousBackups`/
+  `DescribeContinuousBackups`/`RestoreTableToPointInTime`, sealing
+  continuously as a fifth change-log consumer beside periodic base
+  snapshots) are also implemented and green** (`ANIMUS_PITR_SEEDS`, default
+  1, held at `=300` in CI; see ADR 0059's Train 2/3 as-built amendments).
+  The backup/restore/PITR feature train is complete. S3 export/import and
+  an S3 `SegmentStore` backend are deferred follow-ups.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
@@ -349,12 +364,24 @@ truth; this map is just for navigation.
   (in-process split cluster for dev), `gen-config`, and `--auto-split[-bytes]`.
   A config can mix combined-mode indices with control-only/data-only ones for
   an incremental migration.
-- **Deployment target (Kubernetes operator)** — the intended production shape:
-  a K8s operator runs the cluster with seed/intra node-to-node traffic kept
-  cluster-internal (never on an externally-reachable Service); only the
-  client-facing wire edge (DynamoDB) is exposed outside the cluster.
-  This is what motivated the ADR 0047 client/intra port split — review any
-  design touching listeners, ports, or address resolution against this shape.
+- **Kubernetes operator** (ADR 0060) — `animus-operator`: a `kube-rs`
+  controller for the `AnimusCluster` custom resource, reconciling it into a
+  `ConfigMap` (an `animusd::config::ClusterConfig` mirror + dispatch
+  script), a headless internal `Service` + `NetworkPolicy` for node-to-node
+  traffic, a client-facing `dynamo` `Service`, and a `StatefulSet` — one per
+  cluster. Only the client-facing wire edge (DynamoDB) is exposed outside
+  the cluster; this is what motivated the ADR 0047 client/intra port split
+  — review any design touching listeners, ports, or address resolution
+  against this shape. An e2e smoke (`scripts/e2e-kind.sh`,
+  `.github/workflows/e2e-kind.yml`, CI-gated on every push/PR touching this
+  surface) drives a real `kind` cluster through create → bootstrap → scale
+  → delete with the DynamoDB wire exercised throughout — the mechanism no
+  unit test can reach; see `crates/animus-operator/CLAUDE.md`'s e2e section
+  for what it does and does not prove, including a sandbox environment that
+  cannot run it at all (no `CAP_SYS_RESOURCE`, which `kind`'s own
+  control-plane bootstrap needs independent of anything here). The
+  operator's own container image is not yet published — it runs
+  out-of-cluster (or from a locally built image) until that lands.
 
 ## Conventions
 

@@ -15,8 +15,8 @@ use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
-    SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead,
-    TxnAbortReason, decide, dynamo, index_drain, median_split_key, relay_request,
+    RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT,
+    SnapshotRead, TxnAbortReason, decide, dynamo, index_drain, median_split_key, relay_request,
     relay_request_with_timeout, topology,
 };
 
@@ -376,6 +376,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// empty/half-seeded `Building` children parked beside it, indefinitely.
     /// Chasing the refusal's own embedded hint here (identically to a
     /// client-key forward) is what actually reaches the leader.
+    ///
+    /// **A dead first guess is chased too (issue #316), not just a "wrong
+    /// but reachable" one.** The fix above only helps when the guessed
+    /// candidate is alive and answers with a proper refusal — it did
+    /// nothing when the candidate itself was a node that had since
+    /// crashed/been killed: [`relay_request_with_timeout`] folds every
+    /// transport-level failure into one plain-text sentinel
+    /// ([`RELAY_TRANSPORT_FAILURE`]), which doesn't parse as a "not the
+    /// leader here" refusal, so the pre-fix chase gave up on the very
+    /// first unreachable hop. Since the guess is deterministic (both the
+    /// no-local-replica fallback above and a refusal's own embedded hint
+    /// are plain reads, not liveness-checked), every later call — the
+    /// split-build driver's next tick included — reproduced the identical
+    /// dead end forever: exactly `split_survives_losing_one_childs_
+    /// leader_mid_build`'s reported hang (`tests/split_build.rs`), which
+    /// kills a `Building` child's own leader mid-build. The fix: a
+    /// transport failure now gets the identical "no hint" treatment a
+    /// live-but-mid-election refusal already gets — try another known
+    /// replica — rather than a terminal `return resp`.
     pub(crate) async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
@@ -400,7 +419,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             let ClientResponse::Error(e) = &resp else {
                 return resp;
             };
-            let Some(hint) = topology::parse_not_leader_refusal(e) else {
+            // A genuine "not the leader here" refusal carries a hint (or
+            // `None` if the refusing replica is itself mid-election) —
+            // chase it below exactly as before. A **transport** failure
+            // (issue #316: the candidate itself is unreachable — e.g. it
+            // was just killed) gets the identical no-hint treatment: `next`
+            // was a live guess that turned out wrong in a different way,
+            // but the fix is the same either way, "try another known
+            // replica" — never a terminal `return resp` for either. Any
+            // OTHER error is a genuine application-level failure from a
+            // live, leading peer (e.g. a rejected propose) and stays
+            // terminal, unchanged.
+            let hint = if e.as_str() == RELAY_TRANSPORT_FAILURE {
+                None
+            } else if let Some(hint) = topology::parse_not_leader_refusal(e) {
+                hint
+            } else {
                 return resp;
             };
             if self.env.now() >= deadline {
@@ -976,7 +1010,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
-                    Some(_) => ClientResponse::PutOk,
+                    Some((_, outcome)) => ClientResponse::TxnResolved { outcome },
                     None => {
                         ClientResponse::Error("CP group leader moved during resolve; retry".into())
                     }

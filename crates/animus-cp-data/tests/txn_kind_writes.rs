@@ -159,6 +159,7 @@ fn commit_materializes_base_lsi_and_change_record_in_one_entry() {
         .await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
     .unwrap_or_else(|| panic!("txn_resolve did not complete (seed={seed})"));
 
     assert_eq!(
@@ -374,6 +375,7 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
         .await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
     .unwrap_or_else(|| panic!("post-restart resolve did not complete (seed={seed})"));
 
     assert_eq!(block_on(restarted.local_get(&base)), Some(b"v4".to_vec()));
@@ -799,6 +801,7 @@ fn stage_marker_hlc_strictly_precedes_the_resolve_records() {
         .await
     })
     .flatten()
+    .map(|(ts, _outcome)| ts)
     .unwrap_or_else(|| panic!("txn_resolve did not complete (seed={seed})"));
 
     let scanned = block_on(node.local_scan_kind(KIND_CHANGE, &change_prefix, None, None));

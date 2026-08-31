@@ -41,6 +41,15 @@ is **immutable** after creation; a later change is rejected (a status
 condition, `ImmutableFieldChanged`, is set) rather than applied, since v1
 ships no admission webhook to reject the write itself.
 
+## Testing
+
+`cargo test -p animus-operator` is the pure `desired`-builder unit suite —
+no cluster needed. `scripts/e2e-kind.sh` (`.github/workflows/e2e-kind.yml`,
+CI-gated) is the cluster-driven end-to-end complement: a real `kind`
+cluster through create → bootstrap → scale → delete, with the DynamoDB
+wire exercised throughout — see `crates/animus-operator/CLAUDE.md`'s own
+e2e section for what it does and does not prove.
+
 ## What the operator does not do (yet)
 
 - **No finalizer** — deleting an `AnimusCluster` relies on Kubernetes
@@ -48,10 +57,6 @@ ships no admission webhook to reject the write itself.
   (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`) carries. There is
   nothing else to clean up (no external backup store, no DNS record) so
   this is a deliberate v1 scope cut, not a known gap.
-- **No `kind`-cluster end-to-end test** — this stack (crate + manifests) is
-  unit-tested only (`cargo test -p animus-operator`, `cargo test -p
-  animus-operator` — the pure `desired` builders, no cluster needed). A real
-  cluster-driven e2e suite is a separate, later change.
 - **The operator's own container image is not yet built/published** —
   `deployment.yaml` references `ghcr.io/animus-db/animus-operator:latest`
   as a placeholder; building and publishing that image is a follow-up.

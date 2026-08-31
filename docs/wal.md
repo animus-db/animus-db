@@ -34,8 +34,15 @@ WalRecord
 └─ Snapshot  { metadata, last_index, last_term }  ← state-machine snapshot @ last_index
 ```
 
-On disk: newline-delimited JSON, one record per line
-(`encode_record` = `serde_json` + `\n`).
+On disk: newline-delimited, CRC32-checksummed JSON, one record per line —
+`encode_record` = `<crc32 as 8 lowercase hex chars>:` + `serde_json` + `\n`
+(issue #495: a plain `serde_json` + `\n` line had no way to tell a
+bit-flip that kept the JSON syntactically valid apart from a legitimate
+value, so a corrupted-but-parseable record used to decode into a silently
+wrong value instead of a decode error — see `persist.rs`'s own module doc
+for the full account). A line whose checksum doesn't match is treated
+exactly like a torn trailing line by `decode` (§4): dropped, along with
+everything physically after it in the file.
 
 ## 2. Write path — the core emits, the driver persists *before acting*
 
@@ -96,13 +103,20 @@ Append(idx82) Append(idx83) …                Append(idx82 ..)            ← o
 
 `replace` is atomic, so a crash mid-rewrite leaves the **whole old** or **whole
 new** WAL — never a torn file. A torn *append* (a partial trailing line from a
-crash mid-write) is also tolerated: `decode` drops an unparsable last line.
+crash mid-write) is also tolerated: `decode` drops the first line that fails
+its checksum (or fails to parse at all), and everything physically after
+it — the same rule that closes issue #495's at-rest-corruption gap.
 
 ## 4. Recovery — replay the fold on startup (`drive` → `RaftCore::recovered`)
 
 ```
  env.read("raft.wal")  →  bytes
-        │ PersistedState::decode   (split on '\n', parse each line, ignore torn tail)
+        │ PersistedState::decode   (split on '\n'; verify each line's CRC32
+        │                           prefix then parse; stop at the first
+        │                           line that fails either check — a torn
+        │                           tail or a corrupted-but-parseable
+        │                           record, issue #495 — dropping it and
+        │                           everything physically after it)
         ▼
    records: Vec<WalRecord>
         │ PersistedState::replay  — fold in order:

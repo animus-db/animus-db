@@ -1457,6 +1457,22 @@ fn record_transition(
 /// this tick* (violation repair always wins), it proposes a single
 /// balance-improving move so a grown cluster spreads its existing tablets onto new
 /// members — something the pin-survivors reconciler never does on its own.
+///
+/// A third phase, **directed Placing convergence** (ADR 0062 §2,
+/// [`Metadata::split_placing_reconcile`]/[`PlacementView::split_placing_reconcile`]),
+/// runs every tick, unconditionally — independent of repair/rebalance's own
+/// gating, since a split-triggered relief obligation should not wait behind
+/// `REBALANCE_EVERY_N_TICKS`'s cadence (meant for slow, cluster-wide balance
+/// churn) or be starved by repair's own priority. For every un-`done`
+/// `split_placing` entry it recomputes `select_replicas` fresh and proposes a
+/// `CasTabletReplicas` for whichever ones now differ from the tablet's
+/// current replicas — one per entry, so several concurrently-splitting
+/// tablets each get their own move in the same tick (a deliberately
+/// different pacing than rebalance's single-move-per-tick bound, see
+/// `split_placing_reconcile`'s own doc for why). It never proposes
+/// `MarkSplitPlacingDone` — that is a separate, later mechanism (ADR 0062
+/// §3) that observes live Raft convergence, not something this pure
+/// metadata-level view can see.
 async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<Mutex<Metadata>>) {
     let mut tick: u64 = 0;
     loop {
@@ -1492,6 +1508,13 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
             && let Some(command) = view.rebalance()
         {
+            core.lock().expect("raft core poisoned").propose(command);
+        }
+        // ADR 0062 §2's directed-Placing phase: unconditional every tick,
+        // independent of the repair/rebalance gating above. Off-leader
+        // transitions between the check at the top of this tick and here are
+        // just as harmless as they are for repair/rebalance, above.
+        for command in view.split_placing_reconcile() {
             core.lock().expect("raft core poisoned").propose(command);
         }
     }

@@ -1,13 +1,17 @@
 //! **In-place split, group-mint-at-apply, end to end** (ADR 0058 Train 2 rung
-//! 3) — the per-node tablet-host reconciler drives Stages 1 (learner add),
-//! 2 (ordinary Raft catch-up), 3 (the atomic fork + local materialization),
-//! and 5 (post-cutover trim) purely through `animus_cp_data::host`, with no
+//! 3; fork-first per ADR 0062 rung 4/5) — the per-node tablet-host
+//! reconciler drives Stage 3 (the atomic fork, proposed immediately once the
+//! intent is observed — no learner-add/catch-up phase any more) and its
+//! local materialization purely through `animus_cp_data::host`, with no
 //! dependency on `animus-control`/`animusd`: `MetadataView`/
 //! `Tablet::inplace_split` are constructed directly here, standing in for
 //! what `MetaCommand::BeginSplitInPlace`/`CutoverSplit` would produce — the
 //! identical "this module doesn't need a live control-plane `RaftNode`"
 //! posture `tests/reconciler_corpus.rs` already takes for the ordinary
-//! lifecycle.
+//! lifecycle. **Every fixture's intent gives both children the parent's own
+//! current replicas** (`intent`/`splitting_parent`, below) — the real
+//! proposer's shape since ADR 0062 rung 4 — so this corpus cannot drift back
+//! into testing the superseded placement-disjoint-children shape.
 //!
 //! **Harness shape**, borrowed from `tests/reconciler_corpus.rs` (kept small
 //! and self-contained here rather than shared, since integration test
@@ -66,17 +70,25 @@ fn physical(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn intent(left_homes: Vec<NodeId>, right_homes: Vec<NodeId>) -> InPlaceSplitIntent {
+/// Build an in-place split intent the way `ClientCtx::trigger_split`'s
+/// `SplitMode::InPlace` arm actually builds one (ADR 0062 rung 4): both
+/// children get the SAME `replicas` — the parent's own current replica set,
+/// verbatim, never a placement-chosen or disjoint home. Mirrors that
+/// function's own `children: [(left_id, replicas.clone()), (right_id,
+/// replicas)]` construction (`animusd/src/schema.rs::trigger_split`) so this
+/// corpus cannot drift from the real proposer's shape again (the ADR 0062
+/// rung 4 lesson — see `docs/engineering-lessons.md`).
+fn intent(replicas: Vec<NodeId>) -> InPlaceSplitIntent {
     InPlaceSplitIntent {
         split_key: split_key(),
         children: [
             SplitChild {
                 id: LEFT,
-                replicas: left_homes,
+                replicas: replicas.clone(),
             },
             SplitChild {
                 id: RIGHT,
-                replicas: right_homes,
+                replicas,
             },
         ],
     }
@@ -89,6 +101,14 @@ fn parent_tablet(replicas: Vec<NodeId>, split: Option<InPlaceSplitIntent>) -> Ta
     }
     t.inplace_split = split;
     t
+}
+
+/// A parent tablet with an in-place split intent recorded on it, built
+/// through [`intent`] so every scenario's pending-split fixture stays in
+/// lockstep with the real proposer's shape (both children = the parent's
+/// own current replicas).
+fn splitting_parent(replicas: Vec<NodeId>) -> Tablet {
+    parent_tablet(replicas.clone(), Some(intent(replicas)))
 }
 
 /// The post-cutover view: parent gone, both children `Active` at their own
@@ -265,30 +285,29 @@ fn leader_of<'a>(c: &'a Cluster, ids: &[NodeId], tablet: TabletId) -> Option<&'a
 // Scenarios
 // ---------------------------------------------------------------------------
 
-/// The full happy path: parent {p0,p1,p2}, left child final homes
-/// {p0,p1,d3}, right child final homes {p1,p2,d4} — d3/d4 are genuinely new
-/// nodes, so Stage 1 must add real learners and Stage 2 must genuinely catch
-/// them up before Stage 3 forks. Asserts: every stage fires in order, both
-/// children materialize on EVERY fork participant (not just their own final
-/// homes — the over-replication Stage 5 depends on), pre-fork data lands in
+/// The full happy path, fork-first (ADR 0062 rung 4/5): parent {p0,p1,p2},
+/// both children get the parent's own current replicas verbatim — the real
+/// proposer's shape, so there is no learner phase to wait on at all: the
+/// fork proposes the instant the leader observes the intent, gated on
+/// nothing beyond ordinary Raft agreement on the fork entry itself. Asserts:
+/// the fork fires promptly, both children materialize on EVERY fork
+/// participant (not just their own final homes), pre-fork data lands in
 /// exactly the right child, children are born with EMPTY change/cursor
-/// scopes, and the post-cutover `Reconfigure` trims each child down to its
-/// own final placement.
+/// scopes, each child's bootstrap voter set is EXACTLY the parent's own
+/// voters (no over-replication — there is no Stage-5 trim step left to do),
+/// post-cutover convergence holds trivially (bootstrap == final placement
+/// already), and the retired parent is reclaimed everywhere.
 fn scenario_happy_path(seed: u64) {
     run(seed, move |sim| async move {
         let env = sim.env(driver_id());
         let mut c = Cluster::new(sim.clone());
-        let (p0, p1, p2, d3, d4) = (n(0), n(1), n(2), n(3), n(4));
+        let (p0, p1, p2) = (n(0), n(1), n(2));
         let parents = [p0.clone(), p1.clone(), p2.clone()];
-        for id in [p0.clone(), p1.clone(), p2.clone(), d3.clone(), d4.clone()] {
+        for id in parents.iter().cloned() {
             c.add_node(id);
         }
-        let left_homes = vec![p0.clone(), p1.clone(), d3.clone()];
-        let right_homes = vec![p1.clone(), p2.clone(), d4.clone()];
-        let base_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            None,
-        )]);
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
 
         // Stand up + elect the parent, then write some pre-fork data.
         let elected = converge(&mut c, &env, &parents, &base_view, |c| {
@@ -309,23 +328,16 @@ fn scenario_happy_path(seed: u64) {
         }
         env.sleep(Duration::from_millis(500)).await;
 
-        // Stage 1/2: publish the in-place split intent. d3/d4 must
-        // start hosting the parent (as quiet non-voters, then real
-        // learners) and catch up; the ORIGINAL parent nodes must NOT
-        // release them as stray "not in replicas" tablets.
-        let all_participants = [p0.clone(), p1.clone(), p2.clone(), d3.clone(), d4.clone()];
-        let pending_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            Some(intent(left_homes.clone(), right_homes.clone())),
-        )]);
-        let forked = converge(&mut c, &env, &all_participants, &pending_view, |c| {
-            [p0.clone(), p1.clone(), p2.clone(), d3.clone(), d4.clone()]
-                .iter()
-                .all(|id| {
-                    c.node(id.clone())
-                        .hosted_node(PARENT)
-                        .is_some_and(|h| block_on(h.pending_split()).is_some())
-                })
+        // Publish the in-place split intent — the fork proposes immediately
+        // on the leader's very next tick, with no learner-catch-up gate in
+        // the way.
+        let pending_view = view([splitting_parent(homes.clone())]);
+        let forked = converge(&mut c, &env, &parents, &pending_view, |c| {
+            parents.iter().all(|id| {
+                c.node(id.clone())
+                    .hosted_node(PARENT)
+                    .is_some_and(|h| block_on(h.pending_split()).is_some())
+            })
         })
         .await;
         assert!(
@@ -333,11 +345,10 @@ fn scenario_happy_path(seed: u64) {
             "the in-place split never forked on every participant (seed={seed})"
         );
 
-        // Stage 3 materialization: both children must appear on EVERY
-        // fork participant (over-replication by construction), not just
-        // their own final homes.
-        let materialized = converge(&mut c, &env, &all_participants, &pending_view, |c| {
-            all_participants.iter().all(|id| {
+        // Materialization: both children must appear on EVERY fork
+        // participant, not just their own final homes.
+        let materialized = converge(&mut c, &env, &parents, &pending_view, |c| {
+            parents.iter().all(|id| {
                 let hosted = c.hosted_set(id.clone());
                 hosted.contains(&LEFT) && hosted.contains(&RIGHT)
             })
@@ -348,9 +359,32 @@ fn scenario_happy_path(seed: u64) {
             "both children did not materialize on every fork participant (seed={seed})"
         );
 
+        // No over-replication (ADR 0062 rung 4/5): each child's bootstrap
+        // voter set is EXACTLY the parent's own voters, on every fork
+        // participant — nothing recruited, nothing left for a later trim.
+        let want_voters: BTreeSet<NodeId> = homes.iter().cloned().collect();
+        for id in &parents {
+            let node = c.node(id.clone());
+            let left_config = node.hosted_node(LEFT).expect("materialized above").config();
+            let right_config = node
+                .hosted_node(RIGHT)
+                .expect("materialized above")
+                .config();
+            assert_eq!(
+                left_config, want_voters,
+                "node {id}: LEFT bootstrapped over-replicated relative to the parent's own \
+                 voters (seed={seed})"
+            );
+            assert_eq!(
+                right_config, want_voters,
+                "node {id}: RIGHT bootstrapped over-replicated relative to the parent's own \
+                 voters (seed={seed})"
+            );
+        }
+
         // Data property: pre-fork writes land in exactly the right
         // child, on every participant's own local clone.
-        for id in &all_participants {
+        for id in &parents {
             let left_engine = c.storage(id.clone(), LEFT);
             let right_engine = c.storage(id.clone(), RIGHT);
             assert!(
@@ -400,37 +434,35 @@ fn scenario_happy_path(seed: u64) {
             }
         }
 
-        // Stage 4/5: cutover, then confirm the ordinary post-cutover
-        // Reconfigure trims each child down to its own FINAL placement
-        // (over-replicated on the union right after the fork).
-        let post = cutover_view(left_homes.clone(), right_homes.clone());
-        let converged = converge(&mut c, &env, &all_participants, &post, |c| {
-            let left_ok = left_homes
+        // Cutover: post-cutover convergence holds trivially — both
+        // children's bootstrap voters ALREADY equal their final placement
+        // (asserted above), so there is nothing left for the ordinary
+        // `Reconfigure` action to do; this just confirms it stays a no-op.
+        let post = cutover_view(homes.clone(), homes.clone());
+        let converged = converge(&mut c, &env, &parents, &post, |c| {
+            let left_ok = homes
                 .iter()
                 .all(|id| c.node(id.clone()).hosted_node(LEFT).is_some());
-            let right_ok = right_homes
+            let right_ok = homes
                 .iter()
                 .all(|id| c.node(id.clone()).hosted_node(RIGHT).is_some());
-            let left_leader_config = leader_of(c, &left_homes, LEFT).map(|h| h.config());
-            let right_leader_config = leader_of(c, &right_homes, RIGHT).map(|h| h.config());
+            let left_leader_config = leader_of(c, &homes, LEFT).map(|h| h.config());
+            let right_leader_config = leader_of(c, &homes, RIGHT).map(|h| h.config());
             left_ok
                 && right_ok
-                && left_leader_config.as_ref()
-                    == Some(&left_homes.iter().cloned().collect::<BTreeSet<_>>())
-                && right_leader_config.as_ref()
-                    == Some(&right_homes.iter().cloned().collect::<BTreeSet<_>>())
+                && left_leader_config.as_ref() == Some(&want_voters)
+                && right_leader_config.as_ref() == Some(&want_voters)
         })
         .await;
         assert!(
             converged,
-            "post-cutover reconfigure never trimmed each child to its own final placement \
-                 (seed={seed})"
+            "post-cutover each child never converged to its own final placement (seed={seed})"
         );
 
         // The retired parent is reclaimed everywhere (the ordinary
         // hosted-but-absent-from-Metadata path, unmodified).
-        let reclaimed = converge(&mut c, &env, &all_participants, &post, |c| {
-            all_participants
+        let reclaimed = converge(&mut c, &env, &parents, &post, |c| {
+            parents
                 .iter()
                 .all(|id| !c.hosted_set(id.clone()).contains(&PARENT))
         })
@@ -438,77 +470,6 @@ fn scenario_happy_path(seed: u64) {
         assert!(
             reclaimed,
             "the retired parent was never reclaimed everywhere (seed={seed})"
-        );
-    });
-}
-
-/// A leader crash mid-learner-catch-up (Stage 1/2): the split must not
-/// wedge — a new leader picks up where the old one left off (the SAME
-/// intent, read fresh from `Metadata` every tick) and the fork still
-/// eventually completes.
-fn scenario_leader_crash_mid_catch_up(seed: u64) {
-    run(seed, move |sim| async move {
-        let env = sim.env(driver_id());
-        let mut c = Cluster::new(sim.clone());
-        let (p0, p1, p2, d3) = (n(10), n(11), n(12), n(13));
-        let parents = [p0.clone(), p1.clone(), p2.clone()];
-        for id in [p0.clone(), p1.clone(), p2.clone(), d3.clone()] {
-            c.add_node(id);
-        }
-        // A single child (LEFT) suffices to exercise a leader crash during
-        // its own learner catch-up; RIGHT's homes are the original parent
-        // voters (trivially "ready", no learner needed) so the scenario
-        // stays focused on the one property under test.
-        let left_homes = vec![p0.clone(), p1.clone(), d3.clone()];
-        let right_homes = vec![p0.clone(), p1.clone(), p2.clone()];
-        let all = [p0.clone(), p1.clone(), p2.clone(), d3.clone()];
-        let base_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            None,
-        )]);
-        assert!(
-            converge(&mut c, &env, &parents, &base_view, |c| leader_of(
-                c, &parents, PARENT
-            )
-            .is_some())
-            .await,
-            "parent never elected (seed={seed})"
-        );
-
-        let pending_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            Some(intent(left_homes.clone(), right_homes.clone())),
-        )]);
-        // Drive a FEW ticks (enough to add the learner, not enough to catch
-        // it up or fork), then crash whichever original node currently
-        // leads.
-        for _ in 0..3 {
-            c.tick_all(&all, &pending_view).await;
-            env.sleep(Duration::from_millis(50)).await;
-        }
-        if let Some(leader_id) = parents
-            .iter()
-            .find(|id| {
-                c.node((*id).clone())
-                    .hosted_node(PARENT)
-                    .is_some_and(|h| h.is_leader())
-            })
-            .cloned()
-        {
-            c.crash_restart(leader_id);
-        }
-
-        let forked = converge(&mut c, &env, &all, &pending_view, |c| {
-            all.iter().all(|id| {
-                c.node(id.clone())
-                    .hosted_node(PARENT)
-                    .is_some_and(|h| block_on(h.pending_split()).is_some())
-            })
-        })
-        .await;
-        assert!(
-            forked,
-            "the split never recovered from a leader crash mid-catch-up (seed={seed})"
         );
     });
 }
@@ -542,10 +503,7 @@ fn scenario_campaigning_replica_wins_leadership_almost_immediately(seed: u64) {
             "parent never elected (seed={seed})"
         );
 
-        let pending_view = view([parent_tablet(
-            homes.clone(),
-            Some(intent(homes.clone(), homes.clone())),
-        )]);
+        let pending_view = view([splitting_parent(homes.clone())]);
         assert!(
             converge(&mut c, &env, &parents, &pending_view, |c| {
                 parents.iter().all(|id| {
@@ -695,10 +653,7 @@ fn scenario_parent_leader_crash_at_fork_falls_back_to_ordinary_election(seed: u6
             "test fixture invariant: a survivor must not already believe itself leader at the \
              instant of the crash (seed={seed})"
         );
-        let pending_view = view([parent_tablet(
-            homes.clone(),
-            Some(intent(homes.clone(), homes.clone())),
-        )]);
+        let pending_view = view([splitting_parent(homes.clone())]);
         // Ticking the survivors' reconcilers NOW, with zero further elapsed
         // time, is the very first time either of their `TabletFacts::
         // is_leader` for the parent is computed post-crash — it must read
@@ -742,15 +697,11 @@ fn scenario_crash_between_fork_and_materialization(seed: u64) {
         for id in parents.iter().cloned() {
             c.add_node(id);
         }
-        // Every home is an original parent voter — Stage 1 has nothing to
-        // add, so the fork can trigger the very first pending-tick, leaving
-        // only the crash-before-materialization window to test.
-        let left_homes = vec![p0.clone(), p1.clone(), p2.clone()];
-        let right_homes = vec![p0.clone(), p1.clone(), p2.clone()];
-        let base_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            None,
-        )]);
+        // The fork proposes immediately on the leader's very first
+        // pending-tick (ADR 0062 rung 5: no learner phase to wait on),
+        // leaving only the crash-before-materialization window to test.
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let base_view = view([parent_tablet(homes.clone(), None)]);
         assert!(
             converge(&mut c, &env, &parents, &base_view, |c| leader_of(
                 c, &parents, PARENT
@@ -795,10 +746,7 @@ fn scenario_crash_between_fork_and_materialization(seed: u64) {
         }
         env.sleep(Duration::from_millis(300)).await;
 
-        let pending_view = view([parent_tablet(
-            vec![p0.clone(), p1.clone(), p2.clone()],
-            Some(intent(left_homes.clone(), right_homes.clone())),
-        )]);
+        let pending_view = view([splitting_parent(homes.clone())]);
         // Drive ONLY p0/p1's reconcilers to propose+observe the fork —
         // deliberately never ticking p2's own reconciler here, so p2's
         // Raft group (already running since the base-view stage, entirely
@@ -869,62 +817,41 @@ fn scenario_crash_between_fork_and_materialization(seed: u64) {
 }
 
 /// A concurrent unrelated rebalance of an ORDINARY (non-splitting) tablet
-/// must not be disturbed by the split machinery, and — the direction this
-/// scenario actually guards — ticking the split's own parent must never
-/// route through the ordinary `Reconfigure` action (which would see the
-/// split's added learner as stale and immediately try to remove it).
+/// must not be disturbed by the split machinery, and vice versa — the
+/// non-interference proof both directions (ADR 0062 rung 5: there is no
+/// learner-add on the parent any more to race at all, so this narrows to
+/// proving phase 1.5's own exclusion of the ordinary `Reconfigure` action
+/// for a mid-split parent doesn't leak into, or get disturbed by, a
+/// same-tick unrelated tablet's own reconfigure).
 fn scenario_unrelated_rebalance_does_not_race_the_split(seed: u64) {
     run(seed, move |sim| async move {
         let env = sim.env(driver_id());
         let mut c = Cluster::new(sim.clone());
-        let (p0, p1, p2, d3, spare) = (n(30), n(31), n(32), n(33), n(34));
-        for id in [
-            p0.clone(),
-            p1.clone(),
-            p2.clone(),
-            d3.clone(),
-            spare.clone(),
-        ] {
+        let (p0, p1, p2, spare) = (n(30), n(31), n(32), n(34));
+        for id in [p0.clone(), p1.clone(), p2.clone(), spare.clone()] {
             c.add_node(id);
         }
         const OTHER: TabletId = TabletId(9);
-        let left_homes = vec![p0.clone(), p1.clone(), d3.clone()];
-        let right_homes = vec![p0.clone(), p1.clone(), p2.clone()];
-        let all = [
-            p0.clone(),
-            p1.clone(),
-            p2.clone(),
-            d3.clone(),
-            spare.clone(),
-        ];
-        // `spare` never hosts PARENT (it's only OTHER's own replacement
-        // replica) — the split-fork check below must only look at nodes
-        // that actually participate in the split.
-        let split_participants = [p0.clone(), p1.clone(), p2.clone(), d3.clone()];
+        let homes = vec![p0.clone(), p1.clone(), p2.clone()];
+        let all = [p0.clone(), p1.clone(), p2.clone(), spare.clone()];
 
-        // An unrelated, ordinary tablet mid-rebalance (a fourth spare
-        // replacing p2) ticking alongside the split — must converge
-        // normally, on its own schedule, unaffected by the split's own
-        // learner-add on the PARENT tablet.
+        // An unrelated, ordinary tablet mid-rebalance (dropping p2 for
+        // `spare`) ticking alongside the split — must converge normally, on
+        // its own schedule, unaffected by the split's own parent-tablet
+        // handling.
         let other_tablet = |replicas: Vec<NodeId>| {
             Tablet::new_for_table(OTHER, "other", KeyRange::whole(), replicas)
         };
 
-        // Let the parent (and OTHER, already at its final placement) form
-        // and elect before introducing the split intent, mirroring the
+        // Let the parent (and OTHER, still at its pre-rebalance placement)
+        // form and elect before introducing the split intent, mirroring the
         // other scenarios' own staging — a split intent present from a
         // cluster's very first tick is not the property this scenario is
         // about.
         let base_view = MetadataView {
             tablets: [
-                (
-                    PARENT,
-                    parent_tablet(vec![p0.clone(), p1.clone(), p2.clone()], None),
-                ),
-                (
-                    OTHER,
-                    other_tablet(vec![p0.clone(), p1.clone(), spare.clone()]),
-                ),
+                (PARENT, parent_tablet(homes.clone(), None)),
+                (OTHER, other_tablet(homes.clone())),
             ]
             .into_iter()
             .collect(),
@@ -940,13 +867,7 @@ fn scenario_unrelated_rebalance_does_not_race_the_split(seed: u64) {
 
         let pending_view = MetadataView {
             tablets: [
-                (
-                    PARENT,
-                    parent_tablet(
-                        vec![p0.clone(), p1.clone(), p2.clone()],
-                        Some(intent(left_homes.clone(), right_homes.clone())),
-                    ),
-                ),
+                (PARENT, splitting_parent(homes.clone())),
                 (
                     OTHER,
                     other_tablet(vec![p0.clone(), p1.clone(), spare.clone()]),
@@ -957,9 +878,11 @@ fn scenario_unrelated_rebalance_does_not_race_the_split(seed: u64) {
             ..Default::default()
         };
 
+        // Direction 1: the split still forks normally while an unrelated
+        // tablet is also converging.
         assert!(
             converge(&mut c, &env, &all, &pending_view, |c| {
-                split_participants.iter().all(|id| {
+                homes.iter().all(|id| {
                     c.node(id.clone())
                         .hosted_node(PARENT)
                         .is_some_and(|h| block_on(h.pending_split()).is_some())
@@ -968,6 +891,11 @@ fn scenario_unrelated_rebalance_does_not_race_the_split(seed: u64) {
             .await,
             "the split never forked while an unrelated tablet was also converging (seed={seed})"
         );
+        // Direction 2: the unrelated tablet still converges to its own
+        // desired placement while the split is in progress — ticking the
+        // split's own parent must never route through the ordinary
+        // `Reconfigure` action (phase 1.5's exclusion) in a way that starves
+        // or interferes with OTHER's own reconfigure in the same tick.
         assert!(
             converge(&mut c, &env, &all, &pending_view, |c| {
                 leader_of(c, &all, OTHER).map(|h| h.config()).as_ref()
@@ -1044,10 +972,7 @@ fn scenario_eager_wake_and_reconciler_tick_race_benignly(seed: u64) {
             "could not force leadership onto p0 before ticking only p0/p1 (seed={seed})"
         );
 
-        let pending_view = view([parent_tablet(
-            homes.clone(),
-            Some(intent(homes.clone(), homes.clone())),
-        )]);
+        let pending_view = view([splitting_parent(homes.clone())]);
         // Every home is an original parent voter, so p0's very first tick
         // proposes the fork directly (no learner catch-up needed) — drive
         // ONLY p0/p1, never p2, so p2's own Raft group applies the fork
@@ -1211,10 +1136,7 @@ fn scenario_crash_after_apply_loses_the_eager_wake_but_reconciler_fallback_recov
         }
         env.sleep(Duration::from_millis(300)).await;
 
-        let pending_view = view([parent_tablet(
-            homes.clone(),
-            Some(intent(homes.clone(), homes.clone())),
-        )]);
+        let pending_view = view([splitting_parent(homes.clone())]);
         let drivers = [p0.clone(), p1.clone()];
         assert!(
             converge(&mut c, &env, &drivers, &pending_view, |c| {
@@ -1327,10 +1249,6 @@ fn scenario_cells() -> Vec<Scenario> {
     }
     vec![
         scenario!("happy_path", scenario_happy_path),
-        scenario!(
-            "leader_crash_mid_catch_up",
-            scenario_leader_crash_mid_catch_up
-        ),
         scenario!(
             "crash_between_fork_and_materialization",
             scenario_crash_between_fork_and_materialization

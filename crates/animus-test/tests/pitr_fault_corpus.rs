@@ -34,8 +34,8 @@ use std::time::Duration;
 use animus_control::{ApplyOutcome, ColumnType, MetaCommand, Metadata, PitrSpec, TableSchema};
 use animus_cp_data::backup as backup_codec;
 use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, segment};
-use animus_env::{Env, Rng, SegmentStore, nid};
-use animus_sim::{SimEnv, SimSegmentStore, Simulator};
+use animus_env::{Clock, Env, Rng, SegmentStore, nid};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
 use animus_test::corpus;
@@ -1511,5 +1511,402 @@ fn use_latest_restorable_time_matches_the_full_model() {
     for_each_seed(
         "use_latest_restorable_time_matches_the_full_model",
         scenario_use_latest_restorable_time_matches_the_full_model,
+    );
+}
+
+// --- cell 13: fsync-acked-but-lost lie on the crashing sealing leader ------
+
+/// The identical crash-mid-seal property as [`scenario_kill_sealing_leader`]
+/// (cell 3) — a crash between the store `put` and the catalog commit, then a
+/// leader failover, then the idempotent retry re-seals the full backlog as
+/// one epoch — with the added twist that the crashing leader's own recent
+/// `sync`es may have **lied**: [`DiskConfig::set_fsync_lie_prob`] set
+/// globally means some of what the leader believed was durable (WAL records
+/// it had already fsynced and acked) was in fact still only buffered when
+/// the crash hit, so `Simulator::crash`'s default (no [`DiskConfig::
+/// torn_tail_on_crash`] configured here) whole-buffer-drop applies to MORE
+/// bytes than an un-lied crash would ever lose. The corpus's own core
+/// durability argument — the retry recovers the full backlog regardless of
+/// exactly how much the crashed leader's own local WAL lost — has to hold
+/// under this too: Raft safety only ever depends on a *majority* having
+/// durably persisted a committed entry, never on the crashing node's own
+/// copy of it.
+fn scenario_wal_fsync_lie_kill_sealing_leader(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.set_fsync_lie_prob(0.3);
+    sim.set_disk_config(disk_cfg);
+    let engines = engines();
+    let mut meta = base_meta_with_pitr();
+    let group = start_group(&sim, &engines, TabletId(100), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..4 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let old_leader = elect(&mut sim, &group, &live, seed);
+    // A crash between the store `put` and the catalog commit — the
+    // idempotent-retry recovery argument (ledger-named-object amendment) —
+    // while the leader's own fsyncs have been lying about durability.
+    let none = pitr_seal_now(&mut meta, &store, &group, old_leader, 1_000, true);
+    assert_eq!(
+        none, None,
+        "[seed={seed}] skip_commit models no catalog row yet"
+    );
+    assert!(meta.pitr_segments.is_empty());
+
+    sim.crash(nid(NODES[old_leader]));
+    live.retain(|&i| i != old_leader);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+
+    // More writes land under the new leader before the retry.
+    for i in 4..7 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let sealed = pitr_seal_now(&mut meta, &store, &group, new_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the retry re-seals the full backlog as one epoch, even under a lying fsync \
+         on the node that crashed"
+    );
+
+    verify_pitr_lineage(&meta, &store, &[(&group, new_leader, 1)], &journal, seed);
+}
+
+#[test]
+fn wal_fsync_lie_kill_sealing_leader() {
+    for_each_seed(
+        "wal_fsync_lie_kill_sealing_leader",
+        scenario_wal_fsync_lie_kill_sealing_leader,
+    );
+}
+
+// --- cell 14: chaotic network — quiet table rollover under loss+dup -------
+
+/// The identical baseline-rollover property as
+/// [`scenario_quiet_table_pitr_rollover`] (cell 1), under a compound
+/// lossy+duplicating network (`NetConfig::set_drop_prob`/
+/// `set_duplicate_prob`, ADR 0061 Decision 3) set globally from the very
+/// first `Simulator::new(seed)`. Deliberately never
+/// `NetConfig::set_corrupt_prob`: `crates/animus-cp-data/src/codec.rs`'s
+/// dozen-odd `Vec::with_capacity(n as usize)` sites over an untrusted wire
+/// length prefix are still unbounded on this branch (verified directly —
+/// the fix is sibling PR #485, not yet landed), so a corrupted length
+/// prefix landing near `u32::MAX` would abort the whole test process
+/// rather than surface as a recoverable error; excluded, matching the
+/// conservative choice the sibling raftkv/txn/backup corpora already made.
+fn scenario_chaotic_network_pitr_rollover(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_drop_prob(0.05);
+    net_cfg.set_duplicate_prob(0.10);
+    sim.set_net_config(net_cfg);
+    let engines = engines();
+    let mut meta = base_meta_with_pitr();
+    let group = start_group(&sim, &engines, TabletId(101), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..3 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = pitr_seal_now(&mut meta, &store, &group, leader, 1_000, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] expected epoch 0 to seal");
+
+    for i in 0..3 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v1", seed);
+    }
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = pitr_seal_now(&mut meta, &store, &group, leader, 2_000, false);
+    assert_eq!(sealed, Some(1), "[seed={seed}] expected epoch 1 to seal");
+
+    verify_pitr_lineage(&meta, &store, &[(&group, leader, 1)], &journal, seed);
+}
+
+#[test]
+fn chaotic_network_pitr_rollover() {
+    for_each_seed(
+        "chaotic_network_pitr_rollover",
+        scenario_chaotic_network_pitr_rollover,
+    );
+}
+
+// --- cell 15: chaotic network — idle group still never seals a no-op ------
+
+/// The identical quiescence-contract property as
+/// [`scenario_idle_group_never_proposes_a_pitr_seal`] (cell 2), under the
+/// same compound lossy+duplicating network as cell 14 — proving the
+/// "nothing pending ⇒ no store `put`, no propose" contract is a purely
+/// local decision (`pending_changes()` reading empty) that packet loss or
+/// duplication cannot spuriously trip into a false seal, and that a real
+/// write still gets through and seals despite the same fault.
+fn scenario_chaotic_network_idle_group_never_proposes_a_pitr_seal(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_drop_prob(0.05);
+    net_cfg.set_duplicate_prob(0.10);
+    sim.set_net_config(net_cfg);
+    let engines = engines();
+    let mut meta = base_meta_with_pitr();
+    let group = start_group(&sim, &engines, TabletId(102), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = pitr_seal_now(&mut meta, &store, &group, leader, 500, false);
+    assert_eq!(sealed, None, "[seed={seed}] an idle group must never seal");
+    assert!(
+        meta.pitr_segments.is_empty(),
+        "[seed={seed}] no catalog row from a no-op seal attempt"
+    );
+
+    // Now a real write lands — the very next attempt seals it, even under
+    // the same lossy/duplicating network.
+    let mut journal = BTreeMap::new();
+    write_and_journal(&mut sim, &group, &live, &mut journal, &key(0), b"v0", seed);
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = pitr_seal_now(&mut meta, &store, &group, leader, 600, false);
+    assert_eq!(sealed, Some(0), "[seed={seed}] a real write must seal");
+}
+
+#[test]
+fn chaotic_network_idle_group_never_proposes_a_pitr_seal() {
+    for_each_seed(
+        "chaotic_network_idle_group_never_proposes_a_pitr_seal",
+        scenario_chaotic_network_idle_group_never_proposes_a_pitr_seal,
+    );
+}
+
+// --- cell 16: torn/corrupted WAL tail on the crashing sealing leader ------
+
+/// The identical crash-mid-seal property as [`scenario_kill_sealing_leader`]
+/// (cell 3), now with [`DiskConfig::torn_tail_on_crash`]/[`DiskConfig::
+/// corrupt_on_crash`] set globally so the crashing leader's own last
+/// un-synced WAL record is torn (a seed-chosen strict prefix kept, at least
+/// one byte always lost) and bit-flipped, rather than simply dropped
+/// wholesale — and then, unlike cell 3, the crashed node is brought all the
+/// way back as a **true process restart** reading that torn/corrupted tail
+/// off disk. This needs a specific sequencing this repo's crash idiom
+/// requires (see `docs/engineering-lessons.md`): `crash` (applies the tear)
+/// → `restart` (clears the `crashed` mute — a crashed node silently drops
+/// every send/delivery until it does, so skipping this step would leave the
+/// freshly-constructed node permanently unable to talk to its peers) →
+/// `stop` (drops the just-re-armed tasks, keeps the now-torn durable state)
+/// → a fresh `RaftKvNode::start_hosted` on the same id/engine, mirroring
+/// `backup_fault_corpus.rs`'s own `capture_driver_node_crash_restart`
+/// idiom. A further round of writes and a second seal, with the recovered
+/// node back among the live set, proves `current_open_pitr_epoch` — derived
+/// purely from the catalog `Metadata`, never from any one replica's own
+/// recovered state — continues cleanly at epoch 1: a wrong recovered epoch
+/// here would silently produce a duplicate or skipped epoch number on
+/// reseal, exactly what `verify_pitr_lineage`'s exactly-once check exists
+/// to catch.
+fn scenario_wal_torn_on_crash_kill_sealing_leader(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.torn_tail_on_crash = true;
+    disk_cfg.corrupt_on_crash = true;
+    sim.set_disk_config(disk_cfg);
+    let engines = engines();
+    let mut meta = base_meta_with_pitr();
+    let mut group = start_group(&sim, &engines, TabletId(103), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..4 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let old_leader = elect(&mut sim, &group, &live, seed);
+    let none = pitr_seal_now(&mut meta, &store, &group, old_leader, 1_000, true);
+    assert_eq!(
+        none, None,
+        "[seed={seed}] skip_commit models no catalog row yet"
+    );
+    assert!(meta.pitr_segments.is_empty());
+
+    // Crash with the torn/corrupted-tail disk model active — the crashing
+    // leader's own last WAL record may now be torn or bit-flipped.
+    sim.crash(nid(NODES[old_leader]));
+    live.retain(|&i| i != old_leader);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+
+    for i in 4..7 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v0", seed);
+    }
+    let sealed = pitr_seal_now(&mut meta, &store, &group, new_leader, 2_000, false);
+    assert_eq!(
+        sealed,
+        Some(0),
+        "[seed={seed}] the retry re-seals the full backlog as one epoch"
+    );
+    verify_pitr_lineage(&meta, &store, &[(&group, new_leader, 1)], &journal, seed);
+
+    // Bring the crashed node all the way back — see this scenario's own
+    // doc for why `restart` must land between `crash` and `stop`.
+    let restarted_id = NODES[old_leader];
+    sim.restart(nid(restarted_id));
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        engines[&restarted_id].clone(),
+        StorageScope::new(KeyRange::whole()),
+        group.id.0,
+    );
+    group.nodes[old_leader] = fresh;
+    live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    // A further round of writes + seal, now with the recovered node back
+    // among the live set — proves the per-tablet epoch chain recovers
+    // correctly, never duplicating or skipping an epoch number.
+    for i in 7..10 {
+        write_and_journal(&mut sim, &group, &live, &mut journal, &key(i), b"v1", seed);
+    }
+    let leader = elect(&mut sim, &group, &live, seed);
+    let sealed = pitr_seal_now(&mut meta, &store, &group, leader, 3_000, false);
+    assert_eq!(
+        sealed,
+        Some(1),
+        "[seed={seed}] the epoch chain continues at 1 once the recovered node rejoins, never a \
+         duplicate or skipped number"
+    );
+
+    verify_pitr_lineage(&meta, &store, &[(&group, leader, 1)], &journal, seed);
+}
+
+#[test]
+fn wal_torn_on_crash_kill_sealing_leader() {
+    for_each_seed(
+        "wal_torn_on_crash_kill_sealing_leader",
+        scenario_wal_torn_on_crash_kill_sealing_leader,
+    );
+}
+
+// --- cell 17: restore-to-random-second under sealing-leader clock drift ---
+
+/// Sized together with this scenario's own explicit `sim.run_for` between
+/// rounds so the drift accumulates to several visible seconds by the last
+/// round (checked directly below), rather than being lost in the noise of
+/// ordinary write/confirm jitter — a 30% clock-rate error is unrealistically
+/// large for a real machine, but this scenario deliberately wants the
+/// divergence to be unmissable rather than merely plausible.
+const CLOCK_DRIFT_PPM: i64 = 300_000;
+
+/// The identical flagship "restore-to-random-second" property as
+/// [`scenario_restore_to_random_second_matches_the_model_with_a_leader_kill`]
+/// (cell 8), replacing that cell's leader-kill nemesis with a **clock-drift**
+/// one (`Simulator::set_clock_drift_for`, ADR 0061 Decision 3) on the
+/// sealing leader itself — never killed here, so any divergence is
+/// attributable to the drift alone. PITR is unusually well-suited to this
+/// primitive: it is the one subsystem in this codebase that consumes
+/// wall-clock epoch seconds (`seal_wall_ms`/`cutoff_wall_ms`, ADR 0051's
+/// `wall_now()`). `wall_ms` is no longer a synthetic incrementing counter
+/// here — each seal's `wall_ms` argument is read straight off the sealing
+/// leader's own drifted `env.wall_now()`, so the model's own snapshot keys
+/// inherit exactly the readings production code would see, and
+/// `Metadata::pitr_replay_segments` (real code) still has to reproduce the
+/// model exactly at every recorded second.
+fn scenario_restore_to_random_second_under_clock_drift(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let engines = engines();
+    let mut meta = base_meta_with_pitr();
+    let group = start_group(&sim, &engines, TabletId(104), KeyRange::whole());
+    let live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let env = sim.env(nid(NODES[0]));
+    let mut journal: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut snapshots: ModelSnapshots = Vec::new();
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    let wall_ms_before_drift = group.nodes[leader].env().wall_now().0;
+    sim.set_clock_drift_for(nid(NODES[leader]), CLOCK_DRIFT_PPM);
+
+    for round in 0..8usize {
+        let n = 1 + env.gen_below(3) as usize;
+        write_burst(
+            &mut sim,
+            &group,
+            &live,
+            &mut journal,
+            &mut model,
+            &env,
+            round,
+            n,
+            seed,
+        );
+
+        // Advance real virtual time between rounds so the drift has
+        // something to accumulate against — no leader kill or other
+        // nemesis here, so leadership (and thus which node's clock this
+        // reads) stays put for the whole scenario.
+        sim.run_for(Duration::from_secs(2));
+
+        let leader = elect(&mut sim, &group, &live, seed);
+        let wall_ms = group.nodes[leader].env().wall_now().0;
+        if let Some(_epoch) = pitr_seal_now(&mut meta, &store, &group, leader, wall_ms, false) {
+            snapshots.push((wall_ms, model.clone()));
+        }
+    }
+    assert!(
+        snapshots.len() >= 4,
+        "[seed={seed}] expected several successful seals, got {}",
+        snapshots.len()
+    );
+
+    // The drift really did accumulate to several visible seconds beyond
+    // the ~16s of real elapsed time (8 rounds * 2s each) the loop above
+    // actually slept — otherwise this cell is indistinguishable from the
+    // no-drift baseline and proves nothing about drift-robustness
+    // specifically.
+    let (last_wall_ms, _) = snapshots.last().expect("checked above");
+    let real_elapsed_ms: u64 = 2_000 * 8;
+    assert!(
+        last_wall_ms.saturating_sub(wall_ms_before_drift) > real_elapsed_ms + 2_000,
+        "[seed={seed}] expected a visible multi-second drift by the last seal \
+         (wall_ms_before_drift={wall_ms_before_drift}, last_wall_ms={last_wall_ms})"
+    );
+
+    let base = vec![(TabletId(104), 0)];
+    // Every recorded snapshot's own wall_ms reproduces exactly that
+    // snapshot when used as the restore target.
+    for (wall_ms, expected) in &snapshots {
+        assert_replay_matches_model(&meta, &store, &base, *wall_ms, expected, seed);
+    }
+    // A target strictly between two consecutive snapshots reproduces the
+    // EARLIER one.
+    for pair in snapshots.windows(2) {
+        let (a_ms, a_model) = &pair[0];
+        let (b_ms, _) = &pair[1];
+        if b_ms > a_ms {
+            let mid = a_ms + (b_ms - a_ms) / 2;
+            assert_replay_matches_model(&meta, &store, &base, mid, a_model, seed);
+        }
+    }
+    // Before the very first seal: nothing at all is restorable yet.
+    let (first_ms, _) = &snapshots[0];
+    if *first_ms > 0 {
+        assert_replay_matches_model(&meta, &store, &base, first_ms - 1, &BTreeMap::new(), seed);
+    }
+}
+
+#[test]
+fn restore_to_random_second_under_clock_drift() {
+    for_each_seed(
+        "restore_to_random_second_under_clock_drift",
+        scenario_restore_to_random_second_under_clock_drift,
     );
 }

@@ -177,7 +177,66 @@ shape, and `NetworkPolicy` selector/rule structure. **No cluster is
 needed** — every test constructs an `AnimusCluster` via `test_support::
 test_cluster` and asserts on the returned typed object or its JSON, never
 against a live API server. `src/controller.rs` itself is *not* unit-tested
-in this initial landing (it needs a fake/real API server to exercise
-meaningfully) — a `kind`-cluster-driven end-to-end suite is the deliberate
-next step, tracked in `deploy/operator/README.md`'s own "what the operator
-does not do yet" section, not built here.
+this way (it needs a fake/real API server to exercise meaningfully) — that
+is exactly what the e2e smoke below covers instead.
+
+## e2e
+
+`scripts/e2e-kind.sh` (`.github/workflows/e2e-kind.yml`, CI-gated on every
+push/PR touching `crates/animus-operator/**`, `deploy/**`, `Dockerfile`, or
+the script/workflow itself) is the `kind`-cluster-driven end-to-end
+complement `src/controller.rs`'s own unit-test gap above calls for: it
+creates a real `kind` cluster, loads a locally built `animusd` image into
+it, applies the CRD and an `AnimusCluster`, runs the controller **out of
+cluster** (`cargo run -p animus-operator -- run` against the kind
+kubeconfig — in-cluster deployment of the operator's own image, per
+`deploy/operator/deployment.yaml`, is exercised in production, not by this
+smoke), waits for the `StatefulSet` to reach 3/3 ready, exercises the real
+DynamoDB wire through a `kubectl port-forward` (`CreateTable`/`PutItem`/
+`GetItem`, asserting the item round-trips), scales to 4 nodes and confirms
+the item still reads back, then deletes the `AnimusCluster` and confirms
+every owned child is garbage-collected. Local invocation (mirrors the
+script's own header comment):
+
+```sh
+docker build -t animusd:e2e --build-arg BASE_REGISTRY=mirror.gcr.io/library \
+  --secret id=ccrca,src=/root/.ccr/ca-bundle.crt .
+KIND_NODE_IMAGE=mirror.gcr.io/kindest/node:v1.34.0 ANIMUSD_IMAGE=animusd:e2e \
+  bash scripts/e2e-kind.sh
+```
+
+The `--build-arg`/`--secret` pair is only for a sandboxed dev host behind a
+TLS-intercepting egress proxy that can't reach Docker Hub's blob CDN (see
+the Dockerfile's own header) — CI and an ordinary developer machine just
+run `docker build -t animusd:e2e .` with `KIND_NODE_IMAGE` unset (kind
+picks its own pinned default).
+
+**A sandboxed dev/build host can be structurally unable to run this at
+all — not a bug in this script or the operator.** `kind`'s own control
+plane (`etcd`/`kube-apiserver`/`kube-scheduler`/`kube-controller-manager`,
+run as static pods) gets a **negative** `oom_score_adj` from kubelet
+unconditionally, for every one of them, regardless of the pod's own
+resources — the standard Kubernetes "protect the critical pods from the
+OOM killer first" behavior, not something a kind config or a pod spec can
+opt out of. Applying a negative value requires `CAP_SYS_RESOURCE` in the
+container's own namespace at container-create time (`runc`'s `nsexec`
+calls it while still in the parent's privilege domain, so the capability
+has to be present all the way up the chain — the container's declared
+capabilities can never regrant one the host/daemon never had). A host
+whose outermost capability set already excludes `CAP_SYS_RESOURCE` (`docker
+run --cap-add SYS_RESOURCE` there is flatly rejected as "not supported by
+your kernel or not available in the current environment," not merely
+denied at use) can never bring up `kind`'s control plane, independent of
+the node image, the containerd version, or the cgroup driver (`systemd`
+vs. `cgroupfs`, both tried) — every one of those was ruled out by direct
+`runc create --debug` reproduction against a hand-built bundle before
+landing on the real, single-line cause: `nsexec: failed to update
+/proc/self/oom_score_adj: Permission denied`, laundered by containerd into
+the far more generic `can't get final child's PID from pipe: EOF` that
+actually reaches `kubectl`/the kubelet log. A normal CI runner or dev
+machine (full capability set) is unaffected; this is specific to a host
+that has deliberately dropped `CAP_SYS_RESOURCE` for its own sandboxing
+reasons. If `scripts/e2e-kind.sh` fails at the `kind create cluster` phase
+with this exact `runc`/`EOF` signature in the diagnostics dump, this is
+almost certainly it — check `docker run --cap-add SYS_RESOURCE ... echo ok`
+first before debugging anything else.

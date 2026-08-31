@@ -839,7 +839,11 @@ async fn write_action_intent_conflict_flags_transaction_conflict() {
     )
     .await
     {
-        ClientResponse::PutOk => {}
+        ClientResponse::TxnResolved { outcome } => assert_eq!(
+            outcome,
+            animus_cp_data::ResolveOutcome::Resolved,
+            "cleanup resolve must actually land, not fence-miss"
+        ),
         other => panic!("cleanup TxnResolve failed: {other:?}"),
     }
 

@@ -19,7 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animusd::config::NodeRole;
-use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame};
+use animusd::{
+    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeAddrs, RoleAddrs,
+    read_frame,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -167,19 +170,33 @@ async fn join_control_nonvoter(
     new_control_id: u64,
     dir: &Path,
 ) -> (Node, RoleAddrs) {
+    // **Issue #406/#450 (Bug A)**: ports are picked ONCE, outside the retry
+    // loop, and reused on every `bind_control` retry — never re-randomized
+    // per attempt. `start_control_with`'s own one-shot self-registration
+    // (`spawn_common_tail`, ADR 0040 Decision C) is keyed on this id's
+    // `NodeAddrs`; re-picking fresh ports on a retry after a *prior* attempt
+    // in the same call had already gotten far enough to self-register would
+    // make that retry's own claim collide against its own earlier one —
+    // `join_fresh_deadline`'s sibling fix in `tests/support/mod.rs` has the
+    // full account. This helper's own registration only ever fires *after*
+    // a successful bind (so today's bind-only retry loop can't reach that
+    // state mid-loop), but keeping the same fixed-ports-outside-the-loop
+    // shape here too avoids relying on that ordering staying true, and
+    // matches the one other retry-the-whole-step-with-fresh-ports helper
+    // this bug class was found in.
+    let raw = support::free_addrs(6);
+    let addrs = RoleAddrs {
+        id: nid(new_control_id),
+        role: NodeRole::Control,
+        internal: raw[0],
+        client: raw[1],
+        dynamo: raw[2],
+        admin: raw[3],
+        intra: raw[4],
+        console: raw[5],
+        advertise_host: None,
+    };
     for attempt in 0..16 {
-        let raw = support::free_addrs(6);
-        let addrs = RoleAddrs {
-            id: nid(new_control_id),
-            role: NodeRole::Control,
-            internal: raw[0],
-            client: raw[1],
-            dynamo: raw[2],
-            admin: raw[3],
-            intra: raw[4],
-            console: raw[5],
-            advertise_host: None,
-        };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),
             addrs.clone(),
@@ -436,48 +453,33 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
         let replacement_admin = replacement.admin_addr();
         let replacement_control_addr = replacement_addrs.internal;
 
-        // Wait for `replacement`'s own one-shot self-registration
-        // (`MetaCommand::RegisterNode`'s CAS, ADR 0040 PR4) to land before
-        // adding it as a control voter — the identical race, and identical
-        // fix, as the "grown node's own self-registration" wait above:
-        // calling `control/member/add` first races two *independent*
-        // proposals for the same id's `node_addrs` entry against each other,
-        // and the CAS correctly refuses whichever loses. Poll any surviving
-        // control node (an original, or `grown`) rather than a fixed index —
-        // `dead_original` is no longer live by this point.
-        timeout(Duration::from_secs(15), async {
-            loop {
-                let seen = (0..3usize).filter(|&i| i != dead_original).any(|i| {
-                    control_nodes[i]
-                        .metadata()
-                        .node_addrs
-                        .contains_key(&nid(replacement_id))
-                }) || grown
-                    .metadata()
-                    .node_addrs
-                    .contains_key(&nid(replacement_id));
-                if seen {
-                    return;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("replacement node's own self-registration never landed on the real cluster");
-
         // Find whichever surviving node (the two live originals, or the
-        // just-grown 4th) is currently leader.
-        let leader_admin = {
+        // just-grown 4th) is currently leader — **before** waiting for the
+        // replacement's own self-registration to land (issue #406/#450
+        // fix): determine the actor `control/member/add` will actually be
+        // called against first, then poll *that exact node's* own
+        // `.metadata()`, mirroring phase 1's already-correct "grown node's
+        // own self-registration" pattern above exactly. The old code polled
+        // "any surviving node" and only afterwards separately picked
+        // whichever happened to be leader by the time the poll returned —
+        // those two reads could name different nodes, so the leader that
+        // ultimately served `control/member/add` could still have an
+        // ADR-0038-lagged local cache with no trace of the replacement's own
+        // registration at all, forcing `admin_add_control_member` down its
+        // racy "genuinely unclaimed" branch (see that function's own doc for
+        // the full account this test now avoids by construction rather than
+        // relying on the production fix alone).
+        let (leader_idx_after_remove, leader_admin) = {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
                 if let Some(&i) = [0usize, 1, 2]
                     .iter()
                     .find(|&&i| i != dead_original && control_nodes[i].is_control_leader())
                 {
-                    break control_admin[i];
+                    break (Some(i), control_admin[i]);
                 }
                 if grown.is_control_leader() {
-                    break grown_admin;
+                    break (None, grown_admin);
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -486,6 +488,33 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
                 sleep(Duration::from_millis(100)).await;
             }
         };
+
+        // Wait for `replacement`'s own one-shot self-registration
+        // (`MetaCommand::RegisterNode`'s CAS, ADR 0040 PR4) to land on THAT
+        // SAME leader node before adding it as a control voter — calling
+        // `control/member/add` first races two *independent* proposals for
+        // the same id's `node_addrs` entry against each other, and the CAS
+        // correctly refuses whichever loses.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let seen = match leader_idx_after_remove {
+                    Some(i) => control_nodes[i]
+                        .metadata()
+                        .node_addrs
+                        .contains_key(&nid(replacement_id)),
+                    None => grown
+                        .metadata()
+                        .node_addrs
+                        .contains_key(&nid(replacement_id)),
+                };
+                if seen {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("replacement node's own self-registration never landed on the real cluster");
 
         let (status, body) =
             add_control_member(leader_admin, replacement_id, replacement_control_addr).await;
@@ -535,4 +564,182 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
     })
     .await
     .expect("grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic timed out");
+}
+
+/// **Issue #406/#450 (Bug B) regression.** `ClientCtx::admin_add_control_
+/// member` used to gate its "already registered?" check on `Metadata::
+/// members` alone — always false for a control-only id by design (that role
+/// never claims `members`, see `animus-control::meta.rs`'s `RegisterNode`
+/// doc) — so it *always* took the "genuinely unclaimed" branch and
+/// re-derived a fresh `NodeAddrs` from this leader's own local
+/// (ADR 0038 apply-task-lagged) `metadata_cached()` snapshot. If that
+/// snapshot hadn't yet caught up to the growth node's own already-committed
+/// self-registration, the reconstruction had empty `client`/`intra`/`admin`
+/// fields, and the eventual apply-order mismatch was a **permanent**
+/// "already claimed by a different registration" collision — or, in the
+/// investigation's own observed worst case, the malformed proposal *won*
+/// the race and left the node's address book durably blank.
+///
+/// Reproduces the exact "committed but not yet locally applied **on this
+/// leader specifically**" window directly: `Metadata` is `DRIVER_APPLIED`
+/// (ADR 0038) — a `RegisterNode` committed on the control leader's own Raft
+/// log is only *applied* to that leader's own `Metadata` cache by a
+/// separate, async apply task (`animus-control::node.rs`'s
+/// `meta_apply_loop`) on its own schedule, tracked by `GET /admin/raft`'s
+/// own `commit_index`/`engine_applied_index` fields. This test proposes
+/// directly against the **leader itself**, polls that same `/admin/raft`
+/// until `commit_index` has genuinely advanced (the entry is durably
+/// committed, not merely locally appended and not yet acked by any
+/// follower), and fires `control/member/add` at the exact reading where
+/// `engine_applied_index` still lags `commit_index` — landing inside the
+/// real gap between "this leader's log has committed the entry" and "this
+/// leader's own apply task has caught up to it". A tiny bounded search over
+/// distinct ids absorbs the (rare) case where the apply task wins a given
+/// attempt before this test's own poll can observe the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn admin_add_control_member_races_a_control_only_self_registration_and_still_converges() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        // 3 control-only voters, no data-only nodes needed — this race lives
+        // entirely inside the control plane's own commit-vs-apply timing.
+        let (control_nodes, _data_nodes, _config) = bring_up_split(3, 0, dir.path()).await;
+        await_leader(&control_nodes).await;
+
+        // `ProposeSchema` is `Surface::Intra` — the client listener refuses
+        // it outright, so this must dial the intra port, not the client one.
+        let control_intra: Vec<SocketAddr> = control_nodes.iter().map(Node::intra_addr).collect();
+        let control_admin: Vec<SocketAddr> = control_nodes.iter().map(Node::admin_addr).collect();
+        let leader_idx = control_nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("no control leader");
+
+        async fn raft_indices(admin_addr: SocketAddr) -> (u64, u64) {
+            let (status, body) = admin(admin_addr, "GET", "/admin/raft", None).await;
+            assert_eq!(status, 200, "GET /admin/raft failed: {body}");
+            (
+                body["commit_index"].as_u64().expect("commit_index field"),
+                body["engine_applied_index"]
+                    .as_u64()
+                    .expect("engine_applied_index field"),
+            )
+        }
+
+        // Search for a live instance of the race window: propose a fresh,
+        // fully-formed control-only `NodeAddrs` (simulating a real joining
+        // node's own complete self-registration — `RegisterNode`'s CAS never
+        // checks reachability, so proposing this directly with no real bound
+        // listener behind it is exactly as observable as a genuine one)
+        // straight at the leader, then poll `/admin/raft` until it commits,
+        // firing the admin call the instant apply is still behind.
+        let mut caught: Option<(u64, NodeAddrs, u16, serde_json::Value)> = None;
+        'search: for attempt in 0..50u64 {
+            let this_id = 100 + attempt;
+            let addrs = NodeAddrs {
+                internal: format!("127.0.0.1:{}", 20000 + attempt),
+                client: format!("127.0.0.1:{}", 21000 + attempt),
+                admin: format!("127.0.0.1:{}", 22000 + attempt),
+                intra: format!("127.0.0.1:{}", 23000 + attempt),
+                role: "control".to_string(),
+            };
+            let register = MetaCommand::RegisterNode {
+                node: nid(this_id),
+                addrs: addrs.clone(),
+                labels: BTreeMap::new(),
+            };
+
+            let (before_commit, _) = raft_indices(control_admin[leader_idx]).await;
+            call(
+                control_intra[leader_idx],
+                ClientRequest::ProposeSchema(register),
+            )
+            .await;
+
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < poll_deadline {
+                let (commit, applied) = raft_indices(control_admin[leader_idx]).await;
+                if commit > before_commit {
+                    if applied < commit {
+                        let (status, body) = add_control_member(
+                            control_admin[leader_idx],
+                            this_id,
+                            addrs.internal.parse().expect("valid socket addr"),
+                        )
+                        .await;
+                        caught = Some((this_id, addrs, status, body));
+                        break 'search;
+                    }
+                    // The apply task already caught up before this poll
+                    // observed the commit — try a fresh id.
+                    break;
+                }
+            }
+        }
+        let (this_id, addrs, status, body) = caught.expect(
+            "never observed the committed-but-not-yet-applied window across 50 attempts — \
+             the race this test targets did not manifest on this run",
+        );
+
+        assert_eq!(
+            status, 200,
+            "control/member/add must succeed even when it races the target's own \
+             not-yet-locally-applied self-registration, not fail with \"already \
+             claimed by a different registration\": {body}"
+        );
+
+        // `NodeId`'s `Ord` is a plain string compare, not numeric — "n100" <
+        // "n2" lexicographically (the same zero-padding gotcha
+        // `animusd::config`'s own doc calls out) — so `this_id` (100+) does
+        // not necessarily sort after `n0`/`n1`/`n2` the way
+        // `await_voters_everywhere`'s own hard-coded-order tests can assume.
+        // Sort both sides as strings instead of relying on numeric order.
+        let mut want: Vec<String> = [0, 1, 2, this_id]
+            .iter()
+            .map(|&n| nid(n).to_string())
+            .collect();
+        want.sort();
+        for &a in &control_admin {
+            let converged = async {
+                loop {
+                    let (status, body) = control_members(a).await;
+                    if status == 200
+                        && let Some(mut v) = voters_of(&body)
+                    {
+                        v.sort();
+                        if v == want {
+                            return;
+                        }
+                    }
+                    sleep(Duration::from_millis(150)).await;
+                }
+            };
+            timeout(Duration::from_secs(30), converged)
+                .await
+                .unwrap_or_else(|_| panic!("race: node at {a} never converged to {want:?}"));
+        }
+
+        // The address book must exactly match the real self-registration —
+        // never a synthesized/blank one (the "malformed entry wins the
+        // race" corruption variant the investigation also observed).
+        let final_addrs = control_nodes[leader_idx]
+            .metadata()
+            .node_addrs
+            .get(&nid(this_id))
+            .cloned()
+            .expect("grown node's own address book entry must exist");
+        assert_eq!(
+            final_addrs, addrs,
+            "the address book must reflect the real self-registration, never a \
+             synthesized/blank one"
+        );
+
+        for node in control_nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect(
+        "admin_add_control_member_races_a_control_only_self_registration_and_still_converges \
+         timed out",
+    );
 }

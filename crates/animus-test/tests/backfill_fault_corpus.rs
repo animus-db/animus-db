@@ -55,6 +55,7 @@
 //! full knob table.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection};
@@ -62,11 +63,12 @@ use animus_control::{
     ApplyOutcome, ColumnType, IndexStatus, MetaCommand, Metadata, ProposeResult, TableSchema,
 };
 use animus_cp_data::cursor;
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{KIND_BASE, KIND_CURSOR, RaftKvNode};
 use animus_dynamo::index as dynamo_index;
 use animus_dynamo::{AttributeValue, ChangeRecord, storage_key};
-use animus_env::nid;
-use animus_sim::{SimEnv, Simulator};
+use animus_env::{EnvExt, NodeId, nid};
+use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId, partition_token};
 use animus_test::corpus;
@@ -576,17 +578,620 @@ fn single_tablet_backfill_converges() {
     );
 }
 
-// TOMBSTONE (ADR 0050 Train B rung 2): two split cells died here —
-// `concurrent_split_during_backfill` (Fork A: the left child's cursor row
-// byte-identical across the split, the right child reading empty) and
-// `split_after_tablet_already_reported_done`. Both modeled the ZERO-COPY
-// split (`narrow_scope` + a sibling group inheriting the same physical
-// rows in place) — inexpressible under per-tablet engines with immutable
-// ranges. Split-during-backfill remains a REAL scenario class under the
-// copy-based split (ADR 0050): children restart their sweeps from scratch
-// over their own copied rows — its corpus cells are rebuilt on the new
-// mechanism in the cutover rungs, where a split can actually run again.
-// Pre-pivot cells retrievable from git history.
+// --- in-place split + backfill harness (ADR 0058 Train 2 rung 3) ----------
+//
+// The two cells below replace the ADR 0050 Train B rung 2 tombstone that
+// used to sit here: the original `concurrent_split_during_backfill`/
+// `split_after_tablet_already_reported_done` pair modeled the ZERO-COPY
+// split (`narrow_scope` + a sibling group inheriting the same physical rows
+// in place) and died with that mechanism — inexpressible under per-tablet
+// engines with immutable ranges. Split-during-backfill is rebuilt here on
+// the mechanism that actually replaced it: the DEFAULT production split
+// path, the in-place atomic fork (ADR 0058), driven end to end through
+// `animus_cp_data::host::Reconciler` exactly like
+// `animus-cp-data/tests/inplace_split_reconciler.rs` does — this is the
+// production split path's own interaction with GSI backfill, previously
+// untested by any corpus at seed depth. (The copy-based mechanism,
+// `--split-mode copy`, is deprecated pending deletion, ADR 0058's own
+// remaining rung 4 layer — it gets no corpus coverage here.)
+//
+// `Reconciler::tick`/`teardown` `.await` internally (`env.sleep`), so they
+// must be driven via spawn+poll (`drive`/`tick_one`/`converge` below,
+// adapted from `stream_lineage_corpus.rs`'s own `drive` — integration test
+// binaries can't share private items) rather than a bare `block_on`. Once
+// a split's children converge, [`wrap_group`] clones their reconciler-
+// hosted `RaftKvNode` handles back into this file's own plain [`Group`] —
+// the whole point being that every pre-existing helper in this file
+// (`elect`/`confirm`/`backfill_seed_tick`/`drive_sweep_to_completion`/
+// `mark_backfilled`/`maybe_flip_active`/`assert_full_coverage`, …) then
+// works on a split child completely unmodified.
+
+/// The parent tablet id every cell in this file already hardcodes as
+/// `TabletId(1)`, named here only because these two cells also need to name
+/// its two children.
+const PARENT: TabletId = TabletId(1);
+const LEFT: TabletId = TabletId(2);
+const RIGHT: TabletId = TabletId(3);
+
+/// A dedicated node id for spawning the reconciler-driving futures below —
+/// distinct from every real id in [`NODES`]. Any live `SimEnv` handle works
+/// for `spawn_task` (the executor is shared across the whole `Simulator`,
+/// not per-node — `inplace_split_reconciler.rs`'s own `driver_id()` relies
+/// on the identical fact) — this exists only so a stray env mixup would be
+/// obvious rather than accidentally aliasing a real replica.
+fn driver_id() -> NodeId {
+    nid(999)
+}
+
+type Recon = Reconciler<SimEnv, MemoryEngine>;
+
+/// One node's tablet-host reconciler, standing in for the per-node loop
+/// `animusd::tablet_host_reconciler_loop` drives in production — mirrors
+/// `inplace_split_reconciler.rs`'s own `ClusterNode`/`Cluster`, kept local
+/// here rather than shared (that file's own doc: "integration test
+/// binaries can't share private items").
+struct ClusterNode {
+    reconciler: Recon,
+}
+
+struct Cluster {
+    nodes: BTreeMap<NodeId, ClusterNode>,
+}
+
+impl Cluster {
+    fn new(sim: &Simulator) -> Self {
+        let mut nodes = BTreeMap::new();
+        for &n in &NODES {
+            let id = nid(n);
+            let reconciler: Recon = Reconciler::new(
+                sim.env(id.clone()),
+                MemoryTabletEngines::new(),
+                id.clone(),
+                |_, _| {},
+                |_| {},
+            );
+            nodes.insert(id, ClusterNode { reconciler });
+        }
+        Cluster { nodes }
+    }
+
+    fn node(&self, id: &NodeId) -> &Recon {
+        &self.nodes[id].reconciler
+    }
+
+    fn hosted_set(&self, id: &NodeId) -> BTreeSet<TabletId> {
+        self.node(id).local_state().hosted.clone()
+    }
+}
+
+fn metadata_view(meta: &Metadata) -> MetadataView {
+    MetadataView {
+        tablets: meta.tablets.clone(),
+        down: BTreeSet::new(),
+    }
+}
+
+/// Runs `fut` to completion by spawning it on `env` and driving `sim` in
+/// small steps until it resolves — `stream_lineage_corpus.rs`'s own `drive`
+/// helper, copied verbatim: `Reconciler::tick`/`teardown` poll internally
+/// via `env.sleep`, so a bare `block_on` would hang with nothing advancing
+/// the simulator concurrently.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    for _ in 0..500 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("drive: future never completed")
+}
+
+/// Ticks one node's reconciler once against `view`. The node is moved out of
+/// `cluster` for the duration of the tick (`drive`'s spawned future must own
+/// what it touches) and put back once it resolves.
+fn tick_one(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    id: &NodeId,
+    view: &MetadataView,
+) {
+    let mut node = cluster.nodes.remove(id).expect("node exists");
+    let view = view.clone();
+    let ticked = drive(sim, env, async move {
+        node.reconciler.tick(&view).await;
+        node
+    });
+    cluster.nodes.insert(id.clone(), ticked);
+}
+
+/// Ticks every node in `ids` against `view` in a bounded loop until `check`
+/// holds — mirrors `inplace_split_reconciler.rs`'s own `converge`.
+fn converge(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    ids: &[NodeId],
+    view: &MetadataView,
+    mut check: impl FnMut(&Cluster) -> bool,
+) -> bool {
+    for _ in 0..300 {
+        for id in ids {
+            tick_one(sim, env, cluster, id, view);
+        }
+        if check(cluster) {
+            return true;
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    check(cluster)
+}
+
+fn leader_of<'a>(cluster: &'a Cluster, ids: &[NodeId], tablet: TabletId) -> Option<&'a KvNode> {
+    ids.iter().find_map(|id| {
+        cluster
+            .node(id)
+            .hosted_node(tablet)
+            .filter(|h| h.is_leader())
+    })
+}
+
+/// Clones a reconciler-hosted tablet's per-node handles into this file's own
+/// plain [`Group`] — see the section doc above for why. Node order matches
+/// `ids` (== [`NODES`]' own order), so the `live: [0, 1, 2]` index
+/// convention every other cell in this file uses still lines up.
+fn wrap_group(cluster: &Cluster, ids: &[NodeId], tablet: TabletId, range: KeyRange) -> Group {
+    Group {
+        id: tablet,
+        range,
+        nodes: ids
+            .iter()
+            .map(|replica_id| {
+                cluster
+                    .node(replica_id)
+                    .hosted_node(tablet)
+                    .expect("tablet hosted on every fork participant")
+                    .clone()
+            })
+            .collect(),
+    }
+}
+
+// --- cell 2: split_during_backfill_converges -------------------------------
+
+/// The production split path (in-place atomic fork) racing an in-flight GSI
+/// backfill sweep: `CutoverSplit`'s in-place branch carries no drain/
+/// backfill veto of its own (`animus-control/CLAUDE.md`'s "G1" note — "the
+/// GSI-drain/backfill-seeder cutover vetoes stay PRE-cutover, caller-side"),
+/// so this cell deliberately cuts over BEFORE the parent's sweep finishes —
+/// exactly the race a real production split can hit. Both children must
+/// independently converge their own coverage sweep afterward (each is born
+/// with an EMPTY `KIND_CURSOR` scope, `trim_split_child`'s unconditional
+/// wipe — `animus-cp-data/CLAUDE.md`'s "In-place split" section), and the
+/// completion aggregator must wait for BOTH before flipping the index
+/// `Active`.
+fn scenario_split_during_backfill_converges(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, PARENT, KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| { leader_of(c, &node_ids, PARENT).is_some() }
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, PARENT, KeyRange::whole());
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for i in 0..20 {
+        write_pre_existing_row(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    // A couple of ticks, deliberately not to completion (SEED_BATCH=3 over
+    // 20 partitions needs ~7) — leaves the cursor mid-sweep going into the
+    // split.
+    for _ in 0..2 {
+        let leader = elect(&mut sim, &parent, &live, seed);
+        backfill_seed_tick(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &tag,
+            SEED_BATCH,
+            seed,
+        );
+    }
+
+    // The split key: the median of the physical keys actually present,
+    // roughly bisecting the 20 written rows (their hashed partition
+    // tokens, not `pk` order, is what determines physical placement).
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let mut base_keys: Vec<Vec<u8>> = block_on(parent.nodes[leader].local_scan(&[], None, None))
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    base_keys.sort();
+    let split_key = base_keys[base_keys.len() / 2].clone();
+
+    // Both children get the SAME 3 replica homes as the parent (avoids
+    // learner catch-up — already covered by `inplace_split_reconciler.rs`;
+    // keeps this cell focused on the backfill race).
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(LEFT, node_ids.clone()), (RIGHT, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    // Cut over IMMEDIATELY — before the backfill sweep finishes — the race
+    // this cell exists to exercise.
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 0,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(LEFT).is_some()
+                        && c.node(id).hosted_node(RIGHT).is_some()
+                        && !c.hosted_set(id).contains(&PARENT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    let (left_range, right_range) = KeyRange::whole()
+        .split_at(&split_key)
+        .expect("split key must bisect the whole range");
+    let left = wrap_group(&cluster, &node_ids, LEFT, left_range);
+    let right = wrap_group(&cluster, &node_ids, RIGHT, right_range);
+
+    // Both children are born with EMPTY cursor state, regardless of the
+    // parent's own mid-sweep cursor position.
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    let left_cursor_key = cursor::cursor_key(&left.range.start, &tag);
+    assert!(
+        block_on(left.nodes[left_leader].local_get_kind(KIND_CURSOR, &left_cursor_key)).is_none(),
+        "[seed={seed}] LEFT child was not born with an empty backfill cursor"
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    let right_cursor_key = cursor::cursor_key(&right.range.start, &tag);
+    assert!(
+        block_on(right.nodes[right_leader].local_get_kind(KIND_CURSOR, &right_cursor_key))
+            .is_none(),
+        "[seed={seed}] RIGHT child was not born with an empty backfill cursor"
+    );
+
+    drive_sweep_to_completion(&mut sim, &left, &live, &left.range, &tag, seed);
+    drive_sweep_to_completion(&mut sim, &right, &live, &right.range, &tag, seed);
+
+    mark_backfilled(&mut meta, TABLE, "by-email", LEFT);
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must not flip while RIGHT has not yet reported"
+    );
+    mark_backfilled(&mut meta, TABLE, "by-email", RIGHT);
+    assert!(
+        maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must flip once both split children report"
+    );
+    assert_eq!(
+        index_status(&meta, TABLE, "by-email"),
+        Some(IndexStatus::Active)
+    );
+
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    assert_full_coverage(
+        &left.nodes[left_leader],
+        seed,
+        "LEFT child post in-place split",
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    assert_full_coverage(
+        &right.nodes[right_leader],
+        seed,
+        "RIGHT child post in-place split",
+    );
+}
+
+#[test]
+fn split_during_backfill_converges() {
+    for_each_seed(
+        "split_during_backfill_converges",
+        scenario_split_during_backfill_converges,
+    );
+}
+
+// --- cell 3: split_after_tablet_already_reported_done -----------------------
+
+/// The named G1 orphan-report scenario: the PARENT already finished its own
+/// sweep and reported completion BEFORE the split even begins.
+/// `CutoverSplit` removes the parent from the tablet map without pruning its
+/// stale `index_backfill` row (only the drop-table path prunes that — see
+/// `drop_table_mid_backfill` above) — the completion aggregator must still
+/// wait for BOTH children's own independent reports, correctly ignoring the
+/// parent's now-orphaned one once `tablets_for_table` no longer yields it.
+fn scenario_split_after_tablet_already_reported_done(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, PARENT, KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| { leader_of(c, &node_ids, PARENT).is_some() }
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, PARENT, KeyRange::whole());
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    for i in 0..20 {
+        write_pre_existing_row(
+            &mut sim,
+            &parent.nodes[leader],
+            &parent.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    // Run the parent's own sweep all the way to completion and report it —
+    // BEFORE the split even begins.
+    drive_sweep_to_completion(&mut sim, &parent, &live, &parent.range, &tag, seed);
+    mark_backfilled(&mut meta, TABLE, "by-email", PARENT);
+    assert!(
+        meta.index_backfill
+            .contains_key(&(PARENT, "by-email".to_owned())),
+        "[seed={seed}] the parent's own report must be visible before the split"
+    );
+
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let mut base_keys: Vec<Vec<u8>> = block_on(parent.nodes[leader].local_scan(&[], None, None))
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    base_keys.sort();
+    let split_key = base_keys[base_keys.len() / 2].clone();
+
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(LEFT, node_ids.clone()), (RIGHT, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(PARENT)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&LEFT) && hosted.contains(&RIGHT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    let parent_epoch = meta.tablets[&PARENT].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: PARENT,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 0,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(LEFT).is_some()
+                        && c.node(id).hosted_node(RIGHT).is_some()
+                        && !c.hosted_set(id).contains(&PARENT)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    assert!(
+        meta.index_backfill
+            .contains_key(&(PARENT, "by-email".to_owned())),
+        "[seed={seed}] the parent's stale report is a harmless orphan, not pruned by CutoverSplit"
+    );
+    assert_eq!(
+        meta.tablets_for_table(TABLE).count(),
+        2,
+        "[seed={seed}] the table's own tablet map now holds exactly the two children"
+    );
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] the parent's stale report must not count toward completion once its \
+         tablet is gone from `tablets_for_table` — the aggregator must wait for both children's \
+         own independent reports"
+    );
+
+    let (left_range, right_range) = KeyRange::whole()
+        .split_at(&split_key)
+        .expect("split key must bisect the whole range");
+    let left = wrap_group(&cluster, &node_ids, LEFT, left_range);
+    let right = wrap_group(&cluster, &node_ids, RIGHT, right_range);
+
+    drive_sweep_to_completion(&mut sim, &left, &live, &left.range, &tag, seed);
+    drive_sweep_to_completion(&mut sim, &right, &live, &right.range, &tag, seed);
+    mark_backfilled(&mut meta, TABLE, "by-email", LEFT);
+    assert!(
+        !maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must not flip while RIGHT has not yet reported"
+    );
+    mark_backfilled(&mut meta, TABLE, "by-email", RIGHT);
+    assert!(
+        maybe_flip_active(&mut meta, TABLE, "by-email"),
+        "[seed={seed}] must flip once both split children independently report"
+    );
+    assert_eq!(
+        index_status(&meta, TABLE, "by-email"),
+        Some(IndexStatus::Active)
+    );
+
+    let left_leader = elect(&mut sim, &left, &live, seed);
+    assert_full_coverage(
+        &left.nodes[left_leader],
+        seed,
+        "LEFT child, parent already reported",
+    );
+    let right_leader = elect(&mut sim, &right, &live, seed);
+    assert_full_coverage(
+        &right.nodes[right_leader],
+        seed,
+        "RIGHT child, parent already reported",
+    );
+}
+
+#[test]
+fn split_after_tablet_already_reported_done() {
+    for_each_seed(
+        "split_after_tablet_already_reported_done",
+        scenario_split_after_tablet_already_reported_done,
+    );
+}
 
 // --- cell 4: live_writes_race_the_sweep --------------------------------------
 
@@ -1056,5 +1661,421 @@ fn streamed_mid_backfill_seed_flag_never_misclassified() {
     for_each_seed(
         "streamed_mid_backfill_seed_flag_never_misclassified",
         scenario_streamed_mid_backfill_seed_flag_never_misclassified,
+    );
+}
+
+// ============================================================================
+// `Env`-level fault-primitive cells (ADR 0061 Decision 3) — new cells only,
+// each a close copy of an existing one above with one or two added fault
+// calls. Per this corpus's own doctrine (ADR 0014), none of the cells above
+// are modified; these are purely additive. `NetConfig::set_corrupt_prob` is
+// deliberately never used here: as of this branch, `animus-cp-data::codec`'s
+// `Vec::with_capacity(n as usize)` call sites read an untrusted wire length
+// prefix with no upper-bound check, so a corrupted message near `u32::MAX`
+// risks an allocator abort rather than a clean application-level error — out
+// of scope until that fix lands (mirrors the conservative choice every
+// sibling corpus made for the identical reason). `DiskConfig::
+// set_enospc_prob`/`set_error_prob` are excluded for a different reason:
+// their error branches in `persist_wal` are `assert!(halted.load(..), ..)`,
+// and this corpus's scenarios never call the per-node `shutdown()` that sets
+// `halted` — firing either on a live node hard-panics the whole test
+// process.
+// ============================================================================
+
+// --- cell 8: duplicate_proposals_leader_kill_mid_sweep ----------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`] with one added fault: a global
+/// [`NetConfig::set_duplicate_prob`] of 0.15, active from before the first
+/// write — every surviving message may be delivered twice, each copy with
+/// its own independent delay draw. Proves the seeder's own coverage
+/// tracking and the completion aggregator's tally are correct under
+/// duplicated Raft traffic, not just a clean network: a duplicated
+/// `AppendEntries`/vote/proposal message must never double-seed a partition
+/// (the cursor's own forward-only advance already makes re-scanning a
+/// covered partition a no-op) and must never corrupt the final tally the
+/// aggregator flips `Active` on.
+fn scenario_duplicate_proposals_leader_kill_mid_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_duplicate_prob(0.15);
+    sim.set_net_config(net_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded_before_kill, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded_before_kill, SEED_BATCH);
+
+    // Kill the exact leader just written through, same discipline as
+    // `leader_kill_mid_sweep`.
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let _new_leader = elect(&mut sim, &group, &live, seed);
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "duplicate proposals + leader kill",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        24,
+        "[seed={seed}] duplicated Raft traffic must never manufacture or drop a partition"
+    );
+}
+
+#[test]
+fn duplicate_proposals_leader_kill_mid_sweep() {
+    for_each_seed(
+        "duplicate_proposals_leader_kill_mid_sweep",
+        scenario_duplicate_proposals_leader_kill_mid_sweep,
+    );
+}
+
+// --- cell 9: wal_fsync_lie_leader_kill_mid_sweep ----------------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`] with one added fault: a global
+/// [`DiskConfig::set_fsync_lie_prob`] of 0.3, active from before the first
+/// write. `sync` on any node may now return `Ok` while silently leaving the
+/// synced bytes un-synced — transparent to every read until a crash reveals
+/// it. Proves the backfill cursor's own durability claim survives a
+/// lied-to `sync` on the crashing leader: `confirm` only ever treats a
+/// write as durable via the tablet's own *applied* index, which only
+/// advances once a majority holds the entry, so a lie on the crashing node
+/// alone (the survivors never crash in this scenario, so their own
+/// tails — lied to or not — are never revealed) can at most delay
+/// convergence, never leave backfill progress ahead of what is actually
+/// durable.
+fn scenario_wal_fsync_lie_leader_kill_mid_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.set_fsync_lie_prob(0.3);
+    sim.set_disk_config(disk_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let mut live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded_before_kill, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded_before_kill, SEED_BATCH);
+
+    let cursor_key_bytes = cursor::cursor_key(&group.range.start, &tag);
+    let cursor_before_kill =
+        block_on(group.nodes[leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+    assert!(cursor_before_kill.is_some());
+
+    let dying = leader;
+    sim.crash(nid(NODES[dying]));
+    live.retain(|&i| i != dying);
+    let new_leader = elect(&mut sim, &group, &live, seed);
+    let mut cursor_after_kill = None;
+    for _ in 0..200 {
+        cursor_after_kill =
+            block_on(group.nodes[new_leader].local_get_kind(KIND_CURSOR, &cursor_key_bytes));
+        if cursor_after_kill == cursor_before_kill {
+            break;
+        }
+        sim.run_for(Duration::from_millis(10));
+    }
+    assert_eq!(
+        cursor_after_kill, cursor_before_kill,
+        "[seed={seed}] the newly-elected leader must converge to the identical durably-committed \
+         cursor even under a lied-to fsync on the crashing leader"
+    );
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(&group.nodes[leader], seed, "fsync lie + leader kill");
+}
+
+#[test]
+fn wal_fsync_lie_leader_kill_mid_sweep() {
+    for_each_seed(
+        "wal_fsync_lie_leader_kill_mid_sweep",
+        scenario_wal_fsync_lie_leader_kill_mid_sweep,
+    );
+}
+
+// --- cell 10: backfill_cursor_wal_torn_on_restart ---------------------------
+
+/// Near-copy of [`leader_kill_mid_sweep`]'s crash technique, but a true
+/// process restart under a torn/corrupted WAL tail rather than a live
+/// crash-and-failover: a global `DiskConfig{torn_tail_on_crash: true,
+/// corrupt_on_crash: true, ..}`, set right after `Simulator::new`, in effect
+/// for every node's disk throughout.
+///
+/// `torn_tail_on_crash`/`corrupt_on_crash` only fire inside
+/// [`Simulator::crash`], never [`Simulator::stop`] (`stop` unconditionally
+/// drops any un-synced buffer with no tear/corrupt consideration), so
+/// getting an actual torn/corrupted tail on the node's Raft-log WAL ahead of
+/// a genuine fresh-process restart needs one extra step versus a pure
+/// `stop`-based restart: `sim.crash` first (applies the tear/corruption to
+/// whatever was buffered-but-unsynced at that instant — this corpus's
+/// `MemoryEngine` tier makes the state machine itself a durable stand-in,
+/// shared with the fresh node via `.clone()`, exactly as every other
+/// restart cell in this crate already relies on; only the node's own raw
+/// Raft-log disk bytes are torn/corrupted here), then `sim.restart` purely
+/// to clear the `crashed` flag `crash` sets (a `crashed` node's sends/
+/// deliveries are dropped forever until `restart` clears it), then
+/// `sim.stop` to drop the harmlessly re-armed (never re-polled — no
+/// `run_for` happens in between) old tasks before handing off to a
+/// genuinely fresh `RaftKvNode::start_hosted` on the same id and the same
+/// durable (post-tear) engine state. Crucially, the restarted node itself
+/// goes on to serve the remainder of the sweep and is the node
+/// [`assert_full_coverage`] reads from at the end — the cursor recovery
+/// this cell exists to prove is read back by continuing real work, not
+/// merely asserted once and abandoned (a crash-only fault otherwise has
+/// zero test teeth).
+fn scenario_backfill_cursor_wal_torn_on_restart(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut disk_cfg = DiskConfig::default();
+    disk_cfg.torn_tail_on_crash = true;
+    disk_cfg.corrupt_on_crash = true;
+    sim.set_disk_config(disk_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let mut group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = vec![0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..24 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("p{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    let leader = elect(&mut sim, &group, &live, seed);
+    let (seeded, _) = backfill_seed_tick(
+        &mut sim,
+        &group.nodes[leader],
+        &group.range,
+        &tag,
+        SEED_BATCH,
+        seed,
+    );
+    assert_eq!(seeded, SEED_BATCH);
+
+    // Crash (applies the configured torn/corrupted-tail fault to whatever
+    // was buffered-but-unsynced on this node's own Raft-log disk at this
+    // instant), then restart-then-stop purely to clear the `crashed` flag
+    // before handing off to a genuinely fresh process on the same id and
+    // the same durable (post-tear) state — see the scenario's own doc.
+    let restarted_id = NODES[leader];
+    sim.crash(nid(restarted_id));
+    sim.restart(nid(restarted_id));
+    sim.stop(nid(restarted_id));
+    let ids: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let fresh: KvNode = RaftKvNode::start_hosted(
+        sim.env(nid(restarted_id)),
+        ids,
+        engines[&restarted_id].clone(),
+        animus_cp_data::StorageScope::new(group.range.clone()),
+        group.id.0,
+    );
+    group.nodes[leader] = fresh;
+    sim.run_for(Duration::from_secs(2));
+
+    // Post-recovery activity that actually reads the restarted node's own
+    // state back: drive the sweep to completion (which re-elects a leader
+    // every tick — possibly the restarted node itself, possibly a
+    // survivor — and always reads `KIND_CURSOR` from whichever node wins),
+    // then confirm full coverage directly from the restarted node.
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks > 0);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "post torn/corrupted-WAL restart, read directly from the restarted node",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        24,
+        "[seed={seed}] the restarted node's own recovered state must see every partition"
+    );
+}
+
+#[test]
+fn backfill_cursor_wal_torn_on_restart() {
+    for_each_seed(
+        "backfill_cursor_wal_torn_on_restart",
+        scenario_backfill_cursor_wal_torn_on_restart,
+    );
+}
+
+// --- cell 11: chaotic_network_live_writes_race_the_sweep --------------------
+
+/// Near-copy of [`live_writes_race_the_sweep`] with one added fault: a
+/// compound [`NetConfig`] (5% drop, 10% duplicate — [`NetConfig::
+/// set_duplicate_prob`]'s own independent-delay-draw-per-copy semantics)
+/// active for the group's entire lifetime, not just during the sweep.
+/// Proves the seeder's own coverage claim — "every partition that ever held
+/// a row gets at least one dirty marker" — holds under a genuinely lossy,
+/// duplicating network, not just the near-reliable default every other cell
+/// in this file runs under, through ordinary Raft retry alone (nothing
+/// backfill-specific).
+fn scenario_chaotic_network_live_writes_race_the_sweep(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut net_cfg = NetConfig::default();
+    net_cfg.set_drop_prob(0.05);
+    net_cfg.set_duplicate_prob(0.1);
+    sim.set_net_config(net_cfg);
+
+    let engines = engines();
+    let mut meta = base_meta(TABLE);
+    create_tablet(&mut meta, TabletId(1), KeyRange::whole(), TABLE);
+    create_index(&mut meta, TABLE, "by-email", "email");
+    let group = start_group(&sim, &engines, TabletId(1), KeyRange::whole());
+    let live = [0, 1, 2];
+    sim.run_for(Duration::from_secs(2));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    for i in 0..12 {
+        write_pre_existing_row(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("pre{i:03}"),
+            seed,
+        );
+    }
+
+    let tag = backfill_tag("by-email");
+    for round in 0..4 {
+        let leader = elect(&mut sim, &group, &live, seed);
+        backfill_seed_tick(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &tag,
+            SEED_BATCH,
+            seed,
+        );
+        let leader = elect(&mut sim, &group, &live, seed);
+        write_base_row_live(
+            &mut sim,
+            &group.nodes[leader],
+            &group.range,
+            &format!("live{round:03}"),
+            seed,
+        );
+    }
+
+    let ticks = drive_sweep_to_completion(&mut sim, &group, &live, &group.range, &tag, seed);
+    assert!(ticks >= 1);
+    mark_backfilled(&mut meta, TABLE, "by-email", group.id);
+    assert!(maybe_flip_active(&mut meta, TABLE, "by-email"));
+
+    let leader = elect(&mut sim, &group, &live, seed);
+    assert_full_coverage(
+        &group.nodes[leader],
+        seed,
+        "chaotic network, live writes racing the sweep",
+    );
+    let base = base_partitions_present(&group.nodes[leader]);
+    assert_eq!(
+        base.len(),
+        16,
+        "[seed={seed}] 12 pre-existing + 4 live == 16 total partitions, even under a lossy/\
+         duplicating network"
+    );
+}
+
+#[test]
+fn chaotic_network_live_writes_race_the_sweep() {
+    for_each_seed(
+        "chaotic_network_live_writes_race_the_sweep",
+        scenario_chaotic_network_live_writes_race_the_sweep,
     );
 }

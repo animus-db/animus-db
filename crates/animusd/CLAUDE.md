@@ -51,7 +51,20 @@ the wire edges, the remaining background loops, and the test/bench targets.
 **Narrow it further as more of this crate becomes seam-clean; never widen
 it back to make a change compile** — that is precisely the hole this rung
 closes. A module that has no live `tokio`/real-clock sites left earns its
-own `#[deny(...)]` line.
+own `#[deny(...)]` line. Five more leaf background-loop wrappers earned
+theirs this way: `backup_completion`, `backup_janitor`, `index_backfill`,
+`pitr_janitor`, `ttl_reaper` — each had its loop body moved to
+`animus_node` in rung C2 (see each module's own map entry below) and is now
+a thin, logic-free wrapper with zero `Instant::now`/`SystemTime::now`/
+`tokio::time::*`/`tokio::spawn` sites of its own, verified by direct
+inspection before the `#[deny(...)]` line was added. `segment_janitor`
+deliberately did **not** get one — its replica-repair phase is real
+placement/membership orchestration (a live `tokio::time::sleep`), not a
+thin delegation — and stays under the package-level allow along with
+`admin`, `backup_capture`, `backup_restore`, `client_ctx_host`, `console`,
+`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, and `http`. Ten
+modules now carry the narrower `#[deny(...)]`: the original five (`schema`,
+`read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus these five.
 
 **`lib.rs` is ~11,800 lines** (down from ~17,300 before ADR 0061 rung C5
 step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/
@@ -1227,13 +1240,21 @@ driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
 relying on `SplitMode::default()`/`run_node` — see
 `docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
 two test files this caught. `ClientCtx::trigger_split` is still the ONE
-choke point both workflows share (see its own doc, `lib.rs`): `self.
+choke point both workflows share (see its own doc, `schema.rs`): `self.
 split_mode` is the sole branch point between proposing `MetaCommand::
-BeginSplit` or `BeginSplitInPlace`, with identical children (same shape,
-same fields), the identical idempotent already-`Splitting` handling, the
-identical confirm loop, and identical F11 alignment — `auto_split_loop`/
-`admin::action_split`/`ClientRequest::SplitTablet` all fall in behind
-whichever mode is configured automatically, with no fork of their own.
+BeginSplit` or `BeginSplitInPlace`, the identical idempotent
+already-`Splitting` handling, the identical confirm loop, and identical
+F11 alignment — `auto_split_loop`/`admin::action_split`/
+`ClientRequest::SplitTablet` all fall in behind whichever mode is
+configured automatically, with no fork of their own. **Since ADR 0062
+rung 4, the two branches' `children` computation itself is where they
+diverge**: `Copy` still mints its two children at placement-chosen final
+homes (`split_child_placement`/fork F5, unchanged); `InPlace` no longer
+does — both children carry the parent's own current `replicas`, verbatim
+and identical to each other, read from the same already-fetched `meta`
+the confirm loop already holds. The wire *shape* of `children:
+[(TabletId, Vec<NodeId>); 2]` is still identical between the two
+`MetaCommand`s — only the values a proposer computes for it differ.
 
 **The in-place cutover driver** (`index_drain.rs::
 inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
@@ -1242,13 +1263,15 @@ inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
 `Metadata` row, set only by `BeginSplitInPlace`): a node can be configured
 `InPlace` while driving a tablet someone else split with `BeginSplit`
 before the flag flipped, and vice versa. Everything upstream of this —
-adding the fork's learners, catching them up, proposing the single-entry
-`KvCommand::SplitTablet` fork itself, and materializing both children's
-engines on every fork participant — is entirely `animus_cp_data::host`'s
-own reconciler (ADR 0058 Train 2 rung 3, unmodified by this driver); this
-function has nothing to do until `CpGroup::pending_split()` answers `Some`
-on this replica. Once forked, there is no build, no freeze, no tail, no
-convergence bound — Stage 3's atomic mint already fully formed both
+proposing the single-entry `KvCommand::SplitTablet` fork itself (**since
+ADR 0062, immediately, with no learner-add-and-wait phase to run first —
+every replica the fork touches already hosts the parent as an ordinary
+voter**) and materializing both children's engines on every fork
+participant — is entirely `animus_cp_data::host`'s own reconciler (ADR
+0058 Train 2 rung 3; fork-first per ADR 0062 rung 5, unmodified by this
+driver); this function has nothing to do until `CpGroup::pending_split()`
+answers `Some` on this replica. Once forked, there is no build, no freeze,
+no tail, no convergence bound — the atomic mint already fully formed both
 children — so what is left is exactly the copy-based endgame's own two
 pre-cutover vetoes (GSI-drain, accelerated identically via
 `gsi_caught_up`/`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`; backfill-seeder) run
@@ -1268,7 +1291,7 @@ a fresh read off durable/replicated state.
 `CutoverSplit` the instant `pending_split()` is `Some` races
 `animus_cp_data::host`'s own reconciler, which is a *different*,
 independently-scheduled per-node loop (`tablet_host_reconciler_loop`).
-Stages 1–3 commit nothing on the control plane, so that reconciler's
+The fork itself commits nothing on the control plane, so that reconciler's
 `metadata_watch` wakes once (at `BeginSplitInPlace`'s own commit) and not
 again until `CutoverSplit`'s — leaving its `RECONCILE_FALLBACK_INTERVAL`
 (500ms) fallback as the only thing that can make it discover a completed
@@ -1551,6 +1574,37 @@ RPC must forward through this choke point, and its test suite needs a caller
 hosting no replica of the target, which only a cluster larger than RF can
 produce (`tests/split_build.rs::
 split_completes_when_a_child_lives_off_the_parent_leader_node`).
+
+**A dead candidate is chased too, not just a wrong-but-reachable one
+(issue #316, fixed).** The hinted-retry fix above only helps when the
+guessed candidate is alive and answers with a real refusal — a plain
+**transport** failure (the candidate crashed/was killed) used to be
+terminal: `relay_request_with_timeout` folds every connect/write/read
+failure into one sentinel string (`RELAY_TRANSPORT_FAILURE`), which
+doesn't parse as a "not the leader here" refusal, so the pre-fix chase
+gave up on the very first unreachable hop instead of trying another known
+replica. Since the guess itself is deterministic (the no-local-replica
+fallback and a refusal's own embedded hint are both plain reads, never
+liveness-checked), a caller that keeps re-resolving and re-forwarding
+(the split-build driver's own per-tick retry, `seed_child_rows`) kept
+reproducing the identical dead end forever once its first guess or hint
+chase happened to land on a node that had since died — the confirmed root
+cause of `tests/split_build.rs::
+split_survives_losing_one_childs_leader_mid_build`'s reported hang. Fixed
+by giving a transport failure the identical "no hint" treatment a
+live-but-mid-election refusal already gets (try another known replica),
+rather than a terminal return. Regression:
+`forward_transport_failure_tests::
+forward_to_tablet_leader_survives_a_dead_first_guess` (`lib.rs` — **not**
+beside `forward_to_tablet_leader` in `forwarding.rs`, whose module carries
+a hard `#[deny(clippy::disallowed_methods)]`, ADR 0061 Phase C's closing
+rung, that a real-socket test's `tokio::time` calls would trip). See
+`docs/engineering-lessons.md`'s matching entry for the full incident,
+including why this sandbox could never reproduce the original hang live
+(fast localhost + a small dataset's bulk pass usually outracing the
+test's own 30s victim-detection poll) yet the fix was still provable
+red-before/green-after via a fully deterministic isolation of the exact
+mechanism.
 
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
@@ -1890,6 +1944,18 @@ a `Splitting` parent or `Building` child classifies up front as
 this call performed) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
+
+`grow_stream`'s per-tablet loop walks a `Metadata` *snapshot* taken once up
+front but awaits real Raft/network activity per iteration, so a tablet
+captured `Active` in that snapshot can be retired by a **cascade** split
+(one tablet's cutover racing another's still-pending turn in the same
+walk) before this loop reaches it — issue #454. `grow_stream_tablet`'s own
+"no such tablet" lookup miss for exactly that tablet is not a real error:
+it means the split this call would have triggered already happened, one
+beat early. `schema::classify_grow_response` folds that exact message into
+the identical `STREAM_GROW_MID_SPLIT` skip, deliberately narrow (only that
+literal message, only on `grow_stream`'s own call path) so a genuinely
+unknown tablet id elsewhere (e.g. `POST /admin/tablet/split`) still errors.
 
 **Split is the ADR 0050 copy-based workflow's METADATA half (Train B rung
 3)**: `trigger_split` — still the one choke point every surface calls —
@@ -2646,6 +2712,49 @@ route below the edge through the same `ClientCtx` CP primitives.
   kickoff contract as `restore_table_from_backup`: returns as soon as
   `BeginRestore` commits, with `backup_restore.rs`'s driver doing the
   actual seed/replay/activate/GSI-declare sequence in the background.
+- **`split_placing_completion.rs`** (ADR 0062 §3) — the in-place split
+  **directed-Placing completion loop**: a per-tablet, leader-side loop, the
+  same "run everywhere, self-gate per tablet on `group.is_leader()`,
+  propose a relayable completion command once local convergence is
+  observed" shape as `backup_capture.rs`/`index_backfill.rs` (`RaftKvNode::
+  spawn_reconfigure_loop` has zero production callers — see the ADR's own
+  §3 correction to its brief's original anchor). Each tick, for every led
+  tablet with an un-`done` `Metadata::split_placing` entry: if the live
+  Raft group's own voter config matches `Metadata`'s current `replicas`
+  with no dangling learners (`CpGroup::config()`/`CpGroup::learners()`,
+  the second newly unwrapped by this rung, the first pre-existing since ADR
+  0029's own release-GC use) — the identical convergence predicate
+  `RaftKvNode::reconfigure_step`'s own early return already checks —
+  **and that observation has held continuously for
+  `SPLIT_PLACING_DONE_SETTLE`** (a small multiple of `animus-control::
+  node`'s own `RECONCILE_INTERVAL`, tracked in a driver-local `BTreeMap<
+  TabletId, Nanos>`), proposes `MetaCommand::MarkSplitPlacingDone` via
+  `ClientCtx::propose_schema` (on the `is_relayable_command` allowlist).
+  **The settle window is load-bearing, not defensive padding** — a naive
+  one-shot compare marks `done` on the very first tick after cutover,
+  before the control-plane's own reconcile loop has had a single chance to
+  move the tablet off its fork-inherited (trivially "converged" against
+  itself) replicas; see `docs/engineering-lessons.md`'s entry on this rung
+  for the full incident (found via this loop's own real end-to-end test,
+  not by inspection) and a separate, pre-existing `reconfigure_step`
+  oscillation the same investigation surfaced (a 2-of-3-replica-swap target
+  failing to converge under a real cluster) — unrelated to and unmodified
+  by this loop, not fixed here. Spawned on combined and data-only nodes
+  only (`start_with_growth`'s two call sites — mirrors `backup_capture.rs`/
+  `backup_restore.rs`'s own scope: no control-plane-leader dependency of
+  its own, so a control-only node, which hosts no CP-data tablet, gets
+  nothing from spawning it). **Status surface**: no new admin/dashboard
+  code — `admin.rs`'s `status_json` already serializes `effective_metadata()`
+  directly, so a live `split_placing` entry (and its `done` flag) is
+  visible for free, the same "derive from already-replicated state, don't
+  build a bespoke view" discipline every other diagnostic here follows.
+  **Known limitation carried forward, not this loop's to fix** (issue
+  #513): the loop's own convergence predicate is correct, but the
+  `reconfigure_step` convergence it observes can itself oscillate
+  indefinitely for a two-(or-more)-replica-difference target — so a child
+  whose fresh `select_replicas` target differs from its fork-inherited
+  replicas by more than one replica may never reach `done` at all, not
+  just slowly.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
@@ -2803,7 +2912,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories. **Self-removal's
+  self-registration/admin-action-clobber war stories. **`admin_add_control_
+  member`'s "already registered?" gate must check `Metadata::node_addrs`,
+  never `members` alone, and must bound-wait for this leader's own
+  `engine_applied_index() >= commit_index()` before reading either
+  (issues #406/#450)**: a control-only registration never claims `members`
+  by design (the bullet above), so gating on `members` alone made the
+  "genuinely unclaimed" branch run on *every* call for this node shape,
+  re-deriving a `NodeAddrs` from a `metadata_cached()` snapshot that can be
+  lagging this leader's own already-committed Raft log (ADR 0038's async
+  apply task) — a permanent CAS collision, or worse, a durably blank
+  address book if the malformed guess won the race. See
+  `docs/engineering-lessons.md`'s matching entry for the full account,
+  including why the `node_addrs` gate fix alone (without the wait) still
+  measurably collides. **Self-removal's
   leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
   `admin_remove_control_member`'s `node == my_id` branch calls
   `RaftCore::transfer_leadership` exactly once — if the target's

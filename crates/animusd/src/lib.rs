@@ -60,23 +60,33 @@ pub use animus_node::{
 use animus_node::control_handle::ControlHandle as GenericControlHandle;
 use animus_node::host::RelayClient;
 
-// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): these
-// five modules are the `E: Env`-generic, `tokio`-free client path. The
-// package-level `disallowed_methods = "allow"` in this crate's `Cargo.toml`
-// is the pre-Phase-C process-boundary exemption (rung B5) and still applies
-// to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply here. Since C5
-// step 3b converted every `tokio::time`/`tokio::spawn`/`tokio::select!` site
-// in these files to the `Env` seam, the workspace default is re-enabled for
-// them explicitly — which is what makes the determinism constraint
-// compiler-enforced in place, rather than the crate boundary the ADR
-// originally planned and the orphan rule blocked. A `deny` on the `mod`
-// declaration applies to the whole module body, so a reintroduced
-// `Instant::now`/`tokio::spawn`/`tokio::time::sleep` in any of them is a
-// build failure, not a review miss. Do not widen this back to `allow` to
-// make a change compile — that is the hole this rung closes.
+// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): five
+// of these modules are the original `E: Env`-generic, `tokio`-free client
+// path. The package-level `disallowed_methods = "allow"` in this crate's
+// `Cargo.toml` is the pre-Phase-C process-boundary exemption (rung B5) and
+// still applies to `lib.rs`, `dynamo.rs` and the rest; it must NOT apply
+// here. Since C5 step 3b converted every `tokio::time`/`tokio::spawn`/
+// `tokio::select!` site in these files to the `Env` seam, the workspace
+// default is re-enabled for them explicitly — which is what makes the
+// determinism constraint compiler-enforced in place, rather than the crate
+// boundary the ADR originally planned and the orphan rule blocked. Five
+// more leaf background-loop wrappers (`backup_completion`, `backup_janitor`,
+// `index_backfill`, `pitr_janitor`, `ttl_reaper`) earned the same `deny`
+// later, per `crates/animusd/CLAUDE.md`'s stated bar: each has had its loop
+// body moved to `animus_node` (rung C2) and is now a thin, logic-free
+// wrapper with no live `tokio`/real-clock site of its own —
+// `segment_janitor` deliberately did NOT move and stays under the
+// package-level allow, since its replica-repair phase is real orchestration
+// logic, not a thin delegation. A `deny` on the `mod` declaration applies to
+// the whole module body, so a reintroduced `Instant::now`/`tokio::spawn`/
+// `tokio::time::sleep` in any of them is a build failure, not a review
+// miss. Do not widen this back to `allow` to make a change compile — that
+// is the hole this rung closes.
 mod admin;
 mod backup_capture;
+#[deny(clippy::disallowed_methods)]
 mod backup_completion;
+#[deny(clippy::disallowed_methods)]
 mod backup_janitor;
 mod backup_restore;
 mod client_ctx_host;
@@ -88,13 +98,17 @@ mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
+#[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
 #[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
+mod split_placing_completion;
+#[deny(clippy::disallowed_methods)]
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
@@ -108,8 +122,8 @@ use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, RaftKvNode, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome,
-    TxnRecordView,
+    FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
+    TxnOutcome, TxnRecordView,
 };
 use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
 use animus_storage::{
@@ -870,6 +884,19 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// The group's active **learner** configuration (ADR 0058 Train 1) —
+    /// non-voting members mid-catch-up. See [`RaftKvNode::learners`]. Used
+    /// by the split-placing completion loop (ADR 0062 §3) alongside
+    /// [`config`](Self::config) — a dangling learner means
+    /// [`reconfigure_step`](RaftKvNode::reconfigure_step) still has work
+    /// left, even when the voter set already matches.
+    pub(crate) fn learners(&self) -> std::collections::BTreeSet<NodeId> {
+        match self {
+            CpGroup::Lsm(n) => n.learners(),
+            CpGroup::Mem(n) => n.learners(),
+        }
+    }
+
     /// Explicitly wake this group's consensus loop for one extra pass (ADR
     /// 0044 phase-1 PR4) — see [`RaftKvNode::wake`]. Idempotent and safe on
     /// every state.
@@ -1436,14 +1463,16 @@ impl<E: Env> CpGroup<E> {
     }
 
     /// **Resolve** intents on this group given an already-decided outcome.
-    /// See [`RaftKvNode::txn_resolve`].
+    /// See [`RaftKvNode::txn_resolve`] — the caller must check the returned
+    /// [`ResolveOutcome`] (`Fenced`/`OutcomeMismatch` mean nothing here
+    /// actually resolved; only `Resolved` does).
     async fn txn_resolve(
         &self,
         txn_id: TxnId,
         record_key: Vec<u8>,
         keys: Vec<Vec<u8>>,
         outcome: TxnOutcome,
-    ) -> Option<HlcTimestamp> {
+    ) -> Option<(HlcTimestamp, ResolveOutcome)> {
         match self {
             CpGroup::Lsm(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
             CpGroup::Mem(n) => n.txn_resolve(txn_id, record_key, keys, outcome).await,
@@ -1907,6 +1936,17 @@ const TXN_STAGE_PUSH_BACKOFF: Duration = Duration::from_millis(250);
 /// plain transaction's async resolve always could race a follow-up read on
 /// its own participant tables.
 const TXN_RESOLVE_ALL_AWAIT_BUDGET: Duration = Duration::from_secs(2);
+/// Bounded attempts [`ClientCtx::txn_resolve_participant_retrying`] gives a
+/// resolve that comes back `Fenced` (or a transient routing/leadership
+/// error) before giving up for this call — ADR 0018 §2 write-loss amendment
+/// §3/§6's fix for the "resolve reports success but the intent stays live"
+/// residual: a concurrent split can move a key's range between one
+/// `cp_route` call and the next, so a bounded number of fresh re-routes
+/// gives the split a realistic window to finish converging before this
+/// caller gives up (the passive `txn_resolver_loop` sweep, or an on-demand
+/// foreign-intent read-path push, remain the safety net either way — this
+/// is a liveness improvement, not the sole correctness mechanism).
+const TXN_RESOLVE_FENCED_RETRY_ATTEMPTS: u32 = 3;
 /// The bootstrap CP group's replication factor (ADR 0017 #3a): the group spans the
 /// first `min(N, MAX_REPLICATION_FACTOR)` nodes' `raftkv` ids. Dynamic CP placement
 /// over more nodes is later v1 work.
@@ -4032,6 +4072,15 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The in-place split directed-Placing completion loop (ADR 0062
+        // §3): reports a child tablet's own local Raft convergence to the
+        // control-plane catalog. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the backup capture/restore drivers
+        // above.
+        tasks.push(tokio::spawn(
+            split_placing_completion::split_placing_completion_loop(ctx.clone()),
+        ));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -5366,6 +5415,14 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
             ctx.clone(),
         )));
+
+        // The in-place split directed-Placing completion loop (ADR 0062
+        // §3) — same shape/reasoning as the backup capture/restore drivers
+        // just above (per-tablet-leadership-gated, no control-plane-leader
+        // dependency of its own).
+        tasks.push(tokio::spawn(
+            split_placing_completion::split_placing_completion_loop(ctx.clone()),
+        ));
 
         if auto_split_threshold.is_some()
             || auto_split_bytes_threshold.is_some()
@@ -6918,8 +6975,62 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
+        // leader's own `metadata_cached()` is gated on its own async apply
+        // task (ADR 0038), which can lag its own already-committed Raft log
+        // by an unbounded amount under load — `RaftNode::metadata`'s own doc
+        // says as much ("a caller that needs read-your-writes should
+        // confirm via ... `engine_applied_index`"). The dominant #406/#450
+        // failure mode is exactly this, on THIS leader specifically: a
+        // `RegisterNode` for `node` was proposed on (or relayed to) this
+        // same leader moments ago — the target's own concurrent
+        // self-registration racing this very call — and is already
+        // committed to this leader's own log, just not yet reflected in its
+        // local cache. Bound-wait for this leader's own apply task to catch
+        // up to whatever is *already committed here right now* before
+        // deciding anything below, so the gate and the merge-read that
+        // follows are never stale relative to a fact this leader itself has
+        // already decided. This does **not** wait for an entry that has not
+        // reached this leader's log at all yet (e.g. an operator confirming
+        // "up" via a signal other than this exact leader's own state, then
+        // calling immediately) — see the residual note further down.
+        {
+            let commit_at_call = leader.commit_index();
+            let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+            while leader.engine_applied_index() < commit_at_call && self.env.now() < deadline {
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
+
         let meta = self.control.metadata_cached();
-        if meta.members.contains_key(&node) {
+        // **Issue #406/#450 (Bug B)**: this must NOT gate on `meta.members`
+        // alone. A control-only node's own self-registration (`RegisterNode`
+        // with `addrs.role == "control"`) never claims a `members` row by
+        // design (`animus-control::meta.rs`'s own doc on
+        // `MetaCommand::RegisterNode` — "never claim `members` for a
+        // control-only registration"), so `meta.members.contains_key(&node)`
+        // was *always* false for exactly the node shape this admin action
+        // exists to promote, forcing every control-only re-add through the
+        // "genuinely unclaimed" branch below regardless of whether this
+        // leader's own (ADR 0038 apply-task-lagged) local cache had already
+        // seen the node's real self-registration. That branch re-derives a
+        // fresh `NodeAddrs` from this same possibly-stale snapshot — if the
+        // snapshot hadn't caught up yet, the reconstruction has empty
+        // `client`/`intra`/`admin` fields, and once the node's own (earlier,
+        // already-committed) real registration and this malformed one both
+        // eventually apply in log order, the mismatch is a permanent
+        // "already claimed by a different registration" collision — or,
+        // worse, if this malformed proposal's log entry happens to commit
+        // *before* the node's own real self-registration is even proposed,
+        // it wins the CAS and the node is left with a durably blank address
+        // book. Checking `node_addrs` too (the actual claim, `RegisterNode`'s
+        // own CAS key — see that command's doc) closes this for every case
+        // where this leader's local cache has observed the claim under
+        // *either* name, leaving only the narrower "this leader's cache has
+        // seen no trace of the id at all yet" window, not "always" for every
+        // control-only id. See `docs/engineering-lessons.md` for the general
+        // lesson.
+        if meta.members.contains_key(&node) || meta.node_addrs.contains_key(&node) {
             // Already a registered member (its own self-registration, or a
             // prior admin action) — just make sure its `internal` address
             // (this action's whole purpose) matches `addr`. Never touches
@@ -6944,13 +7055,28 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
         } else {
-            // Genuinely unclaimed: the sole claim path (ADR 0040 Decision C).
+            // Genuinely unclaimed (per this leader's own local cache — see
+            // the gate above): the sole claim path (ADR 0040 Decision C).
             // A **minted** id re-mints and retries on collision
             // (astronomically unlikely, but structurally possible — nothing
             // needs rebinding, since ports are never derived from ids); a
             // **proposed** id fails loudly on the first collision instead —
             // an operator/config conflict is a real problem to report, not
-            // to paper over by silently trying something else.
+            // to paper over by silently trying something else. **Residual
+            // #406/#450 window, now much narrower**: the read-your-writes
+            // barrier above closes the race for anything already committed
+            // to *this leader's own* Raft log at call time — which is the
+            // dominant #406/#450 shape (a target's self-registration
+            // relayed to, or proposed on, this exact leader moments
+            // earlier). What remains is genuinely irreducible without
+            // waiting on information this leader hasn't received at all
+            // yet: a self-registration proposed on/relayed to a *different*
+            // node (e.g. mid-leadership-change) that has not yet reached
+            // this leader's log by the time this call's own barrier above
+            // finished waiting. A caller that first confirms the target's
+            // own self-registration is visible on *this exact* leader
+            // before calling (the documented ADR 0037 §7 runbook) does not
+            // hit this window in practice.
             let mut attempts_left = if minted { MAX_MINT_ATTEMPTS } else { 1 };
             loop {
                 // Merge into whatever address-book entry this id's own
@@ -10038,7 +10164,18 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
+    // The node's own identity is `RoleAddrs::id` — the id this same config's
+    // `control_ids()`/`peer_book()` already used to build the voter set and
+    // peer book every node (including this one) was handed. `config::
+    // node_id(index)` mints the unrelated "n{index}" convention, which only
+    // coincides with `addrs.id` for a `generate`d config; a hand-written or
+    // operator-generated config (e.g. the Kubernetes operator's `"{cluster}-
+    // {ordinal}"` ids) diverges, and binding under the wrong id makes
+    // `RaftCore::is_voter()` (`self.config.contains(&self.id)`) false forever
+    // — this node can never see itself as a member of its own genesis
+    // config, so it never campaigns and the group never elects a leader. See
+    // `docs/engineering-lessons.md` for the incident this fixes.
+    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
     // One node per process: a fresh per-process edge-state set (it registers only
     // this node's control handle — cross-process proposal forwarding is future
     // work, ADR 0013).
@@ -10198,7 +10335,10 @@ pub async fn run_node_control_with_orphan_sweep_after(
             "node index does not run the control role",
         ));
     }
-    let bound = Node::bind_control(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind_control(addrs.id.clone(), addrs, dir).await?;
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -10290,7 +10430,10 @@ pub async fn run_node_data(
             "config has no control-role node for this data node to mirror",
         ));
     }
-    let bound = Node::bind_data(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind_data(addrs.id.clone(), addrs, dir).await?;
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -10414,7 +10557,10 @@ pub async fn run_node_growth(
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
-    let bound = Node::bind(config::node_id(index), addrs, dir).await?;
+    // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
+    // comment: the node's own identity must be `addrs.id`, not the unrelated
+    // `config::node_id(index)` minting convention.
+    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
@@ -10990,9 +11136,25 @@ async fn relay_request_with_timeout(
     .await
     {
         Ok(Some(resp)) => resp,
-        _ => ClientResponse::Error("relay to peer node failed".into()),
+        _ => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
     }
 }
+
+/// The plain-text sentinel [`relay_request_with_timeout`] returns for any
+/// **transport**-level failure — connect refused/timed out, the write/read
+/// itself failing, or the whole attempt outliving its budget — as opposed to
+/// a reply a live peer actually sent. Named so `forwarding::ClientCtx::
+/// forward_to_tablet_leader`'s hinted-retry chase can tell the two apart
+/// (issue #316): unlike a parsed "not the leader here" refusal (a candidate
+/// that IS reachable, just not the leader), this means the candidate itself
+/// couldn't be reached at all — which the chase must treat as "try the next
+/// known replica," exactly like a refusal carrying no hint, rather than as a
+/// terminal error. Before that fix, a forward whose first-guess or
+/// hint-chased candidate happened to be a node that had just crashed/been
+/// killed gave up on the very first unreachable hop and never tried the
+/// tablet's other live replicas — see that function's own doc for the full
+/// mechanism.
+const RELAY_TRANSPORT_FAILURE: &str = "relay to peer node failed";
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
@@ -11440,6 +11602,236 @@ mod confirm_futility_tests {
             slow_started.elapsed()
         );
         node.shutdown();
+    }
+}
+
+/// Issue #316 regression: `ClientCtx::forward_to_tablet_leader` must chase
+/// past a candidate that is simply **unreachable**, not only past one that
+/// replies with a "not the leader here" refusal. In-crate, like
+/// `confirm_futility_tests` above/`index_drain.rs`'s `gsi_drain_cursor_tests`
+/// — needs the private `ClientCtx::seed_child_rows`/`Node::ctx_for_test`
+/// handles no external `tests/` file can reach. **Lives here rather than
+/// beside `forward_to_tablet_leader` in `forwarding.rs`** because that
+/// module carries a hard `#[deny(clippy::disallowed_methods)]` (ADR 0061
+/// Phase C's closing rung) — a real `tokio::time::sleep`/`timeout`, which
+/// this real-socket `ProdEnv` test needs freely, is a build error there.
+/// Real-socket `ProdEnv` integration test, per this crate's own testing
+/// discipline.
+#[cfg(test)]
+mod forward_transport_failure_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn cluster_config(n: usize) -> ClusterConfig {
+        let addrs = free_addrs(n * 6);
+        let nodes = (0..n)
+            .map(|i| RoleAddrs {
+                id: crate::config::node_id(i),
+                role: NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+            })
+            .collect();
+        ClusterConfig {
+            nodes,
+            dynamo_auth: None,
+        }
+    }
+
+    /// Bring up an `n`-node cluster, retrying the whole config against the
+    /// documented port-TOCTOU race (`docs/engineering-lessons.md`): each
+    /// attempt allocates a fresh set of addresses.
+    async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
+        for attempt in 0..16 {
+            let config = cluster_config(n);
+            let mut nodes = Vec::new();
+            let mut failed = false;
+            for i in 0..n {
+                match run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                    Ok(node) => nodes.push(node),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed {
+                return nodes;
+            }
+            for node in &nodes {
+                node.shutdown();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    }
+
+    async fn await_bootstrap(nodes: &[Node]) {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes.iter().any(Node::is_control_leader)
+                    && nodes.iter().all(|n| !n.metadata().members.is_empty())
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not bootstrap in 20s");
+    }
+
+    async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+        // 40s, not 20s: this is the FIRST write against a brand-new 4-node
+        // cluster, so it also pays for the first tablet's own provisioning
+        // (placement + group formation) on top of ordinary write latency —
+        // a cold-cache CI/sandbox run occasionally needs more of that
+        // budget than the sibling helpers elsewhere in this crate, whose
+        // clusters are already warm by their own first write.
+        timeout(Duration::from_secs(40), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                crate::write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: table.to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match crate::read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 40s");
+    }
+
+    /// The mechanism behind #316's `split_survives_losing_one_childs_
+    /// leader_mid_build` hang, isolated from the split-build workflow
+    /// entirely: `resolve_cp_route`'s no-local-replica fallback always
+    /// guesses a tablet's FIRST replica in `Metadata` order — a plain,
+    /// deterministic read, not a leader hint — so a caller that hosts no
+    /// local replica of the target tablet forwards there regardless of
+    /// whether that replica is alive, still a follower, or was ever the
+    /// leader. Pre-fix, `forward_to_tablet_leader` gave up outright the
+    /// instant that guess was simply UNREACHABLE (a killed node): a plain
+    /// transport failure doesn't parse as a "not the leader here" refusal,
+    /// so the hinted-retry chase never got a chance to try either of the
+    /// tablet's other two live replicas — and since the guess never
+    /// changes, every subsequent call (the split-build driver's next tick
+    /// included) reproduced the identical dead-end forever.
+    ///
+    /// `seed_child_rows` with an **empty** row set is the cheapest faithful
+    /// exercise of this: it still runs the real `resolve_cp_route` →
+    /// `forward_to_tablet_leader` → `SeedRows` round trip, but the
+    /// server-side `seed_rows_local` returns `Ok(())` immediately for zero
+    /// rows without ever proposing (see that method's own doc) — so a
+    /// prompt `Ok(())` here proves the FORWARDING recovered, nothing about
+    /// the split-build workflow itself (which has its own end-to-end
+    /// coverage in `tests/split_build.rs`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_to_tablet_leader_survives_a_dead_first_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4 nodes vs RF 3 (`MAX_REPLICATION_FACTOR`): exactly one node hosts
+        // no replica of the seeded tablet, forcing the no-local-replica
+        // fallback path every time.
+        let nodes = bring_up(4, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        put_until_ok(nodes[0].client_addr(), "fwd316", b"seed", b"v").await;
+        let tablet = *nodes[0]
+            .metadata()
+            .tablets_for_table("fwd316")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        let replicas = nodes[0]
+            .metadata()
+            .tablets
+            .get(&tablet)
+            .expect("tablet exists")
+            .replicas
+            .clone();
+        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+
+        let caller = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !replicas.contains(&crate::config::node_id(*i)))
+            .map(|(i, _)| i)
+            .expect("a 4-node cluster at RF 3 has exactly one non-replica node");
+
+        // Kill the FIRST replica in `Metadata` order — the deterministic
+        // guess `resolve_cp_route` will make on every single call, whether
+        // or not it was ever this tablet's leader.
+        let victim_id = replicas[0].clone();
+        let victim = (0..nodes.len())
+            .find(|i| crate::config::node_id(*i) == victim_id)
+            .expect("victim id is one of this cluster's nodes");
+        assert_ne!(victim, caller, "the caller must not be its own victim");
+        nodes[victim].shutdown();
+
+        let ctx = nodes[caller].ctx_for_test();
+        let started = tokio::time::Instant::now();
+        // 15s outer bound: comfortably above `seed_child_rows`'/
+        // `forward_to_tablet_leader`'s own internal `CLIENT_TIMEOUT`
+        // (10s) ceiling, so this can never fire first and be mistaken for
+        // the thing under test — the real teeth is the elapsed-time
+        // assertion below.
+        let result = timeout(
+            Duration::from_secs(15),
+            ctx.seed_child_rows(tablet, Vec::new()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "forwarding must recover onto a live replica, not dead-end on the killed \
+             first guess: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pre-fix: a dead first guess is never retried, so this either errs immediately \
+             or (via the caller's own outer retry) burns the whole CLIENT_TIMEOUT budget \
+             every attempt; a fixed forward recovers in well under a second normally, so 5s \
+             is still a generous margin over that, just not over the old broken behavior: \
+             took {elapsed:?}"
+        );
+
+        for (i, node) in nodes.iter().enumerate() {
+            if i != victim {
+                node.shutdown_graceful().await;
+            }
+        }
     }
 }
 
