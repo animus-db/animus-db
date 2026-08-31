@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
-use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan};
+use animus_placement::{Candidate, PlacementPolicy, rebalance_step, replan, select_replicas};
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
 };
@@ -243,6 +243,34 @@ pub struct Metadata {
     /// snapshots loading (empty map).
     #[serde(default)]
     pub split_lineage: BTreeMap<TabletId, SplitLineage>,
+    /// **Directed Placing catalog** (ADR 0062 §2), keyed by an in-place
+    /// split child's own [`TabletId`]. Written **once**, by
+    /// [`MetaCommand::CutoverSplit`]'s in-place branch, as a pure function
+    /// of already-agreed `Metadata` at that exact apply (fork C: the same
+    /// discipline `BeginBackup` already established for deriving its
+    /// manifest stub from agreed state rather than anything the proposer
+    /// carried) — never by the copy-based branch, whose fork F5 already
+    /// mints a child at its placement-chosen final home, so there is
+    /// nothing left to place afterward. An entry exists only when the
+    /// freshly-forked child's inherited (parent-current) replicas do NOT
+    /// already match a fresh `select_replicas` computation under the
+    /// child's own inherited policy — an already-satisfying child gets no
+    /// row at all, mirroring `reconcile`/`rebalance`'s own "nothing to do,
+    /// nothing proposed" convention. **Never rewritten after that one
+    /// write** except by [`MetaCommand::MarkSplitPlacingDone`] flipping
+    /// `done` — the reconcile loop's own directed-Placing phase (a later
+    /// rung) always recomputes `select_replicas` fresh every tick rather
+    /// than trusting or updating `target`, so this field is a diagnostic
+    /// record of "what cutover itself decided," never the mechanism's own
+    /// source of truth (see [`SplitPlacing::target`]'s own doc). Never
+    /// pruned by anything in this rung except
+    /// [`MetaCommand::DropTableTablets`]'s existing drop-table cascade,
+    /// which sweeps a row whose child tablet id no longer exists at all —
+    /// the same orphan-prevention `index_backfill` already gets, since
+    /// nothing else will ever revisit an orphaned row. `#[serde(default)]`
+    /// keeps pre-ADR-0062 snapshots loading (empty map).
+    #[serde(default)]
+    pub split_placing: BTreeMap<TabletId, SplitPlacing>,
     /// The stream-shard segment catalog (ADR 0042 §3, ADR 0043 §A8): every
     /// sealed shard ever committed, keyed by `(tablet, epoch)` — globally
     /// unique for a tablet's whole lifetime (a tablet's own epoch counter
@@ -624,6 +652,38 @@ pub struct SplitLineage {
     /// machine has no clock, so wall time rides the command). Diagnostic /
     /// Console lineage-view data, never load-bearing for correctness.
     pub cutover_wall_ms: u64,
+}
+
+/// An in-place split child's directed-Placing row
+/// ([`Metadata::split_placing`], ADR 0062 §2), written once by
+/// [`MetaCommand::CutoverSplit`]'s in-place branch and updated only by
+/// [`MetaCommand::MarkSplitPlacingDone`] flipping `done`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitPlacing {
+    /// What `CutoverSplit`'s own apply computed as this child's
+    /// policy-satisfying target, at the moment it computed it — `None`
+    /// means placement was UNSATISFIABLE at cutover (fork B: too few
+    /// `Active` candidates, or too few distinct failure domains for a
+    /// strict spread), a state this catalog still records as a durable,
+    /// visible, keep-retrying obligation rather than silently skipping it,
+    /// mirroring `reconcile`'s own "keep trying every tick, forever, until
+    /// candidates recover" stance. **Diagnostic only** — the reconcile
+    /// loop's own directed-Placing phase (a later rung) never trusts or
+    /// rewrites this after this one write; it always recomputes
+    /// `select_replicas` fresh, off current `Metadata`, exactly the way
+    /// `reconcile`/`rebalance` already recompute their own decisions fresh
+    /// every tick rather than persisting and trusting a prior one. See ADR
+    /// 0062 §2's "a deliberate design choice worth stating explicitly" note
+    /// for the full rationale (staleness risk + avoiding a second write
+    /// path purely to keep this field current).
+    pub target: Option<Vec<NodeId>>,
+    /// Set once this child's live replicas have converged to a fresh,
+    /// currently-satisfying target (via [`MetaCommand::MarkSplitPlacingDone`],
+    /// proposed by the tablet's own leader once it observes local Raft
+    /// convergence). Never a serving gate (fork A) — a child serves
+    /// `Active`, unconditionally, from the moment `CutoverSplit` commits;
+    /// this only gates the derived "split fully complete" diagnostic.
+    pub done: bool,
 }
 
 /// A sealed stream shard's catalog row (ADR 0042 §3, ADR 0043 §A3/§A8) — the
@@ -1177,6 +1237,26 @@ pub enum MetaCommand {
         /// state machine has no clock — `SealStreamShard::seal_wall_ms`'s
         /// discipline). Diagnostic only.
         cutover_wall_ms: u64,
+    },
+    /// Mark an in-place split child's directed-Placing obligation complete
+    /// (ADR 0062 §3): `tablet` is the CHILD's own id, not the (long gone)
+    /// parent's. Epoch-CAS'd against the **child's** own current epoch (so
+    /// a stale confirm racing a later churn event on the same tablet is
+    /// rejected rather than marking done against state that has since
+    /// moved again) — the same `CasTabletReplicas` discipline, but this
+    /// command never bumps the tablet's own epoch itself (it isn't a
+    /// placement change, just a completion record). Rejected if `tablet`
+    /// has no [`Metadata::split_placing`] entry at all (nothing to mark
+    /// done); idempotent (`NoOp`) if the entry is already `done` — the
+    /// `MarkIndexBackfilled`/`RecordBackupTabletComplete` idiom, since the
+    /// proposer (a tablet leader's own background loop, `animusd`) is
+    /// expected to retry on an unconfirmed propose. The row itself is
+    /// never deleted by this command — it stays a permanent, bounded-size
+    /// record of "this child's post-split placement finished," pruned only
+    /// by `DropTableTablets`'s existing drop-table cascade.
+    MarkSplitPlacingDone {
+        tablet: TabletId,
+        expected_epoch: Epoch,
     },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
@@ -2216,6 +2296,13 @@ impl Metadata {
                         .range((*parent, 0)..=(*parent, u64::MAX))
                         .next_back()
                         .map(|(&(_, epoch), _)| epoch);
+                    // ADR 0062 §2 (fork C): the directed-Placing target, if
+                    // any, is decided ONCE here, as a pure function of
+                    // already-agreed `Metadata` at this exact apply — the
+                    // same candidate pool every child below is measured
+                    // against, computed once rather than per child (the
+                    // active-member set doesn't change mid-apply).
+                    let candidates = active_candidates(&self.members);
                     for (child, range) in [
                         (&intent.children[0], left_range),
                         (&intent.children[1], right_range),
@@ -2228,6 +2315,7 @@ impl Metadata {
                         );
                         t.state = TabletState::Active;
                         t.epoch = t.epoch.next();
+                        let child_replicas = t.replicas.clone();
                         self.tablets.insert(child.id, t);
                         if let Some(policy) = policy.clone() {
                             self.policies.insert(child.id, policy);
@@ -2240,6 +2328,42 @@ impl Metadata {
                                 cutover_wall_ms: *cutover_wall_ms,
                             },
                         );
+                        // A child inherits no policy at all ⟹ nothing to
+                        // place against, mirroring `reconcile`/`rebalance`'s
+                        // own "no policy, no automatic placement" rule — no
+                        // `split_placing` entry either.
+                        if let Some(policy) = &policy {
+                            match select_replicas(&candidates, policy) {
+                                // Already satisfying the freshest placement
+                                // decision at fork time: no entry at all —
+                                // there is nothing for a directed-Placing
+                                // convergence phase to ever do here.
+                                Ok(wanted) if wanted == child_replicas => {}
+                                Ok(wanted) => {
+                                    self.split_placing.insert(
+                                        child.id,
+                                        SplitPlacing {
+                                            target: Some(wanted),
+                                            done: false,
+                                        },
+                                    );
+                                }
+                                // Fork B: unsatisfiable at cutover (too few
+                                // `Active` candidates, or too few distinct
+                                // failure domains) is still written as a
+                                // durable, visible, keep-retrying
+                                // obligation — never silently skipped.
+                                Err(_) => {
+                                    self.split_placing.insert(
+                                        child.id,
+                                        SplitPlacing {
+                                            target: None,
+                                            done: false,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                     self.tablets.remove(parent);
                     self.policies.remove(parent);
@@ -2294,6 +2418,30 @@ impl Metadata {
                 self.tablets.remove(parent);
                 self.policies.remove(parent);
                 ApplyOutcome::Applied
+            }
+            MetaCommand::MarkSplitPlacingDone {
+                tablet,
+                expected_epoch,
+            } => {
+                // Epoch-CAS against the CHILD's own current epoch (the
+                // `CasTabletReplicas` discipline) — a stale confirm racing
+                // a later churn event on this same tablet is rejected
+                // rather than marking done against state that has since
+                // moved again.
+                match self.tablets.get(tablet) {
+                    None => ApplyOutcome::Rejected("no such tablet"),
+                    Some(t) if t.epoch != *expected_epoch => {
+                        ApplyOutcome::Rejected("epoch mismatch")
+                    }
+                    Some(_) => match self.split_placing.get_mut(tablet) {
+                        None => ApplyOutcome::Rejected("no split_placing entry for this tablet"),
+                        Some(entry) if entry.done => ApplyOutcome::NoOp,
+                        Some(entry) => {
+                            entry.done = true;
+                            ApplyOutcome::Applied
+                        }
+                    },
+                }
             }
             MetaCommand::SetTabletPolicy { tablet, policy } => {
                 if !self.tablets.contains_key(tablet) {
@@ -2377,6 +2525,13 @@ impl Metadata {
                 // catalog forever (nothing will ever prune it otherwise).
                 self.index_backfill
                     .retain(|(tablet, _), ()| !dropped.contains(tablet));
+                // ADR 0062 §2: a dropped tablet can no longer be placed
+                // either — the identical orphan-prevention prune
+                // `index_backfill` gets just above (nothing else will ever
+                // revisit a `split_placing` row for a tablet id no longer
+                // in the live tablet map).
+                self.split_placing
+                    .retain(|tablet, _| !dropped.contains(tablet));
                 // Reclaim the dropped tablets' CP member addresses (ADR 0024 GC —
                 // the address-book counterpart of the hosting nodes' file GC).
                 self.prune_cp_member_addrs();
@@ -5520,6 +5675,51 @@ mod tests {
         );
     }
 
+    /// `DropTableTablets` (ADR 0062 §2): pruning a table's tablets also
+    /// prunes every `split_placing` row keyed to one of those dropped
+    /// tablet ids — the identical `index_backfill` orphan-prevention prune
+    /// above, for the new catalog — while leaving another table's row
+    /// untouched.
+    #[test]
+    fn drop_table_tablets_prunes_split_placing_rows_for_the_dropped_tablets() {
+        let mut m = Metadata::default();
+        for (table, tablet) in [("users", TabletId(1)), ("orders", TabletId(2))] {
+            assert_eq!(
+                m.apply(&MetaCommand::CreateTablet {
+                    tablet,
+                    table: Some(table.to_owned()),
+                    range: KeyRange::whole(),
+                    replicas: vec![nid(1)],
+                }),
+                ApplyOutcome::Applied
+            );
+            m.split_placing.insert(
+                tablet,
+                SplitPlacing {
+                    target: Some(vec![nid(9)]),
+                    done: false,
+                },
+            );
+        }
+        assert_eq!(m.split_placing.len(), 2);
+
+        assert_eq!(
+            m.apply(&MetaCommand::DropTableTablets {
+                table: "users".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            !m.split_placing.contains_key(&TabletId(1)),
+            "the dropped table's row must be pruned"
+        );
+        assert!(
+            m.split_placing.contains_key(&TabletId(2)),
+            "the other table's row must survive"
+        );
+    }
+
     /// `DropTableIndex` (ADR 0045): dropping an index prunes every
     /// `index_backfill` row for that index name, scoped to the owning
     /// table's own tablets — a distinct table's row for a same-named index
@@ -6315,6 +6515,320 @@ mod tests {
             assert_eq!(lineage.parents_final_epoch, None);
             assert_eq!(lineage.cutover_wall_ms, 99);
         }
+    }
+
+    /// ADR 0062 §2, case 1 ("already satisfying"): when a fresh
+    /// `select_replicas` computation under the child's inherited policy
+    /// agrees with the replicas the child was just forked onto, `CutoverSplit`
+    /// writes NO `split_placing` entry at all — there is nothing for a
+    /// directed-Placing convergence phase to ever do.
+    #[test]
+    fn cutover_split_in_place_writes_no_placing_entry_when_already_satisfying() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        // Fork-first (ADR 0062 §1): both children inherit the parent's own
+        // current replicas verbatim — the ONLY three active candidates that
+        // exist, so `select_replicas` can only ever re-derive this exact set.
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                children: [
+                    (TabletId(2), vec![nid(1), nid(2), nid(3)]),
+                    (TabletId(3), vec![nid(1), nid(2), nid(3)]),
+                ],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL.next(),
+                cutover_wall_ms: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert!(
+            m.split_placing.is_empty(),
+            "an already-satisfying fork needs no directed-Placing obligation"
+        );
+    }
+
+    /// ADR 0062 §2, case 2 (a real, satisfiable, non-trivial target): when
+    /// `select_replicas` prefers a DIFFERENT set than the child's
+    /// fork-inherited replicas, `CutoverSplit` writes `SplitPlacing{target:
+    /// Some(wanted), done: false}` for each child.
+    #[test]
+    fn cutover_split_in_place_writes_a_placing_target_when_a_better_placement_exists() {
+        let mut m = Metadata::default();
+        // Four active candidates ("n1".."n4", string-sorted in that exact
+        // order); RF 3 over them prefers the three lowest ids — [n1, n2, n3]
+        // — which the parent's own current replicas ([n2, n3, n4]) are not.
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(2), nid(3), nid(4)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                children: [
+                    (TabletId(2), vec![nid(2), nid(3), nid(4)]),
+                    (TabletId(3), vec![nid(2), nid(3), nid(4)]),
+                ],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: Epoch::INITIAL.next(),
+                cutover_wall_ms: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        for child in [TabletId(2), TabletId(3)] {
+            let entry = &m.split_placing[&child];
+            assert_eq!(entry.target, Some(vec![nid(1), nid(2), nid(3)]));
+            assert!(!entry.done);
+        }
+    }
+
+    /// ADR 0062 §2 fork B, case 3 (unsatisfiable at cutover): when no
+    /// `Active` candidates exist at all (`begin_split_in_place_fixture`'s own
+    /// `Metadata::default()`, RF 3), `select_replicas` errs — `CutoverSplit`
+    /// still writes an entry, `SplitPlacing{target: None, done: false}`,
+    /// rather than silently skipping it. This is what makes an
+    /// unsatisfiable-at-cutover child a visible, keep-retrying obligation
+    /// instead of a gap nothing will ever revisit.
+    #[test]
+    fn cutover_split_in_place_writes_a_pending_placing_entry_when_unsatisfiable() {
+        let (mut m, cmd) = begin_split_in_place_fixture();
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        let parent_epoch = m.tablets[&TabletId(1)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CutoverSplit {
+                parent: TabletId(1),
+                expected_epoch: parent_epoch,
+                cutover_wall_ms: 1,
+            }),
+            ApplyOutcome::Applied
+        );
+
+        for child in [TabletId(2), TabletId(3)] {
+            let entry = &m.split_placing[&child];
+            assert_eq!(entry.target, None);
+            assert!(!entry.done);
+        }
+    }
+
+    /// `MarkSplitPlacingDone` happy path: epoch-CAS against the CHILD's own
+    /// current epoch, flips `done` on an existing un-done entry.
+    #[test]
+    fn mark_split_placing_done_happy_path() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: false,
+            },
+        );
+        let epoch = m.tablets[&TabletId(2)].epoch;
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(2),
+                expected_epoch: epoch,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(m.split_placing[&TabletId(2)].done);
+        // `target` is left exactly as `CutoverSplit` wrote it — a diagnostic
+        // record, never updated by this command.
+        assert_eq!(m.split_placing[&TabletId(2)].target, Some(vec![nid(9)]));
+    }
+
+    /// `MarkSplitPlacingDone` rejects an epoch mismatch against the child's
+    /// own current epoch — a stale confirm racing a later churn event on
+    /// this same tablet is rejected, not marked done against moved-on state.
+    #[test]
+    fn mark_split_placing_done_rejects_epoch_mismatch() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: false,
+            },
+        );
+        let stale_epoch = m.tablets[&TabletId(2)].epoch.next();
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(2),
+                expected_epoch: stale_epoch,
+            }),
+            ApplyOutcome::Rejected("epoch mismatch")
+        );
+        assert!(!m.split_placing[&TabletId(2)].done);
+    }
+
+    /// `MarkSplitPlacingDone` rejects a tablet with no `split_placing` entry
+    /// at all — nothing to mark done (also covers a nonexistent tablet, via
+    /// the same "no such tablet" epoch-CAS gate every other tablet-mutating
+    /// command uses).
+    #[test]
+    fn mark_split_placing_done_rejects_when_no_entry_exists() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        let epoch = m.tablets[&TabletId(2)].epoch;
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(2),
+                expected_epoch: epoch,
+            }),
+            ApplyOutcome::Rejected("no split_placing entry for this tablet")
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::MarkSplitPlacingDone {
+                tablet: TabletId(999),
+                expected_epoch: Epoch::INITIAL,
+            }),
+            ApplyOutcome::Rejected("no such tablet")
+        );
+    }
+
+    /// `MarkSplitPlacingDone` is idempotent on an already-`done` entry — a
+    /// re-propose from the proposer's own retry is a harmless no-op, the
+    /// `MarkIndexBackfilled`/`RecordBackupTabletComplete` idiom.
+    #[test]
+    fn mark_split_placing_done_is_idempotent_on_an_already_done_entry() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: false,
+            },
+        );
+        let epoch = m.tablets[&TabletId(2)].epoch;
+        let cmd = MetaCommand::MarkSplitPlacingDone {
+            tablet: TabletId(2),
+            expected_epoch: epoch,
+        };
+        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&cmd), ApplyOutcome::NoOp);
+        assert!(m.split_placing[&TabletId(2)].done);
+    }
+
+    /// `Metadata` round-trips through JSON with a populated `split_placing`
+    /// catalog (ADR 0062 §2) — same-version WAL/snapshot fidelity for the
+    /// new collection, mirroring `metadata_round_trips_through_json_with_
+    /// populated_backups`' own shape.
+    #[test]
+    fn metadata_round_trips_through_json_with_populated_split_placing() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9), nid(10)]),
+                done: false,
+            },
+        );
+        m.split_placing.insert(
+            TabletId(3),
+            SplitPlacing {
+                target: None,
+                done: true,
+            },
+        );
+
+        let json = serde_json::to_string(&m).expect("serializes");
+        let round_tripped: Metadata = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(m, round_tripped);
     }
 
     /// ADR 0050 stage 4: `CutoverSplit` atomically activates both children

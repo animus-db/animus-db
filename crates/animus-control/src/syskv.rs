@@ -149,6 +149,13 @@ pub enum EntityKind {
     /// `MetaCommand::CutoverSplit`'s apply. The value is the JSON-encoded
     /// `SplitLineage`, same convention as `Tablet`/`Schema`/etc.
     SplitLineage,
+    /// An in-place split child's directed-Placing row
+    /// (`Metadata::split_placing`, ADR 0062 §2), keyed by the child's
+    /// [`TabletId`] — recorded by `MetaCommand::CutoverSplit`'s in-place
+    /// branch, updated only by `MetaCommand::MarkSplitPlacingDone` flipping
+    /// its `done` flag. The value is the JSON-encoded `SplitPlacing`, same
+    /// convention as [`SplitLineage`](Self::SplitLineage)/`Tablet`/`Schema`.
+    SplitPlacing,
     /// A backup catalog row (`Metadata::backups`, ADR 0059 §3), keyed by
     /// its opaque `BackupId` string — never a table name (that catalog's
     /// own "scar", see `Metadata::backups`' doc). The value is the
@@ -210,6 +217,7 @@ impl EntityKind {
             EntityKind::StreamShard => "stream_shard",
             EntityKind::IndexBackfill => "index_backfill",
             EntityKind::SplitLineage => "split_lineage",
+            EntityKind::SplitPlacing => "split_placing",
             EntityKind::Backup => "backup",
             EntityKind::BackupProgress => "backup_progress",
             EntityKind::Restore => "restore",
@@ -237,6 +245,7 @@ impl EntityKind {
             b"stream_shard" => EntityKind::StreamShard,
             b"index_backfill" => EntityKind::IndexBackfill,
             b"split_lineage" => EntityKind::SplitLineage,
+            b"split_placing" => EntityKind::SplitPlacing,
             b"backup" => EntityKind::Backup,
             b"backup_progress" => EntityKind::BackupProgress,
             b"restore" => EntityKind::Restore,
@@ -409,6 +418,14 @@ pub fn cp_member_addr_key(id: &NodeId) -> Vec<u8> {
 #[must_use]
 pub fn split_lineage_key(child: TabletId) -> Vec<u8> {
     entity_key(EntityKind::SplitLineage, &child.0.to_be_bytes())
+}
+
+/// An in-place split child [`TabletId`]'s key under
+/// [`EntityKind::SplitPlacing`] (ADR 0062 §2), recorded by
+/// `MetaCommand::CutoverSplit`'s in-place branch.
+#[must_use]
+pub fn split_placing_key(child: TabletId) -> Vec<u8> {
+    entity_key(EntityKind::SplitPlacing, &child.0.to_be_bytes())
 }
 
 /// A `(tablet, epoch)` pair's key under [`EntityKind::StreamShard`] (ADR

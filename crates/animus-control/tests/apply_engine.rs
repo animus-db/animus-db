@@ -99,7 +99,7 @@ fn run_scenario(seed: u64) {
             tablet: TabletId(1),
             table: Some("orders".to_string()),
             range: KeyRange::whole(),
-            replicas: vec![nid(10), nid(11)],
+            replicas: vec![nid(210), nid(211)],
         });
         nodes[leader].propose(MetaCommand::SetTabletPolicy {
             tablet: TabletId(1),
@@ -139,7 +139,7 @@ fn run_scenario(seed: u64) {
             hlc_range: (0, 100),
             count: 1,
             seal_wall_ms: 1_700_000_000_000,
-            replicas: vec![nid(10), nid(11)],
+            replicas: vec![nid(210), nid(211)],
             object_id: "orders/seed-scenario-L1/1/0/test".to_owned(),
         });
         sim.run_for(Duration::from_secs(1));
@@ -153,8 +153,8 @@ fn run_scenario(seed: u64) {
             expected_epoch: Epoch::INITIAL,
             split_key,
             children: [
-                (TabletId(2), vec![nid(10), nid(11)]),
-                (TabletId(3), vec![nid(10), nid(11)]),
+                (TabletId(2), vec![nid(210), nid(211)]),
+                (TabletId(3), vec![nid(210), nid(211)]),
             ],
         });
         sim.run_for(Duration::from_secs(1));
@@ -171,7 +171,7 @@ fn run_scenario(seed: u64) {
             hlc_range: (100, 200),
             count: 1,
             seal_wall_ms: 1_700_000_000_001,
-            replicas: vec![nid(10), nid(11)],
+            replicas: vec![nid(210), nid(211)],
             object_id: "orders/seed-scenario-L1/1/1/test".to_owned(),
         });
         nodes[leader].propose(MetaCommand::CutoverSplit {
@@ -188,7 +188,7 @@ fn run_scenario(seed: u64) {
             hlc_range: (200, 300),
             count: 1,
             seal_wall_ms: 1_700_000_000_002,
-            replicas: vec![nid(10), nid(11)],
+            replicas: vec![nid(210), nid(211)],
             object_id: "orders/seed-scenario-L1/2/0/test".to_owned(),
         });
         sim.run_for(Duration::from_secs(1));
@@ -207,8 +207,8 @@ fn run_scenario(seed: u64) {
             expected_epoch: Epoch::INITIAL.next(),
             split_key: vec![0xC0, 0, 0, 0, 0, 0, 0, 0],
             children: [
-                (TabletId(4), vec![nid(10), nid(11)]),
-                (TabletId(5), vec![nid(10), nid(11)]),
+                (TabletId(4), vec![nid(210), nid(211)]),
+                (TabletId(5), vec![nid(210), nid(211)]),
             ],
         });
         sim.run_for(Duration::from_secs(1));
@@ -270,5 +270,119 @@ fn run_scenario(seed: u64) {
                 "seed={seed} node {i}: diverged from the leader after restart"
             );
         }
+    });
+}
+
+/// ADR 0062 rung 2: the directed-Placing catalog (`Metadata::split_placing`)
+/// mirrors correctly through the same cache/engine oracle as every other
+/// per-entity collection — proven over an in-place split whose cutover-time
+/// placement decision genuinely differs from the parent's fork-inherited
+/// replicas (so a real `Some(target)` entry is written, not just the
+/// "already satisfying" no-op case), followed by `MarkSplitPlacingDone`.
+#[test]
+fn cache_matches_engine_through_directed_placing() {
+    for seed in [0x5CE0_0101u64, 0x5CE0_0102] {
+        run_directed_placing_scenario(seed);
+    }
+}
+
+fn run_directed_placing_scenario(seed: u64) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let mut sim = Simulator::new(seed);
+        let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
+        let nodes: Vec<RaftNode<SimEnv>> = NODES
+            .iter()
+            .map(|&id| {
+                RaftNode::start(
+                    sim.env(nid(id)),
+                    NODES.iter().copied().map(nid).collect(),
+                    engines[id as usize].clone(),
+                )
+            })
+            .collect();
+        sim.run_for(Duration::from_secs(2));
+        let leader = unique_leader(&nodes, seed);
+
+        // Three active placement candidates, disjoint from the control
+        // cluster's own node ids (0/1/2, `NODES` above) so an id never does
+        // double duty as both a control-Raft peer and a placement
+        // candidate. "n21" sorts ahead of "n210"/"n211" in plain string
+        // order (a shorter string is a prefix of, hence less than, any
+        // longer string it prefixes), so a fresh `select_replicas(RF=2)`
+        // prefers [n21, n210] over the parent's own fork-inherited
+        // [n210, n211] — a genuine, non-trivial Placing target.
+        //
+        // **Timing note**: none of these three ids ever heartbeats for
+        // real, so the leader's own failure detector's phantom-member
+        // hardening (`node.rs`, ADR 0030) gives each a synthetic
+        // observation the first tick it's seen `Active`-but-untracked, then
+        // marks it `Down` once `DETECT_TIMEOUT` (500ms) passes with no
+        // further heartbeat — this crate's own "do not drive load with
+        // `UpsertMember` for node ids that will never heartbeat" test-design
+        // gotcha (`animus-control/CLAUDE.md`'s Tests section). Every
+        // proposal through `CutoverSplit` is therefore issued back-to-back,
+        // in one batch, so the whole sequence commits and applies well
+        // inside that 500ms window — the three candidates are still `Active`
+        // at the one instant that matters (`CutoverSplit`'s own apply).
+        nodes[leader].propose(upsert(21));
+        nodes[leader].propose(upsert(210));
+        nodes[leader].propose(upsert(211));
+        nodes[leader].propose(MetaCommand::CreateTableSchema {
+            table: "widgets".to_string(),
+            schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
+        });
+        nodes[leader].propose(MetaCommand::CreateTablet {
+            tablet: TabletId(100),
+            table: Some("widgets".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(210), nid(211)],
+        });
+        nodes[leader].propose(MetaCommand::SetTabletPolicy {
+            tablet: TabletId(100),
+            policy: Some(PlacementPolicy::simple("p", 2)),
+        });
+        nodes[leader].propose(MetaCommand::BeginSplitInPlace {
+            parent: TabletId(100),
+            expected_epoch: Epoch::INITIAL,
+            split_key: vec![0x80],
+            children: [
+                (TabletId(101), vec![nid(210), nid(211)]),
+                (TabletId(102), vec![nid(210), nid(211)]),
+            ],
+        });
+        nodes[leader].propose(MetaCommand::CutoverSplit {
+            parent: TabletId(100),
+            expected_epoch: Epoch::INITIAL.next(),
+            cutover_wall_ms: 1_700_000_000_100,
+        });
+        sim.run_for(Duration::from_millis(300));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after in-place CutoverSplit").await;
+
+        // Both children forked onto the parent's own replicas, but a fresh
+        // policy-satisfying target prefers a different set — a real,
+        // written `split_placing` obligation for each child.
+        let meta = nodes[leader].metadata();
+        for child in [TabletId(101), TabletId(102)] {
+            let entry = meta.split_placing.get(&child).unwrap_or_else(|| {
+                panic!("seed={seed}: expected a split_placing entry for {child:?}")
+            });
+            assert_eq!(entry.target, Some(vec![nid(21), nid(210)]));
+            assert!(!entry.done);
+        }
+
+        nodes[leader].propose(MetaCommand::MarkSplitPlacingDone {
+            tablet: TabletId(101),
+            expected_epoch: Epoch::INITIAL.next(),
+        });
+        sim.run_for(Duration::from_secs(1));
+        assert_cache_matches_engine(&nodes, &engines, seed, "after MarkSplitPlacingDone").await;
+
+        let meta = nodes[leader].metadata();
+        assert!(meta.split_placing[&TabletId(101)].done);
+        assert!(!meta.split_placing[&TabletId(102)].done);
     });
 }
