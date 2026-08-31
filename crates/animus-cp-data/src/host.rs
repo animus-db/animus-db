@@ -73,10 +73,18 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
     /// engine at `target` — the engine-commit half of the group-mint-at-
     /// apply G4 crash-idempotency contract (see `host.rs`'s
     /// `materialize_split_child`'s own doc for the full sequencing). Backed
-    /// by `LsmEngine::clone_to`/`MemoryEngine::clone_to` (ADR 0058 rung 2) —
-    /// full-engine clone only, no kind filtering or key-range trimming
-    /// (that's this module's own `trim_split_child`, run by the caller
-    /// immediately after).
+    /// by `LsmEngine::clone_to_filtered`/`MemoryEngine::clone_to` (ADR 0058
+    /// rung 2, whole-file assignment closed the fork's own rung-2 deferral —
+    /// see `LsmEngine::clone_to_filtered`'s own doc): `keep` is `target`'s
+    /// own physical keep-set (BASE/LSI/FOOTPRINT scoped to the child's own
+    /// range — nothing of CHANGE/CURSOR, which a child is always born
+    /// empty of), the same set [`materialize_split_child`] derives once and
+    /// passes down. An implementor is free to ignore `keep` and clone the
+    /// whole engine (`MemoryTabletEngines` does — there is no per-file dead
+    /// space to save for an in-memory engine, and the caller's own
+    /// `trim_split_child` still runs immediately after and makes the result
+    /// correct either way); `keep` is an optimization hint, never a
+    /// correctness requirement of this trait.
     ///
     /// **`source` is the caller's own ALREADY-OPEN handle, never a bare
     /// [`TabletId`] this method re-opens itself** — deliberately: the parent
@@ -91,7 +99,12 @@ pub trait EngineFactory<S: StorageEngine>: Send + Sync {
     /// (this method does not itself check `probe(target)` — the caller
     /// consults it first, per the G4 contract, to skip re-cloning after a
     /// crash between the engine commit and the group commit).
-    async fn clone_engine(&self, source: &S, target: TabletId) -> Result<S, String>;
+    async fn clone_engine(
+        &self,
+        source: &S,
+        target: TabletId,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<S, String>;
 }
 
 /// The [`MemoryEngine`] implementation of [`EngineFactory`]: an in-memory
@@ -151,7 +164,11 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
         &self,
         source: &MemoryEngine,
         target: TabletId,
+        _keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<MemoryEngine, String> {
+        // No per-file dead space to save for an in-memory engine (see the
+        // trait's own doc) — `trim_split_child` makes the result correct
+        // either way, so this clones the whole thing unconditionally.
         let cloned = source.clone_to();
         self.engines
             .lock()
@@ -1281,7 +1298,28 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 self.state.split_forming.remove(&child.id);
                 return;
             };
-            let engine = match self.factory.clone_engine(&parent_engine, child.id).await {
+            // The child's own keep-set: its declared range within
+            // BASE/LSI/FOOTPRINT (the sibling's own half of each is what
+            // `clone_engine`'s whole-file assignment gets to skip linking
+            // entirely — see that method's own doc), nothing of
+            // CHANGE/CURSOR (a child is always born with an empty change
+            // log — `trim_split_child`, below, still deletes those two
+            // scopes unconditionally as a correctness backstop, not because
+            // this keep-set could ever be wrong about them).
+            let keep: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+                [crate::KIND_BASE, crate::KIND_LSI, crate::KIND_FOOTPRINT]
+                    .into_iter()
+                    .map(|kind| {
+                        StorageScope::new(range.clone())
+                            .with_kind(kind)
+                            .physical_bounds()
+                    })
+                    .collect();
+            let engine = match self
+                .factory
+                .clone_engine(&parent_engine, child.id, &keep)
+                .await
+            {
                 Ok(engine) => engine,
                 Err(e) => {
                     tracing::warn!(
