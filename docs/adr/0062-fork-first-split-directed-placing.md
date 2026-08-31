@@ -1,8 +1,15 @@
 # ADR 0062 — Fork-first in-place split with directed placing
 
-- **Status:** Proposed — design-only, not scheduled. Every decision below is
-  maintainer-signed-off (Guillaume, 2026-08-31); implementation is future
-  work (see Sequencing).
+- **Status:** Accepted — implemented (rungs 1–7, all as-built notes below;
+  the Sequencing rungs' own numbering starts at the `Metadata::
+  split_placing` groundwork, landed as `a26de6c`). Rung 7 (e2e + bench
+  re-validation) closed this ADR's own "not predicted or asserted here"
+  deferral in its Testing plan. **Known limitation carried forward, not
+  closed by this ADR**: directed Placing's own convergence machinery
+  (`reconfigure_step`, ADR 0058 Train 1, unmodified here) reliably
+  converges only for a one-replica-difference target; a two-of-three
+  target can oscillate indefinitely (issue #513, filed during rung 6,
+  fixed by neither this ADR nor this rung — see the amendment below).
 - **Date:** 2026-08-31
 - **Supersedes:** [ADR 0058](0058-learner-replicas-in-place-split.md) Train
   2 Stage 1's fork **F5** half only — the fused split+move, where
@@ -801,3 +808,146 @@ design never got: the layout argument that justified fusing movement with
 placement for a *copy*-based split does not hold for a *fork*-based one,
 the same shape of finding ADR 0058 itself made about ADR 0028's
 shared-engine layout no longer constraining ADR 0050's private-engine one.
+
+## Amendment (2026-08-31): rung 7 — e2e + bench re-validation, as-built
+
+**Rungs implemented.** All seven of this ADR's Sequencing rungs landed:
+
+| Commit | What |
+|---|---|
+| `6c43372` | This ADR, accepted in design |
+| `a26de6c` | `animus-control`: `Metadata::split_placing` + `MarkSplitPlacingDone` (Sequencing rung 1) |
+| `001c6b4` | `animus-control`: `reconcile_loop` split-placing phase + `rebalance_placement` exclusion (rung 4) |
+| `2d2f8ba` | `animusd`/`animus-cp-data`: fork-first — children inherit parent replicas (rungs 2–3) |
+| `de919df` | `animus-cp-data`: delete Stage 1/2 learner-recruitment machinery, fork-first corpus (rung 2, "delete Stage 1/2") |
+| `2a2e89c` | `animusd`: split-placing completion loop + status surface (rung 5) |
+| `645fbb5` | `animusd`: harden split-placing completion e2e (rung 5 follow-up — the settle-window fix, below) |
+
+(Rung 6, the documentation-only closing sweep of ADR 0058's own F5/Stage
+1-2 language, is folded into this amendment and the `crates/animusd/
+CLAUDE.md`/`crates/animus-cp-data/CLAUDE.md` updates that shipped
+alongside the commits above, rather than a separate commit.)
+
+**The settle-window product bug found and fixed landing rung 5** (the
+completion loop, `animusd::split_placing_completion`): a first, literal
+implementation of this ADR's own §3 pseudocode marked a child's Placing
+`done` the instant `group.config() == t.replicas`, which is **trivially
+true on the very first post-cutover tick** (a fork-first child is born
+already sitting on that value) — before the control-plane's own
+`reconcile_loop` (§2's third phase) had a single chance to move it toward
+its real, differing `split_placing[child].target`. The fix requires the
+converged observation to hold continuously for a settle window
+(`SPLIT_PLACING_DONE_SETTLE`) before trusting it, mirroring the identical
+class of fix ADR 0058's own in-place cutover driver already used
+(`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`) against an analogous race. Full
+incident writeup, including the follow-up hardening of the test itself
+(a one-shot assert on an eventually-converging value, fixed in `645fbb5`):
+`docs/engineering-lessons.md`'s "A 'just compare live state to the target'
+convergence check races the very proposer that sets the target" entry and
+its "Follow-up hardening" successor (both filed under this ADR's rung 6).
+
+**Known limitation, not closed here (issue #513).** Validating the fix
+above surfaced a second, **pre-existing**, unrelated defect in
+`reconfigure_step` itself (ADR 0058 Train 1, unmodified by this ADR):
+driving live Raft membership toward a target that replaces **two** of
+three replicas at once can oscillate indefinitely (reach the transient
+over-replicated 5-voter intermediate state, then partially revert,
+repeating) rather than converge — confirmed unrelated to this ADR's own
+completion loop (reproduces with zero `MarkSplitPlacingDone` proposes
+fired). A one-replica-difference target converges cleanly. Filed as
+[issue #513](https://github.com/animus-db/animus-db/issues/513); `tests/
+split_placing_completion.rs` deliberately exercises only the
+one-replica-difference shape, with its own doc comment naming the gap.
+**This means directed Placing today reliably relocates a child only when
+its fresh `select_replicas` target differs from the parent-inherited set
+by one replica** — a two-(or-more)-replica-difference target (plausible
+on a freshly-grown or rebalancing cluster) can stall in the same
+oscillation `reconfigure_step` already has for any other caller. Fixing
+#513 is out of this ADR's scope and widens Placing's own reach with no
+further change here once it lands.
+
+**E2e re-validation.** `cargo test -p animusd --test inplace_split_e2e`
+(both tests — the paced-continuous-writer fork/cutover test and the
+streams-shard-lineage test) run 3 times as independent invocations: **3/3
+green**, no flake, matching ADR 0058's own rung-8/rung-4 soak precedent
+for this file. `cargo test -p animusd --test split_placing_completion`
+(the rung-5-hardened binary) reran once: **2/2 tests green**
+(`placing_relocates_a_child_off_the_parents_original_nodes_and_the_
+completion_loop_marks_it_done`, `mark_split_placing_done_tolerates_a_
+stale_or_duplicate_relayed_propose`).
+
+**Bench, both configurations, same host, same session.** Per this ADR's
+own Testing plan ("re-run and publish fresh numbers... as a future
+as-built amendment"), `animusd/tests/inplace_split_bench.rs`'s existing
+bench (byte-for-byte the same workload `split_build.rs`'s copy-based bench
+and ADR 0058's own rung-8 in-place bench use: 2,000 rows, 256-byte values,
+3 nodes, RF 3) was run 3× against this branch's HEAD (`645fbb5`,
+fork-first) and 3× against a worktree checked out at `6d2777d` — the
+commit immediately preceding this ADR (`6c43372`), i.e. ADR 0058's own
+Stage 1/2 F5-learner-recruitment in-place design — on this same host, back
+to back, in this same session:
+
+| | fork-first (this ADR), run1/run2/run3 | pre-ADR-0062 baseline (`6d2777d`), run1/run2/run3 | fork-first median | baseline median |
+|---|---|---|---|---|
+| fork-to-children-Active wall clock | 1.347s / 1.568s / 1.152s | 1.149s / 1.202s / 1.108s | **1.347s** | **1.149s** |
+| write blip (max PUT) | 616.1ms / 840.7ms / 476.6ms | 418.8ms / 473.5ms / 371.8ms | **616.1ms** | **418.8ms** |
+| put retries needed | 0 / 0 / 0 | 0 / 0 / 0 | **0** | **0** |
+
+**This bench does not show the improvement this ADR's own structural
+argument predicts, and that is reported honestly rather than reconciled
+away — with a specific, checkable reason why.** The bench this ADR's
+Testing plan names is deliberately identical in shape to ADR 0058's own
+rung-8 bench: **3 nodes, RF 3**. At that scale, `select_replicas`/
+`select_replicas_balanced` has no node outside the parent's own current
+3-member replica set to ever recruit — both children's placement-chosen
+"final home" and the parent's own current replicas are, of structural
+necessity, the identical set. That is exactly the precondition under
+which this ADR's own central claim (§ Rationale: "the fork instant is
+decoupled from cluster size or topology... F5's fork can only proceed
+once every one of its (possibly disjoint, possibly off-node) recruited
+homes has caught up") has **nothing to demonstrate** — the pre-ADR-0062
+baseline's own Stage 1/2 learner-recruitment-and-catch-up window is
+recruiting learners that are already existing, already-caught-up voters,
+so it pays none of the cross-cluster `InstallSnapshot` cost the ADR's
+Context section documents as F5's actual cost driver. Reproducing that
+win would need a bench cluster wider than RF (the same shape `tests/
+split_placing_completion.rs`'s own e2e already uses to prove Placing
+relocates data at all) — out of scope for this rung, which re-runs the
+ADR's own named bench rather than authoring a new one.
+
+Within that acknowledged limitation, the two honest findings from the
+numbers actually measured:
+
+- **Fork-to-Active wall clock is marginally higher under fork-first**
+  (1.347s vs. 1.149s median, ~17% up) — consistent with a fork-first
+  child briefly running the ordinary `reconfigure_step` convergence path
+  its own directed-Placing phase feeds (a same-set `CasTabletReplicas`/
+  no-op check every `reconcile_loop` tick for the duration any
+  `split_placing` entry stays un-`done`) that the pre-ADR-0062 baseline's
+  design never runs at all, on top of near-identical fork/bootstrap costs
+  at N=3. Not confirmed by profiling — flagged as a plausible explanation,
+  not investigated further (out of scope for a bench-and-report rung).
+- **Write blip is higher under fork-first too** (616ms vs. 419ms median,
+  ~47% up), with **zero retries in every run of both configurations** —
+  the same "single slow request, not a refuse-and-retry pattern" shape
+  ADR 0058's own rung-3→rung-4 write-blip investigation already
+  characterized for this bench, so the elevated number here is plausibly
+  the same `cp_route` election-wait/first-materialization cost that
+  investigation chased, not a new fork-first-specific mechanism — again
+  not chased further here.
+
+**Caveats, stated plainly**: this is a **shared, contended host**
+(observed load average ≈2.0 across 4 vCPUs while these runs executed) —
+none of the individual numbers above should be read as a precise,
+reproducible constant, only as same-session, same-host, directionally
+comparable figures per this repo's own bench-comparison discipline. N=3
+per configuration is the minimum this rung's instructions called for, not
+a statistically powered sample — the run-to-run spread within each
+configuration (fork-first's write blip alone spans 476.6ms–840.7ms) is
+comparable in magnitude to the between-configuration delta the table
+reports. Combined with the structural RF=3 ceiling above, this bench run
+neither confirms nor refutes the ADR's core wall-clock claim; it
+positively rules out a regression in write availability (zero retries,
+both configurations, every run) and leaves the fork-to-Active/write-blip
+comparison as a genuinely open question a wider-than-RF bench would need
+to answer.
