@@ -13673,3 +13673,50 @@ regression coverage for this exact race
 (`cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`) is a
 real-thread `ProdEnv` e2e test whose relevant window is a small, non-
 deterministic timing race, unsuitable as the *only* proof the fix holds.
+
+## A branch-selection existence check needs the same read-your-writes barrier as a self-confirm — not just the proposer's own poll (issues #406/#450, `animusd::admin_add_control_member`)
+
+The general "confirm a just-proposed effect via `engine_applied_index()`,
+never a raw cache re-read" lesson is already logged several times over in
+this file (grep the term) — always framed as *a proposer confirming its own
+write*. `admin_add_control_member`'s bug is the same staleness hazard
+wearing a different hat: it isn't confirming anything it just proposed —
+it reads `metadata_cached()` once to decide **which branch to take**
+("is `node` already registered, or genuinely unclaimed?"), where the fact
+it's checking for is *someone else's* concurrent commit (the target
+control-only node's own self-registration, landing on this same leader
+just beforehand). Because a control-only registration never claims
+`Metadata::members` by design (ADR 0040 PR4's own carve-out — see
+`animus-control::meta.rs`'s `RegisterNode` doc), the old gate
+(`meta.members.contains_key`) was *structurally* always false for this
+node shape, so the "genuinely unclaimed" branch ran on **every** call and
+re-derived a fresh `NodeAddrs` from the same stale `metadata_cached()` —
+empty `client`/`intra`/`admin` fields whenever this leader's own ADR 0038
+apply task hadn't yet caught up to the real registration's own commit,
+producing a permanent CAS collision (or, worse, a durable blank address
+book if the malformed proposal won the race). Two independent fixes were
+needed, not one: (1) the gate itself must consult `node_addrs`, the
+command's *actual* CAS key, not `members` alone; (2) before evaluating
+either, the call must bound-wait for `engine_applied_index() >=
+commit_index()` **on this exact leader** — a local read-your-writes
+barrier against *this leader's own* Raft log, not the proposer's own
+command, closing the dominant race (a self-registration relayed to/
+proposed on this same leader moments earlier) outright, and narrowing what
+remains to the genuinely irreducible "hasn't reached this leader's log at
+all yet" case. Fix (1) alone measurably narrows the bug but does **not**
+close it: in the reproduction built to prove this, checking `node_addrs`
+without also adding the wait still collided reliably, because the leader's
+own cache had **no trace under either key** at read time — the commit
+itself, not just the label it's filed under, was the missing fact.
+**General lesson: any local snapshot read used to gate a decision about
+"has some other actor already done X" needs the identical staleness
+audit a self-confirm poll gets, even when the caller never proposed
+anything itself and has no `propose_and_await`-shaped call site to remind
+it** — the caller-doesn't-know-to-wait failure mode is easy to miss
+because nothing in the code *looks* like a write path. Reproducing this
+deterministically in a real `ProdEnv` test needed the same technique as
+the `InstallSnapshot`-window entry just above: not a fixed sleep or
+artificial load, but a condition-based search polling `GET /admin/raft`'s
+`commit_index`/`engine_applied_index` fields directly for the instant
+where commit has advanced but apply hasn't, then firing the racing call at
+exactly that reading.

@@ -2793,7 +2793,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories. **Self-removal's
+  self-registration/admin-action-clobber war stories. **`admin_add_control_
+  member`'s "already registered?" gate must check `Metadata::node_addrs`,
+  never `members` alone, and must bound-wait for this leader's own
+  `engine_applied_index() >= commit_index()` before reading either
+  (issues #406/#450)**: a control-only registration never claims `members`
+  by design (the bullet above), so gating on `members` alone made the
+  "genuinely unclaimed" branch run on *every* call for this node shape,
+  re-deriving a `NodeAddrs` from a `metadata_cached()` snapshot that can be
+  lagging this leader's own already-committed Raft log (ADR 0038's async
+  apply task) — a permanent CAS collision, or worse, a durably blank
+  address book if the malformed guess won the race. See
+  `docs/engineering-lessons.md`'s matching entry for the full account,
+  including why the `node_addrs` gate fix alone (without the wait) still
+  measurably collides. **Self-removal's
   leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
   `admin_remove_control_member`'s `node == my_id` branch calls
   `RaftCore::transfer_leadership` exactly once — if the target's
