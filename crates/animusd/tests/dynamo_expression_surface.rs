@@ -131,7 +131,36 @@ async fn setup() -> (tempfile::TempDir, Vec<Node>, Vec<SocketAddr>) {
                               {"AttributeName":"score","KeyType":"RANGE"}]}]}"#,
     )
     .await;
-    assert_eq!(status, 200, "CreateTable failed: {body}");
+    // A prior attempt can have durably committed the schema and then timed
+    // out server-side in `await_table_serveable` (surfaced to `dynamo_retry`
+    // as a retryable 500) before it could ack — the identical retried
+    // `CreateTable` then legitimately gets a `ResourceInUseException` (the
+    // table already exists), which is success for this fixture's purposes,
+    // not a hard failure (issue #461).
+    let already_exists = status == 400 && body.contains("ResourceInUseException");
+    assert!(
+        status == 200 || already_exists,
+        "CreateTable failed: {body}"
+    );
+    if already_exists {
+        // Unlike a fresh 200, this reply did not go through the server's own
+        // `await_table_serveable` wait (the duplicate-name check short-
+        // circuits ahead of it) — the table's schema exists, but its tablet
+        // may not yet be serveable. Converged-or-timeout probe, mirroring
+        // this file's own `dynamo_retry` (retry a transient 500 for up to
+        // 20s) rather than a fixed-deadline one-shot assert.
+        let (status, body) = dynamo_retry(
+            addrs[0],
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"events","ConsistentRead":true,
+                "Key":{"pk":{"S":"__readiness_probe__"},"sk":{"S":"__readiness_probe__"}}}"#,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "table `events` did not become serveable after ResourceInUseException: {body}"
+        );
+    }
 
     for i in 0..6 {
         let parity = if i % 2 == 0 { "even" } else { "odd" };

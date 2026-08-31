@@ -7909,6 +7909,73 @@ mod tests {
         assert!(!m.members.contains_key(&nid(906)));
     }
 
+    /// **`animusd::ClientCtx::admin_add_control_member` regression companion
+    /// (issue #406/#450)**: proves, at the state-machine level, the
+    /// guarantee that fix relies on — once a control-only id's own
+    /// `RegisterNode` self-registration has claimed `node_addrs` (with no
+    /// `members` row, per the control-only carve-out above), a caller that
+    /// re-observed the claim from a lagging local cache and only knows one
+    /// field changed (here, `internal` — the admin action's whole purpose)
+    /// can repair it via `RegisterNodeAddrs`, merging onto the entry it did
+    /// see, and this **never** collides — only `RegisterNode`'s own
+    /// claim-path CAS can ever produce the "already claimed by a different
+    /// registration" rejection (see
+    /// `register_node_rejects_a_different_registration_for_a_claimed_id_
+    /// then_a_distinct_id_succeeds` above for that still-correct,
+    /// contrasting case: a caller that mistakes an already-claimed id for a
+    /// fresh one and goes through `RegisterNode` again with a *different*
+    /// `NodeAddrs` is, correctly, rejected).
+    #[test]
+    fn register_node_addrs_repairs_a_control_only_registration_without_ever_colliding() {
+        let mut m = Metadata::default();
+        let original = NodeAddrs {
+            internal: "127.0.0.1:9907".to_string(),
+            client: "127.0.0.1:9007".to_string(),
+            admin: "127.0.0.1:9507".to_string(),
+            intra: "127.0.0.1:9607".to_string(),
+            role: "control".to_string(),
+        };
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(907),
+                addrs: original.clone(),
+                labels: BTreeMap::new(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            !m.members.contains_key(&nid(907)),
+            "test premise: a control-only registration must never claim membership"
+        );
+
+        // The repair: merge the one field the caller actually knows changed
+        // onto the full entry it read (never a fresh/empty `NodeAddrs`) —
+        // exactly `admin_add_control_member`'s fixed already-registered
+        // branch.
+        let mut repaired = original.clone();
+        repaired.internal = "127.0.0.1:9999".to_string();
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: nid(907),
+                addrs: repaired.clone(),
+            }),
+            ApplyOutcome::Applied,
+            "RegisterNodeAddrs must repair an existing control-only entry, never collide"
+        );
+        assert_eq!(m.node_addrs.get(&nid(907)), Some(&repaired));
+        assert!(!m.members.contains_key(&nid(907)));
+
+        // Re-applying the identical repaired addrs is a clean NoOp — no
+        // second "collision" surface exists on this path at all.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNodeAddrs {
+                node: nid(907),
+                addrs: repaired,
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
     /// **ADR 0040 PR4 tightening**: `RegisterNodeAddrs` is update-only — a
     /// totally unclaimed id (absent from both `members` and `node_addrs`)
     /// is rejected, not silently registered. `RegisterNode` is the sole

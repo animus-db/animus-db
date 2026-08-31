@@ -295,10 +295,14 @@ async fn base_query_paginates_a_partition_without_duplicates_or_gaps() {
     // onward (including a field that happens to sort after it,
     // `ScannedCount`) to keep a marker search over the combined pages from
     // double-counting the cursor's own echoed attribute values.
+    // `ConsistentRead: true` (ADR 0055/issue #438): this assertion depends on
+    // read-your-writes over `setup()`'s own six `PutItem`s, which the wire
+    // default (eventually-consistent, replica-local) does not guarantee even
+    // on the same node — the async apply task can lag the write's own 200.
     let (status, page1) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","Limit":2,
+        r#"{"TableName":"events","Limit":2,"ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )
@@ -337,12 +341,19 @@ async fn base_query_paginates_a_partition_without_duplicates_or_gaps() {
 async fn final_page_carries_no_last_evaluated_key() {
     let (_dir, _nodes, addrs) = setup().await;
 
+    // `ConsistentRead: true` (ADR 0055/issue #438): this test is about
+    // pagination mechanics (does the final page carry a cursor), not
+    // read-path freshness — without it, the wire default's eventually-
+    // consistent replica-local path can miss the last of `setup()`'s six
+    // sequential `PutItem`s if the async apply task lags the write's own
+    // 200, undercounting `Count` and flaking the assertions below.
+    //
     // Limit 6 exactly matches the partition's size: truncated == false, so
     // no cursor at all, even though the count hits the limit exactly.
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","Limit":6,
+        r#"{"TableName":"events","Limit":6,"ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )
@@ -355,7 +366,7 @@ async fn final_page_carries_no_last_evaluated_key() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","Limit":100,
+        r#"{"TableName":"events","Limit":100,"ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )
@@ -555,10 +566,12 @@ async fn cross_index_cursor_mismatch_is_rejected() {
     let (_dir, _nodes, addrs) = setup().await;
 
     // A base-table cursor (`{pk,sk}`), from a truncated base Query page.
+    // `ConsistentRead: true` (ADR 0055/issue #438): the cursor extraction
+    // below depends on read-your-writes over `setup()`'s `PutItem`s.
     let (status, page1) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","Limit":2,
+        r#"{"TableName":"events","Limit":2,"ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )
@@ -579,10 +592,12 @@ async fn cross_index_cursor_mismatch_is_rejected() {
     let gsi_cursor = extract_last_evaluated_key(&gsi_page1).expect("truncated page has a cursor");
 
     // An LSI cursor (`{score,pk,sk}`), from a truncated LSI Query page.
+    // `ConsistentRead: true` — legal on an LSI (unlike a GSI) and needed for
+    // the same read-your-writes reason as the base cursor above.
     let (status, lsi_page1) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","IndexName":"by-score","Limit":2,
+        r#"{"TableName":"events","IndexName":"by-score","Limit":2,"ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
     )

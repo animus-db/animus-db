@@ -6941,8 +6941,62 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
+        // leader's own `metadata_cached()` is gated on its own async apply
+        // task (ADR 0038), which can lag its own already-committed Raft log
+        // by an unbounded amount under load — `RaftNode::metadata`'s own doc
+        // says as much ("a caller that needs read-your-writes should
+        // confirm via ... `engine_applied_index`"). The dominant #406/#450
+        // failure mode is exactly this, on THIS leader specifically: a
+        // `RegisterNode` for `node` was proposed on (or relayed to) this
+        // same leader moments ago — the target's own concurrent
+        // self-registration racing this very call — and is already
+        // committed to this leader's own log, just not yet reflected in its
+        // local cache. Bound-wait for this leader's own apply task to catch
+        // up to whatever is *already committed here right now* before
+        // deciding anything below, so the gate and the merge-read that
+        // follows are never stale relative to a fact this leader itself has
+        // already decided. This does **not** wait for an entry that has not
+        // reached this leader's log at all yet (e.g. an operator confirming
+        // "up" via a signal other than this exact leader's own state, then
+        // calling immediately) — see the residual note further down.
+        {
+            let commit_at_call = leader.commit_index();
+            let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+            while leader.engine_applied_index() < commit_at_call && self.env.now() < deadline {
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
+
         let meta = self.control.metadata_cached();
-        if meta.members.contains_key(&node) {
+        // **Issue #406/#450 (Bug B)**: this must NOT gate on `meta.members`
+        // alone. A control-only node's own self-registration (`RegisterNode`
+        // with `addrs.role == "control"`) never claims a `members` row by
+        // design (`animus-control::meta.rs`'s own doc on
+        // `MetaCommand::RegisterNode` — "never claim `members` for a
+        // control-only registration"), so `meta.members.contains_key(&node)`
+        // was *always* false for exactly the node shape this admin action
+        // exists to promote, forcing every control-only re-add through the
+        // "genuinely unclaimed" branch below regardless of whether this
+        // leader's own (ADR 0038 apply-task-lagged) local cache had already
+        // seen the node's real self-registration. That branch re-derives a
+        // fresh `NodeAddrs` from this same possibly-stale snapshot — if the
+        // snapshot hadn't caught up yet, the reconstruction has empty
+        // `client`/`intra`/`admin` fields, and once the node's own (earlier,
+        // already-committed) real registration and this malformed one both
+        // eventually apply in log order, the mismatch is a permanent
+        // "already claimed by a different registration" collision — or,
+        // worse, if this malformed proposal's log entry happens to commit
+        // *before* the node's own real self-registration is even proposed,
+        // it wins the CAS and the node is left with a durably blank address
+        // book. Checking `node_addrs` too (the actual claim, `RegisterNode`'s
+        // own CAS key — see that command's doc) closes this for every case
+        // where this leader's local cache has observed the claim under
+        // *either* name, leaving only the narrower "this leader's cache has
+        // seen no trace of the id at all yet" window, not "always" for every
+        // control-only id. See `docs/engineering-lessons.md` for the general
+        // lesson.
+        if meta.members.contains_key(&node) || meta.node_addrs.contains_key(&node) {
             // Already a registered member (its own self-registration, or a
             // prior admin action) — just make sure its `internal` address
             // (this action's whole purpose) matches `addr`. Never touches
@@ -6967,13 +7021,28 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
         } else {
-            // Genuinely unclaimed: the sole claim path (ADR 0040 Decision C).
+            // Genuinely unclaimed (per this leader's own local cache — see
+            // the gate above): the sole claim path (ADR 0040 Decision C).
             // A **minted** id re-mints and retries on collision
             // (astronomically unlikely, but structurally possible — nothing
             // needs rebinding, since ports are never derived from ids); a
             // **proposed** id fails loudly on the first collision instead —
             // an operator/config conflict is a real problem to report, not
-            // to paper over by silently trying something else.
+            // to paper over by silently trying something else. **Residual
+            // #406/#450 window, now much narrower**: the read-your-writes
+            // barrier above closes the race for anything already committed
+            // to *this leader's own* Raft log at call time — which is the
+            // dominant #406/#450 shape (a target's self-registration
+            // relayed to, or proposed on, this exact leader moments
+            // earlier). What remains is genuinely irreducible without
+            // waiting on information this leader hasn't received at all
+            // yet: a self-registration proposed on/relayed to a *different*
+            // node (e.g. mid-leadership-change) that has not yet reached
+            // this leader's log by the time this call's own barrier above
+            // finished waiting. A caller that first confirms the target's
+            // own self-registration is visible on *this exact* leader
+            // before calling (the documented ADR 0037 §7 runbook) does not
+            // hit this window in practice.
             let mut attempts_left = if minted { MAX_MINT_ATTEMPTS } else { 1 };
             loop {
                 // Merge into whatever address-book entry this id's own

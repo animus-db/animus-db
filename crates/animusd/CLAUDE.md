@@ -1879,6 +1879,18 @@ this call performed) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 
+`grow_stream`'s per-tablet loop walks a `Metadata` *snapshot* taken once up
+front but awaits real Raft/network activity per iteration, so a tablet
+captured `Active` in that snapshot can be retired by a **cascade** split
+(one tablet's cutover racing another's still-pending turn in the same
+walk) before this loop reaches it — issue #454. `grow_stream_tablet`'s own
+"no such tablet" lookup miss for exactly that tablet is not a real error:
+it means the split this call would have triggered already happened, one
+beat early. `schema::classify_grow_response` folds that exact message into
+the identical `STREAM_GROW_MID_SPLIT` skip, deliberately narrow (only that
+literal message, only on `grow_stream`'s own call path) so a genuinely
+unknown tablet id elsewhere (e.g. `POST /admin/tablet/split`) still errors.
+
 **Split is the ADR 0050 copy-based workflow's METADATA half (Train B rung
 3)**: `trigger_split` — still the one choke point every surface calls —
 now proposes `MetaCommand::BeginSplit` (parent → `Splitting`, still fully
@@ -2834,7 +2846,20 @@ route below the edge through the same `ClientCtx` CP primitives.
   `control-remove` as part of decommission," never "skip its safety
   checks"). See ADR 0037 (and ADR 0040's amendment on it) for the full
   design, and `docs/engineering-lessons.md` for the id-space-mismatch and
-  self-registration/admin-action-clobber war stories. **Self-removal's
+  self-registration/admin-action-clobber war stories. **`admin_add_control_
+  member`'s "already registered?" gate must check `Metadata::node_addrs`,
+  never `members` alone, and must bound-wait for this leader's own
+  `engine_applied_index() >= commit_index()` before reading either
+  (issues #406/#450)**: a control-only registration never claims `members`
+  by design (the bullet above), so gating on `members` alone made the
+  "genuinely unclaimed" branch run on *every* call for this node shape,
+  re-deriving a `NodeAddrs` from a `metadata_cached()` snapshot that can be
+  lagging this leader's own already-committed Raft log (ADR 0038's async
+  apply task) — a permanent CAS collision, or worse, a durably blank
+  address book if the malformed guess won the race. See
+  `docs/engineering-lessons.md`'s matching entry for the full account,
+  including why the `node_addrs` gate fix alone (without the wait) still
+  measurably collides. **Self-removal's
   leadership-transfer arm is one-shot, not auto-retried (issue #405)**:
   `admin_remove_control_member`'s `node == my_id` branch calls
   `RaftCore::transfer_leadership` exactly once — if the target's

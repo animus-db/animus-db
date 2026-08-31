@@ -5,30 +5,77 @@ on:
     types: [opened, synchronize, reopened]
 
 # One check per PR; a rapid re-push supersedes the run still in flight, which
-# is only re-reading the same commit list.
+# is only re-reading the same commit range.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  # get-pr-commits lists the PR's commits via the REST API; without this the
-  # restricted default token gets "Resource not accessible by integration".
-  pull-requests: read
 
 jobs:
   dco:
     name: DCO sign-off check
     runs-on: ubuntu-latest
     steps:
-      # tim-actions/dco does not fetch the PR's commits itself: its `commits`
-      # input is required, and without it the action JSON-parses an empty
-      # string and fails every PR with "Unexpected end of JSON input".
-      - name: Get PR commits
-        id: get-pr-commits
-        uses: tim-actions/get-pr-commits@v1.3.1
+      # Full history so `git merge-base` below can see both the PR's base
+      # commit and its own tip, for a fork PR as much as a same-repo one:
+      # GitHub mirrors a PR's commits into the base repo's own ref
+      # namespace, so fetching from `origin` (the base repo) is enough even
+      # when the commits themselves originated in a fork.
+      - name: Check out PR head with full history
+        uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: tim-actions/dco@v1.1.0
-        with:
-          commits: ${{ steps.get-pr-commits.outputs.commits }}
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Replaces tim-actions/get-pr-commits + tim-actions/dco (issue #466):
+      # those actions round-trip every commit message through argv/env,
+      # which this repo has seen fail with "Argument list too long" on
+      # large PRs. This script never puts commit content on a command line
+      # or in an environment variable -- only commit SHAs (fixed-width hex
+      # from `git rev-list`, never attacker/author controlled in shape) are
+      # interpolated into commands; message/trailer content is only ever
+      # read back through `$(...)` into a shell variable that is compared
+      # or printed, never re-parsed or eval'd.
+      - name: Verify DCO sign-off on every commit in the PR range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # The PR's own range: from where it diverged from the base branch
+          # up to its tip. Using the merge-base (not BASE_SHA itself) is
+          # what makes this correct for a PR opened before later commits
+          # landed on the base branch, fork or not.
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+
+          # Non-merge commits only; a merge commit carries no sign-off of
+          # its own to check.
+          mapfile -t commits < <(git rev-list --no-merges "${merge_base}..${HEAD_SHA}")
+
+          if [ "${#commits[@]}" -eq 0 ]; then
+            echo "No non-merge commits in range; nothing to check."
+            exit 0
+          fi
+
+          missing=()
+          for sha in "${commits[@]}"; do
+            trailer=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")
+            if [ -z "$trailer" ]; then
+              missing+=("$sha")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing a 'Signed-off-by' trailer (DCO) on:"
+            for sha in "${missing[@]}"; do
+              echo "  - $(git rev-parse --short "$sha")"
+            done
+            echo
+            echo "Every commit must be signed off: git commit -s (see CONTRIBUTING.md)."
+            exit 1
+          fi
+
+          echo "All ${#commits[@]} commit(s) in range are signed off."
