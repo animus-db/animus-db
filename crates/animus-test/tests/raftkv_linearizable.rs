@@ -486,17 +486,23 @@ fn wal_faults_enabled() -> bool {
 /// **Caveat, load-bearing for how to read a failure out of this pass**: the
 /// Raft WAL's on-disk record framing (`animus_control::persist::
 /// PersistedState::encode_record`, reused verbatim by this data plane's own
-/// `raftkv.wal`) is plain newline-terminated `serde_json` with **no
-/// per-record checksum** — decode failure is caught (`decode` skips a
-/// trailing partial/unparseable line, the torn-write case this fault model
-/// is built to hit), but a bit-flip that happens to land inside a byte that
-/// keeps the JSON syntactically valid could silently produce a different,
-/// undetected-corrupt WAL record instead of a decode error. If a
-/// `check_cycles`/`check_durability`/`check_convergence` failure surfaces
-/// from this pass at depth, that is a **real finding** — do not respond by
-/// lowering `corrupt_on_crash`'s effective rate or narrowing which cells run
-/// under it; leave the failing assertion in place and report it (see the
-/// root `CLAUDE.md`'s `ANIMUS_RAFTKV_WAL_FAULTS` row and this test's own doc).
+/// `raftkv.wal`) used to be plain newline-terminated `serde_json` with **no
+/// per-record checksum** — a bit-flip that happened to land inside a byte
+/// that kept the JSON syntactically valid could silently produce a
+/// different, undetected-corrupt WAL record instead of a decode error
+/// (issue #495, confirmed reproducible via the sibling `animus-cp-data`
+/// quiescence corpus's `a_lying_fsync_revealed_by_a_crash_recovers_
+/// correctly_on_restart`). **Fixed**: every WAL line now carries a CRC32
+/// checksum over its JSON payload (`animus_control::persist`), so a
+/// corrupted-but-still-parseable record is now caught and dropped — along
+/// with everything physically after it in the file, exactly like a torn
+/// trailing line — instead of decoding into a wrong value. If a
+/// `check_cycles`/`check_durability`/`check_convergence` failure still
+/// surfaces from this pass at depth, that is a **real finding** — do not
+/// respond by lowering `corrupt_on_crash`'s effective rate or narrowing
+/// which cells run under it; leave the failing assertion in place and
+/// report it (see the root `CLAUDE.md`'s `ANIMUS_RAFTKV_WAL_FAULTS` row and
+/// this test's own doc).
 fn wal_fault_disk_config() -> DiskConfig {
     let mut cfg = DiskConfig::default();
     cfg.torn_tail_on_crash = true;

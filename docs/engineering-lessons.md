@@ -13424,6 +13424,16 @@ reader whether the standing regression probe is still watching for
 something that could happen, or has already been checked and cleared for
 that plane's current invariant set.**
 
+**Update**: issue #495's underlying codec gap (`animus-control::persist::
+WalRecord` having no per-record checksum) is now fixed — every WAL line
+carries a CRC32 checksum, and a corrupted-but-parseable record is dropped
+at decode time (along with everything physically after it in the file)
+instead of decoding into a wrong value. The methodology lesson above is
+unaffected by the fix (it's about how fault-findings do or don't transfer
+across planes, not about this specific bug's status); `control_corpus.rs`'s
+`control_corrupt_on_crash_may_hard_panic_issue_495` stays in place as a
+standing regression probe, now expected to stay clean.
+
 ## `Simulator::crash`+`restart` is not a stand-in for a real process restart — a "does recovery actually rebuild from disk" test needs `stop` + a fresh constructor (`animus-control`'s `control_corpus.rs`, PR③)
 
 `animus-sim`'s `Simulator::crash` mutes a node (drops its un-synced disk +

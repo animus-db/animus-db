@@ -35,12 +35,14 @@
 //!      `docs/engineering-lessons.md`'s "a crash-only fault has zero test
 //!      teeth" entry): the recovered leader must converge to exactly what
 //!      the honest survivors already committed, and must be able to rejoin
-//!      quiescence like any other replica. **`corrupt_on_crash` is
-//!      deliberately excluded from this cell** — arming it alongside
-//!      `torn_tail_on_crash` here reproducibly panics the whole test
-//!      process (a hard-`assert!` witnessing-chain violation,
-//!      `assert_ts_monotonic`), a confirmed real finding — see this
-//!      property's own test doc for the full account.
+//!      quiescence like any other replica. **`corrupt_on_crash` is armed
+//!      alongside `torn_tail_on_crash` here** — it used to be deliberately
+//!      excluded (arming it reproducibly panicked the whole test process, a
+//!      hard-`assert!` witnessing-chain violation in
+//!      `assert_ts_monotonic`), tracked as issue #495; now fixed by a
+//!      per-record checksum on the shared WAL codec
+//!      (`animus_control::persist::WalRecord`) — see this property's own
+//!      test doc for the full before/after account.
 //!
 //! `NetConfig::set_corrupt_prob` is deliberately **not** used anywhere in
 //! this file — as of this checkout, `animus-cp-data::codec`'s fix for the
@@ -528,37 +530,34 @@ fn a_duplicated_peer_message_wakes_a_quiesced_group_exactly_once() {
 /// to exactly what the untouched survivors already committed, and must be
 /// able to rejoin quiescence like any other.
 ///
-/// **`corrupt_on_crash` is deliberately excluded — a confirmed, reproducible
-/// process-abort finding, not a suppressed low-probability flake.** Arming
-/// it alongside `torn_tail_on_crash` here (seed `0xF1DE8`, the leader
-/// replica at index 2) makes the recovered replica hit a **hard `assert!`
-/// panic** once it catches up and applies an entry past the corrupted
-/// record: `animus_cp_data::assert_ts_monotonic`'s witnessing-chain check
+/// **`corrupt_on_crash` is armed alongside `torn_tail_on_crash` — issue
+/// #495, now fixed.** It used to be deliberately excluded: arming it here
+/// (seed `0xF1DE8`, the leader replica at index 2) reproducibly made the
+/// recovered replica hit a **hard `assert!` panic** once it caught up and
+/// applied an entry past the corrupted record:
+/// `animus_cp_data::assert_ts_monotonic`'s witnessing-chain check
 /// (`lib.rs`, ADR 0018 §2) — "did not strictly exceed the last applied
 /// HlcTimestamp — the witnessing chain is broken." The single flipped byte
 /// landed inside a still-JSON-syntactically-valid `WalRecord::Append`'s
 /// packed `HlcTimestamp`, producing a **wrong but successfully decoded**
-/// timestamp rather than a decode failure — exactly the residual gap this
-/// crate's own `WalRecord::decode` doc and the sibling `raftkv` corpus's
-/// `wal_fault_disk_config` doc already flag ("the Raft WAL's on-disk record
-/// framing... has no per-record checksum... a bit-flip that happens to land
-/// inside a byte that keeps the JSON syntactically valid could silently
-/// produce a different, undetected-corrupt WAL record instead of a decode
-/// error"), now confirmed to reach a **hard-panicking** assert rather than
-/// merely stale/wrong served data. Reproduced directly: with
-/// `torn_tail_on_crash` alone (no corruption) the exact same scenario
-/// converges cleanly (`engine_applied` matches the honest survivors' `8`
-/// exactly); adding `corrupt_on_crash` to the identical seed panics the
-/// whole test process every time. This mirrors the already-established
-/// precedent this file's own module doc documents for `NetConfig::
-/// set_corrupt_prob` (and the sibling `raftkv`/`txn` corpora's identical
-/// exclusion) — a fault primitive that reliably aborts the process rather
-/// than degrading gracefully is out of scope for an ambient corpus cell,
-/// not a property this corpus can usefully assert against. **This is a
-/// real, unfixed finding** — the fix belongs in `animus-cp-data`'s WAL
-/// codec (a per-record checksum, or a decode-time HLC sanity bound), as its
-/// own change with its own regression test, never folded into this corpus
-/// PR. Re-arm `corrupt_on_crash` here once that fix lands.
+/// timestamp rather than a decode failure — the gap this crate's own
+/// `WalRecord::decode` doc and the sibling `raftkv` corpus's
+/// `wal_fault_disk_config` doc used to flag as residual. **The fix**
+/// (`animus_control::persist`): every WAL line now carries a CRC32
+/// checksum over its JSON payload; a checksum mismatch is treated exactly
+/// like a torn trailing line — dropped, along with everything physically
+/// after it in the file, never decoded into a value at all, never a panic.
+/// With the fix, this exact composition converges cleanly: the corrupted
+/// record (and, being unable to tell "one corrupt record" from "the log
+/// ends here," anything recorded after it) is simply absent from the
+/// recovered replica's replayed WAL tail, so it catches back up to the
+/// honest survivors' state via the ordinary `AppendEntries`/snapshot
+/// catch-up path below, exactly as the `torn_tail_on_crash`-only case
+/// already did. Regression coverage for the checksum mechanism itself
+/// lives in `animus-control::persist`'s own unit tests
+/// (`corrupted_middle_record_is_dropped_along_with_everything_after_it`);
+/// this cell is the end-to-end proof that the fix actually closes the path
+/// that used to panic here.
 #[test]
 fn a_lying_fsync_revealed_by_a_crash_recovers_correctly_on_restart() {
     for seed in seeds(0xF1DE8) {
@@ -602,9 +601,13 @@ fn a_lying_fsync_revealed_by_a_crash_recovers_correctly_on_restart() {
         // possibly bit-flipped.
         let mut torn = DiskConfig::default();
         torn.torn_tail_on_crash = true;
-        // `corrupt_on_crash` is deliberately NOT armed here — see this
-        // test's own doc for the confirmed process-abort finding that
-        // excludes it.
+        // `corrupt_on_crash` used to be excluded here (issue #495, a
+        // confirmed process-abort finding) — now armed alongside the tear,
+        // since the WAL checksum fix (`animus_control::persist`) makes a
+        // corrupted record decode-fail cleanly instead of silently
+        // producing a wrong value. See this test's own doc for the
+        // before/after account.
+        torn.corrupt_on_crash = true;
         sim.set_disk_config_for(nid(leader as u64), torn);
         sim.crash(nid(leader as u64));
 

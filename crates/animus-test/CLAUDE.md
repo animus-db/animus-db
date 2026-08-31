@@ -262,15 +262,20 @@ retrievable from git history.)
   globally once at group start (not scheduled/reset by `Nemesis`/`heal_all`
   the way `FsyncLie` is — it stays armed for the whole run, since the point
   is that *every* crash the scenario's own schedule triggers tears/corrupts
-  its un-synced WAL tail). **Caveat**: the Raft WAL's on-disk record framing
-  (`animus_control::persist::PersistedState::encode_record`, reused by this
-  plane's own `raftkv.wal`) is plain newline-terminated `serde_json` with no
-  per-record checksum — a bit-flip landing inside a byte that keeps the JSON
-  syntactically valid could produce an undetected-corrupt record rather than
-  a decode error, so a `check_cycles`/`check_durability`/`check_convergence`
-  failure surfacing from this pass at depth is a **real finding**, not a
-  reason to weaken the fault rate or the assertion (see
-  `wal_fault_disk_config`'s own doc in `raftkv_linearizable.rs`).
+  its un-synced WAL tail). **Caveat (issue #495, fixed)**: the Raft WAL's
+  on-disk record framing (`animus_control::persist::
+  PersistedState::encode_record`, reused by this plane's own `raftkv.wal`)
+  used to be plain newline-terminated `serde_json` with no per-record
+  checksum — a bit-flip landing inside a byte that kept the JSON
+  syntactically valid could produce an undetected-corrupt record rather
+  than a decode error. Every WAL line now carries a CRC32 checksum over its
+  JSON payload, so a corrupted-but-parseable record is caught and dropped
+  (along with everything after it in the file) instead of silently
+  decoding into a wrong value. If a `check_cycles`/`check_durability`/
+  `check_convergence` failure still surfaces from this pass at depth, that
+  remains a **real finding**, not a reason to weaken the fault rate or the
+  assertion (see `wal_fault_disk_config`'s own doc in
+  `raftkv_linearizable.rs`).
 - **`ANIMUS_SHRINK` wiring (ADR 0061 rung B4)** — this is the worked example
   the "Failure minimization" section above points to. `Scenario`/`Nemesis`
   derive `Serialize`/`Deserialize`; `scenario_candidates` reduces the fault

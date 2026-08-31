@@ -127,17 +127,18 @@
 //! reconstructing the fresh node, or its network traffic is silently
 //! dropped forever; `Group::stop_node` defensively does this even though no
 //! cell in this file currently composes the two. **`CorruptOnCrash` is also
-//! deliberately NOT a `Nemesis` variant** — this
-//! shared WAL codec (`animus-control::persist::WalRecord`, no per-record
-//! checksum) has an open, confirmed, unfixed hard-panic finding in the CP
-//! data plane when it's composed with `TornTail` (issue #495); the one cell
-//! exercising the identical composition here is a dedicated `#[ignore]`d
-//! test (`control_corrupt_on_crash_may_hard_panic_issue_495`), never part
-//! of the asserted `corpus_cells()` set — see that test's own doc for why
-//! (this plane's own sweep found no reproduction: `Metadata::apply` has no
-//! invariant as strict as cp-data's `assert_ts_monotonic` for a
-//! wrong-but-decodable field to trip). `heal_all` resets **both**
-//! `NetConfig` and `DiskConfig` to default — required for
+//! deliberately NOT a `Nemesis` variant** — a hard process abort (which is
+//! what this composition used to cause in the CP data plane, issue #495,
+//! now fixed by a per-record CRC32 checksum on the shared WAL codec,
+//! `animus-control::persist::WalRecord`) cannot be an ordinary scenario
+//! assertion; the one cell exercising the identical composition here is a
+//! dedicated `#[ignore]`d test
+//! (`control_corrupt_on_crash_may_hard_panic_issue_495`), never part of the
+//! asserted `corpus_cells()` set — see that test's own doc for why this
+//! plane's own sweep found no reproduction even before the fix
+//! (`Metadata::apply` has no invariant as strict as cp-data's
+//! `assert_ts_monotonic` for a wrong-but-decodable field to trip). `heal_all`
+//! resets **both** `NetConfig` and `DiskConfig` to default — required for
 //! `FsyncLie`/`TornTail`, which
 //! are armed globally with no auto-expiry (PR① never used `DiskConfig` at
 //! all, so this reset is new here).
@@ -2135,33 +2136,40 @@ fn control_register_cas_baseline_holds_integrity() {
     );
 }
 
-/// **Deliberately `#[ignore]`d — exercises the same shared-WAL-codec gap
-/// tracked by issue #495**, `animus-cp-data`'s confirmed, reproducible
-/// hard-panic when `DiskConfig::torn_tail_on_crash` is composed with
-/// `corrupt_on_crash`: this shared codec
-/// (`animus-control::persist::WalRecord`, no per-record checksum) lets a
-/// corrupted-but-still-JSON-valid record decode successfully with a wrong
-/// value instead of failing gracefully like a torn/unparseable record does.
-/// #495 confirmed the panic via `animus-cp-data/tests/quiescence.rs`'s
-/// `assert_ts_monotonic` — a downstream invariant over HLC timestamps that
-/// plane's `KvState` machine has and this one does not.
+/// **Deliberately `#[ignore]`d — exercises the same shared-WAL-codec
+/// composition that used to trigger issue #495**, `animus-cp-data`'s
+/// confirmed, reproducible hard-panic when `DiskConfig::torn_tail_on_crash`
+/// was composed with `corrupt_on_crash`: the shared codec
+/// (`animus-control::persist::WalRecord`) used to have no per-record
+/// checksum, so a corrupted-but-still-JSON-valid record decoded
+/// successfully with a wrong value instead of failing gracefully like a
+/// torn/unparseable record does. #495 confirmed the panic via
+/// `animus-cp-data/tests/quiescence.rs`'s `assert_ts_monotonic` — a
+/// downstream invariant over HLC timestamps that plane's `KvState` machine
+/// has and this one does not. **Fixed**: every WAL line now carries a
+/// per-record CRC32 checksum (`animus-control::persist`); a mismatch is
+/// dropped exactly like a torn tail, never decoded into a value.
 ///
 /// **This test's own result, run against this plane** (default single seed
 /// below, plus an 80-combination sweep — seeds × `PlainChurn`/
 /// `AllocatorRace` × `LeaderKill`/`FollowerKill` × with/without an
 /// `FsyncLie`-accumulated un-synced buffer before the crash — done during
 /// this test's own development and not committed as code): **no panic
-/// reproduced anywhere in this plane.** The underlying codec gap is real
-/// (the corruption fires — `DiskCorrupt`/`DiskTear` trace events are
-/// emitted, confirmed by inspection during development) but `Metadata::
-/// apply`/the recovery path have no invariant as strict as
-/// `assert_ts_monotonic` for a wrong-but-decodable numeric field to trip —
-/// this plane's commands carry no HLC timestamp at all, and its CAS/epoch
-/// checks reject a mismatch rather than asserting on one. That is useful
-/// information in its own right (see #495 and this session's PR② report),
-/// not a reason to delete this test: it stays as a standing regression
-/// probe for whichever future `MetaCommand` field or replay-path invariant
-/// eventually becomes strict enough for this exact composition to reach it.
+/// reproduced anywhere in this plane, even before the fix.** The
+/// corruption fired (`DiskCorrupt`/`DiskTear` trace events were emitted,
+/// confirmed by inspection during development) but `Metadata::apply`/the
+/// recovery path have no invariant as strict as `assert_ts_monotonic` for a
+/// wrong-but-decodable numeric field to trip — this plane's commands carry
+/// no HLC timestamp at all, and its CAS/epoch checks reject a mismatch
+/// rather than asserting on one. That negative result stays useful in its
+/// own right (see #495 and this session's PR② report), and this test stays
+/// as a standing regression probe: with the codec now fixed, a corrupted
+/// record is simply dropped (along with anything recorded after it) rather
+/// than silently mis-decoded, so this cell should stay clean regardless —
+/// but it remains the one place that would notice a future `MetaCommand`
+/// field or replay-path invariant becoming strict enough to care about a
+/// dropped tail-of-log the way `assert_ts_monotonic` cares about a
+/// wrong-valued one.
 ///
 /// Deliberately NOT a `Nemesis` variant (see `Nemesis`'s own doc: adding
 /// `CorruptOnCrash` there would put this composition one cell away from
@@ -2173,7 +2181,7 @@ fn control_register_cas_baseline_holds_integrity() {
 /// Run explicitly: `cargo test -p animus-control --test control_corpus
 /// control_corrupt_on_crash_may_hard_panic_issue_495 -- --ignored`.
 #[test]
-#[ignore = "probes the open WAL-corruption gap tracked by issue #495 — see this test's own doc for why it does not currently panic in this plane"]
+#[ignore = "standing regression probe for the WAL-corruption composition tracked by issue #495 (fixed by a per-record checksum) — see this test's own doc"]
 fn control_corrupt_on_crash_may_hard_panic_issue_495() {
     let seed = corpus::name_seed("corrupt_on_crash_issue_495");
     let mut group = Group::start(seed, 3);
@@ -2190,10 +2198,10 @@ fn control_corrupt_on_crash_may_hard_panic_issue_495() {
 
     group.apply(Nemesis::LeaderKill);
     group.sim.run_for(Duration::from_millis(500));
-    // Restarting replays the crashed node's (possibly corrupted) WAL —
-    // #495's own account: the panic fires once the recovered replica
-    // catches up and applies an entry past the corrupted record. In this
-    // plane, this line runs clean (see this test's own doc above).
+    // Restarting replays the crashed node's (possibly corrupted) WAL — with
+    // the checksum fix, a corrupted record is now dropped at decode time
+    // (never applied), so this line runs clean regardless (see this test's
+    // own doc above for why it always ran clean in this plane anyway).
     group.heal_all();
     group.sim.run_for(DRAIN);
 

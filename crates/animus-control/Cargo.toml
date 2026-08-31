@@ -32,6 +32,10 @@ serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
+# Per-record WAL checksum (`persist.rs`, issue #495) — the same crate/impl
+# `animus-storage`'s own CRC-checked SSTable/WAL framing uses (`crc32fast::
+# hash`), reused rather than a second dependency for the same job.
+crc32fast.workspace = true
 
 [dev-dependencies]
 # This crate's own library never constructs a `ProdEnv` — only its real-thread
