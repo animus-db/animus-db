@@ -18,8 +18,17 @@
   ink top-rule, and the ink-plate concept (forced-dark terminal/code
   surface plus its offset drop shadow) removed outright in favour of an
   ordinary bordered block on the theme's own surface. The two in-product
-  consoles are untouched and keep Ledger's original geometry pending their
-  own follow-up PR. See that amendment for the full decision.
+  consoles were untouched by that amendment, keeping Ledger's original
+  geometry pending their own follow-up PR. See that amendment for the full
+  decision. **A third, same-day 2026-08-31 amendment (below) lands that
+  follow-up**: the same geometry and component treatment, applied to both
+  consoles at the app skin's own, denser density.
+  **This closes out the restyle series** begun by the two prior amendments:
+  fonts groundwork (first 2026-08-31 amendment), the website skin (second
+  2026-08-31 amendment), and now the two in-product consoles' own skin
+  (third 2026-08-31 amendment, below) — all three surfaces this ADR governs
+  now share the plainer, more traditional developer-tool geometry and
+  component language.
 - **Date:** 2026-08-23
 - **Amends:** [ADR 0021](0021-web-dashboard.md) (dashboard styling),
   [ADR 0052](0052-data-console-port.md) (data console styling).
@@ -526,3 +535,210 @@ are superseded for `dashboard.css`/`console.css`:
 - "Pills/badges are a **stamped outline**" (2026-08-25 amendment,
   "Component language") — superseded for the website's `.pill`: moved to
   a filled, tinted pill, above. Still accurate for the two consoles.
+
+## Amendment (2026-08-31) — the two consoles' skin: proportional radii, plain-bordered cards, the ink-plate removed, filled pills
+
+The 2026-08-31 type-pairing amendment named two follow-ups: the website's
+skin in one PR, the two consoles' skin in another. The website-skin
+amendment immediately above landed the first; this amendment lands the
+second and **closes out the restyle series** — `crates/animusd/src/
+dashboard.css`, `crates/animusd/src/console.css`, and the inline logo mark
+in `dashboard.html`/`console.html`, geometry and component treatment only.
+Validated the same way both prior amendments in this series were, via a
+design-canvas exploration outside this repo. **Colour is explicitly
+unchanged**: every rule below is built from an existing `var(--...)` token
+already defined (with independent light and dark values) in `tokens.css`;
+`tokens.css` itself was not touched, and
+`dashboard::tokens_css_matches_website_copy` still passes.
+
+Applying the website skin's exact pixel values here was deliberately
+rejected: ADR 0056's own "One base, two skins" rule (Decision, above) —
+unchanged by this whole restyle series — requires the app skin to stay
+**denser** than the website skin, not to match it. Every value below scales
+the app skin's own prior geometry proportionally, the same way the website
+amendment scaled 3px/4px to 6px/8px, and lands strictly below the website's
+now-shipped 6px/8px in both dimensions.
+
+### Radius: uniform 3px → 5px controls / 7px panels
+
+Both consoles shipped Ledger's original app-skin radius as a single flat
+**3px** for everything — `--radius` and `--radius-panel` were defined
+identically, with no control/panel distinction at all (unlike the "One
+base, two skins" table's original aspirational 6px/10px app-skin row,
+already stale against the shipped code before this amendment, corrected
+below). This amendment introduces the same two-tier split the website's
+own `--radius`/`--radius-panel` pair already has: **`--radius` moves to
+5px** (buttons, inputs, the inline `code` chip, segmented controls, small
+row-level chips like a replica row or a create-index row) and
+**`--radius-panel` moves to 7px** (cards, the terminal-log block, the
+placement grid, and every bordered form/toolbar panel — `.fact-strip`,
+`.items-toolbar`, `.stream-controls`, `.index-card`, `.danger-card` in the
+console; `.browser-panel`, `.placement-grid` in the dashboard). Functional
+status pills (below) move off the `--radius`/`--radius-panel` scale
+entirely, to a full 999px pill shape, mirroring the website's own pills
+exactly.
+
+### Cards: the ink top-rule is dropped for a plain, uniform border
+
+Every card recipe in both stylesheets that carried Ledger's
+`border-top: 2px solid var(--text)` accent rule drops it for a plain
+`1px solid var(--border)` on all four sides, at the new `--radius-panel`:
+the dashboard's `.card`, `.tablet-detail`, `.stream-detail`, and
+`.item-detail`; the console's `.tables-card`, `.stub`, `.config-section`,
+`.items-card`, and `.item-editor-card`. This is scoped to the recipes that
+actually carried the top-rule-plus-`--ink-16`-sides pattern — exactly the
+website amendment's own scoping rule. A handful of bordered boxes in both
+files (the dashboard's `.placement-card`/`.index-card`-shaped small
+containers, the console's `.fact-strip`/`.items-toolbar`/`.stream-controls`/
+`.index-card`/`.danger-card`) never carried a top rule to begin with — they
+keep their plain border, just at the bumped `--radius-panel`. Thick 2px ink
+rules used as section-boundary devices rather than card treatments —
+`header.topbar`'s bottom border, `.section-head`'s bottom border, a table
+`th`'s bottom border, the dashboard's `.health-banner` top rule (a
+full-width status band, not a bordered box) — are untouched, exactly the
+distinction the website amendment drew for its own header/footer/`.stat-row`
+rules.
+
+### The ink-plate concept is removed, not tweaked
+
+The dashboard's Streams tail-records log (`.stream-detail .tail-records`) —
+the one place either console used Ledger's ink-plate treatment (a
+permanently-dark interior via `--plate-bg`/`--plate-text`/`--plate-output`
+plus a hard 5px-offset `--plate-shadow`, ADR 0056's 2026-08-25 amendment) —
+now sits on the ordinary themed surface: `background: var(--surface)`,
+`border: 1px solid var(--ink-16)`, `border-radius: var(--radius-panel)`,
+**no shadow at all**. Its record text moves from `var(--plate-output)` to
+`var(--text2)` (the same `--ink-72` stop the website's own `.o`/output
+class reads), matching the "ordinary ink-alpha ramp instead of `--plate-*`"
+substitution the website amendment made for its own `.plate`/`.code`. The
+console never had an ink-plate surface at all (its Items/Stream tabs render
+records as plain table rows, not a terminal block), so there is nothing to
+remove there — grepping `--plate-` across both stylesheets after this
+change returns nothing but the stray `.stream-detail .head`/`h3` selectors,
+none of which read a `--plate-*` token. `--plate-*` and `--code-bg` stay
+defined in `tokens.css`, unused by any consumer now (website and both
+consoles alike) — kept only so the names don't dangle, exactly as the
+website amendment left them.
+
+The only `box-shadow` this amendment removes is the tail-records block's
+`var(--plate-shadow)` line. Every other `box-shadow` in either file was
+already either an explicit `none` (an inherited-property override, not a
+plate artifact) or a legitimate `inset` accent ring marking a selected
+table row or placement card (`tr.selected td:first-child`/
+`.placement-card.selected` in the dashboard, `tr.sel td:first-child` in the
+console) — a selection indicator, not elevation, and untouched here exactly
+as the website amendment's own precedent (leaving `.lcard`'s unrelated
+borders alone) suggests.
+
+### Functional status pills move to filled/tinted; nothing decorative was found
+
+Every pill in both consoles turned out to be a **functional** status
+indicator — cluster/node health (`.health-pill`), replica/tablet/stream
+state (`.pill` + its `.Active`/`.Down`/`.Leaving`/`.forming`/… modifier
+classes, all reached through `dashboard_core.js`'s `pill()` helper), and
+the console's GSI/LSI/table lifecycle and stream shard/event chips
+(`.status-pill` + `.pill-active`/`.pill-creating`/`.pill-deleting`,
+`.shard-pill-open`/`-closed`/`-ttl`) — never a static category label. All of
+them move off Ledger's stamped-outline treatment (`1px`/`1.5px solid
+currentColor`, transparent fill) to a filled, tinted pill at the new 999px
+radius, reading the same `--ok-bg`/`--warn-bg`/`--danger-bg` tokens the
+website's own compatibility pills use; the two colours those tokens don't
+cover — the console's accent-toned `pill-creating` and `shard-pill-ttl` —
+use `--accent-soft` (already defined for the toggle-switch's own "on" tint),
+and the neutral `pill-deleting`/`shard-pill-closed`/the dashboard's
+`forming` state use `--surface2`. Checked for a decorative counterpart to
+the website's `.lcard .tag` (a static, un-pilled label) the way the brief
+asked: the only tag-shaped element in either console is the console
+topbar's `<span class="tag">console</span>` wordmark suffix next to the
+`animusd` logotype — already plain `color: var(--text2)` text with no
+pill/border, the same "already rendered as the treatment being asked for"
+finding the website amendment made for `.lcard .tag`, so it needed no
+change.
+
+### The hatch bar: kept, unchanged
+
+The dashboard's Overview balance bars (`.balance-bars .bar`) are the one
+hatch-fill gauge either console has — already built from
+`repeating-linear-gradient(45deg, var(--accent) 0 3px, var(--hatch) 3px
+6px)`, both tokens carrying independent light/dark values. Kept as-is: it
+was already token-built (nothing hardcoded to fix), and a 45° hatch reads
+as a legible "this is a proportion, not a solid measurement" convention at
+a glance in a way a flat fill would lose — simplifying it was judged to
+cost more than it would gain for the one place it appears. Noted here per
+the brief's own instruction to record the call either way.
+
+### The logo mark: dashboard 20px → 30px, console 19px → 28.5px
+
+Both consoles' header `.brand` inline SVG (the same 19-circle hexagonal
+node-cluster mark the website's logo uses, `viewBox="-43 -43 86 86"`) grows
+50%: the dashboard's from `width="20" height="20"` to `width="30"
+height="30"`, the console's from `width="19" height="19"` to `width="28.5"
+height="28.5"` — only the two attributes change, the mark's own circle
+coordinates and colours are untouched, same as the website's own 24px→36px
+bump.
+
+### Verified
+
+`grep -rEn '#[0-9a-fA-F]{3,8}\b' crates/animusd/src/dashboard.css
+crates/animusd/src/console.css` returns nothing — every rule this amendment
+touched reads an existing `var(--...)` token. `grep -rn "box-shadow"` over
+both files shows only explicit `none` declarations and the two legitimate
+selection-ring insets described above; the plate shadow is gone.
+`crates/animusd/src/console.css` still carries one **pre-existing**,
+untouched `rgba(...)` literal — the item-editor modal overlay's backdrop
+scrim (`.item-editor-overlay`'s `rgba(33,31,26,0.45)`/`rgba(0,0,0,0.6)`) —
+flagged here rather than silently left, per the validation instructions;
+it predates this amendment, is not a card/pill/plate/radius concern, and
+was out of scope to touch. `cargo build -p animusd` succeeds (confirms the
+`concat!`/`include_str!` wiring compiles with the edited CSS/HTML) and
+`dashboard::tokens_css_matches_website_copy` still passes (`tokens.css` was
+not touched). A live single-node cluster (`animusd --cluster 1
+--ephemeral`) was brought up in this sandbox and its served
+`/admin/ui/dashboard.css`/`/console/ui/console.css` and shell HTML were
+fetched directly: the served CSS carries the new `--radius`/`--radius-panel`
+values, the served HTML carries the bumped logo `width`/`height`
+attributes, and no `--plate-bg`/`--plate-shadow`/etc. token is referenced
+outside `tokens.css`'s own definition block — confirming the edited files
+are what the running binary actually serves. **This is a code-level and
+served-bytes check only, not a rendered visual one**: this sandbox's egress
+policy blocks the Chromium binary download Playwright needs (`playwright
+.azureedge.net` and its mirrors all return a proxy-level 403 policy
+denial, the same class of restriction the website amendment's own sandbox
+hit for its live Google Fonts fetch, just one layer earlier in the
+pipeline) — so, unlike the website amendment, this one does **not** claim a
+real browser render in either theme. A maintainer with unrestricted egress
+(or a `chromium-cli`-equipped sandbox) should confirm both consoles' cards,
+the Streams tail-records block, the health/status pills, and both logos
+render as described, in both themes, via each app's own `.theme-switch`
+toggle, before treating this amendment's visual claims as verified beyond
+the served-markup/CSS-bytes level.
+
+### Statements above now superseded
+
+- The "One base, two skins" table's app-skin **Radius** row (Decision, "One
+  base, two skins" — "6px (10 on panels)") — already stale against the
+  shipped code before this amendment (both consoles shipped a flat 3px for
+  both), and superseded now in the other direction: the actual values as of
+  this amendment are 5px (`--radius`) and 7px (`--radius-panel`).
+- "The two in-product consoles keep Ledger's original geometry (3px radius,
+  the card ink top-rule, the ink-plate) until their own follow-up PR"
+  (2026-08-31 website-skin amendment, Context paragraph and "Statements
+  above now superseded" section) — this is that follow-up PR; both
+  consoles now carry the 5px/7px radius, the plain-bordered card, and no
+  ink-plate, exactly mirroring the website's own treatment at app density.
+- "Pills/badges are a **stamped outline**... Still accurate for the two
+  consoles" and "A terminal/log-shaped surface... gets an **ink-plate**
+  treatment... Still accurate for the two consoles" (2026-08-25 amendment,
+  as re-confirmed by the website-skin amendment's own "Statements above now
+  superseded" section) — both superseded for the two consoles by this
+  amendment, above; no surface this ADR governs uses the stamped-outline
+  pill or the ink-plate treatment any longer.
+
+This completes the three-surface restyle begun by the two prior amendments
+in this series: fonts (Work Sans/JetBrains Mono, first 2026-08-31
+amendment), the website skin (second 2026-08-31 amendment), and now both
+in-product consoles' skin, above. Every surface ADR 0056 governs shares one
+plainer, more traditional developer-tool geometry and component language;
+only the two-skin density difference (site vs. app radius/spacing/control
+height, "One base, two skins," Decision, above) still tells them apart, by
+design.

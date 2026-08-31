@@ -7,19 +7,23 @@
  * fonts/CDN — ADR 0021's rule, unchanged; the faces are embedded as base64 in
  * `fonts.css`.
  *
- * Ledger component rules used throughout: cards are a flat `--surface` fill
- * with a 1px rule border plus a 2px solid ink top rule; pills/badges are a
- * stamped outline (1px solid current-color, transparent fill, mono uppercase);
- * a selected table row never gets a full-row accent fill — only its cells go
- * to `--surface` with a single left keyline on the first cell
- * (`tr.sel td:first-child`); the one emphasis device in the system is a 2px
- * accent underline on a live value or active tab (`.tab-strip .active`),
- * never a glow, gradient, or blur shadow.
+ * Component rules used throughout (ADR 0056's 2026-08-31 app-skin
+ * amendment): cards are a flat `--surface` fill with a plain 1px rule border
+ * on all four sides — no ink top rule; a functional status chip
+ * (`.status-pill`, shard/event pills) is filled and tinted at a full 999px
+ * radius, not a stamped outline; a selected table row never gets a full-row
+ * accent fill — only its cells go to `--surface` with a single left keyline
+ * on the first cell (`tr.sel td:first-child`); the one emphasis device in
+ * the system is a 2px accent underline on a live value or active tab
+ * (`.tab-strip .active`), never a glow, gradient, or blur shadow.
  */
 :root {
-  /* app skin — dense: scanned all day, on a desk */
-  --radius: 3px;
-  --radius-panel: 3px;
+  /* app skin — dense: scanned all day, on a desk. Radius stays below the
+     website's 6px/8px (ADR 0056's 2026-08-31 website-skin amendment) so the
+     two-skin density difference (ADR 0056 "One base, two skins") reads in
+     the geometry, not just the type scale. */
+  --radius: 5px;
+  --radius-panel: 7px;
   --ctl-h: 28px;
   --row-h: 34px;
 }
@@ -95,7 +99,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 24px 22px 60px; }
 .btn-new:hover { background: var(--text2); }
 
 .tables-card {
-  border: 1px solid var(--ink-16); border-top: 2px solid var(--text); border-radius: var(--radius);
+  border: 1px solid var(--border); border-radius: var(--radius-panel);
   background: var(--surface); box-shadow: none;
   overflow: hidden;
 }
@@ -139,7 +143,7 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 
 /* ---- not-built-yet placeholder (a future screen's deep link) ---- */
 .stub {
-  border: 1px solid var(--ink-16); border-top: 2px solid var(--text); border-radius: var(--radius);
+  border: 1px solid var(--border); border-radius: var(--radius-panel);
   background: var(--surface); box-shadow: none;
   padding: 32px; text-align: center;
 }
@@ -173,7 +177,7 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 .jump-nav a:hover { background: var(--surface2); color: var(--text); }
 
 .config-section {
-  border: 1px solid var(--ink-16); border-top: 2px solid var(--text); border-radius: var(--radius);
+  border: 1px solid var(--border); border-radius: var(--radius-panel);
   background: var(--surface); box-shadow: none;
   padding: 22px 24px; margin-bottom: 20px; scroll-margin-top: 60px;
 }
@@ -185,7 +189,7 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 
 .fact-strip {
   display: flex; flex-wrap: wrap; gap: 22px; padding: 14px 16px;
-  background: var(--surface2); border: 1px solid var(--ink-16); border-radius: var(--radius);
+  background: var(--surface2); border: 1px solid var(--ink-16); border-radius: var(--radius-panel);
 }
 .fact { display: flex; flex-direction: column; gap: 3px; }
 .fact-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text3); }
@@ -249,7 +253,7 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 .seg-opt.selected { background: var(--text); color: var(--bg); }
 
 .index-card {
-  border: 1px solid var(--ink-16); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px;
+  border: 1px solid var(--ink-16); border-radius: var(--radius-panel); padding: 14px 16px; margin-bottom: 10px;
 }
 .index-list { display: flex; flex-direction: column; gap: 8px; }
 .index-row {
@@ -261,14 +265,16 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 .index-row-keys { flex: 1; color: var(--text2); }
 .index-row-lsi .index-row-main { min-width: 0; }
 
-/* Stamped outline — 1px solid current-color, transparent fill, mono uppercase. */
+/* Filled, tinted chip at a full pill radius — off the --radius/--radius-panel
+   scale entirely, mono uppercase (ADR 0056's 2026-08-31 app-skin amendment,
+   mirroring the website's compatibility pills). */
 .status-pill {
   font: 700 10px var(--font-mono); text-transform: uppercase; letter-spacing: 0.04em;
-  padding: 2px 7px; border-radius: var(--radius); border: 1px solid currentColor; background: transparent;
+  padding: 2px 8px; border-radius: 999px;
 }
-.status-pill.pill-active { color: var(--ok); }
-.status-pill.pill-creating { color: var(--accent); }
-.status-pill.pill-deleting { color: var(--text2); }
+.status-pill.pill-active { color: var(--ok); background: var(--ok-bg); }
+.status-pill.pill-creating { color: var(--accent); background: var(--accent-soft); }
+.status-pill.pill-deleting { color: var(--text2); background: var(--surface2); }
 
 .btn-drop {
   background: transparent; color: var(--danger); border: 1px solid var(--border-strong);
@@ -294,7 +300,7 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 .create-index-row-fields { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
 .create-index-row-fields .gsi-nonkey { flex: 2; min-width: 220px; }
 
-.danger-card { border: 1px solid var(--danger); border-radius: var(--radius); padding: 16px; }
+.danger-card { border: 1px solid var(--danger); border-radius: var(--radius-panel); padding: 16px; }
 .danger-row { display: flex; align-items: center; gap: 16px; }
 .danger-title { font-weight: 700; font-size: 13px; }
 .danger-body { color: var(--text2); font-size: 12px; margin-top: 3px; max-width: 52ch; }
@@ -325,11 +331,11 @@ table.tables .view-type { display: block; color: var(--text3); font-size: 10.5px
 .items-toolbar {
   display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
   padding: 14px 16px; margin-bottom: 12px;
-  border: 1px solid var(--ink-16); border-radius: var(--radius); background: var(--surface2);
+  border: 1px solid var(--ink-16); border-radius: var(--radius-panel); background: var(--surface2);
 }
 .items-toolbar .items-actions { display: flex; gap: 8px; margin-left: auto; align-self: flex-end; }
 .items-card {
-  border: 1px solid var(--ink-16); border-top: 2px solid var(--text); border-radius: var(--radius);
+  border: 1px solid var(--border); border-radius: var(--radius-panel);
   background: var(--surface); box-shadow: none;
   overflow: hidden;
 }
@@ -378,9 +384,8 @@ table.items-table .row-actions { display: flex; gap: 6px; white-space: nowrap; }
   :root:not([data-theme="light"]) .item-editor-overlay { background: rgba(0,0,0,0.6); }
 }
 .item-editor-card {
-  width: 100%; max-width: 620px; background: var(--surface); border: 1px solid var(--ink-16);
-  border-top: 2px solid var(--text);
-  border-radius: var(--radius); padding: 22px 24px; box-shadow: none;
+  width: 100%; max-width: 620px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-panel); padding: 22px 24px; box-shadow: none;
 }
 .item-editor-card h3 { margin: 0 0 14px; font-size: 1.02rem; }
 .attr-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
@@ -402,17 +407,17 @@ table.items-table .row-actions { display: flex; gap: 6px; white-space: nowrap; }
 .stream-disabled .hint { margin-top: 8px; font-size: 12px; }
 .stream-disabled .hint a { color: var(--accent); font-weight: 600; }
 
-.shard-pill-open { color: var(--ok); }
-.shard-pill-closed { color: var(--text2); }
+.shard-pill-open { color: var(--ok); background: var(--ok-bg); }
+.shard-pill-closed { color: var(--text2); background: var(--surface2); }
 /* The TTL-expiry badge (ADR 0051 §7's `userIdentity`) — a distinct accent
    from the event-type pill it sits beside, so "this row didn't come from a
    client write" reads at a glance. */
-.shard-pill-ttl { color: var(--accent); }
+.shard-pill-ttl { color: var(--accent); background: var(--accent-soft); }
 
 .stream-controls {
   display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
   padding: 14px 16px; margin-bottom: 12px;
-  border: 1px solid var(--ink-16); border-radius: var(--radius); background: var(--surface2);
+  border: 1px solid var(--ink-16); border-radius: var(--radius-panel); background: var(--surface2);
 }
 .stream-controls .shard-selected { font-size: 12.5px; padding-bottom: 7px; }
 .records-panel table.items-table .attrs-preview { max-width: 260px; }
