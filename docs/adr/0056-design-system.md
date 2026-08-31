@@ -11,8 +11,15 @@
   type pairing is superseded in turn by a 2026-08-31 amendment**: Space
   Grotesk/Martian Mono are replaced by Work Sans/JetBrains Mono as
   groundwork for a further visual-direction change; Ledger's own
-  colour/geometry/component language is untouched by that amendment. See
-  it for the full decision.
+  colour/geometry/component language is untouched by that amendment. **The
+  website half of that further visual-direction change — geometry and
+  component treatment, not colour — lands in a second, same-day 2026-08-31
+  amendment**: larger radii, a plain uniform card border in place of the
+  ink top-rule, and the ink-plate concept (forced-dark terminal/code
+  surface plus its offset drop shadow) removed outright in favour of an
+  ordinary bordered block on the theme's own surface. The two in-product
+  consoles are untouched and keep Ledger's original geometry pending their
+  own follow-up PR. See that amendment for the full decision.
 - **Date:** 2026-08-23
 - **Amends:** [ADR 0021](0021-web-dashboard.md) (dashboard styling),
   [ADR 0052](0052-data-console-port.md) (data console styling).
@@ -353,3 +360,169 @@ control heights, panel recipe (flat `--surface` fill, ink rules, stamped
 pills, hatch fills, the ink-plate), and every other statement in the
 2026-08-25 amendment above stay exactly as that amendment left them until
 those follow-ups land.
+
+## Amendment (2026-08-31) — website skin: larger radii, plain-bordered cards, the ink-plate removed
+
+The 2026-08-31 type-pairing amendment above named its own follow-ups: the
+website's skin in one PR, the two consoles' skin in another. This
+amendment lands the first — **`website/assets/site.css` and the inline
+logo mark in all 11 website pages, geometry and component treatment
+only.** It was validated the same way the type-pairing change was, via a
+design-canvas exploration outside this repo. **Colour is explicitly
+unchanged**: every value in `website/assets/tokens.css` — light and dark
+— stays exactly as the 2026-08-25 amendment left it; every rule below is
+built from the existing `var(--...)` tokens, none from a literal hex or
+`rgb()`/`rgba()` value. The two in-product consoles keep Ledger's
+original geometry (3px radius, the card ink top-rule, the ink-plate)
+until their own follow-up PR.
+
+### Radius: 3px/4px → 6px/8px
+
+`--radius` (buttons, inputs, small chips — the inline `code` element, the
+plate/code copy button) moves from 3px to **6px**; `--radius-panel`
+(cards, plates, the diagram wrapper) moves from 4px to **8px**. Functional
+status pills (below) move off the `--radius` scale entirely, to a full
+999px pill shape — the point is that they read as a distinct chip
+category, not that they share the control radius.
+
+### Cards: the ink top-rule is dropped for a plain, uniform border
+
+`.lcard` and `.card` (the legacy alias) drop
+`border-top: 2px solid var(--text)` — Ledger's accent-rule-on-top
+treatment — for a plain `1px solid var(--border)` on all four sides, at
+the new 8px panel radius. This is scoped to the two card recipes
+specifically; the thick 2px ink rule survives everywhere else it was
+already a section-boundary device rather than a card treatment — the
+header's bottom border, the footer's top border, `.stat-row`'s top
+border, and an article/doc `h2`'s bottom border are all untouched. The
+decorative `.lcard .tag` label (the "MIGRATION"/"REGULATION"/
+"ENVIRONMENT" tags on the homepage's "who it's for" cards, and similar
+category tags elsewhere) already rendered as a plain `color: var(--accent)`
+mono-uppercase text label with no pill/border — the treatment the
+validated direction asked for — so it needed no change; noted here only
+because the brief called it out explicitly as something to check.
+
+### The ink-plate concept is removed, not tweaked
+
+Ledger's `.plate`/`.code` terminal-and-diff-block recipe (2026-08-25
+amendment, "Component language") is gone: a permanently dark interior
+(`--plate-bg`/`--plate-text`/`--plate-comment`/`--plate-output`/
+`--plate-accent`/`--plate-header`/`--plate-rule`, identical in both
+themes "because a terminal reads as a terminal by staying dark") plus a
+hard 5px-offset drop shadow (`--plate-shadow`) — the one shadow exception
+Ledger's own Decision carved out. Both are gone, not adjusted:
+
+- `.plate`/`.code` now sit on the ordinary themed surface
+  (`var(--surface)`) with a plain `1px solid var(--border)`, at the new
+  panel radius, and **no shadow at all**.
+- Every span-level colour a code/terminal block used — comment (`.c`),
+  output (`.o`), prompt/path/string accents (`.p`/`.s`), the base
+  line/keyword colour (`.k`), and the copy button — now reads from the
+  ordinary ink-alpha ramp and `--text`/`--accent` instead of the
+  `--plate-*` family: comments to `--ink-55`, output to `--ink-72`,
+  prompt/path/string highlights to `--accent`, base text to `--text`. The
+  diff-line colours (`.dm`/`.dp`, the minus/plus rows in the "client
+  configuration" diff block) move off their two literal hex values
+  (`#d98a7a`/`#6fc493`, chosen to hold constant against a permanently-dark
+  plate) onto `var(--danger)`/`var(--ok)`, which already carry independent
+  light/dark values.
+- The copy button's own literal `rgba(233, 229, 220, …)` fill/border
+  (the plate-text colour at low alpha, since it had no other token to
+  read from on a forced-dark surface) moves to `var(--surface2)`/
+  `var(--border)`, and its "done" state to `var(--ok)`.
+- `--plate-*` and `--code-bg` stay defined in `tokens.css` — untouched, in
+  the same "kept only so the name doesn't dangle" spirit the surviving
+  `--glow-*` tokens have had since the 2026-08-25 amendment — but nothing
+  in `website/assets/site.css` reads them any more. Not deleted here
+  because `tokens.css` is the byte-identical, test-enforced shared base
+  with the two consoles (this ADR's original Decision, "Why the token
+  file is duplicated"), and the consoles still use the ink-plate treatment
+  pending their own follow-up PR.
+
+The `.diagram-plate` wrapper (the compact two-planes strip and the fuller
+write-path diagram) gets the same border/radius/no-shadow treatment as
+`.plate`/`.code` — dropping its own `5px 5px 0` hard shadow and the
+dark-theme override that recomputed it. This is the wrapper only: the
+diagrams' internal SVG shapes and classes (`.dg-bx`, `.dg-card`, `.dg-t`,
+`.dg-req`, `.dg-leader`, …) were already `var(--...)`-based and are
+untouched, per the brief.
+
+### Functional status pills stay a distinct chip; decorative tags do not
+
+`.pill` (the compatibility table's Supported/Opt-in/Out-of-scope chips,
+and the install page's port-trust column) moves off Ledger's
+stamped-outline treatment (`1.5px solid currentColor`, transparent fill)
+to a filled, tinted pill — `var(--ok-bg)`/`var(--warn-bg)`/
+`var(--danger-bg)` (the same tokens the compatibility/ports tables'
+`.pill.yes`/`.opt`/`.out` variants already had color-only access to) at a
+999px radius. The point named in the brief holds: a functional status
+signal keeps a distinct chip shape carrying real meaning through colour
+*and* shape, where a decorative category tag (`.lcard .tag`, above) is
+plain text with neither.
+
+### The kicker "// " flourish: considered, not adopted
+
+The validated direction's "// " comment-style prefix for `.kicker` was
+evaluated against every existing use of the class across the 11 pages —
+section eyebrows ("Why this exists," "The two planes"), but also a page
+category label doubling as identity ("Architecture," "Compatibility"), an
+"On this page" TOC heading, an inline tagline ("Open source · Rust ·
+AGPL-3.0"), and a "Keep reading" article-footer label. A single `::before`
+prefix reads naturally on the first group and oddly on the rest, and
+`.kicker` has no markup hook to distinguish them without a rework the
+brief explicitly said to skip in that case. Left as plain text; only the
+radius/font changes already tracked through it (via `var(--font-mono)`,
+untouched by this amendment) carry through.
+
+### The logo mark: 24px → 36px
+
+The header `.brand` link's inline SVG (the 19-circle hexagonal
+node-cluster mark, `viewBox="-43 -43 86 86"`) moves from
+`width="24" height="24"` to `width="36" height="36"` in all 11 pages
+(8 top-level pages plus the 3 `articles/`). Only the two attributes
+change; the mark's own circle coordinates and colours are untouched.
+
+### Verified
+
+Every colour value touched by this amendment traces to a `var(--...)`
+token already defined (with independent light and dark values) in
+`tokens.css` — `grep -rEn '#[0-9a-fA-F]{3,8}\b' website/assets/site.css`
+returns nothing. `tokens.css` itself needed no new tokens and was not
+touched: this amendment removes the plate's need for `--plate-*`
+entirely rather than adding a replacement role, exactly as anticipated
+above ("What this groundwork is not"). Checked with a real headless
+browser render (Playwright against Chromium, driven through the site's
+own `.theme-switch` toggle — not just `prefers-color-scheme` — since
+light is the explicit default the site's own JS stamps before paint) of
+the homepage, install, compatibility and architecture pages in both
+themes: cards, terminal/diff blocks, the diagram plates, status pills,
+decorative tags, and the header logo all render as described, with no
+console errors other than the expected offline Google Fonts fetch
+failures in a network-restricted sandbox.
+
+### Statements above now superseded
+
+For the website only — the two consoles keep the geometry and component
+language described below until their own follow-up PR, so none of these
+are superseded for `dashboard.css`/`console.css`:
+
+- The "One base, two skins" table's site-skin **Radius** row (Decision,
+  "One base, two skins" — "12px (14 on panels)") — already stale against
+  the shipped Ledger code before this amendment (3px/4px), and superseded
+  now in the other direction: the website's actual shipped values are
+  6px (`--radius`) and 8px (`--radius-panel`). The table's app-skin
+  column is untouched and still describes the consoles as they ship
+  today.
+- "Cards carry a flat `--surface` fill, a 1px rule border, and a 2px
+  solid ink top rule (`border-top: 2px solid var(--text)`)" (2026-08-25
+  amendment, "Component language") — superseded for the website's
+  `.lcard`/`.card`: the top rule is dropped for a plain border on all
+  four sides, above. Still accurate for the two consoles.
+- "A terminal/log-shaped surface … gets an **ink-plate** treatment: a
+  dark interior … bordered and given a **hard, offset drop shadow**"
+  (2026-08-25 amendment, "Component language") — superseded for the
+  website's `.plate`/`.code`/`.diagram-plate`: removed outright, above,
+  not merely restyled. Still accurate for the two consoles.
+- "Pills/badges are a **stamped outline**" (2026-08-25 amendment,
+  "Component language") — superseded for the website's `.pill`: moved to
+  a filled, tinted pill, above. Still accurate for the two consoles.
