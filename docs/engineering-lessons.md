@@ -13665,3 +13665,108 @@ before declaring the cleanup done. A downstream exception whose only job
 was to compensate for a mechanism that's gone is exactly as dead as the
 mechanism itself, and is easy to miss because it doesn't share a name or an
 import with what got deleted.
+
+## A "just compare live state to the target" convergence check races the very proposer that sets the target — and the failure mode is silent, not a crash (ADR 0062 rung 6, the completion loop's settle window)
+
+Rung 6's own completion loop (`animusd::split_placing_completion`) was
+first written exactly as the ADR's own minimal pseudocode: each tick, for
+every led tablet with an un-`done` `split_placing` entry, propose
+`MarkSplitPlacingDone` the instant `group.config() == t.replicas` (the
+live Raft voter set matches `Metadata`'s own current desired replicas).
+This looks obviously correct — it's the literal "is there anything left
+for `reconfigure_step` to do" predicate. It is also racy in a way a code
+reader (including the ADR author) would not obviously catch: **immediately
+after `CutoverSplit` commits, a freshly-forked child's live group already
+sits on exactly its fork-inherited `t.replicas`** (ADR 0062's own
+fork-first design), so `group.config() == t.replicas` is **trivially true
+from the very first tick** — before the control-plane leader's OWN
+reconcile loop (`RECONCILE_INTERVAL`, 500ms) has had a single chance to
+bump `t.replicas` toward the *real*, differing target `CutoverSplit`
+already recorded as `split_placing[child].target`. A completion-loop tick
+landing in that (near-guaranteed, since this loop's own cadence is well
+under 500ms) window observes "already converged" and marks `done` before
+any placement move ever happens.
+
+**Why this wasn't caught by reasoning alone, and had to be found by
+running the real thing**: the failure mode is not a crash or a rejected
+command — `MarkSplitPlacingDone` happily applies (nothing about a
+premature-but-otherwise-well-formed CAS is wrong), and `done` flipping
+early doesn't strand the tablet (once `done` is true, `rebalance_placement`
+lifts its own exclusion and the tablet becomes eligible for ordinary,
+slower rebalance again) — so a first-order argument ("it self-heals, and
+`done` is a diagnostic only, never a serving gate per fork A") sounds
+airtight and is *wrong in practice*: `rebalance_step` moves one replica
+per tick, gated behind `REBALANCE_EVERY_N_TICKS` (~4s) and only when
+repair proposed nothing, and it optimizes cluster-wide balance, not "the
+same lowest-id candidates `select_replicas` would pick" — so the actual,
+observed outcome of losing this race was not "slightly delayed," it was
+"converges to a different, worse placement, an order of magnitude slower,
+reported done well before either of those things happened." A real
+end-to-end test (`tests/split_placing_completion.rs`, growing a cluster
+so a fresh `select_replicas` genuinely differs from a parent's fork-
+inherited homes) hit this race on essentially every run, because the
+race isn't a rare interleaving — it's the *default* ordering whenever the
+completion loop's own tick is faster than the control-plane's reconcile
+tick, which it always is.
+
+**The fix**: require the same converged observation to hold continuously
+for a settle window (`SPLIT_PLACING_DONE_SETTLE`, a small multiple of the
+control-plane's own `RECONCILE_INTERVAL`) before trusting it — a
+driver-local `BTreeMap<TabletId, Nanos>` of "first seen converged at",
+cleared the instant a tick observes non-convergence. This is the same
+"wait out a slower sibling loop's own worst-case reaction window before
+trusting an observation" shape `index_drain.rs`'s in-place cutover driver
+already uses (`INPLACE_SPLIT_MATERIALIZE_SETTLE_MS`, closing an analogous
+race against the tablet-host reconciler's own fallback cadence) — worth
+recognizing as a *recurring* pattern class in this codebase: whenever a
+fast, independently-scheduled loop's own read can observe a slower loop's
+"before" state and mistake it for the "after" state, a settle window
+(never a one-shot check) is the fix, and the settle duration is set by the
+*slower* loop's own worst-case cadence, not the fast loop's own tick rate.
+
+**General lesson**: "a premature/wrong observation is harmless because a
+slower fallback mechanism will eventually correct it" is not the same
+claim as "a premature/wrong observation is cheap" — trace the fallback's
+own actual speed and its own actual target-selection algorithm before
+accepting that argument, especially when the fallback is a *different*
+mechanism (here, generic load-balancing rebalance vs. directed,
+target-specific placing) that was never designed to reproduce the fast
+path's specific outcome, only some outcome eventually. A convergence check
+comparing live state to a *just-written, not-yet-widely-observed* target
+needs to ask not just "do these two values match" but "could they match
+merely because the target hasn't moved yet, not because the mover has
+caught up" — the two are indistinguishable from a single snapshot and only
+separable by requiring the match to persist.
+
+## An unrelated, pre-existing `reconfigure_step` instability was found (not fixed) while validating the above: a 2-of-3-replica-swap target can make live Raft membership oscillate instead of converge (ADR 0062 rung 6)
+
+While building the real end-to-end test for the settle-window fix above, a
+target requiring the reconfigure sequence to replace **two** of a tablet's
+three replicas at once (grow a 3-node cluster by two lower-sorting-id
+nodes, so `select_replicas` prefers both new nodes over two of the
+parent's three) reliably made the live CP-data Raft group's own voter set
+**oscillate** under a real `ProdEnv` cluster: it would reach the transient,
+genuinely-over-replicated 5-member intermediate state
+`reconfigure_step`'s add-before-remove sequencing produces (add both new
+learners, promote both, only then remove the two extras), then revert
+partway back toward the original 3-replica set, repeating indefinitely —
+never settling within a 60s budget. **This is provably unrelated to the
+completion loop above**: it reproduces with zero `MarkSplitPlacingDone`
+proposes ever having fired (confirmed by instrumenting the loop and
+observing the oscillation begin before the loop's own settle window had
+even elapsed once), so the cause sits in `host::Reconciler`/
+`reconfigure_step` itself (`animus-cp-data`, ADR 0058 Train 1), pre-dating
+and unmodified by ADR 0062. A target that replaces only **one** of three
+replicas (a strictly simpler add-one/remove-one sequence, never reaching a
+5-voter intermediate state) converged cleanly and quickly on every run.
+
+Not investigated further or fixed — out of this rung's own scope, and
+worth a dedicated investigation rather than a guess folded into an
+unrelated change (this repo's own "an incidental bug gets its own PR"
+rule). `tests/split_placing_completion.rs` deliberately exercises only the
+one-replica-difference shape, with its own doc comment explaining why, so
+a future investigation of the two-replica case has a name, a reproduction
+recipe (grow-by-two, RF3, real `ProdEnv`), and a already-written
+regression-in-waiting to flip on once the underlying issue is found. Filed
+here rather than silently worked around, per this repo's own "record a
+generalizable lesson, including one you didn't chase to the end" practice.

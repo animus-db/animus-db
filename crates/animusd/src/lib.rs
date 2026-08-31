@@ -107,6 +107,7 @@ mod read_path;
 #[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
+mod split_placing_completion;
 #[deny(clippy::disallowed_methods)]
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
@@ -880,6 +881,19 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.is_leader(),
             CpGroup::Mem(n) => n.is_leader(),
+        }
+    }
+
+    /// The group's active **learner** configuration (ADR 0058 Train 1) —
+    /// non-voting members mid-catch-up. See [`RaftKvNode::learners`]. Used
+    /// by the split-placing completion loop (ADR 0062 §3) alongside
+    /// [`config`](Self::config) — a dangling learner means
+    /// [`reconfigure_step`](RaftKvNode::reconfigure_step) still has work
+    /// left, even when the voter set already matches.
+    pub(crate) fn learners(&self) -> std::collections::BTreeSet<NodeId> {
+        match self {
+            CpGroup::Lsm(n) => n.learners(),
+            CpGroup::Mem(n) => n.learners(),
         }
     }
 
@@ -4024,6 +4038,15 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The in-place split directed-Placing completion loop (ADR 0062
+        // §3): reports a child tablet's own local Raft convergence to the
+        // control-plane catalog. Same "run everywhere, self-gate per
+        // tablet on leadership" shape as the backup capture/restore drivers
+        // above.
+        tasks.push(tokio::spawn(
+            split_placing_completion::split_placing_completion_loop(ctx.clone()),
+        ));
+
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
         // plane-leader-only (self-gated every tick, `segment_janitor.rs`'s
@@ -5358,6 +5381,14 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
             ctx.clone(),
         )));
+
+        // The in-place split directed-Placing completion loop (ADR 0062
+        // §3) — same shape/reasoning as the backup capture/restore drivers
+        // just above (per-tablet-leadership-gated, no control-plane-leader
+        // dependency of its own).
+        tasks.push(tokio::spawn(
+            split_placing_completion::split_placing_completion_loop(ctx.clone()),
+        ));
 
         if auto_split_threshold.is_some()
             || auto_split_bytes_threshold.is_some()

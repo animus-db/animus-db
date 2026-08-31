@@ -58,6 +58,29 @@ fn cluster(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>) {
     (sim, nodes)
 }
 
+/// As [`cluster`], but also returns each control node's own `MemoryEngine`
+/// handle — needed only by the real-restart test below, which must reopen
+/// the SAME retained engine across a `Simulator::stop` (unlike `cluster`'s
+/// plain `MemoryEngine::new()`, thrown away the instant `RaftNode::start`
+/// takes ownership of it, which is fine for every other test here since
+/// none of them ever restarts a node).
+fn cluster_with_engines(seed: u64) -> (Simulator, Vec<RaftNode<SimEnv>>, Vec<MemoryEngine>) {
+    let sim = Simulator::new(seed);
+    let engines: Vec<MemoryEngine> = CONTROL.iter().map(|_| MemoryEngine::new()).collect();
+    let nodes = CONTROL
+        .iter()
+        .zip(engines.iter())
+        .map(|(&id, engine)| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                engine.clone(),
+            )
+        })
+        .collect();
+    (sim, nodes, engines)
+}
+
 fn leader_among(nodes: &[RaftNode<SimEnv>], live: &[usize]) -> usize {
     let leaders: Vec<usize> = live
         .iter()
@@ -499,6 +522,138 @@ fn split_placing_phase_converges_despite_a_concurrent_replicas_bump() {
     assert!(
         wait_converged(&mut sim, &nodes, leader, &[TabletId(2), TabletId(3)], &want),
         "did not converge despite a concurrent replicas bump (seed={seed})"
+    );
+}
+
+/// **Test 6** (ADR 0062 §3's testing plan cell 2, "control-failover-mid-
+/// placing"): a control-plane LEADER CHANGE while a child has an un-done
+/// `split_placing` entry — proves the NEW leader's own `reconcile_loop`
+/// picks the third phase back up from durable `Metadata` state with no
+/// lost obligation, mirroring `animus-cp-data`'s own
+/// `learner_move_survives_leader_change_mid_move`-style assertion shape
+/// (ADR 0058 Train 1's own precedent for this exact class of claim,
+/// `reconciler_corpus.rs`, now proven for `split_placing_reconcile` too).
+/// Sound by construction — the phase carries no leader-local state at all,
+/// always recomputing `select_replicas` fresh off durable `Metadata` (ADR
+/// 0062 §2's own "never trusts or rewrites `target`" rule) — but proven
+/// live here, over a real crashed-and-re-elected control group, rather
+/// than merely asserted from the mechanism's own statelessness.
+#[test]
+fn split_placing_phase_resumes_after_a_control_leader_change() {
+    let seed = 0x5717_0006u64;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    split_fixture(&mut sim, &nodes, leader, &[11, 12, 13]);
+
+    // Crash the control-plane leader BEFORE the third phase has necessarily
+    // had any tick to react — the entry is only as fresh as `CutoverSplit`
+    // itself left it (`target: Some([n10,n11,n12])`, un-done, replicas
+    // still the fork-inherited `[n11,n12,n13]`). A survivor majority (2 of
+    // 3) elects a new leader, whose own `reconcile_loop` must pick this up
+    // from nothing but durably-replicated `Metadata`.
+    sim.crash(nid(CONTROL[leader]));
+    sim.run_for(Duration::from_secs(2));
+    let survivors: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
+    let new_leader = leader_among(&nodes, &survivors);
+
+    let want = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            new_leader,
+            &[TabletId(2), TabletId(3)],
+            &want
+        ),
+        "split-placing phase never resumed after a control leader change (seed={seed})"
+    );
+
+    // Every surviving replica converges to the identical final state —
+    // no obligation was lost or double-applied across the failover.
+    for &i in &survivors {
+        assert_eq!(
+            nodes[i].metadata().tablets[&TabletId(2)].replicas,
+            want,
+            "seed={seed}: survivor {i} diverged after the control leader change"
+        );
+    }
+}
+
+/// **Test 7** (ADR 0062 §3's testing plan cell 3, "crash-between-cutover-
+/// and-assignment"): a REAL control-plane process restart (`sim.stop` +
+/// a fresh `RaftNode::start` reopening the SAME retained engine — mirroring
+/// `control_corpus.rs`'s own `StopRestart` nemesis, never `sim.crash`,
+/// which merely mutes a still-live task rather than genuinely losing and
+/// reconstructing volatile state) of EVERY control node, landing right
+/// after `CutoverSplit`'s own commit — before this phase has necessarily
+/// had any tick to react — proves the entry is either fully present
+/// (post-restart apply completes) or the whole `CutoverSplit` command
+/// itself never committed (nothing partially written): every replica
+/// recovers BOTH children's tablet rows AND their `split_placing` rows
+/// together, and the phase still converges normally from there. The
+/// registered candidates' own `heartbeat_loop` tasks (spawned once, by
+/// `register`, before the restart) keep running unaffected — `Simulator`'s
+/// network model routes by node id, not Rust object identity, so they
+/// transparently keep reaching whichever `RaftNode` currently answers for
+/// `CONTROL`'s ids — so no re-registration is needed for convergence to
+/// resume.
+#[test]
+fn split_placing_survives_a_real_control_restart_around_cutover() {
+    let seed = 0x5717_0007u64;
+    let (mut sim, nodes, engines) = cluster_with_engines(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    split_fixture(&mut sim, &nodes, leader, &[11, 12, 13]);
+
+    for &id in &CONTROL {
+        sim.stop(nid(id));
+    }
+    let nodes: Vec<RaftNode<SimEnv>> = CONTROL
+        .iter()
+        .zip(engines.iter())
+        .map(|(&id, engine)| {
+            RaftNode::start(
+                sim.env(nid(id)),
+                CONTROL.iter().copied().map(nid).collect(),
+                engine.clone(),
+            )
+        })
+        .collect();
+    sim.run_for(Duration::from_secs(3));
+
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+    let meta = nodes[leader].metadata();
+    for child in [TabletId(2), TabletId(3)] {
+        assert!(
+            meta.tablets.contains_key(&child),
+            "seed={seed}: {child:?} lost across the restart"
+        );
+        let entry = meta.split_placing.get(&child).unwrap_or_else(|| {
+            panic!("seed={seed}: split_placing entry for {child:?} lost across the restart")
+        });
+        assert!(
+            !entry.done,
+            "seed={seed}: {child:?} reported done across a bare restart"
+        );
+    }
+
+    let want = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(&mut sim, &nodes, leader, &[TabletId(2), TabletId(3)], &want),
+        "split-placing phase never converged after a real control restart around cutover (seed={seed})"
     );
 }
 

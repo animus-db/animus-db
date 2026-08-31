@@ -2632,6 +2632,38 @@ route below the edge through the same `ClientCtx` CP primitives.
   kickoff contract as `restore_table_from_backup`: returns as soon as
   `BeginRestore` commits, with `backup_restore.rs`'s driver doing the
   actual seed/replay/activate/GSI-declare sequence in the background.
+- **`split_placing_completion.rs`** (ADR 0062 §3) — the in-place split
+  **directed-Placing completion loop**: a per-tablet, leader-side loop, the
+  same "run everywhere, self-gate per tablet on `group.is_leader()`,
+  propose a relayable completion command once local convergence is
+  observed" shape as `backup_capture.rs`/`index_backfill.rs` (`RaftKvNode::
+  spawn_reconfigure_loop` has zero production callers — see the ADR's own
+  §3 correction to its brief's original anchor). Each tick, for every led
+  tablet with an un-`done` `Metadata::split_placing` entry: if the live
+  Raft group's own voter config matches `Metadata`'s current `replicas`
+  with no dangling learners (`CpGroup::config()`/`CpGroup::learners()`,
+  the second newly unwrapped by this rung, the first pre-existing since ADR
+  0029's own release-GC use) — the identical convergence predicate
+  `RaftKvNode::reconfigure_step`'s own early return already checks —
+  **and that observation has held continuously for
+  `SPLIT_PLACING_DONE_SETTLE`** (a small multiple of `animus-control::
+  node`'s own `RECONCILE_INTERVAL`, tracked in a driver-local `BTreeMap<
+  TabletId, Nanos>`), proposes `MetaCommand::MarkSplitPlacingDone` via
+  `ClientCtx::propose_schema` (on the `is_relayable_command` allowlist).
+  **The settle window is load-bearing, not defensive padding** — a naive
+  one-shot compare marks `done` on the very first tick after cutover,
+  before the control-plane's own reconcile loop has had a single chance to
+  move the tablet off its fork-inherited (trivially "converged" against
+  itself) replicas; see `docs/engineering-lessons.md`'s entry on this rung
+  for the full incident (found via this loop's own real end-to-end test,
+  not by inspection) and a separate, pre-existing `reconfigure_step`
+  oscillation the same investigation surfaced (a 2-of-3-replica-swap target
+  failing to converge under a real cluster) — unrelated to and unmodified
+  by this loop, not fixed here. Spawned on combined and data-only nodes
+  only (`start_with_growth`'s two call sites — mirrors `backup_capture.rs`/
+  `backup_restore.rs`'s own scope: no control-plane-leader dependency of
+  its own, so a control-only node, which hosts no CP-data tablet, gets
+  nothing from spawning it).
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
