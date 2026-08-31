@@ -1869,6 +1869,18 @@ this call performed) is reported in that tablet's own response entry,
 never escalated into a whole-call failure. `animus admin stream-grow
 <admin-addr> <table>` is the CLI form.
 
+`grow_stream`'s per-tablet loop walks a `Metadata` *snapshot* taken once up
+front but awaits real Raft/network activity per iteration, so a tablet
+captured `Active` in that snapshot can be retired by a **cascade** split
+(one tablet's cutover racing another's still-pending turn in the same
+walk) before this loop reaches it — issue #454. `grow_stream_tablet`'s own
+"no such tablet" lookup miss for exactly that tablet is not a real error:
+it means the split this call would have triggered already happened, one
+beat early. `schema::classify_grow_response` folds that exact message into
+the identical `STREAM_GROW_MID_SPLIT` skip, deliberately narrow (only that
+literal message, only on `grow_stream`'s own call path) so a genuinely
+unknown tablet id elsewhere (e.g. `POST /admin/tablet/split`) still errors.
+
 **Split is the ADR 0050 copy-based workflow's METADATA half (Train B rung
 3)**: `trigger_split` — still the one choke point every surface calls —
 now proposes `MetaCommand::BeginSplit` (parent → `Splitting`, still fully

@@ -1060,7 +1060,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // the summary would miscount as a fresh split), and a `Building`
             // child refuses splits until activation anyway.
             let response = match state {
-                TabletState::Active => self.grow_stream_tablet(tablet).await,
+                // #454: `tablets` above is a `Metadata` snapshot, but this
+                // loop's own body crosses real `await` points per iteration
+                // (`grow_stream_tablet`'s resolve/propose/poll cycle) — a
+                // CASCADE split can retire a tablet captured `Active` here
+                // before its own turn arrives, cutting it over to two
+                // (already-`Active`) children between the snapshot and the
+                // lookup this iteration performs. `classify_grow_response`
+                // folds that vanished-tablet lookup miss into the identical
+                // skip a tablet caught `Splitting`/`Building` one beat
+                // earlier already gets below — see its own doc for why this
+                // is safe.
+                TabletState::Active => {
+                    classify_grow_response(self.grow_stream_tablet(tablet).await)
+                }
                 TabletState::Splitting | TabletState::Building => {
                     ClientResponse::Error(STREAM_GROW_MID_SPLIT.into())
                 }
@@ -1239,6 +1252,103 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err("stream hot read did not reach a tablet leader in time".into());
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// #454: fold [`ClientCtx::grow_stream_tablet`]'s own "no such tablet"
+/// lookup miss into [`STREAM_GROW_MID_SPLIT`], the identical skip
+/// [`ClientCtx::grow_stream`]'s own up-front `match state` already reports
+/// for a tablet caught `Splitting`/`Building` a beat earlier.
+///
+/// `grow_stream` walks a `Metadata` *snapshot* of a table's tablets, but
+/// awaits real Raft/network activity per iteration
+/// (`grow_stream_tablet`'s resolve/propose/poll cycle, or —
+/// `trigger_split`'s own doc — its forwarded `TriggerAutoSplit` twin in
+/// `forwarding.rs`). In a **cascade** split, a tablet snapshotted `Active`
+/// can be retired by an unrelated cutover (this same `grow_stream` call's
+/// own earlier tablet, or a fully independent split) before this loop
+/// reaches it: `trigger_split`'s `effective_metadata().tablets.get(&tablet)`
+/// then comes back `None`, and returns the literal error
+/// `"no such tablet"` — indistinguishable, by string, from a tablet id that
+/// never existed.
+///
+/// This is safe to skip, by the same reasoning `STREAM_GROW_MID_SPLIT`
+/// already relies on for the up-front case: the tablet did not vanish —
+/// it *just finished being split* (into two already-`Active` children),
+/// so there is nothing left for this call to do to it. Nothing is lost:
+/// the split is a normal committed one, so its children's `ParentShardId`
+/// lineage already covers stream continuity (ADR 0042/0043) exactly as it
+/// does for any other split, and — same as a `Splitting` parent's own
+/// not-yet-active children today — those children simply wait for the
+/// *next* `grow_stream` call to be split in their own turn, rather than
+/// this one.
+///
+/// Deliberately narrow: only the exact `"no such tablet"` message coming
+/// back from a `grow_stream_tablet` call is reclassified. Any other error
+/// — including a genuine unknown-tablet request outside this walk (e.g.
+/// `POST /admin/tablet/split` naming a bad id, still handled by
+/// `trigger_split` itself) — passes through unchanged, since this
+/// function is never on that path.
+fn classify_grow_response(response: ClientResponse) -> ClientResponse {
+    match response {
+        ClientResponse::Error(e) if e == "no such tablet" => {
+            ClientResponse::Error(STREAM_GROW_MID_SPLIT.into())
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod grow_stream_classify_tests {
+    use super::classify_grow_response;
+    use crate::{ClientResponse, STREAM_GROW_MID_SPLIT};
+
+    /// #454 regression: a tablet that retired mid-walk (its own
+    /// `grow_stream_tablet` call surfaces the generic "no such tablet"
+    /// lookup miss) must classify as the same skip a tablet caught
+    /// `Splitting`/`Building` up front already gets — never as an error.
+    /// Red before the fix (the pre-#454 code path had no such mapping at
+    /// all — `grow_stream`'s loop pushed `grow_stream_tablet`'s raw
+    /// response straight through), green after.
+    #[test]
+    fn vanished_tablet_lookup_miss_classifies_as_mid_split_skip() {
+        let vanished = ClientResponse::Error("no such tablet".into());
+        assert_eq!(
+            classify_grow_response(vanished),
+            ClientResponse::Error(STREAM_GROW_MID_SPLIT.into()),
+            "a tablet that retired between grow_stream's snapshot and its \
+             own turn must classify identically to STREAM_GROW_MID_SPLIT"
+        );
+    }
+
+    /// A genuine split (`PutOk`) passes through untouched.
+    #[test]
+    fn successful_split_passes_through_unchanged() {
+        assert_eq!(
+            classify_grow_response(ClientResponse::PutOk),
+            ClientResponse::PutOk
+        );
+    }
+
+    /// Every other existing skip/error message passes through unchanged —
+    /// this mapping is precise about which exact message it intercepts, not
+    /// a blanket swallow of every `ClientResponse::Error`.
+    #[test]
+    fn unrelated_errors_pass_through_unchanged() {
+        for msg in [
+            crate::SPLIT_KEY_NOT_TOKEN_VIABLE,
+            crate::STREAM_GROW_NO_SPLIT_POINT,
+            crate::STREAM_GROW_MID_SPLIT,
+            "stream grow: did not reach this tablet's leader in time",
+            "some unrelated failure",
+        ] {
+            let response = ClientResponse::Error(msg.into());
+            assert_eq!(
+                classify_grow_response(response.clone()),
+                response,
+                "message {msg:?} must not be reclassified"
+            );
         }
     }
 }
