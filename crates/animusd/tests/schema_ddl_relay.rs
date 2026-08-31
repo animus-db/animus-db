@@ -126,12 +126,23 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     .await
     .expect("follower-issued DDL did not commit via relay in 20s");
 
-    // It replicated to *every* node.
+    // It replicated to *every* node — a converged-or-timeout poll, never a
+    // one-shot assert: the follower-issued relay only proves the FOLLOWER's
+    // own replicated view has committed; every other node's own ADR 0038
+    // async apply task can genuinely lag that commit by a beat.
     for (i, n) in nodes.iter().enumerate() {
-        assert!(
-            n.metadata().has_table_schema("ddl_t"),
-            "table schema missing on node {i} after follower-relayed DDL"
-        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata().has_table_schema("ddl_t") {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {i}: table schema missing 20s after follower-relayed DDL")
+        });
     }
 
     // The atomic `ALTER TABLE` primitive (`ReplaceTableSchema`) relays too — the
@@ -167,12 +178,18 @@ async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
     .expect("follower-issued ReplaceTableSchema (atomic ALTER) did not replicate in 20s");
     // The replacement was in place: the table kept a schema throughout (spot-check
     // the final state on every node — no drop-then-recreate window exists at all
-    // with a single command).
+    // with a single command). Converged-or-timeout, same reasoning as above.
     for (i, n) in nodes.iter().enumerate() {
-        assert!(
-            n.metadata().has_table_schema("ddl_t"),
-            "table schema missing on node {i} after atomic ALTER"
-        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata().has_table_schema("ddl_t") {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {i}: table schema missing 20s after atomic ALTER"));
     }
 
     // Gate: a non-schema (membership/placement) command must be rejected by the
@@ -307,12 +324,22 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     })
     .await
     .expect("follower-issued SealStreamShard did not commit via relay in 20s");
+    // Converged-or-timeout: the loop above only proves the FOLLOWER's own
+    // replicated view committed the seal; every other node's own async apply
+    // task can lag that commit by a beat.
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(
-            n.metadata().stream_shard_watermark(TabletId(1)),
-            Some(100),
-            "node {i}: SealStreamShard's catalog row did not replicate"
-        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata().stream_shard_watermark(TabletId(1)) == Some(100) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {i}: SealStreamShard's catalog row did not replicate within 20s")
+        });
     }
 
     // `ExpireStreamShards` is deliberately NOT relayable — rejected by the
@@ -444,15 +471,26 @@ async fn update_time_to_live_on_a_follower_is_relayed_to_the_leader() {
     assert!(body.contains("\"AttributeName\":\"expiresAt\""), "{body}");
     assert!(body.contains("\"Enabled\":true"), "{body}");
 
-    // It replicated to *every* node's own replicated catalog.
+    // It replicated to *every* node's own replicated catalog — a
+    // converged-or-timeout poll, never a one-shot assert: the 200 above only
+    // proves the FOLLOWER's own replicated view committed; every other
+    // node's own ADR 0038 async apply task can lag that commit by a beat.
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(
-            n.metadata()
-                .table_ttl("ttl_relay_t")
-                .map(|t| t.attribute_name.as_str()),
-            Some("expiresAt"),
-            "node {i}: TTL spec missing after follower-relayed UpdateTimeToLive"
-        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata()
+                    .table_ttl("ttl_relay_t")
+                    .is_some_and(|t| t.attribute_name == "expiresAt")
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {i}: TTL spec missing 20s after follower-relayed UpdateTimeToLive")
+        });
     }
 
     // `DescribeTimeToLive` against the (different) follower reads the same
@@ -531,15 +569,28 @@ async fn update_continuous_backups_on_a_follower_is_relayed_to_the_leader() {
         "{body}"
     );
 
-    // It replicated to *every* node's own replicated catalog.
+    // It replicated to *every* node's own replicated catalog — a
+    // converged-or-timeout poll, never a one-shot assert (issue #457): the
+    // 200 above only proves the FOLLOWER's own replicated view committed;
+    // every other node's own ADR 0038 async apply task can lag that commit
+    // by a beat.
     for (i, n) in nodes.iter().enumerate() {
-        assert_eq!(
-            n.metadata()
-                .table_pitr("pitr_relay_t")
-                .map(|s| s.generation),
-            Some(1),
-            "node {i}: PITR spec missing after follower-relayed UpdateContinuousBackups"
-        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if n.metadata()
+                    .table_pitr("pitr_relay_t")
+                    .map(|s| s.generation)
+                    == Some(1)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {i}: PITR spec missing 20s after follower-relayed UpdateContinuousBackups")
+        });
     }
 
     // `DescribeContinuousBackups` against the (different) follower reads the

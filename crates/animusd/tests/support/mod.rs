@@ -254,6 +254,27 @@ pub async fn grow_deadline(
 /// Returns the node, the addresses it actually bound, and the data dir it
 /// used (a caller that needs to rejoin at the exact same addresses/dir, e.g.
 /// `seed_join.rs`'s rejoin test, needs all three).
+///
+/// **Issue #406/#450 (Bug A)**: the ports (and therefore the `--id`'s
+/// `NodeAddrs`) are picked **once**, before the retry loop, and reused on
+/// every attempt — never re-randomized per attempt. `run_node_join`'s
+/// `claim_join_identity` durably registers `--id`'s `NodeAddrs` (a
+/// `MetaCommand::RegisterNode` CAS, ADR 0040 Decision C) *before* it ever
+/// calls `Node::bind`; if that bind then fails (the ordinary port-TOCTOU
+/// this retry exists for, issue #278), the old code re-picked brand-new
+/// ports for the *same* `--id` on the next attempt, so the retry's own
+/// re-registration proposed a **different** `NodeAddrs` for an id that had
+/// already durably claimed a different one moments earlier — a genuine CAS
+/// collision against itself, surfacing as "node id already claimed by a
+/// different registration (different addresses/labels)". Reusing the same
+/// `addrs` makes every retry's re-registration land on the *idempotent*
+/// `NoOp` path instead (`existing == addrs`), mirroring
+/// [`restart_same_addrs`]'s own retry-in-place idiom for the identical
+/// reason: a transient port-TOCTOU bind failure is best retried on the same
+/// address (the conflict is another test binary's momentary `free_addrs`
+/// probe, not a permanently-held port), not papered over by minting a new
+/// one that then collides with this attempt's own already-durable claim.
+/// See `docs/engineering-lessons.md` for the general lesson.
 pub async fn join_fresh_deadline(
     seeds: &[SocketAddr],
     index: usize,
@@ -263,24 +284,24 @@ pub async fn join_fresh_deadline(
 ) -> (Node, RoleAddrs, PathBuf) {
     let hard_deadline = tokio::time::Instant::now() + deadline;
     let mut attempt: u64 = 0;
+    let raw = free_addrs(6);
+    let id = animusd::config::node_id(index);
+    let addrs = RoleAddrs {
+        id: id.clone(),
+        role: NodeRole::Both,
+        internal: raw[0],
+        client: raw[1],
+        dynamo: raw[2],
+        admin: raw[3],
+        intra: raw[4],
+        console: raw[5],
+        advertise_host: None,
+    };
     loop {
-        let raw = free_addrs(6);
-        let id = animusd::config::node_id(index);
-        let addrs = RoleAddrs {
-            id: id.clone(),
-            role: NodeRole::Both,
-            internal: raw[0],
-            client: raw[1],
-            dynamo: raw[2],
-            admin: raw[3],
-            intra: raw[4],
-            console: raw[5],
-            advertise_host: None,
-        };
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
         match animusd::run_node_join(
             seeds.iter().map(ToString::to_string).collect(),
-            Some(id),
+            Some(id.clone()),
             addrs.clone(),
             &node_dir,
             backend,

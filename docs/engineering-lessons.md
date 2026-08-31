@@ -32,6 +32,30 @@ debugging anything that feels like it might have happened before.
 > citation needs chasing.
 
 ### Testing
+- **A `dynamo_retry`+`CreateTable` fixture helper must tolerate
+  `ResourceInUseException` on the retry, not just retry 500s (2026-08-31,
+  issue #461).** `create_table` (`crates/animusd/src/schema.rs`) calls the
+  blocking `await_table_serveable` before it acks 200 — a real wait that can
+  itself time out server-side and surface as a retryable 500, *after* the
+  schema commit it was waiting on already landed durably. A test's
+  `dynamo_retry` helper that retries only on `status == 500` then replays
+  the identical `CreateTable` into the duplicate-name check ahead of that
+  wait, which correctly answers `400 ResourceInUseException` — a legitimate
+  outcome of retrying a non-idempotent-from-the-client's-view operation, not
+  a test failure. `dynamo_expression_surface.rs`'s `setup()` hard-asserted
+  200 and had no such tolerance, so it flaked under exactly this timing.
+  Fixed by treating a `ResourceInUseException` `CreateTable` reply as
+  success **and** re-probing serveability explicitly in that branch (a
+  `ConsistentRead` `GetItem` run through the same `dynamo_retry` helper) —
+  the 400 path skips the server's own `await_table_serveable` wait, so
+  "the table exists" and "the table is serveable" are not the same fact
+  once you take that branch. A repo-wide grep at fix time
+  (`ResourceInUseException` in `crates/animusd/tests/`) found no existing
+  shared helper doing this — every other hit was a test deliberately
+  asserting the *rejection* case — so there was nothing to reuse; if a
+  second `setup()` trips the same race, factor the tolerant-CreateTable +
+  readiness-reprobe pair into `tests/support/mod.rs` rather than hand-rolling
+  a third copy.
 - **Adding a new AWS-documented request-shape limit needs a workspace-wide
   sweep for pre-existing test helpers that already build a request past it,
   not just a decode-level unit test (2026-08-23, DynamoDB batch/transaction
@@ -13568,3 +13592,131 @@ observable proxy for "in progress" is the fix, and asserting the poll
 actually caught the window (not just that the scenario as a whole
 converged afterward) is what keeps the test honest about whether it
 exercised the fault window at all.**
+
+## A CI check whose failure mode is "intermittent, unresolved root cause" doesn't need a diagnosis before it can be fixed — remove the risky mechanism instead (issue #466, `.github/workflows/dco.yml`)
+
+`tim-actions/get-pr-commits` + `tim-actions/dco` intermittently died with
+`Argument list too long` (`E2BIG`) on some PRs. The issue's own first theory
+— "our commit messages are unusually large, and that's what crosses
+`ARG_MAX`" — was directly disproved by an A/B comparison: a 37-commit/42KB
+PR failed twice while a 63-commit/73KB PR (~74% more payload) passed on the
+same runner fleet minutes apart. The true trigger inside the third-party
+action was never identified, and didn't need to be: the fix wasn't "explain
+the flake," it was "stop doing the thing that has this failure mode at
+all." Both actions round-trip every commit message through argv/env
+(`get-pr-commits`'s JSON output becomes `dco`'s `commits:` input, which the
+action re-serializes onto a command line internally) — replaced with an
+in-workflow script that walks `git rev-list --no-merges
+<merge-base>..<head>` and checks `git log -1
+--format='%(trailers:key=Signed-off-by,valueonly)' <sha>` per commit,
+capturing trailer content only into a shell variable that's compared/
+printed, never re-interpolated into another command or eval'd — commit
+SHAs (fixed-width hex from `rev-list`, never derived from message content)
+are the only thing that reaches a command line. **General lesson: when a CI
+failure is real, reproducible, but resists root-causing (especially inside
+a third-party action's own internals), don't burn more budget chasing the
+exact trigger before fixing it — if the failure mode has a known shape
+(here: "large untrusted content on argv/env can exceed `ARG_MAX`"), a
+local reimplementation that structurally can't hit that shape closes the
+bug regardless of which precise condition was tripping it, and is usually
+smaller than bisecting a dependency's black box.** Separately: computing the
+PR's commit range via `git merge-base "$BASE_SHA" "$HEAD_SHA"` (both
+supplied by the `pull_request` event, `head.sha`/`base.sha`) rather than
+diffing against the base branch tip works identically for same-repo and
+fork PRs, because GitHub mirrors a fork PR's commits into the base repo's
+own ref namespace — a plain `actions/checkout` with `fetch-depth: 0` and an
+explicit `ref: ${{ github.event.pull_request.head.sha }}` (not the default
+merge-ref checkout) is enough to fetch them all from `origin`.
+
+## A per-item lookup miss during an enumerate-then-await walk can mean "already accomplished by a concurrent actor," not "was never real" — check whether an earlier-caught version of the same race already has a skip to reuse (issue #454, `ClientCtx::grow_stream`)
+
+`grow_stream` (`animusd/src/schema.rs`) enumerates a table's tablets from a
+`Metadata` snapshot up front, then calls `grow_stream_tablet` on each —
+one real `await` per iteration (resolve leader → propose → poll), so wall
+time and Raft activity pass between the snapshot and any one tablet's own
+turn. A tablet snapshotted `Active` can be retired by a **cascade** split
+(a different tablet's cutover in the same walk, or a fully independent
+one) before its turn arrives; the lookup `grow_stream_tablet`'s own
+`trigger_split` call performs then returns the generic "no such tablet"
+message, and — before this fix — that flowed straight through as a hard
+`error`, even though the code already had an identical-shaped skip
+(`STREAM_GROW_MID_SPLIT`) for a tablet caught `Splitting`/`Building` a
+*beat earlier* in the very same up-front `match`. The fix is not a new
+concept, just recognizing that the vanished-tablet case is the SAME
+concurrent-completion race observed one step later: the tablet didn't stop
+existing, it finished being split, and its (now `Active`) children's
+lineage already covers stream continuity exactly as it does for any other
+split — so skipping this call's own attempt on it costs nothing (the
+children just wait for the *next* `grow_stream` call, same as a
+`Splitting` parent's own children do today).
+
+**General lesson**: whenever a loop enumerates a set from a stale
+snapshot and then does real (`await`-crossing) work per item, a per-item
+"this no longer exists" result during the walk is not automatically an
+error — it can be the exact same "someone else already finished this"
+signal an *earlier*-observed variant of the race already has a legitimate
+skip for. Before writing a new error/skip classification, grep the
+sibling code path that already classifies the same job's more-obviously-
+racy states (here, the up-front `Splitting`/`Building` match) and ask
+whether the missing case is really a later-observed instance of the same
+thing — reuse its outcome and its safety argument rather than inventing a
+parallel one. Keep the interception narrow: match the *exact* error
+message/variant produced by the specific call this walk makes, at the one
+call site that walk owns, not a blanket catch on that message everywhere
+it can be produced — `trigger_split`'s own "no such tablet" is a correct,
+unrelated hard error for its other two callers (`auto_split_loop`,
+`POST /admin/tablet/split`), which never enumerate a stale snapshot and so
+have no such race to excuse. A pure `ClientResponse -> ClientResponse`
+classifier extracted into its own function made this reclassification
+unit-testable without any `SimEnv`/`ProdEnv` harness at all — the existing
+regression coverage for this exact race
+(`cascade_split_walks_the_grandparent_chain_with_closed_shard_shape`) is a
+real-thread `ProdEnv` e2e test whose relevant window is a small, non-
+deterministic timing race, unsuitable as the *only* proof the fix holds.
+
+## A branch-selection existence check needs the same read-your-writes barrier as a self-confirm — not just the proposer's own poll (issues #406/#450, `animusd::admin_add_control_member`)
+
+The general "confirm a just-proposed effect via `engine_applied_index()`,
+never a raw cache re-read" lesson is already logged several times over in
+this file (grep the term) — always framed as *a proposer confirming its own
+write*. `admin_add_control_member`'s bug is the same staleness hazard
+wearing a different hat: it isn't confirming anything it just proposed —
+it reads `metadata_cached()` once to decide **which branch to take**
+("is `node` already registered, or genuinely unclaimed?"), where the fact
+it's checking for is *someone else's* concurrent commit (the target
+control-only node's own self-registration, landing on this same leader
+just beforehand). Because a control-only registration never claims
+`Metadata::members` by design (ADR 0040 PR4's own carve-out — see
+`animus-control::meta.rs`'s `RegisterNode` doc), the old gate
+(`meta.members.contains_key`) was *structurally* always false for this
+node shape, so the "genuinely unclaimed" branch ran on **every** call and
+re-derived a fresh `NodeAddrs` from the same stale `metadata_cached()` —
+empty `client`/`intra`/`admin` fields whenever this leader's own ADR 0038
+apply task hadn't yet caught up to the real registration's own commit,
+producing a permanent CAS collision (or, worse, a durable blank address
+book if the malformed proposal won the race). Two independent fixes were
+needed, not one: (1) the gate itself must consult `node_addrs`, the
+command's *actual* CAS key, not `members` alone; (2) before evaluating
+either, the call must bound-wait for `engine_applied_index() >=
+commit_index()` **on this exact leader** — a local read-your-writes
+barrier against *this leader's own* Raft log, not the proposer's own
+command, closing the dominant race (a self-registration relayed to/
+proposed on this same leader moments earlier) outright, and narrowing what
+remains to the genuinely irreducible "hasn't reached this leader's log at
+all yet" case. Fix (1) alone measurably narrows the bug but does **not**
+close it: in the reproduction built to prove this, checking `node_addrs`
+without also adding the wait still collided reliably, because the leader's
+own cache had **no trace under either key** at read time — the commit
+itself, not just the label it's filed under, was the missing fact.
+**General lesson: any local snapshot read used to gate a decision about
+"has some other actor already done X" needs the identical staleness
+audit a self-confirm poll gets, even when the caller never proposed
+anything itself and has no `propose_and_await`-shaped call site to remind
+it** — the caller-doesn't-know-to-wait failure mode is easy to miss
+because nothing in the code *looks* like a write path. Reproducing this
+deterministically in a real `ProdEnv` test needed the same technique as
+the `InstallSnapshot`-window entry just above: not a fixed sleep or
+artificial load, but a condition-based search polling `GET /admin/raft`'s
+`commit_index`/`engine_applied_index` fields directly for the instant
+where commit has advanced but apply hasn't, then firing the racing call at
+exactly that reading.
