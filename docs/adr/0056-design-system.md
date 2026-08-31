@@ -7,7 +7,12 @@
   **"Ledger"** (light-first, keyline-means-live) — same file, same ADR
   number, per-component polish delivered as part of the revision rather
   than as this ADR's own still-open follow-up. See that amendment for the
-  full decision and for which statements below it supersedes.
+  full decision and for which statements below it supersedes. **Its own
+  type pairing is superseded in turn by a 2026-08-31 amendment**: Space
+  Grotesk/Martian Mono are replaced by Work Sans/JetBrains Mono as
+  groundwork for a further visual-direction change; Ledger's own
+  colour/geometry/component language is untouched by that amendment. See
+  it for the full decision.
 - **Date:** 2026-08-23
 - **Amends:** [ADR 0021](0021-web-dashboard.md) (dashboard styling),
   [ADR 0052](0052-data-console-port.md) (data console styling).
@@ -246,7 +251,10 @@ apply now that the values they were computed against are gone.
   delivery still splits by surface (Google Fonts on the public site,
   base64 `data:` URIs embedded in the two consoles) for the identical
   reason this ADR originally gave (ADR 0021's no-CDN-fetch rule, and the
-  Kubernetes egress-restricted deployment target).
+  Kubernetes egress-restricted deployment target). **Superseded by the
+  2026-08-31 amendment, below**: the specific faces change to Work
+  Sans/JetBrains Mono; the role split and the delivery-mechanics
+  reasoning stated here do not.
 
 ### Statements above now superseded
 
@@ -285,3 +293,63 @@ this same delivery — "AnimusDB Console" → **animusd admin**, "AnimusDB
 Data Console" → **animusd console** — a naming change, not a design-system
 one; see [ADR 0021](0021-web-dashboard.md)'s and
 [ADR 0052](0052-data-console-port.md)'s own 2026-08-25 amendments.
+
+## Amendment (2026-08-31) — type pairing: Space Grotesk/Martian Mono → Work Sans/JetBrains Mono
+
+A visual-canvas exploration (outside this repo) validated a further
+restyle away from Ledger's own type toward a plainer, more traditional
+developer-tool look. This amendment lands **only** the shared font/token
+groundwork the rest of that restyle builds on — **the type pairing
+changes; nothing else in Ledger does.** Colour (`--accent`'s `#2f4da8`/
+dark-theme `#8fa7e6` and every other existing colour token), geometry,
+radius, spacing, and shadows are all untouched here — those are a
+separate, later change (see "What this groundwork is not," below).
+
+### The pairing changes: Space Grotesk/Martian Mono → Work Sans/JetBrains Mono
+
+`--font-ui` becomes **Work Sans** (UI, display), replacing Space Grotesk;
+`--font-mono` becomes **JetBrains Mono** (figures, identifiers, commands,
+column labels), replacing Martian Mono. **The role split this ADR's
+original Decision established is unchanged**: *the face a human wrote
+carries `--font-ui`; the face a machine produced carries `--font-mono`* —
+only which two faces fill those roles changes. Both new faces are
+open-source variable fonts, same as the pair they replace (Work Sans is
+OFL; JetBrains Mono is Apache-2.0), so the "Latin subset, one file per
+family covering the whole weight range" property (Decision, "Type",
+above) carries over unchanged — the consoles still embed exactly two
+`.woff2` files, not one per weight. The embedded pair's total size grows
+from ~61 KB of base64 to ~118 KB (Work Sans's and JetBrains Mono's own
+variable-font builds are each larger than Space Grotesk's/Martian Mono's
+were) — noted as a real cost, not treated as a regression: it is still
+one file per family, and the ADR 0021 no-CDN-fetch reasoning that
+justifies embedding at all doesn't scale with face size.
+
+### Font delivery is unchanged
+
+Delivery mechanics still split by surface for the identical reason this
+ADR has given twice already (original Decision's "Why the token file is
+duplicated" section; the 2026-08-25 amendment's "What is unchanged"): the
+website links Work Sans and JetBrains Mono from Google Fonts (`website/*.html`'s
+`<head>`, weights matched to actual usage — `wght@400;500;600;700` for
+Work Sans, `wght@400;500;600` for JetBrains Mono, verified against
+`site.css`'s own `font:`/`font-weight:` declarations rather than carried
+over from the old pair's weight list unexamined); the two consoles embed
+the same two faces as base64 `data:` URIs in `crates/animusd/src/fonts.css`,
+sourced from `crates/animusd/src/fonts/work-sans-latin.woff2` and
+`crates/animusd/src/fonts/jetbrains-mono-latin.woff2`, for ADR 0021's
+unchanged no-CDN-fetch/air-gapped-cluster reason. The `concat!`
+(fonts + tokens + skin → one served stylesheet constant, `dashboard::CSS`/
+`console::CSS`) is untouched.
+
+### What this groundwork is not
+
+This amendment is deliberately narrow — **fonts and the tokens that name
+them, nothing else.** It is groundwork for a broader visual-direction
+change (skin, geometry, component language) that lands in follow-up PRs:
+the website's own skin (`website/assets/site.css`) in one PR, the two
+consoles' skin (`dashboard.css`/`console.css`) in another. Neither is part
+of this amendment; Ledger's colour palette, radius/spacing rhythm,
+control heights, panel recipe (flat `--surface` fill, ink rules, stamped
+pills, hatch fills, the ink-plate), and every other statement in the
+2026-08-25 amendment above stay exactly as that amendment left them until
+those follow-ups land.
