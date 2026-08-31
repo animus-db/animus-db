@@ -11102,9 +11102,25 @@ async fn relay_request_with_timeout(
     .await
     {
         Ok(Some(resp)) => resp,
-        _ => ClientResponse::Error("relay to peer node failed".into()),
+        _ => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
     }
 }
+
+/// The plain-text sentinel [`relay_request_with_timeout`] returns for any
+/// **transport**-level failure — connect refused/timed out, the write/read
+/// itself failing, or the whole attempt outliving its budget — as opposed to
+/// a reply a live peer actually sent. Named so `forwarding::ClientCtx::
+/// forward_to_tablet_leader`'s hinted-retry chase can tell the two apart
+/// (issue #316): unlike a parsed "not the leader here" refusal (a candidate
+/// that IS reachable, just not the leader), this means the candidate itself
+/// couldn't be reached at all — which the chase must treat as "try the next
+/// known replica," exactly like a refusal carrying no hint, rather than as a
+/// terminal error. Before that fix, a forward whose first-guess or
+/// hint-chased candidate happened to be a node that had just crashed/been
+/// killed gave up on the very first unreachable hop and never tried the
+/// tablet's other live replicas — see that function's own doc for the full
+/// mechanism.
+const RELAY_TRANSPORT_FAILURE: &str = "relay to peer node failed";
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
@@ -11549,6 +11565,236 @@ mod confirm_futility_tests {
             slow_started.elapsed()
         );
         node.shutdown();
+    }
+}
+
+/// Issue #316 regression: `ClientCtx::forward_to_tablet_leader` must chase
+/// past a candidate that is simply **unreachable**, not only past one that
+/// replies with a "not the leader here" refusal. In-crate, like
+/// `confirm_futility_tests` above/`index_drain.rs`'s `gsi_drain_cursor_tests`
+/// — needs the private `ClientCtx::seed_child_rows`/`Node::ctx_for_test`
+/// handles no external `tests/` file can reach. **Lives here rather than
+/// beside `forward_to_tablet_leader` in `forwarding.rs`** because that
+/// module carries a hard `#[deny(clippy::disallowed_methods)]` (ADR 0061
+/// Phase C's closing rung) — a real `tokio::time::sleep`/`timeout`, which
+/// this real-socket `ProdEnv` test needs freely, is a build error there.
+/// Real-socket `ProdEnv` integration test, per this crate's own testing
+/// discipline.
+#[cfg(test)]
+mod forward_transport_failure_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn cluster_config(n: usize) -> ClusterConfig {
+        let addrs = free_addrs(n * 6);
+        let nodes = (0..n)
+            .map(|i| RoleAddrs {
+                id: crate::config::node_id(i),
+                role: NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+            })
+            .collect();
+        ClusterConfig {
+            nodes,
+            dynamo_auth: None,
+        }
+    }
+
+    /// Bring up an `n`-node cluster, retrying the whole config against the
+    /// documented port-TOCTOU race (`docs/engineering-lessons.md`): each
+    /// attempt allocates a fresh set of addresses.
+    async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
+        for attempt in 0..16 {
+            let config = cluster_config(n);
+            let mut nodes = Vec::new();
+            let mut failed = false;
+            for i in 0..n {
+                match run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                    Ok(node) => nodes.push(node),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed {
+                return nodes;
+            }
+            for node in &nodes {
+                node.shutdown();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    }
+
+    async fn await_bootstrap(nodes: &[Node]) {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes.iter().any(Node::is_control_leader)
+                    && nodes.iter().all(|n| !n.metadata().members.is_empty())
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not bootstrap in 20s");
+    }
+
+    async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+        // 40s, not 20s: this is the FIRST write against a brand-new 4-node
+        // cluster, so it also pays for the first tablet's own provisioning
+        // (placement + group formation) on top of ordinary write latency —
+        // a cold-cache CI/sandbox run occasionally needs more of that
+        // budget than the sibling helpers elsewhere in this crate, whose
+        // clusters are already warm by their own first write.
+        timeout(Duration::from_secs(40), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                crate::write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: table.to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match crate::read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 40s");
+    }
+
+    /// The mechanism behind #316's `split_survives_losing_one_childs_
+    /// leader_mid_build` hang, isolated from the split-build workflow
+    /// entirely: `resolve_cp_route`'s no-local-replica fallback always
+    /// guesses a tablet's FIRST replica in `Metadata` order — a plain,
+    /// deterministic read, not a leader hint — so a caller that hosts no
+    /// local replica of the target tablet forwards there regardless of
+    /// whether that replica is alive, still a follower, or was ever the
+    /// leader. Pre-fix, `forward_to_tablet_leader` gave up outright the
+    /// instant that guess was simply UNREACHABLE (a killed node): a plain
+    /// transport failure doesn't parse as a "not the leader here" refusal,
+    /// so the hinted-retry chase never got a chance to try either of the
+    /// tablet's other two live replicas — and since the guess never
+    /// changes, every subsequent call (the split-build driver's next tick
+    /// included) reproduced the identical dead-end forever.
+    ///
+    /// `seed_child_rows` with an **empty** row set is the cheapest faithful
+    /// exercise of this: it still runs the real `resolve_cp_route` →
+    /// `forward_to_tablet_leader` → `SeedRows` round trip, but the
+    /// server-side `seed_rows_local` returns `Ok(())` immediately for zero
+    /// rows without ever proposing (see that method's own doc) — so a
+    /// prompt `Ok(())` here proves the FORWARDING recovered, nothing about
+    /// the split-build workflow itself (which has its own end-to-end
+    /// coverage in `tests/split_build.rs`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_to_tablet_leader_survives_a_dead_first_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4 nodes vs RF 3 (`MAX_REPLICATION_FACTOR`): exactly one node hosts
+        // no replica of the seeded tablet, forcing the no-local-replica
+        // fallback path every time.
+        let nodes = bring_up(4, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        put_until_ok(nodes[0].client_addr(), "fwd316", b"seed", b"v").await;
+        let tablet = *nodes[0]
+            .metadata()
+            .tablets_for_table("fwd316")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        let replicas = nodes[0]
+            .metadata()
+            .tablets
+            .get(&tablet)
+            .expect("tablet exists")
+            .replicas
+            .clone();
+        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+
+        let caller = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !replicas.contains(&crate::config::node_id(*i)))
+            .map(|(i, _)| i)
+            .expect("a 4-node cluster at RF 3 has exactly one non-replica node");
+
+        // Kill the FIRST replica in `Metadata` order — the deterministic
+        // guess `resolve_cp_route` will make on every single call, whether
+        // or not it was ever this tablet's leader.
+        let victim_id = replicas[0].clone();
+        let victim = (0..nodes.len())
+            .find(|i| crate::config::node_id(*i) == victim_id)
+            .expect("victim id is one of this cluster's nodes");
+        assert_ne!(victim, caller, "the caller must not be its own victim");
+        nodes[victim].shutdown();
+
+        let ctx = nodes[caller].ctx_for_test();
+        let started = tokio::time::Instant::now();
+        // 15s outer bound: comfortably above `seed_child_rows`'/
+        // `forward_to_tablet_leader`'s own internal `CLIENT_TIMEOUT`
+        // (10s) ceiling, so this can never fire first and be mistaken for
+        // the thing under test — the real teeth is the elapsed-time
+        // assertion below.
+        let result = timeout(
+            Duration::from_secs(15),
+            ctx.seed_child_rows(tablet, Vec::new()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "forwarding must recover onto a live replica, not dead-end on the killed \
+             first guess: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pre-fix: a dead first guess is never retried, so this either errs immediately \
+             or (via the caller's own outer retry) burns the whole CLIENT_TIMEOUT budget \
+             every attempt; a fixed forward recovers in well under a second normally, so 5s \
+             is still a generous margin over that, just not over the old broken behavior: \
+             took {elapsed:?}"
+        );
+
+        for (i, node) in nodes.iter().enumerate() {
+            if i != victim {
+                node.shutdown_graceful().await;
+            }
+        }
     }
 }
 

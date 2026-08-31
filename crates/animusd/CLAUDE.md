@@ -1540,6 +1540,37 @@ hosting no replica of the target, which only a cluster larger than RF can
 produce (`tests/split_build.rs::
 split_completes_when_a_child_lives_off_the_parent_leader_node`).
 
+**A dead candidate is chased too, not just a wrong-but-reachable one
+(issue #316, fixed).** The hinted-retry fix above only helps when the
+guessed candidate is alive and answers with a real refusal — a plain
+**transport** failure (the candidate crashed/was killed) used to be
+terminal: `relay_request_with_timeout` folds every connect/write/read
+failure into one sentinel string (`RELAY_TRANSPORT_FAILURE`), which
+doesn't parse as a "not the leader here" refusal, so the pre-fix chase
+gave up on the very first unreachable hop instead of trying another known
+replica. Since the guess itself is deterministic (the no-local-replica
+fallback and a refusal's own embedded hint are both plain reads, never
+liveness-checked), a caller that keeps re-resolving and re-forwarding
+(the split-build driver's own per-tick retry, `seed_child_rows`) kept
+reproducing the identical dead end forever once its first guess or hint
+chase happened to land on a node that had since died — the confirmed root
+cause of `tests/split_build.rs::
+split_survives_losing_one_childs_leader_mid_build`'s reported hang. Fixed
+by giving a transport failure the identical "no hint" treatment a
+live-but-mid-election refusal already gets (try another known replica),
+rather than a terminal return. Regression:
+`forward_transport_failure_tests::
+forward_to_tablet_leader_survives_a_dead_first_guess` (`lib.rs` — **not**
+beside `forward_to_tablet_leader` in `forwarding.rs`, whose module carries
+a hard `#[deny(clippy::disallowed_methods)]`, ADR 0061 Phase C's closing
+rung, that a real-socket test's `tokio::time` calls would trip). See
+`docs/engineering-lessons.md`'s matching entry for the full incident,
+including why this sandbox could never reproduce the original hang live
+(fast localhost + a small dataset's bulk pass usually outracing the
+test's own 30s victim-detection poll) yet the fix was still provable
+red-before/green-after via a fully deterministic isolation of the exact
+mechanism.
+
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
 formation window, or a crashed leader), one exhausted pass is not a failure.
