@@ -185,6 +185,28 @@ per-tablet CP data plane (`animus-cp-data`).
   (`node.rs`'s `meta_apply_and_compact`) has only ever called plain
   `wal_image()`/`encode_record`.
 
+  **Every WAL line carries a per-record CRC32 checksum (issue #495)**:
+  `<crc32 as 8 lowercase hex chars>:<json>\n`, checked in
+  `verify_checksummed_line` before the JSON is ever parsed. Before this, the
+  newline-terminated-`serde_json` framing had no way to distinguish a
+  bit-flip that happened to keep a record's JSON syntactically valid (e.g.
+  a digit inside a packed numeric field) from a legitimate value — it
+  decoded successfully into a silently wrong record instead of a decode
+  error, confirmed to reach a hard panic once such a record applied past
+  `animus_cp_data::assert_ts_monotonic` (`docs/engineering-lessons.md` has
+  the full account). **A checksum failure is treated exactly like a torn
+  trailing line**: `decode`/`decode_tagged` stop at the first bad record
+  and drop it plus everything physically after it in the buffer — never
+  applied, never a panic. This is a deliberately simpler rule than
+  `animus-storage`'s own CRC-checked WAL framing, which additionally
+  distinguishes real mid-file corruption (hard error) from a torn tail
+  (tolerated) by checking whether a valid record follows; this WAL has no
+  invariant that needs that finer distinction, since a dropped tail-of-log
+  is always safe to recover from here. No back-compat/migration for a
+  pre-existing unchecksummed WAL file (root `CLAUDE.md`'s no-back-compat
+  stance) — an upgraded node needs a fresh WAL like any other format change
+  in this repo.
+
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
 
@@ -966,15 +988,20 @@ once" assertion over that field is checking a *stronger, false* property,
 since several racers legitimately and correctly agreeing "the tablet that
 landed carries my own candidate id" is expected, not a bug — only a
 content/fingerprint comparison (`sample_tablets`), never an occurrence
-count, states injectivity correctly. (c) An open fault-finding confirmed in
-one plane over a shared codec (issue #495, the WAL-corruption gap in
-`animus-control::persist::WalRecord`, confirmed reproducible in
-`animus-cp-data`) does **not** automatically reproduce in a sibling plane
-that shares the codec but not the downstream invariant the corruption has
-to trip — confirmed absent here across an 80-combination sweep (this
-plane's commands carry no HLC timestamp, and its CAS/epoch checks reject a
-mismatch rather than asserting on one); see
-`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc. (d) PR③:
+count, states injectivity correctly. (c) A fault-finding confirmed in one
+plane over a shared codec (issue #495, the WAL-corruption gap in
+`animus-control::persist::WalRecord` — since fixed by a per-record CRC32
+checksum, see that module's own doc — confirmed reproducible at the time
+in `animus-cp-data`) does **not** automatically reproduce in a sibling
+plane that shares the codec but not the downstream invariant the
+corruption has to trip — confirmed absent here across an 80-combination
+sweep (this plane's commands carry no HLC timestamp, and its CAS/epoch
+checks reject a mismatch rather than asserting on one); see
+`control_corrupt_on_crash_may_hard_panic_issue_495`'s own doc — still a
+useful standing regression probe post-fix, now for whichever future
+`MetaCommand` field or replay-path invariant might one day become strict
+enough for a merely-dropped (rather than wrong-valued) tail record to
+matter. (d) PR③:
 `Simulator::crash`+`Simulator::restart` (mutes/re-arms the SAME still-live
 tasks) is **not** a stand-in for a real process restart — proving the ADR
 0038 apply task's restart-recovery path (`meta_apply_loop`'s engine rebuild

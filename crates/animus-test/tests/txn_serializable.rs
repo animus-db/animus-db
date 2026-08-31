@@ -33,13 +33,15 @@
 //! genuine G2 (write-skew) cycle.
 //!
 //! **Topology.** Three independent tablet Raft groups (`t0`/`t1`/`t2`), 3
-//! replicas each, one `MemoryEngine` shared **within** each group's own
-//! replicas (mirroring `txn_multi.rs`'s harness convention — Raft consensus
-//! is still exercised faithfully per replica; only the final storage engine
-//! is a shared test shortcut, exactly as `txn_multi.rs`/`txn_recovery.rs`
-//! already establish). Clients live on dedicated, never-faulted driver env
-//! ids (the raftkv-corpus convention) and route to whichever node in a group
-//! currently leads.
+//! replicas each, **each replica with its own private `MemoryEngine`**
+//! (mirroring `raftkv_linearizable.rs`'s `Group::start`/`factory(&sim, id)`
+//! pattern — the same-crate `Arc`-sharing bug this once had, a single
+//! `MemoryEngine` cloned across a group's 3 replicas, silently collapsed
+//! their storage independence and produced a permanently-orphaned derived
+//! row indistinguishable from a real resolver liveness gap; see issue #488
+//! and `docs/engineering-lessons.md`). Clients live on dedicated,
+//! never-faulted driver env ids (the raftkv-corpus convention) and route to
+//! whichever node in a group currently leads.
 //!
 //! **Keyspace.** Nine keys (3 groups × 3 clients: a key's global id is its
 //! owning group times 3 plus its owning client) — **single-writer-per-key
@@ -284,15 +286,25 @@ impl Topology {
     fn start(sim: &Simulator) -> Topology {
         let mut nodes = Vec::with_capacity(NUM_GROUPS);
         for ids in GROUP_IDS.iter().take(NUM_GROUPS) {
-            let engine = MemoryEngine::new();
             let scope = StorageScope::new(KeyRange::whole());
             let group_nodes: Vec<Node> = ids
                 .iter()
                 .map(|&id| {
+                    // One `MemoryEngine` PER REPLICA, never shared across a
+                    // group's own replicas (issue #488) — `MemoryEngine`
+                    // clones share state (`Arc<Mutex<Inner>>`), so handing
+                    // the same instance to all 3 replicas silently collapses
+                    // their storage independence: a faster replica's own
+                    // apply can make a slower replica's `storage.get()` jump
+                    // ahead of what its own Raft log processing has decided,
+                    // steering it into an already-decided no-op branch that
+                    // skips the `TxnTracker` update. Mirrors
+                    // `raftkv_linearizable.rs`'s `Group::start`
+                    // (`factory(&sim, id)` per node id).
                     RaftKvNode::start_scoped(
                         sim.env(nid(id)),
                         ids.iter().copied().map(nid).collect(),
-                        engine.clone(),
+                        MemoryEngine::new(),
                         scope.clone(),
                     )
                 })

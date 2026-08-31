@@ -402,8 +402,16 @@ async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
         .unwrap()
         .to_owned();
 
-    let it = get_shard_iterator(addr, &stream_arn, &shard_id, "TRIM_HORIZON", None).await;
-    let (records, _next) = get_records(addr, &it, None).await;
+    // `TransactWriteItems`'s change-log record is written by
+    // `materialize_derived` only once the participant's `TxnResolve` has
+    // applied; `ClientCtx::cp_txn` acks the transaction after racing that
+    // resolve against `TXN_RESOLVE_ALL_AWAIT_BUDGET` rather than
+    // guaranteeing it completed first (a timeout still acks — delayed,
+    // never denied; the passive `txn_resolver_loop` finishes it up to
+    // ~1s later otherwise). So this read, like every other eventually-
+    // consistent assertion in this file, is a converged-or-timeout poll,
+    // not a single immediate read (issue #506).
+    let records = await_records(addr, &stream_arn, &shard_id, 2).await;
     assert_eq!(
         records.len(),
         2,
@@ -664,6 +672,33 @@ async fn get_records(
     let records = v["Records"].as_array().cloned().unwrap_or_default();
     let next = v["NextShardIterator"].as_str().map(str::to_owned);
     (records, next)
+}
+
+/// Poll `GetShardIterator`(TRIM_HORIZON) + `GetRecords` until the shard has
+/// delivered at least `at_least` records, or a generous deadline passes —
+/// the converged-or-timeout idiom this file's other assertions already use
+/// (`await_chain_len`), needed for any read that follows a write whose
+/// change-log record is only guaranteed *eventually*, not synchronously
+/// with the write's own ack (issue #506: `TransactWriteItems` on a
+/// streamed/indexed table awaits its participant's resolve on a bounded,
+/// best-effort budget before acking — see `ClientCtx::cp_txn`'s doc). On
+/// timeout this returns whatever it last saw, so the caller's own assertion
+/// still fires with an informative message.
+async fn await_records(
+    addr: SocketAddr,
+    stream_arn: &str,
+    shard_id: &str,
+    at_least: usize,
+) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let it = get_shard_iterator(addr, stream_arn, shard_id, "TRIM_HORIZON", None).await;
+        let (records, _next) = get_records(addr, &it, None).await;
+        if records.len() >= at_least || tokio::time::Instant::now() >= deadline {
+            return records;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The full read-path walk: `ListStreams`/`DescribeStream` show a chain of

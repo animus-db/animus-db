@@ -262,15 +262,20 @@ retrievable from git history.)
   globally once at group start (not scheduled/reset by `Nemesis`/`heal_all`
   the way `FsyncLie` is — it stays armed for the whole run, since the point
   is that *every* crash the scenario's own schedule triggers tears/corrupts
-  its un-synced WAL tail). **Caveat**: the Raft WAL's on-disk record framing
-  (`animus_control::persist::PersistedState::encode_record`, reused by this
-  plane's own `raftkv.wal`) is plain newline-terminated `serde_json` with no
-  per-record checksum — a bit-flip landing inside a byte that keeps the JSON
-  syntactically valid could produce an undetected-corrupt record rather than
-  a decode error, so a `check_cycles`/`check_durability`/`check_convergence`
-  failure surfacing from this pass at depth is a **real finding**, not a
-  reason to weaken the fault rate or the assertion (see
-  `wal_fault_disk_config`'s own doc in `raftkv_linearizable.rs`).
+  its un-synced WAL tail). **Caveat (issue #495, fixed)**: the Raft WAL's
+  on-disk record framing (`animus_control::persist::
+  PersistedState::encode_record`, reused by this plane's own `raftkv.wal`)
+  used to be plain newline-terminated `serde_json` with no per-record
+  checksum — a bit-flip landing inside a byte that kept the JSON
+  syntactically valid could produce an undetected-corrupt record rather
+  than a decode error. Every WAL line now carries a CRC32 checksum over its
+  JSON payload, so a corrupted-but-parseable record is caught and dropped
+  (along with everything after it in the file) instead of silently
+  decoding into a wrong value. If a `check_cycles`/`check_durability`/
+  `check_convergence` failure still surfaces from this pass at depth, that
+  remains a **real finding**, not a reason to weaken the fault rate or the
+  assertion (see `wal_fault_disk_config`'s own doc in
+  `raftkv_linearizable.rs`).
 - **`ANIMUS_SHRINK` wiring (ADR 0061 rung B4)** — this is the worked example
   the "Failure minimization" section above points to. `Scenario`/`Nemesis`
   derive `Serialize`/`Deserialize`; `scenario_candidates` reduces the fault
@@ -425,10 +430,10 @@ retrievable from git history.)
   `raftkv_linearizable.rs`'s own `heal_all` documents for its own,
   globally-scoped `FsyncLie`). Depth knob **`ANIMUS_TXN_SEEDS`** (default 1
   = frozen; `seed_expand`'s usual variant-0-keeps-the-canonical-seed
-  convention; held green at `=100` for the new fault-primitives cells in
-  isolation, `=15` for the full corpus — see the file's own history for why
-  full-corpus runs above `~s24` currently need the pre-existing
-  `compound_lossy_and_anchor_kill` finding below excluded first).
+  convention; held green at `=40`, `corpus-deep.yml`'s full nightly depth,
+  end to end including `check_kind_consistency` — see the `#488` bullet
+  below for the harness bug that used to make full-corpus runs above
+  `~s24` non-convergent).
 - **A single-decider assumption in the recovery protocol itself, found by
   this corpus under real fault injection**: see the ADR 0018 PR6 amendment
   for the full account — the coordinator's own decide attempt and the
@@ -437,22 +442,38 @@ retrievable from git history.)
   the coordinator's own round trip is still genuinely in flight past
   `RECOVERY_GRACE`, and the apply path's "two different commit timestamps
   is impossible by construction" assert does not tolerate that.
-- **A real, pre-existing, UNFIXED `check_kind_consistency` finding, found
-  incidentally while validating the ADR 0061 Decision 3 fault-primitives
-  tier at this corpus's own nightly CI depth** (`ANIMUS_TXN_SEEDS=40`,
-  matching `corpus-deep.yml`'s existing txn tier — no new fault involved):
-  `compound_lossy_and_anchor_kill_s25` (seed `8035380114809936673`)
-  reproduces identically on unmodified `main`, i.e. **before** any of the
-  fault-primitives-tier changes in this section — a `Lossy` + `AnchorLeaderKill`
-  cell whose `KIND_LSI` derived row diverges from its own base row
-  (`Some([1, 11])` vs `Some([1])`). Left unfixed and undiagnosed per this
-  repo's "an incidental bug gets its own PR" convention — it is unrelated to
-  the fault primitives this section documents, was simply never exercised
-  before (this corpus's default depth is 1; nightly CI's `=40` had not, as
-  of this finding, actually been run green end-to-end at that depth with
-  the `kind_consistency` check present). The new fault-primitives cells
-  themselves are clean through `ANIMUS_TXN_SEEDS=100` when run in isolation
-  from this cell (see the previous bullet's depth note).
+- **Issue #488 — `check_kind_consistency` finding, diagnosed as a
+  test-harness-only bug, not a production gap.** First found incidentally
+  while validating the ADR 0061 Decision 3 fault-primitives tier at this
+  corpus's own nightly CI depth (`ANIMUS_TXN_SEEDS=40`, matching
+  `corpus-deep.yml`'s existing txn tier): `compound_lossy_and_anchor_kill_s25`
+  (seed `8035380114809936673`), a `Lossy` + `AnchorLeaderKill` cell, produced
+  a `KIND_LSI` derived row permanently diverging from its own base row
+  (`Some([1, 11])` vs `Some([1])`). Root cause: `Topology::start` used to
+  build **one `MemoryEngine` per group and `.clone()` it into all 3
+  replicas** — `MemoryEngine` clones share state (`Arc<Mutex<Inner>>`), so
+  the corpus's "replicas" secretly shared one physical store. A faster
+  replica's apply could durably write the shared engine before a slower
+  replica's own, separate `apply_and_compact` call for the *same* log index
+  read it back — steering that replica's `TxnCommit`/`TxnStage` apply into
+  an already-decided/idempotent-replay no-op branch that (correctly, for a
+  genuine replay) skips the `TxnTracker` update. When the two replicas that
+  never took the genuine `Pending -> Committed` transition are exactly the
+  two that survive the anchor's leader kill, neither has a populated
+  `TxnTracker::unresolved_decided` for the transaction, so
+  `resolver_tick`'s proactive resolve never fires and the `KIND_LSI` row
+  (only ever materialized inside a genuine local `TxnResolve` apply, never
+  re-derived from engine state) is orphaned forever — while the base row
+  keeps reading correctly everywhere, because its own visibility comes from
+  on-the-fly intent resolution keyed off the (shared, so already-correct)
+  engine status. `animus-cp-data`'s apply arm, `TxnTracker`, and the
+  commit-confirmation path are all sound; production gives every tablet
+  replica its own private engine (ADR 0050) and has no equivalent exposure.
+  **Fixed** by giving each replica its own `MemoryEngine::new()` in
+  `Topology::start`, matching `raftkv_linearizable.rs`'s `Group::start`
+  (`factory(&sim, id)` per node id) — full account in the issue and in
+  `docs/engineering-lessons.md`'s entry on shared-state test doubles. The
+  corpus is green end-to-end at `ANIMUS_TXN_SEEDS=40` with this fix.
 
 ### Elle-adjacent, but not Elle: the DynamoDB Streams lineage-walk corpus (ADR 0042/0043, round-3 PR8)
 

@@ -214,11 +214,14 @@ impl Cluster {
 
     /// Like [`crash_restart`](Self::crash_restart), but the crash itself may
     /// TEAR `id`'s own un-synced WAL tail — `id`'s own [`DiskConfig`] must
-    /// carry [`DiskConfig::torn_tail_on_crash`] (never
-    /// [`DiskConfig::corrupt_on_crash`] alongside it here — a bit-flip
-    /// landing inside a still-JSON-valid packed `HlcTimestamp` is a known,
-    /// separate bug class this corpus deliberately does not chase, tracked
-    /// as issue #495) BEFORE this call. [`Simulator::stop`] alone (what
+    /// carry [`DiskConfig::torn_tail_on_crash`] BEFORE this call. (A
+    /// bit-flip landing inside a still-JSON-valid packed `HlcTimestamp` —
+    /// what [`DiskConfig::corrupt_on_crash`] composed with the tear used to
+    /// risk, issue #495 — is now caught by a per-record WAL checksum
+    /// (`animus_control::persist`) instead of silently mis-decoding; this
+    /// corpus still doesn't compose the two here, since this helper's own
+    /// callers only need the tear, not an extra fault dimension this file
+    /// isn't otherwise exercising.) [`Simulator::stop`] alone (what
     /// [`crash_restart`](Self::crash_restart) uses) never tears anything —
     /// it drops a node's whole un-synced buffer atomically, unconditionally;
     /// only [`Simulator::crash`] draws the tear-point/tear-content RNG.
@@ -2249,10 +2252,11 @@ fn scenario_torn_tail_crash_restart_replica_recovers(seed: u64) {
         }
         env.sleep(Duration::from_secs(2)).await;
 
-        // Torn-tail alone — deliberately never `corrupt_on_crash` alongside
-        // it (issue #495: a bit-flip landing inside a still-JSON-valid
-        // packed `HlcTimestamp` is a known, separate bug class this
-        // scenario does not chase).
+        // Torn-tail alone — `corrupt_on_crash` isn't composed alongside it
+        // here (a bit-flip landing inside a still-JSON-valid packed
+        // `HlcTimestamp` used to be a separate bug class, issue #495, now
+        // closed by a per-record WAL checksum, `animus_control::persist`;
+        // this scenario just isn't exercising that extra fault dimension).
         let mut torn = DiskConfig::default();
         torn.torn_tail_on_crash = true;
         c.sim.set_disk_config_for(node_c(), torn);
