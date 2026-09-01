@@ -2455,11 +2455,14 @@ mod tests {
                 rows: vec![(TabletId(1), 0)],
                 remove: false,
             },
-            // ADR 0050: exercise the `split_lineage` mirror's read side too
-            // — a live engine scan only ever yields `Put`s, so cutover's
-            // lineage row is a value `rebuild_metadata_from_engine` has to
-            // decode.
-            MetaCommand::BeginSplit {
+            // Exercise the `split_lineage` mirror's read side too — a live
+            // engine scan only ever yields `Put`s, so cutover's lineage row
+            // is a value `rebuild_metadata_from_engine` has to decode. Uses
+            // `BeginSplitInPlace` (ADR 0058 Train 2 rung 3) rather than the
+            // deprecated copy-based `BeginSplit` — its own mirror arm
+            // (parent row + allocator counter only, no `Building` child
+            // rows) is otherwise unexercised by any test in this file.
+            MetaCommand::BeginSplitInPlace {
                 parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: vec![5],

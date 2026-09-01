@@ -74,7 +74,7 @@
 //!    unconditionally) — `AllocatorRace`'s `check_allocator_injectivity`:
 //!    every `TabletId` observed in any replica's tablet map at any sampled
 //!    point in the run has a stable identity (never two different
-//!    `CreateTablet`/`BeginSplit` calls assigned the same id), and every id
+//!    `CreateTablet`/`BeginSplitInPlace` calls assigned the same id), and every id
 //!    a proposer's own confirm loop reported as applied is pairwise
 //!    distinct. Sampled at every convergence poll AND every fault-schedule
 //!    step (`Shared::sample_tablets`), not just the final state, so a
@@ -151,7 +151,7 @@
 //! trivial no-contention `UpsertMember` proposals, the non-vacuity floor
 //! every corpus in this repo needs (mirroring `control_raft.rs`'s own
 //! baseline style); (PR②) [`Workload::AllocatorRace`] — several proposers
-//! racing `CreateTablet`/`BeginSplit` against ONE shared table/tablet,
+//! racing `CreateTablet`/`BeginSplitInPlace` against ONE shared table/tablet,
 //! hammering `Metadata::next_tablet_id`/`next_free_tablet_id()`; and (PR②)
 //! [`Workload::RegisterCas`] — several proposers each claiming a distinct
 //! node id then attempting one deterministic differing-re-registration
@@ -352,7 +352,7 @@ enum Workload {
     PlainChurn { proposers: usize },
     /// `proposers` concurrent racers hammering `Metadata::next_tablet_id`/
     /// `next_free_tablet_id()` (`crates/animus-control/src/meta.rs`) — the
-    /// genuinely allocator-shaped counter `CreateTablet`/`BeginSplit` race.
+    /// genuinely allocator-shaped counter `CreateTablet`/`BeginSplitInPlace` race.
     /// Two phases per scenario, both against ONE shared table/tablet (the
     /// "same parent range/table" this workload's own doc promises): first
     /// every racer proposes `CreateTablet` for the identical table name
@@ -360,7 +360,7 @@ enum Workload {
     /// loser must recompute a fresh candidate id and retry against a
     /// *different* table name-shaped collision, i.e. an id another racer's
     /// `CreateTablet` already claimed); then, once any racer observes the
-    /// shared tablet exists, every racer repeatedly proposes `BeginSplit`
+    /// shared tablet exists, every racer repeatedly proposes `BeginSplitInPlace`
     /// against it with a freshly-recomputed split key and freshly-recomputed
     /// child ids (again racing the same counter) until the parent leaves
     /// `Active` (someone won) or the budget expires. See invariant #4
@@ -598,7 +598,8 @@ fn corpus_cells() -> Vec<Scenario> {
     ));
 
     // --- AllocatorRace under a mid-race leader kill (phase-agnostic — may
-    //     land during either the CreateTablet or the BeginSplit phase). ---
+    //     land during either the CreateTablet or the BeginSplitInPlace
+    //     phase). ---
     out.push(allocator_race_scenario(
         "allocator_race_leader_kill_mid_3",
         3,
@@ -608,7 +609,7 @@ fn corpus_cells() -> Vec<Scenario> {
 
     // --- AllocatorRace with a LATER leader kill, timed to land once the
     //     shared tablet is already created and racers are contending
-    //     specifically over `BeginSplit`'s child-id allocation. ---
+    //     specifically over `BeginSplitInPlace`'s child-id allocation. ---
     out.push(allocator_race_scenario(
         "allocator_race_split_leader_kill_3",
         3,
@@ -792,7 +793,7 @@ struct Shared {
     confirmed_members: Mutex<BTreeSet<NodeId>>,
     /// `AllocatorRace`: every `TabletId` a proposer's own confirm loop
     /// actually observed committed (either the shared table's `CreateTablet`
-    /// or a `BeginSplit`'s own child id) — the durability obligation over
+    /// or a `BeginSplitInPlace`'s own child id) — the durability obligation over
     /// `Metadata::tablets`, and the set invariant #4's "no two calls were
     /// ever assigned the same id" check is over (see
     /// `check_allocator_injectivity`).
@@ -829,7 +830,7 @@ struct Shared {
 
 /// `(table, range.start, range.end)` — a tablet's identity for the
 /// allocator-injectivity sampler; cheap to clone/compare, and exactly the
-/// fields two different `CreateTablet`/`BeginSplit` calls minting the same
+/// fields two different `CreateTablet`/`BeginSplitInPlace` calls minting the same
 /// id could plausibly disagree on.
 type TabletFingerprint = (Option<String>, Vec<u8>, Option<Vec<u8>>);
 
@@ -896,23 +897,53 @@ impl Shared {
     /// convergence-poll iteration and fault-schedule step (see this file's
     /// top doc + `run_scenario`) so a transient double-assignment is caught
     /// even if a later poll happens to "correct" back to one identity.
+    ///
+    /// Also fingerprints `AllocatorRace`'s in-place-split racers' `left`/
+    /// `right` ids EVEN THOUGH `BeginSplitInPlace` mints no tablet-map row
+    /// for them at all (the fork is recorded as an intent on the PARENT;
+    /// this workload never proposes the `CutoverSplit` that would
+    /// materialize them) — without this, those ids would never enter
+    /// `tablet_fingerprints` and invariant #4 (allocator injectivity) would
+    /// have no teeth over the split phase of the race at all. Derives the
+    /// SAME `(table, range.start, range.end)` shape a real materialized
+    /// child would carry, computed from the parent's own (untouched) range
+    /// and the intent's own split key — exactly what `CutoverSplit`'s
+    /// in-place branch itself computes when it eventually mints the row.
     fn sample_tablets(&self, metas: &[Metadata]) {
         let mut fp = self.tablet_fingerprints.lock().unwrap();
         let mut violations = self.injectivity_violations.lock().unwrap();
+        let mut record = |ri: usize, id: TabletId, fingerprint: TabletFingerprint| match fp.get(&id)
+        {
+            None => {
+                fp.insert(id, fingerprint);
+            }
+            Some(existing) if *existing == fingerprint => {}
+            Some(existing) => violations.push(format!(
+                "tablet id {id:?} observed with two different identities (replica \
+                 {ri}): {existing:?} then {fingerprint:?} — a transient \
+                 double-assignment"
+            )),
+        };
         for (ri, m) in metas.iter().enumerate() {
             for (id, t) in &m.tablets {
-                let fingerprint: TabletFingerprint =
-                    (t.table.clone(), t.range.start.clone(), t.range.end.clone());
-                match fp.get(id) {
-                    None => {
-                        fp.insert(*id, fingerprint);
-                    }
-                    Some(existing) if *existing == fingerprint => {}
-                    Some(existing) => violations.push(format!(
-                        "tablet id {id:?} observed with two different identities (replica \
-                         {ri}): {existing:?} then {fingerprint:?} — a transient \
-                         double-assignment"
-                    )),
+                record(
+                    ri,
+                    *id,
+                    (t.table.clone(), t.range.start.clone(), t.range.end.clone()),
+                );
+                if let Some(intent) = &t.inplace_split
+                    && let Some((left, right)) = t.range.split_at(&intent.split_key)
+                {
+                    record(
+                        ri,
+                        intent.children[0].id,
+                        (t.table.clone(), left.start, left.end),
+                    );
+                    record(
+                        ri,
+                        intent.children[1].id,
+                        (t.table.clone(), right.start, right.end),
+                    );
                 }
             }
         }
@@ -1322,14 +1353,21 @@ const ALLOCATOR_RACE_TABLE: &str = "ks.alloc_race";
 /// OWN most recently proposed id. Phase 2 starts once ANY racer observes the
 /// shared table has a tablet (own win or not): every racer repeatedly
 /// recomputes a fresh `(left, right)` child id pair from the current
-/// `next_free_tablet_id()` and proposes `BeginSplit` against the shared
-/// parent, with `p`'s own fixed, structurally distinct split key (so a
-/// content check — not mere id presence — can tell a genuine own-win apart
-/// from a same-id coincidence with a different racer's proposal, the exact
-/// "confirm by content, not presence" discipline `schema_race_client`'s own
-/// doc and `docs/engineering-lessons.md` already establish). Stops the
-/// instant the parent leaves `Active` (someone won; nothing left to retry)
-/// or the budget expires.
+/// `next_free_tablet_id()` and proposes `BeginSplitInPlace` (ADR 0058 Train
+/// 2 rung 3 — same monotonic-allocator floor and epoch-CAS discipline
+/// `BeginSplit` used before the copy-split deletion stack's layer 1) against
+/// the shared parent, with `p`'s own fixed, structurally distinct split key
+/// (so a content check — not mere id presence — can tell a genuine own-win
+/// apart from a same-id coincidence with a different racer's proposal, the
+/// exact "confirm by content, not presence" discipline `schema_race_client`'s
+/// own doc and `docs/engineering-lessons.md` already establish). Since
+/// `BeginSplitInPlace` mints no tablet-map row for the children at all
+/// (unlike `BeginSplit`'s `Building` rows), the content check reads the
+/// PARENT's own recorded `inplace_split` intent instead of a child tablet's
+/// `range` — see `check_allocator_injectivity`/`sample_tablets`'s own doc
+/// for how the injectivity sampler was extended to still fingerprint these
+/// never-materialized child ids. Stops the instant the parent leaves
+/// `Active` (someone won; nothing left to retry) or the budget expires.
 async fn allocator_race_client(
     env: SimEnv,
     nodes: Nodes,
@@ -1370,7 +1408,7 @@ async fn allocator_race_client(
         return; // the shared table never got a tablet within budget
     };
 
-    // --- Phase 2: race BeginSplit against the shared parent. ---
+    // --- Phase 2: race BeginSplitInPlace against the shared parent. ---
     let phase2_deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
     while env.now().0 < phase2_deadline {
         let Some((_, node)) = leader_slot(&nodes) else {
@@ -1387,7 +1425,7 @@ async fn allocator_race_client(
         let left = meta.next_free_tablet_id();
         let right = TabletId(left.0 + 1);
         let source_replicas = source.replicas.clone();
-        node.propose(MetaCommand::BeginSplit {
+        node.propose(MetaCommand::BeginSplitInPlace {
             parent,
             expected_epoch: source.epoch,
             split_key: split_key.clone(),
@@ -1396,16 +1434,20 @@ async fn allocator_race_client(
         env.sleep(POLL).await;
         if let Some((_, node)) = leader_slot(&nodes) {
             let meta = node.metadata();
-            // Confirm by CONTENT, not presence: `left`'s own range must end
-            // exactly at THIS racer's split key — a different racer whose
-            // BeginSplit happened to compute the identical (left, right) id
-            // pair from an equally-stale read (a real possibility early in
-            // the race, before either has committed) used a DIFFERENT split
-            // key, so its child's range would disagree with ours here.
+            // Confirm by CONTENT, not presence: `BeginSplitInPlace` mints no
+            // tablet-map row for `left`/`right` at all (unlike `BeginSplit`'s
+            // `Building` rows), so the win check reads the PARENT's own
+            // recorded intent instead — it must carry exactly THIS racer's
+            // split key. A different racer whose proposal happened to
+            // compute the identical (left, right) id pair from an equally
+            // stale read (a real possibility early in the race, before
+            // either has committed) used a DIFFERENT split key, so the
+            // intent that actually landed would disagree with ours here.
             if meta
                 .tablets
-                .get(&left)
-                .is_some_and(|t| t.range.end.as_deref() == Some(split_key.as_slice()))
+                .get(&parent)
+                .and_then(|t| t.inplace_split.as_ref())
+                .is_some_and(|intent| intent.split_key == split_key)
             {
                 shared.confirm_tablet_id(left);
                 shared.confirm_tablet_id(right);
@@ -1542,7 +1584,22 @@ fn check_durability_meta(shared: &Shared, reference: &Metadata) -> Verdict {
         }
     }
     for id in shared.confirmed_tablet_ids.lock().unwrap().iter() {
-        if !reference.tablets.contains_key(id) {
+        // Phase 1's shared-parent id always gets its own materialized
+        // tablet-map row. Phase 2's split `left`/`right` ids never do under
+        // `BeginSplitInPlace` — this workload only ever proposes
+        // `BeginSplitInPlace`, never the `CutoverSplit` that would
+        // materialize them — so "still present" for one of THOSE ids means
+        // its own parent still carries an `inplace_split` intent naming it
+        // (which, once won, is permanent for the life of this scenario: no
+        // other `BeginSplitInPlace` can land on a non-`Active` parent, and
+        // nothing here ever cuts over).
+        let still_present = reference.tablets.contains_key(id)
+            || reference.tablets.values().any(|t| {
+                t.inplace_split
+                    .as_ref()
+                    .is_some_and(|intent| intent.children.iter().any(|c| c.id == *id))
+            });
+        if !still_present {
             violations.push(format!(
                 "confirmed tablet id {id:?} (AllocatorRace) lost from final state"
             ));

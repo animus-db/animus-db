@@ -145,10 +145,26 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after SealStreamShard").await;
 
-        // Copy-based split (ADR 0050): Begin, then cutover — the child pair
-        // partitions the range, the parent retires, lineage freezes.
+        // In-place split (ADR 0058 Train 2 rung 3): `BeginSplitInPlace`, then
+        // cutover — the child pair partitions the range, the parent
+        // retires, lineage freezes.
+        //
+        // NOTE (copy-split deletion stack, layer 1): this proposal's
+        // `expected_epoch: Epoch::INITIAL` is stale by the time it lands —
+        // something ahead of it in this same scenario has already bumped
+        // tablet 1's epoch past `INITIAL` — so it (and the mirrored second
+        // round on tablet 2 below) is rejected on the epoch-CAS and this
+        // whole split round has silently been a no-op ever since it was
+        // written, under BOTH `BeginSplit` and `BeginSplitInPlace` (the
+        // epoch mismatch, not F11 token-alignment, is the actual rejection
+        // reason — confirmed while porting this call for the copy-split
+        // deletion stack; see docs/engineering-lessons.md). Left AS A
+        // FAITHFUL, byte-for-byte command-type port rather than fixed here
+        // — diagnosing and correcting the stale epoch is an unrelated
+        // pre-existing bug and belongs in its own change with its own test,
+        // not folded into this test-surface-only layer.
         let split_key = vec![128u8];
-        nodes[leader].propose(MetaCommand::BeginSplit {
+        nodes[leader].propose(MetaCommand::BeginSplitInPlace {
             parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key,
@@ -158,7 +174,7 @@ fn run_scenario(seed: u64) {
             ],
         });
         sim.run_for(Duration::from_secs(1));
-        assert_cache_matches_engine(&nodes, &engines, seed, "after begin-split").await;
+        assert_cache_matches_engine(&nodes, &engines, seed, "after begin-split-in-place").await;
 
         // The retired-to-be parent seals its next epoch (its final shard),
         // then cutover retires it; the child's own epoch-0 seal follows.
@@ -194,14 +210,16 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;
 
-        // ADR 0050: a full copy-based split round on the split child —
-        // proves `BeginSplit`'s mirror arm (parent state flip + two
-        // `Building` children + inherited policies) and `CutoverSplit`'s
-        // (children activated, parent tablet+policy DELETED, lineage rows
-        // written) replicate and durably survive like every other command.
-        // The table is streamed, so the split key must be token-aligned
-        // (F11) — 8 bytes, strictly inside tablet 2's `[0x80..]` range.
-        nodes[leader].propose(MetaCommand::BeginSplit {
+        // A full in-place split round on the split child — proves
+        // `BeginSplitInPlace`'s mirror arm (parent state flip + recorded
+        // intent + advanced allocator counter, no `Building` rows) and
+        // `CutoverSplit`'s in-place branch (children activated straight
+        // from the intent, parent tablet+policy DELETED, lineage rows
+        // written) replicate and durably survive like every other command
+        // — when it applies at all; see the NOTE on the first round above,
+        // which applies here too (this round is downstream of a parent that
+        // was never actually created).
+        nodes[leader].propose(MetaCommand::BeginSplitInPlace {
             parent: TabletId(2),
             // Activated by the cutover above (child epoch bump).
             expected_epoch: Epoch::INITIAL.next(),
@@ -212,7 +230,7 @@ fn run_scenario(seed: u64) {
             ],
         });
         sim.run_for(Duration::from_secs(1));
-        assert_cache_matches_engine(&nodes, &engines, seed, "after BeginSplit").await;
+        assert_cache_matches_engine(&nodes, &engines, seed, "after BeginSplitInPlace").await;
 
         nodes[leader].propose(MetaCommand::CutoverSplit {
             parent: TabletId(2),

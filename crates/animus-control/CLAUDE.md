@@ -297,17 +297,18 @@ per-tablet CP data plane (`animus-cp-data`).
   hand-driven gotchas.
 
 - **`BeginSplit`'s apply arm also enforces F11 token alignment on a
-  streamed table (ADR 0042 §14, growth PR2).** A split key that isn't
-  exactly `TOKEN_BYTES` (8) long is rejected outright when the source
-  tablet's table has a stream (`self.table_stream(table).is_some()`) —
-  an apply-time structural seatbelt: `animusd`'s `ClientCtx::trigger_split`
+  streamed table (ADR 0042 §14, growth PR2) — `BeginSplitInPlace`'s own
+  arm carries the identical check.** A split key that isn't exactly
+  `TOKEN_BYTES` (8) long is rejected outright when the source tablet's
+  table has a stream (`self.table_stream(table).is_some()`) — an
+  apply-time structural seatbelt: `animusd`'s `ClientCtx::trigger_split`
   is the one choke point that actually rounds a caller's key before ever
   proposing, so this check guards a future caller reaching apply without
-  going through it, never the primary
-  enforcement. See `meta::tests::split_rejects_a_non_token_aligned_key_on_a_streamed_table`/
-  `split_rejects_a_token_aligned_key_equal_to_range_start` (the latter
-  proving the accepted single-token hot-partition limit, Fork E, still
-  rejects at the pre-existing `KeyRange::split_at` "strictly inside" guard
+  going through it, never the primary enforcement. See `meta::tests::
+  split_in_place_rejects_a_non_token_aligned_key_on_a_streamed_table`/
+  `split_in_place_rejects_a_token_aligned_key_equal_to_range_start` (the
+  latter proving the accepted single-token hot-partition limit, Fork E,
+  still rejects at the pre-existing `KeyRange::split_at` "strictly inside" guard
   rather than accepting a zero-width sibling).
 
 - **Epoch-CAS discipline on `BeginSplit`/`CutoverSplit`/`CasTabletReplicas`.** Every
@@ -340,8 +341,13 @@ per-tablet CP data plane (`animus-cp-data`).
   split-provenance record. Placement (`reconcile_placement`/`rebalance_placement`) skips
   every non-`Active` tablet — the mid-split set is frozen. Mirror arms +
   `syskv::EntityKind::SplitLineage` follow the usual per-entity
-  conventions; the `apply_engine.rs` differential oracle drives a full
-  begin→cutover round.
+  conventions. **As of the copy-split deletion stack's layer 1**,
+  `apply_engine.rs`'s differential oracle no longer drives a `BeginSplit`
+  round at all — it was ported to the in-place command below, since the
+  same mirror-correctness property has no reason to prove itself twice;
+  `BeginSplit`'s own remaining direct coverage is `meta.rs`'s in-file
+  tests (the still-Building-children-specific ones) and `tablet_split.rs`'s
+  fixed-seed regressions.
 
 - **The ADR 0058 Train 2 rung 3 in-place split lifecycle:
   `BeginSplitInPlace`/`CutoverSplit`'s in-place branch.** Same epoch-CAS +
@@ -383,7 +389,14 @@ per-tablet CP data plane (`animus-cp-data`).
   child's policy, unconditionally — a harmless duplicate write for the
   copy-based branch, the only source for the in-place one). Tests:
   `meta::tests::begin_split_in_place_*`/`cutover_split_in_place_*`,
-  mirroring the copy-based tests' own shape scenario-for-scenario.
+  mirroring the copy-based tests' own shape scenario-for-scenario;
+  `apply_engine.rs`'s `cache_matches_engine_through_a_mixed_scenario_and_a_
+  restart` (its `BeginSplit` round ported here, copy-split deletion stack
+  layer 1) and `cache_matches_engine_through_directed_placing` for the
+  differential-oracle proof; `mirror.rs`'s own
+  `rebuild_from_engine_matches_direct_apply` for `BeginSplitInPlace`'s
+  write-derivation shape specifically (parent row + counter, no `Building`
+  rows — otherwise unexercised by that file before the same port).
 
 - **ADR 0062: directed Placing — `Metadata::split_placing` +
   `MetaCommand::MarkSplitPlacingDone`.** A split child's *final* replica
@@ -1131,7 +1144,7 @@ for the full write-ups): (a) a racing proposer's confirm loop must decide
 `CreateTableSchema` rejects rather than no-ops on an existing name, "the
 table now exists" is true for every racer the instant *any* of them wins,
 so a presence-only check makes a losing racer misreport itself as a winner
-(`SchemaRace`, PR①; `AllocatorRace`'s `BeginSplit` phase reuses the same
+(`SchemaRace`, PR①; `AllocatorRace`'s split phase reuses the same
 discipline, PR②). (b) The inverse trap for a workload whose racing
 proposals are content-**identical** except for the field being raced
 (`AllocatorRace`'s `CreateTablet` phase — same shared table/range/replicas
@@ -1140,7 +1153,18 @@ once" assertion over that field is checking a *stronger, false* property,
 since several racers legitimately and correctly agreeing "the tablet that
 landed carries my own candidate id" is expected, not a bug — only a
 content/fingerprint comparison (`sample_tablets`), never an occurrence
-count, states injectivity correctly. (c) A fault-finding confirmed in one
+count, states injectivity correctly. (b′, copy-split deletion stack layer
+1) `AllocatorRace`'s split phase was ported from `BeginSplit` to
+`BeginSplitInPlace`, which mints no tablet-map row for its `left`/`right`
+ids at all (this workload never proposes the `CutoverSplit` that would);
+`sample_tablets` was extended to also fingerprint a `Splitting` parent's
+own `inplace_split.children` (deriving the same `(table, range.start,
+range.end)` shape `CutoverSplit` would eventually assign, from the
+parent's own untouched range and the intent's split key) so those ids
+still get injectivity teeth, and `check_durability_meta`'s "confirmed id
+must survive into the final state" check was widened the same way — a
+confirmed split id now counts as present via EITHER a materialized row or
+a still-recorded parent intent naming it. (c) A fault-finding confirmed in one
 plane over a shared codec (issue #495, the WAL-corruption gap in
 `animus-control::persist::WalRecord` — since fixed by a per-record CRC32
 checksum, see that module's own doc — confirmed reproducible at the time
