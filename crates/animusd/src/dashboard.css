@@ -76,7 +76,7 @@ button.link-text { background: none; border: none; color: var(--accent); font-we
 /* ---- top bar ---- */
 header.topbar {
   display: flex; align-items: center; gap: 16px; padding: 0 22px; height: 56px;
-  border-bottom: 2px solid var(--text); flex: none; background: var(--bg);
+  border-bottom: 1px solid var(--border); flex: none; background: var(--bg);
 }
 header.topbar .brand { display: flex; align-items: center; gap: 9px; }
 header.topbar .brand .logo { flex: none; }
@@ -147,7 +147,7 @@ main section.active { display: flex; }
 .row label { color: var(--text3); font-size: 11.5px; }
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 th, td { text-align: left; padding: 8px 12px; white-space: nowrap; }
-th { color: var(--text2); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 2px solid var(--text); }
+th { color: var(--text2); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border); }
 td { border-bottom: 1px solid var(--ink-16); }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: var(--surface2); }
@@ -176,7 +176,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 
 /* ---- Overview ---- */
 /* Filled full-width band: brings its own horizontal inset. */
-.health-banner { border-top: 2px solid var(--text); border-bottom: 1px solid var(--ink-30); background: var(--surface); padding: 14px 20px; }
+.health-banner { border-top: 1px solid var(--border); border-bottom: 1px solid var(--ink-30); background: var(--surface); padding: 14px 20px; }
 .health-banner.degraded, .health-banner.critical { border-top-color: var(--danger); }
 .stat-tiles { display: flex; }
 .stat-tile { flex: 1; padding: 0 22px; border-left: 1px solid var(--ink-16); }
@@ -205,7 +205,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .list-row .status-text { font: 600 11px var(--font-ui); text-transform: uppercase; letter-spacing: .04em; }
 
 .grid-2 { display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; align-items: start; }
-.section-head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2px solid var(--text); padding-bottom: 6px; margin-bottom: 12px; }
+.section-head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 12px; }
 .section-head .title { font: 600 15px var(--font-ui); }
 
 /* Balance bars: hatched fill on a neutral track, keyline baseline. */
