@@ -777,14 +777,13 @@ async fn split_during_backfill_converges_with_correct_final_gsi() {
         matches!(resp, ClientResponse::PutOk),
         "split trigger rejected: {resp:?}"
     );
-    // This node's own `SplitMode` (`SplitMode::default()` = `InPlace` since
-    // ADR 0058 rung 4 layer 2; the ADR 0050 copy-based build → freeze →
-    // backfill-veto → cutover workflow still runs identically under
-    // `--split-mode copy`) drives the split on its own; with an index still
-    // `Creating` the cutover deliberately WAITS for the parent's seeder to
-    // finish (the backfill veto this test exercises end to end — both
-    // workflows share it, see `animusd/CLAUDE.md`'s in-place cutover driver
-    // entry), so the budget is generous. Done = the parent (1) has left the
+    // The in-place split workflow (the only one since the copy-based
+    // build → freeze → backfill-veto → cutover workflow was deleted in
+    // Layer B1) drives the split on its own; with an index still `Creating`
+    // the cutover deliberately WAITS for the parent's seeder to finish (the
+    // backfill veto this test exercises end to end, see
+    // `animusd/CLAUDE.md`'s in-place cutover driver entry), so the budget
+    // is generous. Done = the parent (1) has left the
     // map and two Active children of the base table cover it (the GSI's
     // hidden table may add its own tablet at any point — count only the
     // base table's).

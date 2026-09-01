@@ -597,11 +597,11 @@ async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 /// `cp_tablet_splits_and_both_halves_serve`.
 ///
 /// Drives the REAL split workflow via the public kickoff
-/// (`ClientRequest::SplitTablet` → `trigger_split` → `BeginSplit` or
-/// `BeginSplitInPlace`, per this node's own configured `SplitMode` —
-/// `SplitMode::default()` = `InPlace` since ADR 0058 rung 4 layer 2), then
-/// waits for the driver to retire the parent — populated tables included
-/// (both workflows copy/materialize the data, generically proven here).
+/// (`ClientRequest::SplitTablet` → `trigger_split` → `BeginSplitInPlace`,
+/// the only workflow since the copy-based one was deleted in Layer B1),
+/// then waits for the driver to retire the parent — populated tables
+/// included (the fork/cutover materializes the data, generically proven
+/// here).
 async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_key: &[u8]) {
     match call(
         addr,

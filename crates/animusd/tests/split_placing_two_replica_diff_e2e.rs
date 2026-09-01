@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use animus_env::NodeId;
-use animusd::{ClusterConfig, Node, NodeStatus, RoleAddrs, SplitMode, StorageBackend};
+use animusd::{ClusterConfig, Node, NodeStatus, RoleAddrs, StorageBackend};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -61,7 +61,7 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_split_mode(
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
                 &config,
                 i,
                 dir.join(format!("node-{attempt}-{i}")),
@@ -71,7 +71,6 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
-                SplitMode::InPlace,
                 animusd::BackupStoreConfig::default(),
             )
             .await

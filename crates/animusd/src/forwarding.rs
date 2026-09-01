@@ -804,21 +804,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Err(e) => ClientResponse::Error(e),
                 }
             }
-            // ADR 0050 Train B rung 4: the split-build seed RPC — addressed
-            // by `tablet` (a Building child, deliberately unroutable by
-            // key) directly, mirroring `ForceSeal` just above. One shared
-            // local implementation with `seed_child_rows`' own local
-            // branch (`seed_rows_local`), never a second confirm copy.
-            ClientRequest::SeedRows { tablet, rows } => {
-                let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
-                };
-                match Self::seed_rows_local(&leader, rows).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
-            }
             // Growth PR3 (ADR 0042 §14): the manual-growth split-trigger
             // RPC — addressed by `tablet` directly, mirroring `ForceSeal`
             // just above. Materializes this tablet's own live pairs

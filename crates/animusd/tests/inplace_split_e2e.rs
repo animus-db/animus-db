@@ -1,7 +1,8 @@
 //! ADR 0058 Train 2 rung 3's `animusd`-level driver residue, end to end over
-//! a **real multi-node cluster** started with `--split-mode inplace`
-//! (`SplitMode::InPlace`): a populated table's `trigger_split` proposes
-//! `MetaCommand::BeginSplitInPlace` instead of the copy-based `BeginSplit`,
+//! a **real multi-node cluster**: a populated table's `trigger_split`
+//! proposes `MetaCommand::BeginSplitInPlace` — the only workflow since the
+//! copy-based `BeginSplit`/`SplitMode` selector was deleted in the
+//! copy-split-deletion endgame's Layer B1 (`docs/adr/0058-*.md` rung 4) —
 //! the CP data plane's own host reconciler adds learners/catches them
 //! up/forks the parent's group entirely on its own (ADR 0058 rung 3,
 //! unmodified by this layer), and `index_drain.rs::inplace_split_driver_tick`
@@ -42,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig, SplitMode,
+    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig,
     StorageBackend, StreamSealKnobs, read_frame, write_frame,
 };
 use serde_json::Value;
@@ -54,12 +55,9 @@ mod support;
 
 /// Bring up an `n`-node cluster, one process-shaped node per index (real
 /// TCP, real ports — `support::free_addrs`' bind-then-drop TOCTOU-retry
-/// shape, identical to `split_build.rs::bring_up`), every node started with
-/// `SplitMode::InPlace` — the one behavioral difference from every other
-/// `ProdEnv` split e2e test in this crate. Quiescence disabled
-/// (`Duration::ZERO`, matching `run_node`'s own default every other e2e test
-/// here relies on) so a continuous writer's own traffic is never in a race
-/// with a group re-waking itself.
+/// shape). Quiescence disabled (`Duration::ZERO`, matching `run_node`'s own
+/// default every other e2e test here relies on) so a continuous writer's
+/// own traffic is never in a race with a group re-waking itself.
 async fn bring_up_inplace(
     n: usize,
     dir: &std::path::Path,
@@ -87,7 +85,7 @@ async fn bring_up_inplace(
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_split_mode(
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
                 &config,
                 i,
                 dir.join(format!("node-{attempt}-{i}")),
@@ -97,7 +95,6 @@ async fn bring_up_inplace(
                 SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
-                SplitMode::InPlace,
                 animusd::BackupStoreConfig::default(),
             )
             .await
@@ -240,10 +237,9 @@ fn sole_tablet_of(node: &Node, table: &str) -> u64 {
 }
 
 /// Kick off an **in-place** split of `tablet` at `split_key` via `node`'s
-/// admin surface — the identical `POST /admin/tablet/split` endpoint the
-/// copy-based workflow uses (`ClientCtx::trigger_split` is the ONE choke
-/// point both workflows share; which one actually runs is decided entirely
-/// by this node's own configured `SplitMode`, set at startup above).
+/// admin surface — the `POST /admin/tablet/split` endpoint, which now
+/// always proposes `MetaCommand::BeginSplitInPlace` (`ClientCtx::
+/// trigger_split`'s only workflow since Layer B1).
 async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
     let (status, body) = admin(
         node.admin_addr(),
@@ -331,8 +327,8 @@ async fn paced_writer(
     acked
 }
 
-/// The primary teeth: a real 3-node cluster, `--split-mode inplace`, a
-/// populated table, an in-place split triggered mid-flight, and a paced
+/// The primary teeth: a real 3-node cluster, a populated table, an
+/// in-place split triggered mid-flight, and a paced
 /// continuous writer riding the whole fork→cutover window. Every acked
 /// write must be readable afterward with its exact value, on both sides of
 /// the split.

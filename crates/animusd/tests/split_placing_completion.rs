@@ -54,7 +54,7 @@ use animus_env::NodeId;
 use animus_tablet::{Epoch, TabletId};
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
-    SplitMode, StorageBackend, read_frame, write_frame,
+    StorageBackend, read_frame, write_frame,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,12 +63,12 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-/// Bring up an `n`-node `--split-mode inplace` cluster — the identical
-/// helper `inplace_split_e2e.rs` uses, duplicated here since each test
-/// binary in this crate only shares `mod support` (see that file's own
-/// module doc for why quiescence is disabled: a continuous background
-/// wake/re-wake would otherwise race this file's own polling, though this
-/// file runs no continuous writer of its own).
+/// Bring up an `n`-node cluster — the identical helper
+/// `inplace_split_e2e.rs` uses, duplicated here since each test binary in
+/// this crate only shares `mod support` (see that file's own module doc
+/// for why quiescence is disabled: a continuous background wake/re-wake
+/// would otherwise race this file's own polling, though this file runs no
+/// continuous writer of its own).
 async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
         let addrs = support::free_addrs(n * 6);
@@ -92,7 +92,7 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_split_mode(
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
                 &config,
                 i,
                 dir.join(format!("node-{attempt}-{i}")),
@@ -102,7 +102,6 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
-                SplitMode::InPlace,
                 animusd::BackupStoreConfig::default(),
             )
             .await

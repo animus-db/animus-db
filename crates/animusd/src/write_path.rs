@@ -1,21 +1,22 @@
 //! ClientCtx's write-path cluster (ADR 0061 rung C5 step 2): kind-scoped
-//! item writes (`cp_kind_write_item`, `cp_kind_write_raw*`), raw batch
+//! item writes (`cp_kind_write_item`, `cp_kind_write_raw*`) and raw batch
 //! propose/local-confirm plumbing (`poll_probe`, `cp_batch_local`,
-//! `cp_put_local`/`cp_delete_local`) and split-child row seeding. Moved
-//! verbatim out of `lib.rs`'s `impl<E: Env> ClientCtx<E>` blocks -- no
-//! logic changes.
+//! `cp_put_local`/`cp_delete_local`). Moved verbatim out of `lib.rs`'s
+//! `impl<E: Env> ClientCtx<E>` blocks -- no logic changes. (Split-child row
+//! seeding — `seed_rows_local`/`seed_child_rows` — was deleted in the
+//! copy-split-deletion endgame's Layer B1; `KvCommand::SeedBatch`/
+//! `CpGroup::propose_seed_batch` stay, still used by restore.)
 
 use std::time::Duration;
 
 use animus_control::{Metadata, ProposeResult};
 use animus_env::{Env, Nanos};
 use animus_node::host::RelayClient;
-use animus_tablet::TabletId;
 
 use crate::{
     CLIENT_TIMEOUT, CP_CONFIRM_POLL_INIT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest,
     ClientResponse, CpGroup, CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity,
-    ProbeWait, SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo, topology,
+    ProbeWait, SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -281,89 +282,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// confirm *requires* a `Some`-valued base write), so a raw batch whose
     /// base write is a tombstone erred iff the connected node did not lead
     /// the tablet (leader-placement-bimodal).
-    /// Propose one split-build seed chunk on a **known-leader** local handle
-    /// of the child group and confirm it applied (ADR 0050 Train B rung 4).
-    ///
-    /// The ONE local implementation, shared by `cp_serve_forwarded`'s
-    /// `SeedRows` arm and `seed_child_rows`' own local branch — never two
-    /// copies (the A2-rebase lesson: one confirm implementation per RPC).
-    /// Confirmation is **by applied index**, not a value probe: seed rows
-    /// merge at *carried* versions, so a legitimately newer row on the child
-    /// (per-key LWW — a later tail pass already shipped a fresher version)
-    /// would make a value probe hang forever on a batch that correctly
-    /// no-opped.
-    pub(crate) async fn seed_rows_local(
-        leader: &CpGroup<E>,
-        rows: Vec<animus_cp_data::SeedRow>,
-    ) -> Result<(), String> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        decide::frozen_refusal(leader.is_frozen())?;
-        let index = match leader.propose_seed_batch(rows) {
-            animus_control::ProposeResult::Accepted { index, .. } => index,
-            other => return Err(format!("seed batch not accepted: {other:?}; retry")),
-        };
-        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-        let mut poll = CP_CONFIRM_POLL_INIT;
-        while leader.env().now() < deadline {
-            if leader.engine_applied_index() >= index {
-                return Ok(());
-            }
-            leader.env().sleep(poll).await;
-            poll = (poll * 2).min(CP_CONFIRM_POLL_MAX);
-        }
-        Err("seed batch did not apply in time; retry".into())
-    }
-
-    /// Ship one seed chunk to a split child's group leader, wherever it
-    /// lives (ADR 0050 Train B rung 4): local if this node leads the child,
-    /// else one `Forwarded { SeedRows }` hop chased through the standard
-    /// hint machinery — the identical resolve/relay shape
-    /// `grow_stream_tablet` uses. Idempotent (a duplicate chunk re-merges
-    /// the same versions), so the caller may retry freely.
-    pub(crate) async fn seed_child_rows(
-        &self,
-        child: TabletId,
-        rows: Vec<animus_cp_data::SeedRow>,
-    ) -> Result<(), String> {
-        let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
-        loop {
-            match self.resolve_cp_route(child) {
-                Some(CpRoute::Local(leader)) => {
-                    return Self::seed_rows_local(&leader, rows).await;
-                }
-                Some(CpRoute::Forward(addr)) => {
-                    // Hint-chasing forward (`forward_to_tablet_leader`), never a
-                    // single blind relay: fork F5 places a child at fresh homes,
-                    // so this node (the parent's leader) may host NO replica of
-                    // it — `resolve_cp_route`'s fallback is then only a first
-                    // guess among the child's replicas, and only the refusal's
-                    // own leader hint can correct it.
-                    let request = ClientRequest::SeedRows {
-                        tablet: child.0,
-                        rows: rows.clone(),
-                    };
-                    match self
-                        .forward_to_tablet_leader(Some(child), addr, request)
-                        .await
-                    {
-                        ClientResponse::PutOk => return Ok(()),
-                        ClientResponse::Error(e)
-                            if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
-                        ClientResponse::Error(e) => return Err(e),
-                        other => return Err(format!("unexpected seed reply: {other:?}")),
-                    }
-                }
-                Some(CpRoute::None) | None => {} // child group not settled yet, retry
-            }
-            if self.env.now() >= deadline {
-                return Err("seed: did not reach the child's leader in time; retry".into());
-            }
-            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
-        }
-    }
-
     pub(crate) async fn cp_kind_raw_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,

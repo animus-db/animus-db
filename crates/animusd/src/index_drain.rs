@@ -222,7 +222,6 @@ use animus_dynamo::{
 };
 use animus_env::{Clock, Env, Metric};
 use animus_node::host::RelayClient;
-use animus_tablet::KeyRange;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
 use animus_tablet::TabletState;
@@ -339,11 +338,6 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // accumulate to a floor instead of being trimmed per tick). Same
     // ownership/bounding discipline as `first_hot_seen` above.
     let mut marker_bytes_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
-    // ADR 0050 Train B rung 4: per-parent split-build driver state, keyed by
-    // the `Splitting` parent's id. Driver-local (a re-led driver starts
-    // fresh and re-runs idempotently); mirrored into
-    // `ctx.data().split_builds` for `/admin/raftkv` observability only.
-    let mut split_builds: BTreeMap<TabletId, SplitBuild> = BTreeMap::new();
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
@@ -354,21 +348,6 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         first_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
         first_pitr_hot_seen.retain(|t, _| meta.tablets.contains_key(t));
         marker_bytes_seen.retain(|t, _| meta.tablets.contains_key(t));
-        // A build entry lives exactly as long as its parent is `Splitting`
-        // (cutover removes the parent from the map entirely, fork F6).
-        split_builds.retain(|t, _| {
-            meta.tablets
-                .get(t)
-                .is_some_and(|tab| tab.state == TabletState::Splitting)
-        });
-        {
-            let mut mirror = ctx
-                .data()
-                .split_builds
-                .lock()
-                .expect("split_builds poisoned");
-            mirror.retain(|t, _| split_builds.contains_key(&TabletId(*t)));
-        }
         // Growth PR3 Fork F: bound the change-rate tracker the same way —
         // `ctx.data()` is safe unconditionally here, exactly like
         // `seal_tick`'s own `ctx.data().raftkv_metrics` access below: this
@@ -406,28 +385,14 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             if splitting {
                 group.wake();
                 group.set_quiesce_veto(true, veto_fresh_through);
-                // ADR 0058 Train 2 rung 3 residue: which workflow is running
-                // on THIS tablet is a durable fact of its own `Metadata` row
-                // (`Tablet::inplace_split`, set by `BeginSplitInPlace` and
-                // never by `BeginSplit`) — not this node's own configured
-                // `ClientCtx::split_mode` default, which only governs a
-                // FUTURE `trigger_split` call. A node can easily be driving
-                // one workflow's tablet while configured to trigger the
-                // other one's for the next split.
-                if tablet_row.is_some_and(|t| t.inplace_split.is_some()) {
-                    if let Err(e) = inplace_split_driver_tick(&ctx, &meta, tablet, &group).await {
-                        tracing::debug!(tablet = tablet.0, error = %e, "inplace split: tick failed");
-                    }
-                } else {
-                    let build = split_builds.entry(tablet).or_default();
-                    if let Err(e) = split_driver_tick(&ctx, &meta, tablet, &group, build).await {
-                        tracing::debug!(tablet = tablet.0, error = %e, "split build: tick failed");
-                    }
-                    ctx.data()
-                        .split_builds
-                        .lock()
-                        .expect("split_builds poisoned")
-                        .insert(tablet.0, (build.rows_shipped, build.converged, build.phase));
+                // The copy-based split-build driver (ADR 0050) was deleted
+                // in the copy-split-deletion endgame's Layer B1 — every
+                // `Splitting` parent is now driven by the in-place cutover
+                // driver unconditionally (`BeginSplit`'s own apply/mirror
+                // arms are production-dead pending Layer B2's deletion, so
+                // no live parent can lack `Tablet::inplace_split` here).
+                if let Err(e) = inplace_split_driver_tick(&ctx, &meta, tablet, &group).await {
+                    tracing::debug!(tablet = tablet.0, error = %e, "inplace split: tick failed");
                 }
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
@@ -717,92 +682,6 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     }
 }
 
-/// Reconcile every dirty item of one tablet not yet covered by the "gsi"
-/// cursor, then advance that cursor to the highest HLC this pass covers.
-/// Per-parent driver state for one in-flight split build (ADR 0050 Train B
-/// rung 4) — **driver-local, never correctness state**: everything here is
-/// an optimization over "re-run the whole pass," which is what a fresh
-/// leader's driver does from an empty entry.
-#[derive(Default)]
-pub(crate) struct SplitBuild {
-    /// The one-time whole-scope copy (BASE + LSI + FOOTPRINT) completed.
-    bulk_done: bool,
-    /// The tail's exclusive packed-HLC watermark: only change records whose
-    /// key's own trailing 8 bytes exceed it count as new. **Deliberately an
-    /// HLC watermark, never a key-position cursor**: `pending_changes`' key
-    /// order is prefix-then-HLC, NOT commit order, so a later write to a
-    /// lower prefix inserts *below* any key cursor and would be skipped
-    /// forever (this rung's own e2e went red on exactly that; the sealer's
-    /// load-bearing re-sort is the same lesson). HLC order IS commit order
-    /// within one tablet (`assert_ts_monotonic`), so the watermark is
-    /// complete. Cost: each tail pass re-scans the whole (trim-held)
-    /// pending set — O(pending) per tick, accepted for the build's bounded
-    /// duration; an O(delta) commit-ordered read is a named B-final
-    /// optimization.
-    ///
-    /// **Starts at the parent's highest change HLC as of the pre-bulk
-    /// pass, not at 0** (captured beside `bulk_version_floor`): every row
-    /// those records describe is in the bulk image by construction, so a
-    /// zero start made the first tail pass re-ship the WHOLE table one
-    /// dirty unit at a time — measured at ~6,000 no-op consensus rounds
-    /// per child on a 20,000-key split, ~85% of the build's wall clock,
-    /// with the children's key counts flat throughout. The tail's job is
-    /// the delta written *during* the build, and that is now what it
-    /// costs.
-    tail_hlc: u64,
-    /// Rows shipped so far (observability only).
-    rows_shipped: u64,
-    /// Post-bulk tail passes that shipped something — the freeze-liveness
-    /// counter behind [`SPLIT_MAX_TAIL_PASSES`].
-    tail_passes: u32,
-    /// The max MVCC version over the copy kinds, captured by a read-only
-    /// pass run strictly BEFORE the bulk scan starts. The final image
-    /// ships only rows above it: apply order == HLC order within one group
-    /// (`assert_ts_monotonic`), so any rewrite the bulk image missed —
-    /// i.e. applied after its row's bulk read, hence after bulk start —
-    /// carries a version above everything applied before bulk start, which
-    /// bounds this floor. Rewrites applied *before* bulk start are in the
-    /// bulk image itself (the scan reads current bytes). Deliberately NOT
-    /// `latest_version()`: the ADR 0018 read-ceiling marker merges at a
-    /// deliberately future-shifted version, which would push the floor
-    /// above genuinely-later user writes. `None` (a driver re-led straight
-    /// into the endgame) falls back to floor 0 — the full image.
-    bulk_version_floor: Option<u64>,
-    /// `bulk_done` and the tail is caught up *or* chased long enough
-    /// ([`SPLIT_MAX_TAIL_PASSES`]) — the rung-8 liveness fix.
-    converged: bool,
-    /// The endgame step this build last parked at (observability only,
-    /// mirrored to `/admin/raftkv`): `"build"` -> `"freeze"` ->
-    /// `"final-drain"` -> `"final-seal"` -> `"gsi-veto"`/`"backfill-veto"`
-    /// -> `"cutover"`. Driver-local like everything else here.
-    phase: &'static str,
-    /// The parent's commit index captured at the first frozen tick — every
-    /// mutating entry that will EVER apply is at or below it (the propose
-    /// latch refuses from the moment `Freeze` applies, and the append-to-
-    /// apply sliver's entries are ordered before this read). The final
-    /// image waits for `engine_applied_index()` to reach it, closing the
-    /// "decision applies mid-scan" sliver.
-    frozen_commit_floor: Option<u64>,
-    /// The endgame's one full re-scan ship of the frozen parent completed
-    /// (driver-local — a re-led driver redoes it; idempotent merges).
-    final_image_done: bool,
-}
-
-/// The split-build seed chunk budget: one `SeedBatch` entry's row payload is
-/// capped near this many bytes. Large enough to amortize the per-entry
-/// consensus round, small enough that one entry's apply never stalls the
-/// child's consensus loop past an election timeout (the ADR 0017
-/// apply-stall lesson) and the JSON-framed forwarded hop stays modest.
-const SEED_CHUNK_BYTES: usize = 256 * 1024;
-
-/// Freeze liveness (rung 8): after this many post-bulk tail passes that
-/// each still found fresh writes, the driver freezes anyway — a
-/// continuously-written parent must not starve its own split forever (see
-/// the convergence check's comment for the full argument). At the 200ms
-/// loop cadence this is ~5s of chasing; the final residue is one tick's
-/// writes, drained post-freeze.
-const SPLIT_MAX_TAIL_PASSES: u32 = 25;
-
 /// Frozen-endgame GSI-drain acceleration bound (issue #288). Pre-fix, the
 /// GSI-drain veto below only *checked* `"gsi"`'s cursor against the highest
 /// pending record and, if short, returned — leaving all the actual draining
@@ -847,314 +726,6 @@ const FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES: u32 = 64;
 /// routing refresh").
 const INPLACE_SPLIT_MATERIALIZE_SETTLE_MS: u64 = 250;
 
-/// The copy kinds (ADR 0050): BASE (values, tombstones, intent envelopes,
-/// txn records), LSI, FOOTPRINT — **never** KIND_CHANGE (a child re-serving
-/// parent change records is the #220 duplication class; children are born
-/// with empty change logs) and **never** KIND_CURSOR (consumer-owned,
-/// restart-from-scratch per ADR 0046's consolidation).
-const SEED_KINDS: [u8; 3] = [KIND_BASE, animus_cp_data::KIND_LSI, KIND_FOOTPRINT];
-
-/// One split-build driver tick for a `Splitting` parent this node leads
-/// (ADR 0050 Train B rung 4). Bulk pass on the first tick (whole-scope,
-/// inline — the `local_pairs` materialization precedent), then O(delta)
-/// tail passes off the parent's change log. Everything idempotent: a
-/// crash/re-lead re-runs from an empty [`SplitBuild`] and converges to the
-/// same state. This rung STOPS at convergence — freeze/final-pass/cutover
-/// are B5's.
-async fn split_driver_tick(
-    ctx: &ClientCtx,
-    meta: &Metadata,
-    tablet: TabletId,
-    group: &CpGroup,
-    build: &mut SplitBuild,
-) -> Result<(), String> {
-    let Some(parent) = meta.tablets.get(&tablet) else {
-        return Ok(()); // stale view; nothing to do
-    };
-    // The two Building children BeginSplit minted: same table, sub-ranges of
-    // the parent's own range (B3 guarantees exactly two).
-    let children: Vec<(TabletId, KeyRange)> = meta
-        .tablets
-        .iter()
-        .filter(|(_, t)| {
-            t.state == TabletState::Building
-                && t.table == parent.table
-                && parent.range.contains_range(&t.range)
-        })
-        .map(|(id, t)| (*id, t.range.clone()))
-        .collect();
-    if children.len() != 2 {
-        return Err(format!(
-            "split build: expected 2 Building children of tablet {}, found {}",
-            tablet.0,
-            children.len()
-        ));
-    }
-
-    if !group.is_frozen() {
-        // ---- the build (ADR 0050 stage 2, rung 4) ----
-        if !build.bulk_done {
-            // The version-floor pre-pass — see `bulk_version_floor`'s doc.
-            // Must COMPLETE before the bulk scan below starts; capturing
-            // the max from the bulk's own reads instead is unsound (a
-            // mid-scan rewrite can be missed by the scan yet undercut a
-            // later-scanned row's version).
-            let mut floor = 0u64;
-            for kind in SEED_KINDS {
-                for (_, _, ver) in group.seed_rows_kind(kind as usize, None).await {
-                    floor = floor.max(ver);
-                }
-            }
-            build.bulk_version_floor = Some(floor);
-            // The tail's own starting watermark, captured in the SAME
-            // pre-pass and for the same reason (see `tail_hlc`'s doc): the
-            // bulk image below covers every write whose change record
-            // already exists here, so re-shipping those rows one dirty unit
-            // at a time is pure duplicated work. Must be read STRICTLY
-            // BEFORE the bulk scan — a write applied after this read gets
-            // an HLC above it (`assert_ts_monotonic`), so the tail still
-            // catches everything the bulk image may have missed.
-            build.tail_hlc = max_change_hlc(group).await;
-            for kind in SEED_KINDS {
-                let rows = group.seed_rows_kind(kind as usize, None).await;
-                let batches = children
-                    .iter()
-                    .map(|(child, range)| {
-                        let child_rows: Vec<_> = rows
-                            .iter()
-                            .filter(|(logical, _, _)| range.contains(logical))
-                            .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
-                            .collect();
-                        (*child, child_rows)
-                    })
-                    .collect();
-                ship_all(ctx, batches, &mut build.rows_shipped).await?;
-            }
-            build.bulk_done = true;
-        }
-        let shipped = tail_pass(ctx, group, &children, build).await?;
-        if shipped {
-            build.tail_passes += 1;
-        }
-        // Converged = caught up (a pass shipped nothing) OR chased long
-        // enough. The bounded-passes arm is a LIVENESS fix, not a
-        // correctness relaxation: rung 8's bench drove a *continuous*
-        // sequential writer against the parent and the build never froze —
-        // every 200ms tick's tail pass found that tick's own fresh writes,
-        // so "zero new records" structurally never fired. A hot tablet is
-        // exactly the one that needs splitting, so after
-        // `SPLIT_MAX_TAIL_PASSES` post-bulk passes the driver freezes
-        // regardless; the post-freeze final drain (over a log the freeze
-        // stops from growing) plus the final image still transfer
-        // everything, unchanged — the residue's size only bounds the write
-        // blip, which is the F8 knob ADR 0050 stage 4 names.
-        build.converged =
-            build.bulk_done && (!shipped || build.tail_passes >= SPLIT_MAX_TAIL_PASSES);
-        if build.converged {
-            // ---- stage 3 kickoff (rung 5): converged — terminally freeze
-            // the parent. Idempotent (a duplicate `Freeze` applies as a
-            // no-op), so a crash/re-lead between propose and apply just
-            // re-proposes here next tick. Once the entry APPLIES,
-            // `is_frozen()` flips and every subsequent tick runs the
-            // endgame below instead.
-            build.phase = "freeze";
-            match group.propose_freeze() {
-                animus_control::ProposeResult::Accepted { .. } => {}
-                other => return Err(format!("freeze not accepted: {other:?}")),
-            }
-        } else {
-            build.phase = "build";
-        }
-        return Ok(());
-    }
-
-    // ---- the endgame (frozen parent; ADR 0050 stages 3-4, rung 5). Every
-    // step is idempotent and re-derived per tick from durable/replicated
-    // state only, so a driver crash or re-lead at ANY boundary resumes by
-    // simply re-running the tick: the freeze is engine-durable
-    // (`is_frozen()` re-latches from its marker), a re-run tail pass ships
-    // nothing new, a re-run seal finds nothing left to seal, the vetoes are
-    // pure reads, and a duplicate `CutoverSplit` rejects at its own
-    // state/epoch CAS. ----
-    build.bulk_done = true;
-    build.converged = true;
-
-    // 1. Final drain: the identical watermark tail, now over a log that can
-    //    no longer grow (the freeze's own log position bounds it). Runs to
-    //    literally zero new records — no lag threshold. Loops to completion
-    //    WITHIN this tick (rung 8): the frozen log bounds the iteration, and
-    //    every 200ms tick boundary spent between endgame phases is pure
-    //    added write-blip — the bench measured ~3s of blip dominated by
-    //    phase-per-tick progression before this fall-through.
-    build.phase = "final-drain";
-    while tail_pass(ctx, group, &children, build).await? {}
-
-    // 1b. The FINAL IMAGE: one full re-scan ship of the frozen parent —
-    //     the freeze's log position defines the final state, and this
-    //     transfers it verbatim (carried-version merges make it an
-    //     idempotent no-op for every row the build already shipped). This
-    //     is deliberately a whole-scan, not another tail pass, because
-    //     transaction DECISIONS (`TxnCommit`/`TxnAbort`) and RESOLVES
-    //     rewrite base rows with **no change record of their own** — an
-    //     O(delta) tail structurally misses them, and a child inheriting a
-    //     stale `Pending` record for an acked-committed transaction is the
-    //     in-doubt-recovery-aborts-a-committed-write class, the one thing
-    //     fork F7 exists to prevent. Cost: a second full read+wire pass
-    //     per split, accepted for v1 (the pivot's safe-over-clever ethos);
-    //     apply-side decision/resolve markers restoring O(delta) are the
-    //     named B-final optimization. Gated on the apply task having
-    //     caught up past the freeze-window commit floor, so a decision
-    //     appended in the freeze's own append-to-apply sliver can never
-    //     apply mid-scan and be missed.
-    let floor = *build
-        .frozen_commit_floor
-        .get_or_insert_with(|| group.commit_index());
-    if group.engine_applied_index() < floor {
-        build.phase = "final-drain";
-        return Ok(());
-    }
-    if !build.final_image_done {
-        // Rung 8: filtered by the pre-bulk version floor — only rows
-        // rewritten since the bulk began ship here (the signal-less
-        // decision/resolve class included, by the floor's monotonicity
-        // argument). The unfiltered image (floor 0) was measured at ~2s of
-        // extra write blip on a 2,000-row table and scales with table
-        // size; the filtered residue scales with the build-window write
-        // rate instead.
-        let floor = build.bulk_version_floor.unwrap_or(0);
-        for kind in SEED_KINDS {
-            let rows = group.seed_rows_kind(kind as usize, None).await;
-            let batches = children
-                .iter()
-                .map(|(child, range)| {
-                    let child_rows: Vec<_> = rows
-                        .iter()
-                        .filter(|(logical, _, ver)| *ver > floor && range.contains(logical))
-                        .map(|(l, v, ver)| (kind, l.clone(), v.clone(), *ver))
-                        .collect();
-                    (*child, child_rows)
-                })
-                .collect();
-            ship_all(ctx, batches, &mut build.rows_shipped).await?;
-        }
-        build.final_image_done = true;
-        build.phase = "final-image";
-        // Fall through (rung 8): the image is shipped and durable on the
-        // children; nothing below needs a tick boundary to become true.
-    }
-
-    let table = parent.table.clone().unwrap_or_default();
-
-    // 2. Streams final seal (stage 3): seal the parent's KIND_CHANGE to
-    //    end-of-log under the ordinary seal machinery — a routine seal
-    //    (same shard-id discipline, so an in-flight iterator drains it and
-    //    walks on), just with no size/age gate. The parent is frozen and
-    //    drained, so one seal covers everything; a tick that sealed
-    //    something re-checks next tick and finds nothing left.
-    if !table.is_empty() && meta.table_stream(&table).is_some() {
-        // Loop within the tick (rung 8): the drained, frozen log means at
-        // most one real seal plus one nothing-left re-check.
-        build.phase = "final-seal";
-        while seal_now(ctx, &table, tablet, group).await?.is_some() {}
-    }
-    // 2b. PITR final seal (ADR 0059 §9, Train 3) — the identical exhaustion
-    // loop, independently, for a currently-PITR-enabled table (mirrors the
-    // "splitting tablet's exclusion guard" the ADR 0059 §9 task calls for:
-    // `change_consumer_loop`'s own per-tick PITR seal arm is excluded for a
-    // `Splitting` tablet, so this endgame step is PITR's ONLY chance to
-    // cover the frozen parent's final backlog before cutover retires it).
-    if !table.is_empty() && meta.table_pitr(&table).is_some() {
-        while pitr_seal_now(ctx, &table, tablet, group).await?.is_some() {}
-    }
-
-    // 3a. GSI-drain veto (stage 3): the drain must have consumed the
-    //     parent's change log (its cursor at or past the highest pending
-    //     record — markers included, whose HLCs the drain folds in), or
-    //     cutover would retire records whose GSI updates were never
-    //     materialized (children's change logs are empty by design).
-    //
-    //     Issue #288: drive the drain directly, to exhaustion, right here
-    //     before even checking the veto — see
-    //     [`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`]'s doc for why looping is
-    //     safe in this branch specifically (frozen, static parent) and what
-    //     class of slowness this closes (a large flood's backlog otherwise
-    //     depended on `change_consumer_loop`'s own once-per-tick
-    //     `drain_tablet` call surviving to completion, with each transient
-    //     failure under load costing a full extra tick to retry).
-    if !table.is_empty() && !meta.table_indexes(&table).is_empty() {
-        let gsis: Vec<IndexDef> = meta
-            .table_indexes(&table)
-            .iter()
-            .filter(|i| {
-                i.kind == IndexKind::Global
-                    && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
-            })
-            .cloned()
-            .collect();
-        if !gsis.is_empty() {
-            for _ in 0..FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES {
-                if gsi_caught_up(group).await {
-                    break;
-                }
-                if let Err(e) = drain_tablet(ctx, meta, &table, group, &gsis).await {
-                    tracing::debug!(
-                        tablet = tablet.0,
-                        error = %e,
-                        "split build: frozen-endgame gsi drain pass failed"
-                    );
-                    // See `is_retryable_elsewhere`'s doc (issue #298): a
-                    // dirty partition's GSI row write can target a
-                    // *different*, also-mid-split tablet that only THIS
-                    // node's own next tick can unblock — spending the rest
-                    // of this pass budget spinning on it here would starve
-                    // that other tablet's own turn on this same loop.
-                    if is_retryable_elsewhere(&e) {
-                        break;
-                    }
-                }
-            }
-        }
-        if !gsi_caught_up(group).await {
-            build.phase = "gsi-veto";
-            return Ok(());
-        }
-    }
-
-    // 3b. Backfill veto (stage 3): a still-`Creating` index's seeder must
-    //     have finished its sweep of the (frozen, hence static) parent —
-    //     its `MarkIndexBackfilled` row present — before the parent may
-    //     retire; the children then restart their own narrower sweeps from
-    //     scratch (ADR 0045 Fork A) and the completion aggregator re-reads
-    //     the live tablet map every tick, so post-cutover convergence is
-    //     sound.
-    if !table.is_empty() {
-        for idx in meta.table_indexes(&table) {
-            if idx.status == IndexStatus::Creating
-                && !meta
-                    .index_backfill
-                    .contains_key(&(tablet, idx.name.clone()))
-            {
-                build.phase = "backfill-veto";
-                return Ok(());
-            }
-        }
-    }
-
-    // 4. Cutover (stage 4): the atomic flip — children Active, parent
-    //    removed, lineage frozen. Confirmed by the parent VANISHING from
-    //    the map (the loop-top retain drops this build entry), so this
-    //    propose is simply re-issued each tick until observed; the
-    //    state/epoch CAS makes a duplicate reject cleanly.
-    build.phase = "cutover";
-    let cmd = MetaCommand::CutoverSplit {
-        parent: tablet,
-        expected_epoch: parent.epoch,
-        cutover_wall_ms: ctx.env.now().0 / 1_000_000,
-    };
-    ctx.propose_schema(&cmd).await;
-    Ok(())
-}
-
 /// One **in-place split** driver tick for a `Splitting` parent (carrying an
 /// [`animus_tablet::InPlaceSplitIntent`]) this node leads (ADR 0058 Train 2
 /// rung 3's residue — the `animusd`-level layer the ADR's own as-built note
@@ -1186,11 +757,12 @@ async fn split_driver_tick(
 /// control-plane epoch/state CAS makes a duplicate reject cleanly).
 ///
 /// **Idempotent across crash/re-lead by construction, with NO driver-local
-/// state at all** (unlike [`SplitBuild`], which memoizes the copy-based
-/// build's own progress): every step here is a fresh read off durable/
-/// replicated state — `pending_split()`, the change log, the GSI cursor, the
-/// backfill catalog — so a freshly re-led driver re-derives the exact same
-/// answer a long-running one would have, on its very first tick.
+/// state at all**: every step here is a fresh read off durable/replicated
+/// state — `pending_split()`, the change log, the GSI cursor, the backfill
+/// catalog — so a freshly re-led driver re-derives the exact same answer a
+/// long-running one would have, on its very first tick. (The copy-based
+/// endgame's own `SplitBuild` driver state, which this doc used to contrast
+/// against, was deleted in the copy-split-deletion endgame's Layer B1.)
 async fn inplace_split_driver_tick(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -1357,236 +929,8 @@ async fn inplace_split_driver_tick(
     Ok(())
 }
 
-/// One seed row's wire/payload cost against the [`SEED_CHUNK_BYTES`]
-/// budget: the kind byte, the logical key, the value, and a fixed
-/// allowance for the carried version plus framing. Shared by [`ship`]'s own
-/// chunking and [`tail_pass`]'s cross-unit accumulator so the two agree on
-/// what "a full chunk" means.
-fn seed_row_bytes(logical: &[u8], value: Option<&Vec<u8>>) -> usize {
-    1 + logical.len() + value.map_or(0, Vec::len) + 16
-}
-
-/// Ship `rows` (already filtered to one child) in bounded chunks
-/// (ADR 0050 rung 4 — see [`SEED_CHUNK_BYTES`]), returning how many rows
-/// went out.
-///
-/// **Returns the count rather than accumulating into a borrowed counter**
-/// so that ships to *different* children can run concurrently
-/// ([`ship_all`]) — one `&mut` into `SplitBuild` would serialize them at
-/// the borrow checker before they ever reached the network.
-async fn ship(
-    ctx: &ClientCtx,
-    child: TabletId,
-    rows: Vec<animus_cp_data::SeedRow>,
-) -> Result<u64, String> {
-    let mut shipped = 0u64;
-    let mut chunk: Vec<animus_cp_data::SeedRow> = Vec::new();
-    let mut bytes = 0usize;
-    for row in rows {
-        bytes += seed_row_bytes(&row.1, row.2.as_ref());
-        chunk.push(row);
-        if bytes >= SEED_CHUNK_BYTES {
-            let n = chunk.len() as u64;
-            ctx.seed_child_rows(child, std::mem::take(&mut chunk))
-                .await?;
-            shipped += n;
-            bytes = 0;
-        }
-    }
-    if !chunk.is_empty() {
-        let n = chunk.len() as u64;
-        ctx.seed_child_rows(child, chunk).await?;
-        shipped += n;
-    }
-    Ok(shipped)
-}
-
-/// Ship one batch **per child, concurrently**, and fold the row counts into
-/// `shipped` once they all land (ADR 0050).
-///
-/// A split's two children are two independent Raft groups, at
-/// placement-chosen homes (fork F5) that are frequently two *different*
-/// nodes — so shipping to them one after the other left each child's
-/// replica set idle for exactly as long as the other child's chunk took to
-/// commit. The copy is the dominant cost of a split, and this halves its
-/// wall clock without moving a single byte more.
-///
-/// Failure semantics are deliberately unchanged: `try_join_all` surfaces
-/// the first error and drops the sibling future, which at worst abandons a
-/// confirm-wait for a chunk that may still commit. That is exactly the
-/// state a crashed driver leaves behind, and the same thing makes it safe —
-/// a `SeedBatch` merges at its carried versions, so the next tick's re-run
-/// (from an empty [`SplitBuild`] after a re-lead, or from the unmoved tail
-/// watermark otherwise) re-ships it as a no-op.
-async fn ship_all(
-    ctx: &ClientCtx,
-    batches: Vec<(TabletId, Vec<animus_cp_data::SeedRow>)>,
-    shipped: &mut u64,
-) -> Result<(), String> {
-    let counts = futures::future::try_join_all(
-        batches
-            .into_iter()
-            .map(|(child, rows)| ship(ctx, child, rows)),
-    )
-    .await?;
-    *shipped += counts.iter().sum::<u64>();
-    Ok(())
-}
-
-/// One tail pass of the split build (ADR 0050 rung 4; reused VERBATIM as
-/// rung 5's post-freeze final drain): ship every dirty unit whose change
-/// record's packed HLC exceeds the driver's watermark, then advance the
-/// watermark only once every ship in the pass succeeded. Returns whether
-/// anything shipped (`false` == the pass found zero new records).
-///
-/// Dirty granularity is two-tier, keyed off the change key's own prefix
-/// (the logical key minus its trailing 8-byte packed HLC):
-/// - a prefix carrying a full 8-byte token (every dynamo key, and any
-///   raw key >= 8 bytes) dirties its whole **token** — the unit that also
-///   owns the item's LSI rows (which reorder the sk and share only the
-///   token+pk lead) and its txn-record row (which shares the anchor's
-///   token), and the unit F11 keeps wholly on one child;
-/// - a shorter raw-protocol prefix dirties exactly itself (such tables
-///   structurally have no LSI/txn rows — `cp_txn` rejects sub-token keys —
-///   so the prefix covers everything).
-async fn tail_pass(
-    ctx: &ClientCtx,
-    group: &CpGroup,
-    children: &[(TabletId, KeyRange)],
-    build: &mut SplitBuild,
-) -> Result<bool, String> {
-    let changes = group.pending_changes().await;
-    let fresh: Vec<(&Vec<u8>, u64)> = changes
-        .iter()
-        .filter_map(|(logical, _)| Some((logical, packed_hlc(logical)?)))
-        .filter(|(_, hlc)| *hlc > build.tail_hlc)
-        .collect();
-    if fresh.is_empty() {
-        return Ok(false);
-    }
-    let mut dirty: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut max_hlc = build.tail_hlc;
-    for (logical, hlc) in fresh {
-        let prefix = &logical[..logical.len() - HLC_BYTES];
-        if prefix.len() >= 8 {
-            dirty.insert(prefix[..8].to_vec());
-        } else if !prefix.is_empty() {
-            dirty.insert(prefix.to_vec());
-        }
-        max_hlc = max_hlc.max(hlc);
-    }
-    // Per-child accumulator: a dirty unit's rows are a handful of bytes, so
-    // shipping each unit on its own — as this pass originally did — bought
-    // one whole consensus round (plus, for a child off this node, a
-    // forwarded hop) per partition key, while the bulk pass moved thousands
-    // of rows per round. Batching across units to the same
-    // [`SEED_CHUNK_BYTES`] budget the bulk pass uses collapses that to the
-    // same rounds-per-megabyte cost. Semantics are unchanged: a `SeedBatch`
-    // is idempotent at its carried versions, and chunk boundaries already
-    // cut across rows on the bulk path, so nothing depends on one unit's
-    // rows sharing an entry.
-    let mut pending: BTreeMap<TabletId, (Vec<animus_cp_data::SeedRow>, usize)> = BTreeMap::new();
-    for unit in dirty {
-        // The child whose range contains the unit's first key owns every
-        // row under it (F11 token alignment for tokenized tables; a raw
-        // prefix is a single key's own lineage).
-        let Some((child, _)) = children.iter().find(|(_, range)| range.contains(&unit)) else {
-            continue; // outside the parent's own range — cannot happen; skip
-        };
-        let upper = prefix_upper(&unit);
-        for kind in SEED_KINDS {
-            let rows = match &upper {
-                Some(hi) => {
-                    group
-                        .seed_rows_kind(kind as usize, Some((unit.as_slice(), hi.as_slice())))
-                        .await
-                }
-                // All-0xFF unit: no finite upper bound — scan the kind
-                // scope whole and keep the unit's own rows.
-                None => group
-                    .seed_rows_kind(kind as usize, None)
-                    .await
-                    .into_iter()
-                    .filter(|(l, _, _)| l.starts_with(&unit))
-                    .collect(),
-            };
-            // Buffer, and flush only once this child's buffer is worth a
-            // consensus round (the trailing partial batches go out below).
-            let batch = {
-                let (buf, bytes) = pending.entry(*child).or_insert_with(|| (Vec::new(), 0));
-                for (logical, value, version) in rows {
-                    *bytes += seed_row_bytes(&logical, value.as_ref());
-                    buf.push((kind, logical, value, version));
-                }
-                if *bytes >= SEED_CHUNK_BYTES {
-                    *bytes = 0;
-                    std::mem::take(buf)
-                } else {
-                    Vec::new()
-                }
-            };
-            if !batch.is_empty() {
-                build.rows_shipped += ship(ctx, *child, batch).await?;
-            }
-        }
-    }
-    // The trailing partial batches — one per child, so they go out
-    // concurrently like every other per-child ship.
-    ship_all(
-        ctx,
-        pending
-            .into_iter()
-            .map(|(child, (rows, _))| (child, rows))
-            .collect(),
-        &mut build.rows_shipped,
-    )
-    .await?;
-    // Only past every successful ship: a failed tick re-derives the same
-    // dirty units next tick from the unmoved watermark.
-    build.tail_hlc = max_hlc;
-    Ok(true)
-}
-
-/// The trailing packed HLC of a change record's logical key
-/// (`prefix || hlc`, ADR 0049) — `None` for a key too short to carry one.
-/// The tail's watermark unit: raw big-endian packed bits, the same
-/// encoding [`SplitBuild::tail_hlc`] holds.
-fn packed_hlc(logical: &[u8]) -> Option<u64> {
-    let suffix = logical
-        .len()
-        .checked_sub(HLC_BYTES)
-        .map(|n| &logical[n..])?;
-    Some(u64::from_be_bytes(suffix.try_into().ok()?))
-}
-
-/// The highest packed HLC over a group's current change log, `0` for an
-/// empty one — the split build's pre-bulk tail watermark (see its capture
-/// site in [`split_driver_tick`]).
-async fn max_change_hlc(group: &CpGroup) -> u64 {
-    group
-        .pending_changes()
-        .await
-        .iter()
-        .filter_map(|(logical, _)| packed_hlc(logical))
-        .max()
-        .unwrap_or(0)
-}
-
-/// The exclusive upper bound of "every key starting with `prefix`": the
-/// prefix as a big-endian integer plus one, trailing `0xFF` bytes dropped —
-/// the `physical_bounds` prefix-upper-bound idiom. `None` when the prefix is
-/// all `0xFF` (no finite bound exists).
-fn prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    while let Some(last) = upper.pop() {
-        if last < 0xFF {
-            upper.push(last + 1);
-            return Some(upper);
-        }
-    }
-    None
-}
-
+/// Reconcile every dirty item of one tablet not yet covered by the "gsi"
+/// cursor, then advance that cursor to the highest HLC this pass covers.
 async fn drain_tablet(
     ctx: &ClientCtx,
     meta: &Metadata,
@@ -4100,7 +3444,6 @@ mod stream_sealer_tests {
                 quiesce_after,
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 None,
-                crate::config::SplitMode::default(),
                 crate::BackupStoreConfig::default(),
                 crate::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )

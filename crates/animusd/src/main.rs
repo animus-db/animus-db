@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
@@ -93,16 +93,10 @@
 //! time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
 //!
-//! `--split-mode {copy,inplace}` (ADR 0058 Train 2 rung 3) selects which
-//! tablet-split workflow `ClientCtx::trigger_split` proposes: `inplace` (the
-//! default since rung 4 layer 2, and every entry point that omits the flag)
-//! is the ADR 0058 single-entry atomic fork; `copy` is the original ADR
-//! 0050 build/freeze/cutover workflow, still selectable pending its own
-//! deletion. Threads through `--config`/`--node` and `--cluster N` only —
-//! the same scope `--quiesce-after` has, and the same documented gap for
-//! `--cluster-control`/`--cluster-data` and the standalone
-//! `control`/`data`/`join` subcommands (each always runs `inplace`, with no
-//! flag to select `copy` on those shapes).
+//! `ClientCtx::trigger_split` always proposes the ADR 0058 single-entry
+//! atomic in-place fork now — the original ADR 0050 copy-based
+//! build/freeze/cutover workflow and its `--split-mode` flag were deleted in
+//! the copy-split-deletion endgame's Layer B1 (`docs/adr/0058-*.md` rung 4).
 //!
 //! `--dynamo-auth PATH` (ADR 0057) points at a JSON file holding the client
 //! DynamoDB port's SigV4 credential store — the same shape as a
@@ -209,8 +203,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
@@ -327,20 +321,6 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
-    // `--split-mode {copy,inplace}` (ADR 0058 Train 2 rung 3): selects which
-    // tablet-split workflow `ClientCtx::trigger_split` proposes. `None` (the
-    // flag omitted) keeps `animusd::SplitMode::default()`, which is
-    // `InPlace` as of ADR 0058 rung 4 layer 2 (the ADR 0058 in-place
-    // single-entry atomic fork; was `Copy`, the original ADR 0050
-    // build/freeze/cutover workflow, until this layer flipped the default)
-    // on every mode below. `--split-mode copy` still selects the original
-    // workflow explicitly, pending its own deletion. Threads through
-    // `--config`/`--cluster N` only (the same scope as `--quiesce-after`);
-    // silently unused for `--cluster-control`/`--cluster-data` (a documented
-    // gap matching that path's existing `--quiesce-after` one) — that dev
-    // shape and the standalone `control`/`data`/`join` subcommands all get
-    // `SplitMode::default()` = `InPlace` too, with no way to override it.
-    let mut split_mode: Option<animusd::SplitMode> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
     // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
@@ -359,9 +339,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // applied to every generated node (they still each bind their own
     // distinct port, so `{host}:{port}` stays a unique identity per node).
     // `--cluster-control`/`--cluster-data`: a documented gap, matching this
-    // dev-only path's existing `--quiesce-after`/`--split-mode` ones — not
-    // threaded through, since `run_in_process_split_cluster` has no
-    // per-node-advertise-host wrapper to call.
+    // dev-only path's existing `--quiesce-after` one — not threaded through,
+    // since `run_in_process_split_cluster` has no per-node-advertise-host
+    // wrapper to call.
     let mut advertise_host: Option<String> = None;
 
     let mut it = args.iter();
@@ -403,9 +383,6 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
-            }
-            "--split-mode" => {
-                split_mode = Some(parse_next(&mut it, "--split-mode")?);
             }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
@@ -481,7 +458,6 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
-                split_mode.unwrap_or_default(),
                 dynamo_auth_flag,
                 backup_store_config,
                 advertise_host,
@@ -501,7 +477,6 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
-                split_mode.unwrap_or_default(),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
                 advertise_host,
@@ -716,7 +691,6 @@ async fn run_single(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
-    split_mode: animusd::SplitMode,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
@@ -727,7 +701,7 @@ async fn run_single(
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
-    let node = animusd::run_node_with_streams_quiesce_and_split_mode(
+    let node = animusd::run_node_with_streams_quiesce_and_backup_store(
         &config,
         index,
         &dir,
@@ -737,7 +711,6 @@ async fn run_single(
         segment_store_config,
         stream_retention,
         quiesce_after,
-        split_mode,
         backup_store_config,
     )
     .await
@@ -1117,7 +1090,6 @@ async fn run_in_process_cluster(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
-    split_mode: animusd::SplitMode,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
@@ -1140,7 +1112,6 @@ async fn run_in_process_cluster(
         auto_split_change_rate,
         quiesce_after,
         dynamo_auth,
-        split_mode,
         backup_store_config,
     )
     .await
@@ -1156,14 +1127,6 @@ async fn run_in_process_cluster(
         println!(
             "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
         );
-    }
-    match split_mode {
-        animusd::SplitMode::InPlace => {
-            println!("animusd: split-mode = inplace (ADR 0058, the default since rung 4 layer 2)")
-        }
-        animusd::SplitMode::Copy => {
-            println!("animusd: split-mode = copy (ADR 0050, explicitly selected)")
-        }
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(

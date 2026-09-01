@@ -6,13 +6,14 @@
 //! exactly the bench that should be pointed at this one before it is
 //! trusted." This file is that pointing — same continuous-writer shape,
 //! same workload parameters (2,000 rows, 256-byte values, 3 nodes), so the
-//! two files' numbers are directly comparable, run against a `--split-mode
-//! inplace` cluster instead of the default copy-based one.
+//! two files' numbers are directly comparable, against the (now sole)
+//! in-place split workflow — the copy-based workflow and its `--split-mode`
+//! flag were deleted in the copy-split-deletion endgame's Layer B1
+//! (`docs/adr/0058-*.md` rung 4).
 //!
-//! Deliberately a **separate file**, not an addition to `split_build.rs`:
-//! the two benches need different bring-up (`SplitMode::InPlace` threaded
-//! through `run_node_with_streams_quiesce_and_split_mode`, mirroring
-//! `inplace_split_e2e.rs::bring_up_inplace`) and a small retry-counting
+//! Deliberately a **separate file**, not an addition to `split_build.rs`
+//! (itself deleted in Layer A): the two benches needed different bring-up
+//! (mirroring `inplace_split_e2e.rs::bring_up_inplace`) and a small retry-counting
 //! variant of `put_in`, and this crate's own stated convention is that a
 //! small fixture is duplicated per test binary rather than shared (see
 //! `animusd/CLAUDE.md`'s note on `field()`/`dynamo()`-shaped duplication) —
@@ -26,7 +27,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig, SplitMode,
+    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig,
     StorageBackend, StreamSealKnobs, read_frame, write_frame,
 };
 use serde_json::Value;
@@ -36,11 +37,11 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-/// Bring up an `n`-node cluster, one process-shaped node per index, every
-/// node started with `SplitMode::InPlace` — otherwise byte-for-byte the same
-/// bring-up shape (including quiescence disabled, `Duration::ZERO`) as
-/// `split_build.rs::bring_up`'s copy-mode cluster, so the two benches run
-/// under identical conditions apart from the one variable under test.
+/// Bring up an `n`-node cluster, one process-shaped node per index —
+/// byte-for-byte the same bring-up shape (including quiescence disabled,
+/// `Duration::ZERO`) the deleted `split_build.rs::bring_up`'s copy-mode
+/// cluster used, minus the now-deleted `SplitMode` selection (every split
+/// is in-place unconditionally since Layer B1).
 async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
     for attempt in 0..16 {
         let addrs = support::free_addrs(n * 6);
@@ -64,7 +65,7 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_split_mode(
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
                 &config,
                 i,
                 dir.join(format!("node-{attempt}-{i}")),
@@ -74,7 +75,6 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
                 SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
-                SplitMode::InPlace,
                 animusd::BackupStoreConfig::default(),
             )
             .await
@@ -218,9 +218,9 @@ fn sole_tablet_of(node: &Node, table: &str) -> u64 {
     ids[0]
 }
 
-/// [`split_build.rs::kickoff_tablet`], identical — the identical `POST
-/// /admin/tablet/split` endpoint; which workflow actually runs is decided
-/// entirely by this cluster's configured `SplitMode` (in-place, above).
+/// The `POST /admin/tablet/split` endpoint — always the in-place workflow
+/// now (the copy-based one and its `SplitMode` selector were deleted in
+/// Layer B1).
 async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
     let (status, body) = admin(
         node.admin_addr(),
