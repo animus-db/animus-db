@@ -4995,8 +4995,8 @@ mod tests {
         );
         // `CreateTablet` allows only one tablet per table (ADR 0023) — a
         // genuine second tablet on the same table comes only from a real
-        // split, so drive `BeginSplit`/`CutoverSplit` to end up with two
-        // `Active` tablets scoped to `users`.
+        // split, so drive one (via `split_tablet`, in-place) to end up with
+        // two `Active` tablets scoped to `users`.
         assert_eq!(
             m.apply(&MetaCommand::CreateTablet {
                 tablet: TabletId(1),
@@ -5007,24 +5007,7 @@ mod tests {
             ApplyOutcome::Applied
         );
         let split_key = [0x80; TOKEN_BYTES].to_vec();
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key,
-                children: [(TabletId(2), vec![nid(1)]), (TabletId(3), vec![nid(1)])],
-            }),
-            ApplyOutcome::Applied
-        );
-        let parent_epoch = m.tablets[&TabletId(1)].epoch;
-        assert_eq!(
-            m.apply(&MetaCommand::CutoverSplit {
-                parent: TabletId(1),
-                expected_epoch: parent_epoch,
-                cutover_wall_ms: 500,
-            }),
-            ApplyOutcome::Applied
-        );
+        split_tablet(&mut m, TabletId(1), split_key, TabletId(2));
 
         assert_eq!(
             m.apply(&MetaCommand::BeginBackup {
@@ -6534,81 +6517,6 @@ mod tests {
         assert!(m.split_lineage.is_empty());
     }
 
-    /// ADR 0050 state/CAS gates on `BeginSplit`: epoch mismatch, a
-    /// non-`Active` parent (no re-split of a `Splitting` parent, no split of
-    /// a `Building` child), duplicate/colliding child ids, and ids below the
-    /// allocator floor are all rejected.
-    #[test]
-    fn begin_split_rejects_bad_epoch_state_and_child_ids() {
-        let (mut m, cmd) = begin_split_fixture();
-
-        // Epoch mismatch.
-        let MetaCommand::BeginSplit {
-            parent,
-            split_key,
-            children,
-            ..
-        } = cmd.clone()
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent,
-                expected_epoch: Epoch::INITIAL.next(),
-                split_key: split_key.clone(),
-                children: children.clone(),
-            }),
-            ApplyOutcome::Rejected("epoch mismatch")
-        );
-
-        // Identical child ids.
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent,
-                expected_epoch: Epoch::INITIAL,
-                split_key: split_key.clone(),
-                children: [(TabletId(2), vec![nid(4)]), (TabletId(2), vec![nid(5)])],
-            }),
-            ApplyOutcome::Rejected("child ids must be distinct")
-        );
-
-        // Child id below the monotonic allocator floor (id 1 is spoken for).
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent,
-                expected_epoch: Epoch::INITIAL,
-                split_key: split_key.clone(),
-                children: [(TabletId(1), vec![nid(4)]), (TabletId(9), vec![nid(5)])],
-            }),
-            ApplyOutcome::Rejected("child tablet id already exists")
-        );
-
-        // A real begin succeeds…
-        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
-        // …after which the parent is `Splitting`: a re-split is rejected on
-        // state (with the freshly bumped epoch, so the CAS passes).
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent,
-                expected_epoch: Epoch::INITIAL.next(),
-                split_key: split_key.clone(),
-                children: [(TabletId(10), vec![nid(4)]), (TabletId(11), vec![nid(5)])],
-            }),
-            ApplyOutcome::Rejected("tablet is not Active")
-        );
-        // …and a `Building` child is not splittable either.
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent: TabletId(3),
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0xC000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                children: [(TabletId(10), vec![nid(4)]), (TabletId(11), vec![nid(5)])],
-            }),
-            ApplyOutcome::Rejected("tablet is not Active")
-        );
-    }
-
     /// ADR 0058 Train 2 rung 3: `BeginSplitInPlace`'s own fixture — one
     /// `Active` parent tablet (id 1, whole range, RF 3, a recorded policy)
     /// plus the command splitting it at the ring midpoint into children 2
@@ -6689,7 +6597,12 @@ mod tests {
     }
 
     /// `BeginSplitInPlace` rejects on the identical epoch/state/child-id
-    /// gates `BeginSplit` does — same discipline, same fixture shape.
+    /// gates `BeginSplit` does — same discipline, same fixture shape. This is
+    /// now the SOLE coverage of that shared gate discipline: the copy-based
+    /// mirror of this test (`begin_split_rejects_bad_epoch_state_and_child_
+    /// ids`) was deleted as redundant once this one existed (copy-split
+    /// deletion stack, layer 1) — nothing here is specific to the in-place
+    /// command, so it stands in for both.
     #[test]
     fn begin_split_in_place_rejects_bad_epoch_state_and_child_ids() {
         let (mut m, cmd) = begin_split_in_place_fixture();
@@ -7566,7 +7479,14 @@ mod tests {
     /// `Splitting` parent or a `Building` child, even when the replica set
     /// violates policy (here: RF 3 policy, 1-replica sets, which repair
     /// would otherwise fix immediately); an ordinary `Active` tablet in the
-    /// same view still gets repaired.
+    /// same view still gets repaired. **Deliberately kept alongside
+    /// [`placement_is_frozen_for_a_splitting_parent_with_an_in_place_
+    /// intent`]** rather than deleted as redundant (copy-split deletion
+    /// stack, layer 1): the `Building`-child half of this assertion is
+    /// copy-workflow-specific mechanics (an in-place split never mints one),
+    /// so it stays as coverage for `TabletState::Building` until the later
+    /// layer that deletes the copy-based workflow removes that state
+    /// entirely.
     #[test]
     fn placement_is_frozen_for_splitting_parents_and_building_children() {
         let mut m = Metadata::default();
@@ -7644,6 +7564,92 @@ mod tests {
         assert!(m.rebalance().is_none());
     }
 
+    /// ADR 0058 Train 2 rung 3: the same placement-freeze rule as
+    /// [`placement_is_frozen_for_splitting_parents_and_building_children`],
+    /// over `BeginSplitInPlace` — a `Splitting` parent carrying an in-place
+    /// intent is just as invisible to repair/rebalance as the copy-based
+    /// workflow's `Splitting` parent, even though this workflow never mints
+    /// any `Building` child rows at all (there is nothing else here to
+    /// freeze — `reconcile_placement`/`rebalance_placement` skip on the
+    /// parent's own non-`Active` state alone).
+    #[test]
+    fn placement_is_frozen_for_a_splitting_parent_with_an_in_place_intent() {
+        let mut m = Metadata::default();
+        for n in 1..=6u64 {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        // An under-replicated Active tablet: repair proposes for it.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("a".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(1),
+                policy: Some(PlacementPolicy::simple("p", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        // A second table, mid-in-place-split: equally under-replicated, but
+        // frozen on the parent's own `Splitting` state alone.
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("b".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(2)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("p", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::BeginSplitInPlace {
+                parent: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
+                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
+                children: [(TabletId(3), vec![nid(2)]), (TabletId(4), vec![nid(2)])],
+            }),
+            ApplyOutcome::Applied
+        );
+
+        let proposed = m.reconcile();
+        let targets: Vec<TabletId> = proposed
+            .iter()
+            .map(|c| match c {
+                MetaCommand::CasTabletReplicas { tablet, .. } => *tablet,
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![TabletId(1)],
+            "repair touches only the Active tablet; the Splitting parent (in-place, no \
+             Building rows at all) is frozen"
+        );
+        // The rebalancer proposes nothing for the frozen set either (the
+        // Active tablet's set violates policy, so rebalance skips it by its
+        // own pre-existing rule; nothing else is eligible at all).
+        assert!(m.rebalance().is_none());
+    }
+
     /// `DropTableTablets` (ADR 0024): removes every tablet scoped to the table —
     /// split children included — with their policies, in one apply; leaves other
     /// tables' and the legacy unscoped tablet alone; no-op when the table has no
@@ -7660,7 +7666,7 @@ mod tests {
         assert_eq!(m.apply(&create(1, Some("users"))), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(2, Some("orders"))), ApplyOutcome::Applied);
         assert_eq!(m.apply(&create(3, None)), ApplyOutcome::Applied); // legacy
-        // Split `users` (copy-based, Begin+Cutover) so the table owns two
+        // Split `users` (`split_tablet`, in-place) so the table owns two
         // tablets (ids 4 and 5; tablet 1 is retired by the cutover).
         split_tablet(
             &mut m,
@@ -9256,17 +9262,7 @@ mod tests {
         // The base snapshot pinned tablet 1 at cut_version 10, then it
         // sealed one more segment (epoch 0, hlc 0..50) before splitting.
         m.apply(&pitr_seal("orders", 1, TabletId(1), 0));
-        m.apply(&MetaCommand::BeginSplit {
-            parent: TabletId(1),
-            expected_epoch: m.tablets[&TabletId(1)].epoch,
-            split_key: b"m".to_vec(),
-            children: [(TabletId(2), Vec::new()), (TabletId(3), Vec::new())],
-        });
-        m.apply(&MetaCommand::CutoverSplit {
-            parent: TabletId(1),
-            expected_epoch: m.tablets[&TabletId(1)].epoch,
-            cutover_wall_ms: 1_500,
-        });
+        split_tablet(&mut m, TabletId(1), b"m".to_vec(), TabletId(2));
         assert!(!m.tablets.contains_key(&TabletId(1)));
         // Each child seals its own fresh epoch-0 chain independently.
         m.apply(&pitr_seal("orders", 1, TabletId(2), 0));
@@ -9491,14 +9487,18 @@ mod tests {
         );
     }
 
-    /// F11 (ADR 0042 §14, Fork D) apply-time seatbelt: `SplitTablet`
-    /// against a **streamed** table's tablet rejects a split key that
-    /// isn't exactly `TOKEN_BYTES` long, the structural check against a
-    /// future caller that bypasses `animusd::ClientCtx::trigger_split`'s
-    /// own rounding (the primary enforcement, tested at that layer). A
-    /// properly token-aligned (8-byte) key still applies normally.
+    /// F11 (ADR 0042 §14, Fork D) apply-time seatbelt, over `BeginSplitInPlace`
+    /// (its own arm carries the identical check, see that command's doc):
+    /// against a **streamed** table's tablet, a split key that isn't exactly
+    /// `TOKEN_BYTES` long is rejected — the structural check against a
+    /// future caller that bypasses `animusd::ClientCtx::trigger_split`'s own
+    /// rounding (the primary enforcement, tested at that layer). A properly
+    /// token-aligned (8-byte) key still applies normally. Supersedes the
+    /// deleted copy-based `BeginSplit` version of this test (copy-split
+    /// deletion stack, layer 1) — the F11 seatbelt is byte-for-byte
+    /// identical on both commands' apply arms.
     #[test]
-    fn split_rejects_a_non_token_aligned_key_on_a_streamed_table() {
+    fn split_in_place_rejects_a_non_token_aligned_key_on_a_streamed_table() {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
         assert_eq!(
@@ -9516,7 +9516,7 @@ mod tests {
         // split_at` is even consulted.
         let homes = vec![nid(1), nid(2), nid(3)];
         assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
+            m.apply(&MetaCommand::BeginSplitInPlace {
                 parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: b"mmmmm".to_vec(),
@@ -9525,10 +9525,16 @@ mod tests {
             ApplyOutcome::Rejected("split key not token-aligned for a streamed table")
         );
         assert_eq!(m.tablets.len(), 1, "the rejected split changed nothing");
+        assert!(
+            m.tablets[&TabletId(1)].inplace_split.is_none(),
+            "the rejected split recorded no intent either"
+        );
 
-        // The same tablet, same epoch, a properly token-aligned key: applies.
+        // The same tablet, same epoch, a properly token-aligned key: applies
+        // — the parent records the intent (no tablet-map row for the
+        // children yet, unlike the deleted copy-based arm).
         assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
+            m.apply(&MetaCommand::BeginSplitInPlace {
                 parent: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
@@ -9536,7 +9542,7 @@ mod tests {
             }),
             ApplyOutcome::Applied
         );
-        assert!(m.tablets.contains_key(&TabletId(2)));
+        assert!(m.tablets[&TabletId(1)].inplace_split.is_some());
 
         // An unstreamed table's tablet is completely unaffected by the
         // fence — any strictly-interior key, of any length, still applies.
@@ -9550,7 +9556,7 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
+            m.apply(&MetaCommand::BeginSplitInPlace {
                 parent: TabletId(10),
                 expected_epoch: Epoch::INITIAL,
                 split_key: b"mmmmm".to_vec(),
@@ -9563,17 +9569,19 @@ mod tests {
         );
     }
 
-    /// F11 Fork E (ADR 0042 §14): the accepted single-token hot-partition
-    /// limit at the apply layer — a token-aligned split key that happens
-    /// to equal the *target* tablet's own `range.start` (a single very hot
-    /// partition token owning the tablet's entire range) is rejected by
-    /// the pre-existing `KeyRange::split_at` "strictly inside" guard, not
-    /// silently accepted into a zero-width sibling. `ClientCtx::
+    /// F11 Fork E (ADR 0042 §14), over `BeginSplitInPlace`: the accepted
+    /// single-token hot-partition limit at the apply layer — a
+    /// token-aligned split key that happens to equal the *target* tablet's
+    /// own `range.start` (a single very hot partition token owning the
+    /// tablet's entire range) is rejected by the pre-existing `KeyRange::
+    /// split_at` "strictly inside" guard, not silently accepted. `ClientCtx::
     /// trigger_split` (`animusd`) is the layer that turns this into a
-    /// metered skip before ever proposing; this proves the fence holds
-    /// even if a future caller reaches apply directly.
+    /// metered skip before ever proposing; this proves the fence holds even
+    /// if a future caller reaches apply directly. Supersedes the deleted
+    /// copy-based `BeginSplit` version of this test (copy-split deletion
+    /// stack, layer 1).
     #[test]
-    fn split_rejects_a_token_aligned_key_equal_to_range_start() {
+    fn split_in_place_rejects_a_token_aligned_key_equal_to_range_start() {
         let mut m = Metadata::default();
         enable_stream(&mut m, "orders", "L1");
         assert_eq!(
@@ -9594,7 +9602,7 @@ mod tests {
         // — the single-hot-token degenerate case — is rejected, not
         // accepted into a zero-width tablet.
         assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
+            m.apply(&MetaCommand::BeginSplitInPlace {
                 parent: TabletId(3),
                 expected_epoch: m.tablets[&TabletId(3)].epoch,
                 split_key: boundary,
@@ -9890,17 +9898,19 @@ mod tests {
 
     // --- accessors ------------------------------------------------------
 
-    /// A real `SplitTablet` apply of `source` into `new_id` (a `CreateTablet`
-    /// for `source` must already have applied) — used by the stream-basis
-    /// tests below instead of hand-poking `split_parents`, so
-    /// `Metadata::stream_split_basis` gets frozen exactly the way production
-    /// freezes it.
-    /// Run a full copy-based split of `source` at `split_key` (ADR 0050):
-    /// `BeginSplit` minting children `new_id`/`new_id + 1` on the parent's
-    /// own replicas, then `CutoverSplit` — children `Active`, parent
-    /// removed, `split_lineage` frozen. The metadata-only equivalent of
-    /// the workflow (sound as a fixture: `Metadata::apply` carries no
-    /// build state; on an empty/unhosted fixture there is nothing to copy).
+    /// Run a full split of `source` at `split_key` (`new_id`/`new_id + 1`
+    /// end up `Active`, `source` removed, `split_lineage` frozen) as a
+    /// shared fixture step for tests below whose actual subject is
+    /// downstream of the split (backup re-planning, PITR replay, table
+    /// drop, the allocator floor) rather than the split apply-gates
+    /// themselves — those get their own dedicated `begin_split_in_place_*`/
+    /// `cutover_split_in_place_*` tests. Drives `BeginSplitInPlace` (ADR
+    /// 0062: both children fork onto `source`'s own current replicas,
+    /// verbatim and identical) then `CutoverSplit`'s in-place branch, rather
+    /// than the deprecated copy-based `BeginSplit` this helper used before
+    /// the copy-split deletion stack's layer 1 — no caller here sets a
+    /// policy on `source` before splitting, so `CutoverSplit` never has
+    /// anything to place and writes no `split_placing` entry either.
     fn split_tablet(m: &mut Metadata, source: TabletId, split_key: Vec<u8>, new_id: TabletId) {
         let expected_epoch = m.tablets.get(&source).map_or(Epoch::INITIAL, |t| t.epoch);
         let replicas = m
@@ -9909,7 +9919,7 @@ mod tests {
             .map(|t| t.replicas.clone())
             .unwrap_or_default();
         assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
+            m.apply(&MetaCommand::BeginSplitInPlace {
                 parent: source,
                 expected_epoch,
                 split_key,
@@ -9919,7 +9929,7 @@ mod tests {
                 ],
             }),
             ApplyOutcome::Applied,
-            "test setup: begin-split must apply"
+            "test setup: begin-split-in-place must apply"
         );
         let bumped = m.tablets.get(&source).map_or(Epoch::INITIAL, |t| t.epoch);
         assert_eq!(
