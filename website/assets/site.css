@@ -390,6 +390,12 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .pill.out { color: var(--danger); background: var(--danger-bg); }
 .pill.part { color: var(--warn); background: var(--warn-bg); }
 
+/* ---------- status list (single flat list, one status pill per row) ---------- */
+.status-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius-panel); overflow: hidden; }
+.status-list li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 13.5px; color: var(--ink-85); }
+.status-list li:last-child { border-bottom: none; }
+.status-list .pill { flex: 0 0 auto; }
+
 /* ---------- callouts, warnings, asides, pull quotes ---------- */
 .callout {
   border: 1px solid var(--border); border-left: 3px solid var(--accent);
