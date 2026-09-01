@@ -236,30 +236,24 @@
   <div class="wrap">
     <span class="kicker">Where it stands</span>
     <h2>Pre-alpha. Here's the honest version.</h2>
-    <div class="cardgrid c3" style="margin-top:18px">
-      <div class="lcard"><h3>Works today</h3><ul>
-        <li>Per-tablet Raft replication, linearizable writes</li>
-        <li>Tablet splits, movement and online rebalancing</li>
-        <li>Multi-tablet transactions (2PC, MVCC snapshot reads)</li>
-        <li>Secondary indexes, added and dropped online with backfill</li>
-        <li>Streams and time to live</li>
-        <li>On-demand backup and restore, plus continuous backups (point-in-time recovery) to any second</li>
-        <li>Metrics endpoint, admin API and a built-in dashboard</li>
-        <li>Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</li>
-        <li>A Kubernetes operator (an <code>AnimusCluster</code> custom resource, one <code>StatefulSet</code> per cluster), with a CI-gated <code>kind</code> cluster smoke test — create, bootstrap, scale, delete</li>
-      </ul></div>
-      <div class="lcard"><h3>Planned</h3><ul>
-        <li>TLS on every port; authentication beyond the client port's opt-in SigV4</li>
-        <li>On-disk format stability, then rolling upgrades</li>
-        <li>Published benchmarks with disclosed methodology</li>
-      </ul></div>
-      <div class="lcard"><h3>Not yet</h3><ul>
-        <li>Production use, by anyone, anywhere</li>
-        <li>Any performance claim — it has not been benchmarked at scale</li>
-        <li>Compatibility between revisions: upgrading means recreating the cluster</li>
-        <li>Tablet merging — a table that shrinks keeps its tablet count</li>
-      </ul></div>
-    </div>
+    <ul class="status-list" style="margin-top:18px">
+      <li><span class="t">Per-tablet Raft replication, linearizable writes</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Tablet splits, movement and online rebalancing</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Multi-tablet transactions (2PC, MVCC snapshot reads)</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Secondary indexes, added and dropped online with backfill</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Streams and time to live</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">On-demand backup and restore, plus continuous backups (point-in-time recovery) to any second</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Metrics endpoint, admin API and a built-in dashboard</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">A Kubernetes operator (an <code>AnimusCluster</code> custom resource, one <code>StatefulSet</code> per cluster), with a CI-gated <code>kind</code> cluster smoke test — create, bootstrap, scale, delete</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">TLS on every port; authentication beyond the client port's opt-in SigV4</span><span class="pill opt">Planned</span></li>
+      <li><span class="t">On-disk format stability, then rolling upgrades</span><span class="pill opt">Planned</span></li>
+      <li><span class="t">Published benchmarks with disclosed methodology</span><span class="pill opt">Planned</span></li>
+      <li><span class="t">Production use, by anyone, anywhere</span><span class="pill out">Not yet</span></li>
+      <li><span class="t">Any performance claim — it has not been benchmarked at scale</span><span class="pill out">Not yet</span></li>
+      <li><span class="t">Compatibility between revisions: upgrading means recreating the cluster</span><span class="pill out">Not yet</span></li>
+      <li><span class="t">Tablet merging — a table that shrinks keeps its tablet count</span><span class="pill out">Not yet</span></li>
+    </ul>
     <div class="warnbox">
       <span class="label">Before you point anything at it</span>
       <p><strong>There is no TLS today, and no authentication beyond opt-in SigV4 on the client DynamoDB port.</strong> Every port assumes a trusted network. Don't put this on the public internet, and don't store data you can't recreate.</p>
