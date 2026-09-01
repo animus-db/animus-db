@@ -6480,43 +6480,6 @@ mod tests {
         (m, cmd)
     }
 
-    /// ADR 0050 stage 1: `BeginSplit` marks the parent `Splitting` (range
-    /// untouched — it serves until cutover), mints two `Building` children
-    /// over the half-ranges at the command's own replica homes (fork F5),
-    /// inherits the policy, advances the allocator, and writes NO
-    /// zero-copy-split provenance (`split_parents`/`stream_split_basis` are
-    /// the old mechanism's maps; copy-based lineage is CutoverSplit's
-    /// `split_lineage`, written only at cutover).
-    #[test]
-    fn begin_split_mints_two_building_children_and_marks_the_parent_splitting() {
-        let (mut m, cmd) = begin_split_fixture();
-        assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
-
-        let parent = &m.tablets[&TabletId(1)];
-        assert_eq!(parent.state, TabletState::Splitting);
-        assert_eq!(parent.range, KeyRange::whole(), "parent range untouched");
-        assert_eq!(parent.epoch, Epoch::INITIAL.next());
-
-        let left = &m.tablets[&TabletId(2)];
-        let right = &m.tablets[&TabletId(3)];
-        assert_eq!(left.state, TabletState::Building);
-        assert_eq!(right.state, TabletState::Building);
-        assert_eq!(left.table.as_deref(), Some("users"));
-        assert_eq!(right.table.as_deref(), Some("users"));
-        assert_eq!(left.replicas, vec![nid(4), nid(5), nid(6)]);
-        assert_eq!(right.replicas, vec![nid(7), nid(8), nid(9)]);
-        let mid = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
-        assert_eq!(left.range.end.as_deref(), Some(mid.as_slice()));
-        assert_eq!(right.range.start, mid);
-        assert!(m.policies.contains_key(&TabletId(2)));
-        assert!(m.policies.contains_key(&TabletId(3)));
-        assert!(m.next_free_tablet_id().0 >= 4);
-
-        // No premature lineage (the zero-copy provenance/basis maps are
-        // gone entirely — nothing to assert absent, Train B rung 7).
-        assert!(m.split_lineage.is_empty());
-    }
-
     /// ADR 0058 Train 2 rung 3: `BeginSplitInPlace`'s own fixture — one
     /// `Active` parent tablet (id 1, whole range, RF 3, a recorded policy)
     /// plus the command splitting it at the ring midpoint into children 2
@@ -7474,103 +7437,14 @@ mod tests {
         );
     }
 
-    /// ADR 0050 (fork F5 rider): placement is frozen mid-split — neither the
+    /// ADR 0058 Train 2 rung 3: placement is frozen mid-split — neither the
     /// repair reconciler nor the rebalancer proposes a move for a
-    /// `Splitting` parent or a `Building` child, even when the replica set
-    /// violates policy (here: RF 3 policy, 1-replica sets, which repair
-    /// would otherwise fix immediately); an ordinary `Active` tablet in the
-    /// same view still gets repaired. **Deliberately kept alongside
-    /// [`placement_is_frozen_for_a_splitting_parent_with_an_in_place_
-    /// intent`]** rather than deleted as redundant (copy-split deletion
-    /// stack, layer 1): the `Building`-child half of this assertion is
-    /// copy-workflow-specific mechanics (an in-place split never mints one),
-    /// so it stays as coverage for `TabletState::Building` until the later
-    /// layer that deletes the copy-based workflow removes that state
-    /// entirely.
-    #[test]
-    fn placement_is_frozen_for_splitting_parents_and_building_children() {
-        let mut m = Metadata::default();
-        for n in 1..=6u64 {
-            assert_eq!(
-                m.apply(&MetaCommand::UpsertMember {
-                    node: nid(n),
-                    labels: BTreeMap::new(),
-                    status: NodeStatus::Active,
-                }),
-                ApplyOutcome::Applied
-            );
-        }
-        // An under-replicated Active tablet: repair proposes for it.
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
-                table: Some("a".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(1)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::SetTabletPolicy {
-                tablet: TabletId(1),
-                policy: Some(PlacementPolicy::simple("p", 3)),
-            }),
-            ApplyOutcome::Applied
-        );
-        // A second table, mid-split: equally under-replicated parent+children.
-        assert_eq!(
-            m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(2),
-                table: Some("b".to_owned()),
-                range: KeyRange::whole(),
-                replicas: vec![nid(2)],
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::SetTabletPolicy {
-                tablet: TabletId(2),
-                policy: Some(PlacementPolicy::simple("p", 3)),
-            }),
-            ApplyOutcome::Applied
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::BeginSplit {
-                parent: TabletId(2),
-                expected_epoch: Epoch::INITIAL,
-                split_key: 0x8000_0000_0000_0000u64.to_be_bytes().to_vec(),
-                children: [(TabletId(3), vec![nid(3)]), (TabletId(4), vec![nid(4)])],
-            }),
-            ApplyOutcome::Applied
-        );
-
-        let proposed = m.reconcile();
-        let targets: Vec<TabletId> = proposed
-            .iter()
-            .map(|c| match c {
-                MetaCommand::CasTabletReplicas { tablet, .. } => *tablet,
-                other => panic!("unexpected command: {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            targets,
-            vec![TabletId(1)],
-            "repair touches only the Active tablet; parent (Splitting) and \
-             children (Building) are frozen"
-        );
-        // The rebalancer proposes nothing for the frozen set either (the
-        // Active tablet's set violates policy, so rebalance skips it by its
-        // own pre-existing rule; nothing else is eligible at all).
-        assert!(m.rebalance().is_none());
-    }
-
-    /// ADR 0058 Train 2 rung 3: the same placement-freeze rule as
-    /// [`placement_is_frozen_for_splitting_parents_and_building_children`],
-    /// over `BeginSplitInPlace` — a `Splitting` parent carrying an in-place
-    /// intent is just as invisible to repair/rebalance as the copy-based
-    /// workflow's `Splitting` parent, even though this workflow never mints
-    /// any `Building` child rows at all (there is nothing else here to
-    /// freeze — `reconcile_placement`/`rebalance_placement` skip on the
+    /// `Splitting` parent carrying an in-place split intent, even when the
+    /// replica set violates policy (here: RF 3 policy, 1-replica sets,
+    /// which repair would otherwise fix immediately); an ordinary `Active`
+    /// tablet in the same view still gets repaired. This workflow never
+    /// mints any `Building` child rows at all — there is nothing else here
+    /// to freeze (`reconcile_placement`/`rebalance_placement` skip on the
     /// parent's own non-`Active` state alone).
     #[test]
     fn placement_is_frozen_for_a_splitting_parent_with_an_in_place_intent() {

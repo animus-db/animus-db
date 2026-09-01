@@ -842,30 +842,17 @@ retrievable from git history.)
   store `put` and the catalog commit, then a leader failover, then the
   idempotent retry re-seals the full backlog), `disable_then_reenable_
   resets_generation_and_continues_epoch_chain` (a fresh generation, but the
-  SAME tablet's own epoch chain continues, never resets), `split_children_
-  seal_independently_and_inherit_generation` (a control-metadata-only
-  `BeginSplit`/`CutoverSplit` cutover; each child seals its own epoch 0
-  independently, inheriting PITR from the table spec with zero
-  special-casing since `table_pitr` is table- not tablet-scoped; the union
-  of parent-plus-children content covers the full journal with no
-  double-counting), `drop_table_then_segments_and_generation_floor_survive`
+  SAME tablet's own epoch chain continues, never resets),
+  `drop_table_then_segments_and_generation_floor_survive`
   (the catalog's deliberate outlives-the-table override of the streams
   retention-zero rule), and `retention_keep_anchor_never_orphans_a_needed_
-  replay_base` (the randomized keep-anchor property, above). Depth knob
+  replay_base` (the randomized keep-anchor property, above). (The original
+  `split_children_seal_independently_and_inherit_generation` cell —
+  a control-metadata-only `BeginSplit`/`CutoverSplit` cutover — was deleted
+  by the copy-mode-split deletion stack; its in-place successor is cell 18,
+  below.) Depth knob
   `ANIMUS_PITR_SEEDS` (default 1 = the frozen cells; held green at `=300`
   in ~1s release / well under a minute debug).
-- **A real modeling bug this corpus found on its own split scenario's
-  first run** (not a production bug — a test-harness one): the scenario
-  originally reused the PARENT's own `engines()` map for both split
-  children, giving parent and children the identical physical
-  `MemoryEngine` per node — sibling tablets share nothing in production
-  (ADR 0050 rung 1/2's whole point), so a child's own `pending_changes()`
-  scan silently saw the parent's pre-split records too, corrupting the
-  seal content. Fixed by giving each child its own fresh `engines()` map,
-  mirroring `stream_lineage_corpus.rs::scenario_copy_split_children_born_
-  empty`'s own (already-correct) three-separate-maps precedent, which this
-  file's first draft failed to copy faithfully. See `docs/engineering-
-  lessons.md` for the general lesson.
 - **Train 3 PR② adds a `RestoreTableToPointInTime` tier**: five more named
   cells, verified against the **real** `Metadata::pitr_replay_segments`
   (called directly, never reimplemented) applied to segments this
@@ -877,15 +864,17 @@ retrievable from git history.)
   several rounds, a leader kill mid-stream, checked against a model
   snapshotted at *every* successful seal, not just the last one — proving
   replay is correct at any point in the timeline, not merely at the end)
-  and `restore_to_random_second_matches_the_model_across_a_split` (the
-  same property carried across a cutover, parent and both children sealing
-  independently) join `pitr_restore_window_scopes_to_the_latest_
+  joins `pitr_restore_window_scopes_to_the_latest_
   generation_under_random_cycles` (the generation-gap validation property
   under randomized disable/re-enable cycling, not just one hand-picked
   gap), `deleted_table_pitr_restore_matches_the_model` (a table dropped,
   not split, still replays correctly — this is the regression shape for
   the `live_split_descendants` bug below), and
-  `use_latest_restorable_time_matches_the_full_model`. Held green at
+  `use_latest_restorable_time_matches_the_full_model`. (The original
+  `restore_to_random_second_matches_the_model_across_a_split` cell — the
+  same flagship property carried across a control-metadata-only
+  `BeginSplit`/`CutoverSplit` cutover — was deleted by the copy-mode-split
+  deletion stack; its in-place successor is cell 19, below.) Held green at
   `ANIMUS_PITR_SEEDS=300` (~8s) alongside the PR① cells above (same file,
   same knob).
 - **A real production bug this restore tier's own first run found, not
@@ -948,10 +937,8 @@ retrievable from git history.)
   `assert_replay_matches_model` still has to hold at every recorded second).
   Held green at `ANIMUS_PITR_SEEDS=40` alongside every other cell in this
   file (same knob).
-- **Cells 18/19 (ADR 0058 Train 2 rung 3, "Layer 0" of the copy-mode-split
-  deletion plan) rebuild cells 5's and 9's own PITR contracts on the
-  DEFAULT production split path — the in-place atomic fork — alongside
-  (never replacing) their copy-based siblings**:
+- **Cells 18/19 (ADR 0058 Train 2 rung 3) drive the DEFAULT production
+  split path — the in-place atomic fork**:
   `inplace_split_children_seal_independently_and_inherit_generation` and
   `restore_to_random_second_matches_the_model_across_an_inplace_split`
   drive `MetaCommand::BeginSplitInPlace` + `animus_cp_data::host::
@@ -959,18 +946,22 @@ retrievable from git history.)
   `backup_fault_corpus.rs`'s cell 14 / `stream_lineage_corpus.rs`'s cells
   11/12 own harness shape (`Cluster`/`ClusterNode`/`tick_one`/`converge`/
   `wrap_group`, kept local — integration test binaries can't share private
-  items). Both cells prove the identical claims their copy-based siblings
-  do (independent per-child epoch-0 seals inheriting the table-scoped PITR
+  items). These two cells originally rebuilt, on the in-place path, the
+  identical claims two now-deleted copy-based sibling cells once proved
+  (independent per-child epoch-0 seals inheriting the table-scoped PITR
   generation with zero special-casing; the base-snapshot-pins-the-parent
-  restore-to-any-second property holding across the cutover). **This
+  restore-to-any-second property holding across the cutover) — those two
+  copy-based cells (formerly cells 5/9) were deleted by the copy-mode-split
+  deletion stack, so cells 18/19 are now this corpus's only coverage of the
+  claims, kept at their original numbers per this file's own corpus
+  doctrine. **This
   table's own `orders` schema has no stream configured** (only
   `UpdateContinuousBackups`), so `BeginSplitInPlace`'s F11 token-alignment
   seatbelt (`self.table_stream(table).is_some()`) never engages here —
   unlike `stream_lineage_corpus.rs`'s own in-place cells, which split on an
-  8-byte-token-aligned `key8`, these two split on the identical plain
-  `key(2)` their copy-based siblings already use. Real in-place
-  fork+materialize clones+trims each child's own share of the parent's
-  data automatically, so neither cell needs the copy-based cells' manual
-  "fresh `engines()` map per child" isolation workaround. Held clean at
-  `ANIMUS_PITR_SEEDS=300` (release, ~2.6s) with no regression to any of the
-  other seventeen cells in the file.
+  8-byte-token-aligned `key8`, these two split on a plain `key(2)`. Real
+  in-place fork+materialize clones+trims each child's own share of the
+  parent's data automatically, so neither cell needs a manual "fresh
+  `engines()` map per child" isolation workaround. Held clean at
+  `ANIMUS_PITR_SEEDS=300` (release, ~2.6s) with no regression to any other
+  cell in the file.
