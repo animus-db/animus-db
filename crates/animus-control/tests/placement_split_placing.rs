@@ -23,7 +23,7 @@
 //! for the "never touches a `done` entry" case — wiring its real completion
 //! loop is ADR 0062 §3, a later rung.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_control::node::heartbeat_loop;
@@ -184,9 +184,11 @@ fn wait_converged(
 /// **Test 1**: an un-done `split_placing` entry with `Some(target)`
 /// differing from the child's current replicas gets a `CasTabletReplicas`
 /// proposed by the third reconcile phase, and `Metadata`'s replicas
-/// converge to that target — `target` itself (the diagnostic `CutoverSplit`
-/// wrote) is left untouched, and `done` stays `false` (nothing in this rung
-/// ever proposes `MarkSplitPlacingDone`).
+/// converge to that target — `target` itself (what `CutoverSplit` wrote) is
+/// left untouched throughout, since every one of its members stays
+/// `Active` the whole test (issue #528 fix: the phase now drives toward a
+/// healthy stored target verbatim, never recomputing it), and `done` stays
+/// `false` (nothing in this rung ever proposes `MarkSplitPlacingDone`).
 #[test]
 fn split_placing_phase_converges_a_differing_target() {
     let seed = 0x5717_0001u64;
@@ -226,8 +228,9 @@ fn split_placing_phase_converges_a_differing_target() {
     let meta = nodes[leader].metadata();
     for child in [TabletId(2), TabletId(3)] {
         assert_eq!(meta.tablets[&child].replicas, want);
-        // `target` is a diagnostic snapshot of what `CutoverSplit` decided —
-        // never rewritten by the reconcile loop (ADR 0062 §2).
+        // `target` is unchanged from what `CutoverSplit` decided — every
+        // one of its members stayed `Active` throughout, so the phase
+        // never had cause to retarget (ADR 0062 §2, issue #528 fix).
         assert_eq!(meta.split_placing[&child].target, Some(want.clone()));
         assert!(!meta.split_placing[&child].done);
     }
@@ -235,9 +238,14 @@ fn split_placing_phase_converges_a_differing_target() {
 
 /// **Test 2**: a `target: None` (unsatisfiable-at-cutover) entry stays
 /// completely inert while candidates remain insufficient, then converges
-/// once enough `Active` members exist — `target` itself is left `None`
-/// forever (a diagnostic snapshot of the cutover instant, never rewritten),
-/// even once the live replicas have actually converged.
+/// once enough `Active` members exist. **Since the issue #528 fix,
+/// `target` is authoritative, not a frozen diagnostic snapshot** — fork B's
+/// own "no stored target to protect, keep retrying every tick" stance
+/// (`split_placing_reconcile`'s own doc) means a successful recomputation
+/// REPLACES `None` with the freshly resolved `Some(..)` (via
+/// `MetaCommand::RetargetSplitPlacing`) the moment candidates recover,
+/// rather than leaving the diagnostic stuck at the cutover-time value
+/// forever while the live replicas silently move on without it.
 #[test]
 fn split_placing_phase_stays_inert_then_converges_once_candidates_recover() {
     let seed = 0x5717_0002u64;
@@ -287,9 +295,11 @@ fn split_placing_phase_stays_inert_then_converges_once_candidates_recover() {
     let meta = nodes[leader].metadata();
     for child in [TabletId(2), TabletId(3)] {
         assert_eq!(meta.tablets[&child].replicas, want);
-        // `target` stays exactly what `CutoverSplit` wrote (`None`) —
-        // diagnostic only, never updated once the live replicas converge.
-        assert_eq!(meta.split_placing[&child].target, None);
+        // `target` is authoritative (issue #528 fix): once candidates
+        // recovered, the phase established a fresh stored target matching
+        // the now-converged replicas — no longer stuck at `CutoverSplit`'s
+        // original `None`.
+        assert_eq!(meta.split_placing[&child].target, Some(want.clone()));
         assert!(!meta.split_placing[&child].done);
     }
 }
@@ -436,7 +446,7 @@ fn split_placing_epoch_churn_rejects_the_stale_cas_harmlessly() {
 
     // What this tick's third phase would compute and propose.
     let stale_command = m
-        .split_placing_reconcile()
+        .split_placing_reconcile(&BTreeSet::new())
         .into_iter()
         .find(|c| matches!(c, MetaCommand::CasTabletReplicas { tablet, .. } if *tablet == child))
         .expect("the phase should propose a move for this child");
@@ -471,7 +481,7 @@ fn split_placing_epoch_churn_rejects_the_stale_cas_harmlessly() {
     // Next tick: a fresh recomputation reacts to the NOW-current state
     // (not the stale one) and keeps retrying rather than getting stuck.
     let retried_command = m
-        .split_placing_reconcile()
+        .split_placing_reconcile(&BTreeSet::new())
         .into_iter()
         .find(|c| matches!(c, MetaCommand::CasTabletReplicas { tablet, .. } if *tablet == child))
         .expect("the phase must keep retrying, not give up after one rejection");
@@ -533,11 +543,16 @@ fn split_placing_phase_converges_despite_a_concurrent_replicas_bump() {
 /// `learner_move_survives_leader_change_mid_move`-style assertion shape
 /// (ADR 0058 Train 1's own precedent for this exact class of claim,
 /// `reconciler_corpus.rs`, now proven for `split_placing_reconcile` too).
-/// Sound by construction — the phase carries no leader-local state at all,
-/// always recomputing `select_replicas` fresh off durable `Metadata` (ADR
-/// 0062 §2's own "never trusts or rewrites `target`" rule) — but proven
-/// live here, over a real crashed-and-re-elected control group, rather
-/// than merely asserted from the mechanism's own statelessness.
+/// Sound by construction — the phase's only replicated state is durable
+/// `Metadata` (`split_placing[..].target`, driven toward verbatim while
+/// healthy, issue #528 fix); its dwell-gate tracking (`retarget_since`,
+/// `node.rs`) is driver-local and starts fresh on a newly elected leader,
+/// same as the failure detector's own per-node state, which only ever
+/// delays a would-be retarget — never loses or corrupts the durable target
+/// itself. Every target member here stays `Active` throughout, so no
+/// retarget is ever needed — but proven live here, over a real
+/// crashed-and-re-elected control group, rather than merely asserted from
+/// the mechanism's own design.
 #[test]
 fn split_placing_phase_resumes_after_a_control_leader_change() {
     let seed = 0x5717_0006u64;
@@ -722,6 +737,173 @@ fn split_placing_phase_is_leader_only() {
             node.metadata().tablets[&TabletId(2)].replicas,
             want,
             "a replica diverged from the leader-driven convergence"
+        );
+    }
+}
+
+/// **Test 8** (issue #528 fix, node-level dwell — the live `reconcile_loop`
+/// driver, not the pure `Metadata::split_placing_reconcile` function):
+/// once a stored target's member has been down PAST
+/// `animus_control::node::SPLIT_PLACING_RETARGET_DWELL`, the leader
+/// eventually proposes a REPLICATED retarget and drives the tablet to the
+/// new target. Five candidates (`n10..n14`) so the post-retarget target is
+/// genuinely different from both the original target and the tablet's
+/// current replicas — proving both the retarget itself and the
+/// subsequent real data movement, not a coincidental no-op.
+#[test]
+fn split_placing_phase_retargets_a_member_down_past_the_dwell() {
+    let seed = 0x5717_0008u64;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13, 14] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    // RF3 over 5 candidates prefers the three lowest ids — [n10, n11, n12]
+    // — which the parent's own current (fork-inherited) replicas
+    // ([n12, n13, n14]) are not.
+    split_fixture(&mut sim, &nodes, leader, &[12, 13, 14]);
+
+    let original_target = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &original_target
+        ),
+        "initial convergence to the stored target never happened (seed={seed})"
+    );
+
+    // n10 (a member of the stored target) dies for good: stop its
+    // heartbeat (`sim.crash`, the same idiom `placement_reconcile.rs`/
+    // `placement_rebalance.rs` use), then mark it `Down` directly for a
+    // deterministic transition instant rather than waiting out the
+    // failure detector's own `DETECT_TIMEOUT`.
+    sim.crash(nid(10));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+
+    // Well under the dwell: the phase must PAUSE, not retarget — the
+    // stored target and the tablet's replicas both stay exactly as they
+    // were (this is `split_placing_phase_flapping_under_the_dwell_does_
+    // not_retarget`'s sibling assertion, restated here for the "genuinely
+    // dead" path so this test alone proves the pause half too).
+    sim.run_for(Duration::from_secs(2));
+    for child in [TabletId(2), TabletId(3)] {
+        let meta = nodes[leader].metadata();
+        assert_eq!(
+            meta.split_placing[&child].target,
+            Some(original_target.clone()),
+            "child {child:?}: must not retarget before the dwell elapses (seed={seed})"
+        );
+        assert_eq!(
+            meta.tablets[&child].replicas, original_target,
+            "child {child:?}: must stay paused (no move) while a target member is down (seed={seed})"
+        );
+    }
+
+    // Past the dwell (started at the `UpsertMember{Down}` propose above,
+    // ~2s ago; run well past the remaining ~3s plus slack): the phase
+    // must now retarget. `replan` keeps the still-live target survivors
+    // (n11, n12) and replaces only the dead one (n10) with the next
+    // eligible candidate (n13) — genuinely different from both the
+    // original target AND the tablet's current replicas, so convergence
+    // here proves real data movement, not a no-op.
+    let fresh_target = vec![nid(11), nid(12), nid(13)];
+    assert!(
+        wait_converged(
+            &mut sim,
+            &nodes,
+            leader,
+            &[TabletId(2), TabletId(3)],
+            &fresh_target
+        ),
+        "never retargeted/converged past the dwell (seed={seed})"
+    );
+    for child in [TabletId(2), TabletId(3)] {
+        let meta = nodes[leader].metadata();
+        assert_eq!(
+            meta.split_placing[&child].target,
+            Some(fresh_target.clone()),
+            "child {child:?}: stored target must reflect the retarget (seed={seed})"
+        );
+        assert!(!meta.split_placing[&child].done);
+    }
+}
+
+/// **Test 9** (issue #528 fix, node-level dwell — the flap-under-the-dwell
+/// half): a target member that goes `Down` and recovers `Active` again
+/// WELL BEFORE `SPLIT_PLACING_RETARGET_DWELL` elapses never triggers a
+/// retarget — the stored target is untouched throughout, and the tablet
+/// converges back to the ORIGINAL target once the flap resolves. This is
+/// the live-driver companion to `meta.rs`'s pure-function
+/// `split_placing_reconcile_does_not_retarget_on_a_flap` unit test —
+/// proven here through the real `reconcile_loop`'s own dwell-tracking
+/// state (`retarget_since`), not asserted from the pure decision alone.
+#[test]
+fn split_placing_phase_flapping_under_the_dwell_does_not_retarget() {
+    let seed = 0x5717_0009u64;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_among(&nodes, &[0, 1, 2]);
+
+    for id in [10, 11, 12, 13] {
+        register(&sim, &nodes[leader], id);
+    }
+    sim.run_for(Duration::from_secs(1));
+
+    split_fixture(&mut sim, &nodes, leader, &[11, 12, 13]);
+
+    let want = vec![nid(10), nid(11), nid(12)];
+    assert!(
+        wait_converged(&mut sim, &nodes, leader, &[TabletId(2), TabletId(3)], &want),
+        "initial convergence to the stored target never happened (seed={seed})"
+    );
+
+    // n10 flaps: down, then straight back up, well inside the dwell
+    // window (`SPLIT_PLACING_RETARGET_DWELL` is 5s; this flap resolves in
+    // well under 2s). Crash its heartbeat task so the `Down` sticks for
+    // the flap's duration, then start a fresh one to bring it back —
+    // `register` would re-propose `UpsertMember{Active}` AND spawn a new
+    // heartbeat task, which is exactly "recovers".
+    sim.crash(nid(10));
+    assert!(matches!(
+        nodes[leader].propose(MetaCommand::UpsertMember {
+            node: nid(10),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        }),
+        ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(Duration::from_millis(800));
+    register(&sim, &nodes[leader], 10); // back to Active, heartbeating again
+
+    // Give the phase several more ticks to react to the recovery — still
+    // nowhere near the dwell threshold measured from when n10 first went
+    // down.
+    sim.run_for(Duration::from_secs(2));
+
+    for child in [TabletId(2), TabletId(3)] {
+        let meta = nodes[leader].metadata();
+        assert_eq!(
+            meta.split_placing[&child].target,
+            Some(want.clone()),
+            "child {child:?}: a flap well under the dwell must never retarget (seed={seed})"
+        );
+        assert_eq!(
+            meta.tablets[&child].replicas, want,
+            "child {child:?}: replicas must have converged back to the ORIGINAL target (seed={seed})"
         );
     }
 }

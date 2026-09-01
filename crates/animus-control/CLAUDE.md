@@ -399,41 +399,74 @@ per-tablet CP data plane (`animus-cp-data`).
   false}` (fork B — a visible, keep-retrying obligation, mirroring
   `reconcile_placement`'s own stance rather than staying silent). A child
   with no inherited policy gets no entry at all — nothing to place
-  against. `SplitPlacing::target` is a write-once diagnostic snapshot of
-  what cutover decided (or couldn't); the reconcile loop below never trusts
-  or rewrites it, always recomputing `select_replicas` fresh instead
-  (staleness avoidance, and it sidesteps needing a second command purely to
-  update a persisted target). `node.rs`'s `reconcile_loop` gains a
-  **third phase**, `Metadata::split_placing_reconcile`/`PlacementView::
-  split_placing_reconcile`, run unconditionally every tick (own cadence,
-  independent of repair/rebalance's gating — a split-triggered relief
-  obligation shouldn't wait behind `REBALANCE_EVERY_N_TICKS`): for every
-  un-`done` entry, recompute `select_replicas` fresh and propose a
-  `CasTabletReplicas` for whichever ones now differ from the tablet's
-  current replicas — one per entry per tick (deliberately not
-  rebalance's one-move-per-tick bound). It never proposes
-  `MarkSplitPlacingDone` itself — that observes *live Raft* convergence
-  (`RaftKvNode::config()`/`learners()`), which this pure metadata-level
-  view can't see; a leader-gated `animusd` background loop does, once a
-  led tablet's live group matches `Metadata`'s current `replicas` with no
-  dangling learners, held continuously for a settle window (see
-  `animusd/CLAUDE.md`). `MarkSplitPlacingDone` is epoch-CAS'd against the
-  **child's own** current epoch and idempotent on an already-`done` entry
-  (`MarkIndexBackfilled`/`RecordBackupTabletComplete`'s idiom exactly); on
-  `is_relayable_command`'s allowlist (`animus-node/src/wire.rs`), since a
-  tablet's leader is frequently not the control-plane leader.
-  `rebalance_placement`'s own eligibility filter (`meta.rs`) gains one more
-  exclusion alongside its existing `t.state != Active` skip: a tablet
-  carrying an un-`done` `split_placing` entry is skipped by ordinary
-  rebalance too, so the two convergence sources never compete for the same
-  tablet's epoch in the same tick. `DropTableTablets` prunes any
+  against. **`SplitPlacing::target` is AUTHORITATIVE, not a write-once
+  diagnostic (fixed for issue #528, ADR 0062's 2026-09-01 amendment)** —
+  it used to be treated as a frozen snapshot of what `CutoverSplit`
+  decided, with the reconcile loop always recomputing `select_replicas`
+  fresh off current membership instead of trusting it; under sustained
+  load the ordinary failure detector's own flap (ADR 0012) made that fresh
+  recompute pick a *different* target almost every tick, faster than
+  `animus-cp-data`'s learner-phased mover (`reconfigure_step`) could ever
+  complete one cycle — a livelock that meant `MarkSplitPlacingDone` never
+  fired. `node.rs`'s `reconcile_loop`'s **third phase**,
+  `Metadata::split_placing_reconcile`/`PlacementView::
+  split_placing_reconcile`, still runs unconditionally every tick (own
+  cadence, independent of repair/rebalance's gating — a split-triggered
+  relief obligation shouldn't wait behind `REBALANCE_EVERY_N_TICKS`), but
+  now: (1) drives toward the STORED target **verbatim**, proposing a
+  `CasTabletReplicas` only when it differs from the tablet's current
+  replicas, as long as every one of the target's members is currently
+  `Active` — never recomputed while healthy; (2) **pauses** (proposes
+  nothing) for a tablet whose stored target has a transiently non-`Active`
+  member; (3) only past a dwell (`node::SPLIT_PLACING_RETARGET_DWELL`, 5s,
+  tracked per-`(tablet, member)` in a driver-local, `env.now()`-keyed
+  `BTreeMap` — `node::retarget_ready_this_tick`) does it recompute — via
+  `replan` (keeping still-live survivors of the old target, replacing only
+  the genuinely-gone member, minimizing churn), never `select_replicas`
+  from scratch — and propose the result as a REPLICATED
+  `MetaCommand::RetargetSplitPlacing{tablet, expected_epoch, target}`
+  (epoch-CAS'd against the child's own current epoch, `MarkSplitPlacingDone`'s
+  discipline), so the new target is itself stable for every subsequent
+  tick and every replica rather than independently re-derived by whichever
+  node happens to lead. `target: None` (unsatisfiable at cutover, fork B)
+  keeps its original "nothing stored to protect, keep retrying every tick"
+  stance — a successful recomputation there now *establishes* the first
+  stored target via the same `RetargetSplitPlacing` command. This phase
+  never proposes `MarkSplitPlacingDone` itself — that observes *live Raft*
+  convergence (`RaftKvNode::config()`/`learners()`), which this pure
+  metadata-level view can't see; a leader-gated `animusd` background loop
+  does, once a led tablet's live group matches `Metadata`'s current
+  `replicas` with no dangling learners, held continuously for a settle
+  window (see `animusd/CLAUDE.md`). `MarkSplitPlacingDone` is epoch-CAS'd
+  against the **child's own** current epoch and idempotent on an
+  already-`done` entry (`MarkIndexBackfilled`/`RecordBackupTabletComplete`'s
+  idiom exactly); on `is_relayable_command`'s allowlist
+  (`animus-node/src/wire.rs`), since a tablet's leader is frequently not
+  the control-plane leader — `RetargetSplitPlacing` is deliberately **not**
+  on that allowlist (like `CasTabletReplicas`, it's proposed directly by
+  the control-plane leader off its own live `RaftNode` handle, never
+  relayed). Both `rebalance_placement`'s own eligibility filter AND
+  `reconcile_placement`'s (repair) now exclude a tablet carrying an
+  un-`done` `split_placing` entry (the repair exclusion is the issue #528
+  fix's own addition — closing a secondary, compounding race where repair
+  could independently retarget the same tablet in the same tick) — the
+  dwell-gated placing phase is the sole mover for that tablet until
+  `done`, so none of the three convergence sources ever compete for the
+  same tablet's epoch in the same tick. `DropTableTablets` prunes any
   `split_placing` row for a tablet it removes (`mirror.rs`), the same
   orphan-sweep `MarkIndexBackfilled`'s own doc describes for
   `index_backfill`. `syskv::EntityKind::SplitPlacing` follows the usual
-  per-entity mirror conventions. Tests: `meta::tests::cutover_split_*` for
-  the apply-time decision (already-satisfying/differing-target/
-  unsatisfiable-at-cutover/no-policy shapes), `node::tests::` for the
-  reconcile-loop phase and the rebalance exclusion,
+  per-entity mirror conventions (`RetargetSplitPlacing`'s own mirror arm is
+  identical to `MarkSplitPlacingDone`'s). Tests: `meta::tests::
+  cutover_split_*` for the apply-time decision (already-satisfying/
+  differing-target/unsatisfiable-at-cutover/no-policy shapes),
+  `meta::tests::split_placing_reconcile_*`/`retarget_split_placing_*`/
+  `reconcile_skips_an_undone_split_placing_tablet_even_with_a_down_replica`
+  for the issue #528 fix's dwell-gate/retarget/repair-exclusion behavior at
+  the pure-`Metadata` level, `tests/placement_split_placing.rs`'s
+  `split_placing_phase_retargets_a_member_down_past_the_dwell`/
+  `split_placing_phase_flapping_under_the_dwell_does_not_retarget` for the
+  same behavior proven live over a real `reconcile_loop`/`SimEnv`,
   `drop_table_tablets_prunes_split_placing_rows_for_the_dropped_tablets`
   for the cascade. **Issue #513** (a suspected oscillation in the
   convergence primitive this phase drives — `reconfigure_step`, ADR 0058

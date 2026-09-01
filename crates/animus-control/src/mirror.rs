@@ -367,7 +367,8 @@ pub fn apply_and_derive_mirror(
                 Vec::new(),
             ));
         }
-        MetaCommand::MarkSplitPlacingDone { tablet, .. } => {
+        MetaCommand::MarkSplitPlacingDone { tablet, .. }
+        | MetaCommand::RetargetSplitPlacing { tablet, .. } => {
             writes.push(put_json(
                 syskv::split_placing_key(*tablet),
                 &meta.split_placing[tablet],

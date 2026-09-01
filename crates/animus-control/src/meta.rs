@@ -657,27 +657,41 @@ pub struct SplitLineage {
 
 /// An in-place split child's directed-Placing row
 /// ([`Metadata::split_placing`], ADR 0062 §2), written once by
-/// [`MetaCommand::CutoverSplit`]'s in-place branch and updated only by
-/// [`MetaCommand::MarkSplitPlacingDone`] flipping `done`.
+/// [`MetaCommand::CutoverSplit`]'s in-place branch, driven toward by the
+/// reconcile loop's third phase, and updated by
+/// [`MetaCommand::RetargetSplitPlacing`] (a fresh target, dwell-gated) and
+/// [`MetaCommand::MarkSplitPlacingDone`] (flipping `done`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitPlacing {
-    /// What `CutoverSplit`'s own apply computed as this child's
-    /// policy-satisfying target, at the moment it computed it — `None`
-    /// means placement was UNSATISFIABLE at cutover (fork B: too few
-    /// `Active` candidates, or too few distinct failure domains for a
-    /// strict spread), a state this catalog still records as a durable,
-    /// visible, keep-retrying obligation rather than silently skipping it,
-    /// mirroring `reconcile`'s own "keep trying every tick, forever, until
-    /// candidates recover" stance. **Diagnostic only** — the reconcile
-    /// loop's own directed-Placing phase ([`Metadata::split_placing_reconcile`],
-    /// wired into `node.rs`'s `reconcile_loop`) never trusts or
-    /// rewrites this after this one write; it always recomputes
-    /// `select_replicas` fresh, off current `Metadata`, exactly the way
-    /// `reconcile`/`rebalance` already recompute their own decisions fresh
-    /// every tick rather than persisting and trusting a prior one. See ADR
-    /// 0062 §2's "a deliberate design choice worth stating explicitly" note
-    /// for the full rationale (staleness risk + avoiding a second write
-    /// path purely to keep this field current).
+    /// This child's directed-Placing target — **authoritative, not
+    /// diagnostic** (issue #528's fix; see ADR 0062 §2's 2026-09-01
+    /// amendment for the full incident this corrected). `CutoverSplit`
+    /// computes the first value the same way it always has: this child's
+    /// policy-satisfying target at cutover, or `None` if placement was
+    /// UNSATISFIABLE at that instant (fork B: too few `Active` candidates,
+    /// or too few distinct failure domains for a strict spread) — still
+    /// recorded as a durable, visible, keep-retrying obligation rather than
+    /// silently skipped.
+    ///
+    /// **What changed**: the reconcile loop's own directed-Placing phase
+    /// ([`Metadata::split_placing_reconcile`], wired into `node.rs`'s
+    /// `reconcile_loop`) used to recompute `select_replicas` fresh off
+    /// current `Metadata` every tick and drive toward *that*, treating this
+    /// field as a write-once diagnostic snapshot. Under a flapping failure
+    /// detector, that recompute changes the answer as often as membership
+    /// flickers — faster than `animus-cp-data`'s own learner-phased mover
+    /// (`reconfigure_step`) can complete a single reconfiguration cycle, a
+    /// livelock that never converges (`MarkSplitPlacingDone` never fires
+    /// because the predicate it needs never holds). The phase now drives
+    /// toward THIS field's value **verbatim** while every member of it is
+    /// currently `Active`, and only recomputes (via
+    /// [`MetaCommand::RetargetSplitPlacing`], replicated, so the new value
+    /// is itself stable) once a member has been continuously non-`Active`
+    /// past a dwell window — see that command's own doc and
+    /// `split_placing_reconcile`'s for the exact mechanics. A transiently
+    /// `Down` target member pauses the drive (proposes nothing) rather than
+    /// retargeting; serving is unaffected either way (fork A: this never
+    /// gates serving).
     pub target: Option<Vec<NodeId>>,
     /// Set once this child's live replicas have converged to a fresh,
     /// currently-satisfying target (via [`MetaCommand::MarkSplitPlacingDone`],
@@ -1259,6 +1273,37 @@ pub enum MetaCommand {
     MarkSplitPlacingDone {
         tablet: TabletId,
         expected_epoch: Epoch,
+    },
+    /// Replace an in-place split child's directed-Placing STORED target
+    /// (ADR 0062 §2, issue #528 fix): `tablet` is the CHILD's own id.
+    /// Proposed only by the control-plane leader's own `reconcile_loop`
+    /// third phase, once its driver-local dwell tracking decides a
+    /// currently-stored target member has been continuously non-`Active`
+    /// long enough to treat as genuinely gone (see
+    /// `split_placing_reconcile`'s own doc, `meta.rs`, for the full
+    /// mechanics) — never proposed for a merely transiently-`Down` member.
+    /// Epoch-CAS'd against the CHILD's own current epoch, the same
+    /// `MarkSplitPlacingDone` discipline — a stale recompute racing a later
+    /// churn event on this same tablet (an intervening `CasTabletReplicas`,
+    /// or another leader after a failover) is rejected rather than
+    /// overwriting a target computed against state that has since moved on;
+    /// the reconcile loop's own next tick simply recomputes fresh. Rejected
+    /// if `tablet` has no [`Metadata::split_placing`] entry at all (nothing
+    /// to retarget); a `NoOp` if the entry is already `done` (nothing left
+    /// to retarget) or the new value is byte-identical to the stored one
+    /// (no-op retry). This command never touches the tablet's own replicas
+    /// or bumps its epoch — only [`Metadata::split_placing`]'s stored
+    /// `target` field changes; the reconcile loop's own next tick is what
+    /// actually drives replicas toward the new value via an ordinary
+    /// `CasTabletReplicas`. **Not relayable** (`is_relayable_command`,
+    /// `animus-node::wire`): unlike `MarkSplitPlacingDone` (a tablet
+    /// leader's own report, which may run on any node), this is proposed
+    /// directly by the control-plane leader off its own live `RaftNode`
+    /// handle, the same class as `CasTabletReplicas` itself.
+    RetargetSplitPlacing {
+        tablet: TabletId,
+        expected_epoch: Epoch,
+        target: Option<Vec<NodeId>>,
     },
     /// Set (or clear) a tablet's placement policy (ADR 0005). Once a tablet has
     /// a policy, the leader's reconciler keeps its replica set satisfying it;
@@ -1908,7 +1953,12 @@ impl PlacementView {
     /// [`Metadata::reconcile`] (both delegate to the same body).
     #[must_use]
     pub fn reconcile(&self) -> Vec<MetaCommand> {
-        reconcile_placement(&self.members, &self.tablets, &self.policies)
+        reconcile_placement(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
     }
 
     /// The pure load-rebalancing decision over this view — identical to
@@ -1924,14 +1974,18 @@ impl PlacementView {
     }
 
     /// The pure directed-Placing convergence decision (ADR 0062 §2) —
-    /// identical to [`Metadata::split_placing_reconcile`].
+    /// identical to [`Metadata::split_placing_reconcile`]. `retarget_ready`
+    /// is the driver's own dwell-gate decision (`node.rs`'s
+    /// `retarget_ready_this_tick`) — see the free function's own doc for
+    /// the full per-entry state machine (issue #528 fix).
     #[must_use]
-    pub fn split_placing_reconcile(&self) -> Vec<MetaCommand> {
+    pub fn split_placing_reconcile(&self, retarget_ready: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         split_placing_reconcile(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            retarget_ready,
         )
     }
 }
@@ -1955,6 +2009,7 @@ fn reconcile_placement(
     members: &BTreeMap<NodeId, Member>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
+    split_placing: &BTreeMap<TabletId, SplitPlacing>,
 ) -> Vec<MetaCommand> {
     let candidates = active_candidates(members);
     policies
@@ -1966,6 +2021,15 @@ fn reconcile_placement(
             // split driver seeds it, and a `Splitting` parent is torn down
             // at cutover anyway.
             if t.state != TabletState::Active {
+                return None;
+            }
+            // ADR 0062 §2 (issue #528 fix): an un-done directed-Placing
+            // obligation owns this tablet's convergence exclusively —
+            // the dwell-gated placing phase is the sole mover until
+            // `done`, so repair must not independently retarget it too
+            // (the same exclusion `rebalance_placement` already applies,
+            // below).
+            if split_placing.get(tablet).is_some_and(|entry| !entry.done) {
                 return None;
             }
             let desired = replan(&t.replicas, &candidates, policy).ok()?;
@@ -2038,48 +2102,106 @@ fn rebalance_placement(
 
 /// The shared body of [`Metadata::split_placing_reconcile`] /
 /// [`PlacementView::split_placing_reconcile`]: ADR 0062 §2's third
-/// reconcile-loop phase — for every un-`done` [`SplitPlacing`] entry,
-/// recompute [`select_replicas`] **fresh** off current membership (never
-/// trust or persist `SplitPlacing::target`, a diagnostic snapshot of what
-/// `CutoverSplit` decided at fork time — see that field's own doc for why)
-/// and, when the freshly-computed target differs from the tablet's current
-/// replicas, propose a `CasTabletReplicas` moving it there. A tablet whose
-/// row no longer exists (the table was dropped — `DropTableTablets` prunes
-/// the `split_placing` row itself, so this is likely unreachable in
-/// practice, but is guarded defensively anyway) or which inherited no policy
-/// is skipped outright — nothing to converge toward. A still-unsatisfiable
-/// recomputation (`select_replicas` errs) is silently skipped this tick and
-/// re-attempted next tick (fork B's own keep-retrying stance, restated at
-/// the convergence site) rather than treated as an error. Deterministic
-/// (only `BTreeMap` iteration + the pure planner), so every replica agrees —
-/// though only the leader ever *proposes* the result. Unlike
+/// reconcile-loop phase, fixed for issue #528 (see that field's doc and the
+/// ADR's 2026-09-01 amendment for the full incident).
+///
+/// For every un-`done` [`SplitPlacing`] entry:
+///
+/// - **`target: Some(list)`, every member of `list` currently `Active`**:
+///   drive toward `list` **verbatim** — propose a `CasTabletReplicas`
+///   iff `list` differs from the tablet's current replicas. The target is
+///   never recomputed while it is healthy, which is what makes it stable
+///   under ordinary failure-detector flap (the root cause this rung fixes:
+///   a fresh `select_replicas` answer every tick moves the target faster
+///   than `animus-cp-data`'s learner-phased mover can complete a cycle).
+/// - **`target: Some(list)`, some member of `list` NOT currently `Active`,
+///   but `child` is not in `retarget_ready`**: paused — propose nothing
+///   this tick. `retarget_ready` is the driver's own dwell-gate decision
+///   (`node.rs`'s `retarget_ready_this_tick`, `Env`-time based, never a
+///   pure function of `Metadata` alone) — a transiently-`Down` target
+///   member must not itself trigger a retarget, only a continuously-down
+///   one past the dwell window. Serving is unaffected either way (fork A:
+///   this never gates serving).
+/// - **`target: Some(list)`, some member of `list` NOT currently `Active`,
+///   AND `child` IS in `retarget_ready`**: the dwell has elapsed for at
+///   least one member of `list` — recompute via [`replan`] (not
+///   `select_replicas`: `list` is the "current" set here, so a still-live
+///   member of it is kept and only the genuinely-gone one is replaced,
+///   minimizing churn exactly the way ordinary repair already does for
+///   ANY tablet). A differing result proposes
+///   [`MetaCommand::RetargetSplitPlacing`] — a REPLICATED update of the
+///   stored target, so the new value is itself stable next tick, never a
+///   direct `CasTabletReplicas` (that still waits for a future tick once
+///   the new target is stored and found fully `Active`).
+/// - **`target: None`** (unsatisfiable at cutover, fork B): no stored
+///   target to protect, so keep retrying every tick regardless of
+///   `retarget_ready` — [`select_replicas`] fresh, and a success proposes
+///   `RetargetSplitPlacing` to establish the first stored target. A
+///   still-unsatisfiable recomputation is silently skipped this tick and
+///   re-attempted next tick, restating fork B's stance.
+///
+/// A tablet whose row no longer exists (the table was dropped —
+/// `DropTableTablets` prunes the `split_placing` row itself, so this is
+/// likely unreachable in practice, but is guarded defensively anyway) or
+/// which inherited no policy is skipped outright — nothing to converge
+/// toward. Deterministic given its inputs (only `BTreeMap` iteration + the
+/// pure planners) — `retarget_ready` itself is driver-local, `Env`-time
+/// state, but every replica that computes this function agrees given the
+/// same inputs, and only the leader ever *proposes* the result. Unlike
 /// [`rebalance_placement`], this returns **every** eligible move in one
 /// call, not just one — ADR 0062 §2's own pseudocode bounds churn per entry
-/// (at most one `CasTabletReplicas` per un-done entry per tick), not
-/// globally across entries, since a split-triggered relief obligation
-/// should not queue behind an unrelated split's own convergence.
+/// (at most one command per un-done entry per tick), not globally across
+/// entries, since a split-triggered relief obligation should not queue
+/// behind an unrelated split's own convergence.
 fn split_placing_reconcile(
     members: &BTreeMap<NodeId, Member>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
+    retarget_ready: &BTreeSet<TabletId>,
 ) -> Vec<MetaCommand> {
     let candidates = active_candidates(members);
+    let active: BTreeSet<NodeId> = candidates.iter().map(|c| c.node.clone()).collect();
     split_placing
         .iter()
         .filter(|(_, entry)| !entry.done)
-        .filter_map(|(&child, _entry)| {
+        .filter_map(|(&child, entry)| {
             let t = tablets.get(&child)?;
             let policy = policies.get(&child)?;
-            let wanted = select_replicas(&candidates, policy).ok()?;
-            if wanted == t.replicas {
-                return None;
+            match &entry.target {
+                Some(target) if target.iter().all(|m| active.contains(m)) => {
+                    if *target == t.replicas {
+                        None
+                    } else {
+                        Some(MetaCommand::CasTabletReplicas {
+                            tablet: child,
+                            expected_epoch: t.epoch,
+                            replicas: target.clone(),
+                        })
+                    }
+                }
+                Some(target) if retarget_ready.contains(&child) => {
+                    let fresh = replan(target, &candidates, policy).ok()?;
+                    if Some(&fresh) == entry.target.as_ref() {
+                        None
+                    } else {
+                        Some(MetaCommand::RetargetSplitPlacing {
+                            tablet: child,
+                            expected_epoch: t.epoch,
+                            target: Some(fresh),
+                        })
+                    }
+                }
+                Some(_) => None, // paused: dwelling on a down target member
+                None => {
+                    let fresh = select_replicas(&candidates, policy).ok()?;
+                    Some(MetaCommand::RetargetSplitPlacing {
+                        tablet: child,
+                        expected_epoch: t.epoch,
+                        target: Some(fresh),
+                    })
+                }
             }
-            Some(MetaCommand::CasTabletReplicas {
-                tablet: child,
-                expected_epoch: t.epoch,
-                replicas: wanted,
-            })
         })
         .collect()
 }
@@ -2111,10 +2233,21 @@ impl Metadata {
     /// **idempotent** (no churn at steady state). A tablet whose policy cannot be
     /// satisfied with the current candidates (e.g. too few eligible nodes) is
     /// skipped, leaving the existing replicas in place rather than shrinking the
-    /// set.
+    /// set. **ADR 0062 §2 (issue #528 fix)**: a tablet carrying an un-`done`
+    /// [`split_placing`](Self::split_placing) entry is skipped here too — the
+    /// dwell-gated directed-Placing phase
+    /// ([`split_placing_reconcile`](Self::split_placing_reconcile)) is the
+    /// sole mover for that tablet until `done`, so this repair pass must not
+    /// independently retarget it (the same exclusion
+    /// [`rebalance`](Self::rebalance) already applies).
     #[must_use]
     pub fn reconcile(&self) -> Vec<MetaCommand> {
-        reconcile_placement(&self.members, &self.tablets, &self.policies)
+        reconcile_placement(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+        )
     }
 
     /// The single load-rebalancing move to make right now (ADR 0029), or `None`
@@ -2140,29 +2273,34 @@ impl Metadata {
         )
     }
 
-    /// The directed-Placing convergence phase (ADR 0062 §2): for every
-    /// un-`done` [`split_placing`](Self::split_placing) entry, recompute
-    /// [`select_replicas`] fresh off current membership and, when it now
-    /// differs from the tablet's current replicas, a
-    /// [`CasTabletReplicas`](MetaCommand::CasTabletReplicas) moving it
-    /// there. Also **pure + deterministic**; the leader's `reconcile_loop`
-    /// runs this every tick, unconditionally — no `REBALANCE_EVERY_N_TICKS`-
-    /// style throttle, since a split child's own relief obligation should
-    /// not wait behind a cadence meant for slow, cluster-wide balance churn.
-    /// Returns one command per eligible un-done entry (not capped to one
-    /// total per call, unlike [`rebalance`](Self::rebalance) — see
+    /// The directed-Placing convergence phase (ADR 0062 §2, fixed for issue
+    /// #528): for every un-`done` [`split_placing`](Self::split_placing)
+    /// entry, drive toward its STORED target while every member of it is
+    /// `Active`, pause while a member is transiently down, and only
+    /// recompute (via a replicated [`MetaCommand::RetargetSplitPlacing`])
+    /// once `retarget_ready` (the driver's own dwell-gate decision) says a
+    /// member has been down long enough to treat as genuinely gone — see
+    /// the free `split_placing_reconcile` function's own doc for the full
+    /// per-entry state machine. Also **pure + deterministic given its
+    /// inputs**; the leader's `reconcile_loop` runs this every tick,
+    /// unconditionally — no `REBALANCE_EVERY_N_TICKS`-style throttle, since
+    /// a split child's own relief obligation should not wait behind a
+    /// cadence meant for slow, cluster-wide balance churn. Returns one
+    /// command per eligible un-done entry (not capped to one total per
+    /// call, unlike [`rebalance`](Self::rebalance) — see
     /// [`split_placing_reconcile`]'s own doc for why that's the correct
     /// bound here). `MarkSplitPlacingDone` is never proposed from here — a
     /// separate, later mechanism (ADR 0062 §3) observes live Raft
     /// convergence, which this pure metadata-level function has no way to
     /// see.
     #[must_use]
-    pub fn split_placing_reconcile(&self) -> Vec<MetaCommand> {
+    pub fn split_placing_reconcile(&self, retarget_ready: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         split_placing_reconcile(
             &self.members,
             &self.tablets,
             &self.policies,
             &self.split_placing,
+            retarget_ready,
         )
     }
 
@@ -2558,6 +2696,31 @@ impl Metadata {
                         Some(entry) if entry.done => ApplyOutcome::NoOp,
                         Some(entry) => {
                             entry.done = true;
+                            ApplyOutcome::Applied
+                        }
+                    },
+                }
+            }
+            MetaCommand::RetargetSplitPlacing {
+                tablet,
+                expected_epoch,
+                target,
+            } => {
+                // Same epoch-CAS discipline as `MarkSplitPlacingDone` just
+                // above: a stale recompute racing a later churn event on
+                // this same tablet is rejected rather than overwriting a
+                // target computed against state that has since moved on.
+                match self.tablets.get(tablet) {
+                    None => ApplyOutcome::Rejected("no such tablet"),
+                    Some(t) if t.epoch != *expected_epoch => {
+                        ApplyOutcome::Rejected("epoch mismatch")
+                    }
+                    Some(_) => match self.split_placing.get_mut(tablet) {
+                        None => ApplyOutcome::Rejected("no split_placing entry for this tablet"),
+                        Some(entry) if entry.done => ApplyOutcome::NoOp,
+                        Some(entry) if entry.target == *target => ApplyOutcome::NoOp,
+                        Some(entry) => {
+                            entry.target = target.clone();
                             ApplyOutcome::Applied
                         }
                     },
@@ -6916,6 +7079,357 @@ mod tests {
         assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
         assert_eq!(m.apply(&cmd), ApplyOutcome::NoOp);
         assert!(m.split_placing[&TabletId(2)].done);
+    }
+
+    /// Shared fixture for the issue #528 regression tests below: an un-done
+    /// `split_placing` entry with a stored target `[n1, n2, n3]` over four
+    /// `Active` candidates (`n1..n4`) and an RF3 policy — mirrors the
+    /// through-Raft `placement_split_placing.rs` suite's own 4-candidates
+    /// shape, at the pure-`Metadata` level.
+    fn split_placing_dwell_fixture() -> Metadata {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                // Deliberately DIFFERENT from the stored target below (n4
+                // instead of n3), mirroring a freshly-cutover, not-yet-
+                // converged child, so the reconcile phase has real work to
+                // do until it converges.
+                replicas: vec![nid(1), nid(2), nid(4)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(1), nid(2), nid(3)]),
+                done: false,
+            },
+        );
+        m
+    }
+
+    /// **Issue #528 regression (red on the pre-fix code, which recomputed
+    /// `select_replicas` fresh every tick)**: a stored target whose members
+    /// are ALL `Active` is driven toward verbatim, and flipping one member
+    /// `Down` then back `Active` — a flap, never past the dwell gate — never
+    /// changes the computed proposal set away from that same original
+    /// target, even mid-flap. On the pre-fix code, `n1` going `Down` would
+    /// have made `select_replicas` pick a fresh 3-of-{n2,n3,n4} target
+    /// immediately; here it does not, because `n1` never crosses
+    /// `retarget_ready`.
+    #[test]
+    fn split_placing_reconcile_does_not_retarget_on_a_flap() {
+        let mut m = split_placing_dwell_fixture();
+        let empty: BTreeSet<TabletId> = BTreeSet::new();
+
+        // Healthy: proposes the CAS toward the stored target (replicas
+        // still the fork-inherited set, differing from it).
+        let proposals = m.split_placing_reconcile(&empty);
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert!(matches!(
+            &proposals[0],
+            MetaCommand::CasTabletReplicas { tablet, replicas, .. }
+                if *tablet == TabletId(2) && *replicas == vec![nid(1), nid(2), nid(3)]
+        ));
+
+        // Flap: n1 goes Down. `retarget_ready` is still empty (the driver's
+        // dwell has not elapsed — indeed this is the very first tick it's
+        // been observed down) — the phase must propose NOTHING for this
+        // tablet: not a retarget, and not a `CasTabletReplicas` toward a
+        // target with a now-dead member.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+        let proposals = m.split_placing_reconcile(&empty);
+        assert!(
+            proposals.is_empty(),
+            "expected a pause (no proposal) while n1 is down but not yet retarget-ready: {proposals:?}"
+        );
+
+        // Flap recovers: n1 back to Active before ever crossing the dwell.
+        // The stored target is untouched (`RetargetSplitPlacing` was never
+        // proposed), so the phase resumes driving toward the SAME original
+        // target — no churn from the flap at all.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.split_placing[&TabletId(2)].target,
+            Some(vec![nid(1), nid(2), nid(3)]),
+            "the stored target must be untouched by a flap that never reached the dwell gate"
+        );
+        let proposals = m.split_placing_reconcile(&empty);
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert!(matches!(
+            &proposals[0],
+            MetaCommand::CasTabletReplicas { tablet, replicas, .. }
+                if *tablet == TabletId(2) && *replicas == vec![nid(1), nid(2), nid(3)]
+        ));
+    }
+
+    /// A paused tick (target member down, not yet `retarget_ready`)
+    /// proposes nothing — the pause half of the dwell gate, isolated from
+    /// the flap-recovery scenario above.
+    #[test]
+    fn split_placing_reconcile_pauses_while_a_target_member_is_down_and_not_ready() {
+        let mut m = split_placing_dwell_fixture();
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(2),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+        let proposals = m.split_placing_reconcile(&BTreeSet::new());
+        assert!(proposals.is_empty(), "{proposals:?}");
+        // The stored target itself is untouched by a paused tick.
+        assert_eq!(
+            m.split_placing[&TabletId(2)].target,
+            Some(vec![nid(1), nid(2), nid(3)])
+        );
+    }
+
+    /// Once `retarget_ready` names the tablet (the driver's dwell having
+    /// elapsed for a down target member), the phase proposes a REPLICATED
+    /// `RetargetSplitPlacing` — via `replan`, so the still-`Active` members
+    /// of the old target (`n1`, `n3`) are kept and only the down one (`n2`)
+    /// is replaced by the sole remaining eligible candidate (`n4`) — never
+    /// a direct `CasTabletReplicas` in the same tick (the new target must
+    /// itself become stable before anything drives toward it).
+    #[test]
+    fn split_placing_reconcile_retargets_once_ready_keeping_live_survivors() {
+        let mut m = split_placing_dwell_fixture();
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(2),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Down,
+            }),
+            ApplyOutcome::Applied
+        );
+        let ready: BTreeSet<TabletId> = [TabletId(2)].into_iter().collect();
+        let proposals = m.split_placing_reconcile(&ready);
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert!(matches!(
+            &proposals[0],
+            MetaCommand::RetargetSplitPlacing { tablet, target, .. }
+                if *tablet == TabletId(2) && *target == Some(vec![nid(1), nid(3), nid(4)])
+        ));
+    }
+
+    /// `RetargetSplitPlacing` happy path: epoch-CAS against the child's own
+    /// current epoch, replaces the stored `target`, never touches `done` or
+    /// the tablet's own replicas/epoch.
+    #[test]
+    fn retarget_split_placing_happy_path() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: false,
+            },
+        );
+        let epoch = m.tablets[&TabletId(2)].epoch;
+
+        assert_eq!(
+            m.apply(&MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(2),
+                expected_epoch: epoch,
+                target: Some(vec![nid(8)]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.split_placing[&TabletId(2)].target, Some(vec![nid(8)]));
+        assert!(!m.split_placing[&TabletId(2)].done);
+        assert_eq!(m.tablets[&TabletId(2)].replicas, vec![nid(1)]);
+        assert_eq!(m.tablets[&TabletId(2)].epoch, epoch);
+    }
+
+    /// `RetargetSplitPlacing` rejects an epoch mismatch — the identical
+    /// stale-confirm guard `MarkSplitPlacingDone` already has.
+    #[test]
+    fn retarget_split_placing_rejects_epoch_mismatch() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: false,
+            },
+        );
+        let stale_epoch = m.tablets[&TabletId(2)].epoch.next();
+        assert_eq!(
+            m.apply(&MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(2),
+                expected_epoch: stale_epoch,
+                target: Some(vec![nid(8)]),
+            }),
+            ApplyOutcome::Rejected("epoch mismatch")
+        );
+        assert_eq!(m.split_placing[&TabletId(2)].target, Some(vec![nid(9)]));
+    }
+
+    /// `RetargetSplitPlacing` rejects a tablet with no `split_placing` entry
+    /// (also a nonexistent tablet) and is idempotent on an already-`done`
+    /// entry — the identical shape `MarkSplitPlacingDone`'s own tests cover.
+    #[test]
+    fn retarget_split_placing_rejects_missing_entry_and_is_a_noop_once_done() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: Some("users".to_owned()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        });
+        let epoch = m.tablets[&TabletId(2)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(2),
+                expected_epoch: epoch,
+                target: Some(vec![nid(8)]),
+            }),
+            ApplyOutcome::Rejected("no split_placing entry for this tablet")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(999),
+                expected_epoch: Epoch::INITIAL,
+                target: Some(vec![nid(8)]),
+            }),
+            ApplyOutcome::Rejected("no such tablet")
+        );
+
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(9)]),
+                done: true,
+            },
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(2),
+                expected_epoch: epoch,
+                target: Some(vec![nid(8)]),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.split_placing[&TabletId(2)].target, Some(vec![nid(9)]));
+    }
+
+    /// **Repair-exclusion regression (issue #528)**: an un-done
+    /// `split_placing` tablet with a genuinely `Down` replica (one that is
+    /// NOT even part of the stored target, so the placing phase itself
+    /// would also skip it) must NOT be retargeted by the repair path
+    /// (`Metadata::reconcile`) either — the placing phase (dwell-gated) is
+    /// the sole mover for this tablet until `done`. Mirrors the existing
+    /// exclusion `rebalance_placement` already has (`rebalance_never_
+    /// touches_a_split_placing_tablet`, if present) but for `reconcile`.
+    #[test]
+    fn reconcile_skips_an_undone_split_placing_tablet_even_with_a_down_replica() {
+        let mut m = Metadata::default();
+        for n in [1u64, 2, 3, 4] {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(2),
+                table: Some("users".to_owned()),
+                range: KeyRange::whole(),
+                // n5 is a replica but never an `Active` member — an
+                // ordinary policy violation `reconcile` would otherwise
+                // repair immediately.
+                replicas: vec![nid(1), nid(2), nid(5)],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(2),
+                policy: Some(PlacementPolicy::simple("users", 3)),
+            }),
+            ApplyOutcome::Applied
+        );
+        m.split_placing.insert(
+            TabletId(2),
+            SplitPlacing {
+                target: Some(vec![nid(1), nid(2), nid(3)]),
+                done: false,
+            },
+        );
+
+        // Sanity: without the un-done split_placing entry, `reconcile`
+        // WOULD repair this violation — proves the exclusion is actually
+        // doing something, not merely vacuously true.
+        let mut without_entry = m.clone();
+        without_entry.split_placing.remove(&TabletId(2));
+        assert!(
+            !without_entry.reconcile().is_empty(),
+            "expected the sanity baseline to actually repair the violation"
+        );
+
+        assert!(
+            m.reconcile().is_empty(),
+            "repair must not touch a tablet with an un-done split_placing entry"
+        );
+
+        // Marking it done reopens the tablet to ordinary repair.
+        m.split_placing.get_mut(&TabletId(2)).unwrap().done = true;
+        assert!(
+            !m.reconcile().is_empty(),
+            "a done split_placing entry must no longer exclude the tablet from repair"
+        );
     }
 
     /// `Metadata` round-trips through JSON with a populated `split_placing`

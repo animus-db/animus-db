@@ -12,8 +12,9 @@ use std::time::Duration;
 
 #[cfg(test)]
 use animus_env::nid;
-use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
+use animus_tablet::TabletId;
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 
@@ -58,6 +59,27 @@ const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 /// hardened into a load-bearing invariant — any value produces a correct cluster,
 /// just at a different rebalancing speed.
 const REBALANCE_EVERY_N_TICKS: u64 = 8;
+
+/// How long a directed-Placing target member (`SplitPlacing::target`) must
+/// be observed CONTINUOUSLY non-`Active` — by `reconcile_loop`'s own
+/// per-tick liveness check, never wall clock — before the third phase
+/// (`split_placing_reconcile`) treats it as genuinely gone and recomputes a
+/// fresh target, rather than pausing indefinitely (ADR 0062 §2, issue #528
+/// fix; see `retarget_ready_this_tick`'s own doc for the tracking
+/// mechanics). Sized well past ordinary failure-detector flap noise: the
+/// investigation behind issue #528 captured dozens of `Down`↔`Active`
+/// flips per member within a 240s window under sustained load — individual
+/// flaps well under a second — so 10× [`DETECT_TIMEOUT`] (500ms) comfortably
+/// outlasts that noise floor, and it is also well past the
+/// `animusd::split_placing_completion::SPLIT_PLACING_DONE_SETTLE`
+/// precedent (1.5s, 3× [`RECONCILE_INTERVAL`]) for "how long a control-loop
+/// observation must hold before it's trusted." Not zero-risk churn either
+/// way: too short re-litigates a target mid-flap (this constant's whole
+/// reason to exist); too long delays relief for a genuinely dead node. This
+/// value is a pacing/liveness heuristic, not a safety invariant — the
+/// epoch-CAS on [`MetaCommand::RetargetSplitPlacing`] is what keeps a
+/// retarget itself sound regardless of how this is tuned.
+pub const SPLIT_PLACING_RETARGET_DWELL: Duration = Duration::from_millis(5_000);
 
 /// How often a member emits a liveness heartbeat to the control group
 /// (ADR 0012). On the order of the Raft heartbeat interval, and short relative to
@@ -1459,22 +1481,34 @@ fn record_transition(
 /// members — something the pin-survivors reconciler never does on its own.
 ///
 /// A third phase, **directed Placing convergence** (ADR 0062 §2,
-/// [`Metadata::split_placing_reconcile`]/[`PlacementView::split_placing_reconcile`]),
-/// runs every tick, unconditionally — independent of repair/rebalance's own
-/// gating, since a split-triggered relief obligation should not wait behind
-/// `REBALANCE_EVERY_N_TICKS`'s cadence (meant for slow, cluster-wide balance
-/// churn) or be starved by repair's own priority. For every un-`done`
-/// `split_placing` entry it recomputes `select_replicas` fresh and proposes a
-/// `CasTabletReplicas` for whichever ones now differ from the tablet's
-/// current replicas — one per entry, so several concurrently-splitting
-/// tablets each get their own move in the same tick (a deliberately
-/// different pacing than rebalance's single-move-per-tick bound, see
-/// `split_placing_reconcile`'s own doc for why). It never proposes
-/// `MarkSplitPlacingDone` — that is a separate, later mechanism (ADR 0062
-/// §3) that observes live Raft convergence, not something this pure
-/// metadata-level view can see.
+/// [`Metadata::split_placing_reconcile`]/[`PlacementView::split_placing_reconcile`],
+/// fixed for issue #528), runs every tick, unconditionally — independent of
+/// repair/rebalance's own gating, since a split-triggered relief obligation
+/// should not wait behind `REBALANCE_EVERY_N_TICKS`'s cadence (meant for
+/// slow, cluster-wide balance churn) or be starved by repair's own
+/// priority. For every un-`done` `split_placing` entry it drives toward the
+/// STORED target verbatim while every member of it is `Active`, pausing
+/// (proposing nothing) while a member is transiently `Down`, and only
+/// recomputes once `retarget_ready_this_tick`'s dwell tracking says a
+/// member has been down long enough to treat as genuinely gone — see that
+/// function's own doc and `split_placing_reconcile`'s (`meta.rs`) for the
+/// full mechanics and the root cause this fixes (a fresh recompute every
+/// tick made the target itself flap faster than `animus-cp-data`'s own
+/// mover could converge, a livelock one layer below the completion loop's
+/// own correct logic). It never proposes `MarkSplitPlacingDone` — that is a
+/// separate, later mechanism (ADR 0062 §3) that observes live Raft
+/// convergence, not something this pure metadata-level view can see.
 async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<Mutex<Metadata>>) {
     let mut tick: u64 = 0;
+    // Driver-local dwell tracking for the directed-Placing phase's
+    // retarget gate (ADR 0062 §2, issue #528 fix) — see
+    // `retarget_ready_this_tick`'s own doc. Volatile, per-node,
+    // `env.now()`-keyed (never wall clock, per the root `CLAUDE.md`
+    // determinism rules) — lost across a leadership change exactly like
+    // the failure detector's own per-node state, which only ever delays a
+    // retarget, never mis-times one unsoundly (the epoch-CAS on
+    // `RetargetSplitPlacing` is what keeps it safe regardless).
+    let mut retarget_since: BTreeMap<(TabletId, NodeId), Nanos> = BTreeMap::new();
     loop {
         env.sleep(RECONCILE_INTERVAL).await;
         tick = tick.wrapping_add(1);
@@ -1487,6 +1521,13 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // background tick into a full-blob clone every 500ms (clone-churn
         // fix).
         if !core.lock().expect("raft core poisoned").is_leader() {
+            // A non-leader's dwell tracking is meaningless (only the leader
+            // ever proposes a retarget) — clear it so a future leadership
+            // stint starts its dwell clocks fresh rather than resuming a
+            // stale one from `env.now()` values that may be arbitrarily far
+            // in the past, mirroring the failure detector's own cold-start
+            // stance on regaining leadership.
+            retarget_since.clear();
             continue;
         }
         let view = cache.lock().expect("cache poisoned").placement_view();
@@ -1514,10 +1555,65 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // independent of the repair/rebalance gating above. Off-leader
         // transitions between the check at the top of this tick and here are
         // just as harmless as they are for repair/rebalance, above.
-        for command in view.split_placing_reconcile() {
+        let retarget_ready = retarget_ready_this_tick(&env, &view, &mut retarget_since);
+        for command in view.split_placing_reconcile(&retarget_ready) {
             core.lock().expect("raft core poisoned").propose(command);
         }
     }
+}
+
+/// One tick's worth of dwell-gate bookkeeping for `reconcile_loop`'s
+/// directed-Placing phase (ADR 0062 §2, issue #528 fix): for every un-`done`
+/// `split_placing` entry with a stored `Some(target)`, tracks how long each
+/// currently-non-`Active` target member has been CONTINUOUSLY non-`Active`
+/// (via `env.now()`, never wall clock) in `retarget_since`, and returns the
+/// set of tablets for which at least one target member has been down for at
+/// least [`SPLIT_PLACING_RETARGET_DWELL`] — i.e. tablets `split_placing_
+/// reconcile` may recompute a fresh target for this tick.
+///
+/// `retarget_since` is mutated in place: a member observed `Active` this
+/// tick has its tracked timer removed (a "continuously down" clock must
+/// restart from zero the next time it goes down, not resume a stale one —
+/// this is what makes the gate a genuine dwell rather than a cumulative
+/// down-time counter), and any tracked `(tablet, member)` pair that is no
+/// longer live this tick (the member came back, the tablet's entry
+/// finished/vanished, or that member is no longer even part of the current
+/// stored target) is pruned outright, so this map never grows unbounded
+/// across a long-running leader's lifetime.
+fn retarget_ready_this_tick<E: Env>(
+    env: &E,
+    view: &PlacementView,
+    retarget_since: &mut BTreeMap<(TabletId, NodeId), Nanos>,
+) -> BTreeSet<TabletId> {
+    let now = env.now();
+    let mut ready = BTreeSet::new();
+    let mut live: BTreeSet<(TabletId, NodeId)> = BTreeSet::new();
+    for (&tablet, entry) in &view.split_placing {
+        if entry.done {
+            continue;
+        }
+        let Some(target) = &entry.target else {
+            continue; // nothing stored yet for this entry — no dwell to track
+        };
+        for member in target {
+            let is_active = view
+                .members
+                .get(member)
+                .is_some_and(|m| m.status == NodeStatus::Active);
+            if is_active {
+                continue; // this member needs no dwell tracking right now
+            }
+            live.insert((tablet, member.clone()));
+            let since = *retarget_since
+                .entry((tablet, member.clone()))
+                .or_insert(now);
+            if now.duration_since(since) >= SPLIT_PLACING_RETARGET_DWELL {
+                ready.insert(tablet);
+            }
+        }
+    }
+    retarget_since.retain(|key, _| live.contains(key));
+    ready
 }
 
 /// The leader's failure detector (ADR 0012): on a timer, if this node is leader,
