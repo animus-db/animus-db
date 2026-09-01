@@ -3,15 +3,16 @@
  * Design tokens come from the shared base, `assets/tokens.css`, which is
  * byte-identical to the copy the in-product consoles embed; a test in
  * `animusd` fails if the two drift. Only the *skin* lives here: the geometry
- * that makes this surface roomy and read-at-leisure — ruled, sharp-cornered,
- * ledger-like, with no drop shadows except the ink plates and diagram frame,
- * and no rounded pills except tight status chips. Faces load from Google
- * Fonts (allowed on the marketing site); no build step.
+ * that makes this surface roomy and read-at-leisure — ruled, plain-bordered,
+ * softly rounded (6px controls, 8px panels), with no drop shadows anywhere,
+ * not even the ink plates (that exception is gone — see the ADR's newest
+ * amendment), and no rounded pills except tight status chips. Faces load
+ * from Google Fonts (allowed on the marketing site); no build step.
  */
 :root {
   /* site skin — roomy: read at leisure, often on a phone */
-  --radius: 3px;
-  --radius-panel: 4px;
+  --radius: 6px;
+  --radius-panel: 8px;
   --ctl-h: 44px;
   --maxw: 1120px;
   --pad-x: 24px; /* container side inset — narrows a step at <=860/560px below */
@@ -53,7 +54,7 @@ code {
   background: var(--surface2);
   border: 1px solid var(--border);
   padding: 0.1em 0.4em;
-  border-radius: 3px;
+  border-radius: var(--radius);
   color: var(--text);
 }
 
@@ -68,6 +69,11 @@ code {
 }
 .skip-link:focus { left: 0; }
 
+/* Considered a "// " comment-style prefix here (2026-08-31 skin restyle) —
+ * dropped: .kicker also labels TOC headings ("On this page"), the "Keep
+ * reading" article footer, and a tagline ("Open source · Rust · AGPL-3.0"),
+ * contexts where a comment prefix reads oddly rather than as a section
+ * eyebrow. Left as plain text; only radius/font tracked through it. */
 .kicker {
   font: 600 11px/1 var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--accent); margin-bottom: 12px; display: block;
@@ -185,42 +191,47 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 .ctalink:hover { color: var(--accent-hi); text-decoration: none; }
 .ctalink-row { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-top: 16px; }
 
-/* ---------- ink plates: terminal / diff blocks ---------- */
+/* ---------- terminal / diff blocks ----------
+ * Plain bordered boxes on the ordinary themed surface — no forced-dark
+ * interior, no shadow. This deliberately drops Ledger's "ink-plate"
+ * concept (a permanently-dark surface plus a hard offset shadow, ADR
+ * 0056's 2026-08-25 amendment): see this file's 2026-08-31 amendment for
+ * the removal. */
 .plate, .code {
-  position: relative; background: var(--plate-bg); border: var(--plate-border);
-  border-radius: var(--radius-panel); box-shadow: var(--plate-shadow); overflow: hidden;
+  position: relative; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-panel); overflow: hidden;
 }
 .plate .head, .code-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 7px 14px; border-bottom: 1px solid var(--plate-rule);
+  padding: 7px 14px; border-bottom: 1px solid var(--border);
 }
 .plate .head .t, .code-head .title {
   font: 500 9.5px/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.08em;
-  color: var(--plate-header);
+  color: var(--ink-72);
 }
-.plate .head .ext, .code-head .ext { font: 500 9.5px var(--font-mono); color: var(--plate-accent); }
+.plate .head .ext, .code-head .ext { font: 500 9.5px var(--font-mono); color: var(--accent); }
 .code-head .lights { display: none; }
 .plate .body, .code pre {
-  margin: 0; padding: 13px 16px; overflow-x: auto; color: var(--plate-text);
+  margin: 0; padding: 13px 16px; overflow-x: auto; color: var(--text);
   font: 400 13px/1.85 var(--font-mono); tab-size: 2;
 }
 .plate .cl { white-space: pre; }
-.plate .c, .code pre .c, .pc { color: var(--plate-comment); }
-.plate .o, .code pre .o, .po { color: var(--plate-output); }
-.plate .p, .code pre .p, .pp { color: var(--plate-accent); }
-.plate .k, .code pre .k { color: var(--plate-text); }
-.plate .s, .code pre .s { color: var(--plate-accent); }
-.plate .dm, .code pre .dm, .pminus { color: #d98a7a; }
-.plate .dp, .code pre .dp, .pplus { color: #6fc493; }
+.plate .c, .code pre .c, .pc { color: var(--ink-55); }
+.plate .o, .code pre .o, .po { color: var(--ink-72); }
+.plate .p, .code pre .p, .pp { color: var(--accent); }
+.plate .k, .code pre .k { color: var(--text); }
+.plate .s, .code pre .s { color: var(--accent); }
+.plate .dm, .code pre .dm, .pminus { color: var(--danger); }
+.plate .dp, .code pre .dp, .pplus { color: var(--ok); }
 .copy-btn {
   position: absolute; top: 8px; right: 8px; z-index: 2;
-  background: rgba(233, 229, 220, 0.08); border: 1px solid rgba(233, 229, 220, 0.16);
-  color: var(--plate-text); font: 500 11px var(--font-ui); padding: 5px 9px; border-radius: 3px;
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text2); font: 500 11px var(--font-ui); padding: 5px 9px; border-radius: var(--radius);
   cursor: pointer; opacity: 0; transition: opacity .15s;
 }
 .plate:hover .copy-btn, .code:hover .copy-btn, .copy-btn:focus { opacity: 1; }
-.copy-btn:hover { background: rgba(233, 229, 220, 0.16); }
-.copy-btn.done { color: #6fc493; }
+.copy-btn:hover { background: var(--recessed); color: var(--text); }
+.copy-btn.done { color: var(--ok); }
 
 /* Below 640px an ink plate keeps its container inset (never full-bleed) but
    tightens its own interior: less padding, and mono a step smaller so
@@ -298,7 +309,7 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
 @media (max-width: 620px) { .cardgrid { --cols: 1 !important; } }
 
 .lcard {
-  background: var(--surface); border: 1px solid var(--border); border-top: 2px solid var(--text);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel);
   padding: 16px 18px;
 }
 .lcard .tag {
@@ -315,18 +326,16 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
 
 /* legacy alias used by docs/install feature cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-top: 2px solid var(--text); padding: 18px 20px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: 18px 20px; }
 .card h3 { margin-bottom: 8px; }
 .card p { margin: 0; font-size: 14px; }
 
 /* ---------- diagram plate ---------- */
 .diagram-plate {
-  border: 1px solid var(--border-strong); background: var(--surface);
-  box-shadow: 5px 5px 0 rgba(33, 31, 26, 0.12); padding: 16px;
+  border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius-panel);
+  padding: 16px;
   overflow-x: auto;
 }
-:root[data-theme="dark"] .diagram-plate { box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5); }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .diagram-plate { box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.5); } }
 /* Below ~640px these annotated diagrams shrink past legibility if scaled to
    fit; a min-width floor keeps the labels readable and the plate scrolls
    horizontally in its own box instead (the page itself never scrolls). */
@@ -368,15 +377,18 @@ td { color: var(--ink-85); }
 td code { background: transparent; border: none; padding: 0; color: var(--text); }
 td.d { color: var(--ink-72); font-size: 12.5px; }
 
+/* Functional status chips (Supported/Opt-in/Out-of-scope, port trust
+ * levels): a filled, tinted pill — real meaning carried by colour + shape,
+ * kept visually distinct from the plain-text decorative tags above. */
 .pill {
   display: inline-block; font: 600 10.5px/1 var(--font-ui); text-transform: uppercase; letter-spacing: 0.04em;
-  padding: 2px 8px; border-radius: var(--radius); white-space: nowrap; border: 1.5px solid currentColor;
+  padding: 3px 9px; border-radius: 999px; white-space: nowrap; border: 1px solid transparent;
 }
-.pill.yes { color: var(--ok); }
-.pill.plan, .pill.no { color: var(--ink-55); }
-.pill.opt { color: var(--warn); }
-.pill.out { color: var(--danger); }
-.pill.part { color: var(--warn); }
+.pill.yes { color: var(--ok); background: var(--ok-bg); }
+.pill.plan, .pill.no { color: var(--ink-55); background: var(--surface2); }
+.pill.opt { color: var(--warn); background: var(--warn-bg); }
+.pill.out { color: var(--danger); background: var(--danger-bg); }
+.pill.part { color: var(--warn); background: var(--warn-bg); }
 
 /* ---------- callouts, warnings, asides, pull quotes ---------- */
 .callout {

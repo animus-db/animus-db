@@ -92,8 +92,8 @@
   --shadow-recessed: none;
 
   /* --- type --- */
-  --font-ui: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif;
-  --font-mono: "Martian Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font-ui: "Work Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
   /* --- motion (kept minimal — no glow to animate) --- */
   --t-control: 120ms;

@@ -14316,6 +14316,102 @@ artificial load, but a condition-based search polling `GET /admin/raft`'s
 where commit has advanced but apply hasn't, then firing the racing call at
 exactly that reading.
 
+## Sourcing a real Google Fonts variable-font `.woff2` for embedding (ADR 0056's 2026-08-31 amendment, the Space Grotesk/Martian Mono → Work Sans/JetBrains Mono font swap)
+
+The Google Fonts CSS2 API (`https://fonts.googleapis.com/css2?family=...`)
+returns a **static** per-weight face by default, even for a family that
+does ship a variable font — `family=Work+Sans:wght@400;500;600;700`
+returns four separate weight-scoped `@font-face` blocks pointing at four
+different `.woff2` files, not one file covering the range. To get the
+single-file-per-family property this ADR's embedding strategy depends on
+(`crates/animusd/src/fonts.css`'s own doc comment: "one file per family
+covering the whole weight range," not one per weight), the request needs
+the **range** syntax instead — `wght@100..900` (two dots, a closed
+interval), which the API recognizes as "give me the variable axis" and
+returns one `@font-face` per **script subset** (vietnamese/latin-ext/latin/
+…), each still spanning the declared weight range via a single
+`font-weight: 100 900;` line and a single `.woff2` url — the **latin**
+subset block (usually the last one in the response, `unicode-range:
+U+0000-00FF, …`) is the one to keep; the others cover scripts this
+codebase's Latin-only convention (ADR 0056's own "Latin subset" framing)
+has never needed. A response's `font-weight` range is also the fastest way
+to confirm you got the variable build rather than a static one — a static
+per-weight response never has two numbers on that line. Second gotcha:
+the API 403s/serves a stripped legacy response to an unrecognized or
+absent `User-Agent` (its browser-sniffing decides which font format —
+woff2 vs. ttf — and which API shape to serve); a plain modern-browser UA
+string (`Mozilla/5.0 ... Chrome/128.0.0.0 Safari/537.36`) on both the CSS
+fetch and the follow-up `fonts.gstatic.com/.../*.woff2` binary fetch is
+required — a request with no UA, or a generic `curl/*` one, can silently
+get a different (or empty) result. Once you have the CSS response, the
+actual binary is one more plain `curl` of the `url(...)` inside the
+`latin` block's `src:`; `base64 -w0` the result straight into the
+`data:font/woff2;base64,...` `@font-face` src exactly as the existing
+fonts.css comment already documents for regeneration. One real
+consequence worth knowing before assuming "same shape, similar size":
+different families' variable-font builds are not size-comparable just
+because they're both "one file, full weight range" — Work Sans's and
+JetBrains Mono's latin variable builds came back meaningfully larger than
+Space Grotesk's/Martian Mono's (~50 KB and ~40 KB raw vs. ~22 KB and
+~24 KB), pushing the consoles' total embedded-font base64 from ~61 KB to
+~118 KB — not a sign anything went wrong, just a property of the
+specific typefaces, and not something to "fix" by falling back to a
+per-weight static embed (which would cost far more, not less).
+
+## Screenshotting a themed page in both modes needs the app's own toggle, not Playwright's `colorScheme` context option (website skin restyle, ADR 0056)
+
+`website/assets/site.js` implements the three-state theme switch by
+stamping `data-theme="light"|"dark"` on `<html>` **before first paint**,
+defaulting to `"light"` when nothing is in `localStorage` yet — "system"
+is a third, explicit choice that *removes* the attribute so
+`prefers-color-scheme` decides, not the default state. Because
+`tokens.css`'s dark values are gated behind
+`:root[data-theme="dark"]`/`:root:not([data-theme="light"])`, a
+Playwright `browser.newContext({ colorScheme: 'dark' })` has **no
+effect** here: the explicit `data-theme="light"` attribute the page's own
+JS sets pre-paint always wins over `prefers-color-scheme`, so two
+contexts opened with `colorScheme: 'light'` vs `'dark'` render
+byte-identical screenshots — a false "looks the same in both themes"
+result that silently skips the check it was meant to run. The fix is to
+drive the real control: `page.click('.theme-switch
+button[data-theme-choice="dark"]')` after load, which is also strictly
+better verification — it exercises `site.js`'s actual selectors
+(`data-theme-choice`, `aria-pressed`) and catches a markup/JS mismatch
+that a context-option shortcut never would. Generalizes to any site whose
+theme mechanism is "JS sets an explicit attribute, CSS gates on that
+attribute" (the common pattern for a persisted three-state toggle) rather
+than pure `prefers-color-scheme`: always toggle through the app's own UI
+when screenshotting for a light/dark diff, don't assume a browser-level
+colour-scheme hint reaches the page.
+
+## Playwright's Chromium download is an egress-policy 403 in this sandbox, not a flaky mirror (apps skin restyle, ADR 0056)
+
+`npx playwright install --with-deps chromium` gets as far as `apt-get`
+installing the real OS deps (xvfb, libnss3, …) — those hosts are
+allowlisted — then fails downloading the browser binary itself:
+`playwright.azureedge.net`, `playwright-akamai.azureedge.net`, and
+`playwright-verizon.azureedge.net` (all three CDN mirrors Playwright
+tries in turn) each return a proxy-level `ERR_SOCKET_CLOSED`/connection
+reset from Node's http client. `curl -sS
+$HTTPS_PROXY/__agentproxy/status` (per this repo's own sandbox README)
+shows the real cause: `recentRelayFailures` records `connect_rejected,
+"gateway answered 403 to CONNECT (policy denial or upstream failure)"`
+for exactly those three hosts — an organization egress-policy denial, not
+a transient network failure, so retrying (a different mirror, a retry
+loop, `--force`) wastes time for zero chance of success. `npm install
+playwright` itself succeeds fine (npm's registry is allowlisted); it is
+specifically the browser-binary CDN that is blocked. Practical
+consequence: a task asking for a real rendered/screenshotted visual check
+cannot always get one in this sandbox even when Node/npm/apt all work and
+the task budget allows for it — check `/__agentproxy/status` for a `403`/
+`connect_rejected` against the actual download host before spending time
+on `apt-get`/`npm install` troubleshooting, and if it's a policy denial,
+say so honestly and fall back to the next-best verification available
+(built/served bytes inspection, a live server's `curl`'d output, code
+review) rather than silently claiming a visual check that didn't happen —
+the task instructions in this repo are explicit that an honest "couldn't
+verify visually" beats a false claim.
+
 ## An interleaved-key test writer defeats a whole-file-assignment property it was meant to prove (ADR 0058 fork closed, `LsmEngine::clone_to_filtered`)
 
 Writing the first `ProdEnv` concurrency regression for range-aware cloning
