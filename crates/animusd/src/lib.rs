@@ -7889,17 +7889,24 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         &self,
         source: &LsmEngine<ProdEnv>,
         target: TabletId,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<LsmEngine<ProdEnv>, String> {
         // ADR 0058 Train 2 rung 3: the in-place split's Stage 3
         // materialization, over this node's real on-disk backend —
-        // `LsmEngine::clone_to` (ADR 0058 rung 2) is the SSTable-hard-link
-        // clone; the target's own filename prefix is the SAME per-tablet
+        // `LsmEngine::clone_to_filtered` (ADR 0058 rung 2, whole-file
+        // assignment) is the range/kind-aware SSTable-hard-link clone: a
+        // source table wholly outside the caller's own `keep` set (the
+        // child's own BASE/LSI/FOOTPRINT range) is never linked into the
+        // target's namespace at all, closing the cold-child dead-space
+        // debt, the per-engine size-accounting double-count, and the
+        // oversized learner-snapshot bytes a full-clone-then-trim left
+        // behind. The target's own filename prefix is the SAME per-tablet
         // naming convention every other tablet engine uses, so a restart's
         // ordinary `open(target)` recovers it identically to any other
         // hosted tablet. `source` is the caller's own already-open handle
         // (see the trait's own doc for why this method never re-opens it).
         source
-            .clone_to(tablet_lsm_prefix(target.0))
+            .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
             .map_err(|e| e.to_string())
     }

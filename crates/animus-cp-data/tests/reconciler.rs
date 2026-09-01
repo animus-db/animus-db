@@ -402,8 +402,9 @@ impl EngineFactory<MemoryEngine> for FaultyTabletEngines {
         &self,
         source: &MemoryEngine,
         target: TabletId,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<MemoryEngine, String> {
-        self.inner.clone_engine(source, target).await
+        self.inner.clone_engine(source, target, keep).await
     }
 }
 

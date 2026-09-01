@@ -1874,7 +1874,12 @@ impl<E: Env> LsmEngine<E> {
     /// Clone this engine's current durable state into a **new**, independent
     /// engine at `target_prefix` on the same `Env`, at SSTable file
     /// granularity (ADR 0058 rung 2 — the prerequisite for a later split's
-    /// local materialization; this method itself knows nothing about splits).
+    /// local materialization), keeping only the rows that fall inside `keep`
+    /// — a set of half-open physical-key ranges (`(start, end)`, `end: None`
+    /// meaning unbounded above, the same convention [`approx_bytes_in_range`]
+    /// and every other range predicate in this module already use). This
+    /// method itself knows nothing about splits or kinds; `keep` is just
+    /// bytes to a caller built on top of it.
     ///
     /// ## The cut
     ///
@@ -1892,26 +1897,43 @@ impl<E: Env> LsmEngine<E> {
     /// retrying: the write path (`log_and_apply`) only returns to its caller
     /// after a record is both WAL-synced and applied to the memtable under
     /// this identical lock, so any write already acked by the time a caller
-    /// invokes `clone_to` is provably present at this snapshot, either still
-    /// resident in the memtable or already folded into a table by an
+    /// invokes this method is provably present at this snapshot, either
+    /// still resident in the memtable or already folded into a table by an
     /// intervening flush; a write a concurrent caller starts *during* this
     /// call may legitimately land on either side of the cut.
     ///
-    /// Every table the snapshot names is [hard-linked](animus_env::Disk::link)
-    /// — not copied — into `target_prefix`'s own file namespace. Any rows the
-    /// snapshot found still resident in the memtable are written out as one
-    /// additional, brand-**new** SSTable built directly inside the clone's
-    /// own namespace (never the source's — the source's manifest, WAL, and
-    /// files are untouched either way), at a sequence number past the
-    /// source's own `next_seq` floor. A fresh manifest is then written naming
-    /// every linked table plus that new one if any rows needed it (same
-    /// `next_seq` floor, bumped past the new table if one was written, so the
-    /// target's own future flushes never collide with an inherited seq; same
-    /// `max_version`; an empty `wal_segments`). SSTable immutability is what
-    /// makes sharing the linked bytes instead of copying them safe: the
-    /// source and the returned engine hold independent directory entries over
-    /// the same durable bytes, so the source's own compaction later removing
-    /// a superseded input file has no effect on the clone's own link to it.
+    /// ## Whole-file assignment (ADR 0058 fork closed)
+    ///
+    /// A table from the snapshot is [hard-linked](animus_env::Disk::link)
+    /// into `target_prefix`'s own file namespace only if its own
+    /// `[min_key, max_key]` (already recorded in `SsTableMeta` at
+    /// flush/compaction time — the same in-memory metadata
+    /// [`SsTableMeta::may_contain`]/`approx_bytes_in_range` already gate on,
+    /// so this needed no manifest format change and no extra disk read)
+    /// overlaps at least one `keep`
+    /// range. A table wholly outside every `keep` range is **not linked at
+    /// all** — the dead-space/double-counted-size/oversized-snapshot costs a
+    /// full clone-then-trim would otherwise leave behind never exist for
+    /// that file. A table straddling a `keep` boundary is still linked
+    /// whole — its rows outside `keep` ride along, exactly as a caller's own
+    /// post-clone trim step (a `delete_range` over the dropped span) already
+    /// expects and correctly handles: `delete_range` only ever removes rows
+    /// that are actually present, so trimming a table that was never linked
+    /// in the first place is already a harmless no-op. Memtable rows are
+    /// filtered the identical way, key by key. Any kept row still resident
+    /// in the memtable is written out as one additional, brand-**new**
+    /// SSTable built directly inside the clone's own namespace (never the
+    /// source's — the source's manifest, WAL, and files are untouched either
+    /// way), at a sequence number past the source's own `next_seq` floor. A
+    /// fresh manifest is then written naming every linked table plus that
+    /// new one if any rows needed it (same `next_seq` floor, bumped past the
+    /// new table if one was written, so the target's own future flushes
+    /// never collide with an inherited seq; same `max_version`; an empty
+    /// `wal_segments`). SSTable immutability is what makes sharing the
+    /// linked bytes instead of copying them safe: the source and the
+    /// returned engine hold independent directory entries over the same
+    /// durable bytes, so the source's own compaction later removing a
+    /// superseded input file has no effect on the clone's own link to it.
     ///
     /// **This never spins**: unlike an earlier version of this method (which
     /// retried `flush()` in a bounded loop until the memtable read empty), no
@@ -1961,16 +1983,10 @@ impl<E: Env> LsmEngine<E> {
     /// just without a handle to show for it here. Either way the invariant
     /// that matters holds: what is durable at `target_prefix` is always
     /// either **nothing** or a **complete** clone, never a torn one. A
-    /// caller that gets `Err` back can simply retry `clone_to` (the flush and
-    /// every link are no-ops/idempotent overwrites if already done) or call
+    /// caller that gets `Err` back can simply retry (the flush and every
+    /// link are no-ops/idempotent overwrites if already done) or call
     /// [`open`](Self::open) directly if it already knows the commit
     /// succeeded.
-    ///
-    /// ## Scope
-    ///
-    /// Full-engine clone only — no kind filtering, no key-range trimming.
-    /// Every live table at every level is linked verbatim; any such filtering
-    /// belongs in a caller built on top of this primitive, not inside it.
     ///
     /// [`Disk::link`]: animus_env::Disk::link
     ///
@@ -1979,7 +1995,11 @@ impl<E: Env> LsmEngine<E> {
     /// Propagates a flush or disk I/O failure. The source engine's own
     /// manifest/readers are never touched by this method, so it leaves the
     /// source unaffected on any error path.
-    pub async fn clone_to(&self, target_prefix: impl Into<String>) -> Result<LsmEngine<E>> {
+    pub async fn clone_to_filtered(
+        &self,
+        target_prefix: impl Into<String>,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<LsmEngine<E>> {
         let target_prefix: String = target_prefix.into();
 
         // One best-effort flush attempt, so the common (quiescent) case still
@@ -2009,19 +2029,19 @@ impl<E: Env> LsmEngine<E> {
         // point-in-time **snapshot**: below, `tables` + whatever is left in
         // the memtable are read under the SAME `Inner` lock acquisition.
         // That single critical section is enough on its own — no retry, no
-        // sleep — to satisfy `clone_to`'s real contract ("every write ACKED
-        // before this call must appear in the clone"): `log_and_apply`
-        // (this engine's one write path) only returns to its caller *after*
-        // the record has both synced to the WAL and been applied to the
-        // memtable under this identical lock, so by the time any caller
-        // observes a write as acked, that write is already durably present
-        // under the next acquisition of this lock — either still in the
-        // memtable (captured by the snapshot below) or already folded into
-        // an SSTable by an intervening flush (captured by `tables`). A write
-        // a concurrent caller starts *during* this call is legitimately
-        // allowed to land on either side of the cut (it raced `clone_to`,
-        // not a bug); this snapshot cannot ever miss one that completed
-        // strictly before.
+        // sleep — to satisfy this method's real contract ("every write ACKED
+        // before this call must appear in the clone, if it falls inside
+        // `keep`"): `log_and_apply` (this engine's one write path) only
+        // returns to its caller *after* the record has both synced to the
+        // WAL and been applied to the memtable under this identical lock, so
+        // by the time any caller observes a write as acked, that write is
+        // already durably present under the next acquisition of this lock —
+        // either still in the memtable (captured by the snapshot below) or
+        // already folded into a table by an intervening flush (captured by
+        // `tables`). A write a concurrent caller starts *during* this call is
+        // legitimately allowed to land on either side of the cut (it raced
+        // this call, not a bug); this snapshot cannot ever miss one that
+        // completed strictly before.
         self.flush().await?;
 
         // Hold the maintenance lock for the whole snapshot+link sequence so a
@@ -2029,7 +2049,7 @@ impl<E: Env> LsmEngine<E> {
         // call is in the middle of linking (see the doc comment above).
         let _maintenance = self.maintenance.acquire().await;
 
-        let (tables, mut next_seq, max_version, leftover) = {
+        let (tables, mut next_seq, max_version, mut leftover) = {
             let inner = self.lock();
             (
                 inner.manifest.tables.clone(),
@@ -2039,26 +2059,42 @@ impl<E: Env> LsmEngine<E> {
             )
         };
 
-        for meta in &tables {
+        // Whole-file assignment (`table_overlaps_keep`'s own doc has the
+        // degenerate-empty-table case): a table with no `keep` overlap is
+        // dropped from the link set entirely — never even considered, so it
+        // never becomes a directory entry in the target's namespace at all.
+        let kept_tables: Vec<SsTableMeta> = tables
+            .into_iter()
+            .filter(|meta| table_overlaps_keep(meta, keep))
+            .collect();
+
+        for meta in &kept_tables {
             let src = self.sst_file(meta.seq);
             let dst = format!("{target_prefix}sst-{:06}", meta.seq);
             self.env.link(&src, &dst).await.map_err(io)?;
         }
 
-        // Anything still resident in the memtable at snapshot time — the
-        // ordinary case is empty (the flush above already drained it), but a
-        // persistent concurrent writer, or one that simply landed between
-        // the flush and the snapshot, can leave real rows here — is written
-        // out as a **new** SSTable directly into the CLONE's own namespace,
-        // never the source's. This never touches the source's manifest, WAL,
-        // or files (the source's own integrity, flush/compaction cadence,
-        // and this call's own crash-safety contract are all unaffected); it
-        // is bounded, one-shot work sized to a single point-in-time memtable
-        // snapshot, never a race against however long a writer keeps
-        // writing. The new table's seq comes from the source's own
-        // `next_seq` floor (bumped so the clone's future flushes never
-        // collide with it), landing at L0 like an ordinary flush.
-        let mut target_tables = tables;
+        // The memtable snapshot is filtered key-by-key against the same
+        // `keep` ranges a table's own `[min_key, max_key]` was just tested
+        // against, so a leftover table built from it needs no further
+        // trimming either.
+        leftover.retain(|rec| key_in_keep(&rec.key, keep));
+
+        // Anything still resident in the memtable at snapshot time (and
+        // inside `keep`) — the ordinary case is empty (the flush above
+        // already drained it), but a persistent concurrent writer, or one
+        // that simply landed between the flush and the snapshot, can leave
+        // real rows here — is written out as a **new** SSTable directly into
+        // the CLONE's own namespace, never the source's. This never touches
+        // the source's manifest, WAL, or files (the source's own integrity,
+        // flush/compaction cadence, and this call's own crash-safety
+        // contract are all unaffected); it is bounded, one-shot work sized
+        // to a single point-in-time memtable snapshot, never a race against
+        // however long a writer keeps writing. The new table's seq comes
+        // from the source's own `next_seq` floor (bumped so the clone's
+        // future flushes never collide with it), landing at L0 like an
+        // ordinary flush.
+        let mut target_tables = kept_tables;
         if !leftover.is_empty() {
             let seq = next_seq + 1;
             let file = format!("{target_prefix}sst-{seq:06}");
@@ -2088,6 +2124,22 @@ impl<E: Env> LsmEngine<E> {
         drop(_maintenance);
 
         LsmEngine::open_with(self.env.clone(), target_prefix, self.opts).await
+    }
+
+    /// Clone the whole engine — [`clone_to_filtered`](Self::clone_to_filtered)
+    /// with one `keep` range covering the entire keyspace
+    /// (`([], None)`), so every live table is linked verbatim and every
+    /// memtable row is kept. Full-engine clone only — no kind filtering, no
+    /// key-range trimming; a caller that wants either uses
+    /// `clone_to_filtered` directly. See that method's own doc for the full
+    /// cut/crash-safety contract, unchanged here.
+    ///
+    /// # Errors
+    ///
+    /// See [`clone_to_filtered`](Self::clone_to_filtered).
+    pub async fn clone_to(&self, target_prefix: impl Into<String>) -> Result<LsmEngine<E>> {
+        self.clone_to_filtered(target_prefix, &[(Vec::new(), None)])
+            .await
     }
 }
 
@@ -2897,6 +2949,30 @@ fn sstable_overlaps(t: &SsTableMeta, start: &[u8], end: Option<&[u8]>) -> bool {
     max_key.as_slice() >= start && end.is_none_or(|e| min_key.as_slice() < e)
 }
 
+/// A table with no `min_key`/`max_key` (empty — never produced by this
+/// engine's own writer/compactor, but not structurally impossible for a
+/// hand-built/legacy `SsTableMeta`) has no range to test against `keep` and
+/// is kept unconditionally — [`clone_to_filtered`](LsmEngine::
+/// clone_to_filtered)'s only use of this: matches [`clone_to`](LsmEngine::
+/// clone_to)'s pre-filtering behavior for that degenerate case exactly.
+fn table_overlaps_keep(t: &SsTableMeta, keep: &[(Vec<u8>, Option<Vec<u8>>)]) -> bool {
+    t.min_key.is_none()
+        || keep
+            .iter()
+            .any(|(start, end)| sstable_overlaps(t, start, end.as_deref()))
+}
+
+/// Whether `key` falls inside at least one of `keep`'s half-open
+/// `[start, end)` ranges (`end: None` meaning unbounded above) — the
+/// memtable-row-granularity sibling of [`table_overlaps_keep`] used by
+/// [`clone_to_filtered`](LsmEngine::clone_to_filtered) to filter the
+/// leftover-memtable snapshot the identical way a table's own
+/// `[min_key, max_key]` is filtered.
+fn key_in_keep(key: &[u8], keep: &[(Vec<u8>, Option<Vec<u8>>)]) -> bool {
+    keep.iter()
+        .any(|(start, end)| key >= start.as_slice() && end.as_deref().is_none_or(|e| key < e))
+}
+
 /// Flatten a memtable into sorted SSTable records (`(key asc, version asc)`),
 /// keeping every version (full MVCC history) and tombstones.
 fn flatten_memtable(memtable: &BTreeMap<Key, History>) -> Vec<sstable::Record> {
@@ -3675,6 +3751,145 @@ mod manifest_tests {
             back.wal_segments.is_empty(),
             "v1 binary manifest carries no WAL-segment list"
         );
+    }
+}
+
+/// Direct tests of [`table_overlaps_keep`]/[`key_in_keep`], the pure
+/// range-membership predicates `clone_to_filtered` filters the table set and
+/// the leftover-memtable snapshot with respectively (ADR 0058 fork closed).
+/// Extracted specifically so the "whole-file assignment" decision is
+/// provable without a live engine — see this crate's `CLAUDE.md` for why a
+/// genuinely leftover (unflushed) memtable row at `clone_to_filtered`-time
+/// can't be reliably reproduced in a `block_on`-only `SimEnv` integration
+/// test (the internal `flush()` call at the top of `clone_to_filtered`
+/// unconditionally drains a non-empty memtable when nothing else is
+/// concurrently writing, which is always true for a single-threaded,
+/// non-yielding `SimEnv` disk); the same real-multi-thread `ProdEnv` shape
+/// `lsm_clone_concurrent.rs` already uses for `clone_to`'s own
+/// applies-in-flight race would be needed to reach that code path for real,
+/// and this predicate is simple enough that a live-engine test would add
+/// weight, not confidence, over a table-driven unit test.
+#[cfg(test)]
+mod clone_filter_tests {
+    use super::*;
+
+    fn table(min: &[u8], max: &[u8]) -> SsTableMeta {
+        SsTableMeta {
+            seq: 0,
+            level: 0,
+            min_key: Some(min.to_vec()),
+            max_key: Some(max.to_vec()),
+            min_version: 0,
+            max_version: 0,
+            index_offset: 0,
+            index_len: 0,
+            file_size: 0,
+            bloom: BloomFilter::default(),
+            has_bloom: false,
+            format: 1,
+        }
+    }
+
+    fn empty_table() -> SsTableMeta {
+        SsTableMeta {
+            min_key: None,
+            max_key: None,
+            ..table(b"", b"")
+        }
+    }
+
+    #[test]
+    fn table_wholly_outside_every_keep_range_is_dropped() {
+        let t = table(b"b0000", b"b0009");
+        let keep = [(b"a".to_vec(), Some(b"b".to_vec()))];
+        assert!(
+            !table_overlaps_keep(&t, &keep),
+            "a table entirely below `keep`'s start (a) is dropped"
+        );
+        let t2 = table(b"c0000", b"c0009");
+        assert!(
+            !table_overlaps_keep(&t2, &keep),
+            "a table entirely above `keep`'s end (b) is dropped"
+        );
+    }
+
+    #[test]
+    fn table_wholly_inside_a_keep_range_is_kept() {
+        let t = table(b"a0000", b"a0009");
+        let keep = [(b"a".to_vec(), Some(b"b".to_vec()))];
+        assert!(table_overlaps_keep(&t, &keep));
+    }
+
+    #[test]
+    fn a_straddling_table_is_kept_whole() {
+        let t = table(b"a0000", b"b0005");
+        let keep = [(b"a0005".to_vec(), Some(b"b0000".to_vec()))];
+        assert!(
+            table_overlaps_keep(&t, &keep),
+            "a table straddling keep's boundary overlaps and is kept — its \
+             out-of-keep rows ride along, for the caller's own trim step"
+        );
+    }
+
+    #[test]
+    fn a_table_touching_keeps_exclusive_end_is_dropped() {
+        // keep = [a, b) and a table starting exactly at `b` — a clean
+        // boundary, not a straddle.
+        let t = table(b"b0000", b"b0009");
+        let keep = [(b"a".to_vec(), Some(b"b".to_vec()))];
+        assert!(!table_overlaps_keep(&t, &keep));
+    }
+
+    #[test]
+    fn an_unbounded_keep_range_keeps_everything_at_or_above_its_start() {
+        let keep = [(b"m".to_vec(), None)];
+        assert!(table_overlaps_keep(&table(b"m0000", b"m0009"), &keep));
+        assert!(table_overlaps_keep(&table(b"z0000", b"z0009"), &keep));
+        assert!(!table_overlaps_keep(&table(b"a0000", b"a0009"), &keep));
+    }
+
+    #[test]
+    fn multiple_keep_ranges_union() {
+        let keep = [
+            (b"a".to_vec(), Some(b"b".to_vec())),
+            (b"y".to_vec(), Some(b"z".to_vec())),
+        ];
+        assert!(table_overlaps_keep(&table(b"a0000", b"a0009"), &keep));
+        assert!(table_overlaps_keep(&table(b"y0000", b"y0009"), &keep));
+        assert!(!table_overlaps_keep(&table(b"m0000", b"m0009"), &keep));
+    }
+
+    #[test]
+    fn an_empty_table_is_always_kept() {
+        // Matches `clone_to`'s pre-filtering behavior for this degenerate
+        // (never-produced-in-practice) case exactly.
+        let keep: [(Vec<u8>, Option<Vec<u8>>); 0] = [];
+        assert!(table_overlaps_keep(&empty_table(), &keep));
+    }
+
+    #[test]
+    fn key_in_keep_matches_half_open_ranges() {
+        let keep = [(b"a".to_vec(), Some(b"b".to_vec()))];
+        assert!(key_in_keep(b"a0001", &keep));
+        assert!(!key_in_keep(b"b0000", &keep), "keep's end is exclusive");
+        assert!(!key_in_keep(b"9", &keep), "below keep's start");
+    }
+
+    #[test]
+    fn key_in_keep_unbounded_end() {
+        let keep = [(b"m".to_vec(), None)];
+        assert!(key_in_keep(b"zzzz", &keep));
+        assert!(!key_in_keep(b"a", &keep));
+    }
+
+    #[test]
+    fn clone_to_wraps_clone_to_filtered_with_the_whole_keyspace() {
+        // `clone_to`'s own delegation, pinned directly: the one keep range
+        // it passes must overlap every possible table/key.
+        let whole: [(Vec<u8>, Option<Vec<u8>>); 1] = [(Vec::new(), None)];
+        assert!(table_overlaps_keep(&table(b"\x00", b"\xff"), &whole));
+        assert!(key_in_keep(b"", &whole));
+        assert!(key_in_keep(b"\xff\xff\xff", &whole));
     }
 }
 
