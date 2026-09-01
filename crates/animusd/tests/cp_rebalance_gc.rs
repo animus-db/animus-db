@@ -307,7 +307,7 @@ async fn set_replicas(nodes: &[Node], tablet: TabletId, replicas: &[NodeId]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn moved_off_replica_is_stopped_and_its_scope_erased() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         // 4 nodes, RF=3: kv lands on ids 0..2; node 3 is
         // a spare, so we can move a replica off onto it and leave a stable RF-3 set.
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
@@ -380,7 +380,7 @@ async fn moved_off_replica_is_stopped_and_its_scope_erased() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn release_survives_a_restart_replay() {
     timeout(Duration::from_secs(150), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (nodes, config, dirs) = bring_up(4, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let raftkv_ids = config.data_ids();
@@ -524,7 +524,7 @@ async fn release_survives_a_restart_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_joining_spare_is_never_released() {
     timeout(Duration::from_secs(150), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         // 4 nodes, RF=3: kv on ids 0..2, spare id 3. Kill a replica -> the reconciler
         // moves the tablet onto the spare, which join-hosts a fresh (initially
         // non-voter, empty) group. The release phase must NEVER touch that spare's

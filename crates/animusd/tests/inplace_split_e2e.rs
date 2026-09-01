@@ -339,7 +339,7 @@ async fn paced_writer(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inplace_split_survives_a_paced_continuous_writer_across_fork_and_cutover() {
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_inplace(3, dir.path(), StreamSealKnobs::default()).await;
         await_bootstrap(&nodes).await;
 
@@ -688,7 +688,7 @@ async fn put_item(addr: SocketAddr, table: &str, id: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inplace_split_stream_shard_walks_parent_to_children_without_loss_or_duplication() {
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_inplace(
             3,
             dir.path(),

@@ -133,7 +133,7 @@ fn assert_no_cluster_shape(body: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_paginates_and_visits_every_item_exactly_once() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -236,7 +236,7 @@ async fn scan_paginates_and_visits_every_item_exactly_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_by_partition_key_and_sort_condition() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -315,7 +315,7 @@ async fn query_by_partition_key_and_sort_condition() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_get_delete_item_round_trip() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -432,7 +432,7 @@ async fn put_get_delete_item_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_and_query_a_gsi_by_name() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();

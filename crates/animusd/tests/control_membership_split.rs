@@ -264,7 +264,7 @@ async fn await_voters_everywhere(probes: &[SocketAddr], want: &[u64], secs: u64,
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffic() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // 3 control-only (ids 0,1,2) + 2 data-only (ids 3,4 — ADR 0040 PR1:
         // one identity per node).
         let (control_nodes, data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
@@ -599,7 +599,7 @@ async fn grow_then_replace_a_voter_over_a_split_deployment_with_live_data_traffi
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn admin_add_control_member_races_a_control_only_self_registration_and_still_converges() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // 3 control-only voters, no data-only nodes needed — this race lives
         // entirely inside the control plane's own commit-vs-apply timing.
         let (control_nodes, _data_nodes, _config) = bring_up_split(3, 0, dir.path()).await;

@@ -380,7 +380,7 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn drop_of_an_active_index_on_a_populated_table_reclaims_everything() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
         let dynamo_addr = node.dynamo_addr();
@@ -472,7 +472,7 @@ async fn drop_of_an_active_index_on_a_populated_table_reclaims_everything() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn in_flight_backfill_is_cancelled_by_a_concurrent_drop() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, config) = bring_up(3, dir.path()).await;
         let leader = nodes.iter().position(Node::is_control_leader).unwrap();
         // ADR 0047: `ProposeSchema` is intra-only.
@@ -585,7 +585,7 @@ async fn in_flight_backfill_is_cancelled_by_a_concurrent_drop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn create_drop_recreate_same_index_name_backfills_from_scratch() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, config) = bring_up(3, dir.path()).await;
         let leader = nodes.iter().position(Node::is_control_leader).unwrap();
         // ADR 0047: `ProposeSchema` is intra-only.
@@ -735,7 +735,7 @@ async fn create_drop_recreate_same_index_name_backfills_from_scratch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_and_retry_mid_cascade_still_converges() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, config) =
             support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
         let table = "crash_drop";

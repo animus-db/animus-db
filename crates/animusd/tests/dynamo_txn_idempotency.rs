@@ -215,7 +215,7 @@ async fn read_counter(dynamo_addr: SocketAddr, table: &str, id: &str, attr: &str
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn same_token_same_fingerprint_retry_after_commit_is_cached() {
     let n = 2;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
@@ -253,7 +253,7 @@ async fn same_token_same_fingerprint_retry_after_commit_is_cached() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn same_token_different_actions_is_a_parameter_mismatch() {
     let n = 2;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
@@ -315,7 +315,7 @@ async fn await_tablet_leader_index(config: &ClusterConfig, tablet: u64) -> usize
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn token_dedup_survives_a_leader_failover_of_the_internal_tablet() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -406,7 +406,7 @@ async fn token_dedup_survives_a_leader_failover_of_the_internal_tablet() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn the_internal_table_is_invisible_and_unreachable() {
     let n = 1;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
@@ -640,7 +640,7 @@ async fn drain_shard0_keys(dynamo_addr: SocketAddr, stream_arn: &str) -> Vec<Str
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn same_token_retry_after_a_killed_connection_is_exactly_once_including_the_stream() {
     let n = 2;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr = config.nodes[0].dynamo;
@@ -735,7 +735,7 @@ async fn same_token_retry_after_a_killed_connection_is_exactly_once_including_th
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_participant_leader_kill_racing_a_tokened_transaction_never_falsely_cancels() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;

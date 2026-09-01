@@ -310,7 +310,7 @@ async fn await_pitr_base_snapshot(node: &Node, table: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_to_a_mid_point_second_shows_exactly_the_rows_as_of_then() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (node, config) = start_single_node_fast_pitr(dir.path()).await;
         let addr = config.nodes[0].dynamo;
         let table = "orders";
@@ -387,7 +387,7 @@ async fn restore_to_a_mid_point_second_shows_exactly_the_rows_as_of_then() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deleted_table_pitr_restore_within_the_window_still_works() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (node, config) = start_single_node_fast_pitr(dir.path()).await;
         let addr = config.nodes[0].dynamo;
         let table = "orders";
@@ -430,7 +430,7 @@ async fn deleted_table_pitr_restore_within_the_window_still_works() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_to_point_in_time_error_shapes() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (_node, config) = start_single_node_fast_pitr(dir.path()).await;
         let addr = config.nodes[0].dynamo;
 

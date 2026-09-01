@@ -3280,7 +3280,25 @@ default to a test-sized interval), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
-split-cluster bring-up).
+split-cluster bring-up), **and `support::PanicSafeTempDir`/
+`support::panic_safe_tempdir()` (issue #511)** — the drop-in replacement
+for `tempfile::tempdir().unwrap()`/`TempDir::new().unwrap()` every one of
+the 59 `tests/*.rs` files that already `mod support;` now uses: it leaks
+its directory (`std::mem::forget`) instead of removing it on a
+*panicking* drop, so a mid-test assertion failure can no longer cascade
+into the control-plane WAL's unconditional `.expect("wal append"/"wal
+sync")` panic (`animus-control::node::persist_wal` has no `halted`-gate at
+all — see that crate's own CLAUDE.md entry — and `Drop for Node`
+deliberately only latches CP-group `halted` flags, never aborting the
+still-live background driver tasks a panic's own unwind can race). A
+normal, non-panicking drop is byte-identical to `TempDir`. **Not covered**:
+the ~40 files that never pull in `mod support;` (several hand-roll their
+own bring-up, e.g. `dynamo_index_scan.rs::setup()` — see that function's
+own issue #273 doc) still construct a bare `TempDir` directly and remain
+exposed to the same cascade; `docs/engineering-lessons.md` names the
+mechanism and this file's own doc comment on `PanicSafeTempDir` has the
+full account. Regression (deterministic, no ProdEnv, no timing
+dependency): `tests/panic_safe_teardown.rs`.
 
 ## Benchmark
 

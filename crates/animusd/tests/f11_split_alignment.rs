@@ -174,7 +174,7 @@ async fn put_retry(client: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn manual_split_with_unaligned_key_on_streamed_table_rounds_to_token_boundary() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let nodes = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 

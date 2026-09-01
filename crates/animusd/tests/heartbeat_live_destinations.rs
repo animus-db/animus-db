@@ -206,7 +206,7 @@ async fn join_control_nonvoter(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn heartbeat_reaches_a_runtime_added_voter_after_it_becomes_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // Step 1: a single combined node, id 0 — the control group's sole voter
     // at bring-up. Its `heartbeat_loop_live` starts with a static destination

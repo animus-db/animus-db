@@ -178,7 +178,7 @@ async fn join_data_fresh(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn data_node_joins_a_split_cluster_via_seed_and_gets_a_rebalanced_replica() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. Bring up a split cluster (3 control-only + 2 data-only) and wait for
     // both the control deployment's own leader and the two data nodes'

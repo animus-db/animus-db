@@ -173,7 +173,7 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn drop_table_cascades_to_its_gsis_hidden_table() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(tmp.path(), StorageBackend::default()).await;
         let dynamo_addr = node.dynamo_addr();

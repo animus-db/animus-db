@@ -132,7 +132,7 @@ fn assert_no_cluster_shape(body: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn table_detail_projects_full_configuration() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -237,7 +237,7 @@ async fn table_detail_projects_full_configuration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_and_drop_gsi_round_trip() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -347,7 +347,7 @@ async fn add_and_drop_gsi_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_toggle_round_trips() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -409,7 +409,7 @@ async fn stream_toggle_round_trips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_set_and_clear_round_trips() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -471,7 +471,7 @@ async fn ttl_set_and_clear_round_trips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_table_works() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();

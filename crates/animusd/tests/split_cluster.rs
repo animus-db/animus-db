@@ -148,7 +148,7 @@ fn table_tablets(node: &Node, table: &str) -> Vec<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn control_leader_failover_under_live_data_traffic() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (mut control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
@@ -299,7 +299,7 @@ const SPLIT_KEYS: [(&str, &str); 5] = [
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn split_over_a_split_deployment() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
@@ -373,7 +373,7 @@ async fn split_over_a_split_deployment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn data_node_failure_is_detected_and_repaired_onto_a_spare() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // RF = min(N, 3): 4 data nodes leaves exactly one idle spare once the
         // first table's tablet provisions onto the 3 lowest-id Active members.
         let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
@@ -481,7 +481,7 @@ fn table_with_replica(node: &Node, raftkv_id: animus_env::NodeId) -> Option<Stri
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn decommission_a_data_node_over_split_deployment_via_the_control_leader() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, mut data_nodes, _config) = bring_up_split(3, 4, dir.path()).await;
         await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
@@ -846,7 +846,7 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
     // Generous outer bound: 4 sequential rebinds can each need up to
     // `RESTART_REBIND_TIMEOUT` under heavy contention (see its doc).
     timeout(Duration::from_secs(300), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // A single data node is enough to prove "data re-hosts and re-serves
         // after a full outage" — replication/HA across multiple data nodes is
         // already covered elsewhere in this file; keeping the fleet small
@@ -958,7 +958,7 @@ async fn full_split_cluster_restart_recovers_metadata_and_data() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn control_leader_and_data_node_failure_simultaneously_still_converges() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // RF = min(N,3): 4 data nodes leaves exactly one spare once the
         // first table's tablet provisions onto the 3 lowest-id Active
         // members (mirroring scenario 3), so the killed data replica has
@@ -1168,7 +1168,7 @@ const CROSSOVER_KEYS: [(&str, &str); 5] = [
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn decommission_racing_a_tablet_split_converges_with_no_data_loss() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // RF = min(N,3): 4 data nodes leaves exactly one spare so the
         // decommissioned replica has somewhere for BOTH the split parent and
         // its new child to be repaired onto.

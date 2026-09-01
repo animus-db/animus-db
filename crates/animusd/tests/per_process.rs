@@ -78,7 +78,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
     // documented **port-TOCTOU retry** (`free_addrs` releases the probed ports
     // before `run_node` rebinds them, so a concurrent test binary can steal one;
     // re-allocate fresh ports and retry the bring-up as a unit).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let mut brought_up = None;
     'attempts: for attempt in 0..16 {
         let addrs = support::free_addrs(n * 6);
