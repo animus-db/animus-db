@@ -37,7 +37,7 @@ on:
         required: false
         default: "40"
       split_seeds:
-        description: "Seeds per structural cell (ANIMUS_SPLIT_SEEDS, ADR 0050 split-build corpus)"
+        description: "Seeds per structural cell (ANIMUS_SPLIT_SEEDS, KvCommand::SeedBatch corpus — the row-merge command originally built for the now-deleted copy-based split driver, ADR 0050 Train B, now used by the restore driver, ADR 0059 §7)"
         required: false
         default: "40"
       reconciler_seeds:
@@ -193,10 +193,13 @@ jobs:
           ANIMUS_BACKFILL_SEEDS: ${{ github.event.inputs.backfill_seeds || '40' }}
         run: cargo test -p animus-test --test backfill_fault_corpus -- --nocapture
 
-      # ADR 0050's copy-based split-build corpus: SeedBatch idempotence +
-      # child-replica crash/partition/duplicate-delivery during a build,
-      # scaled to depth. Each cell is a pure function of its seed.
-      - name: deep split-build corpus (ADR 0050 seed/convergence)
+      # KvCommand::SeedBatch corpus: idempotence + child-replica
+      # crash/partition/duplicate-delivery during a row merge, scaled to
+      # depth. Originally built for the now-deleted copy-based split-build
+      # driver (ADR 0050 Train B); SeedBatch's sole surviving consumer is
+      # the restore driver (ADR 0059 §7). Each cell is a pure function of
+      # its seed.
+      - name: deep SeedBatch corpus (ADR 0050 seed/convergence)
         id: split
         continue-on-error: true
         env:

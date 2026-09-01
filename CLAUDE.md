@@ -123,7 +123,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
-| `ANIMUS_SPLIT_SEEDS=K` | 1 | split-build `SeedBatch` corpus depth (`animus-cp-data`, ADR 0050 Train B) |
+| `ANIMUS_SPLIT_SEEDS=K` | 1 | `KvCommand::SeedBatch` corpus depth (`animus-cp-data`) — the version-carrying row-merge command originally built for the now-deleted copy-based split driver (ADR 0050 Train B), its sole surviving consumer is the restore driver (ADR 0059 §7) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
 | `ANIMUS_CONTROL_SEEDS=K` | 1 | control-plane machinery (apply task, schema-catalog exclusivity) fault-injection corpus depth (`animus-control`) |
 | `ANIMUS_INPLACE_SPLIT_SEEDS=K` | 1 | in-place split group-mint-at-apply fault-injection corpus depth (`animus-cp-data`, ADR 0058 Train 2 rung 3) |
@@ -275,9 +275,12 @@ truth; this map is just for navigation.
   0050 — `BeginSplit` mints two `Building` children at placement-chosen
   homes, a driver on the parent's leader copies + tails, a terminal
   `Freeze` stops writes, `CutoverSplit` activates the children and retires
-  the parent) still exists, selectable via `--split-mode copy`, but is
-  deprecated pending deletion (ADR 0058's remaining rung 4 layer); lineage
-  is frozen in `split_lineage` either way. Auto-split triggers on
+  the parent) — and the `--split-mode {copy,inplace}` selector that used to
+  choose between it and the in-place workflow above — was **deleted
+  2026-09-01** (the copy-split-deletion stack, ADR 0058's rung 4 layer),
+  retrievable from git history if ever needed again; in-place fork is now
+  the only split. Lineage is still frozen in `split_lineage`. Auto-split
+  triggers on
   **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never

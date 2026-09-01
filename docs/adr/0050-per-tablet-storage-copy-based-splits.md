@@ -4,7 +4,11 @@
   2026-08-17 as-built amendment at the bottom). **Supersedes [ADR
   0028](0028-shared-storage-single-command-split.md) in full** (both
   halves: the shared per-node engine and the metadata-only zero-copy
-  split).
+  split). **Decision 2 (the copy-based split workflow, Stages 1–5) was
+  itself fully removed 2026-09-01**, superseded in production by [ADR
+  0058](0058-learner-replicas-in-place-split.md)'s in-place split — see the
+  2026-09-01 amendment at the bottom for what survives (Decision 1,
+  `split_lineage`, `SeedBatch`) and what doesn't.
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0002](0002-tablets-unit-of-placement.md) (tablet
   lifecycle: `Building`/`Splitting` states, retire-at-cutover), [ADR
@@ -688,3 +692,46 @@ never re-examined against the layout Decision 1 itself put in place,
 which is what ADR 0058 does. ADR 0058 is **Proposed**, not accepted; this
 ADR's Decision 2 remains the implemented, as-built workflow until (and
 unless) ADR 0058 is accepted and its own rungs land.
+
+## Amendment (2026-09-01) — Decision 2 fully removed
+
+[ADR 0058](0058-learner-replicas-in-place-split.md) was accepted
+(2026-08-25) and its in-place split became `SplitMode`'s default
+(2026-08-25, rung 4 layer 2); as of 2026-09-01, rung 4's remaining layer —
+deleting the copy-based workflow outright — is **done** (a three-layer
+stacked series: Layer A removed every copy-split-pinned test; Layer B1
+removed `animusd`'s side of the workflow — the `SplitBuild` driver,
+`ClientCtx::seed_rows_local`/`seed_child_rows`, the `SeedRows` wire RPC,
+and the `SplitMode`/`--split-mode {copy,inplace}` selector itself; Layer
+B2 removed `animus-control`'s `MetaCommand::BeginSplit` — its enum
+variant, apply arm, mirror arm, and relayable-command classification —
+and collapsed `CutoverSplit`'s apply arm to its sole surviving in-place
+branch). **This ADR's Decision 2 (the `BeginSplit`/build/freeze/
+`CutoverSplit`-retire workflow, Stages 1–5 above) is accordingly no longer
+implemented at all** — every symbol and command this section names is
+gone from the tree, retrievable only from git history. `CutoverSplit`
+itself **survives** as a command name — one apply arm, not two branches —
+now exclusively the in-place workflow's own activation step (ADR 0058
+Train 2 Stage 4, directed by [ADR 0062](0062-fork-first-split-directed-placing.md)'s
+Placing phase).
+
+**What this ADR's other decisions and forks leave behind, still
+load-bearing**: **Decision 1** (per-tablet private engines, `kind ||
+logical_key`, no table/tablet bytes in the physical key) is unconditionally
+still the storage layout — the in-place workflow depends on it exactly as
+this amendment's own 2026-08-24 note already explained, and nothing about
+deleting Decision 2 touches it. **Fork F9** (`Metadata::split_lineage`,
+written at the one immutable moment a split completes) is unconditionally
+still the sole split-provenance record — both the deleted copy-based
+`CutoverSplit` branch and the surviving in-place one wrote it identically,
+and nothing downstream (backup capture's §6 re-planning, PITR replay,
+stream epoch derivation) cared which branch wrote it. **`KvCommand::
+SeedBatch`** (the version-carrying row-merge primitive Decision 2's build
+stage originally proposed for its own bulk/tail passes, fork F3) is also
+unconditionally still alive, `ANIMUS_SPLIT_SEEDS`-corpus-tested — but its
+production caller changed: the deleted split-build driver was its
+original and, until this deletion stack, only caller; the on-demand
+restore driver (`animusd::backup_restore`, [ADR 0059](0059-backup-and-restore.md)
+§7) is now its sole surviving consumer, seeding a restore's destination
+tablet from a backup's captured chunks the identical way the old split
+driver used to seed a fresh child.

@@ -1,19 +1,19 @@
 # ADR 0058 — Learner replicas and in-place tablet split
 
-- **Status:** Accepted — implemented (Trains 1–2, rungs 1–4 layers 1–2, all
-  as-built notes below; accepted by the maintainer merging the
-  implementation stack on 2026-08-25: interim GSI-drain acceleration,
-  learner class + reconciler adoption, SSTable clone, in-place split core,
-  the `--split-mode` driver layer, the rung-4 write-blip fixes, and the
-  rung-4 layer-2 default flip). **`InPlace` is now `SplitMode`'s default
-  everywhere** — `--split-mode copy` still selects the original ADR 0050
-  workflow explicitly. **Rung 4's remaining layer** (delete the ADR 0050
-  build driver, the freeze-as-outage path, and the cutover vetoes now that
-  the copy path is no longer the default) is this ADR's only unimplemented
-  piece. **(2026-09-01 amendment) Rung 4's remaining layer is now in
-  progress, accepted by the maintainer as a G5 gate pass (2026-09-01) for a
-  stacked deletion series (`docs/engineering-lessons.md` has the delivery
-  shape): Layer A (delete every copy-split-pinned test, `tests/
+- **Status:** Accepted — implemented and **complete** (Trains 1–2, rung 4's
+  four layers, all as-built notes below; accepted by the maintainer
+  merging the implementation stack on 2026-08-25: interim GSI-drain
+  acceleration, learner class + reconciler adoption, SSTable clone,
+  in-place split core, the `--split-mode` driver layer, the rung-4
+  write-blip fixes, and the rung-4 layer-2 default flip). **In-place is
+  the sole split mechanism as of 2026-09-01** — the original ADR 0050
+  copy-based workflow, and the `--split-mode` selector that used to choose
+  between the two, are deleted (see the 2026-09-01 as-built note below);
+  `--split-mode copy` no longer exists. **(2026-09-01 amendment) Rung 4's
+  remaining layer, accepted by the maintainer as a G5 gate pass
+  (2026-09-01) for a stacked deletion series (`docs/engineering-lessons.md`
+  has the delivery shape): Layer A (delete every copy-split-pinned test,
+  `tests/
   split_build.rs` included) shipped first; Layer B1 (this rung's own
   scope — delete the entire `animusd`-side copy workflow —
   `SplitBuild`/`split_driver_tick`/`ship`/`ship_all`/`tail_pass`/
@@ -27,7 +27,27 @@
   definition/apply/mirror/relayable-command classification in
   `animus-control` is deliberately untouched by B1 (production-dead,
   compiles) — its deletion is Layer B2's job. Layer C (the remaining root
-  `CLAUDE.md`/this ADR prose sweep) follows once B2 lands.** **(2026-08-31
+  `CLAUDE.md`/this ADR prose sweep) follows once B2 lands.**
+  **(2026-09-01 as-built note — rung 4's remaining layer is DONE.)**
+  Layer B2 (`claude/copy-split-del-B2-control`, stacked on Layer B1's
+  `claude/copy-split-del-B1-animusd`, itself stacked on Layer A) deleted
+  `MetaCommand::BeginSplit` itself — the enum variant, its apply arm, its
+  mirror arm, and its `is_relayable_command` classification
+  (`animus-control::meta`/`mirror`, `animus-node::wire`) — and collapsed
+  `CutoverSplit`'s apply arm to its sole surviving (in-place) branch: a
+  `Splitting` parent carrying no `InPlaceSplitIntent` is now structurally
+  unreachable (`BeginSplitInPlace` is the only path into `Splitting`), so
+  that case is rejected defensively rather than trusted with an
+  `.expect()`. Layer C (this amendment, plus the matching sweep of root
+  `CLAUDE.md`, `docs/adr/0050-*.md`, `docs/engineering-lessons.md`, and the
+  `animus-control`/`animus-cp-data` crate guides) closes out the same
+  stack. The full series, bottom to top: **Layer A** (delete every
+  copy-split-pinned test), **Layer B1** (`animusd`'s copy-workflow driver +
+  `SplitMode` selector), **Layer B2** (`animus-control`'s `BeginSplit`
+  itself + this doc sweep). The copy-based split workflow (ADR 0050's
+  `BeginSplit`/build driver/freeze/`CutoverSplit`'s copy branch) is now
+  **fully deleted**, retrievable from git history; the in-place fork (ADR
+  0058 Train 2, directed by ADR 0062) is the sole split mechanism. **(2026-08-31
   amendment) Train 2 Stage 1/2 — the fused split+move
   half of fork F5, where `BeginSplitInPlace` recruits both children's
   *final* homes as learners on the parent before it can ever fork — is
@@ -730,8 +750,9 @@ Train 2's single-entry mint.
    ADR 0050's own Train B used. **As-built: split into layers** — layer 1
    (eager child materialization, closing the write-blip tail) and layer 2
    (flip `SplitMode`'s default to `InPlace`, below) landed first, with the
-   copy path kept fully selectable; the deletion itself is this rung's
-   remaining, still-unstarted layer.
+   copy path kept fully selectable; the deletion itself followed as its own
+   stacked series (Layers A/B1/B2, **done** as of 2026-09-01 — see the
+   as-built note near the top of this ADR).
 
 **Independent of this sequencing**, the interim GSI-drain endgame
 acceleration (Alternative 1 — an acceleration, deliberately *not* a bound;

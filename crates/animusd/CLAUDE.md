@@ -1126,12 +1126,11 @@ were deleted whole in the copy-split-deletion endgame's Layer B1**
 {copy,inplace}` are all gone; `tests/split_build.rs` was deleted earlier,
 in Layer A. `ClientCtx::trigger_split` now unconditionally proposes
 `MetaCommand::BeginSplitInPlace` — see its own doc, `schema.rs`.
-`MetaCommand::BeginSplit`/`split_child_placement`'s fork F5 placement-at-
-mint logic are production-dead pending Layer B2's deletion of `BeginSplit`
-itself, but the type still compiles (relayable-command classification,
-apply, mirror). `animus_control::select_replicas_balanced` (the placement
-primitive `split_child_placement` used to call) stays in `animus-placement`
-— also production-dead now, kept since nothing in this layer's scope
+`MetaCommand::BeginSplit` itself (and `split_child_placement`'s fork F5
+placement-at-mint logic) was deleted in Layer B2. `animus_control::
+select_replicas_balanced` (the placement primitive `split_child_placement`
+used to call) stays in `animus-placement` — production-dead now, kept
+since nothing in this layer's scope
 justified touching that crate. What follows below is the **in-place**
 workflow, which was always independent of the copy-based one apart from
 sharing `trigger_split`'s choke point and (until Layer B1) the GSI-drain/

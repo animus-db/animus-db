@@ -7872,23 +7872,12 @@ debugging anything that feels like it might have happened before.
   own follower-connected regression
   (`cql::cql_kind_write_tests::cql_whole_partition_delete_serves_from_every_node`,
   red on the two-implementation code with exactly the diagnosed refusal).
-- **A change-log consumer's resume cursor must be a commit-order (HLC)
-  watermark, never a key-position cursor** (ADR 0050 rung 4, the
-  split-build tail). `pending_changes`' key order is prefix-then-HLC, NOT
-  commit order — a later write to a *lower* prefix inserts *below* any
-  key-position cursor and is skipped forever. The sealer learned this once
-  (its load-bearing re-sort in `seal_now`, recorded only as a code
-  comment); the split-build driver re-made the identical mistake with a
-  "resume after the last key I saw" cursor, caught red by its own e2e
-  (`split_build.rs`, 4 of 16 racing writes silently missing while the
-  build reported converged). Within one tablet, HLC order IS commit order
-  (`assert_ts_monotonic`), so filtering the scan by a packed-HLC watermark
-  (the key's own trailing 8 bytes) is complete where any key cursor is
-  not. Advance the watermark only after the tick's work fully succeeds, or
-  a failed ship loses its dirty set. General form: before giving any
-  key-ordered scan a positional resume cursor, ask what order NEW entries
-  arrive in — if insertion order ≠ scan order, a positional cursor is a
-  silent-loss bug.
+- **General form (mechanism superseded): before giving any key-ordered scan
+  a positional resume cursor, ask what order NEW entries arrive in — if
+  insertion order ≠ scan order, a positional cursor is a silent-loss bug.**
+  Originally learned from the now-deleted copy-based split-build driver's
+  own tail cursor; see `docs/engineering-lessons-archive.md`'s "The
+  copy-based split-build driver" section for the full incident.
 - **A success ack that confirms a metadata commit does not confirm the
   asynchronous machinery that commit triggers — a client-facing "created"
   reply must wait for *serveability*, not hand the client the formation
@@ -8004,40 +7993,17 @@ debugging anything that feels like it might have happened before.
   quietly vanish — grep for it explicitly rather than assuming the
   unification preserved it.
   (`crates/animusd/src/lib.rs::cp_kind_write_item`, `cp_kind_write_raw`.)
-- **A batched fast path plus an unbatched incremental path over the same
-  data is a performance bug waiting for its first big input — the
-  incremental one silently costs one round trip per ITEM where its sibling
-  costs one per MEGABYTE** (ADR 0050's split build, 2026-08-19). The bulk
-  copy pass batched rows into 256 KB `SeedBatch` chunks; the tail pass that
-  chases writes arriving during the copy called the very same `ship()`
-  helper *inside its per-dirty-unit loop*, so every partition key bought a
-  full consensus round + apply-confirm (plus a forwarded hop for an
-  off-node child). Both paths looked correct and shared the same primitive
-  — the batching lived in the caller, and only one caller did it. Made
-  vastly worse by a second, independent conservatism: the tail's watermark
-  started at 0, so its FIRST pass classified every change record in the log
-  as dirty and re-shipped the whole table one key at a time, every merge an
-  idempotent no-op. Together: on a 20,000-row split, ~6,000 no-op Raft
-  entries per child and ~85% of the build's wall clock spent re-copying
-  data it already had — while the children's key counts sat visibly flat.
-  **The generalizable rules.** (1) When one loop batches and a sibling loop
-  over the same rows doesn't, that asymmetry is the bug — an accumulate-
-  and-flush-on-budget shape is usually a few lines and needs no semantic
-  argument, because an idempotent, versioned batch doesn't care where the
-  chunk boundaries fall. (2) A "safe" zero/empty starting watermark is not
-  free when a cheap, *sound* starting value is available from a pass the
-  code already makes: this one was recoverable from the same pre-bulk
-  read that already computed the version floor, under the identical
-  monotonicity argument. Ask what the conservative default actually costs
-  on the first large input, not whether it's correct. **The diagnostic
-  that made it obvious in minutes**: one consensus entry == one Raft log
-  index, so a receiver's own `commit_index` growth divided by rows
-  received IS the effective batch size — visible from `/admin/raftkv`
-  with no instrumentation, and it turned "the split feels slow" into
-  "6,000 entries moved 0 rows." That ratio is now the regression's
-  assertion, too: an entry-count budget catches a re-introduced per-row
-  ship where a wall-clock assertion would just go flaky.
-  (`crates/animusd/src/index_drain.rs::tail_pass`, `split_driver_tick`.)
+- **General form (mechanism superseded): when one loop batches and a
+  sibling loop over the same rows doesn't, that asymmetry is the bug — and
+  a "safe" zero/empty starting watermark is not free when a cheap, sound
+  starting value is available from a pass the code already makes.**
+  Originally learned from the now-deleted copy-based split-build driver's
+  own tail-pass/bulk-pass batching asymmetry; see
+  `docs/engineering-lessons-archive.md`'s "The copy-based split-build
+  driver" section for the full incident (including the diagnostic that
+  made it obvious: one consensus entry == one Raft log index, so
+  `commit_index` growth divided by rows received IS the effective batch
+  size).
 
 - **Adding a variant to `animus-dynamo::wire::Operation` breaks `animusd`'s
   exhaustive `match op { .. }` dispatch by construction — that's a downstream
@@ -8168,44 +8134,18 @@ debugging anything that feels like it might have happened before.
   previously untested cancellation path), but selling it as a 2x win would
   have been false.
   (`crates/animusd/src/index_drain.rs::ship_all`.)
-- **A crate's own gotcha bullet can itself go stale — verify a "the log
-  index is the version" premise against the primary source before trusting
-  it enough to build on (2026-08-19).** Tasked with dropping the split
-  driver's version-floor pre-pass scan (`index_drain.rs`) in favor of an
-  O(1) `group.engine_applied_index()` read, on the stated premise "CP
-  writes need no client-assigned version — the Raft log index *is* the
-  MVCC version" (verbatim, then-current text of this crate's own
-  `CLAUDE.md`). That premise was true once but had been superseded over a
-  year earlier: ADR 0018 §2/PR2 (2026-08-11) retired the Raft-index MVCC
-  encoding and replaced it with a packed HLC commit timestamp
-  (`hlc::pack(ts) = wall_ms << 20 | logical`) — a completely different
-  value space from a Raft log index (wall-clock milliseconds vs. an entry
-  count), so the proposed substitution was unsound in both directions:
-  under real workloads it would under-filter back to the exact unfiltered-
-  final-image regression a prior rung of the same ADR had fixed, buying
-  nothing for a known cost. (A first draft of this entry also claimed it
-  could *over-filter* under `SimEnv`; that was withdrawn on review —
-  `animusd` has no `animus-sim` dependency, so this driver never runs
-  under a simulated clock. Reviewing your own supporting arguments as
-  hard as the conclusion is part of the lesson: the conclusion held, one
-  of its three legs did not.) The tell was
-  in the *type* the target field held (`ts: HlcTimestamp` on every
-  `KvCommand` variant, `KvCommand`'s own doc comment naming `hlc::pack` as
-  "the engine's MVCC version at apply") — one grep away from the code the
-  premise was supposedly about, and a mismatch the crate's own summary
-  bullet had quietly drifted away from. **Rule:** before implementing an
+- **General form (mechanism superseded): before implementing an
   optimization whose soundness rests on an invariant stated only in a
   summary doc (a `CLAUDE.md` gotcha bullet, a one-line ADR recap), grep the
   actual type/field the invariant is about and read its own doc comment —
   the summary is a pointer, not the source, and it can lag the code by
-  exactly as long as nobody happened to need that bullet to be right. This
-  generalizes the existing "before implementing a 'close this documented
+  exactly as long as nobody happened to need that bullet to be right.**
+  Generalizes the existing "before implementing a 'close this documented
   gap' task, grep the code" rule (root `CLAUDE.md`) to invariants, not just
-  missing-feature claims. Found and corrected in the same change that
-  fixed the stale bullet (`crates/animusd/CLAUDE.md`'s "CP writes need no
-  client-assigned version" entry) and recorded the rejected optimization
-  (ADR 0050's 2026-08-19 "investigated and rejected" amendment) so it
-  isn't re-attempted on the same false premise.
+  missing-feature claims. Originally learned investigating (and rejecting)
+  a proposed version-floor optimization on the now-deleted copy-based
+  split-build driver; see `docs/engineering-lessons-archive.md`'s "The
+  copy-based split-build driver" section for the full incident.
 - **A cross-task veto fed by a periodic sweep needs a freshness contract
   expressed in the same value space the consumer already gates on — a
   wall-clock stamp compared against an activity marker is not equivalent, even
@@ -8418,42 +8358,49 @@ debugging anything that feels like it might have happened before.
 - **A convergence veto that guards a correctness property must be
   accelerated, never bounded or bypassed — the bound belongs on the *load*
   that's slow to drain, not on the gate itself (issue #288).** The
-  split-cutover GSI-drain veto (`index_drain.rs::split_driver_tick`
-  stage 3a) blocks `CutoverSplit` until the parent's `"gsi"` cursor reaches
-  the highest pending change record — because cutover retires the parent and
-  the reconciler reclaims its engine outright (no drain-before-halt exists
-  post-ADR-0044, see `animus-cp-data/CLAUDE.md`'s "Superseded by ADR 0044"
-  entry), so firing
+  frozen-endgame GSI-drain veto blocks `CutoverSplit` until the parent's
+  `"gsi"` cursor reaches the highest pending change record — because
+  cutover retires the parent and the reconciler reclaims its engine
+  outright (no drain-before-halt exists post-ADR-0044, see
+  `animus-cp-data/CLAUDE.md`'s "Superseded by ADR 0044" entry), so firing
   cutover past an un-drained cursor would silently lose GSI updates forever
   (children are born with empty change logs by design). An unthrottled write
   flood racing the split made this veto converge too slowly (several
   10s-of-seconds retries under load, see the "unthrottled continuous write
   flood" entry above) — but the correct fix was never to loosen the veto
-  (e.g. force cutover after N stalled ticks, mirroring `SPLIT_MAX_TAIL_
-  PASSES`'s bounded chase for the *build* phase). `SPLIT_MAX_TAIL_PASSES`
-  is safe to bound because its own correctness never depended on the lag
-  being zero (the post-freeze final drain + final image still transfer
-  everything regardless of the bound); the GSI-drain veto's correctness
-  *is* exactly "the lag is zero" — there is no compensating post-cutover
+  (e.g. force cutover after N stalled ticks, the shape the now-deleted
+  copy-based split-build driver's own bounded tail-pass chase used for the
+  *build* phase, safe there only because that phase's correctness never
+  depended on the lag being zero). The GSI-drain veto's correctness *is*
+  exactly "the lag is zero" — there is no compensating post-cutover
   mechanism, so a bound here would be a straightforward data-loss bug, not
-  a liveness relaxation. The sound fix exploits a fact the *build* phase
-  doesn't have: once the parent is frozen (Freeze rejects every later user
-  write), the backlog this veto watches is fixed, not growing — so driving
-  the drain to exhaustion in a tight loop, right there in the frozen
-  endgame, has zero fairness cost and only removes the artificial one-tick
-  (`INDEX_DRAIN_INTERVAL`, 200ms) lag between "a drain pass makes progress"
-  and "the veto notices," including surviving a transient propose failure
-  under load without waiting a full extra tick to retry it. **General rule**:
-  before touching a gate that's "too slow to satisfy," classify it — is the
-  gate a correctness invariant (something bad happens if you proceed before
-  it holds) or a liveness heuristic (nothing unsafe happens, it's just an
-  imperfect proxy for "caught up")? Only the second kind may ever grow a
-  bounded-chase escape hatch; the first kind's only legal fix is making the
-  thing it's waiting on happen faster, exploiting whatever makes the wait
-  bounded now (here: the parent going static at freeze) rather than relaxing
-  what "caught up" means.
-  (`crates/animusd/src/index_drain.rs::split_driver_tick`,
-  `FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`.)
+  a liveness relaxation. The sound fix exploits a fact the copy-based
+  build phase didn't have: once the parent is frozen (in-place: once its
+  own single-entry fork has committed and both children are already fully
+  formed), the backlog this veto watches is fixed, not growing — so
+  driving the drain to exhaustion in a tight loop, right there in the
+  frozen endgame, has zero fairness cost and only removes the artificial
+  one-tick (`INDEX_DRAIN_INTERVAL`, 200ms) lag between "a drain pass makes
+  progress" and "the veto notices," including surviving a transient
+  propose failure under load without waiting a full extra tick to retry
+  it. **General rule**: before touching a gate that's "too slow to
+  satisfy," classify it — is the gate a correctness invariant (something
+  bad happens if you proceed before it holds) or a liveness heuristic
+  (nothing unsafe happens, it's just an imperfect proxy for "caught up")?
+  Only the second kind may ever grow a bounded-chase escape hatch; the
+  first kind's only legal fix is making the thing it's waiting on happen
+  faster, exploiting whatever makes the wait bounded now, rather than
+  relaxing what "caught up" means. **Still live, still following this
+  rule**: the acceleration mechanism itself (`gsi_caught_up`/
+  `FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) survived the copy-based driver's
+  own deletion — the in-place split's own frozen-endgame driver
+  (`index_drain.rs::inplace_split_driver_tick`) is now its sole caller,
+  applying the identical acceleration to the identical veto ahead of its
+  own `CutoverSplit` propose. Only the copy-based build-phase counterexample
+  (`SPLIT_MAX_TAIL_PASSES`, the bounded chase this entry originally
+  contrasted against) is gone; see
+  `docs/engineering-lessons-archive.md`'s "The copy-based split-build
+  driver" section for that original text verbatim.
 - **A field added to a shared, generic type (`RaftCore<C, S>`'s `LogEntry`/
   `RaftMsg`) needs a matching update at every *hand-rolled* encoder for it,
   not just wherever `#[derive(Serialize, Deserialize)]` already covers it —
@@ -9783,39 +9730,20 @@ debugging anything that feels like it might have happened before.
   land," burning the full timeout on the latter converts transient churn
   into stacked client stalls that read as unavailability.
 
-- **A retry loop whose "retry" recomputes from unchanged inputs is a spin,
-  not a retry — and only a cluster LARGER than the replication factor can
-  prove a tablet-id-addressed forward** (ADR 0050 fork F5 fallout,
-  2026-08-17). Every tablet-id-addressed internal RPC (`SeedRows`,
-  `ForceSeal`, `TriggerAutoSplit`, `ClearBackfillCursor`, `StreamHotRead`)
-  used a resolve → relay-once → on-"not the leader here"-refusal
-  re-resolve-from-scratch loop, and one even documented that shape as
-  "correct (converged-or-timeout)". It converges only when the calling
-  node hosts a replica of the target tablet: the local replica's own
-  leader hint is what changes between iterations. With **no** local
-  replica, `resolve_cp_route`'s fallback deterministically returns the
-  tablet's *first* metadata replica every time, that follower refuses
-  with the real leader's address embedded in the refusal every time, and
-  the loop threw that hint away every time — an infinite spin dressed as
-  a retry. The split driver hit it the first time anyone ran a split on a
-  cluster with more nodes than RF: fork F5 places children at fresh
-  balance-chosen homes, so the parent's leader routinely hosts no replica
-  of one child, and seeding that child spun forever — the parent parked
-  `Splitting` holding every key with an empty `Building` child beside it,
-  indefinitely (the "auto-split made 2 new tablets but never rebalanced
-  the keys" field report). Every split e2e ran 3-node clusters at RF 3,
-  where every node hosts every tablet and the no-local-replica branch is
-  structurally unreachable. Two general forms: (1) for any retry loop,
-  name the input that CHANGES on a failed attempt — if the answer is
-  "none", it is a spin, and the fix is feeding the failure's own payload
-  (here: the refusal's leader hint) back into the next attempt, done once
-  at a shared choke point (`forward_to_tablet_leader`, now backing
-  `cp_forward` and every tablet-addressed RPC alike); (2) the existing
-  "test through a follower-connected node" rule is not enough for
-  tablet-addressed forwards — the caller must host *no replica at all* of
-  the target, which requires a cluster larger than RF
-  (`split_build.rs::split_completes_when_a_child_lives_off_the_parent_leader_node`
-  is the 5-node teeth).
+- **General form (mechanism superseded): for any retry loop, name the
+  input that CHANGES on a failed attempt — if the answer is "none," it is
+  a spin, not a retry, and the fix is feeding the failure's own payload
+  back into the next attempt, done once at a shared choke point. And: the
+  existing "test through a follower-connected node" rule is not enough for
+  a tablet-addressed forward — the caller must host *no replica at all* of
+  the target, which requires a cluster LARGER than the replication factor
+  to prove at all.** Originally learned from the now-deleted copy-based
+  split driver's own fork-F5 seeding hint-chase (`SeedRows` spinning
+  forever against a freshly-placed, off-node child); the fix — feeding a
+  refusal's own leader hint back into the next attempt at one shared choke
+  point — is still exactly what `forward_to_tablet_leader` does today for
+  every tablet-addressed RPC. See `docs/engineering-lessons-archive.md`'s
+  "The copy-based split-build driver" section for the full incident.
 
 - **An in-crate `#[cfg(test)]` bring-up (one that can't reach
   `tests/support`) needs the documented port-TOCTOU retry exactly as much
