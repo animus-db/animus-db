@@ -503,28 +503,25 @@ retrievable from git history.)
   `kill_sealing_leader`, `store_outage_then_heal`, `disable_grace_drain`;
   the five zero-copy-split cells — `split_mid_stream`, the #216/#220
   regressions, `combined_chaos` — died in ADR 0050 Train B rung 2 with the
-  in-place lineage they modeled, see the file's tombstone; their
-  copy-based successors landed in rung 6: `copy_split_children_born_empty`
-  (sealed history + backlog → final seal → cutover-frozen `split_lineage`
-  → children with EMPTY change logs sealing their own epoch 0,
-  exactly-once across the walk) and
-  `copy_split_endgame_survives_seal_faults` (the final seal crashing
-  between `put` and catalog commit, then a store outage, then healing —
-  the identical epoch lands on retry; the fidelity boundary — the animusd
-  driver itself is `split_build.rs`/`streams_e2e.rs`'s subject — is
-  stated in the cells' own section doc) plus a
+  in-place lineage they modeled, see the file's tombstone) plus a
   dedicated `durability_invariant_holds_at_every_kill_point` scenario
   (ADR 0042 §9, D9): a scripted seal lifecycle with a modeled crash between
   the segment `put` and the catalog commit, asserting every acked write
   stays recoverable (from hot Raft state or a committed segment) at every
   kill point — this corpus never implements retention (that's `animusd::
   segment_janitor`'s own `ProdEnv` suite, `stream_janitor.rs`), so nothing
-  here is ever expected to answer `TrimmedDataAccess`. Depth knob
-  `ANIMUS_STREAM_SEEDS` (default 1 = the frozen cells; held green at
-  `=40`, matching `corpus-deep.yml`'s nightly tier).
+  here is ever expected to answer `TrimmedDataAccess`. **The rung-6
+  copy-based split successors these cells once sat beside —
+  `copy_split_children_born_empty`/`copy_split_endgame_survives_seal_
+  faults` — were deleted by the copy-mode-split deletion stack** once
+  cells 11/12 below verified the identical lineage/durability claims on
+  the DEFAULT production split path; `--split-mode copy` itself is still
+  selectable pending its own removal, but nothing in this file exercises
+  it any more. Depth knob `ANIMUS_STREAM_SEEDS` (default 1 = the frozen
+  cells; held green at `=40`, matching `corpus-deep.yml`'s nightly tier).
 - **Cells 11/12 (ADR 0058 Train 2 rung 3) rebuild the SAME lineage/
-  durability claims on the DEFAULT production split path — the in-place
-  atomic fork — alongside (never replacing) the copy-based cells above**:
+  durability claims the deleted rung-6 copy-based cells once carried, on
+  the DEFAULT production split path — the in-place atomic fork**:
   `inplace_split_lineage_frozen_at_fork` (sealed history + backlog, sealed
   in FULL before the fork — the fork is atomic, so there is no
   "meanwhile" window to interleave a seal into the way the copy-based
@@ -533,25 +530,25 @@ retrievable from git history.)
   the in-place branch carries no freeze/veto gate of its own → both
   children EMPTY change logs, sealing their own epoch 0, exactly-once
   across the walk) and `inplace_split_races_an_open_seal` (the identical
-  seal-crash/store-outage/healed-retry fault sequence
-  `copy_split_endgame_survives_seal_faults` injects, applied to the
-  parent's FINAL seal right before `BeginSplitInPlace` — the retried
-  seal's epoch is what the frozen `split_lineage` names). Unlike the
-  copy-based cells (a control-metadata-only `BeginSplit`/`CutoverSplit`,
-  the parent hosted directly via this file's own `start_group`), the
-  in-place fork is materialized by `animus_cp_data::host::Reconciler`, so
-  both cells build a small `InplaceCluster` of `Reconciler<SimEnv,
-  MemoryEngine>` instances and drive it to convergence at each stage via a
-  local `tick_one`/`converge` pair (adapted from this file's own
-  pre-existing `drive`, mirroring `animus-cp-data/tests/
-  inplace_split_reconciler.rs`'s and `backfill_fault_corpus.rs`'s own
-  identical harness shape for the SAME mechanism) — `wrap_group` then
-  clones the reconciler-hosted `RaftKvNode` handles back into this file's
-  own plain `Group` so every pre-existing helper
-  (`elect`/`write_and_journal`/`seal_now`/`verify_lineage`, …) runs on the
-  reconciler-hosted parent or a split child completely unmodified. Both
-  cells held clean at `ANIMUS_STREAM_SEEDS=300` with no regression to the
-  other ten cells in the file — no exactly-once/ordering/lineage violation
+  seal-crash/store-outage/healed-retry fault sequence the deleted
+  `copy_split_endgame_survives_seal_faults` cell used to inject, applied
+  to the parent's FINAL seal right before `BeginSplitInPlace` — the
+  retried seal's epoch is what the frozen `split_lineage` names). Unlike
+  the deleted copy-based cells (a control-metadata-only `BeginSplit`/
+  `CutoverSplit`, the parent hosted directly via this file's own
+  `start_group`), the in-place fork is materialized by
+  `animus_cp_data::host::Reconciler`, so both cells build a small
+  `InplaceCluster` of `Reconciler<SimEnv, MemoryEngine>` instances and
+  drive it to convergence at each stage via a local `tick_one`/`converge`
+  pair (adapted from this file's own pre-existing `drive`, mirroring
+  `animus-cp-data/tests/inplace_split_reconciler.rs`'s and
+  `backfill_fault_corpus.rs`'s own identical harness shape for the SAME
+  mechanism) — `wrap_group` then clones the reconciler-hosted `RaftKvNode`
+  handles back into this file's own plain `Group` so every pre-existing
+  helper (`elect`/`write_and_journal`/`seal_now`/`verify_lineage`, …) runs
+  on the reconciler-hosted parent or a split child completely unmodified.
+  Both cells held clean at `ANIMUS_STREAM_SEEDS=300` with no regression to
+  the other cells in the file — no exactly-once/ordering/lineage violation
   surfaced; the in-place split's interaction with stream sealing behaves
   exactly as designed.
 - **A real bug this corpus found while being built** (not in the streams
@@ -712,14 +709,20 @@ retrievable from git history.)
   crash_restart` (a **true process restart** — `sim.stop` + a fresh
   `RaftKvNode::start_hosted` on the same id and the same durable
   `MemoryEngine`, mirroring `raftkv_linearizable.rs`'s own `StopRestart`
-  nemesis — as opposed to the previous cell's live-but-muted crash),
-  `split_races_capture_and_replans_onto_descendants` (the named §6
-  scenario: a split cuts over mid-capture, the parent's own unfinished
-  progress is simply abandoned, and each child restarts its own share from
-  scratch — `SplitPolicy::RestartFromScratch`), and `store_faults_ack_
-  lost_puts_still_converge` (`SimSegmentStore`'s existing ack-lost-put
-  fault, at probability 0.5). A sixth cell, `a_wedged_capture_fails_after_
-  the_stuck_timeout`, proves the aggregator's own stuck-`Creating` mark
+  nemesis — as opposed to the previous cell's live-but-muted crash), and
+  `store_faults_ack_lost_puts_still_converge` (`SimSegmentStore`'s existing
+  ack-lost-put fault, at probability 0.5). **Cell 4
+  (`split_races_capture_and_replans_onto_descendants`, the copy-based §6
+  scenario) and cell 4b (`backup_started_mid_copy_split_build_pins_only_
+  the_parent`, a regression for a race window — parent `Splitting` + two
+  `Building` children live simultaneously — that in-place split
+  structurally cannot hit, since the fork is atomic with no build phase)
+  were both deleted by the copy-mode-split deletion stack**: cell 4's own
+  §6 claim is superseded verbatim by cell 14 below; cell 4b's own race
+  window has no in-place counterpart to port to, so it was simply removed
+  once `--split-mode copy` itself became deprecated. A sixth cell,
+  `a_wedged_capture_fails_after_the_stuck_timeout`, proves the aggregator's
+  own stuck-`Creating` mark
   phase directly against the sim's virtual `Clock` (env-time, deterministic
   — this corpus's own reimplementation is not bound by `animusd`'s real
   `tokio::time::Instant`, which this crate can't reach anyway) — both that
@@ -774,9 +777,13 @@ retrievable from git history.)
   corpus's scenarios never call the per-node `shutdown()` that sets
   `halted`, so firing either on a live node hard-panics the test process.
 - **Cell 14 (ADR 0058 Train 2 rung 3) rebuilds the §6 re-planning claim on
-  the DEFAULT production split path — the in-place atomic fork — alongside
-  (never replacing) `split_races_capture_and_replans_onto_descendants`'s
-  own copy-based cell above**: `inplace_split_races_capture_and_replans_
+  the DEFAULT production split path — the in-place atomic fork.** Originally
+  built alongside (never replacing) a copy-based sibling cell
+  (`split_races_capture_and_replans_onto_descendants`, deleted by the
+  copy-mode-split deletion stack once this cell verified the identical
+  claim; this repo's corpus doctrine still keeps a scenario forever once
+  added, which is why this cell — the surviving proof — remains):
+  `inplace_split_races_capture_and_replans_
   onto_descendants` cuts over deliberately before the parent's own capture
   finishes (`CutoverSplit`'s in-place branch carries no freeze/veto gate of
   its own), then proves the identical §6 claim — the manifest's authoritative
@@ -789,11 +796,11 @@ retrievable from git history.)
   reads `Metadata::split_lineage`, entirely split-mechanism-agnostic, so
   swapping the trigger for `BeginSplitInPlace`/`CutoverSplit` driven through
   `animus_cp_data::host::Reconciler` (the same local `tick_one`/`converge`
-  pair the two sibling ports use) is the whole port — and real in-place
+  pair the two sibling ports use) was the whole port — and real in-place
   fork+materialize clones+trims each child's own share of the parent's data
-  automatically, eliminating the copy-based cell's manual per-row copy loop
-  entirely rather than merely relocating it. Held clean at
-  `ANIMUS_BACKUP_SEEDS=300` with no regression to the other twelve cells in
+  automatically, eliminating the deleted copy-based cell's manual per-row
+  copy loop entirely rather than merely relocating it. Held clean at
+  `ANIMUS_BACKUP_SEEDS=300` with no regression to the other cells in
   the file — no §6/double-count violation surfaced; the in-place split's
   interaction with backup capture behaves exactly as designed.
 

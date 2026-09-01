@@ -545,32 +545,6 @@ fn begin_backup(meta: &mut Metadata, backup_id: &str, wall_ms: u64) {
     );
 }
 
-fn split_tablet(meta: &mut Metadata, source: TabletId, split_key: Vec<u8>, new_id: TabletId) {
-    let expected_epoch = meta.tablets[&source].epoch;
-    let replicas = meta.tablets[&source].replicas.clone();
-    assert_eq!(
-        meta.apply(&MetaCommand::BeginSplit {
-            parent: source,
-            expected_epoch,
-            split_key,
-            children: [
-                (new_id, replicas.clone()),
-                (TabletId(new_id.0 + 1), replicas),
-            ],
-        }),
-        ApplyOutcome::Applied
-    );
-    let bumped = meta.tablets[&source].epoch;
-    assert_eq!(
-        meta.apply(&MetaCommand::CutoverSplit {
-            parent: source,
-            expected_epoch: bumped,
-            cutover_wall_ms: 1_000,
-        }),
-        ApplyOutcome::Applied
-    );
-}
-
 // --- verification (ADR 0059 §5, "committed values only") ------------------
 
 /// Every row this backup's own data objects hold, decoded directly —
@@ -1098,293 +1072,6 @@ fn capture_driver_node_crash_restart() {
     for_each_seed(
         "capture_driver_node_crash_restart",
         scenario_capture_driver_node_crash_restart,
-    );
-}
-
-// --- cell 4: split_races_capture_and_replans_onto_descendants (ADR 0059 §6) -
-
-/// The named §6 scenario: a split cuts over **while capture is still in
-/// flight** on the parent. The parent's own (never completed) cursor/chunks
-/// are simply abandoned; each child restarts its own capture from scratch
-/// over its own narrower range (`SplitPolicy::RestartFromScratch`, real
-/// `Metadata::backup_capture_target`/`live_split_descendants` decide who
-/// the live targets are) — the manifest's own `tablet_progress` ends up
-/// naming the two children, never the retired parent, and the union of
-/// what they each captured is exactly the parent's original row set with
-/// no row ever double-counted (each child only ever holds its own
-/// half-range's rows, copied here directly rather than through a real
-/// `SeedBatch` — the split-build driver's own mechanics are out of this
-/// corpus's scope, proven elsewhere, ADR 0050).
-fn scenario_split_races_capture_and_replans_onto_descendants(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let parent_engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
-    let parent = start_group(&sim, &parent_engines, TabletId(1), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-
-    // Rows straddling the split key `"m..."` — half fall left, half right.
-    let mut model = BTreeMap::new();
-    let leader = elect(&mut sim, &parent, &live, seed);
-    for pk in ["a001", "a002", "a003", "z001", "z002", "z003"] {
-        let value = format!("v-{pk}").into_bytes();
-        write_base_row(&mut sim, &parent.nodes[leader], pk.as_bytes(), &value);
-        model.insert(logical(pk.as_bytes()), value);
-    }
-    begin_backup(&mut meta, "backup-1", 1_000);
-
-    // The parent makes SOME progress before the split lands.
-    let leader = elect(&mut sim, &parent, &live, seed);
-    backup_capture_tick(
-        &mut sim,
-        &parent.nodes[leader],
-        &parent.range,
-        &store,
-        "backup-1",
-        parent.id,
-        seed,
-    );
-    assert!(
-        !meta
-            .backup_manifest_tablet_progress("backup-1")
-            .iter()
-            .any(|(_, p)| p.is_some()),
-        "[seed={seed}] the parent must not have finished before the split"
-    );
-
-    let split_key = b"m".to_vec();
-    split_tablet(&mut meta, TabletId(1), split_key.clone(), TabletId(2));
-    let (left_id, right_id) = (TabletId(2), TabletId(3));
-    assert!(!meta.tablets.contains_key(&TabletId(1)));
-    assert!(meta.backup_capture_target("backup-1", left_id));
-    assert!(meta.backup_capture_target("backup-1", right_id));
-    assert!(!meta.backup_capture_target("backup-1", TabletId(1)));
-
-    // Materialize each child's own copied share directly (the split-build
-    // driver's own SeedBatch mechanics are out of scope here) — every row
-    // whose logical key falls in the child's own range.
-    let left_range = KeyRange::new(Vec::new(), Some(split_key.clone()));
-    let right_range = KeyRange::new(split_key, None);
-    let left_engines = engines();
-    let right_engines = engines();
-    let left = start_group(&sim, &left_engines, left_id, left_range.clone());
-    let right = start_group(&sim, &right_engines, right_id, right_range.clone());
-    sim.run_for(Duration::from_secs(2));
-    let ll = elect(&mut sim, &left, &live, seed);
-    let rl = elect(&mut sim, &right, &live, seed);
-    for (key, value) in &model {
-        if left_range.contains(key) {
-            let result = left.nodes[ll].put_kind_batch(
-                vec![(KIND_BASE, key.clone(), Some(value.clone()))],
-                Vec::new(),
-            );
-            propose_confirmed(&mut sim, &left.nodes[ll], seed, result);
-        } else {
-            assert!(
-                right_range.contains(key),
-                "[seed={seed}] every key falls in exactly one child's range"
-            );
-            let result = right.nodes[rl].put_kind_batch(
-                vec![(KIND_BASE, key.clone(), Some(value.clone()))],
-                Vec::new(),
-            );
-            propose_confirmed(&mut sim, &right.nodes[rl], seed, result);
-        }
-    }
-
-    drive_tablet_capture_to_reported(&mut sim, &mut meta, &left, &live, &store, "backup-1", seed);
-    drive_tablet_capture_to_reported(&mut sim, &mut meta, &right, &live, &store, "backup-1", seed);
-    assert!(meta.backup_ready_to_complete("backup-1"));
-
-    let env = sim.env(nid(NODES[0]));
-    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
-
-    let final_tablets: BTreeSet<u64> = meta
-        .backup_manifest_tablet_progress("backup-1")
-        .into_iter()
-        .map(|(t, _)| t.0)
-        .collect();
-    assert_eq!(
-        final_tablets,
-        BTreeSet::from([left_id.0, right_id.0]),
-        "[seed={seed}] the manifest's authoritative tablet list must be the two \
-         children, never the retired parent"
-    );
-    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
-}
-
-#[test]
-fn split_races_capture_and_replans_onto_descendants() {
-    for_each_seed(
-        "split_races_capture_and_replans_onto_descendants",
-        scenario_split_races_capture_and_replans_onto_descendants,
-    );
-}
-
-// --- cell 4b: backup_started_mid_copy_split_build_pins_only_the_parent -----
-//
-// A regression for the bug fixed alongside this cell: `BeginBackup`'s apply
-// arm used to derive `pinned_tablets` from `Metadata::tablets_for_table`
-// with no state filter, so a backup started while a copy-based split
-// (`BeginSplit`, ADR 0050) was still in its build window — parent
-// `Splitting`, both children already minted `Building`, well before
-// `CutoverSplit` ever runs — pinned all THREE overlapping rows at once. The
-// two `Building` children are never authoritative (unroutable, an
-// incomplete copy — see `animus_control::Metadata::apply`'s `BeginBackup`
-// arm doc), so this cell proves the fixed behavior directly: only the
-// still-serving `Splitting` parent is pinned, its own capture alone
-// completes and matches the full model (nothing lost by excluding the
-// children), and a restore from that backup reproduces the model exactly —
-// all BEFORE `CutoverSplit` ever applies, unlike cell 4 above (which starts
-// its backup before the split and only observes re-planning onto
-// descendants after a completed cutover).
-fn scenario_backup_started_mid_copy_split_build_pins_only_the_parent(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let parent_engines = engines();
-    let mut meta = base_meta();
-    create_tablet(&mut meta, TabletId(1), KeyRange::whole());
-    let parent = start_group(&sim, &parent_engines, TabletId(1), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-
-    // Rows straddling the eventual split key `"m..."` — half fall left,
-    // half right — all written and captured entirely through the PARENT,
-    // which never stops serving during the build window.
-    let mut model = BTreeMap::new();
-    let leader = elect(&mut sim, &parent, &live, seed);
-    for pk in ["a001", "a002", "a003", "z001", "z002", "z003"] {
-        let value = format!("v-{pk}").into_bytes();
-        write_base_row(&mut sim, &parent.nodes[leader], pk.as_bytes(), &value);
-        model.insert(logical(pk.as_bytes()), value);
-    }
-
-    // `BeginSplit` only — deliberately never `CutoverSplit` in this cell
-    // (that's `split_tablet`'s job, and cell 4's own scenario) — mints the
-    // build-window shape the bug lived in: parent `Splitting`, both
-    // children `Building`, all three still in `meta.tablets` at once.
-    let split_key = b"m".to_vec();
-    let (left_id, right_id) = (TabletId(2), TabletId(3));
-    let expected_epoch = meta.tablets[&TabletId(1)].epoch;
-    let replicas = meta.tablets[&TabletId(1)].replicas.clone();
-    assert_eq!(
-        meta.apply(&MetaCommand::BeginSplit {
-            parent: TabletId(1),
-            expected_epoch,
-            split_key,
-            children: [(left_id, replicas.clone()), (right_id, replicas)],
-        }),
-        ApplyOutcome::Applied
-    );
-    assert_eq!(
-        meta.tablets[&TabletId(1)].state,
-        animus_tablet::TabletState::Splitting
-    );
-    assert_eq!(
-        meta.tablets[&left_id].state,
-        animus_tablet::TabletState::Building
-    );
-    assert_eq!(
-        meta.tablets[&right_id].state,
-        animus_tablet::TabletState::Building
-    );
-
-    begin_backup(&mut meta, "backup-1", 1_000);
-
-    // The fix under test: only the parent is pinned. Pre-fix, this vec
-    // held all three tablet ids and the assertions below would fail
-    // (either a missing key — the un-driven `Building` children never
-    // report — or, if driven, a duplicated/inflated manifest).
-    let pinned: Vec<u64> = meta
-        .backup("backup-1")
-        .expect("backup row exists")
-        .manifest
-        .pinned_tablets
-        .iter()
-        .map(|p| p.tablet.0)
-        .collect();
-    assert_eq!(
-        pinned,
-        vec![TabletId(1).0],
-        "[seed={seed}] a backup started mid-build must pin only the still-\
-         authoritative Splitting parent, never its Building children"
-    );
-    assert!(
-        meta.backup_capture_target("backup-1", TabletId(1)),
-        "[seed={seed}] the parent is a capture target"
-    );
-    assert!(
-        !meta.backup_capture_target("backup-1", left_id),
-        "[seed={seed}] a Building child must never be a capture target — \
-         it isn't pinned and traces to no pinned ancestor"
-    );
-    assert!(
-        !meta.backup_capture_target("backup-1", right_id),
-        "[seed={seed}] a Building child must never be a capture target — \
-         it isn't pinned and traces to no pinned ancestor"
-    );
-
-    // Drive only the parent's own capture — the children are never touched,
-    // proving their exclusion costs nothing (the parent alone still holds
-    // every row in its still-unnarrowed range).
-    drive_tablet_capture_to_reported(
-        &mut sim, &mut meta, &parent, &live, &store, "backup-1", seed,
-    );
-    assert!(meta.backup_ready_to_complete("backup-1"));
-    let env = sim.env(nid(NODES[0]));
-    drive_completion_to_available(&mut sim, &env, &mut meta, &store, "backup-1", seed);
-
-    let final_tablets: Vec<u64> = meta
-        .backup_manifest_tablet_progress("backup-1")
-        .into_iter()
-        .map(|(t, _)| t.0)
-        .collect();
-    assert_eq!(
-        final_tablets,
-        vec![TabletId(1).0],
-        "[seed={seed}] the completed manifest must name only the parent — \
-         no duplication with either Building child"
-    );
-    assert_backup_matches_model(&store, "backup-1", &model, &[], seed);
-
-    // Restore round-trips the model exactly — the split never even reached
-    // cutover, so this also proves the fix didn't lose or corrupt anything
-    // the still-in-flight split workflow would later have needed.
-    begin_restore(
-        &mut meta,
-        "restore-1",
-        "backup-1",
-        "widgets_restored_midbuild",
-        TabletId(4),
-    );
-    let dest_engines = engines();
-    let dest = start_group(&sim, &dest_engines, TabletId(4), KeyRange::whole());
-    sim.run_for(Duration::from_secs(2));
-    drive_restore_to_done(
-        &mut sim,
-        &mut meta,
-        &dest,
-        &live,
-        &store,
-        "restore-1",
-        "backup-1",
-        seed,
-    );
-    let dest_leader = elect(&mut sim, &dest, &live, seed);
-    let restored = read_all_base_rows(&dest.nodes[dest_leader]);
-    assert_eq!(
-        restored, model,
-        "[seed={seed}] restored table content does not match the model"
-    );
-}
-
-#[test]
-fn backup_started_mid_copy_split_build_pins_only_the_parent() {
-    for_each_seed(
-        "backup_started_mid_copy_split_build_pins_only_the_parent",
-        scenario_backup_started_mid_copy_split_build_pins_only_the_parent,
     );
 }
 
@@ -2344,21 +2031,22 @@ fn capture_driver_wal_torn_on_restart() {
 
 // --- cell 14: inplace_split_races_capture_and_replans_onto_descendants -----
 //
-// The in-place analog of cell 4 above
-// (`split_races_capture_and_replans_onto_descendants`): the identical §6
-// re-planning claim — a split cutting over while capture is still in
-// flight, the parent's own unfinished progress simply abandoned, each
-// child restarting its own capture from scratch over its own narrower
-// range — driven through the DEFAULT production split path (the in-place
-// atomic fork, ADR 0058) instead of the deprecated copy-based
-// `BeginSplit`/`CutoverSplit` cell 4 exercises. `--split-mode copy`'s own
-// cell 4 is untouched above; this repo's corpus doctrine keeps a scenario
-// forever once added.
+// Originally the in-place analog of a now-deleted copy-based cell 4
+// (`split_races_capture_and_replans_onto_descendants`, `BeginSplit`/
+// `CutoverSplit` — removed by the copy-mode-split deletion stack once this
+// cell verified the identical claim on the DEFAULT production split path;
+// this repo's corpus doctrine still keeps a scenario forever once added,
+// which is why this cell — the surviving, in-place proof of the §6
+// claim — remains): the §6 re-planning claim — a split cutting over while
+// capture is still in flight, the parent's own unfinished progress simply
+// abandoned, each child restarting its own capture from scratch over its
+// own narrower range — driven through the DEFAULT production split path
+// (the in-place atomic fork, ADR 0058).
 //
 // The §6 re-planning logic itself (`Metadata::backup_capture_target`/
 // `live_split_descendants`/`backup_ready_to_complete`/`backup_manifest_
 // tablet_progress`) is entirely split-mechanism-agnostic — it only reads
-// `Metadata::split_lineage` — so this is the lightest of the sibling ports
+// `Metadata::split_lineage` — so this was the lightest of the sibling ports
 // (`backfill_fault_corpus.rs`'s/`stream_lineage_corpus.rs`'s own in-place
 // cells): swap the trigger, drive the fork+materialize through
 // `animus_cp_data::host::Reconciler` (mirroring `inplace_split_reconciler.
@@ -2368,12 +2056,13 @@ fn capture_driver_wal_torn_on_restart() {
 // unmodified.
 //
 // **Real in-place fork+materialize clones+trims each child's own share of
-// the parent's data automatically** — unlike cell 4's manual per-row copy
-// loop (a stand-in for the copy-based split-build driver's own SeedBatch
-// mechanics, explicitly out of that cell's own scope) — so this cell needs
-// no equivalent: once fork+materialize converges, each child's engine
-// already holds exactly its own half-range's rows, verified indirectly by
-// `assert_backup_matches_model`'s own full round-trip against `model`.
+// the parent's data automatically** — unlike the deleted copy-based cell's
+// manual per-row copy loop (a stand-in for the copy-based split-build
+// driver's own SeedBatch mechanics, explicitly out of that cell's own
+// scope) — so this cell needs no equivalent: once fork+materialize
+// converges, each child's engine already holds exactly its own half-range's
+// rows, verified indirectly by `assert_backup_matches_model`'s own full
+// round-trip against `model`.
 
 /// A dedicated node id for spawning the reconciler-driving futures below —
 /// distinct from every real replica id in [`NODES`], so a stray env mixup
@@ -2560,7 +2249,7 @@ fn scenario_inplace_split_races_capture_and_replans_onto_descendants(seed: u64) 
     let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
 
     // Rows straddling the eventual split key `"m..."` — half fall left,
-    // half right (mirrors cell 4's own fixture).
+    // half right (mirrors the deleted copy-based cell's own fixture).
     let mut model = BTreeMap::new();
     let leader = elect(&mut sim, &parent, &live, seed);
     for pk in ["a001", "a002", "a003", "z001", "z002", "z003"] {
@@ -2643,7 +2332,8 @@ fn scenario_inplace_split_races_capture_and_replans_onto_descendants(seed: u64) 
 
     // Cut over IMMEDIATELY — the in-place branch's own `CutoverSplit`
     // carries no freeze/veto gate, deliberately before capture completes —
-    // the identical race cell 4 exercises on the copy-based path.
+    // the identical race the deleted copy-based cell used to exercise on
+    // the copy-based path.
     let parent_epoch = meta.tablets[&TabletId(1)].epoch;
     assert_eq!(
         meta.apply(&MetaCommand::CutoverSplit {
