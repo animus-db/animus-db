@@ -25,7 +25,7 @@ use std::time::Duration;
 use animus_env::NodeId;
 use animusd::{
     ClientRequest, ClientResponse, Node, StorageBackend, bind_cluster, read_frame, start_cluster,
-    start_cluster_auto_split, start_cluster_with_auto_split_bytes,
+    start_cluster_with_auto_split_bytes,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -452,18 +452,22 @@ async fn single_write_latency_is_low() {
 }
 
 /// Phase 2.4 — **automatic size-telemetry split trigger.** With the auto-split
-/// loop enabled at a low key-count threshold, writing past it causes the tablet's
+/// loop enabled at a low byte threshold, writing past it causes the tablet's
 /// leader to split it at the median **with no manual trigger**; afterwards both
-/// halves serve. Closes the auto-shard loop.
+/// halves serve. Closes the auto-shard loop. (The former key-count trigger
+/// this test used to exercise — `start_cluster_auto_split` — was removed;
+/// this proves the same general split-triggering behavior via bytes instead.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_when_it_grows() {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    // Auto-split once a tablet exceeds 16 keys (a test threshold; production is
-    // size-based + higher).
-    let nodes = start_cluster_auto_split(bound, 16).await.unwrap();
+    // Auto-split once a tablet exceeds ~100 bytes (a test threshold; the 24
+    // `key##`/`v#` rows written below total well over that).
+    let nodes = start_cluster_with_auto_split_bytes(bound, StorageBackend::default(), Some(100))
+        .await
+        .unwrap();
     await_bootstrap(&nodes).await;
     let addr0 = nodes[0].client_addr();
 
@@ -541,31 +545,28 @@ async fn tablet_auto_splits_when_it_grows() {
 }
 
 /// ADR 0034 — **byte-based** auto-split trigger with skewed value sizes. A
-/// tablet with only a handful of keys (well under any reasonable key-count
-/// threshold — this cluster is started with `keys: None`, so the key-count
-/// trigger is disabled entirely) but a few large values auto-splits purely
-/// on the **byte** threshold, and — the point of the byte-weighted median —
-/// the resulting halves are roughly **byte**-balanced, not just
-/// key-count-balanced (a plain positional median here would put nearly all
-/// the bytes on one side: 6 tiny keys sort before 6 large ones, so the
-/// positional median falls right at the first large key).
+/// tablet with only a handful of keys auto-splits purely on the **byte**
+/// threshold (the only trigger this crate has since the key-count trigger's
+/// removal), and — the point of the byte-weighted median — the resulting
+/// halves are roughly **byte**-balanced, not just key-count-balanced (a
+/// plain positional median here would put nearly all the bytes on one side:
+/// 6 tiny keys sort before 6 large ones, so the positional median falls
+/// right at the first large key).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    // Bytes-only trigger (no key-count threshold at all): 6 tiny rows (~10
-    // bytes each) + 6 large rows (~2000 bytes each) comfortably exceed this
-    // *combined*, while each post-split half (~6,000 bytes, see the
-    // byte-weighted-median math in the comment below) stays under it — so
-    // the tablet splits exactly once, not repeatedly. The key count (12)
-    // would never trip any sane key threshold.
+    // 6 tiny rows (~10 bytes each) + 6 large rows (~2000 bytes each)
+    // comfortably exceed this *combined*, while each post-split half
+    // (~6,000 bytes, see the byte-weighted-median math in the comment
+    // below) stays under it — so the tablet splits exactly once, not
+    // repeatedly.
     const BYTES_THRESHOLD: u64 = 8_000;
     let nodes = start_cluster_with_auto_split_bytes(
         bound,
         StorageBackend::default(),
-        None,
         Some(BYTES_THRESHOLD),
     )
     .await
@@ -717,18 +718,21 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
 /// Regression: a tablet can be split **more than once** over its life — since
 /// split is just a metadata range-narrowing command (epoch-CAS gated, no
 /// one-shot latch anywhere), a tablet that already split once and keeps
-/// absorbing writes must split *again* once it regrows past `threshold`, not
-/// sit frozen forever. This proves the tablet count keeps growing as the same
-/// lineage repeatedly crosses the threshold, and that every resulting tablet
-/// ends up with a real CP group (structurally guaranteed now — see the root
-/// `CLAUDE.md`).
+/// absorbing writes must split *again* once it regrows past the byte
+/// threshold, not sit frozen forever. This proves the tablet count keeps
+/// growing as the same lineage repeatedly crosses the threshold, and that
+/// every resulting tablet ends up with a real CP group (structurally
+/// guaranteed now — see the root `CLAUDE.md`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn already_split_tablet_splits_again_once_it_regrows() {
     let dir = tempfile::tempdir().unwrap();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
-    let nodes = start_cluster_auto_split(bound, 16).await.unwrap();
+    // Same ~100-byte test threshold as `tablet_auto_splits_when_it_grows`.
+    let nodes = start_cluster_with_auto_split_bytes(bound, StorageBackend::default(), Some(100))
+        .await
+        .unwrap();
     await_bootstrap(&nodes).await;
     let addr0 = nodes[0].client_addr();
 

@@ -254,7 +254,7 @@
 
         <div class="card scroll" style="margin-top:14px">
           <h2>Bulk seed (sharding test)</h2>
-          <div class="muted" style="margin-bottom:10px">Writes synthetic DynamoDB items into the table selected below to grow its tablet (it must already exist — create it above). Seeded rows are real items — keyed by the table's schema, readable back with Scan/Query above — with a filler <code>payload</code> attribute padding each to ~value bytes. Run the cluster with <code>--auto-split K</code> to watch tablets split in the Tablets view as the count crosses K.</div>
+          <div class="muted" style="margin-bottom:10px">Writes synthetic DynamoDB items into the table selected below to grow its tablet (it must already exist — create it above). Seeded rows are real items — keyed by the table's schema, readable back with Scan/Query above — with a filler <code>payload</code> attribute padding each to ~value bytes. Run the cluster with <code>--auto-split-bytes B</code> to watch tablets split in the Tablets view as the size crosses B.</div>
           <div class="row" style="margin-bottom:10px">
             <label>table</label><select id="seed-table"></select>
             <span class="muted" id="seed-no-tables" style="display:none"></span>

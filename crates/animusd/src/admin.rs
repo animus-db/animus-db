@@ -111,10 +111,10 @@ pub(crate) struct CpRaftView {
     /// This tablet's live key count — **the cheap, non-materializing
     /// `CpGroup::approx_key_count` estimate by default**, the exact
     /// `local_pairs` count under `?exact=1` (see `CpGroup::raft_view` for
-    /// why the polled default must not materialize). The estimate is the
-    /// very number `auto_split_loop` checks against `--auto-split K`, so
-    /// the Console's over-threshold pill agrees with the trigger that will
-    /// actually fire; it errs toward over-counting by design. `None` on the
+    /// why the polled default must not materialize). Purely informational
+    /// display now — `auto_split_loop` no longer gates on a key-count
+    /// threshold (the former `--auto-split K` flag was removed; only bytes
+    /// and, for streamed tables, change-rate trigger a split). `None` on the
     /// **memory** backend, which has no cheap counter — `?exact=1` answers
     /// there (and on either backend) precisely.
     pub(crate) key_count: Option<usize>,
@@ -525,7 +525,6 @@ fn config_view(ctx: &ClientCtx) -> Value {
         },
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
-        "auto_split_threshold": a.auto_split_threshold,
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
     })
 }
@@ -1418,7 +1417,7 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
     // Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
     // change-append-rate estimates (bytes/sec) — the signal an operator
     // needs since a high-churn, small-footprint streamed table never
-    // crosses the base-scoped byte/key auto-split thresholds. Empty on a
+    // crosses the base-scoped byte auto-split threshold. Empty on a
     // control-only node.
     let stream_change_rates: Vec<Value> = ctx
         .stream_change_rates()
@@ -2004,8 +2003,8 @@ fn seed_key_attr(ty: ColumnType, prefix: &str, index_text: &str) -> AttributeVal
 /// marker batches for a plain table, the per-item evaluate-at-leader funnel
 /// for an images-carrying (streamed/GSI'd) one — so a seeded row is
 /// observable on the table's change log/stream like any client write. With
-/// `--auto-split` enabled, crossing the split threshold splits the tablet —
-/// visible live in the Tablets view.
+/// `--auto-split-bytes` enabled, crossing the split threshold splits the
+/// tablet — visible live in the Tablets view.
 async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SeedReq = match parse_body(body) {
         Ok(r) => r,

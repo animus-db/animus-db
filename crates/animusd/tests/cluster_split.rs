@@ -121,7 +121,6 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
         "127.0.0.1".parse().unwrap(),
         StorageBackend::Memory,
         None,
-        None,
     )
     .await
     .expect("split cluster starts");
@@ -236,7 +235,6 @@ async fn fixed_control_node_write_read_is_deterministic() {
         "127.0.0.1".parse().unwrap(),
         StorageBackend::Memory,
         None,
-        None,
     )
     .await
     .expect("split cluster starts");
@@ -308,7 +306,6 @@ async fn single_shot_first_write_through_control_node_succeeds() {
         dir.path(),
         "127.0.0.1".parse().unwrap(),
         StorageBackend::Memory,
-        None,
         None,
     )
     .await

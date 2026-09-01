@@ -262,3 +262,37 @@ partition-key/shard affinity a change record's own token-leading key
 already assumes. This also narrows a pre-existing residual `txn.rs` noted
 in ADR 0018's PR3 amendment about a non-token-aligned split racing an
 in-flight transaction's own token, for every streamed table.
+
+## Amendment (2026-09-01): the key-count trigger removed
+
+`--auto-split K` — the original, ADR-0002-era key-count trigger this ADR's
+byte-based trigger was added *alongside* (the "CLI / config surface:
+additive, not a replacement" section above) — is **deleted**, along with
+`AutoSplitThresholds.keys`, `auto_split_loop`'s `key_hot`/
+`over_key_threshold` checks, and the plain positional-median split-point
+path it drove (`start_cluster_auto_split`/`start_cluster_with_auto_split`,
+the key-count-only wrappers that section's "thin wrappers... for
+back-compat" design left in place, are deleted with it).
+
+The byte-weighted median this ADR introduced and the ADR 0042 §14
+change-rate trigger cover every failure mode key count did, with nothing
+left that is *specifically* a key-count concern: bytes bound
+snapshot/compaction/replica-move/recovery cost directly (this ADR's own
+Context section), and change-rate (ADR 0042 §14 Fork F) catches the one gap
+bytes structurally can't — a high-churn, small-footprint streamed table.
+`CpGroup::approx_key_count` itself is **not** removed — `/admin/raftkv`'s
+`key_count` field still reads it for the Console's Tablets view, now purely
+informational (no threshold to compare against).
+
+**Default behavior is unchanged.** Auto-split of any kind was always
+opt-in — no `DEFAULT_AUTO_SPLIT_*` constant ever existed, `--cluster N`/
+`--cluster-control`+`--cluster-data` start with `AutoSplitThresholds`'s
+fields at `None` unless a flag is passed, and `--config`/`--node` (the real
+per-process deployment) never had an auto-split flag of any kind to begin
+with. Removing `--auto-split K` therefore does not turn auto-split off
+anywhere it used to be on by default — there was no such default to lose.
+An operator who was relying on `--auto-split K` in a dev/test invocation
+should switch to `--auto-split-bytes B` (a byte value tuned for the
+workload) or `--auto-split-change-rate RATE` for a streamed table; there is
+no drop-in numeric equivalent (bytes and keys are different units), so this
+is a deliberate re-tuning, not a mechanical substitution.

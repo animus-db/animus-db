@@ -6,8 +6,8 @@
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
@@ -210,8 +210,8 @@ const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split K] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--split-mode {copy,inplace}] [--dynamo-auth PATH]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH]\n  \
@@ -275,15 +275,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // Data replica engine: durable on-disk LSM by default; `--ephemeral` selects
     // the volatile in-memory engine (data does not survive restart).
     let mut backend = animusd::StorageBackend::default();
-    // `--auto-split K`: in `--cluster` mode, a CP-hosting node auto-splits a tablet
-    // it leads once it exceeds K keys (Phase 2.4). Handy for testing sharding by
-    // bulk-seeding past the threshold.
-    let mut auto_split: Option<usize> = None;
-    // `--auto-split-bytes B` (ADR 0034): same, but on an (approximate) scoped
-    // bytes threshold instead of a key count — the metric splitting is meant
-    // to bound in production (snapshot/compaction/replica-move/recovery cost
-    // scales with bytes, not key count). Either, both, or neither may be set;
-    // when both are set, whichever threshold is hit first triggers.
+    // `--auto-split-bytes B` (ADR 0034): in `--cluster` mode, a CP-hosting
+    // node auto-splits a tablet it leads once its (approximate) scoped
+    // bytes exceed B (Phase 2.4) — the metric splitting is meant to bound
+    // in production (snapshot/compaction/replica-move/recovery cost scales
+    // with bytes). Handy for testing sharding by bulk-seeding past the
+    // threshold. **The former `--auto-split K` key-count trigger was
+    // removed** (bytes and, for streamed tables, `--auto-split-change-rate`
+    // below cover its use cases — see the root `CLAUDE.md`'s auto-split
+    // entry).
     let mut auto_split_bytes: Option<u64> = None;
     // `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
     // opt-in — a **streamed** led tablet whose own smoothed change-append
@@ -377,7 +377,6 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
             "--ip" => ip = parse_next(&mut it, "--ip")?,
             "--ephemeral" => backend = animusd::StorageBackend::Memory,
-            "--auto-split" => auto_split = Some(parse_next(&mut it, "--auto-split")?),
             "--auto-split-bytes" => {
                 auto_split_bytes = Some(parse_next(&mut it, "--auto-split-bytes")?);
             }
@@ -460,7 +459,6 @@ async fn run(args: &[String]) -> Result<(), String> {
             ip,
             dir,
             backend,
-            auto_split,
             auto_split_bytes,
             auto_split_change_rate,
             orphan_sweep_after,
@@ -496,7 +494,6 @@ async fn run(args: &[String]) -> Result<(), String> {
                 ip,
                 dir,
                 backend,
-                auto_split,
                 auto_split_bytes,
                 auto_split_change_rate,
                 orphan_sweep_after,
@@ -1113,7 +1110,6 @@ async fn run_in_process_cluster(
     ip: IpAddr,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
-    auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
@@ -1136,7 +1132,6 @@ async fn run_in_process_cluster(
     let nodes = animusd::start_cluster_with_growth_and_quiesce_after(
         bound,
         backend,
-        auto_split,
         auto_split_bytes,
         orphan_sweep_after,
         stream_seal_knobs,
@@ -1151,17 +1146,11 @@ async fn run_in_process_cluster(
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
 
-    match (auto_split, auto_split_bytes) {
-        (Some(k), Some(b)) => println!(
-            "animusd: started {n}-node cluster (CP) — auto-split at {k} keys or {b} bytes/tablet"
-        ),
-        (Some(k), None) => {
-            println!("animusd: started {n}-node cluster (CP) — auto-split at {k} keys/tablet")
-        }
-        (None, Some(b)) => {
+    match auto_split_bytes {
+        Some(b) => {
             println!("animusd: started {n}-node cluster (CP) — auto-split at {b} bytes/tablet")
         }
-        (None, None) => println!("animusd: started {n}-node cluster (CP)"),
+        None => println!("animusd: started {n}-node cluster (CP)"),
     }
     if let Some(rate) = auto_split_change_rate {
         println!(
@@ -1205,7 +1194,6 @@ async fn run_in_process_split_cluster(
     ip: IpAddr,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
-    auto_split: Option<usize>,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     orphan_sweep_after: Duration,
@@ -1221,7 +1209,6 @@ async fn run_in_process_split_cluster(
         &dir,
         ip,
         backend,
-        auto_split,
         auto_split_bytes,
         orphan_sweep_after,
         auto_split_change_rate,
@@ -1230,17 +1217,11 @@ async fn run_in_process_split_cluster(
     .await
     .map_err(|e| format!("failed to start split cluster: {e}"))?;
 
-    match (auto_split, auto_split_bytes) {
-        (Some(k), Some(b)) => println!(
-            "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {k} keys or {b} bytes/tablet"
-        ),
-        (Some(k), None) => println!(
-            "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {k} keys/tablet"
-        ),
-        (None, Some(b)) => println!(
+    match auto_split_bytes {
+        Some(b) => println!(
             "animusd: started split cluster ({control_n} control + {data_n} data, CP) — auto-split at {b} bytes/tablet"
         ),
-        (None, None) => {
+        None => {
             println!("animusd: started split cluster ({control_n} control + {data_n} data, CP)")
         }
     }

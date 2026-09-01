@@ -71,7 +71,7 @@ step 2 split `impl<E: Env> ClientCtx<E>` into `schema.rs`/`read_path.rs`/
 `write_path.rs`/`txn_coordinator.rs`/`forwarding.rs`, below) — grep for the
 symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
-can't reach — e.g. `auto_split_median_tests` and `confirm_futility_tests`
+can't reach — e.g. `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
 `CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_local`; `split_fence_tests`
 and `hot_read_latch_tests` were deleted with their fence/latch subjects in
@@ -1322,19 +1322,21 @@ streams-enabled variant walking a `GetRecords` iterator from the parent's
 own shard 0 across the fork to both children's own shard 0s with no loss
 or duplication.
 
-`--auto-split K` (key count), `--auto-split-bytes B` (byte size), and
-`--auto-split-change-rate RATE` (streamed tables only, ADR 0042 §14 Fork F —
-bytes/sec of a tablet's own `KIND_CHANGE` growth, `/admin/metrics`'s
-`stream_change_rates`) are independent OR-gated triggers — any combination,
-or none. `--auto-split-change-rate` closes the gap the other two
-structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034), so a
-high-churn, small-footprint streamed table never crosses a byte/key
+`--auto-split-bytes B` (byte size) and `--auto-split-change-rate RATE`
+(streamed tables only, ADR 0042 §14 Fork F — bytes/sec of a tablet's own
+`KIND_CHANGE` growth, `/admin/metrics`'s `stream_change_rates`) are
+independent OR-gated triggers — either, both, or neither. (**The former
+key-count trigger, `--auto-split K`, was removed** — see the root
+`CLAUDE.md`'s auto-split entry.) `--auto-split-change-rate` closes the gap
+bytes structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034),
+so a high-churn, small-footprint streamed table never crosses a byte
 threshold regardless of write rate. No production-tuned default exists yet
 — omitting the flag disables the trigger entirely (zero behavior change);
-an operator must pick `RATE` for their own workload. All three flags are
+an operator must pick `RATE` for their own workload. Both flags are
 `--cluster N`/`--cluster-control`+`--cluster-data` dev-cluster-only (not
-reachable from `--config/--node`'s real per-process deployment, matching
-the two older flags' own existing scope). **`--node I` is gone from
+reachable from `--config/--node`'s real per-process deployment — auto-split
+has never been reachable from a real per-process deployment, so this scope
+is unchanged by the key-count trigger's removal). **`--node I` is gone from
 `join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
@@ -1902,16 +1904,20 @@ stays in `animusd` (`tablet_host_reconciler_loop`):
   is `LocalState::hosted`.
 
 **Auto-split (byte-based, ADR 0034)**: `auto_split_loop` gates per-tick on
-`CpGroup::approx_key_count` (LSM-only) **and** `CpGroup::approx_bytes` (either
-backend). The split point matches the metric: a byte-configured cluster splits at
-`byte_weighted_median` (private to `lib.rs`, unit-tested in
-`auto_split_median_tests`) — which scans every achievable key-boundary cut for the
-one closest to half the bytes, not a single accumulate-and-threshold pass (subtly
-wrong when one key dominates; see the root log). Key-count clusters keep the plain
-positional median. **Tablets are split-only (ADR 0044)** — there is no
-merge, automatic or operator-driven, to trigger; a tablet's count only ever
-grows, and reversing an over-eager split is no longer possible (see that
-ADR's "shrink-in-place" note).
+`CpGroup::approx_bytes` (either backend). The split point is always
+`decide::byte_weighted_median` (`animus-node`, unit-tested in that crate's own
+test module — see `animus-node/CLAUDE.md`) — which scans every achievable
+key-boundary cut for the one closest to half the bytes, not a single
+accumulate-and-threshold pass (subtly wrong when one key dominates; see the
+root log). **The former key-count trigger (`--auto-split K`) and its plain
+positional-median split point were removed** — bytes (and, for streamed
+tables, change-rate below) cover every use case key count did, with no
+key-count-specific failure mode left to justify a third independent knob;
+`CpGroup::approx_key_count` itself is unchanged and still backs `/admin/
+raftkv`'s informational `key_count` display. **Tablets are split-only
+(ADR 0044)** — there is no merge, automatic or operator-driven, to trigger;
+a tablet's count only ever grows, and reversing an over-eager split is no
+longer possible (see that ADR's "shrink-in-place" note).
 
 **Change-append-rate trigger (opt-in, ADR 0042 §14 Fork F, growth PR3)**:
 `--auto-split-change-rate RATE` joins the same either-fires gate above,
@@ -3194,10 +3200,9 @@ exception, and lives in `lib.rs` rather than `tests/` for exactly the
 private-handle reason its own section gives. The restart tests run both
 incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
-(`auto_split_median_tests`, `confirm_futility_tests`) live in `lib.rs` itself
-because they need private handles (a raw `CpGroup`/the private
-`byte_weighted_median` helper/the `pub(crate)` `ClientCtx::cp_kind_local`)
-that no external `tests/` file can reach;
+(`confirm_futility_tests`) live in `lib.rs` itself
+because they need private handles (a raw `CpGroup`/the `pub(crate)`
+`ClientCtx::cp_kind_local`) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private

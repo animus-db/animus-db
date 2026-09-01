@@ -143,15 +143,10 @@ async fn write_after_leader_kill_of_a_quiesced_group_converges() {
     let clients: Vec<SocketAddr> = bound.iter().map(animusd::BoundNode::client_addr).collect();
     let admins: Vec<SocketAddr> = bound.iter().map(animusd::BoundNode::admin_addr).collect();
 
-    let nodes = start_cluster_with_quiesce_after(
-        bound,
-        StorageBackend::default(),
-        None,
-        None,
-        QUIESCE_AFTER,
-    )
-    .await
-    .unwrap();
+    let nodes =
+        start_cluster_with_quiesce_after(bound, StorageBackend::default(), None, QUIESCE_AFTER)
+            .await
+            .unwrap();
     await_bootstrap(&nodes).await;
 
     // ADR 0023: a fresh cluster has no data tablet — provision it by writing
@@ -263,15 +258,10 @@ async fn quiescence_enabled_does_not_disrupt_ordinary_traffic() {
     let bound = bind_cluster(3, ip, dir.path()).await.unwrap();
     let clients: Vec<SocketAddr> = bound.iter().map(animusd::BoundNode::client_addr).collect();
 
-    let nodes = start_cluster_with_quiesce_after(
-        bound,
-        StorageBackend::default(),
-        None,
-        None,
-        QUIESCE_AFTER,
-    )
-    .await
-    .unwrap();
+    let nodes =
+        start_cluster_with_quiesce_after(bound, StorageBackend::default(), None, QUIESCE_AFTER)
+            .await
+            .unwrap();
     await_bootstrap(&nodes).await;
 
     for i in 0..20u32 {

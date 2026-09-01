@@ -581,7 +581,6 @@ async fn start_streamed_cluster(
         bound,
         StorageBackend::default(),
         None,
-        None,
         Duration::from_secs(600),
         knobs,
         SegmentStoreConfig::default(),

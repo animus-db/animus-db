@@ -1,16 +1,18 @@
 "use strict";
 // The Tablets view: a filterable list (by table, by derived status) with
 // replica-role dots, current leader, ESTIMATED live key count and byte size
-// (ADR 0034 — each with its own over-auto-split-threshold indicator, since
-// either `--auto-split K` or `--auto-split-bytes B` independently fires a
-// split), and status. The counts are estimates on purpose: this view polls
-// every node's `/admin/raftkv` on the auto-refresh interval, and the exact
-// count materializes every hosted tablet's rows per request — an observer
-// that measurably slows what it observes (it inflated a 20,000-row split's
-// build ~9x). They are the very counters auto-split gates on, so a pill here
-// agrees with the trigger that will fire; `/admin/raftkv?exact=1` is the
-// deliberate one-off precise answer. `Keys` is blank on the memory backend,
-// which has no cheap counter. Clicking a row opens a right-side detail panel: raft group members
+// (ADR 0034 — the byte column carries an over-auto-split-threshold
+// indicator, since `--auto-split-bytes B` — or, for a streamed table,
+// `--auto-split-change-rate` — fires a split), and status. The counts are
+// estimates on purpose: this view polls every node's `/admin/raftkv` on the
+// auto-refresh interval, and the exact count materializes every hosted
+// tablet's rows per request — an observer that measurably slows what it
+// observes (it inflated a 20,000-row split's build ~9x). The byte estimate
+// is the very counter auto-split gates on, so its pill agrees with the
+// trigger that will fire; `/admin/raftkv?exact=1` is the deliberate one-off
+// precise answer. The key count is purely informational now (the former
+// key-count auto-split trigger was removed) and blank on the memory
+// backend, which has no cheap counter. Clicking a row opens a right-side detail panel: raft group members
 // (from data already fetched) plus storage-engine stats fetched on demand
 // from a single node (/admin/storage/lsm) only for the selected tablet's
 // leader — not for every row. No election-history section: this codebase
@@ -72,15 +74,13 @@ function renderTablets() {
     const st = tabletStatus(t, gs);
     const keyCount = lead && lead.g.key_count != null ? lead.g.key_count : null;
     const byteSize = lead && lead.g.byte_size != null ? lead.g.byte_size : null;
-    const keyOver = keyCount != null && thresholds.keys != null && keyCount > thresholds.keys;
+    // Purely informational now — there is no key-count auto-split trigger
+    // to flag against (removed; bytes and, for streamed tables,
+    // change-rate are the only remaining triggers).
     const byteOver = byteSize != null && thresholds.bytes != null && byteSize > thresholds.bytes;
-    // Both triggers are independent (ADR 0034 — either exceeding its own
-    // threshold fires a split, mirroring `auto_split_loop`'s OR gate), so each
-    // column gets its own over-threshold pill rather than one dimension
-    // silently masking the other.
     const keysCell = keyCount == null
       ? `<span class="muted">—</span>`
-      : `${esc(keyCount.toLocaleString())}` + (keyOver ? " " + pill("warn", "over " + thresholds.keys.toLocaleString()) : "");
+      : esc(keyCount.toLocaleString());
     const sizeCell = byteSize == null
       ? `<span class="muted">—</span>`
       : `${esc(humanBytes(byteSize))}` + (byteOver ? " " + pill("warn", "over " + humanBytes(thresholds.bytes)) : "");
@@ -101,7 +101,7 @@ function renderTablets() {
     </tr>`;
   }).join("");
   $("tb-body").innerHTML = bodyRows ? `<table>
-    <thead><tr><th>Tablet</th><th>Table</th><th title="Estimate \u2014 the same cheap counter --auto-split gates on. Exact: /admin/raftkv?exact=1">Keys ~</th><th title="Estimate, base-scoped (ADR 0034) \u2014 the same counter --auto-split-bytes gates on. Exact: /admin/raftkv?exact=1">Size ~</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
+    <thead><tr><th>Tablet</th><th>Table</th><th title="Estimate, informational only. Exact: /admin/raftkv?exact=1">Keys ~</th><th title="Estimate, base-scoped (ADR 0034) \u2014 the same counter --auto-split-bytes gates on. Exact: /admin/raftkv?exact=1">Size ~</th><th>Leader</th><th>Replicas</th><th>Status</th></tr></thead>
     <tbody>${bodyRows}</tbody></table>` : `<div class="empty">no tablets match this filter</div>`;
 
   document.querySelectorAll("#tb-body tr[data-id]").forEach((tr) =>

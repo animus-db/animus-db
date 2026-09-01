@@ -56,7 +56,6 @@ async fn start_streamed_cluster_with_store(
         bound,
         StorageBackend::default(),
         None,
-        None,
         Duration::from_secs(600),
         tiny_seal_knobs(),
         store,

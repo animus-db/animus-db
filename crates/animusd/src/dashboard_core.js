@@ -251,14 +251,14 @@ function cpGroupsByTablet() {
   return map;
 }
 
-// The `--auto-split K` (keys) and `--auto-split-bytes B` (bytes, ADR 0034)
-// thresholds, from any reachable node's `/admin/config` — a single flag set,
-// so every node agrees. Either field is `null` if that trigger isn't enabled
-// for this run (both, either, or neither may be set).
+// The `--auto-split-bytes B` (bytes, ADR 0034) threshold, from any
+// reachable node's `/admin/config` — a single flag set, so every node
+// agrees. `null` if the trigger isn't enabled for this run. (The former
+// key-count `--auto-split K` trigger was removed — bytes and, for streamed
+// tables, `--auto-split-change-rate` are the only remaining triggers.)
 function autoSplitThresholds() {
   const n = STATE.nodes.find((x) => x.ok && x.config);
   return {
-    keys: n ? n.config.auto_split_threshold : null,
     bytes: n ? n.config.auto_split_bytes_threshold : null,
   };
 }
