@@ -599,174 +599,6 @@ fn disable_then_reenable_resets_generation_and_continues_epoch_chain() {
     );
 }
 
-// --- cell 5: split — children seal independently and inherit generation ---
-
-fn scenario_split_children_seal_independently(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let parent_engines = engines();
-    let mut meta = base_meta_with_pitr();
-    let parent = start_group(&sim, &parent_engines, TabletId(10), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let mut journal = BTreeMap::new();
-
-    for i in 0..4 {
-        write_and_journal(
-            &mut sim,
-            &parent,
-            &live,
-            &mut journal,
-            &key(i),
-            b"pre",
-            seed,
-        );
-    }
-    let leader = elect(&mut sim, &parent, &live, seed);
-    assert_eq!(
-        pitr_seal_now(&mut meta, &store, &parent, leader, 1_000, false),
-        Some(0),
-        "[seed={seed}] parent's pre-split backlog seals as epoch 0"
-    );
-
-    // Cutover (control-metadata only — the CP data plane's own split
-    // machinery is a different subsystem's own corpus, ADR 0050 Train B):
-    // register the tablet + retire the parent from `meta.tablets`, and
-    // freeze `split_lineage` at cutover — the identical fork F9 write real
-    // `CutoverSplit` performs.
-    assert_eq!(
-        meta.apply(&MetaCommand::CreateTablet {
-            tablet: parent.id,
-            table: Some(TABLE.into()),
-            range: KeyRange::whole(),
-            replicas: Vec::new(),
-        }),
-        ApplyOutcome::Applied
-    );
-    let left = TabletId(11);
-    let right = TabletId(12);
-    let (left_range, right_range) = KeyRange::whole().split_at(&key(2)).expect("split point");
-    assert_eq!(
-        meta.apply(&MetaCommand::BeginSplit {
-            parent: parent.id,
-            expected_epoch: meta.tablets[&parent.id].epoch,
-            split_key: key(2),
-            children: [(left, Vec::new()), (right, Vec::new())],
-        }),
-        ApplyOutcome::Applied,
-        "[seed={seed}] BeginSplit must apply"
-    );
-    assert_eq!(
-        meta.apply(&MetaCommand::CutoverSplit {
-            parent: parent.id,
-            expected_epoch: meta.tablets[&parent.id].epoch,
-            cutover_wall_ms: 1_500,
-        }),
-        ApplyOutcome::Applied,
-        "[seed={seed}] CutoverSplit must apply"
-    );
-    assert!(!meta.tablets.contains_key(&parent.id), "the parent retires");
-    // Children inherit PITR from the table spec (ADR 0059 §9's own scope
-    // ask) — structurally true here: `table_pitr(TABLE)` is table-scoped,
-    // not tablet-scoped, so both children see the identical generation
-    // with zero special-casing.
-    let generation = meta.table_pitr(TABLE).unwrap().generation;
-
-    // Fresh, INDEPENDENT engine maps per child — sibling tablets each get
-    // their own private engine in production (ADR 0050 rung 1/2); reusing
-    // `engines` (the parent's own map) here would silently give parent and
-    // children the identical physical `MemoryEngine` per node, so a
-    // child's own `pending_changes()` scan would see the parent's
-    // pre-split records too (found by this corpus's own first run — see
-    // `docs/engineering-lessons.md`).
-    let left_engines = engines();
-    let right_engines = engines();
-    let left_group = start_group(&sim, &left_engines, left, left_range);
-    let right_group = start_group(&sim, &right_engines, right, right_range);
-    sim.run_for(Duration::from_secs(2));
-    let mut left_journal = BTreeMap::new();
-    let mut right_journal = BTreeMap::new();
-    // Deliberate wall-clock separation between the two freshly-started
-    // sibling groups' own write bursts: each child's `Hlc` starts fresh
-    // (unwitnessed, unlike production's real `SeedBatch`, which this
-    // corpus does not model — see the scenario's own doc), so two
-    // independent groups minting their very first record at the identical
-    // virtual millisecond can legitimately produce the identical packed
-    // HLC (no node-id bits, ADR 0018 §2's own documented tradeoff).
-    // Packed-HLC uniqueness is a WITHIN-tablet guarantee only; spacing the
-    // two groups' own minting windows apart keeps this scenario's
-    // cross-tablet lineage check meaningful without reimplementing
-    // `SeedBatch`'s witnessing for a mechanism (PITR sealing) this corpus
-    // isn't testing.
-    for i in 0..2 {
-        write_and_journal(
-            &mut sim,
-            &left_group,
-            &live,
-            &mut left_journal,
-            &key(i),
-            b"post",
-            seed,
-        );
-    }
-    sim.run_for(Duration::from_secs(1));
-    for i in 2..4 {
-        write_and_journal(
-            &mut sim,
-            &right_group,
-            &live,
-            &mut right_journal,
-            &key(i),
-            b"post",
-            seed,
-        );
-    }
-    let left_leader = elect(&mut sim, &left_group, &live, seed);
-    let right_leader = elect(&mut sim, &right_group, &live, seed);
-    assert_eq!(
-        pitr_seal_now(&mut meta, &store, &left_group, left_leader, 2_000, false),
-        Some(0),
-        "[seed={seed}] a copy-based split child's own first PITR seal starts its own chain at 0"
-    );
-    assert_eq!(
-        pitr_seal_now(&mut meta, &store, &right_group, right_leader, 2_000, false),
-        Some(0)
-    );
-
-    // The union of the parent's final segment and both children's own new
-    // segments covers exactly the pre-split writes (parent) plus each
-    // child's own post-split writes — no key double-counted across
-    // reporting tablets, no key lost.
-    verify_pitr_lineage(
-        &meta,
-        &store,
-        &[
-            (&parent, leader, generation),
-            (&left_group, left_leader, generation),
-            (&right_group, right_leader, generation),
-        ],
-        &{
-            let mut all = journal.clone();
-            for (k, v) in &left_journal {
-                all.entry(k.clone()).or_default().extend(v.clone());
-            }
-            for (k, v) in &right_journal {
-                all.entry(k.clone()).or_default().extend(v.clone());
-            }
-            all
-        },
-        seed,
-    );
-}
-
-#[test]
-fn split_children_seal_independently_and_inherit_generation() {
-    for_each_seed(
-        "split_children_seal_independently_and_inherit_generation",
-        scenario_split_children_seal_independently,
-    );
-}
-
 // --- cell 6: drop-table retention hold --------------------------------------
 
 /// PITR segments and the generation floor survive `DropTableSchema` — the
@@ -1112,201 +944,6 @@ fn restore_to_random_second_matches_the_model_with_a_leader_kill() {
     for_each_seed(
         "restore_to_random_second_matches_the_model_with_a_leader_kill",
         scenario_restore_to_random_second_matches_the_model_with_a_leader_kill,
-    );
-}
-
-// --- cell 9: restore-to-random-second across a split -----------------------
-
-/// The identical flagship property as above, but spanning a split: the
-/// base snapshot pins the PARENT tablet; the target second can land before
-/// the split (parent-only content), right after cutover but before either
-/// child seals (still parent-only — children start their own chains
-/// empty), or after one or both children have sealed their own post-split
-/// writes (parent content UNION whichever child has sealed so far) —
-/// proving `Metadata::pitr_replay_segments`'s split-lineage walk against a
-/// model that tracks the two children's writes independently.
-fn scenario_restore_to_random_second_matches_the_model_across_a_split(seed: u64) {
-    let mut sim = Simulator::new(seed);
-    let parent_engines = engines();
-    let mut meta = base_meta_with_pitr();
-    let parent = start_group(&sim, &parent_engines, TabletId(50), KeyRange::whole());
-    let live = [0, 1, 2];
-    sim.run_for(Duration::from_secs(2));
-    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
-    let env = sim.env(nid(NODES[0]));
-    let mut journal = BTreeMap::new();
-    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-
-    write_burst(
-        &mut sim,
-        &parent,
-        &live,
-        &mut journal,
-        &mut model,
-        &env,
-        0,
-        3,
-        seed,
-    );
-    let leader = elect(&mut sim, &parent, &live, seed);
-    let parent_seal_ms = 1_000u64;
-    assert_eq!(
-        pitr_seal_now(&mut meta, &store, &parent, leader, parent_seal_ms, false),
-        Some(0),
-        "[seed={seed}] parent's pre-split backlog seals as epoch 0"
-    );
-    let model_at_parent_seal = model.clone();
-
-    // Cutover (control-metadata only, mirroring cell 5's own technique).
-    assert_eq!(
-        meta.apply(&MetaCommand::CreateTablet {
-            tablet: parent.id,
-            table: Some(TABLE.into()),
-            range: KeyRange::whole(),
-            replicas: Vec::new(),
-        }),
-        ApplyOutcome::Applied
-    );
-    let left = TabletId(51);
-    let right = TabletId(52);
-    assert_eq!(
-        meta.apply(&MetaCommand::BeginSplit {
-            parent: parent.id,
-            expected_epoch: meta.tablets[&parent.id].epoch,
-            split_key: key(2),
-            children: [(left, Vec::new()), (right, Vec::new())],
-        }),
-        ApplyOutcome::Applied
-    );
-    assert_eq!(
-        meta.apply(&MetaCommand::CutoverSplit {
-            parent: parent.id,
-            expected_epoch: meta.tablets[&parent.id].epoch,
-            cutover_wall_ms: parent_seal_ms + 200,
-        }),
-        ApplyOutcome::Applied
-    );
-    assert!(!meta.tablets.contains_key(&parent.id));
-
-    let (left_range, right_range) = KeyRange::whole().split_at(&key(2)).expect("split point");
-    let left_engines = engines();
-    let right_engines = engines();
-    let left_group = start_group(&sim, &left_engines, left, left_range);
-    let right_group = start_group(&sim, &right_engines, right, right_range);
-    sim.run_for(Duration::from_secs(2));
-
-    let base = vec![(TabletId(50), 0)];
-    // Right after cutover, before either child has sealed anything: the
-    // model is still exactly the parent's own pre-split content.
-    let just_after_cutover = parent_seal_ms + 300;
-    assert_replay_matches_model(
-        &meta,
-        &store,
-        &base,
-        just_after_cutover,
-        &model_at_parent_seal,
-        seed,
-    );
-
-    let mut left_journal = BTreeMap::new();
-    let mut right_journal = BTreeMap::new();
-    // `key(0)`/`key(1)` sort below `key(2)` (the split key) — left's own
-    // range; `key(2)..key(5)` is right's.
-    write_burst_ranged(
-        &mut sim,
-        &left_group,
-        &live,
-        &mut left_journal,
-        &mut model,
-        &env,
-        1,
-        2,
-        0..2,
-        seed,
-    );
-    sim.run_for(Duration::from_secs(1));
-    let left_seal_ms = parent_seal_ms + 1_000;
-    let left_leader = elect(&mut sim, &left_group, &live, seed);
-    assert_eq!(
-        pitr_seal_now(
-            &mut meta,
-            &store,
-            &left_group,
-            left_leader,
-            left_seal_ms,
-            false
-        ),
-        Some(0),
-        "[seed={seed}] left child's own first PITR seal starts its own chain at 0"
-    );
-    let model_after_left_seal = model.clone();
-    assert_replay_matches_model(
-        &meta,
-        &store,
-        &base,
-        left_seal_ms,
-        &model_after_left_seal,
-        seed,
-    );
-    // The right child hasn't sealed anything of its own post-split writes
-    // yet, so the model at this point is parent-content UNION left's own
-    // (already reflected in `model`, since `write_burst` mutated it
-    // directly) — right's own writes below must not leak in early.
-
-    write_burst_ranged(
-        &mut sim,
-        &right_group,
-        &live,
-        &mut right_journal,
-        &mut model,
-        &env,
-        2,
-        2,
-        2..6,
-        seed,
-    );
-    sim.run_for(Duration::from_secs(1));
-    let right_seal_ms = left_seal_ms + 1_000;
-    let right_leader = elect(&mut sim, &right_group, &live, seed);
-    assert_eq!(
-        pitr_seal_now(
-            &mut meta,
-            &store,
-            &right_group,
-            right_leader,
-            right_seal_ms,
-            false
-        ),
-        Some(0)
-    );
-    let model_after_right_seal = model.clone();
-    assert_replay_matches_model(
-        &meta,
-        &store,
-        &base,
-        right_seal_ms,
-        &model_after_right_seal,
-        seed,
-    );
-    // Restoring to a point BEFORE the right child's own seal must still
-    // exclude its writes even though they are already fully committed by
-    // now — proving the split-lineage walk floors each child at its own
-    // segment set, not at "whatever the tablet currently holds".
-    assert_replay_matches_model(
-        &meta,
-        &store,
-        &base,
-        left_seal_ms,
-        &model_after_left_seal,
-        seed,
-    );
-}
-
-#[test]
-fn restore_to_random_second_matches_the_model_across_a_split() {
-    for_each_seed(
-        "restore_to_random_second_matches_the_model_across_a_split",
-        scenario_restore_to_random_second_matches_the_model_across_a_split,
     );
 }
 
@@ -1914,16 +1551,19 @@ fn restore_to_random_second_under_clock_drift() {
 
 // --- cells 18/19: the in-place split's PITR contract (ADR 0058 Train 2 rung 3) ---
 //
-// Cells 5 (`split_children_seal_independently_and_inherit_generation`) and 9
-// (`restore_to_random_second_matches_the_model_across_a_split`) above prove
-// the DEPRECATED copy-based split workflow's PITR contract (a
-// control-metadata-only `BeginSplit`/`CutoverSplit`, with the parent's own
-// `Group` hosted directly via this file's `start_group` and never touched
-// by a reconciler). The two cells below rebuild the identical claims on the
-// DEFAULT production split path — the in-place atomic fork — alongside
-// (never replacing) their copy-based siblings; this repo's corpus doctrine
-// keeps a scenario forever once added. `--split-mode copy`'s own cells 5/9
-// are untouched above.
+// These two cells originally rebuilt, on the DEFAULT production split path
+// (the in-place atomic fork), the identical PITR contract two now-deleted
+// copy-based cells once proved (`split_children_seal_independently_and_
+// inherit_generation`, formerly cell 5, and
+// `restore_to_random_second_matches_the_model_across_a_split`, formerly
+// cell 9 — a control-metadata-only `BeginSplit`/`CutoverSplit`, with the
+// parent's own `Group` hosted directly via this file's `start_group` and
+// never touched by a reconciler). Those two copy-based cells were removed
+// by the copy-mode-split deletion stack (`--split-mode copy` no longer has
+// any coverage in this file); the two cells below are now this corpus's
+// only coverage of the split/PITR interaction, kept at their original
+// numbers (18/19) per this repo's corpus doctrine (a scenario keeps its
+// name/number forever once added — see `crates/animus-test/CLAUDE.md`).
 //
 // Unlike the copy-based workflow, the in-place fork is materialized by
 // `animus_cp_data::host::Reconciler`, so the parent (and both children) must
@@ -2109,15 +1749,16 @@ fn wrap_group(cluster: &Cluster, ids: &[NodeId], tablet: TabletId) -> Group {
 
 // --- cell 18: inplace_split_children_seal_independently_and_inherit_generation
 
-/// The in-place analog of cell 5
-/// (`split_children_seal_independently_and_inherit_generation`) — the
-/// identical claim (each child seals its own epoch 0 independently,
-/// inheriting PITR from the table spec with zero special-casing since
-/// `table_pitr` is table- not tablet-scoped; the union of parent-plus-
-/// children content covers the full journal with no double-counting),
-/// driven through `BeginSplitInPlace`/reconciler fork+materialize/
-/// `CutoverSplit` instead of the deprecated `BeginSplit`/`CutoverSplit`
-/// control-metadata-only cutover.
+/// Proves that each child seals its own epoch 0 independently, inheriting
+/// PITR from the table spec with zero special-casing since `table_pitr` is
+/// table- not tablet-scoped; the union of parent-plus-children content
+/// covers the full journal with no double-counting. Originally built
+/// alongside a now-deleted copy-based sibling cell proving the identical
+/// claim via the deprecated `BeginSplit`/`CutoverSplit` control-metadata-
+/// only cutover — this cell drives the claim through
+/// `BeginSplitInPlace`/reconciler fork+materialize/`CutoverSplit` instead,
+/// and is now the corpus's only coverage of it (see the "cells 18/19"
+/// section doc above).
 fn scenario_inplace_split_children_seal_independently(seed: u64) {
     let mut sim = Simulator::new(seed);
     let mut meta = base_meta_with_pitr();
@@ -2268,7 +1909,7 @@ fn scenario_inplace_split_children_seal_independently(seed: u64) {
     let mut left_journal = BTreeMap::new();
     let mut right_journal = BTreeMap::new();
     // Deliberate wall-clock separation between the two children's own write
-    // bursts, mirroring cell 5's own reasoning: each child's `Hlc` starts
+    // bursts: each child's `Hlc` starts
     // fresh (unwitnessed, unlike production's real `SeedBatch`, which this
     // corpus doesn't model), so two independent groups minting their very
     // first record at the identical virtual millisecond can legitimately
@@ -2347,14 +1988,16 @@ fn inplace_split_children_seal_independently_and_inherit_generation() {
 
 // --- cell 19: restore_to_random_second_matches_the_model_across_an_inplace_split
 
-/// The in-place analog of cell 9
-/// (`restore_to_random_second_matches_the_model_across_a_split`) — the
-/// identical flagship property (the base snapshot pins the PARENT tablet;
-/// the target second can land before the split, right after cutover but
-/// before either child seals, or after one or both children have sealed
-/// their own post-split writes) driven through `BeginSplitInPlace`/
-/// reconciler fork+materialize/`CutoverSplit` instead of the deprecated
-/// control-metadata-only `BeginSplit`/`CutoverSplit` cutover.
+/// The flagship restore-across-a-split property: the base snapshot pins
+/// the PARENT tablet; the target second can land before the split, right
+/// after cutover but before either child seals, or after one or both
+/// children have sealed their own post-split writes. Originally built
+/// alongside a now-deleted copy-based sibling cell proving the identical
+/// property via the deprecated control-metadata-only `BeginSplit`/
+/// `CutoverSplit` cutover — this cell drives it through
+/// `BeginSplitInPlace`/reconciler fork+materialize/`CutoverSplit` instead,
+/// and is now the corpus's only coverage of it (see the "cells 18/19"
+/// section doc above).
 fn scenario_restore_to_random_second_matches_the_model_across_an_inplace_split(seed: u64) {
     let mut sim = Simulator::new(seed);
     let mut meta = base_meta_with_pitr();
