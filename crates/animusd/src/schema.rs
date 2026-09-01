@@ -17,9 +17,8 @@ use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, MAX_REPLICATION_FACTOR,
     MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult, RegisterOutcome,
     SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
-    SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT, SplitMode,
-    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, split_child_placement,
-    topology,
+    SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT,
+    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -392,35 +391,28 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
-    /// Kick off a split of `tablet` at `split_key` — either the **copy-based**
-    /// workflow (ADR 0050: propose `MetaCommand::BeginSplit` — parent to
-    /// `Splitting`, still fully serving, two `Building` children minted at
-    /// **placement-chosen final homes**, fork F5, [`split_child_placement`])
-    /// or the **in-place** workflow (ADR 0058 Train 2: propose
-    /// `MetaCommand::BeginSplitInPlace` — parent to `Splitting`, no tablet-map
-    /// rows minted, the intent recorded directly on the parent for the CP
-    /// data plane's own host reconciler to drive), selected by
-    /// [`ClientCtx::split_mode`] — the ONE branch point between the two;
-    /// everything else on this call (the idempotent already-`Splitting`
-    /// handling, the confirm loop, the child-id allocation, F11 token
-    /// alignment) is shared verbatim. Confirms by observing the parent's own
-    /// state become `Splitting` (state-based, replacing the old zero-copy
-    /// epoch-advance confirm: a rebalance's `CasTabletReplicas` also bumps
-    /// the epoch, so an epoch advance alone proves nothing about a split;
-    /// observing the state does, and on a stray epoch bump the loop re-arms
-    /// its CAS instead of mis-reporting).
+    /// Kick off an **in-place** split of `tablet` at `split_key` (ADR 0058
+    /// Train 2: propose `MetaCommand::BeginSplitInPlace` — parent to
+    /// `Splitting`, no tablet-map rows minted, the intent recorded directly
+    /// on the parent for the CP data plane's own host reconciler to drive).
+    /// The copy-based workflow this call used to also be able to select
+    /// (ADR 0050: `MetaCommand::BeginSplit`, placement-chosen final homes,
+    /// fork F5) was deleted in the copy-split-deletion endgame's Layer B1
+    /// (`docs/adr/0058-*.md` rung 4) — `MetaCommand::BeginSplit` itself
+    /// stays defined (production-dead) pending Layer B2. Confirms by
+    /// observing the parent's own state become `Splitting` (state-based,
+    /// replacing the old zero-copy epoch-advance confirm: a rebalance's
+    /// `CasTabletReplicas` also bumps the epoch, so an epoch advance alone
+    /// proves nothing about a split; observing the state does, and on a
+    /// stray epoch bump the loop re-arms its CAS instead of mis-reporting).
     ///
     /// **Asynchronous by design**: success means *the split workflow
-    /// started* — a copy-based split's own driver (ADR 0050 stages 2–4)
-    /// seeds the children and performs the freeze/cutover; an in-place
-    /// split's fork happens entirely inside the CP data plane's own Raft
-    /// apply (ADR 0058 Stage 3) and its cutover is driven by
+    /// started* — the fork happens entirely inside the CP data plane's own
+    /// Raft apply (ADR 0058 Stage 3) and its cutover is driven by
     /// `index_drain.rs`'s `inplace_split_driver_tick`. This call never waits
-    /// for either. Calling on a tablet already `Splitting` returns success
+    /// for it. Calling on a tablet already `Splitting` returns success
     /// immediately ("already in flight" — the caller's intent is
-    /// accomplished-in-progress, and kickoff is idempotent) **regardless of
-    /// which workflow is running** — a stale-configured caller can never
-    /// re-trigger a split that already started under the other mode.
+    /// accomplished-in-progress, and kickoff is idempotent).
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
@@ -525,60 +517,26 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return ClientResponse::Error(SPLIT_KEY_NOT_TOKEN_VIABLE.into());
                 }
                 tracing::Span::current().record("new_id", left_id.0);
-                // ADR 0058 Train 2 rung 3 residue: `self.split_mode` is the
-                // ONE branch point between the two workflows — both
-                // commands share the identical `{parent, expected_epoch,
-                // split_key, children}` shape (`BeginSplitInPlace`'s own
-                // doc), the idempotent already-`Splitting` handling and the
-                // confirm loop above are unchanged either way, and neither
-                // `auto_split_loop` nor any other caller of `trigger_split`
-                // needs to know which one ran. What DOES differ between the
-                // two branches, since ADR 0062 rung 4: where each child's
-                // *own* replica set comes from.
-                let cmd = match self.split_mode {
-                    SplitMode::Copy => {
-                        // Fork F5 (ADR 0050, unchanged): children are minted
-                        // at placement-chosen final homes — the one data
-                        // movement of a copy-based split is the build
-                        // itself, so the mint must pick the real
-                        // destinations.
-                        let [left_replicas, right_replicas] =
-                            match split_child_placement(&meta, tablet) {
-                                Ok(sets) => sets,
-                                Err(e) => return ClientResponse::Error(e),
-                            };
-                        MetaCommand::BeginSplit {
-                            parent: tablet,
-                            expected_epoch: initial_epoch,
-                            split_key: aligned_key,
-                            children: [(left_id, left_replicas), (right_id, right_replicas)],
-                        }
-                    }
-                    SplitMode::InPlace => {
-                        // ADR 0062 rung 4 ("fork first, always local"):
-                        // both children get the parent's own CURRENT
-                        // replica set, verbatim, identical for both —
-                        // never a placement-computed final home. Every
-                        // replica already hosting the parent already has
-                        // everything the fork needs (Stage 3 clones the
-                        // parent's own already-open engine locally), so
-                        // there is nothing to recruit/catch-up before the
-                        // fork can proceed. Where a child *ends up* is
-                        // decided later, once, at `CutoverSplit`'s own
-                        // apply (ADR 0062 §2's directed Placing phase) —
-                        // not here.
-                        let replicas = meta
-                            .tablets
-                            .get(&tablet)
-                            .map(|t| t.replicas.clone())
-                            .unwrap_or_default();
-                        MetaCommand::BeginSplitInPlace {
-                            parent: tablet,
-                            expected_epoch: initial_epoch,
-                            split_key: aligned_key,
-                            children: [(left_id, replicas.clone()), (right_id, replicas)],
-                        }
-                    }
+                // ADR 0062 rung 4 ("fork first, always local"): both
+                // children get the parent's own CURRENT replica set,
+                // verbatim, identical for both — never a placement-computed
+                // final home. Every replica already hosting the parent
+                // already has everything the fork needs (Stage 3 clones the
+                // parent's own already-open engine locally), so there is
+                // nothing to recruit/catch-up before the fork can proceed.
+                // Where a child *ends up* is decided later, once, at
+                // `CutoverSplit`'s own apply (ADR 0062 §2's directed
+                // Placing phase) — not here.
+                let replicas = meta
+                    .tablets
+                    .get(&tablet)
+                    .map(|t| t.replicas.clone())
+                    .unwrap_or_default();
+                let cmd = MetaCommand::BeginSplitInPlace {
+                    parent: tablet,
+                    expected_epoch: initial_epoch,
+                    split_key: aligned_key,
+                    children: [(left_id, replicas.clone()), (right_id, replicas)],
                 };
                 let sent = self.propose_schema(&cmd).await;
                 next_propose_at = self.env.now().saturating_add(if sent {

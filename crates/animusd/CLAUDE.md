@@ -89,8 +89,9 @@ own entry below).
 3).** Since these mods can't reach `tests/support`, each hand-rolls its own
 `free_addrs`/`single_node`-shaped fixtures — and each must independently
 carry the bounded fresh-config retry documented in
-`docs/engineering-lessons.md` (the same idiom `tests/split_build.rs::bring_up`
-uses), or it panics `AddrInUse` under `cargo test --workspace` contention. A
+`docs/engineering-lessons.md` (the same idiom every surviving `tests/
+*_split*.rs`'s own `bring_up`/`bring_up_inplace` uses), or it panics
+`AddrInUse` under `cargo test --workspace` contention. A
 same-address restart (`gsi_drain_cursor_tests::
 crash_mid_reconcile_recovers_without_skipping_or_corrupting_the_gsi`) instead
 retries the rebind itself on a bounded deadline, mirroring
@@ -329,9 +330,11 @@ reusing the captured config is the point of the test.
   `cp_stale_forward_target`, `relay_stale_read`, `record_eventual_read`,
   `cp_get_local_resolving`, `confirm_or_push`, `cp_get_local_snapshot`,
   `cp_scan_local`, `cp_scan_kind_local`, `cp_get`); **`write_path.rs`**
-  (13 methods — `cp_kind_write_item`, `cp_kind_write_raw*`,
+  (13 methods as moved, now 11 — `seed_rows_local`/`seed_child_rows` were
+  deleted with the copy-based split-build driver in the copy-split-deletion
+  endgame's Layer B1: `cp_kind_write_item`, `cp_kind_write_raw*`,
   `cp_kind_local`, `poll_probe`, `cp_batch_local`/`cp_batch_propose`,
-  `cp_put_local`/`cp_delete_local`, `seed_rows_local`/`seed_child_rows`);
+  `cp_put_local`/`cp_delete_local`);
   **`txn_coordinator.rs`** (14 methods — the 2PC coordinator:
   `txn_stage_local`, `txn_prepare*`, `txn_decide_anchor`,
   `txn_resolve_participant`, `txn_status`, `txn_record_view`,
@@ -644,9 +647,10 @@ reusing the captured config is the point of the test.
   **PITR seal arm** (`pitr_tick`/`pitr_seal_now`, ADR 0059 §9 Train 3 —
   the stream seal arm's twin: same trigger knobs
   (`ctx.data().stream_seal_knobs`), same ledger-named-object recovery
-  argument, same `!splitting` exclusion guard mirrored into both
-  `split_driver_tick`/`inplace_split_driver_tick`'s own frozen-endgame
-  final seal, but writing to `crate::BackupStoreHandle`/`Metadata::
+  argument, same `!splitting` exclusion guard mirrored into
+  `inplace_split_driver_tick`'s own frozen-endgame final seal (the
+  copy-based `split_driver_tick`'s identical guard was deleted with it in
+  Layer B1), but writing to `crate::BackupStoreHandle`/`Metadata::
   pitr_segments` under `animus_cp_data::backup::pitr_segment_object_id`'s
   namespace rather than the streams `SegmentStoreHandle`/`stream_shards` —
   a table can have a stream, PITR, both, or neither, independently, and the
@@ -1110,182 +1114,57 @@ for why a static alias like `localhost` can't stand in for that), and a
 3-node cluster whose every entry shares one advertised host, proving the
 static config-derived peer book (not just self-registration) prefers it.
 
-**The split-build driver** (ADR 0050 Train B rung 4) is a
-`change_consumer_loop` arm: for a `Splitting` parent this node leads, it
-wakes the group, holds the quiesce veto, **holds trim** (metadata-derived —
-the `!splitting` gates on the marker branch and `trim_janitor`; driver
-liveness never gates it), bulk-copies BASE+LSI+FOOTPRINT (never
-CHANGE/CURSOR) into the two `Building` children via
-`ClientCtx::seed_child_rows` (local-or-`Forwarded{SeedRows}`, one confirm
-implementation `seed_rows_local`, confirm-by-applied-index) — **one ship
-per child, concurrently** (`ship_all`/`try_join_all`; `ship` returns its
-row count rather than taking `&mut build.rows_shipped`, which is what used
-to serialize them at the borrow checker). A failure cancels the sibling's
-in-flight future, which is safe for the same reason a crashed driver is:
-`SeedBatch` merges at carried versions, so the next tick re-ships as a
-no-op (`tests/split_build.rs::split_survives_losing_one_childs_leader_mid_
-build` kills a child's leader mid-build to prove it). Worth ~0.6s of a ~6s
-build, not the ~2x the shape suggests — the ships are a minority of the
-cost; **three full engine scans** (version-floor pre-pass, bulk scan, final
-image) dominate a quiet build and are the named next win, then tails the
-parent's change log by **packed-HLC watermark** (never a key-position
-cursor — see the engineering-lessons entry) at token granularity (or full
-prefix for sub-token raw keys). **The tail costs the DELTA, not the table
-(2026-08-19 amendment):** its watermark starts at the parent's highest
-change HLC as of the pre-bulk pass (captured beside `bulk_version_floor`,
-under the same monotonicity argument) rather than at 0 — a zero start made
-the first pass re-ship every row the bulk image already held — and it
-batches rows per child across dirty units to the same `SEED_CHUNK_BYTES`
-budget the bulk pass uses, instead of one `SeedBatch` (hence one consensus
-round, plus a forwarded hop for an off-node child) per partition key.
-Before the fix, a 20,000-row split spent ~6,000 no-op Raft entries per
-child and ~85% of its wall clock re-copying; a child's `commit_index`
-growth per row received is the batch-size meter that shows it, and is what
-`tests/split_build.rs::split_build_tail_does_not_re_ship_the_bulk_image_
-row_by_row` asserts on. Progress mirrors to
-`ctx.data().split_builds` → `/admin/raftkv`'s
-`split_rows_shipped`/`split_converged`/`split_phase`. **Rung 5 completes the
-workflow**: at convergence — caught up, OR `SPLIT_MAX_TAIL_PASSES` (25)
-post-bulk chasing passes elapsed (the rung-8 liveness bound: a
-continuously-written parent must still freeze; see the engineering-lessons
-entry) — the driver proposes `KvCommand::Freeze` on the parent (terminal
-whole-range seal; USER data only — consumer bookkeeping writes stay
-allowed so the vetoes below can converge, see the engineering-lessons
-entry), then in ONE tick (rung 8: each phase-per-tick boundary was pure
-write-blip): final tail drain to zero → the **final image** (a re-scan
-ship of the frozen parent *filtered by the pre-bulk version floor* — txn
-decisions/resolves are signal-less writes an O(delta) tail misses, and
-apply order == HLC order makes every bulk-missed rewrite out-version the
-floor; deliberately not `latest_version()`, which the read-ceiling marker
-future-shifts; gated on the apply task reaching the freeze-window commit
-floor) → streams final seal — **the pre-bulk floor costs its own full
-engine scan and is deliberately NOT `group.engine_applied_index()`, a
-Raft log index that is not the same value space as a row's packed-HLC
-MVCC version** (ADR 0018 §2/PR2; see the "CP writes need no
-client-assigned version" gotcha below and ADR 0050's 2026-08-19
-"investigated and rejected" amendment — that substitution was considered
-for this exact scan and found unsound both directions, not merely
-unoptimized)
-(`seal_now`, no size/age gate) → GSI-drain veto (`"gsi"` cursor ≥ max
-pending record) → backfill veto (`MarkIndexBackfilled` for every
-`Creating` index) → proposes `CutoverSplit` until the parent leaves the
-map (the reconciler then `Reclaim`s it everywhere). **The GSI-drain veto is
-a correctness gate, not a liveness heuristic** (cutover retires the parent
-and the reconciler reclaims its engine outright — no drain-before-halt, see
-`animus-cp-data/CLAUDE.md`'s "Superseded by ADR 0044" entry — so firing
-cutover past an un-drained cursor would silently lose GSI updates forever):
-its fix for slow convergence under a write flood (issue #288) is therefore
-to accelerate the drain, never to bound or bypass the veto the way
-`SPLIT_MAX_TAIL_PASSES` bounds the *build* phase's own chase (that bound is
-safe only because the build's correctness never depended on the lag being
-zero; this veto's does). Once the parent freezes the backlog this veto
-watches is fixed, not growing, so `split_driver_tick`'s frozen endgame
-drives the GSI drain to exhaustion in a tight loop right there
-(`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`) instead of waiting on
-`change_consumer_loop`'s own once-per-`INDEX_DRAIN_INTERVAL` call to make
-progress — zero fairness cost against a static parent, and it survives a
-transient propose failure under load without costing a full extra tick to
-retry. See `docs/engineering-lessons.md`'s issue #288 entry for the general
-"accelerate a correctness gate, never bound it" rule, and
-`tests/split_build.rs::
-indexed_put_item_unthrottled_flood_racing_the_split_converges_with_no_lost_gsi_updates`
-for the regression (an unpaced flood racing a split, asserting both
-convergence and that the post-cutover GSI reflects every acked write). A
-stale-routed write
-to a frozen parent gets the retryable `FROZEN_REFUSAL` from every local
-write/txn helper (`frozen_refusal`; bookkeeping-only kind batches exempt).
-**Both `ClientCtx::cp_kind_write_item` (the evaluated arm) and
-`cp_kind_write_raw` (the fast/marker arm) retry this internally** (issue
-#288: pre-fix, neither had a retry loop at all — every Dynamo/raw-
-protocol write funnels through one of these two since ADR 0049's write-path
-unification, so a write racing the freeze window got a terminal 500
-instead of the write landing on the child a moment later), mirroring
-`cp_read`'s deadline-bounded loop and re-resolving `cp_route` each attempt.
-A `Building` child runs **no consumer arms at all**: it is structurally
-unroutable (`topology::tablet_for_key` excludes it — its range overlaps
-the still-serving parent's), so any cursor write keyed inside its own
-range would land in the parent's scope and poison the parent's
-min-over-rows watermark regardless of the cursor key's own encoding —
-issue #355's fix (`cursor::cursor_key` embedding `range.start` verbatim)
-closes a *different* misrouting (a fresh right child's own writes landing
-on its left sibling post-cutover) and doesn't touch this one, since an
-unroutable tablet has no routing candidacy to fix into. E2e:
-`tests/split_build.rs` (full workflow + racing txns + post-freeze leader
-kill).
-
-**`SplitMode` (ADR 0058 Train 2 rung 3's `animusd`-level driver residue)
-selects between the copy-based workflow above and the in-place one**:
-`animusd::config::SplitMode` (`Copy`/`InPlace`; **`InPlace` is the default
-since ADR 0058 rung 4 layer 2** — measurement showed it ~1.8× faster to
-converge with no correctness gap, see that ADR's rung-4-layer-2 as-built
-note — `Copy` was the default and every config/test's implicit behavior
-before this layer, and stays fully selectable via `--split-mode copy`
-pending its own deletion, not yet done), stored as a plain
-`ClientCtx.split_mode` field — deliberately **not** a `ClusterConfig` field
-(unlike `DynamoAuthConfig`, which has no other way to reach a `--config
-FILE` process): this is threaded exactly the way `--auto-split`/
-`--quiesce-after` are, as a CLI-parsed runtime parameter down the
-`spawn_common_tail`/`start_with_growth`/`start_control_with`/
-`start_data_with_growth` call chain, so adding it never touched
-`ClusterConfig`'s struct-literal shape (which dozens of existing tests
-construct directly). `--split-mode {copy,inplace}` threads through
-`--config FILE --node I` and `--cluster N` only — the identical scope
-`--quiesce-after` has, including the same documented gap for
-`--cluster-control`/`--cluster-data` and the standalone
-`control`/`data`/`join` subcommands (each always runs `SplitMode::
-default()` = `InPlace`, no flag of its own to select `Copy`). A test that
-specifically exercises the copy workflow's own mechanics (its
-`Splitting`/`Building` intermediate metadata shape, its build/freeze/tail
-driver, its own bench) must pin `SplitMode::Copy` explicitly rather than
-relying on `SplitMode::default()`/`run_node` — see
-`docs/engineering-lessons.md`'s rung-4-layer-2 entry for the audit and the
-two test files this caught. `ClientCtx::trigger_split` is still the ONE
-choke point both workflows share (see its own doc, `schema.rs`): `self.
-split_mode` is the sole branch point between proposing `MetaCommand::
-BeginSplit` or `BeginSplitInPlace`, the identical idempotent
-already-`Splitting` handling, the identical confirm loop, and identical
-F11 alignment — `auto_split_loop`/`admin::action_split`/
-`ClientRequest::SplitTablet` all fall in behind whichever mode is
-configured automatically, with no fork of their own. **Since ADR 0062
-rung 4, the two branches' `children` computation itself is where they
-diverge**: `Copy` still mints its two children at placement-chosen final
-homes (`split_child_placement`/fork F5, unchanged); `InPlace` no longer
-does — both children carry the parent's own current `replicas`, verbatim
-and identical to each other, read from the same already-fetched `meta`
-the confirm loop already holds. The wire *shape* of `children:
-[(TabletId, Vec<NodeId>); 2]` is still identical between the two
-`MetaCommand`s — only the values a proposer computes for it differ.
+**The copy-based split-build driver (ADR 0050 Train B rungs 4-8) and the
+`SplitMode` selector that chose between it and the in-place workflow below
+were deleted whole in the copy-split-deletion endgame's Layer B1**
+(`docs/adr/0058-*.md` rung 4) — `SplitBuild`/`split_driver_tick`/`ship`/
+`ship_all`/`tail_pass`/`seed_row_bytes`/`packed_hlc`/`prefix_upper`/
+`max_change_hlc`/`SEED_KINDS`/`SEED_CHUNK_BYTES`/`SPLIT_MAX_TAIL_PASSES`
+(`index_drain.rs`), `ClientCtx::seed_rows_local`/`seed_child_rows`
+(`write_path.rs`), the `SeedRows` wire RPC (`animus-node::wire`), and
+`animusd::config::SplitMode`/`ClientCtx.split_mode`/`--split-mode
+{copy,inplace}` are all gone; `tests/split_build.rs` was deleted earlier,
+in Layer A. `ClientCtx::trigger_split` now unconditionally proposes
+`MetaCommand::BeginSplitInPlace` — see its own doc, `schema.rs`.
+`MetaCommand::BeginSplit`/`split_child_placement`'s fork F5 placement-at-
+mint logic are production-dead pending Layer B2's deletion of `BeginSplit`
+itself, but the type still compiles (relayable-command classification,
+apply, mirror). `animus_control::select_replicas_balanced` (the placement
+primitive `split_child_placement` used to call) stays in `animus-placement`
+— also production-dead now, kept since nothing in this layer's scope
+justified touching that crate. What follows below is the **in-place**
+workflow, which was always independent of the copy-based one apart from
+sharing `trigger_split`'s choke point and (until Layer B1) the GSI-drain/
+backfill-veto constants documented next.
 
 **The in-place cutover driver** (`index_drain.rs::
-inplace_split_driver_tick`) is `change_consumer_loop`'s in-place sibling to
-`split_driver_tick` above, selected per-tablet — not per-node — by
+inplace_split_driver_tick`) is `change_consumer_loop`'s in-place arm for a
+`Splitting` parent this node leads — the only arm now that the copy-based
+driver above it is gone, selected (still per-tablet, not per-node, though
+there is no longer a second workflow to distinguish it from) by
 `Tablet::inplace_split.is_some()` (a durable fact of the tablet's own
-`Metadata` row, set only by `BeginSplitInPlace`): a node can be configured
-`InPlace` while driving a tablet someone else split with `BeginSplit`
-before the flag flipped, and vice versa. Everything upstream of this —
-proposing the single-entry `KvCommand::SplitTablet` fork itself (**since
-ADR 0062, immediately, with no learner-add-and-wait phase to run first —
-every replica the fork touches already hosts the parent as an ordinary
-voter**) and materializing both children's engines on every fork
+`Metadata` row, set only by `BeginSplitInPlace`). Everything upstream of
+this — proposing the single-entry `KvCommand::SplitTablet` fork itself
+(**since ADR 0062, immediately, with no learner-add-and-wait phase to run
+first — every replica the fork touches already hosts the parent as an
+ordinary voter**) and materializing both children's engines on every fork
 participant — is entirely `animus_cp_data::host`'s own reconciler (ADR
 0058 Train 2 rung 3; fork-first per ADR 0062 rung 5, unmodified by this
 driver); this function has nothing to do until `CpGroup::pending_split()`
 answers `Some` on this replica. Once forked, there is no build, no freeze,
 no tail, no convergence bound — the atomic mint already fully formed both
-children — so what is left is exactly the copy-based endgame's own two
-pre-cutover vetoes (GSI-drain, accelerated identically via
-`gsi_caught_up`/`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`; backfill-seeder) run
-against the parent's own (now-frozen, static — `SplitTablet` reuses
-`Freeze`'s exact whole-range seal discipline) change log, plus the
-**streams final seal** anchored at the fork position (`seal_now`, looped
-to exhaustion — identical call the copy-based endgame makes, closing the
-shard so an in-flight streams iterator drains the parent shard and walks
-on to the children via `split_lineage`), before proposing
+children — so what is left is exactly the two pre-cutover vetoes the
+deleted copy-based endgame used to share the constants for (GSI-drain,
+accelerated via `gsi_caught_up`/`FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES`,
+both of which stayed — the in-place driver is now their only caller;
+backfill-seeder) run against the parent's own (now-frozen, static —
+`SplitTablet` reuses `Freeze`'s exact whole-range seal discipline) change
+log, plus the **streams final seal** anchored at the fork position
+(`seal_now`, looped to exhaustion), before proposing
 `MetaCommand::CutoverSplit` with the identical confirm-by-observation loop
 (re-issued every tick until the parent vanishes from the map). Fully
-idempotent across crash/re-lead with **no driver-local state at all**
-(stricter than `SplitBuild`, which memoizes real progress): every check is
-a fresh read off durable/replicated state.
+idempotent across crash/re-lead with **no driver-local state at all**:
+every check is a fresh read off durable/replicated state.
 
 **Gotcha this rung found, in real `ProdEnv`, not `SimEnv`**: proposing
 `CutoverSplit` the instant `pending_split()` is `Some` races
@@ -1314,8 +1193,8 @@ the same `env.now()`-derived clock `cutover_wall_ms` already uses — no
 driver-local timer) **and** this replica's own `ctx.edge.hosted_groups()`
 to already contain both children, before it may ever propose cutover. See
 `docs/engineering-lessons.md`'s entry for the general lesson. E2e:
-`tests/inplace_split_e2e.rs` — a real 3-node `--split-mode inplace`
-cluster, a paced continuous writer riding kickoff through cutover
+`tests/inplace_split_e2e.rs` — a real 3-node cluster, a paced continuous
+writer riding kickoff through cutover
 (asserting every acked write survives with its exact value, and observing
 zero write refusals across every run once the fix landed), and a
 streams-enabled variant walking a `GetRecords` iterator from the parent's
@@ -1560,22 +1439,23 @@ re-forwards.
 
 **Hinted-retry forwarding** (`ClientCtx::forward_to_tablet_leader`, the single
 choke point for every forward — `cp_forward` is its (table, key)-resolving
-wrapper, and every **tablet-id-addressed** internal RPC (`SeedRows`,
-`ForceSeal`, `TriggerAutoSplit`, `ClearBackfillCursor`, `StreamHotRead`) calls
-it directly): a "not the leader here" refusal carries the refusing node's own
-leader hint (`topology::format_not_leader_refusal`, a plain string suffix so old
-and new binaries interoperate); the chase retries at the hint if
-untried, else at another of the tablet's known replicas, bounded to one pass over
-{hint} ∪ replicas within the overall `CLIENT_TIMEOUT`. The tablet-addressed
-RPCs used to relay once and re-resolve from scratch instead — which never
-converges when the calling node hosts **no replica** of the target tablet
-(the fallback deterministically re-picks the first metadata replica; the
-split driver seeding an off-node fork-F5 child spun on exactly this forever,
-parking the split — see `docs/engineering-lessons.md`). A new tablet-addressed
-RPC must forward through this choke point, and its test suite needs a caller
-hosting no replica of the target, which only a cluster larger than RF can
-produce (`tests/split_build.rs::
-split_completes_when_a_child_lives_off_the_parent_leader_node`).
+wrapper, and every **tablet-id-addressed** internal RPC (`ForceSeal`,
+`TriggerAutoSplit`, `ClearBackfillCursor`, `StreamHotRead` — `SeedRows`, the
+copy-based split-build driver's own tablet-addressed RPC, was deleted in
+Layer B1) calls it directly): a "not the leader here" refusal carries the
+refusing node's own leader hint (`topology::format_not_leader_refusal`, a
+plain string suffix so old and new binaries interoperate); the chase retries
+at the hint if untried, else at another of the tablet's known replicas,
+bounded to one pass over {hint} ∪ replicas within the overall
+`CLIENT_TIMEOUT`. The tablet-addressed RPCs used to relay once and
+re-resolve from scratch instead — which never converges when the calling
+node hosts **no replica** of the target tablet (the fallback
+deterministically re-picks the first metadata replica; the deleted
+copy-based split driver seeding an off-node fork-F5 child spun on exactly
+this forever, parking the split — see `docs/engineering-lessons.md`). A new
+tablet-addressed RPC must forward through this choke point, and its test
+suite needs a caller hosting no replica of the target, which only a cluster
+larger than RF can produce.
 
 **A dead candidate is chased too, not just a wrong-but-reachable one
 (issue #316, fixed).** The hinted-retry fix above only helps when the
@@ -1587,11 +1467,11 @@ doesn't parse as a "not the leader here" refusal, so the pre-fix chase
 gave up on the very first unreachable hop instead of trying another known
 replica. Since the guess itself is deterministic (the no-local-replica
 fallback and a refusal's own embedded hint are both plain reads, never
-liveness-checked), a caller that keeps re-resolving and re-forwarding
-(the split-build driver's own per-tick retry, `seed_child_rows`) kept
-reproducing the identical dead end forever once its first guess or hint
-chase happened to land on a node that had since died — the confirmed root
-cause of `tests/split_build.rs::
+liveness-checked), a caller that keeps re-resolving and re-forwarding (the
+deleted copy-based split-build driver's own per-tick retry, formerly
+`seed_child_rows`) kept reproducing the identical dead end forever once its
+first guess or hint chase happened to land on a node that had since died —
+the confirmed root cause of the deleted `tests/split_build.rs::
 split_survives_losing_one_childs_leader_mid_build`'s reported hang. Fixed
 by giving a transport failure the identical "no hint" treatment a
 live-but-mid-election refusal already gets (try another known replica),
@@ -1600,8 +1480,10 @@ rather than a terminal return. Regression:
 forward_to_tablet_leader_survives_a_dead_first_guess` (`lib.rs` — **not**
 beside `forward_to_tablet_leader` in `forwarding.rs`, whose module carries
 a hard `#[deny(clippy::disallowed_methods)]`, ADR 0061 Phase C's closing
-rung, that a real-socket test's `tokio::time` calls would trip). See
-`docs/engineering-lessons.md`'s matching entry for the full incident,
+rung, that a real-socket test's `tokio::time` calls would trip; probed via
+`ClientCtx::clear_backfill_cursor_for_table` since Layer B1 deleted
+`seed_child_rows`, the original probe — see that test's own updated doc).
+See `docs/engineering-lessons.md`'s matching entry for the full incident,
 including why this sandbox could never reproduce the original hang live
 (fast localhost + a small dataset's bulk pass usually outracing the
 test's own 30s victim-detection poll) yet the fix was still provable
@@ -3335,8 +3217,8 @@ node (`/admin/raftkv`'s `is_leader`) and re-measures `PutItem`/
 `GetItem(ConsistentRead:true)` through the resulting election, via a
 bounded-retry wire helper that counts (and reports) retries rather than
 failing on a transient "not the leader here". Cluster bring-up follows
-`tests/inplace_split_bench.rs`/`tests/split_build.rs`'s bounded-retry
-port-TOCTOU idiom. Workload knobs: `ANIMUS_BENCH_NODES` (3),
+`tests/inplace_split_bench.rs`'s bounded-retry port-TOCTOU idiom. Workload
+knobs: `ANIMUS_BENCH_NODES` (3),
 `ANIMUS_BENCH_ITEMS` (2_000, preload size), `ANIMUS_BENCH_OPS` (1_000,
 measured ops per class), `ANIMUS_BENCH_VALUE_BYTES` (256),
 `ANIMUS_BENCH_CLIENTS` ("1,8,32"), and `ANIMUS_BENCH_JSON=<path>` to also
@@ -3348,9 +3230,9 @@ doc for the full mapping.
 
 **Manual/local only — this bench does not run in CI.** Real sockets, real
 disk, and real elapsed wall clock make it unsuitable for a shared runner's
-noise floor (the same reason `tests/inplace_split_bench.rs`/
-`split_build.rs`'s own benches are `#[ignore]`d rather than part of the
-default `cargo test` run). Run it locally when you need a number, not as
+noise floor (the same reason `tests/inplace_split_bench.rs`'s own bench is
+`#[ignore]`d rather than part of the default `cargo test` run). Run it
+locally when you need a number, not as
 a gate. **Numbers are comparable only to another run on the same host, in
 the same session** — never across machines or sessions, per
 `docs/engineering-lessons.md`'s "a historical bench figure from a

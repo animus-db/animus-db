@@ -68,17 +68,18 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-/// Like [`bring_up`], but pins every node's [`animusd::SplitMode`] explicitly
-/// instead of taking whatever `SplitMode::default()` currently is — for
-/// `admin_split_kicks_off_the_copy_based_workflow` below, which asserts the
-/// ADR 0050 copy-based workflow's own intermediate states (`Splitting` +
-/// two `Building` children) and must keep exercising that workflow
-/// regardless of which mode is the cluster-wide default (ADR 0058 rung 4
-/// layer 2 flipped it to `InPlace`).
-async fn bring_up_with_split_mode(
+/// Like [`bring_up`], but goes through `run_node_with_streams_quiesce_and_
+/// backup_store` directly (production streams/segment-store/backup-store
+/// defaults, quiescence explicitly disabled) instead of [`bring_up`]'s
+/// plain [`animusd::run_node`] — used by
+/// `admin_split_in_place_children_inherit_the_parents_own_replicas` below.
+/// (Originally also pinned an explicit `SplitMode`, back when the crate had
+/// two split workflows to choose between; the copy-based one and the
+/// `SplitMode` selector were deleted in the copy-split-deletion endgame's
+/// Layer B1 — every split is in-place unconditionally now.)
+async fn bring_up_with_streams_quiesce(
     n: usize,
     dir: &std::path::Path,
-    split_mode: animusd::SplitMode,
 ) -> (Vec<Node>, animusd::ClusterConfig) {
     for attempt in 0..16 {
         let addrs = support::free_addrs(n * 6);
@@ -102,7 +103,7 @@ async fn bring_up_with_split_mode(
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_split_mode(
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
                 &config,
                 i,
                 dir.join(format!("node-{attempt}-{i}")),
@@ -112,7 +113,6 @@ async fn bring_up_with_split_mode(
                 animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
-                split_mode,
                 animusd::BackupStoreConfig::default(),
             )
             .await
@@ -1278,8 +1278,7 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
 async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
     timeout(Duration::from_secs(60), async {
         let dir = support::panic_safe_tempdir();
-        let (nodes, _config) =
-            bring_up_with_split_mode(4, dir.path(), animusd::SplitMode::InPlace).await;
+        let (nodes, _config) = bring_up_with_streams_quiesce(4, dir.path()).await;
         await_bootstrap(&nodes).await;
 
         // Provision the table's bootstrap tablet through the ordinary

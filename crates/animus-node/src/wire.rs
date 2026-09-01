@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{
-    ResolveOutcome, SeedRow, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
+    ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::NodeId;
 use animus_tablet::KeyRange;
@@ -313,26 +313,6 @@ pub enum ClientRequest {
     /// apply; real handling lives in `cp_serve_forwarded`'s match, reached
     /// only through the `Forwarded` arm.
     ClearBackfillCursor { tablet: u64, index: String },
-    /// **Internal split-build seed RPC — never sent bare, only wrapped in
-    /// [`Forwarded`](Self::Forwarded)** (ADR 0050 Train B rung 4): propose
-    /// one `KvCommand::SeedBatch` chunk — `(kind, logical key,
-    /// value-or-tombstone, MVCC version)` rows — into `tablet`'s (a
-    /// `Building` split child's) own Raft group, applied as
-    /// version-carrying merges. The **one** production sender is the
-    /// split-build driver (`index_drain::split_driver_tick` via
-    /// `ClientCtx::seed_child_rows`), running on the *parent* tablet's
-    /// leader node — a child's own leader can live anywhere (fork F5,
-    /// placement-chosen homes), so this needs the identical one-hop
-    /// forward/leader-resolution machinery every other CP op already has.
-    /// Addressed by `tablet` directly, mirroring
-    /// [`ForceSeal`](Self::ForceSeal) (a `Building` child is deliberately
-    /// unroutable by key). Bare delivery is refused for the same reason
-    /// `KindWrite`'s is: an arbitrary caller must never install raw rows
-    /// at arbitrary versions into a tablet's scopes. Not a `MetaCommand`,
-    /// so `is_relayable_command` does not apply; real handling lives in
-    /// `cp_serve_forwarded`'s match, reached only through the `Forwarded`
-    /// arm.
-    SeedRows { tablet: u64, rows: Vec<SeedRow> },
     /// **Internal evaluate-at-leader write RPC — never sent bare, only
     /// wrapped in [`Forwarded`](Self::Forwarded)** (ADR 0046 "evaluate at
     /// leader", U3, tracked against `docs/adr-tablet-log-model` #222): the
@@ -703,7 +683,6 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::TriggerAutoSplit { .. }
         | ClientRequest::StreamHotRead { .. }
         | ClientRequest::ClearBackfillCursor { .. }
-        | ClientRequest::SeedRows { .. }
         | ClientRequest::KindWriteItem { .. }
         | ClientRequest::TxnPrepare { .. }
         | ClientRequest::TxnDecide { .. }

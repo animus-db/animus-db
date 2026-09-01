@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod config;
 mod index_drain;
 pub mod otel;
-pub use config::{ClusterConfig, DynamoAuthConfig, SplitMode};
+pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
 // `animus-control` directly.
@@ -953,24 +953,6 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
-    /// This replica's Raft commit index — the rung-5 endgame's
-    /// apply-catch-up floor read. See [`RaftKvNode::commit_index`].
-    pub(crate) fn commit_index(&self) -> u64 {
-        match self {
-            CpGroup::Lsm(n) => n.commit_index(),
-            CpGroup::Mem(n) => n.commit_index(),
-        }
-    }
-
-    /// Propose the split-cutover freeze on this (parent) group (ADR 0050
-    /// rung 5). See [`RaftKvNode::propose_freeze`].
-    pub(crate) fn propose_freeze(&self) -> animus_control::ProposeResult {
-        match self {
-            CpGroup::Lsm(n) => n.propose_freeze(),
-            CpGroup::Mem(n) => n.propose_freeze(),
-        }
-    }
-
     /// This replica's `engine_applied_index()` — the confirm-by-index
     /// primitive linearizable reads themselves gate on. See
     /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
@@ -1003,20 +985,6 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.propose_seed_batch(rows),
             CpGroup::Mem(n) => n.propose_seed_batch(rows),
-        }
-    }
-
-    /// The split-build driver's raw row read — one kind scope's rows with
-    /// tombstones and versions, optionally bounded to a logical range. See
-    /// [`RaftKvNode::seed_rows_kind`].
-    pub(crate) async fn seed_rows_kind(
-        &self,
-        kind_idx: usize,
-        logical_range: Option<(&[u8], &[u8])>,
-    ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
-        match self {
-            CpGroup::Lsm(n) => n.seed_rows_kind(kind_idx, logical_range).await,
-            CpGroup::Mem(n) => n.seed_rows_kind(kind_idx, logical_range).await,
         }
     }
 
@@ -1215,12 +1183,6 @@ impl<E: Env> CpGroup<E> {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
-                    // Overlaid by `admin::raftkv_view` from the data role's
-                    // split-build mirror (ADR 0050 rung 4); this constructor
-                    // has no `ClientCtx` to read it from.
-                    split_rows_shipped: None,
-                    split_converged: None,
-                    split_phase: None,
                 }
             };
         }
@@ -3247,7 +3209,6 @@ fn spawn_common_tail(
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-    split_mode: SplitMode,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3269,7 +3230,6 @@ fn spawn_common_tail(
         remote_metadata: Arc::new(Mutex::new(None)),
         control_storage,
         dynamo_auth,
-        split_mode,
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -3534,7 +3494,6 @@ impl BoundNode {
             Duration::ZERO,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
-            SplitMode::default(),
             BackupStoreConfig::default(),
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         )
@@ -3568,11 +3527,6 @@ impl BoundNode {
     /// reading `ClusterConfig::dynamo_auth`, or `start_cluster_inner` for
     /// `--cluster N`) calls this method directly, the same layered-wrapper
     /// convention as every other knob here.
-    ///
-    /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
-    /// node's `ClientCtx::trigger_split` proposes — `SplitMode::default()`
-    /// (every caller above this layer) is `InPlace` since rung 4 layer 2.
-    /// See [`SplitMode`]'s own doc.
     ///
     /// `backup_store_config` (ADR 0059 §1) selects this node's second,
     /// backup-dedicated [`BackupStoreHandle`] — `BackupStoreConfig::Cluster`
@@ -3611,7 +3565,6 @@ impl BoundNode {
         quiesce_after: Duration,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-        split_mode: SplitMode,
         backup_store_config: BackupStoreConfig,
         pitr_snapshot_cadence: Duration,
     ) -> std::io::Result<Node> {
@@ -3818,7 +3771,6 @@ impl BoundNode {
             backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
-            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -3844,7 +3796,6 @@ impl BoundNode {
             Some(storage.clone()),
             self.env.clone(),
             dynamo_auth,
-            split_mode,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -4706,13 +4657,6 @@ impl BoundControlNode {
     /// of the apply task's published cache (`Metadata: DRIVER_APPLIED`)
     /// rather than an optional shadow mirror.
     ///
-    /// `split_mode` (ADR 0058 Train 2 rung 3) selects which workflow this
-    /// node's own `ClientCtx::trigger_split` proposes when it receives one
-    /// (a relayed admin/client `SplitTablet` request, or a follower-
-    /// connected `BeginSplit`/`BeginSplitInPlace` propose) — no explicit
-    /// caller override picks up `SplitMode::default()` = `InPlace` since
-    /// rung 4 layer 2; `Copy` stays selectable.
-    ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
     #[allow(clippy::too_many_arguments)]
@@ -4725,7 +4669,6 @@ impl BoundControlNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
-        split_mode: SplitMode,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4836,7 +4779,6 @@ impl BoundControlNode {
             // A control-only node never binds the dynamo listener (ADR
             // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
             None,
-            split_mode,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5104,7 +5046,6 @@ impl BoundDataNode {
             segment_store_config,
             None,
             None,
-            SplitMode::default(),
             BackupStoreConfig::default(),
         )
         .await
@@ -5119,10 +5060,6 @@ impl BoundDataNode {
     /// same knob, same default-`None`-disables contract. A data-only node
     /// binds the dynamo listener (ADR 0035 PR4) just like a combined node,
     /// so this is threaded here too, not skipped.
-    ///
-    /// `split_mode` (ADR 0058 Train 2 rung 3) — see
-    /// [`BoundNode::start_with_growth`]'s doc: same knob, same
-    /// `SplitMode::default()` (`InPlace` since rung 4 layer 2) contract.
     ///
     /// `backup_store_config` (ADR 0059 §1) — see [`BoundNode::
     /// start_with_growth`]'s doc: same knob, same default-`Cluster`
@@ -5146,7 +5083,6 @@ impl BoundDataNode {
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-        split_mode: SplitMode,
         backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
@@ -5239,7 +5175,6 @@ impl BoundDataNode {
             backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
-            split_builds: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -5267,7 +5202,6 @@ impl BoundDataNode {
             None,
             self.env.clone(),
             dynamo_auth,
-            split_mode,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -6185,10 +6119,6 @@ fn build_backup_store(
 /// fine: every access is a quick lock/mutate/drop with no `.await` held
 /// across it, the same discipline `ClientCtx::metrics_history` already
 /// uses.
-/// One `/admin/raftkv` split-build mirror entry (ADR 0050):
-/// `(rows_shipped, converged, phase)`.
-pub(crate) type SplitBuildView = (u64, bool, &'static str);
-
 #[derive(Clone, Default)]
 pub(crate) struct ChangeRateTracker {
     inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
@@ -6313,15 +6243,6 @@ struct DataRole {
     /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
     /// doc for the full design.
     pub(crate) change_rates: ChangeRateTracker,
-    /// ADR 0050 Train B rung 4: this node's own per-parent-tablet split-build
-    /// progress — `(rows shipped, build converged)` — written by
-    /// `index_drain`'s split-driver arm on the parent's leader node, read by
-    /// `/admin/raftkv` (`CpRaftView.split_rows_shipped`/`split_converged`).
-    /// Driver-local observability only, NEVER correctness state: a leader
-    /// change starts a fresh entry on the new leader's node (the build
-    /// re-runs idempotently), and B5's freeze/cutover decisions read the
-    /// tail's own convergence directly, not this mirror.
-    pub(crate) split_builds: Arc<Mutex<BTreeMap<u64, SplitBuildView>>>,
 }
 
 /// Shared context for the client request server and the DynamoDB endpoint:
@@ -6437,18 +6358,6 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// "explicitly out of scope: rotation, dynamic credential API") — cheap
     /// to clone onto each connection's `ClientCtx`, never locked.
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-    /// Which tablet-split workflow this node proposes when it drives
-    /// `trigger_split` (ADR 0058 Train 2 rung 3's `animusd`-level driver
-    /// residue) — `InPlace` (every constructor below that doesn't take an
-    /// explicit override defaults to `SplitMode::default()`, `InPlace`
-    /// since rung 4 layer 2) is the ADR 0058 in-place single-entry atomic
-    /// fork; `Copy` is the original ADR 0050 workflow, still selectable.
-    /// See [`SplitMode`]'s own doc. Threaded
-    /// from the `--split-mode {copy,inplace}` CLI flag (`--config`/
-    /// `--cluster N` only, mirroring `--quiesce-after`'s own scope) —
-    /// plain per-node config, not gated by [`DataRole`], since a
-    /// control-only node's `trigger_split` calls need it too.
-    pub(crate) split_mode: SplitMode,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -8480,67 +8389,6 @@ const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
 // /admin/tablet/split`, `ClientRequest::SplitTablet`). See that function's
 // own doc for the full F11/Fork E rationale.
 
-/// Choose the two `BeginSplit` children's replica sets (ADR 0050 fork F5:
-/// **fresh placement at mint** — children are born at their final homes, so
-/// the copy-based build is the only data movement a split ever makes).
-///
-/// Pure over the given `Metadata` snapshot: candidates are the `Active`
-/// members (the same liveness rule `Metadata::reconcile` applies), the
-/// parent's own placement policy carries RF/residency/spread, and per-node
-/// load is the current replica count across every tablet (seeded `0` for
-/// every candidate — a fresh member is a genuine minimum, matching
-/// `rebalance_step`'s rule). The second child's selection sees the first
-/// child's picks as load, so the two don't pile onto the same least-loaded
-/// nodes. A parent with no recorded policy (not a state `provision_tablet`
-/// produces, but reachable via a hand-built cluster) falls back to
-/// inheriting the parent's own replica set for both children — the
-/// pre-fork-F5 behavior, safe if never balanced.
-fn split_child_placement(meta: &Metadata, parent: TabletId) -> Result<[Vec<NodeId>; 2], String> {
-    let Some(parent_tablet) = meta.tablets.get(&parent) else {
-        return Err("no such tablet".into());
-    };
-    let Some(policy) = meta.policies.get(&parent) else {
-        return Ok([
-            parent_tablet.replicas.clone(),
-            parent_tablet.replicas.clone(),
-        ]);
-    };
-    let candidates: Vec<animus_control::Candidate> = meta
-        .members
-        .iter()
-        .filter(|(_, m)| m.status == NodeStatus::Active)
-        .map(|(id, m)| animus_control::Candidate::new(id.clone(), m.labels.clone()))
-        .collect();
-    let mut load: BTreeMap<NodeId, usize> =
-        candidates.iter().map(|c| (c.node.clone(), 0)).collect();
-    for t in meta.tablets.values() {
-        for r in &t.replicas {
-            if let Some(n) = load.get_mut(r) {
-                *n += 1;
-            }
-        }
-    }
-    // Placement can be under-satisfiable right now (a dev/single-node
-    // cluster whose recorded RF exceeds the live member count — the exact
-    // state `provision_tablet` already documents as legitimate, with repair
-    // self-healing once members exist). Fall back to inheriting the
-    // parent's own replica set then, exactly like the no-policy case above:
-    // best-effort placement now, `reconcile_placement` fixes the children
-    // up after cutover once they are `Active` again.
-    let pick = |load: &BTreeMap<NodeId, usize>| {
-        animus_control::select_replicas_balanced(&candidates, policy, load)
-            .unwrap_or_else(|_| parent_tablet.replicas.clone())
-    };
-    let left = pick(&load);
-    for r in &left {
-        if let Some(n) = load.get_mut(r) {
-            *n += 1;
-        }
-    }
-    let right = pick(&load);
-    Ok([left, right])
-}
-
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
 /// whose CP group this node currently **leads**, take the leader's **cheap
 /// estimate** ([`CpGroup::approx_bytes`] — memtable + SSTable metadata, no
@@ -8822,7 +8670,6 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::TriggerAutoSplit { .. } => "trigger_auto_split",
         ClientRequest::StreamHotRead { .. } => "stream_hot_read",
         ClientRequest::ClearBackfillCursor { .. } => "clear_backfill_cursor",
-        ClientRequest::SeedRows { .. } => "seed_rows",
         ClientRequest::Get { .. } => "get",
         ClientRequest::GetSnapshot { .. } => "get_snapshot",
         ClientRequest::Scan { .. } => "scan",
@@ -9084,11 +8931,6 @@ async fn handle_request(
              `Forwarded`"
                 .into(),
         ),
-        ClientRequest::SeedRows { .. } => ClientResponse::Error(
-            "this request is an internal split-build seed RPC and must be sent wrapped in \
-             `Forwarded`"
-                .into(),
-        ),
         ClientRequest::ClearBackfillCursor { .. } => ClientResponse::Error(
             "this request is an internal backfill-cursor-cleanup RPC and must be sent wrapped \
              in `Forwarded`"
@@ -9213,7 +9055,6 @@ pub async fn start_cluster_with(
         None,
         Duration::ZERO,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9247,7 +9088,6 @@ pub async fn start_cluster_with_auto_split_bytes(
         None,
         Duration::ZERO,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9278,7 +9118,6 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         None,
         Duration::ZERO,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9316,7 +9155,6 @@ pub async fn start_cluster_with_streams(
         None,
         Duration::ZERO,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9351,7 +9189,6 @@ pub async fn start_cluster_with_growth(
         auto_split_change_rate,
         Duration::ZERO,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9386,7 +9223,6 @@ pub async fn start_cluster_with_quiesce_after(
         None,
         quiesce_after,
         None,
-        SplitMode::default(),
         BackupStoreConfig::default(),
     )
     .await
@@ -9407,12 +9243,6 @@ pub async fn start_cluster_with_quiesce_after(
 /// other wrapper above) disables auth entirely, byte-identical to
 /// pre-ADR-0057 behavior.
 ///
-/// `split_mode` (ADR 0058 Train 2 rung 3) selects which split workflow the
-/// whole in-process cluster runs — `--cluster N`'s `--split-mode
-/// {copy,inplace}` CLI flag threads through here; `SplitMode::default()`
-/// (every other wrapper above) is `InPlace` since rung 4 layer 2 — `Copy`
-/// stays selectable via the flag pending its own deletion.
-///
 /// `backup_store_config` (ADR 0059 §1) selects the whole in-process
 /// cluster's backup store — `--cluster N`'s `--backup-store cluster|fs:PATH`
 /// CLI flag threads through here; `BackupStoreConfig::Cluster` (every other
@@ -9432,7 +9262,6 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-    split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
@@ -9446,7 +9275,6 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         auto_split_change_rate,
         quiesce_after,
         dynamo_auth,
-        split_mode,
         backup_store_config,
     )
     .await
@@ -9464,7 +9292,6 @@ async fn start_cluster_inner(
     auto_split_change_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
-    split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
@@ -9543,7 +9370,6 @@ async fn start_cluster_inner(
                 // per-process `run_node_with_ttl_sweep_interval` instead.
                 ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 dynamo_auth.clone(),
-                split_mode,
                 backup_store_config.clone(),
                 pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             )
@@ -9768,14 +9594,6 @@ pub async fn start_split_cluster_with_growth(
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
-                // `split_mode` does not thread through the split-deployment
-                // dev path yet — same documented gap this function already
-                // has for `quiesce_after` (`main.rs::run`'s own comment) and
-                // `--stream-seal-*`/`--segment-store` below: always
-                // `SplitMode::default()`, `InPlace` since rung 4 layer 2
-                // (was `Copy`) — this dev shape has no `--split-mode` flag
-                // to override it with.
-                SplitMode::default(),
             )
             .await?,
         );
@@ -9798,8 +9616,6 @@ pub async fn start_split_cluster_with_growth(
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
                 dynamo_auth.clone(),
-                // Same documented gap as the control-role loop above.
-                SplitMode::default(),
                 BackupStoreConfig::default(),
             )
             .await?,
@@ -9931,7 +9747,6 @@ pub async fn run_node_with_streams_and_quiesce_after(
         stream_retention,
         quiesce_after,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
-        SplitMode::default(),
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
@@ -9973,7 +9788,6 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         stream_retention,
         Duration::ZERO,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
-        SplitMode::default(),
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
     )
@@ -9981,22 +9795,19 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
 }
 
 /// Like [`run_node_with_streams_and_quiesce_after`], but also selects the
-/// **split workflow** (ADR 0058 Train 2 rung 3) explicitly instead of
-/// [`SplitMode::default`] — `--config FILE --node I`'s `--split-mode
-/// {copy,inplace}` CLI flag threads through here. The same layered-wrapper
-/// convention as [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s
-/// own `ttl_sweep_interval` knob: every existing call site above keeps
-/// compiling and behaving identically at `SplitMode::default()` (`InPlace`
-/// since rung 4 layer 2).
-///
-/// `backup_store_config` (ADR 0059 §1) — `--config FILE --node I`'s own
-/// `--backup-store cluster|fs:PATH` CLI flag threads through here. Plumbing
-/// only (ADR 0059 Train 1 PR②).
+/// **backup store** (ADR 0059 §1) explicitly instead of
+/// [`BackupStoreConfig::default`] — `--config FILE --node I`'s own
+/// `--backup-store cluster|fs:PATH` CLI flag threads through here. The same
+/// layered-wrapper convention as
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`]'s own
+/// `ttl_sweep_interval` knob: every existing call site above keeps compiling
+/// and behaving identically at `BackupStoreConfig::default()`. Plumbing only
+/// (ADR 0059 Train 1 PR②).
 ///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
-pub async fn run_node_with_streams_quiesce_and_split_mode(
+pub async fn run_node_with_streams_quiesce_and_backup_store(
     config: &ClusterConfig,
     index: usize,
     dir: impl Into<PathBuf>,
@@ -10006,7 +9817,6 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
-    split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
@@ -10020,7 +9830,6 @@ pub async fn run_node_with_streams_quiesce_and_split_mode(
         stream_retention,
         quiesce_after,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
-        split_mode,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
@@ -10051,7 +9860,6 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     stream_retention: Duration,
     quiesce_after: Duration,
     ttl_sweep_interval: Duration,
-    split_mode: SplitMode,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
 ) -> std::io::Result<Node> {
@@ -10122,7 +9930,6 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
-            split_mode,
             backup_store_config,
             pitr_snapshot_cadence,
         )
@@ -10157,7 +9964,6 @@ pub async fn run_node_with_ttl_sweep_interval(
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
         ttl_sweep_interval,
-        SplitMode::default(),
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
     )
@@ -10267,13 +10073,6 @@ pub async fn run_node_control_with_orphan_sweep_after(
             admin_addrs,
             backend,
             orphan_sweep_after,
-            // `animusd control`'s CLI surface has no `--split-mode` flag of
-            // its own (mirroring `--quiesce-after`'s identical scope gap
-            // for this same subcommand) — a control-only node's
-            // `trigger_split` calls always default to `SplitMode::default()`,
-            // `InPlace` since rung 4 layer 2 (was `Copy`); `--config`'s own
-            // `run` path is still the only way to pin `Copy` explicitly.
-            SplitMode::default(),
         )
         .await
 }
@@ -10392,11 +10191,6 @@ pub async fn run_node_data(
             SegmentStoreConfig::default(),
             None,
             dynamo_auth,
-            // `animusd data --config`'s CLI surface has no `--split-mode`
-            // flag of its own (mirrors `run_node_control_with_orphan_sweep_
-            // after`'s identical scope gap) — always `SplitMode::default()`,
-            // `InPlace` since rung 4 layer 2 (was `Copy`).
-            SplitMode::default(),
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
             // CLI flag reaches `animusd data --config` yet, so this always
             // gets the default `Cluster` store.
@@ -10968,11 +10762,6 @@ async fn finish_data_join(
             SegmentStoreConfig::default(),
             None,
             dynamo_auth,
-            // `animusd data --seed` join has no `--split-mode` flag of its
-            // own (same documented gap as `run_node_data`) — always
-            // `SplitMode::default()`, `InPlace` since rung 4 layer 2 (was
-            // `Copy`).
-            SplitMode::default(),
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
         )
@@ -11498,8 +11287,13 @@ mod confirm_futility_tests {
 /// past a candidate that is simply **unreachable**, not only past one that
 /// replies with a "not the leader here" refusal. In-crate, like
 /// `confirm_futility_tests` above/`index_drain.rs`'s `gsi_drain_cursor_tests`
-/// — needs the private `ClientCtx::seed_child_rows`/`Node::ctx_for_test`
-/// handles no external `tests/` file can reach. **Lives here rather than
+/// — needs the private `ClientCtx::clear_backfill_cursor_for_table`/
+/// `Node::ctx_for_test` handles no external `tests/` file can reach.
+/// (Originally probed via `ClientCtx::seed_child_rows`, the copy-based
+/// split-build driver's own tablet-addressed forwarded RPC — deleted in the
+/// copy-split-deletion endgame's Layer B1; `ClearBackfillCursor` is the
+/// same tablet-addressed-forward shape, so it takes over as the probe with
+/// no loss of coverage.) **Lives here rather than
 /// beside `forward_to_tablet_leader` in `forwarding.rs`** because that
 /// module carries a hard `#[deny(clippy::disallowed_methods)]` (ADR 0061
 /// Phase C's closing rung) — a real `tokio::time::sleep`/`timeout`, which
@@ -11638,14 +11432,14 @@ mod forward_transport_failure_tests {
     /// changes, every subsequent call (the split-build driver's next tick
     /// included) reproduced the identical dead-end forever.
     ///
-    /// `seed_child_rows` with an **empty** row set is the cheapest faithful
-    /// exercise of this: it still runs the real `resolve_cp_route` →
-    /// `forward_to_tablet_leader` → `SeedRows` round trip, but the
-    /// server-side `seed_rows_local` returns `Ok(())` immediately for zero
-    /// rows without ever proposing (see that method's own doc) — so a
-    /// prompt `Ok(())` here proves the FORWARDING recovered, nothing about
-    /// the split-build workflow itself (which has its own end-to-end
-    /// coverage in `tests/split_build.rs`).
+    /// `clear_backfill_cursor_for_table` on a **nonexistent** index name is
+    /// the cheapest faithful exercise of this: it still runs the real
+    /// `resolve_cp_route` → `forward_to_tablet_leader` →
+    /// `ClearBackfillCursor` round trip, but the server-side
+    /// `index_drain::clear_backfill_cursor` is an idempotent tombstone
+    /// write that no-ops cleanly when the row was never there (see that
+    /// function's own doc) — so a prompt `Ok(())` here proves the
+    /// FORWARDING recovered, nothing about backfill-cursor cleanup itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn forward_to_tablet_leader_survives_a_dead_first_guess() {
         let dir = tempfile::tempdir().unwrap();
@@ -11690,14 +11484,14 @@ mod forward_transport_failure_tests {
 
         let ctx = nodes[caller].ctx_for_test();
         let started = tokio::time::Instant::now();
-        // 15s outer bound: comfortably above `seed_child_rows`'/
+        // 15s outer bound: comfortably above `clear_backfill_cursor_for_table`'s/
         // `forward_to_tablet_leader`'s own internal `CLIENT_TIMEOUT`
         // (10s) ceiling, so this can never fire first and be mistaken for
         // the thing under test — the real teeth is the elapsed-time
         // assertion below.
         let result = timeout(
             Duration::from_secs(15),
-            ctx.seed_child_rows(tablet, Vec::new()),
+            ctx.clear_backfill_cursor_for_table("fwd316", "nonexistent-index"),
         )
         .await;
         let elapsed = started.elapsed();
@@ -12285,7 +12079,6 @@ mod simenv_client_ctx_tests {
             remote_metadata: Arc::new(Mutex::new(None)),
             control_storage: None,
             dynamo_auth: None,
-            split_mode: SplitMode::default(),
         };
 
         (sim, ctx, control, kv)

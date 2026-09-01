@@ -10,7 +10,25 @@
   workflow explicitly. **Rung 4's remaining layer** (delete the ADR 0050
   build driver, the freeze-as-outage path, and the cutover vetoes now that
   the copy path is no longer the default) is this ADR's only unimplemented
-  piece. **(2026-08-31 amendment) Train 2 Stage 1/2 — the fused split+move
+  piece. **(2026-09-01 amendment) Rung 4's remaining layer is now in
+  progress, accepted by the maintainer as a G5 gate pass (2026-09-01) for a
+  stacked deletion series (`docs/engineering-lessons.md` has the delivery
+  shape): Layer A (delete every copy-split-pinned test, `tests/
+  split_build.rs` included) shipped first; Layer B1 (this rung's own
+  scope — delete the entire `animusd`-side copy workflow —
+  `SplitBuild`/`split_driver_tick`/`ship`/`ship_all`/`tail_pass`/
+  `seed_row_bytes`/`packed_hlc`/`prefix_upper`/`max_change_hlc`/
+  `SEED_KINDS`/`SEED_CHUNK_BYTES`/`SPLIT_MAX_TAIL_PASSES` in
+  `index_drain.rs`, `ClientCtx::seed_rows_local`/`seed_child_rows` in
+  `write_path.rs`, the `SeedRows` wire RPC, and `animusd::config::
+  SplitMode`/`ClientCtx.split_mode`/`--split-mode {copy,inplace}` itself —
+  plus the now-production-dead `split_child_placement`/fork F5 mint-at-
+  placement logic in `lib.rs`) is done. `MetaCommand::BeginSplit`'s own
+  definition/apply/mirror/relayable-command classification in
+  `animus-control` is deliberately untouched by B1 (production-dead,
+  compiles) — its deletion is Layer B2's job. Layer C (the remaining root
+  `CLAUDE.md`/this ADR prose sweep) follows once B2 lands.** **(2026-08-31
+  amendment) Train 2 Stage 1/2 — the fused split+move
   half of fork F5, where `BeginSplitInPlace` recruits both children's
   *final* homes as learners on the parent before it can ever fork — is
   superseded by [ADR 0062](0062-fork-first-split-directed-placing.md)**:
