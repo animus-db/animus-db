@@ -271,6 +271,35 @@ pub struct LsmOptions {
     pub background_maintenance: bool,
 }
 
+impl LsmOptions {
+    /// Reject option combinations that would make [`LsmEngine`]'s leveled
+    /// compaction unable to reach a stable state.
+    ///
+    /// Currently checks only `level_fanout`: [`level_table_budget`] computes
+    /// `L1_TABLE_BUDGET * level_fanout^(level - 1)`, so at `level_fanout <= 1`
+    /// every level ≥1 gets the *same* fixed budget (`L1_TABLE_BUDGET`,
+    /// `pow(0) == 1`) or, at `level_fanout == 0`, a budget of `0` from level 2
+    /// onward (`0.pow(1) == 0`) — over budget the instant a single table lands
+    /// there. Either way the budget never grows with depth, so a table set
+    /// whose fully-merged size exceeds `L1_TABLE_BUDGET` cascades down
+    /// through every level forever: each cascade at level `n` re-lands over
+    /// budget at level `n + 1`, ad infinitum, never settling into `None`
+    /// (see [`next_compaction_plan`]'s own cascade-termination argument,
+    /// which only holds because a real fanout makes the budget strictly
+    /// increasing).
+    ///
+    /// # Errors
+    /// [`StorageError::InvalidLevelFanout`] if `level_fanout <= 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.level_fanout <= 1 {
+            return Err(StorageError::InvalidLevelFanout {
+                level_fanout: self.level_fanout,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Default for LsmOptions {
     fn default() -> Self {
         Self {
@@ -662,7 +691,8 @@ impl<E: Env> LsmEngine<E> {
     /// read storage counters back opens with [`open_with_metrics`](Self::open_with_metrics).
     ///
     /// # Errors
-    /// As [`open`](Self::open).
+    /// As [`open`](Self::open), plus [`LsmOptions::validate`]'s errors if
+    /// `opts` is invalid (checked before any I/O).
     pub async fn open_with(env: E, prefix: impl Into<String>, opts: LsmOptions) -> Result<Self> {
         let metrics = env.metrics();
         Self::open_with_metrics(env, prefix, opts, metrics).await
@@ -676,13 +706,15 @@ impl<E: Env> LsmEngine<E> {
     /// [`open_with`](Self::open_with), which forward `env.metrics()`.
     ///
     /// # Errors
-    /// As [`open`](Self::open).
+    /// As [`open`](Self::open), plus [`LsmOptions::validate`]'s errors if
+    /// `opts` is invalid (checked before any I/O).
     pub async fn open_with_metrics(
         env: E,
         prefix: impl Into<String>,
         opts: LsmOptions,
         metrics: MetricsHandle,
     ) -> Result<Self> {
+        opts.validate()?;
         let prefix: Arc<str> = Arc::from(prefix.into());
         let manifest_file = format!("{prefix}MANIFEST");
 
