@@ -14051,6 +14051,74 @@ regression-in-waiting to flip on once the underlying issue is found. Filed
 here rather than silently worked around, per this repo's own "record a
 generalizable lesson, including one you didn't chase to the end" practice.
 
+**Amendment (2026-08-31, issue #513 dedicated investigation): re-attempted
+and NOT reproduced.** A follow-up investigation drove the exact
+grow-by-two-lower-sorting-nodes/RF3/real-`ProdEnv` recipe named above —
+`crates/animusd/tests/split_placing_two_replica_diff_e2e.rs`, run 30+
+consecutive times, several with continuous write traffic and several
+where the tablet's own leader genuinely transferred mid-sequence (one of
+the two suspects named when the issue was filed) — plus a `SimEnv` side
+(`crates/animus-cp-data/tests/reconfigure_multi_replica_diff.rs`, 60
+seeds) across five harness shapes of increasing production-fidelity:
+calling `reconfigure_step` directly in a poll loop; `spawn_reconfigure_
+loop` with one shared static target; `spawn_reconfigure_loop` with EVERY
+group member (including the two about-to-be-removed originals)
+independently polling its OWN control-plane replica — genuinely
+Raft-replicated, not a shared closure — for `desired`/`down`; the real
+`host::Reconciler` driven uniformly across all group members each tick;
+and combinations of the above with continuous write traffic and forced
+leadership churn via network partition. **Every single run converged**:
+each reached the transient over-replicated 5-voter intermediate the
+original finding names, then shrank monotonically to the target with no
+reversion ever observed.
+
+**Likely explanation for the original finding, based on this
+investigation's own repeated experience**: building each of the five
+`SimEnv` harnesses above, the very first draft of the "did it converge"
+check independently made the SAME mistake three separate times before it
+was caught — checking `config()`/`voters` on a replica that HAD ALREADY
+BEEN EXCLUDED from the group's voter set (one of the two originals being
+replaced), not one of the surviving/target members. A removed replica
+stops receiving `AppendEntries` the instant it's excluded, so its own
+locally-cached config **freezes** at whatever it last observed rather
+than updating (there is nothing left to update it — that is what "removed
+from the group" means). Comparing that frozen value against a live,
+still-converging replica's value — or worse, alternating which replica an
+observer reads from over time (e.g. "whichever node currently answers a
+routing/admin query," which can itself change as a group's own admin
+routing state settles) — produces exactly the "grows to N, then reverts"
+shape the original finding described, without any defect in
+`reconfigure_step` or its caller: the group genuinely converged; the
+OBSERVATION read a stale snapshot and mistook it for regression. This is
+the same class of mistake as the "convergence check races the proposer
+that sets the target" entry immediately above this one in this file (a
+naive comparison against live/eventual state, on a system that is by
+design mid-flight), generalized to "and make sure which REPLICA you're
+reading the live state FROM is still a live member of the thing you're
+checking."
+
+**General lesson**: when a convergence check spans multiple replicas of a
+group whose membership itself is changing (not just its data), the check
+must pin its observations to replicas that will remain members of the
+final target set — reading from, or comparing against, a replica that's
+mid-removal produces a frozen/stale value that looks exactly like a live
+regression. This is a narrower instance of the "converging vs. stable
+value" audit already named in this file's `placing_relocates_a_child...`
+entry above, worth calling out on its own because it is easy to introduce
+by accident when a repro harness (rather than production code) polls
+"any" node's own admin/observability surface without checking whether
+that node is still supposed to be part of the answer.
+
+No code in `reconfigure_step`, `host::Reconciler`, or any of their
+production callers changed as a result of this investigation — there was
+no concrete defect to change. `crates/animus-cp-data/tests/
+reconfigure_multi_replica_diff.rs` and `crates/animusd/tests/
+split_placing_two_replica_diff_e2e.rs` are the two regressions this
+investigation leaves behind: if the oscillation is ever genuinely observed
+again (under conditions this investigation didn't hit, or because a future
+change reintroduces it), these are the first things that should catch it.
+ADR 0062 carries the matching amendment.
+
 ## A bench whose cluster size equals RF cannot exercise a design change whose whole benefit is "fewer/cheaper cross-node catch-ups" (ADR 0062 rung 7, bench re-validation)
 
 Re-running `animusd/tests/inplace_split_bench.rs` (byte-for-byte the same
@@ -14343,3 +14411,48 @@ say so honestly and fall back to the next-best verification available
 review) rather than silently claiming a visual check that didn't happen —
 the task instructions in this repo are explicit that an honest "couldn't
 verify visually" beats a false claim.
+
+## An interleaved-key test writer defeats a whole-file-assignment property it was meant to prove (ADR 0058 fork closed, `LsmEngine::clone_to_filtered`)
+
+Writing the first `ProdEnv` concurrency regression for range-aware cloning
+(`clone_to_filtered`'s whole-file assignment: a source SSTable wholly
+outside a `keep` set is never linked into the target, but a table
+straddling `keep`'s boundary is still linked whole — see
+`animus-storage/CLAUDE.md`'s entry), the natural-looking first draft had
+one writer alternate between an in-`keep` key (`a*`) and a dropped-range
+key (`z*`) on every iteration, then asserted the racing clone never
+carried a `z*` row. It failed immediately — not because the feature was
+broken, but because the test's own writer defeated the property it meant
+to isolate: `clone_to_filtered` calls the SAME unconditionally-draining
+`flush()` `clone_to` always has (a no-op only while a concurrent apply is
+mid-flight, never threshold-gated), so every round's internal flush drains
+whatever the shared memtable currently holds — and with `a`/`z` writes
+interleaved key-by-key, that memtable is *always* a mix of both, so the
+resulting SSTable's own `[min_key, max_key]` almost always straddles
+`keep`'s boundary and gets linked whole, `z*` rows included, by design
+(the boundary-straddling case is correct and separately tested). The fix
+was two SEPARATE single-writer scenarios — one writer entirely inside
+`keep`, one entirely outside it — so a flush's own table range can never
+straddle by construction, leaving a clean pass/fail signal regardless of
+timing.
+
+**General lesson: when a test's own workload can produce the SAME
+structural shape (here, a straddling file) that the code under test
+already handles as a *documented, correct* case, the property the test
+meant to isolate is confounded, not merely harder to see** — the fix is
+almost never a smarter assertion over the confounded run, it's removing
+the confound from the workload itself (here: don't interleave what the
+two branches of the very property being tested need to stay separable).
+This generalizes beyond storage: any test asserting "X never happens" over
+a workload that itself can legitimately produce the shape that makes X
+correct needs to ask, before chasing the failure, whether the workload —
+not the code — created that shape. A second, narrower gotcha the same
+file surfaced: a genuinely leftover (still-memtable-resident, never
+flushed) row at `clone_to_filtered` time can only arise from a writer
+racing strictly *between* that internal `flush()` and the snapshot lock
+acquisition — a window `SimEnv`'s non-yielding disk model cannot produce
+at all (same root cause as `lsm_clone_concurrent.rs`'s own pre-existing
+rationale for `clone_to`), so a memtable-filtering unit test belongs at
+the extracted-pure-predicate level (`key_in_keep`, table-driven, no
+engine) rather than as a `SimEnv` integration test reaching for a code
+path it structurally cannot exercise.

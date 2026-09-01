@@ -435,12 +435,14 @@ per-tablet CP data plane (`animus-cp-data`).
   unsatisfiable-at-cutover/no-policy shapes), `node::tests::` for the
   reconcile-loop phase and the rebalance exclusion,
   `drop_table_tablets_prunes_split_placing_rows_for_the_dropped_tablets`
-  for the cascade. **Known limitation** (issue #513, not closed by ADR
-  0062): the convergence primitive this phase drives —
-  `reconfigure_step`, ADR 0058 Train 1, unmodified — only reliably
-  converges a one-replica-difference target; a two-(or-more)-replica
-  target can oscillate indefinitely, so directed Placing today reliably
-  relocates a child only across that narrower gap.
+  for the cascade. **Issue #513** (a suspected oscillation in the
+  convergence primitive this phase drives — `reconfigure_step`, ADR 0058
+  Train 1 — for a two-(or-more)-replica-difference target) **was
+  investigated and closed as not reproducible**; see `crates/animusd/
+  tests/split_placing_two_replica_diff_e2e.rs`, `crates/animus-cp-data/
+  tests/reconfigure_multi_replica_diff.rs`, `docs/engineering-lessons.md`,
+  and ADR 0062's #513 amendment. Directed Placing relocates a child
+  regardless of how many replicas its fresh target differs by.
 
 - **The backup catalog (ADR 0059 §3, Train 1 PR ①): `BeginBackup`/
   `RecordBackupTabletComplete`/`CompleteBackup`/`FailBackup`/`DeleteBackup`.**

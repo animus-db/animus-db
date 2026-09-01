@@ -4,12 +4,14 @@
   the Sequencing rungs' own numbering starts at the `Metadata::
   split_placing` groundwork, landed as `a26de6c`). Rung 7 (e2e + bench
   re-validation) closed this ADR's own "not predicted or asserted here"
-  deferral in its Testing plan. **Known limitation carried forward, not
-  closed by this ADR**: directed Placing's own convergence machinery
-  (`reconfigure_step`, ADR 0058 Train 1, unmodified here) reliably
-  converges only for a one-replica-difference target; a two-of-three
-  target can oscillate indefinitely (issue #513, filed during rung 6,
-  fixed by neither this ADR nor this rung — see the amendment below).
+  deferral in its Testing plan. **Issue #513 investigated and closed as
+  not reproducible**: directed Placing's own convergence machinery
+  (`reconfigure_step`, ADR 0058 Train 1, unmodified here) was suspected of
+  only reliably converging a one-replica-difference target, with a
+  two-of-three target oscillating indefinitely (filed during rung 6). A
+  dedicated re-investigation could not reproduce that oscillation — see
+  the amendment below — so directed Placing's own reach was never actually
+  narrower than "whatever `select_replicas` computes."
 - **Date:** 2026-08-31
 - **Supersedes:** [ADR 0058](0058-learner-replicas-in-place-split.md) Train
   2 Stage 1's fork **F5** half only — the fused split+move, where
@@ -112,8 +114,9 @@ places:
    at a child's *final* home [...] receives the **whole parent range** via
    `InstallSnapshot`, not the range-filtered half a copy-based `SeedBatch`
    bulk pass would ship — roughly 2× the network bytes [...] when the two
-   children's homes don't overlap," left as an explicitly open fork (G2,
-   never closed).
+   children's homes don't overlap," left as an explicitly open fork (G2 —
+   its clone-step half is since closed, 2026-08-31; see the "Companion
+   decisions" bullet below).
 
 None of this is a bug — every one of these is a deliberate, documented
 consequence of choosing F5 for the in-place shape. But once the fork
@@ -498,6 +501,22 @@ sees a green "split complete" pill versus an amber "still placing" one.
   trigger (unrelated surface, referenced only because it shares the
   `--auto-split`-family CLI flags this ADR does not touch).
 
+  **The clone half is since closed (2026-08-31, `LsmEngine::
+  clone_to_filtered`, ADR 0058's own rung-2 amendment)**: the fork's own
+  clone step (`EngineFactory::clone_engine`) now does whole-file
+  assignment — a source SSTable wholly outside the target's own keep-set
+  is never linked in at all, rather than shipped whole and trimmed after.
+  This closes the *clone-step* half of G2 unconditionally (independent of
+  whether a child's eventual home is disjoint from the parent's — it helps
+  the fork-first case described here too, since even a same-home clone
+  benefits from not linking a wholly-sibling table it will only delete a
+  moment later via `trim_split_child`). **What stays open**: a genuinely
+  range-filtered `InstallSnapshot` **wire format** — a straddling table is
+  still linked (and shipped) whole, and Placing's own post-cutover learner
+  catch-up (the "child-range-only, not whole-parent-range" property two
+  bullets below) was already true before this closure and is unaffected by
+  it either way.
+
 ### Rationale — why fork-first / late-binding, and what is given up
 
 **The structural argument.** Total data moved across a split's whole
@@ -847,25 +866,62 @@ convergence check races the very proposer that sets the target" entry
 (filed under this ADR's rung 6, and covering both the product race and its
 test-hardening follow-up in one place).
 
-**Known limitation, not closed here (issue #513).** Validating the fix
-above surfaced a second, **pre-existing**, unrelated defect in
-`reconfigure_step` itself (ADR 0058 Train 1, unmodified by this ADR):
-driving live Raft membership toward a target that replaces **two** of
-three replicas at once can oscillate indefinitely (reach the transient
-over-replicated 5-voter intermediate state, then partially revert,
-repeating) rather than converge — confirmed unrelated to this ADR's own
-completion loop (reproduces with zero `MarkSplitPlacingDone` proposes
-fired). A one-replica-difference target converges cleanly. Filed as
-[issue #513](https://github.com/animus-db/animus-db/issues/513); `tests/
-split_placing_completion.rs` deliberately exercises only the
-one-replica-difference shape, with its own doc comment naming the gap.
-**This means directed Placing today reliably relocates a child only when
-its fresh `select_replicas` target differs from the parent-inherited set
-by one replica** — a two-(or-more)-replica-difference target (plausible
-on a freshly-grown or rebalancing cluster) can stall in the same
-oscillation `reconfigure_step` already has for any other caller. Fixing
-#513 is out of this ADR's scope and widens Placing's own reach with no
-further change here once it lands.
+**Issue #513, investigated and closed as not reproducible (2026-08-31
+amendment).** Validating the fix above surfaced what looked like a second,
+**pre-existing**, unrelated defect in `reconfigure_step` itself (ADR 0058
+Train 1, unmodified by this ADR): driving live Raft membership toward a
+target that replaces **two** of three replicas at once appeared to
+oscillate indefinitely (reach the transient over-replicated 5-voter
+intermediate state, then partially revert, repeating) rather than
+converge — confirmed unrelated to this ADR's own completion loop
+(reproduced with zero `MarkSplitPlacingDone` proposes fired). Filed as
+[issue #513](https://github.com/animus-db/animus-db/issues/513).
+
+A dedicated re-investigation could not reproduce the oscillation, across:
+five `SimEnv` harness shapes of increasing fidelity (direct
+`reconfigure_step` polling; `spawn_reconfigure_loop` with a shared target;
+`spawn_reconfigure_loop` with each group member independently polling its
+own control-plane replica; the real `host::Reconciler` driven uniformly;
+all swept across dozens of seeds — `crates/animus-cp-data/tests/
+reconfigure_multi_replica_diff.rs`, 60 seeds); and 30+ consecutive runs of
+a real multi-threaded `ProdEnv` end-to-end test that reproduces the
+ORIGINAL rung-6 recipe exactly — grow a 3-node cluster by two
+lower-sorting-id nodes so a fresh `select_replicas` prefers both over two
+of the parent's three, then drive a real in-place split's directed-Placing
+target through it (`crates/animusd/tests/
+split_placing_two_replica_diff_e2e.rs`), including several runs where the
+tablet's own leader genuinely transfers mid-sequence via
+`reconfigure_step`'s own step-6 self-removal case (one of the suspects
+named when #513 was filed). Every run passes through the genuinely
+over-replicated 5-voter intermediate the issue names, then shrinks
+monotonically to the target with **no reversion observed**.
+
+The most likely explanation, based on this investigation's own repeated
+experience building repro harnesses before catching it: a convergence
+check that includes an ALREADY-REMOVED replica's own `config()`/`voters`
+snapshot. A replica excluded from a group's voter set stops receiving
+`AppendEntries` the instant it's excluded, so its own locally-cached
+config freezes at whatever it last observed — comparing that frozen value
+against a live, still-converging replica's value can look exactly like a
+"revert" to an observer that doesn't realize the two readings came from
+different points in the sequence, or from a replica no longer part of the
+group at all. See `docs/engineering-lessons.md`'s entry for the full
+writeup. **This means directed Placing's own reach was never actually
+narrower than "whatever `select_replicas` computes"** — no further change
+is needed for a two-(or-more)-replica-difference target (plausible on a
+freshly-grown or rebalancing cluster) to relocate a child correctly.
+`tests/split_placing_completion.rs` keeps its one-replica shape (simpler,
+and still a fully sufficient proof of this rung's own completion-loop
+requirement); the two-replica shape has its own dedicated e2e instead of
+folding a second, unrelated concern into that file's assertions.
+
+Closing this out as "investigated, not reproduced" rather than "fixed" is
+deliberate: no code in `reconfigure_step` or its callers changed, because
+none of this investigation's evidence pointed at a concrete defect to
+change. If the oscillation is ever genuinely observed again (or was real
+under conditions this investigation didn't hit), the two regression tests
+above are the first things that should catch it, and are a name and a
+reproduction recipe for whoever picks this back up.
 
 **E2e re-validation.** `cargo test -p animusd --test inplace_split_e2e`
 (both tests — the paced-continuous-writer fork/cutover test and the
