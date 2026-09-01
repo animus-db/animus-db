@@ -414,7 +414,6 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
             <tr><td><code>--dir DIR</code></td><td>Where this node keeps its write-ahead logs, SSTables and snapshots.</td></tr>
             <tr><td><code>--ephemeral</code></td><td>Keep all state in memory; nothing survives a restart.</td></tr>
             <tr><td><code>--auto-split-bytes B</code></td><td>Split a tablet once it exceeds <code>B</code> bytes.</td></tr>
-            <tr><td><code>--auto-split K</code></td><td>Split a tablet once it exceeds <code>K</code> keys.</td></tr>
             <tr><td><code>--quiesce-after SECS</code></td><td>How long a tablet group must be idle before it stops ticking. On by default.</td></tr>
             <tr><td><code>--stream-seal-bytes B</code><br><code>--stream-seal-age SECS</code><br><code>--stream-retention SECS</code></td><td>When change-log segments are sealed into stream shards, and how long they are kept.</td></tr>
             <tr><td><code>--segment-store dir:PATH</code></td><td>Store sealed stream segments on a filesystem path instead of replicating them across the cluster.</td></tr>

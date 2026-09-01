@@ -361,7 +361,7 @@ truth; this map is just for navigation.
   --seed ADDR[,ADDR...]` to join — no local control `RaftCore`; `Metadata`
   comes from a polled/long-polled mirror via `ControlHandle::Remote`). Also:
   `animusd join` (ADR 0032 growth), `--cluster-control N --cluster-data M`
-  (in-process split cluster for dev), `gen-config`, and `--auto-split[-bytes]`.
+  (in-process split cluster for dev), `gen-config`, and `--auto-split-bytes`.
   A config can mix combined-mode indices with control-only/data-only ones for
   an incremental migration.
 - **Kubernetes operator** (ADR 0060) — `animus-operator`: a `kube-rs`

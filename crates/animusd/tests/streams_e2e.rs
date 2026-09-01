@@ -136,7 +136,7 @@ fn production_seal_knobs() -> StreamSealKnobs {
 }
 
 async fn start_streamed_cluster(n: usize, dir: &Path, knobs: StreamSealKnobs) -> Vec<Node> {
-    start_streamed_cluster_full(n, dir, knobs, None, None, SegmentStoreConfig::default()).await
+    start_streamed_cluster_full(n, dir, knobs, None, SegmentStoreConfig::default()).await
 }
 
 /// Like [`start_streamed_cluster_full`], but pinned to `SplitMode::Copy`
@@ -155,7 +155,6 @@ async fn start_streamed_cluster_full_copy_pinned(
     n: usize,
     dir: &Path,
     knobs: StreamSealKnobs,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     store: SegmentStoreConfig,
 ) -> Vec<Node> {
@@ -165,7 +164,6 @@ async fn start_streamed_cluster_full_copy_pinned(
     start_cluster_with_growth_and_quiesce_after(
         bound,
         StorageBackend::default(),
-        auto_split_keys,
         auto_split_bytes,
         Duration::from_secs(600),
         knobs,
@@ -186,7 +184,6 @@ async fn start_streamed_cluster_full(
     n: usize,
     dir: &Path,
     knobs: StreamSealKnobs,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     store: SegmentStoreConfig,
 ) -> Vec<Node> {
@@ -196,7 +193,6 @@ async fn start_streamed_cluster_full(
     start_cluster_with_streams(
         bound,
         StorageBackend::default(),
-        auto_split_keys,
         auto_split_bytes,
         Duration::from_secs(600),
         knobs,
@@ -224,7 +220,6 @@ async fn start_streamed_cluster_with_change_rate(
     animusd::start_cluster_with_growth(
         bound,
         StorageBackend::default(),
-        None,
         None,
         Duration::from_secs(600),
         knobs,
@@ -1016,7 +1011,6 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
         bound,
         StorageBackend::Lsm,
         None,
-        None,
         Duration::from_secs(600),
         tiny_seal_knobs(),
         SegmentStoreConfig::default(),
@@ -1071,7 +1065,6 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     let nodes = start_cluster_with_streams(
         bound,
         StorageBackend::Lsm,
-        None,
         None,
         Duration::from_secs(600),
         tiny_seal_knobs(),
@@ -1129,7 +1122,6 @@ async fn fs_segment_store_opt_in_smoke() {
         1,
         &dir.path().join("node"),
         tiny_seal_knobs(),
-        None,
         None,
         SegmentStoreConfig::Fs(store_dir.clone()),
     )
@@ -1249,7 +1241,6 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         3,
         dir.path(),
         tiny_seal_knobs(),
-        None,
         Some(2_048), // tiny byte threshold — a handful of writes triggers a split
         SegmentStoreConfig::default(),
     )
@@ -1497,7 +1488,6 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
         3,
         dir.path(),
         production_seal_knobs(),
-        None,
         Some(128), // auto-split threshold — small, so the split fires fast off a handful of writes
         SegmentStoreConfig::default(),
     )
@@ -2609,7 +2599,6 @@ async fn multi_split_soak_streamed_gsi_table_under_mixed_load() {
             3,
             dir.path(),
             tiny_seal_knobs(),
-            None,
             Some(2_048),
             SegmentStoreConfig::default(),
         )

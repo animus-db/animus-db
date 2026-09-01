@@ -4090,7 +4090,6 @@ mod stream_sealer_tests {
                 ClusterEdgeState::new(),
                 client_route,
                 intra_route,
-                None,
                 auto_split_bytes,
                 vec![config.nodes[0].admin],
                 Duration::from_secs(600),
@@ -4998,7 +4997,6 @@ mod stream_sealer_tests {
                     crate::ClusterEdgeState::new(),
                     Default::default(),
                     Default::default(),
-                    None,
                     // A generous threshold, deliberately NOT tiny: this
                     // test only needs ONE split to happen, not a
                     // cascade — a too-tiny threshold re-splits every

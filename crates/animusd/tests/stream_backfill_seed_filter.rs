@@ -83,7 +83,6 @@ async fn start_streamed_cluster(n: usize, dir: &Path, knobs: StreamSealKnobs) ->
         bound,
         StorageBackend::default(),
         None,
-        None,
         Duration::from_secs(600),
         knobs,
         SegmentStoreConfig::default(),

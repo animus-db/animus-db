@@ -2213,16 +2213,12 @@ pub(crate) struct AdminInfo {
     /// this node's admin address when the full set is unknown (the simple
     /// [`BoundNode::start`] path / hand-built nodes).
     pub(crate) admin_addrs: Vec<SocketAddr>,
-    /// The `--auto-split K` key-count threshold this node was started with, if
-    /// any (`--cluster N --auto-split K`; the per-process `--config`/`--node`
-    /// path has no auto-split support yet, so this is always `None` there).
-    /// Surfaced on `/admin/config` so the dashboard can flag a tablet as
-    /// "over threshold, about to split" without hardcoding the value.
-    pub(crate) auto_split_threshold: Option<usize>,
-    /// The `--auto-split-bytes B` threshold (ADR 0034), if any — same
-    /// `--cluster N`-only scoping as `auto_split_threshold` above. A
-    /// CP-hosting node splits a tablet it leads once **either** configured
-    /// threshold is exceeded.
+    /// The `--auto-split-bytes B` threshold (ADR 0034), if any
+    /// (`--cluster N --auto-split-bytes B`; the per-process `--config`/
+    /// `--node` path has no auto-split support yet, so this is always `None`
+    /// there). Surfaced on `/admin/config` so the dashboard can flag a
+    /// tablet as "over threshold, about to split" without hardcoding the
+    /// value.
     pub(crate) auto_split_bytes_threshold: Option<u64>,
 }
 
@@ -3424,7 +3420,6 @@ impl BoundNode {
             BTreeMap::new(),
             BTreeMap::new(),
             None,
-            None,
             vec![admin_addr],
             DEFAULT_ORPHAN_SWEEP_AFTER,
         )
@@ -3433,12 +3428,11 @@ impl BoundNode {
 
     /// Like [`start`](Self::start), but selects the CP group's storage engine and
     /// options. [`StorageBackend::Lsm`] is durable (survives restart);
-    /// [`StorageBackend::Memory`] is volatile (ephemeral runs). `auto_split_threshold`
-    /// opts a CP-hosting node into the automatic key-count split trigger (Phase
-    /// 2.4): when a tablet it leads exceeds that many keys, it splits. Sibling
-    /// `auto_split_bytes_threshold` (ADR 0034) does the same for an
-    /// (approximate) scoped-bytes trigger. Either, both, or neither may be
-    /// `Some`; `(None, None)` (the default) disables auto-split entirely.
+    /// [`StorageBackend::Memory`] is volatile (ephemeral runs).
+    /// `auto_split_bytes_threshold` (ADR 0034) opts a CP-hosting node into the
+    /// automatic (approximate) scoped-bytes split trigger (Phase 2.4): when a
+    /// tablet it leads exceeds that many bytes, it splits. `None` (the
+    /// default) disables auto-split entirely.
     ///
     /// `data_ids` is the set of ids [`bootstrap`] auto-registers as `Active`
     /// data members — i.e. the ids of nodes that actually run the **data**
@@ -3464,7 +3458,6 @@ impl BoundNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         orphan_sweep_after: Duration,
@@ -3477,7 +3470,6 @@ impl BoundNode {
             edge,
             client_route,
             intra_route,
-            auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
             orphan_sweep_after,
@@ -3517,7 +3509,6 @@ impl BoundNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         orphan_sweep_after: Duration,
@@ -3533,7 +3524,6 @@ impl BoundNode {
             edge,
             client_route,
             intra_route,
-            auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
             orphan_sweep_after,
@@ -3611,7 +3601,6 @@ impl BoundNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         orphan_sweep_after: Duration,
@@ -3682,7 +3671,6 @@ impl BoundNode {
             } else {
                 cluster_admin_addrs
             },
-            auto_split_threshold,
             auto_split_bytes_threshold,
         });
 
@@ -4140,14 +4128,10 @@ impl BoundNode {
         // leadership per tablet, so running it on every node is harmless).
         // Growth PR3 Fork F: `auto_split_change_rate` joins the same
         // either-triggers-fires gate, opt-in and streamed-tables-only.
-        if auto_split_threshold.is_some()
-            || auto_split_bytes_threshold.is_some()
-            || auto_split_change_rate.is_some()
-        {
+        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
-                    keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
                 },
@@ -4769,7 +4753,6 @@ impl BoundControlNode {
             } else {
                 cluster_admin_addrs
             },
-            auto_split_threshold: None,
             auto_split_bytes_threshold: None,
         });
 
@@ -5069,7 +5052,6 @@ impl BoundDataNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
     ) -> std::io::Result<Node> {
@@ -5081,7 +5063,6 @@ impl BoundDataNode {
             edge,
             client_route,
             intra_route,
-            auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
             StreamSealKnobs::default(),
@@ -5104,7 +5085,6 @@ impl BoundDataNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         stream_seal_knobs: StreamSealKnobs,
@@ -5118,7 +5098,6 @@ impl BoundDataNode {
             edge,
             client_route,
             intra_route,
-            auto_split_threshold,
             auto_split_bytes_threshold,
             cluster_admin_addrs,
             stream_seal_knobs,
@@ -5161,7 +5140,6 @@ impl BoundDataNode {
         edge: ClusterEdgeState,
         client_route: BTreeMap<NodeId, String>,
         intra_route: BTreeMap<NodeId, String>,
-        auto_split_threshold: Option<usize>,
         auto_split_bytes_threshold: Option<u64>,
         cluster_admin_addrs: Vec<SocketAddr>,
         stream_seal_knobs: StreamSealKnobs,
@@ -5211,7 +5189,6 @@ impl BoundDataNode {
             } else {
                 cluster_admin_addrs
             },
-            auto_split_threshold,
             auto_split_bytes_threshold,
         });
 
@@ -5424,14 +5401,10 @@ impl BoundDataNode {
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
 
-        if auto_split_threshold.is_some()
-            || auto_split_bytes_threshold.is_some()
-            || auto_split_change_rate.is_some()
-        {
+        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
-                    keys: auto_split_threshold,
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
                 },
@@ -8463,15 +8436,16 @@ const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 /// The auto-split trigger's configured thresholds (ADR 0034). Either, both, or
 /// neither field may be `Some`; `auto_split_loop` is only spawned when at
 /// least one is (see [`BoundNode::start_with`]'s doc). When both are set,
-/// **either** exceeding its threshold fires a split — a byte-heavy tablet of
-/// few huge values and a key-heavy tablet of many tiny ones are different
-/// failure modes (snapshot/compaction/replica-move/recovery cost scales with
-/// bytes; some operational costs still scale with key count, e.g. bulk scan
-/// iteration overhead), so neither trigger alone dominates the other.
+/// **either** exceeding its threshold fires a split — bytes and change-rate
+/// are different failure modes (snapshot/compaction/replica-move/recovery
+/// cost scales with bytes; change-rate catches a high-churn, small-footprint
+/// streamed table bytes alone can't see, ADR 0042 §14 Fork F), so neither
+/// trigger alone dominates the other. **The former key-count trigger
+/// (`--auto-split K`) was removed** — bytes and change-rate cover its use
+/// cases with no key-count-specific failure mode left to justify a third
+/// independent knob; see the root `CLAUDE.md`'s auto-split entry.
 #[derive(Clone, Copy, Debug)]
 struct AutoSplitThresholds {
-    /// `--auto-split K`: split once a led tablet holds more than `K` keys.
-    keys: Option<usize>,
     /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
     /// (approximate) scoped bytes exceed `B`.
     bytes: Option<u64>,
@@ -8569,22 +8543,23 @@ fn split_child_placement(meta: &Metadata, parent: TabletId) -> Result<[Vec<NodeI
 
 /// The leader-driven **automatic split trigger**: on each tick, for every tablet
 /// whose CP group this node currently **leads**, take the leader's **cheap
-/// estimates** ([`CpGroup::approx_key_count`]/[`CpGroup::approx_bytes`] —
-/// memtable + SSTable metadata, no materialization) and only when one says the
-/// tablet might exceed its configured threshold (or on a slow per-tablet confirm
-/// cadence) materialize the live pairs once — the authoritative key count, byte
-/// total, and (if over threshold) **split key** all come from that one snapshot.
-/// Per-tablet cooldown avoids a duplicate trigger while a split is in flight;
-/// once it applies, the parent's counts halve below both thresholds.
+/// estimate** ([`CpGroup::approx_bytes`] — memtable + SSTable metadata, no
+/// materialization) and only when it says the tablet might exceed its
+/// configured threshold (or on a slow per-tablet confirm cadence) materialize
+/// the live pairs once — the authoritative byte total and (if over threshold)
+/// **split key** both come from that one snapshot. Per-tablet cooldown avoids
+/// a duplicate trigger while a split is in flight; once it applies, the
+/// parent's byte total halves below the threshold.
 ///
-/// **The split point is byte-weighted whenever a byte threshold is configured**
-/// (ADR 0034 — [`decide::byte_weighted_median`], the key that roughly bisects the
-/// tablet's *bytes*, not just its key count): with skewed value sizes a plain
-/// positional median can leave one huge half and one tiny half, which
-/// immediately re-triggers on the huge side. A key-count-only configuration
-/// (`bytes: None`) keeps the plain positional median byte-for-byte unchanged
-/// from before this ADR, so existing key-count auto-split behavior/tests are
-/// untouched.
+/// **The split point is always byte-weighted** (ADR 0034 —
+/// [`decide::byte_weighted_median`], the key that roughly bisects the
+/// tablet's *bytes*): with skewed value sizes a plain positional median can
+/// leave one huge half and one tiny half, which immediately re-triggers on
+/// the huge side. **The former key-count trigger (`--auto-split K`) and its
+/// plain-positional-median split point were removed** — bytes and change-rate
+/// (below) are the only remaining triggers; see the root `CLAUDE.md`'s
+/// auto-split entry for why key count added no failure mode neither of those
+/// already covers.
 ///
 /// Since a split is now a **single, atomic, epoch-CAS-gated** control-plane
 /// command (`ClientCtx::trigger_split`, mirroring `CasTabletReplicas`), there is
@@ -8659,11 +8634,6 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let due_confirm = last_counted
                 .get(&tablet)
                 .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
-            let key_hot = thresholds.keys.is_some_and(|t| {
-                leader
-                    .approx_key_count()
-                    .is_some_and(|estimate| estimate > t)
-            });
             let byte_hot = match thresholds.bytes {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
@@ -8677,15 +8647,14 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let change_rate_hot = thresholds
                 .change_rate
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
-            if !key_hot && !byte_hot && !change_rate_hot && !due_confirm {
+            if !byte_hot && !change_rate_hot && !due_confirm {
                 continue;
             }
-            // Materialize once: the authoritative count, byte total, and (if over
-            // threshold) the split key all come from the same snapshot.
+            // Materialize once: the authoritative byte total and (if over
+            // threshold) the split key both come from the same snapshot.
             let pairs = leader.local_pairs().await;
             last_counted.insert(tablet, tokio::time::Instant::now());
             let key_count = pairs.len();
-            let over_key_threshold = thresholds.keys.is_some_and(|t| key_count > t);
             let over_byte_threshold = thresholds.bytes.is_some_and(|t| {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
                 total_bytes > t
@@ -8700,22 +8669,13 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
             // Need at least 2 distinct keys for any split to have an interior
             // point (`SplitTablet` requires `start < at < end`).
-            if key_count < 2
-                || (!over_key_threshold && !over_byte_threshold && !over_change_rate_threshold)
-            {
+            if key_count < 2 || (!over_byte_threshold && !over_change_rate_threshold) {
                 continue;
             }
-            // A byte- or change-rate-configured cluster uses the
-            // byte-weighted median (ADR 0034) so a skewed value-size
+            // Always byte-weighted (ADR 0034): a skewed value-size
             // distribution still bisects the tablet's *bytes* roughly
-            // evenly; a key-count-only cluster keeps the plain positional
-            // median unchanged from before this ADR (the interior key of
-            // `> threshold >= 2` distinct keys `SplitTablet` accepts).
-            let split_key = if thresholds.bytes.is_some() || over_change_rate_threshold {
-                decide::byte_weighted_median(&pairs)
-            } else {
-                pairs[pairs.len() / 2].0.clone()
-            };
+            // evenly, whether the byte or the change-rate trigger fired.
+            let split_key = decide::byte_weighted_median(&pairs);
             // F11 (ADR 0042 §14, Fork D): the token-alignment rounding itself
             // now lives inside `ClientCtx::trigger_split` — the one choke
             // point every split proposer (this loop, `POST
@@ -9246,7 +9206,6 @@ pub async fn start_cluster_with(
         bound,
         backend,
         None,
-        None,
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
@@ -9260,82 +9219,26 @@ pub async fn start_cluster_with(
     .await
 }
 
-/// Like [`start_cluster`], but enables the **automatic split trigger** (Phase 2.4)
-/// with the given key-count `threshold`: a CP-hosting node splits a tablet it leads
-/// once it exceeds that many keys. For tests/dev that want to exercise auto-sharding
-/// without the (high, size-based) production threshold.
-///
-/// # Errors
-/// Propagates a failure to open any node's CP group engine.
-pub async fn start_cluster_auto_split(
-    bound: Vec<BoundNode>,
-    threshold: usize,
-) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(
-        bound,
-        StorageBackend::default(),
-        Some(threshold),
-        None,
-        DEFAULT_ORPHAN_SWEEP_AFTER,
-        StreamSealKnobs::default(),
-        SegmentStoreConfig::default(),
-        DEFAULT_STREAM_RETENTION,
-        None,
-        Duration::ZERO,
-        None,
-        SplitMode::default(),
-        BackupStoreConfig::default(),
-    )
-    .await
-}
-
-/// Like [`start_cluster_with`], but also enables the **automatic split trigger**
-/// (Phase 2.4) when `auto_split` is `Some(threshold)` — so the chosen `backend`
-/// and the trigger can be combined (e.g. `--cluster N --ephemeral --auto-split K`).
-///
-/// # Errors
-/// Propagates a failure to open any node's CP group engine.
-pub async fn start_cluster_with_auto_split(
-    bound: Vec<BoundNode>,
-    backend: StorageBackend,
-    auto_split: Option<usize>,
-) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(
-        bound,
-        backend,
-        auto_split,
-        None,
-        DEFAULT_ORPHAN_SWEEP_AFTER,
-        StreamSealKnobs::default(),
-        SegmentStoreConfig::default(),
-        DEFAULT_STREAM_RETENTION,
-        None,
-        Duration::ZERO,
-        None,
-        SplitMode::default(),
-        BackupStoreConfig::default(),
-    )
-    .await
-}
-
-/// Like [`start_cluster_with_auto_split`], but also configures the **byte**
-/// auto-split threshold (ADR 0034): a CP-hosting node splits a tablet it
-/// leads once **either** `auto_split_keys` or `auto_split_bytes` is exceeded
-/// (each independently optional). The plain key-count-only entry points
-/// above are kept as thin wrappers over this one for back-compat.
+/// Like [`start_cluster_with`], but also enables the **automatic split
+/// trigger** (Phase 2.4 / ADR 0034) when `auto_split_bytes` is
+/// `Some(threshold)`: a CP-hosting node splits a tablet it leads once its
+/// (approximate) scoped bytes exceed `threshold`. For tests/dev that want to
+/// exercise auto-sharding without the (higher) production threshold. **The
+/// former key-count-threshold entry points (`start_cluster_auto_split`,
+/// `start_cluster_with_auto_split`) were removed** — bytes (and, for
+/// streamed tables, change-rate) are the only remaining triggers; see the
+/// root `CLAUDE.md`'s auto-split entry.
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 pub async fn start_cluster_with_auto_split_bytes(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
@@ -9361,14 +9264,12 @@ pub async fn start_cluster_with_auto_split_bytes(
 pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         orphan_sweep_after,
         StreamSealKnobs::default(),
@@ -9398,7 +9299,6 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
 pub async fn start_cluster_with_streams(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
@@ -9408,7 +9308,6 @@ pub async fn start_cluster_with_streams(
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         orphan_sweep_after,
         stream_seal_knobs,
@@ -9434,7 +9333,6 @@ pub async fn start_cluster_with_streams(
 pub async fn start_cluster_with_growth(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
@@ -9445,7 +9343,6 @@ pub async fn start_cluster_with_growth(
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         orphan_sweep_after,
         stream_seal_knobs,
@@ -9475,14 +9372,12 @@ pub async fn start_cluster_with_growth(
 pub async fn start_cluster_with_quiesce_after(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     quiesce_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         DEFAULT_ORPHAN_SWEEP_AFTER,
         StreamSealKnobs::default(),
@@ -9529,7 +9424,6 @@ pub async fn start_cluster_with_quiesce_after(
 pub async fn start_cluster_with_growth_and_quiesce_after(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_keys: Option<usize>,
     auto_split_bytes: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
@@ -9544,7 +9438,6 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     start_cluster_inner(
         bound,
         backend,
-        auto_split_keys,
         auto_split_bytes,
         orphan_sweep_after,
         stream_seal_knobs,
@@ -9563,7 +9456,6 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
-    auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
@@ -9636,7 +9528,6 @@ async fn start_cluster_inner(
                 ClusterEdgeState::new(),
                 client_route.clone(),
                 intra_route.clone(),
-                auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
                 orphan_sweep_after,
@@ -9684,8 +9575,10 @@ async fn start_cluster_inner(
 /// shortcuts cross-node reach through shared in-process state. `ip` binds
 /// every listener at an ephemeral port on that address (mirroring
 /// [`bind_cluster`]'s own `SocketAddr::new(ip, 0)` convention); `backend` and
-/// the two auto-split thresholds apply to the **data** nodes only (a
-/// control-only node hosts no storage engine to split).
+/// the auto-split byte threshold apply to the **data** nodes only (a
+/// control-only node hosts no storage engine to split). **The former
+/// key-count threshold parameter was removed** — see the root `CLAUDE.md`'s
+/// auto-split entry.
 ///
 /// # Errors
 /// Propagates any bind failure or a failure to open a data node's CP group
@@ -9696,7 +9589,6 @@ pub async fn start_split_cluster_with(
     dir: impl Into<PathBuf>,
     ip: std::net::IpAddr,
     backend: StorageBackend,
-    auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_split_cluster_with_orphan_sweep_after(
@@ -9705,7 +9597,6 @@ pub async fn start_split_cluster_with(
         dir,
         ip,
         backend,
-        auto_split_threshold,
         auto_split_bytes_threshold,
         DEFAULT_ORPHAN_SWEEP_AFTER,
     )
@@ -9727,7 +9618,6 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
     dir: impl Into<PathBuf>,
     ip: std::net::IpAddr,
     backend: StorageBackend,
-    auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Vec<Node>> {
@@ -9737,7 +9627,6 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         dir,
         ip,
         backend,
-        auto_split_threshold,
         auto_split_bytes_threshold,
         orphan_sweep_after,
         None,
@@ -9761,7 +9650,6 @@ pub async fn start_split_cluster_with_growth(
     dir: impl Into<PathBuf>,
     ip: std::net::IpAddr,
     backend: StorageBackend,
-    auto_split_threshold: Option<usize>,
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
     auto_split_change_rate: Option<u64>,
@@ -9904,7 +9792,6 @@ pub async fn start_split_cluster_with_growth(
                 ClusterEdgeState::new(),
                 client_route.clone(),
                 intra_route.clone(),
-                auto_split_threshold,
                 auto_split_bytes_threshold,
                 admin_addrs.clone(),
                 StreamSealKnobs::default(),
@@ -10226,7 +10113,6 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             client_route,
             intra_route,
             None,
-            None,
             admin_addrs,
             orphan_sweep_after,
             stream_seal_knobs,
@@ -10501,7 +10387,6 @@ pub async fn run_node_data(
             client_route,
             intra_route,
             None,
-            None,
             admin_addrs,
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
@@ -10603,7 +10488,6 @@ pub async fn run_node_growth(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
             None,
             admin_addrs,
             DEFAULT_ORPHAN_SWEEP_AFTER,
@@ -10815,7 +10699,6 @@ async fn finish_combined_join(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
             None,
             admin_addrs,
             DEFAULT_ORPHAN_SWEEP_AFTER,
@@ -11079,7 +10962,6 @@ async fn finish_data_join(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
             None,
             admin_addrs,
             StreamSealKnobs::default(),
@@ -12383,7 +12265,6 @@ mod simenv_client_ctx_tests {
             control_ids: vec![nid(0)],
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],
-            auto_split_threshold: None,
             auto_split_bytes_threshold: None,
         });
 

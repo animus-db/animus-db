@@ -158,7 +158,7 @@ impl DynamoAuthConfig {
 /// **Deliberately not a [`ClusterConfig`] field**: unlike
 /// [`DynamoAuthConfig`] (a secret that has no other way to reach a
 /// `--config FILE` per-process deployment), this is a plain operational
-/// knob threaded exactly the way `--auto-split`/`--quiesce-after` are —
+/// knob threaded exactly the way `--auto-split-bytes`/`--quiesce-after` are —
 /// through the CLI/function-parameter chain, not the JSON config file — so
 /// adding it never touches [`ClusterConfig`]'s struct-literal shape (which
 /// dozens of existing tests construct directly, all of them needing to stay
