@@ -781,6 +781,15 @@ impl<E: Env> RaftNode<E> {
         self.lock().transfer_leadership(target, self.env.now())
     }
 
+    /// The voter this leader is currently handing leadership off to, if any
+    /// (see [`RaftCore::transfer_target`]) — `/admin/raft`'s own window onto
+    /// an in-flight transfer (issue #313: previously invisible short of
+    /// reading the abort log). `None` on any non-leader, and on a leader
+    /// with no transfer armed.
+    pub fn transfer_target(&self) -> Option<NodeId> {
+        self.lock().transfer_target()
+    }
+
     /// Whether this node's failure detector currently judges `member` alive
     /// (a heartbeat seen within the timeout). Observability for tests; the
     /// authoritative liveness lives in the replicated `Metadata` status, which
@@ -958,9 +967,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         // state transition the step causes to a metric (ADR 0015). All inputs to
         // the metric decisions are `Env`-supplied or core-derived, so recording
         // stays a deterministic function of the run.
-        let (before_role, before_term) = {
+        let (before_role, before_term, before_transfer) = {
             let c = core.lock().expect("raft core poisoned");
-            (c.role(), c.term())
+            (c.role(), c.term(), c.transfer_target())
         };
 
         // The persist arm is polled first, so a landed round releases its acks
@@ -1031,11 +1040,23 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
 
         // Attribute role/term transitions to election metrics + keep the
         // leadership gauge current.
-        let (after_role, after_term) = {
+        let (after_role, after_term, after_transfer, election_budget) = {
             let c = core.lock().expect("raft core poisoned");
-            (c.role(), c.term())
+            (
+                c.role(),
+                c.term(),
+                c.transfer_target(),
+                c.election_timeout(),
+            )
         };
         record_transition(&metrics, before_role, before_term, after_role, after_term);
+        record_transfer_clear(
+            &metrics,
+            before_transfer.as_ref(),
+            after_transfer.as_ref(),
+            after_role,
+            election_budget,
+        );
 
         // Durability before action: persist (and fsync) the core's state changes
         // before sending the responses that depend on them (a granted vote, an
@@ -1459,6 +1480,57 @@ fn record_transition(
     // Keep the gauge level current on any leadership change.
     if (after_role == Role::Leader) != (before_role == Role::Leader) {
         metrics.set_leader(after_role == Role::Leader);
+    }
+}
+
+/// Observe a `transfer_target` clear (issue #313) — `RaftCore::
+/// transfer_leadership`'s handoff has no output message and no metrics
+/// handle of its own (it's pure, I/O-free core state, ADR 0003's sync/
+/// driver split), so the only way to tell "the transfer just aborted" from
+/// "the transfer just succeeded" from outside is to diff `transfer_target`
+/// across one `tick`/`handle` step alongside `after_role`, the same idiom
+/// [`record_transition`] already uses for election metrics. Pure in its
+/// inputs; called unconditionally, cheap no-op on every iteration where
+/// nothing changed.
+///
+/// - `Some -> None` while still `Leader`: the deadline in `RaftCore::tick`
+///   fired with the target never having stepped down — an **abort**
+///   (crashed after arming, fell behind, or a dropped `TimeoutNow`/election
+///   round). This is the case issue #313 found completely invisible:
+///   logged here at `warn`, plus [`Metric::ControlTransferAborted`].
+/// - `Some -> None` while no longer `Leader`: this node itself stepped down
+///   (`RaftCore::handle`'s higher-term branch) — either the transfer
+///   **succeeded** (the target won an election and this node saw its
+///   higher term) or a *different* node won one instead (superseded). Both
+///   are ordinary, not failures, so this logs at `info` with no metric —
+///   an operator diagnosing a stuck transfer cares about the abort case
+///   above, not every routine handoff completion.
+fn record_transfer_clear(
+    metrics: &MetricsHandle,
+    before_transfer: Option<&NodeId>,
+    after_transfer: Option<&NodeId>,
+    after_role: Role,
+    election_budget: Duration,
+) {
+    let Some(target) = before_transfer else {
+        return;
+    };
+    if after_transfer.is_some() {
+        return;
+    }
+    if after_role == Role::Leader {
+        metrics.incr(Metric::ControlTransferAborted);
+        tracing::warn!(
+            %target,
+            budget_ms = election_budget.as_millis() as u64,
+            "leadership transfer aborted: target did not step down within budget"
+        );
+    } else {
+        tracing::info!(
+            %target,
+            "leadership transfer resolved: this node stepped down (transfer likely completed, \
+             or was superseded by a different election)"
+        );
     }
 }
 

@@ -456,9 +456,14 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
-    // `election_base` is configurable via [`set_election_timeout`](RaftCore::set_election_timeout)
-    // so the assembly layer can widen it for a node doing real disk I/O (whose
-    // driver may briefly stall past the default 150ms); defaults to 150ms.
+    // Fixed at 150ms for every constructor — issue #313 removed the
+    // `set_election_timeout` setter this comment used to point to: it had
+    // zero call sites (no assembly layer was ever built to widen this for a
+    // node doing real disk I/O, the use case its own doc described), so it
+    // was dead, aspirational API rather than a documented-but-unwired
+    // knob worth keeping. See `election_timeout()` for the read-only
+    // accessor, still used by `transfer_leadership`'s deadline and by
+    // driver-side observability.
     election_base: Duration,
     heartbeat_interval: Duration,
     election_deadline: Nanos,
@@ -1365,6 +1370,17 @@ where
         self.last_contact.get(&node).copied()
     }
 
+    /// The voter this leader is currently handing leadership off to, if a
+    /// transfer is armed (see [`transfer_leadership`](Self::transfer_leadership))
+    /// — `None` on every other node (a transfer is leader-local state, never
+    /// replicated) and on a leader with none in flight. Introspection only
+    /// (`/admin/raft`, `RaftNode`'s own driver-side abort observability,
+    /// issue #313) — nothing in this core reads it back through this method.
+    #[must_use]
+    pub fn transfer_target(&self) -> Option<NodeId> {
+        self.transfer_target.clone()
+    }
+
     /// Arm a leadership transfer to `target` (Raft §3.10): once armed,
     /// `propose`/`change_membership` freeze (report `NotLeader`) so the log stops
     /// growing, and `broadcast_append` sends `target` a [`RaftMsg::TimeoutNow`]
@@ -1433,20 +1449,11 @@ where
         true
     }
 
-    /// Set the **election-timeout base** and re-arm the election timer from `now`.
-    /// The randomized timeout is drawn from `[base, 2*base)` (as always); widening
-    /// `base` makes this node slower to campaign, which the assembly layer wants
-    /// for a node whose driver does real disk I/O and may briefly stall past the
-    /// 150ms default (that stall would otherwise trigger a spurious election and,
-    /// with pre-vote, at least a spurious pre-vote round). Additive: existing
-    /// callers keep the 150ms default. Deterministic — timing comes from the
-    /// injected `now`/`entropy`, never a wall clock.
-    pub fn set_election_timeout(&mut self, base: Duration, now: Nanos, entropy: u64) {
-        self.election_base = base;
-        self.reset_election_timer(now, entropy);
-    }
-
-    /// The current election-timeout base (the low end of the randomized range).
+    /// The current election-timeout base (the low end of the randomized
+    /// `[base, 2*base)` range a follower's real timeout is drawn from) — also
+    /// the un-randomized budget [`transfer_leadership`](Self::transfer_leadership)
+    /// arms its own deadline with. Introspection only (driver-side
+    /// observability logs the budget a transfer had to fit in).
     #[must_use]
     pub fn election_timeout(&self) -> Duration {
         self.election_base

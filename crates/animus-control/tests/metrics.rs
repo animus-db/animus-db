@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use animus_control::node::heartbeat_loop;
-use animus_control::{MetaCommand, NodeStatus, RaftNode};
+use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftNode};
 use animus_env::{EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
@@ -150,6 +150,92 @@ fn run(seed: u64) {
         "failure_detector_up should increment on the Down->Active edge \
          (before={up_before}, after={up_after}, seed={seed})"
     );
+}
+
+/// Issue #313: an aborted leadership transfer used to be cleared with no log,
+/// metric, or trace anywhere in the path — a caller (or an operator) could
+/// not tell "transfer in progress" from "transfer was silently dropped
+/// moments ago". Arm a transfer, then crash the target *before it can ever
+/// receive/act on `TimeoutNow`* (mirroring "the target crashed after
+/// arming"), and drive past the un-randomized `election_base` deadline
+/// (150ms default) `RaftCore::tick` aborts on. The abort must now be
+/// observable via `Metric::ControlTransferAborted`, and `transfer_target()`
+/// must reflect both the arm and the clear (`/admin/raft`'s own window onto
+/// this, ADR 0037/0009).
+#[test]
+fn aborted_leadership_transfer_is_observable() {
+    aborted_leadership_transfer_run(0xABCD_1234);
+}
+
+/// The abort (and its metric) are a pure function of the seed, same
+/// discipline as `metrics_are_reproducible_from_seed` below.
+#[test]
+fn aborted_leadership_transfer_is_reproducible_from_seed() {
+    fn trace(seed: u64) -> u64 {
+        aborted_leadership_transfer_run(seed)
+    }
+    assert_eq!(trace(0x0313_5EED), trace(0x0313_5EED));
+}
+
+/// Drives the abort scenario described above once and returns the leader's
+/// final `ControlTransferAborted` count, so both tests above can share one
+/// implementation (the seed-reproducibility test needs the return value; the
+/// primary test only needs its own assertions along the way).
+fn aborted_leadership_transfer_run(seed: u64) -> u64 {
+    let (mut sim, nodes, handles) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = leader_index(&nodes);
+    let target = (0..nodes.len())
+        .find(|&i| i != leader)
+        .expect("a 3-node cluster has a non-leader");
+    let target_id = nid(CONTROL[target]);
+
+    let aborted_before = handles[leader].get(Metric::ControlTransferAborted);
+    assert!(
+        nodes[leader].transfer_leadership(target_id.clone()),
+        "target should already be caught up enough to arm (seed={seed})"
+    );
+    assert_eq!(
+        nodes[leader].transfer_target(),
+        Some(target_id.clone()),
+        "an armed transfer should be visible via transfer_target() (seed={seed})"
+    );
+
+    // Kill the target immediately — no sim time elapses between arming and
+    // this crash, so it can never receive (let alone act on) `TimeoutNow`.
+    sim.crash(target_id);
+    // Well past one un-randomized election_base (150ms default): long enough
+    // for `RaftCore::tick`'s deadline check to fire on every plausible tick
+    // cadence, short enough to stay well inside this test's own budget.
+    sim.run_for(Duration::from_millis(500));
+
+    assert!(
+        nodes[leader].is_leader(),
+        "an aborted transfer must not itself demote the leader (seed={seed})"
+    );
+    assert_eq!(
+        nodes[leader].transfer_target(),
+        None,
+        "the aborted transfer must have cleared (seed={seed})"
+    );
+    let aborted_after = handles[leader].get(Metric::ControlTransferAborted);
+    assert!(
+        aborted_after > aborted_before,
+        "an aborted transfer must be observable via Metric::ControlTransferAborted \
+         (before={aborted_before}, after={aborted_after}, seed={seed})"
+    );
+
+    // The freeze must lift once the abort clears — an ordinary propose
+    // succeeds again with no further intervention.
+    assert!(
+        matches!(
+            nodes[leader].propose(MetaCommand::NoOp),
+            ProposeResult::Accepted { .. }
+        ),
+        "proposing must resume once the aborted transfer clears (seed={seed})"
+    );
+
+    aborted_after
 }
 
 /// The recorded counters are a pure function of the seed: the same seed yields a

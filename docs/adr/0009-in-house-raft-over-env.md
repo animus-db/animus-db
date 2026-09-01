@@ -193,12 +193,24 @@ Pre-vote rides the shared `RaftMsg` enum additively, so **both** planes (control
 `animus-cp-data`) keep their wire formats; the cp-data driver forwards the new
 variants through `KvWire::Raft` unchanged.
 
-**Configurable election timeout.** `RaftCore::set_election_timeout(base, now,
-entropy)` sets the election-timeout base (still randomized in `[base, 2*base)`,
-default 150ms) and re-arms the timer, so the assembly layer can **widen** it for a
-node doing real disk I/O — cutting the rate of spurious timeouts at the source,
-complementary to pre-vote (which makes any timeout that does slip through
-non-disruptive).
+**Configurable election timeout — removed (issue #313, 2026-09-01 amendment).**
+`RaftCore::set_election_timeout(base, now, entropy)` originally set the
+election-timeout base (still randomized in `[base, 2*base)`, default 150ms)
+and re-armed the timer, with the stated intent that an assembly layer would
+widen it for a node doing real disk I/O — cutting the rate of spurious
+timeouts at the source, complementary to pre-vote (which makes any timeout
+that does slip through non-disruptive). That assembly layer was never
+built: the setter had zero call sites (grep-verified) beyond its own
+definition and a doc cross-reference, for the entire time between this
+ADR's authoring and its removal. Rather than leave a documented-but-unwired
+knob in limbo, it was deleted; `RaftCore::election_timeout()` (the
+read-only accessor) stays — `transfer_leadership` arms its deadline from
+it, and `animus-control::node`'s driver now also logs it as the budget an
+aborted leadership transfer had to fit in (issue #313's own fix, see the
+"Leadership transfer" entries in `animus-control/CLAUDE.md`). If a real
+need to widen the timeout for a slow-disk node resurfaces, re-add the
+setter alongside its actual caller in the same change, not speculatively
+ahead of one.
 
 Coverage: `tests/pre_vote.rs` — core-level (a live-leader lease rejects a pre-vote
 and the term is untouched; an expired lease grants; a timeout makes a pre-candidate

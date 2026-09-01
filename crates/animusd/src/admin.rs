@@ -635,6 +635,14 @@ fn raft_view(ctx: &ClientCtx) -> Value {
         // enough) answer for that case; a `Local` replica's is always
         // `Some(..)`.
         "voters": r.config().unwrap_or_default().into_iter().collect::<Vec<_>>(),
+        // ADR 0037/0009, issue #313: the voter this replica's own leader is
+        // currently handing off to, if any — `null` covers both "not
+        // leading" and "leading with nothing armed" (see `ControlHandle::
+        // transfer_target`'s own doc for why that's the honest answer
+        // here). Diagnostic only; an aborted transfer is logged +
+        // `Metric::ControlTransferAborted`-metered at the moment it clears,
+        // not retained here once it's gone.
+        "transfer_target": r.transfer_target(),
         "members": members,
         // ADR 0035 PR7: this handle's control-plane mirror status — the one
         // thing a genuine control-group voter (`ControlHandle::Local`) can't

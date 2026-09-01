@@ -769,8 +769,14 @@ per-tablet CP data plane (`animus-cp-data`).
   the pre-candidate to a follower at that term. Tick semantics: a multi-node
   election now needs a `PreVoteResp` grant fed before the real
   `RequestVote`/`RequestVoteResp`; a single-node group still elects on one tick
-  (self is a pre-vote majority). `set_election_timeout(base, now, entropy)` makes
-  the default-150ms base configurable for a node doing real disk I/O.
+  (self is a pre-vote majority). **`set_election_timeout` — the setter this
+  used to describe as configuring the base for a node doing real disk I/O —
+  was deleted (issue #313, 2026-09-01): it had zero call sites, no assembly
+  layer to widen it was ever built, and the doc text describing that
+  assembly layer was aspirational, not a real gap left for later.**
+  `election_timeout()` (read-only) survives — `transfer_leadership` arms its
+  deadline from it, and it now also backs the driver's own abort-observability
+  log (see the "Leadership transfer" entry below).
 
 - **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
   gains a per-member `role`: alongside the existing voter `config`, a
@@ -875,6 +881,44 @@ per-tablet CP data plane (`animus-cp-data`).
   the full account and the fix (retry the *whole admin call*, not just the
   side effect, since every refusal this one-shot arm can produce is
   equally retryable and maps to the identical HTTP status).
+
+  **The abort above used to be cleared with no log, metric, or trace
+  anywhere in the path (issue #313, fixed 2026-09-01) — now observable.**
+  `RaftCore` itself stays pure/I/O-free (ADR 0003), so `node.rs`'s driver
+  loop (`drive`) diffs `RaftCore::transfer_target()` across each
+  `tick`/`handle` step, the same idiom `record_transition` already uses for
+  election metrics: a `Some -> None` clear while still `Leader` is the
+  deadline-timeout abort this section describes — logged
+  (`tracing::warn!`, naming the target and the `election_timeout()` budget
+  it had to fit in) and metered (`Metric::ControlTransferAborted`,
+  `/metrics`'s `control_transfer_aborted`). A `Some -> None` clear while no
+  longer `Leader` (this node itself stepped down to a higher term — the
+  transfer likely succeeded, or was superseded by a different election) is
+  logged at `info` with no metric — an operator chasing a stuck transfer
+  cares about the abort case, not every routine completion.
+  `RaftNode::transfer_target()`/`ControlHandle::transfer_target()` also
+  surface the **live** armed target (or `None`) via `/admin/raft`'s
+  `transfer_target` field, mirroring `voters`' "this replica's own view"
+  diagnostic scope — `Remote` always answers `None` (no local `RaftCore`,
+  and the wire carries no such signal). Regression:
+  `tests/metrics.rs::aborted_leadership_transfer_is_observable` (arms a
+  transfer, kills the target before it can ever see `TimeoutNow`, drives
+  past the deadline, asserts the metric moved and the leader survived) +
+  its seed-reproducibility sibling.
+
+  **`RaftCore::set_election_timeout` — the setter, not the read-only
+  `election_timeout()` accessor above — was deleted in the same change.**
+  It had zero call sites (grep-verified) despite its own doc comment
+  describing an "assembly layer" meant to widen it for a node doing real
+  disk I/O; that assembly layer was never built, and — confirmed by
+  reading `handle_timeout_now` — it was never the "missing `TimeoutNow`
+  half" either: a received `TimeoutNow` already campaigns immediately via
+  `start_election`, bypassing the election timer entirely, so this setter
+  could not have made a transfer faster or more reliable even if wired up.
+  Genuinely unused, aspirational API, not a documented gap worth leaving
+  in limbo — see ADR 0009's matching 2026-09-01 amendment. If a real need
+  to widen the timeout for a slow-disk node resurfaces, re-add the setter
+  alongside its actual caller in the same change.
 
 - **Snapshot transfer is chunked and O(chunk), not O(state).** A follower
   behind the compacted prefix is caught up via a chunked `InstallSnapshot`,
