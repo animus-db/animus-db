@@ -152,6 +152,17 @@ pub enum StorageError {
     /// An error from an underlying persistent backend.
     #[error("storage backend error: {0}")]
     Backend(String),
+    /// `LsmOptions::level_fanout` was `<= 1`. The per-level table budget is
+    /// `L1_TABLE_BUDGET * level_fanout^(level - 1)`, so at `level_fanout <= 1`
+    /// it never grows with depth — a table set whose fully-merged size
+    /// exceeds the L1 budget can cascade down through every level forever
+    /// without ever settling. Validated at [`LsmOptions::validate`] /
+    /// `LsmEngine::open*`, rather than left as a silent footgun.
+    #[error("invalid LsmOptions: level_fanout must be >= 2, got {level_fanout}")]
+    InvalidLevelFanout {
+        /// The rejected value.
+        level_fanout: usize,
+    },
 }
 
 /// Result alias for storage operations.
