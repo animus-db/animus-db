@@ -95,7 +95,7 @@ code {
 header.site {
   position: sticky; top: 0; z-index: 50;
   background: var(--bg);
-  border-bottom: 2px solid var(--text);
+  border-bottom: 1px solid var(--border);
 }
 header.site .bar { display: flex; align-items: center; gap: 32px; height: 66px; }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); font-size: 19px; }
@@ -269,7 +269,7 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
 }
 
 /* horizontal stat strip, divided by rules (not boxed) */
-.stat-row { display: flex; flex-wrap: wrap; border-top: 2px solid var(--text); padding-top: 24px; margin: 0 0 46px; }
+.stat-row { display: flex; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 24px; margin: 0 0 46px; }
 .stat-row .stat { flex: 1 1 200px; padding: 0 26px; border-left: 1px solid var(--ink-16); }
 .stat-row .stat:first-child { padding-left: 0; border-left: none; }
 .stat-row .stat .n { font: 600 20px/1.25 var(--font-ui); letter-spacing: -0.01em; color: var(--text); margin-bottom: 4px; }
@@ -371,7 +371,7 @@ section.alt, .page-section.alt { background: var(--bg-soft); border-top: 1px sol
    table sideways inside .table-scroll instead (the page itself doesn't). */
 table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 13.5px; }
 th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
-th { font-weight: 600; color: var(--ink-72); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; border-bottom: 2px solid var(--text); }
+th { font-weight: 600; color: var(--ink-72); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 td { color: var(--ink-85); }
 td code { background: transparent; border: none; padding: 0; color: var(--text); }
@@ -398,7 +398,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 
 /* ---------- callouts, warnings, asides, pull quotes ---------- */
 .callout {
-  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border: 1px solid var(--border); border-left: 2px solid var(--accent);
   background: var(--surface); padding: 16px 20px; margin: 24px 0;
 }
 .callout h4 { margin: 0 0 8px; font-size: 14px; }
@@ -410,7 +410,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .callout p:last-child { margin-bottom: 0; }
 
 .warnbox {
-  border: 1px solid var(--border-strong); border-left: 3px solid var(--danger);
+  border: 1px solid var(--border-strong); border-left: 2px solid var(--danger);
   background: var(--surface); padding: 14px 18px; margin: 20px 0;
 }
 .warnbox .label {
@@ -427,7 +427,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .aside strong { color: var(--text); }
 
 .pull {
-  border-left: 3px solid var(--accent); margin: 24px 0; padding: 4px 0 4px 22px;
+  border-left: 2px solid var(--accent); margin: 24px 0; padding: 4px 0 4px 22px;
   font: 500 18px/1.55 var(--font-ui); color: var(--text);
 }
 @media (max-width: 640px) {
@@ -440,7 +440,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .article .article-head h1 { margin: 10px 0 14px; font-size: clamp(1.9rem, 4vw, 2.4rem); }
 .article .lede { font-size: 16.5px; font-style: italic; color: var(--ink-72); margin: 0; }
 .article h2 {
-  margin: 38px 0 14px; font-size: 22px; border-bottom: 2px solid var(--text); padding-bottom: 8px;
+  margin: 38px 0 14px; font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 8px;
 }
 .article p { font-size: 15px; color: var(--ink-85); }
 .article ul, .article ol { font-size: 14.5px; color: var(--ink-85); line-height: 1.7; }
@@ -493,7 +493,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .doc-nav a { display: block; padding: 5px 0 5px 12px; color: var(--text2); border-left: 2px solid var(--border); }
 .doc-nav a:hover { color: var(--text); text-decoration: none; border-left-color: var(--border-strong); }
 .doc-nav a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 500; }
-.doc-body h2 { margin-top: 6px; padding-top: 20px; border-bottom: 2px solid var(--text); padding-bottom: 8px; }
+.doc-body h2 { margin-top: 6px; padding-top: 20px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
 .doc-body section { padding: 0 0 26px; }
 .doc-body section + section { border-top: 1px solid var(--border); padding-top: 6px; }
 .doc-body h3 { margin-top: 28px; }
@@ -533,7 +533,7 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .steps > li > h3 { margin: 2px 0 8px; }
 
 /* ---------- footer ---------- */
-footer.site { border-top: 2px solid var(--text); padding: 40px 0 30px; }
+footer.site { border-top: 1px solid var(--border); padding: 40px 0 30px; }
 .foot-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 32px; }
 @media (max-width: 780px) { .foot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; } }
 @media (max-width: 480px) { .foot-grid { grid-template-columns: minmax(0, 1fr); gap: 22px; } }

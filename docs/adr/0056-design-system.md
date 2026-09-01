@@ -28,7 +28,12 @@
   2026-08-31 amendment), and now the two in-product consoles' own skin
   (third 2026-08-31 amendment, below) — all three surfaces this ADR governs
   now share the plainer, more traditional developer-tool geometry and
-  component language.
+  component language. **A 2026-09-01 amendment (below) is a small follow-up
+  polish on top of that closed-out series**, not a new leg of it: heavy
+  `var(--text)`-colored structural borders left in place by the series
+  above are softened to quiet 1px hairlines, and the callout/warnbox/pull
+  left-accent borders are reduced 3px→2px — a maintainer visual-feedback
+  fix, not a further direction change.
 - **Date:** 2026-08-23
 - **Amends:** [ADR 0021](0021-web-dashboard.md) (dashboard styling),
   [ADR 0052](0052-data-console-port.md) (data console styling).
@@ -742,3 +747,93 @@ plainer, more traditional developer-tool geometry and component language;
 only the two-skin density difference (site vs. app radius/spacing/control
 height, "One base, two skins," Decision, above) still tells them apart, by
 design.
+
+## Amendment (2026-09-01) — soften remaining heavy structural borders; reduce the callout family's left-accent to 2px
+
+Direct maintainer visual feedback on the completed restyle series above:
+*"soften the design a bit — the bold lines clash with the very techy logo
+I like"* (the 19-circle hexagonal node-cluster mark). The three restyle
+amendments above already removed the hard-shadow ink-plate and the
+stamped-outline pills, but each one explicitly, deliberately **left in
+place** a set of `2px`/`3px` `var(--text)`-colored structural rules,
+calling them out by name as section-boundary devices rather than card
+treatments (see the website-skin amendment's "Cards" section and the
+consoles-skin amendment's own matching paragraph) — those rules are what
+this amendment softens. This is a small follow-up polish on the closed-out
+series, not a new leg of it: no colour token, radius, spacing, or the
+ink-plate/pill/card component work from the three prior amendments changes
+here — line weight only.
+
+### Structural `var(--text)` borders: 2px/3px → a 1px `var(--border)` hairline
+
+Every purely-structural border that used `var(--text)`/`var(--ink-*)` at
+2px or more, across all three surfaces this ADR governs, drops to a plain
+`1px solid var(--border)` — the same quiet hairline the already-restyled
+cards/panels use elsewhere in the same files:
+
+- `website/assets/site.css`: `header.site`'s bottom border,
+  `footer.site`'s top border, `.stat-row`'s top border, the reference-page
+  table `th`'s bottom border, `.article h2`'s bottom border, and
+  `.doc-body h2`'s bottom border.
+- `crates/animusd/src/dashboard.css`: `header.topbar`'s bottom border, the
+  table `th`'s bottom border, `.section-head`'s bottom border, and
+  `.health-banner`'s top border (its own `.degraded`/`.critical`
+  `border-top-color: var(--danger)` override is untouched — same rule,
+  now at 1px instead of 2px).
+- `crates/animusd/src/console.css`: `.topbar`'s bottom border, and the
+  bottom border on both `table.tables th` and `table.items-table th`.
+
+### The callout family's left-accent: 3px → 2px, colour unchanged
+
+`.callout`'s and `.pull`'s `border-left: 3px solid var(--accent)` and
+`.warnbox`'s `border-left: 3px solid var(--danger)` (`website/assets/
+site.css`) all drop to **2px**, colour untouched — these carry real
+meaning (which kind of callout this is) via colour, so the border stays,
+just quieter. `.warnbox`'s own `border: 1px solid var(--border-strong)`
+(the box's outline, not the left accent) was already quiet and is
+untouched. `.aside`'s `border-left: 2px solid var(--border-strong)` is a
+third, visually similar left-rule in the same section but was already at
+the target 2px width and uses neither `var(--text)`/`var(--ink-*)` nor
+`var(--accent)`/`var(--danger)` — it matches neither category this
+amendment addresses, so it is untouched.
+
+### What stays exactly as it was: "keyline means live"
+
+The 2026-08-25 Ledger revision's own load-bearing rule — a 2px solid
+**accent**-colored underline/border is the system's one emphasis device,
+reserved for real state ("Keyline-means-live replaces glow-means-live",
+above) — is a different, meaningful device from the structural rules this
+amendment softens, and is deliberately untouched: the active nav link
+(`nav.main a.here`), the active reference-page subnav item (`.subnav
+a.on`), the pressed theme-switch button (both consoles' and the site's own
+`.theme-switch button[aria-pressed="true"]`/`.theme-switch button.active`),
+the dashboard sidebar's active nav link, and the console's active tab-strip
+link (`.tab-strip .tab-link.active`) all keep their exact `2px solid
+var(--accent)` (or `border-bottom-color: var(--accent)` paired with a
+`transparent` inactive-state sibling rule) byte-for-byte. The complaint
+this amendment answers was specifically about heavy **black/ink**
+dividers, not the accent live-indicator — softening that mechanism too
+would have thrown away the one signal a viewer is supposed to notice.
+
+### Verified
+
+`grep -nE "2px solid var\(--text\)|3px solid var\(--text\)|2px solid var\(--ink"` over
+`website/assets/site.css`, `crates/animusd/src/dashboard.css`, and
+`crates/animusd/src/console.css` returns nothing after this amendment.
+`grep -nE "2px solid var\(--accent\)|border-bottom: var\(--live-underline\)"`
+over the same three files returns the identical set of matches before and
+after (the callout-family accent rules that moved 3px→2px are a distinct,
+intentional line — not part of this grep's `2px` pattern, since they were
+3px before the change and stayed non-`2px`-literal). `cargo build -p
+animusd` succeeds. **A real headless-browser check was done for both
+themes, on both the website and both in-product consoles** — Playwright
+against the sandbox's pre-installed Chromium, driven through each page's
+own `.theme-switch` toggle (never a browser-context override): the website
+homepage and the compatibility page (table-bearing); a live single-node
+`animusd --cluster 1 --ephemeral` cluster's admin dashboard Overview tab
+and the console's Items tab (with a real table and row created via the
+DynamoDB wire, so a genuine table `th` renders). Every structural border
+named above rendered as a quiet hairline in both themes on every page
+checked, and every live-indicator rule (the active nav link, the active
+subnav item, the pressed theme button, the active console tab) rendered
+with its full, unmodified accent-colored keyline in both themes.
