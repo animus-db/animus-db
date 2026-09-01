@@ -1093,7 +1093,6 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
 
         // The cheap path still answers, and `?exact=1` still answers exactly.
         let (_, cheap_view) = admin_get(a, "/admin/raftkv").await;
-        let (_, exact_view) = admin_get(a, "/admin/raftkv?exact=1").await;
         let sum = |v: &Value| -> u64 {
             v["groups"]
                 .as_array()
@@ -1107,6 +1106,35 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
             sum(&cheap_view) > 0,
             "the LSM backend has a cheap key-count estimate: {cheap_view}"
         );
+        // `raft_view`'s exact path (`CpGroup::local_pairs`) is a pure LOCAL engine
+        // read with no consensus barrier or leadership check (`admin.rs`'s own
+        // doc: "/admin/raftkv is node-local"), and every poll in this test targets
+        // `nodes[0]` specifically regardless of which node leads the "big" table's
+        // tablet. If node 0 is a follower here, its exact count is an EVENTUAL
+        // property of its own apply loop, not a fact the leader-side seed/flush
+        // acks already guarantee — so assert it one-shot only. Converge-poll
+        // instead (the repo's own idiom, `docs/engineering-lessons.md`'s Testing
+        // section: "Eventual properties get a converged-or-timeout poll, never a
+        // fixed-deadline one-shot assert"). Bounded generously (20s) relative to
+        // the apply/flush cadence exercised above, not guessed.
+        let exact_view = timeout(Duration::from_secs(20), async {
+            loop {
+                let (_, v) = admin_get(a, "/admin/raftkv?exact=1").await;
+                if sum(&v) >= N as u64 {
+                    return v;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "`?exact=1` on node {a} never converged to counting every seeded row \
+                 within 20s — a lagging follower's own applied state, not a genuine \
+                 undercount (the seeding/flush above only guarantees the LEADER's \
+                 view, not every follower's)"
+            )
+        });
         assert!(
             sum(&exact_view) >= N as u64,
             "`?exact=1` counts every seeded row (plus bookkeeping kinds): {exact_view}"
