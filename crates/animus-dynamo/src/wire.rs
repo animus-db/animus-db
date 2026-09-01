@@ -4289,7 +4289,9 @@ pub fn restore_table_response(
 
 /// The JSON body for a successful `DescribeTable` (ADR 0042 §2): the same
 /// shape as [`create_table_response`], plus `AttributeDefinitions` (derived
-/// from `key_types`, mirroring `CreateTable`'s own decode), wrapped under
+/// from `key_types` and `indexes`, covering every base **and** index key
+/// attribute — see [`attribute_definitions`]'s own doc for the issue #319
+/// coverage fix), wrapped under
 /// `Table` (DynamoDB's own `DescribeTable` response shape, distinct from
 /// `CreateTable`/`UpdateTable`'s `TableDescription`). `index_statuses` is the
 /// caller's Fork-D side channel of each index's *real* replicated-catalog
@@ -4312,7 +4314,7 @@ pub fn describe_table_response(
     let mut desc = table_description_object(table, schema, indexes, index_statuses, stream, status);
     desc.insert(
         "AttributeDefinitions".into(),
-        Value::Array(attribute_definitions(schema, key_types)),
+        Value::Array(attribute_definitions(schema, key_types, indexes)),
     );
     let mut obj = Map::new();
     obj.insert("Table".into(), Value::Object(desc));
@@ -4347,24 +4349,71 @@ pub fn delete_table_response(
     desc.insert("TableStatus".into(), Value::String("DELETING".into()));
     desc.insert(
         "AttributeDefinitions".into(),
-        Value::Array(attribute_definitions(schema, key_types)),
+        Value::Array(attribute_definitions(schema, key_types, indexes)),
     );
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("delete-table response serializes")
 }
 
-/// The `AttributeDefinitions` array (partition key, plus sort key when
-/// composite) for `schema`, resolving each key attribute's declared type
-/// from `key_types` (defaulting to `S` when absent, mirroring
-/// `CreateTable`'s own decode). Shared by [`describe_table_response`] and
-/// [`delete_table_response`] — the two response shapes that echo it.
-fn attribute_definitions(schema: &TableSchema, key_types: &[(String, String)]) -> Vec<Value> {
-    let mut attrs = vec![attribute_definition(&schema.partition_key, key_types)];
+/// The `AttributeDefinitions` array (base partition key, base sort key when
+/// composite, plus every secondary index's own key attribute not already
+/// covered by the base) for `schema`/`indexes`, resolving each key
+/// attribute's declared type from `key_types` (defaulting to `S` when
+/// absent, mirroring `CreateTable`'s own decode). Shared by
+/// [`describe_table_response`] and [`delete_table_response`] — the two
+/// response shapes that echo it.
+///
+/// **Real DynamoDB's `AttributeDefinitions` covers every key attribute in
+/// the table, base and index alike** — a GSI's hash/sort attribute or an
+/// LSI's alternate sort attribute, not just the base table's own
+/// partition/sort key (issue #319). Neither this crate's `IndexDef`
+/// bridge nor `IndexDef` itself ever records an index key attribute's own
+/// declared type (`animus-dynamo/CLAUDE.md`/`animusd/CLAUDE.md` both trace
+/// why — it holds uniformly for a `CreateTable`-declared index and a later
+/// `UpdateTable`-added one alike), so an index-only key attribute here
+/// always renders as the same `key_types`-absent `"S"` default every other
+/// untyped attribute already gets — an honest "unknown, defaulted" answer
+/// rather than an omission. **This does not restore a genuine per-index
+/// type** (nothing here started persisting one); it only closes the
+/// coverage gap — every declared key attribute now gets *an* entry, the
+/// AWS-faithful shape `DescribeTable` promises, even though today every
+/// index-only one names the same placeholder type.
+fn attribute_definitions(
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+) -> Vec<Value> {
+    let mut names = vec![schema.partition_key.clone()];
     if let Some(sk) = &schema.sort_key {
-        attrs.push(attribute_definition(sk, key_types));
+        names.push(sk.clone());
     }
-    attrs
+    for index in indexes {
+        match index {
+            SecondaryIndex::Global(g) => {
+                if !names.contains(&g.key_attribute) {
+                    names.push(g.key_attribute.clone());
+                }
+                if let Some(sort) = &g.sort_attribute
+                    && !names.contains(sort)
+                {
+                    names.push(sort.clone());
+                }
+            }
+            // An LSI's hash is always the base partition key (already
+            // pushed above) — only its own alternate sort attribute can be
+            // new.
+            SecondaryIndex::Local(l) => {
+                if !names.contains(&l.sort_attribute) {
+                    names.push(l.sort_attribute.clone());
+                }
+            }
+        }
+    }
+    names
+        .iter()
+        .map(|n| attribute_definition(n, key_types))
+        .collect()
 }
 
 fn attribute_definition(name: &str, key_types: &[(String, String)]) -> Value {
@@ -5796,6 +5845,64 @@ mod tests {
         assert!(body.contains("\"AttributeDefinitions\""));
         assert!(body.contains("\"AttributeType\":\"N\""));
         assert!(body.contains("\"StreamViewType\":\"KEYS_ONLY\""));
+    }
+
+    /// `DescribeTable`'s `AttributeDefinitions` must cover a GSI's own key
+    /// attribute(s), an LSI's own alternate sort attribute, and the base
+    /// table's own keys — the AWS-faithful shape (issue #319's DescribeTable
+    /// fidelity gap): before this fix `attribute_definitions` only ever
+    /// looked at `schema.partition_key`/`schema.sort_key`, so a composite
+    /// GSI's `score` (hash) and `rank` (sort) — neither of them the base
+    /// table's own `id` — never appeared in the response at all. Every
+    /// index-only attribute here has no recorded type anywhere in the
+    /// catalog (a separate, uniform-across-`CreateTable`/`UpdateTable` gap,
+    /// not fixed by this test — see `attribute_definitions`'s own doc), so
+    /// it renders the same `"S"` placeholder every other untyped attribute
+    /// gets; what this test actually pins is that the attribute *appears at
+    /// all*, deduplicated against the base/other index attributes.
+    #[test]
+    fn describe_table_response_attribute_definitions_cover_index_key_attributes() {
+        let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-score".into(),
+            key_attribute: "score".into(),
+            sort_attribute: Some("rank".into()),
+            projection: IndexProjection::All,
+        });
+        let lsi = SecondaryIndex::Local(LocalSecondaryIndex {
+            name: "by-alt-sort".into(),
+            // Shares the base partition key's own name coincidentally to
+            // prove dedup: `id` must appear exactly once in the output.
+            sort_attribute: "alt_sort".into(),
+            projection: IndexProjection::All,
+        });
+        let body = describe_table_response(
+            "t",
+            &TableSchema::simple("id"),
+            &[("id".into(), "S".into())],
+            &[gsi, lsi],
+            &[],
+            None,
+            "ACTIVE",
+        );
+        // Scope the assertions to the `AttributeDefinitions` array itself —
+        // `AttributeName` also appears inside `KeySchema`/
+        // `GlobalSecondaryIndexes`/`LocalSecondaryIndexes`, which would
+        // otherwise inflate the count below.
+        let attr_defs_start = body.find("\"AttributeDefinitions\":[").expect("present");
+        let attr_defs_end = attr_defs_start + body[attr_defs_start..].find(']').expect("closes");
+        let attr_defs = &body[attr_defs_start..=attr_defs_end];
+        for name in ["id", "score", "rank", "alt_sort"] {
+            assert!(
+                attr_defs.contains(&format!("\"AttributeName\":\"{name}\"")),
+                "missing AttributeDefinitions entry for `{name}`: {attr_defs}"
+            );
+        }
+        assert_eq!(
+            attr_defs.matches("\"AttributeName\":\"id\"").count(),
+            1,
+            "base partition key must appear exactly once even though nothing \
+             else names it: {attr_defs}"
+        );
     }
 
     /// `DescribeTable`'s per-index `IndexStatus` (ADR 0045 §6 Fork D): each of
