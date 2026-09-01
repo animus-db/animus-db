@@ -114,8 +114,9 @@ places:
    at a child's *final* home [...] receives the **whole parent range** via
    `InstallSnapshot`, not the range-filtered half a copy-based `SeedBatch`
    bulk pass would ship — roughly 2× the network bytes [...] when the two
-   children's homes don't overlap," left as an explicitly open fork (G2,
-   never closed).
+   children's homes don't overlap," left as an explicitly open fork (G2 —
+   its clone-step half is since closed, 2026-08-31; see the "Companion
+   decisions" bullet below).
 
 None of this is a bug — every one of these is a deliberate, documented
 consequence of choosing F5 for the in-place shape. But once the fork
@@ -499,6 +500,22 @@ sees a green "split complete" pill versus an amber "still placing" one.
   G2's own copy-based-analog case); removing the key-count auto-split
   trigger (unrelated surface, referenced only because it shares the
   `--auto-split`-family CLI flags this ADR does not touch).
+
+  **The clone half is since closed (2026-08-31, `LsmEngine::
+  clone_to_filtered`, ADR 0058's own rung-2 amendment)**: the fork's own
+  clone step (`EngineFactory::clone_engine`) now does whole-file
+  assignment — a source SSTable wholly outside the target's own keep-set
+  is never linked in at all, rather than shipped whole and trimmed after.
+  This closes the *clone-step* half of G2 unconditionally (independent of
+  whether a child's eventual home is disjoint from the parent's — it helps
+  the fork-first case described here too, since even a same-home clone
+  benefits from not linking a wholly-sibling table it will only delete a
+  moment later via `trim_split_child`). **What stays open**: a genuinely
+  range-filtered `InstallSnapshot` **wire format** — a straddling table is
+  still linked (and shipped) whole, and Placing's own post-cutover learner
+  catch-up (the "child-range-only, not whole-parent-range" property two
+  bullets below) was already true before this closure and is unaffected by
+  it either way.
 
 ### Rationale — why fork-first / late-binding, and what is given up
 

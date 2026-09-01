@@ -970,10 +970,39 @@ already a member of the parent's own).
   unconditionally — ADR 0050's copy-kinds rule, reused verbatim), then
   either `RaftKvNode::start_hosted` or `start_hosted_campaigning` with
   `bootstrap_voters`, selected by `HostAction::MaterializeSplitChild.
-  campaign` — see "Deterministic first leader" below.
-- **`EngineFactory::clone_engine(&self, source: &S, target: TabletId)`**
-  takes the source's own already-open handle, not a bare `TabletId` — see
-  its own doc for why re-opening would be unsafe.
+  campaign` — see "Deterministic first leader" below. **`clone_engine` is
+  now range-aware (ADR 0058 fork closed, 2026-08-31)**: immediately before
+  calling it, `materialize_split_child` computes the child's own
+  physical keep-set once — its declared `range` sliced through
+  `KIND_BASE`/`KIND_LSI`/`KIND_FOOTPRINT` via `StorageScope::with_kind(..)
+  .physical_bounds()`, nothing of `KIND_CHANGE`/`KIND_CURSOR` (a child is
+  always born empty of those two, per `trim_split_child`'s own rule below)
+  — and passes it down; the backing `LsmEngine::clone_to_filtered` does
+  whole-file assignment with it (a source SSTable wholly outside every
+  keep range is never linked into the child's namespace at all). This does
+  **not** replace `trim_split_child` — a table straddling the keep/drop
+  boundary is still linked whole, so the post-clone `delete_range` over
+  the sibling's own range remains necessary and still correct (deleting a
+  range from a table that was never linked in the first place is a
+  harmless no-op) — it only removes the whole *wholly-sibling* tables from
+  the clone before trim ever runs, closing the dead-space debt a
+  cold/quiesced child used to leave for its own compaction to eventually
+  reclaim, and the per-engine size-accounting double-count across the two
+  children. See `animus-storage/CLAUDE.md`'s `clone_to_filtered` entry for
+  the primitive's own full design and test list; `tests/
+  inplace_split_dead_space.rs` (this crate) is the file-level regression —
+  a parent seeded with explicitly flushed, range-disjoint SSTables forks,
+  and each child's own materialized engine is asserted, by SSTable
+  sequence number, to have excluded its sibling's wholly-outside table.
+- **`EngineFactory::clone_engine(&self, source: &S, target: TabletId, keep:
+  &[(Vec<u8>, Option<Vec<u8>>)])`** takes the source's own already-open
+  handle, not a bare `TabletId` — see its own doc for why re-opening would
+  be unsafe. `keep` is an optimization hint, never a correctness
+  requirement of the trait: `MemoryTabletEngines`'s implementor ignores it
+  (no per-file dead space to save for an in-memory engine, and
+  `trim_split_child` still runs immediately after and makes the result
+  correct either way), while `animusd`'s `LsmTabletFactory` threads it
+  straight into `LsmEngine::clone_to_filtered`.
 
 #### Deterministic first leader at the fork (ADR 0058 Train 2 rung 4)
 
@@ -1071,6 +1100,12 @@ level driver that watches a forked-locally parent, runs the (unmodified)
 GSI-drain/backfill vetoes against it, and proposes `CutoverSplit`; the
 `--split-mode` operator flag; a real multi-node `ProdEnv` end-to-end
 regression (both landed in a later rung, see `animusd/CLAUDE.md`).
+`tests/inplace_split_dead_space.rs` is a separate, small, single-node
+`LsmEngine<SimEnv>` regression (ADR 0058 fork closed, 2026-08-31) proving
+`clone_engine`'s range-awareness at the FILE level — this corpus's own
+`MemoryEngine`-backed scenarios above already prove per-row correctness
+but have no files to exclude, so they can't prove whole-file assignment
+by themselves.
 
 #### Eager child materialization at the fork (ADR 0058 Train 2 rung 4 layer 1)
 
