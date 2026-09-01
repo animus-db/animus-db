@@ -14456,3 +14456,64 @@ rationale for `clone_to`), so a memtable-filtering unit test belongs at
 the extracted-pure-predicate level (`key_in_keep`, table-driven, no
 engine) rather than as a `SimEnv` integration test reaching for a code
 path it structurally cannot exercise.
+
+## A bench with no cross-cluster catch-up cost is not proof the catch-up gate never blocks — sustained write load, not idle-cluster size, is what starves it (ADR 0062's cluster>RF amendment, 2026-09-01)
+
+The rung-7 bench (ADR 0062) ran an idle-then-split cluster at RF=3 nodes
+and correctly flagged that it could show nothing about the design's
+central "decoupled movement from placement" claim, since no node outside
+the parent's own replicas ever exists to recruit. This session finally ran
+the wider-than-RF bench that rung 7 named as the follow-up — but the
+result that actually mattered wasn't the RF ceiling, it was the workload
+shape: an IDLE 4-node cluster (population only, then kickoff, then poll —
+no writer) converged the pre-ADR-0062 F5-fused split's learner catch-up in
+single-digit seconds even with a real 2,000-row/512KB dataset and a real
+cross-node recruit. Add a CONTINUOUS paced writer to the same splitting
+tablet — the shape any of this repo's own benches use to measure a write
+blip — and the identical scenario failed to complete its split within a
+5-minute budget, in 3 out of 3 runs, with `/admin/raftkv`'s own
+`commit_index` observed pinned for the entire window while `log_len` grew
+from ~3,700 to ~25,000 entries. The isolating test that found this: same
+population, same growth, same kickoff, WITHOUT the interleaved writer —
+converged in ~10s. The mechanism these two facts point at (not confirmed
+further, out of scope for a bench-and-report task): Stage 1/2's "the fork
+can only proceed once the recruited learner has caught up" gate targets a
+moving snapshot, and a continuous write stream to the same tablet can make
+that target move faster than a contended host's InstallSnapshot pipeline
+can close the gap — a genuine liveness risk this repo's own benches had
+never combined with a "recruit an off-parent replica" scenario before.
+**The general lesson**: when characterizing a gate whose cost is "wait for
+X to catch up," an idle-then-once test proves the gate exists and can
+resolve; it does not prove the gate resolves under the load the mechanism
+is actually meant to survive. Pair the "does it have somewhere to move
+to" axis (cluster size vs. RF) with the "is the target standing still"
+axis (idle vs. continuously written) — a bench that only varies one can
+report a clean pass while the combination the design exists to handle is
+untested.
+
+## A live-state-matches-target check can pass for a legitimately not-yet-converged tablet, twice, under different conditions — the same symptom recurred under continuous write load with no clear trigger (ADR 0062's cluster>RF amendment, 2026-09-01)
+
+Rung 6 (this same log, "A 'just compare live state to the target'
+convergence check races the very proposer that sets the target") already
+fixed one instance of this class: the completion loop's own
+`config() == target` check needed a settle window because a fork-first
+child is born already satisfying it trivially. The cluster>RF bench
+surfaced what looks like a second, unrelated recurrence of the same
+*symptom* under real load: in 2 of 3 runs, one of two concurrently
+converging children sat with its live `replicas` already **exactly**
+matching its own `split_placing` target for the entire remainder of a
+240-second poll budget, with `done` never flipping to `true` — while its
+sibling child (same split, same tick cadence) converged normally. This
+session did not root-cause it (continuous write load plus two children
+converging simultaneously plus real host contention makes the search
+space large, and root-causing a product defect is out of scope for a
+bench-and-report task) — it is flagged here, with a reproduction recipe
+(`tests/cluster_gt_rf_split_bench.rs`, grow-by-one-lower-sorting-node +
+kickoff + a continuous paced writer, 3-node→4-node RF=3), as a genuine
+open finding rather than smoothed into "the ADR's claim is confirmed."
+**The lesson to carry forward**: a settle-window fix for one instance of
+"live state transiently equals target" does not prove every instance of
+that class is closed — re-run the SAME symptom check whenever a new load
+shape (concurrent siblings, sustained writes, real contention) exercises
+the mechanism for the first time, rather than assuming the rung-6 fix
+covers it structurally.

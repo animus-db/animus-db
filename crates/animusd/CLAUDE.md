@@ -3321,3 +3321,24 @@ the same session** — never across machines or sessions, per
 different host is not a baseline" entry: if you need to compare against
 an earlier figure, rerun the earlier configuration alongside the new one
 on this same host rather than trusting a number quoted from elsewhere.
+
+**`tests/cluster_gt_rf_split_bench.rs`** (ADR 0062's cluster>RF follow-up
+amendment, 2026-09-01) is the `#[ignore]`d bench that finally answers the
+"reproducing that win would need a bench cluster wider than RF" gap
+rung 7 named and could not fill: a 3-node RF=3 cluster grown by one
+lower-sorting-id node immediately before kickoff (mirroring `tests/
+split_placing_completion.rs`'s own recipe), so the split's placement
+target is provably NOT the parent's current replicas. Measures (a)
+kickoff→children-Active, (b) kickoff→directed-Placing fully converged, and
+(c) max write blip across the whole window, with a paced continuous
+writer running throughout. **The workload's write-continuity matters more
+than the node count**: an idle version of the identical scenario (no
+interleaved writer) converges the pre-ADR-0062 F5-fused baseline's
+learner catch-up in ~10s; add the writer, and it did not complete within a
+5-minute budget in 3/3 runs on this host — see
+`docs/engineering-lessons.md`'s matching entry and the ADR's own amendment
+for the full numbers, including a second, separately-flagged (not fixed)
+finding: fork-first's own post-cutover directed-Placing completion loop
+also failed to reach `done` within a 240s budget in 2/3 runs under the
+same load, despite one of those two already having live replicas matching
+its target.
