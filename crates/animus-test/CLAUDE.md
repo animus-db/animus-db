@@ -941,3 +941,29 @@ retrievable from git history.)
   `assert_replay_matches_model` still has to hold at every recorded second).
   Held green at `ANIMUS_PITR_SEEDS=40` alongside every other cell in this
   file (same knob).
+- **Cells 18/19 (ADR 0058 Train 2 rung 3, "Layer 0" of the copy-mode-split
+  deletion plan) rebuild cells 5's and 9's own PITR contracts on the
+  DEFAULT production split path — the in-place atomic fork — alongside
+  (never replacing) their copy-based siblings**:
+  `inplace_split_children_seal_independently_and_inherit_generation` and
+  `restore_to_random_second_matches_the_model_across_an_inplace_split`
+  drive `MetaCommand::BeginSplitInPlace` + `animus_cp_data::host::
+  Reconciler` fork/materialize convergence + `CutoverSplit`, mirroring
+  `backup_fault_corpus.rs`'s cell 14 / `stream_lineage_corpus.rs`'s cells
+  11/12 own harness shape (`Cluster`/`ClusterNode`/`tick_one`/`converge`/
+  `wrap_group`, kept local — integration test binaries can't share private
+  items). Both cells prove the identical claims their copy-based siblings
+  do (independent per-child epoch-0 seals inheriting the table-scoped PITR
+  generation with zero special-casing; the base-snapshot-pins-the-parent
+  restore-to-any-second property holding across the cutover). **This
+  table's own `orders` schema has no stream configured** (only
+  `UpdateContinuousBackups`), so `BeginSplitInPlace`'s F11 token-alignment
+  seatbelt (`self.table_stream(table).is_some()`) never engages here —
+  unlike `stream_lineage_corpus.rs`'s own in-place cells, which split on an
+  8-byte-token-aligned `key8`, these two split on the identical plain
+  `key(2)` their copy-based siblings already use. Real in-place
+  fork+materialize clones+trims each child's own share of the parent's
+  data automatically, so neither cell needs the copy-based cells' manual
+  "fresh `engines()` map per child" isolation workaround. Held clean at
+  `ANIMUS_PITR_SEEDS=300` (release, ~2.6s) with no regression to any of the
+  other seventeen cells in the file.

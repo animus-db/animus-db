@@ -33,8 +33,9 @@ use std::time::Duration;
 
 use animus_control::{ApplyOutcome, ColumnType, MetaCommand, Metadata, PitrSpec, TableSchema};
 use animus_cp_data::backup as backup_codec;
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{KIND_BASE, RaftKvNode, StorageScope, segment};
-use animus_env::{Clock, Env, Rng, SegmentStore, nid};
+use animus_env::{Clock, Env, EnvExt, NodeId, Rng, SegmentStore, nid};
 use animus_sim::{DiskConfig, NetConfig, SimEnv, SimSegmentStore, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, TabletId};
@@ -1908,5 +1909,705 @@ fn restore_to_random_second_under_clock_drift() {
     for_each_seed(
         "restore_to_random_second_under_clock_drift",
         scenario_restore_to_random_second_under_clock_drift,
+    );
+}
+
+// --- cells 18/19: the in-place split's PITR contract (ADR 0058 Train 2 rung 3) ---
+//
+// Cells 5 (`split_children_seal_independently_and_inherit_generation`) and 9
+// (`restore_to_random_second_matches_the_model_across_a_split`) above prove
+// the DEPRECATED copy-based split workflow's PITR contract (a
+// control-metadata-only `BeginSplit`/`CutoverSplit`, with the parent's own
+// `Group` hosted directly via this file's `start_group` and never touched
+// by a reconciler). The two cells below rebuild the identical claims on the
+// DEFAULT production split path — the in-place atomic fork — alongside
+// (never replacing) their copy-based siblings; this repo's corpus doctrine
+// keeps a scenario forever once added. `--split-mode copy`'s own cells 5/9
+// are untouched above.
+//
+// Unlike the copy-based workflow, the in-place fork is materialized by
+// `animus_cp_data::host::Reconciler`, so the parent (and both children) must
+// be reconciler-hosted from the start: a small `Cluster` of
+// `Reconciler<SimEnv, MemoryEngine>` instances (one per node id, mirroring
+// `animus-cp-data/tests/inplace_split_reconciler.rs`'s own harness shape),
+// driven to convergence at each stage via `tick_one`/`converge` (adapted
+// from `backup_fault_corpus.rs`'s/`stream_lineage_corpus.rs`'s own identical
+// adaptation for the same mechanism — `Reconciler::tick` `.await`s
+// internally via `env.sleep`, so a bare `block_on` would hang with nothing
+// advancing the simulator concurrently). Once a stage converges,
+// [`wrap_group`] clones the reconciler-hosted `RaftKvNode` handles back into
+// this file's own plain [`Group`] — so `elect`/`write_and_journal`/
+// `pitr_seal_now`/`verify_pitr_lineage`/`write_burst`/`write_burst_ranged`/
+// `assert_replay_matches_model` all run on the reconciler-hosted parent or a
+// split child completely unmodified. **Real in-place fork+materialize
+// clones+trims each child's own share of the parent's data automatically**
+// — unlike the copy-based cells' manual "fresh `engines()` map per child"
+// workaround (their own doc explains why that hand-rolled isolation is
+// needed there), so neither cell below needs an equivalent: each child's
+// engine already holds exactly its own half-range's rows once fork+
+// materialize converges.
+
+/// A dedicated node id for spawning the reconciler-driving futures below —
+/// distinct from every real replica id in [`NODES`], so a stray env mixup
+/// would be obvious rather than silently aliasing a real replica (mirrors
+/// `backup_fault_corpus.rs`'s own `driver_id`/`stream_lineage_corpus.rs`'s
+/// own `inplace_driver_id`).
+fn driver_id() -> NodeId {
+    nid(999)
+}
+
+type Recon = Reconciler<SimEnv, MemoryEngine>;
+
+/// One node's tablet-host reconciler, standing in for the per-node loop
+/// `animusd::tablet_host_reconciler_loop` drives in production — mirrors
+/// the sibling corpora's own `Cluster`/`ClusterNode` (kept local here
+/// rather than shared: integration test binaries can't share private
+/// items).
+struct ClusterNode {
+    reconciler: Recon,
+}
+
+struct Cluster {
+    nodes: BTreeMap<NodeId, ClusterNode>,
+}
+
+impl Cluster {
+    fn new(sim: &Simulator) -> Self {
+        let mut nodes = BTreeMap::new();
+        for &n in &NODES {
+            let id = nid(n);
+            let reconciler: Recon = Reconciler::new(
+                sim.env(id.clone()),
+                MemoryTabletEngines::new(),
+                id.clone(),
+                |_, _| {},
+                |_| {},
+            );
+            nodes.insert(id, ClusterNode { reconciler });
+        }
+        Cluster { nodes }
+    }
+
+    fn node(&self, id: &NodeId) -> &Recon {
+        &self.nodes[id].reconciler
+    }
+
+    fn hosted_set(&self, id: &NodeId) -> BTreeSet<TabletId> {
+        self.node(id).local_state().hosted.clone()
+    }
+}
+
+/// `MetadataView { tablets: meta.tablets.clone(), down: BTreeSet::new() }`
+/// built from this file's own bare `Metadata` after applying commands — no
+/// separate fake view needed.
+fn metadata_view(meta: &Metadata) -> MetadataView {
+    MetadataView {
+        tablets: meta.tablets.clone(),
+        down: BTreeSet::new(),
+    }
+}
+
+/// Runs `fut` to completion by spawning it on `env` and driving `sim` in
+/// small steps until it resolves — `stream_lineage_corpus.rs`'s/
+/// `backup_fault_corpus.rs`'s own `drive` helper, copied verbatim:
+/// `Reconciler::tick` polls internally via `env.sleep`, so a bare
+/// `block_on` would hang with nothing advancing the simulator
+/// concurrently.
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let slot: std::sync::Arc<std::sync::Mutex<Option<T>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s = std::sync::Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    for _ in 0..500 {
+        if slot.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_millis(20));
+    }
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("drive: future never completed")
+}
+
+/// Ticks one node's reconciler once against `view`. The node is moved out of
+/// `cluster` for the duration of the tick (`drive`'s spawned future must own
+/// what it touches) and put back once it resolves.
+fn tick_one(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    id: &NodeId,
+    view: &MetadataView,
+) {
+    let mut node = cluster.nodes.remove(id).expect("node exists");
+    let view = view.clone();
+    let ticked = drive(sim, env, async move {
+        node.reconciler.tick(&view).await;
+        node
+    });
+    cluster.nodes.insert(id.clone(), ticked);
+}
+
+/// Ticks every node in `ids` against `view` in a bounded loop until `check`
+/// holds — mirrors `inplace_split_reconciler.rs`'s own `converge`.
+fn converge(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    cluster: &mut Cluster,
+    ids: &[NodeId],
+    view: &MetadataView,
+    mut check: impl FnMut(&Cluster) -> bool,
+) -> bool {
+    for _ in 0..300 {
+        for id in ids {
+            tick_one(sim, env, cluster, id, view);
+        }
+        if check(cluster) {
+            return true;
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    check(cluster)
+}
+
+fn leader_of<'a>(cluster: &'a Cluster, ids: &[NodeId], tablet: TabletId) -> Option<&'a KvNode> {
+    ids.iter().find_map(|id| {
+        cluster
+            .node(id)
+            .hosted_node(tablet)
+            .filter(|h| h.is_leader())
+    })
+}
+
+/// Clones a reconciler-hosted tablet's per-node handles into this file's own
+/// plain [`Group`] — see the section doc above for why. Node order matches
+/// `ids` (== [`NODES`]' own order), so the `live: [0, 1, 2]` index
+/// convention every other cell in this file uses still lines up.
+fn wrap_group(cluster: &Cluster, ids: &[NodeId], tablet: TabletId) -> Group {
+    Group {
+        id: tablet,
+        nodes: ids
+            .iter()
+            .map(|id| {
+                cluster
+                    .node(id)
+                    .hosted_node(tablet)
+                    .expect("tablet hosted on every fork participant")
+                    .clone()
+            })
+            .collect(),
+    }
+}
+
+// --- cell 18: inplace_split_children_seal_independently_and_inherit_generation
+
+/// The in-place analog of cell 5
+/// (`split_children_seal_independently_and_inherit_generation`) — the
+/// identical claim (each child seals its own epoch 0 independently,
+/// inheriting PITR from the table spec with zero special-casing since
+/// `table_pitr` is table- not tablet-scoped; the union of parent-plus-
+/// children content covers the full journal with no double-counting),
+/// driven through `BeginSplitInPlace`/reconciler fork+materialize/
+/// `CutoverSplit` instead of the deprecated `BeginSplit`/`CutoverSplit`
+/// control-metadata-only cutover.
+fn scenario_inplace_split_children_seal_independently(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta_with_pitr();
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let parent_id = TabletId(110);
+    assert_eq!(
+        meta.apply(&MetaCommand::CreateTablet {
+            tablet: parent_id,
+            table: Some(TABLE.into()),
+            range: KeyRange::whole(),
+            replicas: node_ids.clone(),
+        }),
+        ApplyOutcome::Applied
+    );
+
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| leader_of(c, &node_ids, parent_id).is_some()
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, parent_id);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let mut journal = BTreeMap::new();
+
+    for i in 0..4 {
+        write_and_journal(
+            &mut sim,
+            &parent,
+            &live,
+            &mut journal,
+            &key(i),
+            b"pre",
+            seed,
+        );
+    }
+    let leader = elect(&mut sim, &parent, &live, seed);
+    assert_eq!(
+        pitr_seal_now(&mut meta, &store, &parent, leader, 1_000, false),
+        Some(0),
+        "[seed={seed}] parent's pre-split backlog seals as epoch 0"
+    );
+
+    // Fork: `BeginSplitInPlace` records the intent on the parent; the
+    // reconciler materializes both children on every fork participant, then
+    // `CutoverSplit` (no freeze/veto gate on the in-place branch — proposed
+    // immediately) activates them and retires the parent, freezing
+    // `split_lineage`.
+    let left = TabletId(111);
+    let right = TabletId(112);
+    let split_key = key(2);
+    let parent_epoch = meta.tablets[&parent_id].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: parent_id,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(left, node_ids.clone()), (right, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(parent_id)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&left) && hosted.contains(&right)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    let parent_epoch = meta.tablets[&parent_id].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: parent_id,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: 1_500,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+    assert!(!meta.tablets.contains_key(&parent_id), "the parent retires");
+    // Children inherit PITR from the table spec (ADR 0059 §9's own scope
+    // ask) — structurally true here: `table_pitr(TABLE)` is table-scoped,
+    // not tablet-scoped, so both children see the identical generation
+    // with zero special-casing.
+    let generation = meta.table_pitr(TABLE).unwrap().generation;
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(left).is_some()
+                        && c.node(id).hosted_node(right).is_some()
+                        && !c.hosted_set(id).contains(&parent_id)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    let left_group = wrap_group(&cluster, &node_ids, left);
+    let right_group = wrap_group(&cluster, &node_ids, right);
+    let mut left_journal = BTreeMap::new();
+    let mut right_journal = BTreeMap::new();
+    // Deliberate wall-clock separation between the two children's own write
+    // bursts, mirroring cell 5's own reasoning: each child's `Hlc` starts
+    // fresh (unwitnessed, unlike production's real `SeedBatch`, which this
+    // corpus doesn't model), so two independent groups minting their very
+    // first record at the identical virtual millisecond can legitimately
+    // produce the identical packed HLC (no node-id bits, ADR 0018 §2's own
+    // documented tradeoff) — spacing keeps the cross-tablet lineage check
+    // meaningful without reimplementing `SeedBatch`'s witnessing for a
+    // mechanism (PITR sealing) this corpus isn't testing.
+    for i in 0..2 {
+        write_and_journal(
+            &mut sim,
+            &left_group,
+            &live,
+            &mut left_journal,
+            &key(i),
+            b"post",
+            seed,
+        );
+    }
+    sim.run_for(Duration::from_secs(1));
+    for i in 2..4 {
+        write_and_journal(
+            &mut sim,
+            &right_group,
+            &live,
+            &mut right_journal,
+            &key(i),
+            b"post",
+            seed,
+        );
+    }
+    let left_leader = elect(&mut sim, &left_group, &live, seed);
+    let right_leader = elect(&mut sim, &right_group, &live, seed);
+    assert_eq!(
+        pitr_seal_now(&mut meta, &store, &left_group, left_leader, 2_000, false),
+        Some(0),
+        "[seed={seed}] an in-place split child's own first PITR seal starts its own chain at 0"
+    );
+    assert_eq!(
+        pitr_seal_now(&mut meta, &store, &right_group, right_leader, 2_000, false),
+        Some(0)
+    );
+
+    // The union of the parent's final segment and both children's own new
+    // segments covers exactly the pre-split writes (parent) plus each
+    // child's own post-split writes — no key double-counted across
+    // reporting tablets, no key lost.
+    verify_pitr_lineage(
+        &meta,
+        &store,
+        &[
+            (&parent, leader, generation),
+            (&left_group, left_leader, generation),
+            (&right_group, right_leader, generation),
+        ],
+        &{
+            let mut all = journal.clone();
+            for (k, v) in &left_journal {
+                all.entry(k.clone()).or_default().extend(v.clone());
+            }
+            for (k, v) in &right_journal {
+                all.entry(k.clone()).or_default().extend(v.clone());
+            }
+            all
+        },
+        seed,
+    );
+}
+
+#[test]
+fn inplace_split_children_seal_independently_and_inherit_generation() {
+    for_each_seed(
+        "inplace_split_children_seal_independently_and_inherit_generation",
+        scenario_inplace_split_children_seal_independently,
+    );
+}
+
+// --- cell 19: restore_to_random_second_matches_the_model_across_an_inplace_split
+
+/// The in-place analog of cell 9
+/// (`restore_to_random_second_matches_the_model_across_a_split`) — the
+/// identical flagship property (the base snapshot pins the PARENT tablet;
+/// the target second can land before the split, right after cutover but
+/// before either child seals, or after one or both children have sealed
+/// their own post-split writes) driven through `BeginSplitInPlace`/
+/// reconciler fork+materialize/`CutoverSplit` instead of the deprecated
+/// control-metadata-only `BeginSplit`/`CutoverSplit` cutover.
+fn scenario_restore_to_random_second_matches_the_model_across_an_inplace_split(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let mut meta = base_meta_with_pitr();
+    let node_ids: Vec<NodeId> = NODES.iter().copied().map(nid).collect();
+    let parent_id = TabletId(120);
+    assert_eq!(
+        meta.apply(&MetaCommand::CreateTablet {
+            tablet: parent_id,
+            table: Some(TABLE.into()),
+            range: KeyRange::whole(),
+            replicas: node_ids.clone(),
+        }),
+        ApplyOutcome::Applied
+    );
+
+    let live = [0, 1, 2];
+    let driver = sim.env(driver_id());
+    let mut cluster = Cluster::new(&sim);
+
+    let base_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &base_view,
+            |c| leader_of(c, &node_ids, parent_id).is_some()
+        ),
+        "[seed={seed}] parent never elected a leader"
+    );
+    let parent = wrap_group(&cluster, &node_ids, parent_id);
+
+    let store = SimSegmentStore::new(sim.env(nid(NODES[0])));
+    let env = sim.env(nid(NODES[0]));
+    let mut journal = BTreeMap::new();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+    write_burst(
+        &mut sim,
+        &parent,
+        &live,
+        &mut journal,
+        &mut model,
+        &env,
+        0,
+        3,
+        seed,
+    );
+    let leader = elect(&mut sim, &parent, &live, seed);
+    let parent_seal_ms = 1_000u64;
+    assert_eq!(
+        pitr_seal_now(&mut meta, &store, &parent, leader, parent_seal_ms, false),
+        Some(0),
+        "[seed={seed}] parent's pre-split backlog seals as epoch 0"
+    );
+    let model_at_parent_seal = model.clone();
+
+    let left = TabletId(121);
+    let right = TabletId(122);
+    let split_key = key(2);
+    let parent_epoch = meta.tablets[&parent_id].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::BeginSplitInPlace {
+            parent: parent_id,
+            expected_epoch: parent_epoch,
+            split_key: split_key.clone(),
+            children: [(left, node_ids.clone()), (right, node_ids.clone())],
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] BeginSplitInPlace must apply"
+    );
+
+    let pending_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id)
+                        .hosted_node(parent_id)
+                        .is_some_and(|h| block_on(h.pending_split()).is_some())
+                })
+            }
+        ),
+        "[seed={seed}] the in-place split never forked on every participant"
+    );
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &pending_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    let hosted = c.hosted_set(id);
+                    hosted.contains(&left) && hosted.contains(&right)
+                })
+            }
+        ),
+        "[seed={seed}] both children never materialized on every fork participant"
+    );
+
+    let parent_epoch = meta.tablets[&parent_id].epoch;
+    assert_eq!(
+        meta.apply(&MetaCommand::CutoverSplit {
+            parent: parent_id,
+            expected_epoch: parent_epoch,
+            cutover_wall_ms: parent_seal_ms + 200,
+        }),
+        ApplyOutcome::Applied,
+        "[seed={seed}] CutoverSplit must apply"
+    );
+    assert!(!meta.tablets.contains_key(&parent_id));
+
+    let post_view = metadata_view(&meta);
+    assert!(
+        converge(
+            &mut sim,
+            &driver,
+            &mut cluster,
+            &node_ids,
+            &post_view,
+            |c| {
+                node_ids.iter().all(|id| {
+                    c.node(id).hosted_node(left).is_some()
+                        && c.node(id).hosted_node(right).is_some()
+                        && !c.hosted_set(id).contains(&parent_id)
+                })
+            }
+        ),
+        "[seed={seed}] both children never activated and the parent was never reclaimed everywhere"
+    );
+
+    let left_group = wrap_group(&cluster, &node_ids, left);
+    let right_group = wrap_group(&cluster, &node_ids, right);
+
+    let base = vec![(parent_id, 0)];
+    // Right after cutover, before either child has sealed anything: the
+    // model is still exactly the parent's own pre-split content.
+    let just_after_cutover = parent_seal_ms + 300;
+    assert_replay_matches_model(
+        &meta,
+        &store,
+        &base,
+        just_after_cutover,
+        &model_at_parent_seal,
+        seed,
+    );
+
+    let mut left_journal = BTreeMap::new();
+    let mut right_journal = BTreeMap::new();
+    // `key(0)`/`key(1)` sort below `key(2)` (the split key) — left's own
+    // range; `key(2)..key(5)` is right's.
+    write_burst_ranged(
+        &mut sim,
+        &left_group,
+        &live,
+        &mut left_journal,
+        &mut model,
+        &env,
+        1,
+        2,
+        0..2,
+        seed,
+    );
+    sim.run_for(Duration::from_secs(1));
+    let left_seal_ms = parent_seal_ms + 1_000;
+    let left_leader = elect(&mut sim, &left_group, &live, seed);
+    assert_eq!(
+        pitr_seal_now(
+            &mut meta,
+            &store,
+            &left_group,
+            left_leader,
+            left_seal_ms,
+            false
+        ),
+        Some(0),
+        "[seed={seed}] left child's own first PITR seal starts its own chain at 0"
+    );
+    let model_after_left_seal = model.clone();
+    assert_replay_matches_model(
+        &meta,
+        &store,
+        &base,
+        left_seal_ms,
+        &model_after_left_seal,
+        seed,
+    );
+    // The right child hasn't sealed anything of its own post-split writes
+    // yet, so the model at this point is parent-content UNION left's own
+    // (already reflected in `model`, since `write_burst_ranged` mutated it
+    // directly) — right's own writes below must not leak in early.
+
+    write_burst_ranged(
+        &mut sim,
+        &right_group,
+        &live,
+        &mut right_journal,
+        &mut model,
+        &env,
+        2,
+        2,
+        2..6,
+        seed,
+    );
+    sim.run_for(Duration::from_secs(1));
+    let right_seal_ms = left_seal_ms + 1_000;
+    let right_leader = elect(&mut sim, &right_group, &live, seed);
+    assert_eq!(
+        pitr_seal_now(
+            &mut meta,
+            &store,
+            &right_group,
+            right_leader,
+            right_seal_ms,
+            false
+        ),
+        Some(0)
+    );
+    let model_after_right_seal = model.clone();
+    assert_replay_matches_model(
+        &meta,
+        &store,
+        &base,
+        right_seal_ms,
+        &model_after_right_seal,
+        seed,
+    );
+    // Restoring to a point BEFORE the right child's own seal must still
+    // exclude its writes even though they are already fully committed by
+    // now — proving the split-lineage walk floors each child at its own
+    // segment set, not at "whatever the tablet currently holds".
+    assert_replay_matches_model(
+        &meta,
+        &store,
+        &base,
+        left_seal_ms,
+        &model_after_left_seal,
+        seed,
+    );
+}
+
+#[test]
+fn restore_to_random_second_matches_the_model_across_an_inplace_split() {
+    for_each_seed(
+        "restore_to_random_second_matches_the_model_across_an_inplace_split",
+        scenario_restore_to_random_second_matches_the_model_across_an_inplace_split,
     );
 }
