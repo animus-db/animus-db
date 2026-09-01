@@ -3670,6 +3670,67 @@ debugging anything that feels like it might have happened before.
   fault-injection depth (not the default-depth corpus run) is what
   actually exposes it.
 
+- **A mid-test panic can cascade into an unrelated durability panic that
+  masks the real failure — because `Drop` latching a fault-tolerance flag
+  is not the same as stopping the background task that flag gates (issue
+  #511).** `crates/animusd/tests/*` bring up real `ProdEnv` clusters into a
+  `Vec<Node>` plus a caller-owned `tempfile::TempDir` (`--dir`). Issue #273
+  already established that a bring-up helper must never own-and-drop its
+  own `TempDir` internally; issues #282/#279 already gave `Node` a `Drop`
+  impl that latches every hosted CP group's `halted` flag before anything
+  else can touch its driver tasks, closing the "kill/panic races a live
+  WAL write" window for the CP-data plane. Issue #511 found this was
+  **not** actually closed for a mid-test panic, for two compounding
+  reasons neither prior fix addressed: (1) **`Drop for Node` deliberately
+  only latches — it never aborts the node's own tasks or tears down its
+  envs** (see that impl's own doc), so the control-plane Raft driver task
+  (and every other background loop) keeps running, detached, past the
+  point its `Node` was dropped — an ordinary passing test never notices
+  because nothing races it, but a panic can catch a write mid-flight; (2)
+  **the control-plane WAL has NO `halted`-gate at all** —
+  `animus-control::node::persist_wal`'s `env.append(WAL,
+  ..).await.expect("wal append")`/`env.sync(WAL).await.expect("wal sync")`
+  are bare, unconditional `.expect()`s, live or shutting down (see that
+  crate's own CLAUDE.md entry) — so even a *correct* local drop order
+  (`TempDir` declared before its `Vec<Node>`, the safe LIFO shape) doesn't
+  help: the still-live control-plane driver task's next WAL append/sync
+  against the now-removed directory panics unconditionally, on whichever
+  thread is driving it, burying the actual assertion failure that
+  triggered the unwind. **Fix, deliberately NOT another `halted`-gate**
+  (that would mean widening a production I/O panic's tolerance for a
+  testing concern, and still wouldn't be deterministic — `task.abort()`
+  only *requests* cancellation): `crates/animusd/tests/support::
+  PanicSafeTempDir` wraps `TempDir` and, on a *panicking* drop only,
+  `std::mem::forget`s it instead of letting it remove the directory — the
+  files a still-live background task might be using simply never
+  disappear, so nothing can race their removal, regardless of how long
+  that task keeps running past the test. A normal (non-panicking) drop is
+  byte-identical to `TempDir` (no leak on the passing-test path); the
+  leaked directory on a panic is bounded by CI's ephemeral runner.
+  Mechanically applied to every one of the 59 `tests/*.rs` files that
+  already `mod support;` and constructed a `TempDir` directly — the ~40
+  files with their own hand-rolled, non-`support::`-using fixtures (a
+  `dynamo_index_scan.rs`-shaped in-file `setup()`, or simply never pulling
+  in `mod support;`) are a **named, documented gap this PR does not
+  close** (see the module's own doc for the exact file list). **Test
+  design lesson**: proving this deterministically does not require a real
+  ProdEnv cluster or any timing-dependent race at all — the actual
+  mechanism is "does a panicking `Drop` remove files a concurrent operation
+  is using," which isolates cleanly to a plain `std::thread` background
+  writer racing a `std::panic::catch_unwind`, coordinated by an explicit
+  liveness signal (wait for the writer's first successful write) rather
+  than a sleep — red-before/green-after with zero flakiness
+  (`crates/animusd/tests/panic_safe_teardown.rs`). A live-ProdEnv attempt
+  at the same proof (hammering `propose_meta` against a real single-node
+  cluster right up to a deliberate panic) was tried first and abandoned:
+  the exact race window between "background driver task mid-I/O" and
+  "directory just removed" is a handful of instructions wide even under
+  real contention, and forcing it reliably would have meant a genuinely
+  flaky test proving a flakiness fix — the opposite of the point. When a
+  bug's mechanism can be isolated from the full system it was found in
+  without losing what makes it true, prefer the isolated, deterministic
+  proof over a bigger fixture that merely makes the race *more likely*.
+
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
   formatting into a caller's own error type is not the same guarantee as
@@ -14503,3 +14564,64 @@ rationale for `clone_to`), so a memtable-filtering unit test belongs at
 the extracted-pure-predicate level (`key_in_keep`, table-driven, no
 engine) rather than as a `SimEnv` integration test reaching for a code
 path it structurally cannot exercise.
+
+## A bench with no cross-cluster catch-up cost is not proof the catch-up gate never blocks — sustained write load, not idle-cluster size, is what starves it (ADR 0062's cluster>RF amendment, 2026-09-01)
+
+The rung-7 bench (ADR 0062) ran an idle-then-split cluster at RF=3 nodes
+and correctly flagged that it could show nothing about the design's
+central "decoupled movement from placement" claim, since no node outside
+the parent's own replicas ever exists to recruit. This session finally ran
+the wider-than-RF bench that rung 7 named as the follow-up — but the
+result that actually mattered wasn't the RF ceiling, it was the workload
+shape: an IDLE 4-node cluster (population only, then kickoff, then poll —
+no writer) converged the pre-ADR-0062 F5-fused split's learner catch-up in
+single-digit seconds even with a real 2,000-row/512KB dataset and a real
+cross-node recruit. Add a CONTINUOUS paced writer to the same splitting
+tablet — the shape any of this repo's own benches use to measure a write
+blip — and the identical scenario failed to complete its split within a
+5-minute budget, in 3 out of 3 runs, with `/admin/raftkv`'s own
+`commit_index` observed pinned for the entire window while `log_len` grew
+from ~3,700 to ~25,000 entries. The isolating test that found this: same
+population, same growth, same kickoff, WITHOUT the interleaved writer —
+converged in ~10s. The mechanism these two facts point at (not confirmed
+further, out of scope for a bench-and-report task): Stage 1/2's "the fork
+can only proceed once the recruited learner has caught up" gate targets a
+moving snapshot, and a continuous write stream to the same tablet can make
+that target move faster than a contended host's InstallSnapshot pipeline
+can close the gap — a genuine liveness risk this repo's own benches had
+never combined with a "recruit an off-parent replica" scenario before.
+**The general lesson**: when characterizing a gate whose cost is "wait for
+X to catch up," an idle-then-once test proves the gate exists and can
+resolve; it does not prove the gate resolves under the load the mechanism
+is actually meant to survive. Pair the "does it have somewhere to move
+to" axis (cluster size vs. RF) with the "is the target standing still"
+axis (idle vs. continuously written) — a bench that only varies one can
+report a clean pass while the combination the design exists to handle is
+untested.
+
+## A live-state-matches-target check can pass for a legitimately not-yet-converged tablet, twice, under different conditions — the same symptom recurred under continuous write load with no clear trigger (ADR 0062's cluster>RF amendment, 2026-09-01)
+
+Rung 6 (this same log, "A 'just compare live state to the target'
+convergence check races the very proposer that sets the target") already
+fixed one instance of this class: the completion loop's own
+`config() == target` check needed a settle window because a fork-first
+child is born already satisfying it trivially. The cluster>RF bench
+surfaced what looks like a second, unrelated recurrence of the same
+*symptom* under real load: in 2 of 3 runs, one of two concurrently
+converging children sat with its live `replicas` already **exactly**
+matching its own `split_placing` target for the entire remainder of a
+240-second poll budget, with `done` never flipping to `true` — while its
+sibling child (same split, same tick cadence) converged normally. This
+session did not root-cause it (continuous write load plus two children
+converging simultaneously plus real host contention makes the search
+space large, and root-causing a product defect is out of scope for a
+bench-and-report task) — it is flagged here, with a reproduction recipe
+(`tests/cluster_gt_rf_split_bench.rs`, grow-by-one-lower-sorting-node +
+kickoff + a continuous paced writer, 3-node→4-node RF=3), as a genuine
+open finding rather than smoothed into "the ADR's claim is confirmed."
+**The lesson to carry forward**: a settle-window fix for one instance of
+"live state transiently equals target" does not prove every instance of
+that class is closed — re-run the SAME symptom check whenever a new load
+shape (concurrent siblings, sustained writes, real contention) exercises
+the mechanism for the first time, rather than assuming the rung-6 fix
+covers it structurally.

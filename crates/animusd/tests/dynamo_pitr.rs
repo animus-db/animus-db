@@ -178,7 +178,7 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_continuous_backups_rejects_unknown_table() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (node, _config) = start_single_node_fast_seal(dir.path()).await;
         let (status, body) =
             update_continuous_backups(node.dynamo_addr(), "no-such-table", true).await;
@@ -194,7 +194,7 @@ async fn update_continuous_backups_rejects_unknown_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_continuous_backups_disabled_by_default() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (node, _config) = start_single_node_fast_seal(dir.path()).await;
         let table = "orders";
         create_base_table(node.dynamo_addr(), table).await;
@@ -222,7 +222,7 @@ async fn describe_continuous_backups_disabled_by_default() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enable_write_describe_disable_reenable_resets_the_window() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = support::panic_safe_tempdir();
         let (node, _config) = start_single_node_fast_seal(dir.path()).await;
         let table = "orders";
         create_base_table(node.dynamo_addr(), table).await;

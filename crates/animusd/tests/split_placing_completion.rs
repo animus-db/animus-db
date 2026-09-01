@@ -435,7 +435,7 @@ fn tablet_epoch(status: &Value, tablet: u64) -> u64 {
 async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_completion_loop_marks_it_done()
  {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -592,7 +592,7 @@ async fn placing_relocates_a_child_off_the_parents_original_nodes_and_the_comple
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn mark_split_placing_done_tolerates_a_stale_or_duplicate_relayed_propose() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 

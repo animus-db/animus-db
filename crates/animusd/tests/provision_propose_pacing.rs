@@ -63,7 +63,7 @@ async fn control_log_position(admin_addr: SocketAddr) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn provisioning_against_a_quorumless_control_plane_does_not_spam_proposals() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = support::bring_up_deadline(n, dir.path(), support::JOIN_DEADLINE).await;
 
     // Bootstrap: a control leader exists and every node registered.

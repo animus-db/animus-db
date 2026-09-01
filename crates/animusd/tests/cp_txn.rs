@@ -142,7 +142,7 @@ async fn decide_via_any_node(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -243,7 +243,7 @@ async fn coordinator_crash_between_prepare_and_decide_recovers_to_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn commit_already_applied_but_unresolved_converges_via_reads() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -365,7 +365,7 @@ async fn commit_already_applied_but_unresolved_converges_via_reads() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn decided_but_unresolved_record_survives_its_own_tablet_splitting_before_resolve() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -642,7 +642,7 @@ async fn split_and_settle(nodes: &[Node], addr: SocketAddr, table: &str, split_k
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -730,7 +730,7 @@ async fn multi_tablet_txn_commits_atomically_across_a_split_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn txn_through_every_node_including_followers_succeeds() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -803,7 +803,7 @@ async fn txn_through_every_node_including_followers_succeeds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrent_transactions_are_individually_atomic() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -895,7 +895,7 @@ async fn concurrent_transactions_are_individually_atomic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn violated_precondition_aborts_the_whole_transaction() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;

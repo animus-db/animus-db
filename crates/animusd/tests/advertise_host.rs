@@ -172,7 +172,7 @@ fn role_addrs_at(id: usize, addrs: &[SocketAddr], advertise_host: Option<&str>) 
 /// the advertised name, not the bind address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_with_config(
         |addrs| ClusterConfig {
             nodes: vec![
@@ -244,7 +244,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
         return;
     };
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (mut nodes, mut config) = bring_up_with_config(
         |addrs| ClusterConfig {
             nodes: vec![
@@ -375,7 +375,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
 /// config-derived seed — used the advertised name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let n = 3;
     let (nodes, _config) = bring_up_with_config(
         |addrs| ClusterConfig {

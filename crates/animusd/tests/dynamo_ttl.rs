@@ -206,7 +206,7 @@ async fn await_node_bootstrap(node: &Node) {
 /// (ADR 0051 §2, matching AWS's own omission rule).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_time_to_live_enable_and_disable_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) =
         support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
     await_node_bootstrap(&node).await;
@@ -259,7 +259,7 @@ async fn update_time_to_live_enable_and_disable_round_trip() {
 /// attribute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disable_with_a_mismatched_attribute_name_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) =
         support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
     await_node_bootstrap(&node).await;
@@ -298,7 +298,7 @@ async fn disable_with_a_mismatched_attribute_name_is_rejected() {
 /// reaper: `GetItem` runs well within the first interval of node start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_item_is_still_readable_immediately() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) =
         support::start_single_node(&dir.path().join("n"), StorageBackend::default()).await;
     await_node_bootstrap(&node).await;
@@ -325,7 +325,7 @@ async fn expired_item_is_still_readable_immediately() {
 /// poll against the fast-sweep node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_item_is_eventually_reaped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
@@ -347,7 +347,7 @@ async fn expired_item_is_eventually_reaped() {
 /// An item with a future TTL is never deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn future_ttl_item_is_never_deleted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
@@ -378,7 +378,7 @@ async fn future_ttl_item_is_never_deleted() {
 /// silently never-expiring, matching AWS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrong_type_ttl_attribute_is_never_deleted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
@@ -409,7 +409,7 @@ async fn wrong_type_ttl_attribute_is_never_deleted() {
 /// entire table against instant mass deletion the moment TTL is enabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn absurdly_past_ttl_is_never_deleted_the_five_year_safety_window() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
@@ -445,7 +445,7 @@ async fn absurdly_past_ttl_is_never_deleted_the_five_year_safety_window() {
 /// reproducible deterministically from a black-box HTTP client.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refreshed_ttl_survives_the_reaper() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;
@@ -492,7 +492,7 @@ async fn refreshed_ttl_survives_the_reaper() {
 /// ordinary client `DeleteItem` carries none at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_deletion_is_visible_in_the_stream_with_a_service_user_identity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
     await_node_bootstrap(&node).await;
     let addr = config.nodes[0].dynamo;

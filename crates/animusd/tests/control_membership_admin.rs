@@ -365,7 +365,7 @@ async fn join_control_nonvoter(
 /// data-only node's `ControlHandle::Remote` view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn grow_control_group_converges_everywhere() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (control_nodes, data_nodes, config) = support::bring_up_split(3, 1, dir.path()).await;
     support::await_leader(&control_nodes).await;
 
@@ -464,7 +464,7 @@ async fn grow_control_group_converges_everywhere() {
 /// `tests/register_node_cas.rs`, not re-proven here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn add_control_member_collision_shapes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -506,7 +506,7 @@ async fn add_control_member_collision_shapes() {
 /// core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -683,7 +683,7 @@ async fn remove_control_voter_refusals_transfer_and_quorum_warnings() {
 /// every control-role node's own `control_peer_sync_loop`) closes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn runtime_added_voter_survives_leadership_change_to_a_different_original_voter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -901,7 +901,7 @@ async fn bring_up_with_one_dead_follower(
 /// The config is left unchanged (still all 3 original voters).
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_force() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, _admin_addrs, leader_admin, dead_id, live_target_id) =
         bring_up_with_one_dead_follower(dir.path()).await;
 
@@ -957,7 +957,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_is_refused_without_
 /// documented as unconditionally accepted — it is no longer unconditional.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn removing_a_live_voter_while_another_is_already_dead_succeeds_with_force() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, _admin_addrs, leader_admin, _dead_id, live_target_id) =
         bring_up_with_one_dead_follower(dir.path()).await;
 
@@ -1013,7 +1013,7 @@ async fn removing_a_live_voter_while_another_is_already_dead_succeeds_with_force
 /// was never part of that set to begin with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn removing_the_actually_dead_voter_itself_needs_no_force() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, _admin_addrs, leader_admin, dead_id, _live_target_id) =
         bring_up_with_one_dead_follower(dir.path()).await;
 
@@ -1039,7 +1039,7 @@ async fn removing_the_actually_dead_voter_itself_needs_no_force() {
 /// always has, `--force` or not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -1086,7 +1086,7 @@ async fn removing_a_voter_when_every_remaining_voter_is_alive_is_never_refused()
 /// while only one of them has anywhere to go yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -1185,7 +1185,7 @@ async fn concurrent_control_add_surfaces_in_flight_as_a_clean_retryable_error() 
 /// already trusts for the operator-supplied path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();
@@ -1247,7 +1247,7 @@ async fn omitted_node_add_mints_an_id_and_converges_to_a_live_voter() {
 /// caller to replay).
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up_combined(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let admin_addrs: Vec<SocketAddr> = config.nodes.iter().map(|n| n.admin).collect();

@@ -164,7 +164,7 @@ async fn await_bootstrap(nodes: &[Node]) {
 /// `config::node_id(index)` used to bind it under.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_cluster_with_operator_style_ids_elects_a_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) =
         bring_up_named("custom-cluster", 3, dir.path(), Duration::from_secs(30)).await;
 

@@ -139,7 +139,7 @@ async fn client_op(stream: &mut TcpStream, req: &ClientRequest) -> ClientRespons
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn begin_split_lifecycle_over_three_nodes_via_a_follower() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 

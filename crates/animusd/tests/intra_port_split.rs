@@ -172,7 +172,7 @@ async fn find_leader_index(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
 
@@ -292,7 +292,7 @@ async fn client_port_refuses_intra_traffic_intra_port_serves_it() {
 /// check, not a routing/leadership scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cp_serve_forwarded_refuses_every_never_forwarded_variant() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(1, dir.path()).await;
     await_bootstrap(&nodes).await;
     let intra = config.nodes[0].intra;

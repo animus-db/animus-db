@@ -76,7 +76,7 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
 
@@ -300,7 +300,7 @@ async fn split_cluster_serves_reads_and_writes_across_data_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn schema_ddl_via_a_data_node_relays_and_commits() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
 
@@ -369,7 +369,7 @@ async fn schema_ddl_via_a_data_node_relays_and_commits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_node_falls_over_to_a_remaining_control_seed() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (mut control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
 
@@ -439,7 +439,7 @@ async fn data_node_falls_over_to_a_remaining_control_seed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_node_restart_rejoins_and_serves_reads_again() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, mut data_nodes, config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
 
@@ -541,7 +541,7 @@ async fn data_node_restart_rejoins_and_serves_reads_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_node_observes_live_control_voters_after_a_fresh_fetch() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, _config) = bring_up_split(3, 2, dir.path()).await;
         await_leader(&control_nodes).await;
 

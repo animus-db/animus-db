@@ -340,7 +340,7 @@ async fn create_table_pre_split(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn transact_write_items_commits_atomically_across_a_split_table() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -397,7 +397,7 @@ async fn transact_write_items_commits_atomically_across_a_split_table() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn failing_condition_check_cancels_the_whole_transaction() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -463,7 +463,7 @@ async fn failing_condition_check_cancels_the_whole_transaction() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn transact_get_items_never_observes_a_torn_pair_under_concurrent_writes() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -587,7 +587,7 @@ async fn transact_get_items_never_observes_a_torn_pair_under_concurrent_writes()
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -686,7 +686,7 @@ async fn concurrent_transact_write_items_on_a_shared_key_resolve_one_winner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -833,7 +833,7 @@ async fn admin_txns_shows_a_pending_record_then_clears_after_recovery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr_a = config.nodes[0].dynamo;
@@ -915,7 +915,7 @@ async fn cross_node_racing_own_key_conditional_writes_resolve_exactly_one_winner
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -1001,7 +1001,7 @@ async fn own_key_condition_failure_cancels_a_multi_tablet_transaction_wholly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn own_key_condition_completes_quickly_with_no_recovery_grace_stall() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;

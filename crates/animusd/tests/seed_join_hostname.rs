@@ -28,7 +28,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn node_joins_via_a_hostname_seed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. A single-node core to seed against.
     let (core_nodes, core_config) = bring_up(1, dir.path()).await;

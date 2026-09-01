@@ -144,7 +144,7 @@ async fn put(clients: &[SocketAddr], table: &str, key: &[u8], value: &[u8], secs
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_provisioned_undersized_on_a_small_cluster_self_heals_after_growth() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // A genuinely 2-node cluster: the tablet's *initial* replica set can only
     // ever be sized 2 here — no timing race needed to construct this, it's

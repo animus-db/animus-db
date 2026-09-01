@@ -141,7 +141,7 @@ async fn raw_post(addr: SocketAddr, path: &str, extra_header: &str, body: &str) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn dashboard_serves_spa_with_cors_and_peers() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -348,7 +348,7 @@ async fn dashboard_serves_spa_with_cors_and_peers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn dashboard_role_gating_split_deployment() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
         support::await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
@@ -536,7 +536,7 @@ async fn dashboard_role_gating_split_deployment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn control_node_streams_read_path_is_ground_truth() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
         support::await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =

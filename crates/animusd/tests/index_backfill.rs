@@ -177,7 +177,7 @@ async fn assert_no_premature_flip(nodes: &[Node], table: &str, index: &str, wind
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn index_backfill_converges_to_active_once_every_tablet_reports() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only.
@@ -303,7 +303,7 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
 /// until the new arrival reports too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only.
@@ -459,7 +459,7 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
 /// all in the whole deployment) must still be able to drive the flip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_only_leader_drives_the_flip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (control_nodes, data_nodes, config) = support::bring_up_split(1, 0, dir.path()).await;
     assert!(data_nodes.is_empty(), "test premise: no data role anywhere");
     support::await_leader(&control_nodes).await;

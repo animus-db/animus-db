@@ -56,7 +56,7 @@ fn watermark_of(reply: &ClientResponse) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (control_nodes, data_nodes, _config) = bring_up_split(1, 1, dir.path()).await;
     timeout(Duration::from_secs(20), async {
         loop {
@@ -150,7 +150,7 @@ async fn control_node_wakes_the_watch_on_a_real_commit_not_the_server_timeout() 
 /// fallback, not the wake. This proves both consumers now wake independently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn combined_node_reconciler_and_long_poll_both_wake_on_one_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node(dir.path(), animusd::StorageBackend::Lsm).await;
     timeout(Duration::from_secs(20), async {
         loop {
@@ -241,7 +241,7 @@ async fn combined_node_reconciler_and_long_poll_both_wake_on_one_commit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_only_node_rejects_watch_metadata_instead_of_degrading() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (control_nodes, data_nodes, _config) = bring_up_split(1, 1, dir.path()).await;
     timeout(Duration::from_secs(20), async {
         loop {
@@ -286,7 +286,7 @@ async fn data_only_node_rejects_watch_metadata_instead_of_degrading() {
 /// still gets the cheap trivial delta.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_back() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let addrs = {
         let free = || {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

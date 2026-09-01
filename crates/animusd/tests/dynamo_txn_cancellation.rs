@@ -360,7 +360,7 @@ async fn prepare_via_any_node(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn condition_check_failure_flags_the_right_action_index() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -433,7 +433,7 @@ async fn condition_check_failure_flags_the_right_action_index() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn condition_check_failure_echoes_item_when_all_old_requested() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -481,7 +481,7 @@ async fn condition_check_failure_echoes_item_when_all_old_requested() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn all_condition_check_transaction_flags_the_right_index() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -526,7 +526,7 @@ async fn all_condition_check_transaction_flags_the_right_index() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_successful_transact_write_has_no_cancellation_reasons() {
     let n = 1;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -568,7 +568,7 @@ async fn a_successful_transact_write_has_no_cancellation_reasons() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn write_action_condition_failure_flags_the_right_action_index() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -646,7 +646,7 @@ async fn write_action_condition_failure_flags_the_right_action_index() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn write_action_condition_failure_survives_the_forwarding_hop() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].dynamo;
@@ -747,7 +747,7 @@ async fn write_action_condition_failure_survives_the_forwarding_hop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn write_action_intent_conflict_flags_transaction_conflict() {
     let n = 1;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let client0 = config.nodes[0].client;

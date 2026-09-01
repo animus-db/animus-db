@@ -185,7 +185,7 @@ async fn await_table_active(addr: SocketAddr, table: &str) {
 /// with its GSI converging to `ACTIVE` and queryable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_serves_exactly_the_backup_time_rows_with_a_queryable_gsi() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -342,7 +342,7 @@ async fn restore_serves_exactly_the_backup_time_rows_with_a_queryable_gsi() {
 /// gone) source table, is what restore replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_works_after_the_source_table_is_dropped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -399,7 +399,7 @@ async fn restore_works_after_the_source_table_is_dropped() {
 /// reused as-is rather than minting a second "table already exists" code).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_rejects_a_bad_backup_or_an_existing_target() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;

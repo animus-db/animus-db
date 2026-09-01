@@ -15,9 +15,96 @@ use std::time::Duration;
 
 use animusd::config::NodeRole;
 use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+
+/// A [`TempDir`] that survives a panicking unwind instead of removing its
+/// directory tree (issue #511).
+///
+/// **The mechanism this closes**: a prod-liveness test's locals normally
+/// drop in the safe order (a `TempDir` declared before its `Vec<Node>`/
+/// `Node`s, so the nodes drop first) — but [`Node`]'s own `Drop` impl only
+/// latches every *hosted CP group's* `halted` flag (issues #282/#279,
+/// `ClusterEdgeState::halt_hosted_cp_groups`); it deliberately does **not**
+/// abort this node's tasks or tear down its envs, so the control-plane Raft
+/// driver task (and every other background loop) keeps running, detached,
+/// past the point its owning `Node` was dropped. **The control-plane WAL
+/// has no `halted`-gate at all** (see `animus-control/CLAUDE.md`'s "The WAL
+/// `fsync` is raced..." entry) — `persist_wal`'s `env.append(WAL,
+/// ..).await.expect("wal append")`/`env.sync(WAL).await.expect("wal
+/// sync")` are bare, unconditional `.expect()`s on every node, live or
+/// shutting down, with no tolerated-error path whatsoever. So a plain
+/// `tempfile::TempDir` dropping right after — synchronously removing the
+/// directory tree as part of the SAME panicking unwind — races that still-
+/// live, still-polled control-plane driver task: the next time it appends/
+/// syncs its WAL against now-vanished files, `persist_wal`'s bare
+/// `.expect()` panics unconditionally, on whichever thread is driving it.
+/// That panic is indistinguishable from a genuine live durability fault and
+/// buries the actual assertion failure that triggered the unwind in the
+/// first place (issue #511) — the very thing issue #273 first found for a
+/// bring-up helper that owned-and-dropped its own `TempDir` internally,
+/// just reached here by a mid-test panic instead of a badly-scoped helper.
+///
+/// The fix here is deliberately **not** another `halted`-gate (that would
+/// mean teaching `animus-control`'s consensus WAL about test-only teardown,
+/// widening a production I/O panic's tolerance for a testing concern, and
+/// still wouldn't be deterministic — `task.abort()` only *requests*
+/// cancellation, docs on [`Node::shutdown`] are explicit that it doesn't
+/// wait). Instead: **never let the directory disappear out from under a
+/// panicking test at all.** On a clean, non-panicking drop this behaves
+/// exactly like `TempDir` (the directory is removed — no leak on the
+/// passing-test path); on a *panicking* drop it leaks the directory
+/// (`std::mem::forget`) instead of removing it, so any background task
+/// still racing it keeps seeing real files and never faults — the original
+/// panic (the real assertion failure) is what surfaces, and CI's ephemeral
+/// runner bounds the leaked directory's lifetime. This protects **every**
+/// background loop uniformly (the control-plane WAL persist above, and any
+/// CP-group I/O the `halted` latch already covers or doesn't), and touches
+/// no production code: a real, non-test `.expect("wal append")` durability
+/// panic is completely unaffected — this only ever changes whether a
+/// **test's own `TempDir`** is removed on an unwind it did not cause.
+///
+/// Construct via [`panic_safe_tempdir`]; call [`path`](Self::path) exactly
+/// like `TempDir::path`.
+pub struct PanicSafeTempDir(Option<TempDir>);
+
+impl PanicSafeTempDir {
+    /// This directory's path — mirrors `TempDir::path`.
+    pub fn path(&self) -> &Path {
+        self.0
+            .as_ref()
+            .expect("PanicSafeTempDir: path() called after drop")
+            .path()
+    }
+}
+
+impl Drop for PanicSafeTempDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Leak rather than remove: see the type's own doc for why this
+            // is the fix, not a `halted`-style latch.
+            if let Some(dir) = self.0.take() {
+                std::mem::forget(dir);
+            }
+        }
+        // Not panicking: fall through and let the `Option<TempDir>` drop
+        // normally below, removing the directory exactly like a bare
+        // `TempDir` would on the ordinary passing-test path.
+    }
+}
+
+/// Construct a [`PanicSafeTempDir`] — the drop-in replacement for
+/// `tempfile::tempdir().unwrap()` every `support::`-fixture-using
+/// prod-liveness test should use instead, so a mid-test panic can never
+/// cascade into issue #511's WAL panic. See [`PanicSafeTempDir`]'s own doc
+/// for the full mechanism.
+pub fn panic_safe_tempdir() -> PanicSafeTempDir {
+    PanicSafeTempDir(Some(
+        tempfile::tempdir().expect("create panic-safe temp dir"),
+    ))
+}
 
 /// Default wall-clock deadline for the `*_deadline` join/bring-up helpers
 /// below — generous enough that a genuinely broken join still fails loudly,

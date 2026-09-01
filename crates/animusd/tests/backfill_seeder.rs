@@ -328,7 +328,7 @@ async fn await_gsi_miss(addr: SocketAddr, table: &str, index: &str, hash: &str, 
 /// since nothing in this test ever proposes `MarkIndexBackfilled` by hand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
@@ -391,7 +391,7 @@ async fn backfill_seeder_materializes_every_pre_existing_row_then_flips_active()
 /// against.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
@@ -469,7 +469,7 @@ async fn live_writes_during_backfill_converge_to_the_correct_final_gsi() {
 /// correct, independent content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_indexes_creating_simultaneously_converge_independently() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only (intra also serves the
@@ -552,7 +552,7 @@ async fn two_indexes_creating_simultaneously_converge_independently() {
 /// corpus scope, not duplicated here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_and_restart_mid_backfill_still_converges() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let config = animusd::ClusterConfig {
         nodes: vec![{
@@ -702,7 +702,7 @@ fn item_key(pk: &str) -> Vec<u8> {
 /// flip early without both reporting, and both genuinely do report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn split_during_backfill_converges_with_correct_final_gsi() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
     // ADR 0047: `ProposeSchema` is intra-only (intra also serves the

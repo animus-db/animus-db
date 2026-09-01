@@ -134,7 +134,7 @@ fn field(body: &str, name: &str) -> String {
 /// the stream configuration rather than the key schema.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn set_table_stream_enable_propagates_and_survives_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
@@ -170,7 +170,7 @@ async fn set_table_stream_enable_propagates_and_survives_restart() {
 /// other schema-catalog command's identical follower-connected test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_table_stream_enable_and_disable_through_every_node() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -235,7 +235,7 @@ async fn update_table_stream_enable_and_disable_through_every_node() {
 /// disable-then-re-enable mints a genuinely different label (ADR 0042 §4/§9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
@@ -321,7 +321,7 @@ async fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label() {
 /// unmodified on a plain table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
@@ -447,7 +447,7 @@ async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
 /// than a direct kind-scope read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transact_write_items_abort_leaves_no_stream_event() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
@@ -707,7 +707,7 @@ async fn await_records(
 /// returns the identical iterator (F4/§7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_records_walks_the_shard_chain_and_drains_the_open_tail() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -838,7 +838,7 @@ async fn get_records_walks_the_shard_chain_and_drains_the_open_tail() {
 /// now resolves through the sealed path and still returns the correct data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_shard_iterator_survives_a_seal_and_keeps_working() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -909,7 +909,7 @@ async fn open_shard_iterator_survives_a_seal_and_keeps_working() {
 /// path), then a small `Limit` walks the whole thing page by page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn limit_pagination_drains_a_sealed_shard_exactly_once() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), age_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -1013,7 +1013,7 @@ async fn limit_pagination_drains_a_sealed_shard_exactly_once() {
 /// cluster (`K = min(RF, candidates) = 3`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_records_on_a_sealed_shard_works_from_every_node() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr0 = nodes[0].dynamo_addr();
@@ -1077,7 +1077,7 @@ async fn get_records_on_a_sealed_shard_works_from_every_node() {
 /// `kind_scan.rs`'s house pattern for this class of bimodal flake).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_records_on_an_open_shard_forwards_correctly_from_every_node() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), never_seals_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr0 = nodes[0].dynamo_addr();
@@ -1151,7 +1151,7 @@ async fn get_records_on_an_open_shard_forwards_correctly_from_every_node() {
 /// intra port now (see `intra_port_split.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_stream_hot_read_is_refused() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -1190,7 +1190,7 @@ async fn bare_stream_hot_read_is_refused() {
 /// catalog-row-based label resolution (§4), no dedicated disable janitor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open_shard() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -1296,7 +1296,7 @@ async fn disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open
 /// write, on a chain whose sealed segments physically contain the markers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pre_enable_marker_records_never_surface_on_the_stream() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();

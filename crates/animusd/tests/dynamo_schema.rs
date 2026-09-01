@@ -171,7 +171,7 @@ async fn stop(node: Node) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_survives_node_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a composite table, write + read an item. ---
@@ -247,7 +247,7 @@ async fn create_table_survives_node_restart() {
 /// clear `ValidationException` — not a commit-wait timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_rejects_reserved_namespace() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
     let dynamo_addr = config.nodes[0].dynamo;
@@ -309,7 +309,7 @@ async fn create_table_rejects_reserved_namespace() {
 /// end-to-end proof that the former written-key tracking is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_and_query_read_live_storage_after_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a composite table and write three rows in two
@@ -413,7 +413,7 @@ async fn scan_and_query_read_live_storage_after_restart() {
 /// `CreateTable`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_index_replicates_to_second_node() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -506,7 +506,7 @@ async fn create_table_index_replicates_to_second_node() {
 /// node, and a re-CreateTable is rejected as already existing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_index_survives_node_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: create a table with a GSI + write an indexed item. ---
@@ -611,7 +611,7 @@ async fn create_table_index_survives_node_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extended_surface() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

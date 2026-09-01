@@ -11,7 +11,13 @@
   two-of-three target oscillating indefinitely (filed during rung 6). A
   dedicated re-investigation could not reproduce that oscillation — see
   the amendment below — so directed Placing's own reach was never actually
-  narrower than "whatever `select_replicas` computes."
+  narrower than "whatever `select_replicas` computes." **2026-09-01
+  amendment**: the cluster>RF bench rung 7 named as out-of-scope is now
+  run — it confirms this ADR's central time-to-relief claim decisively
+  under sustained write load, but also surfaces a new, open, unconfirmed
+  finding (the post-cutover directed-Placing completion loop failing to
+  reach `done` within a 240s budget in 2 of 3 runs) that is flagged for
+  follow-up, not fixed here — see that amendment for the full account.
 - **Date:** 2026-08-31
 - **Supersedes:** [ADR 0058](0058-learner-replicas-in-place-split.md) Train
   2 Stage 1's fork **F5** half only — the fused split+move, where
@@ -1008,6 +1014,183 @@ positively rules out a regression in write availability (zero retries,
 both configurations, every run) and leaves the fork-to-Active/write-blip
 comparison as a genuinely open question a wider-than-RF bench would need
 to answer.
+
+## Amendment (2026-09-01): cluster>RF bench — the wider-than-RF question, answered
+
+The rung-7 amendment above named the gap plainly and left it open: the
+named bench is structurally RF=3-at-3-nodes, so it cannot show the
+decoupled-movement-from-placement claim doing any work, and "reproducing
+that win would need a bench cluster wider than RF... out of scope for this
+rung." This amendment is that bench, run fresh on this same host in one
+session, both against current `HEAD` (fork-first, `39339c3`, which now
+also includes the range-aware `clone_to_filtered` fork commit `c1874fc`
+that landed after rung 7) and against a second worktree at `6d2777d`
+(the pre-ADR-0062 F5-fused baseline, same commit rung 7 used). Two
+separate measurements: a fresh 3-node re-run of rung 7's own bench (does
+the range-aware clone change anything at RF=3), and the new cluster>RF
+bench (`tests/cluster_gt_rf_split_bench.rs` on the fork-first tree,
+`tests/cluster_gt_rf_split_bench_f5.rs` — uncommitted, throwaway — on the
+baseline worktree).
+
+**Caveats up front, unchanged from rung 7 and worth repeating**: this is a
+shared, contended 4-vCPU host (background load observed throughout these
+runs); N=3 per configuration is the floor this task's own instructions
+called for, not a statistically powered sample; every number below is
+same-host/same-session only, never comparable to a figure quoted from a
+different run.
+
+### 3-node re-run: does the range-aware clone change anything?
+
+Byte-for-byte the same bench and workload as rung 7 (`inplace_split_bench.rs`,
+2,000 rows, 256-byte values, 3 nodes, RF 3), 3 runs per configuration,
+interleaved:
+
+| | fork-first (`HEAD`), run1/run2/run3 | baseline (`6d2777d`), run1/run2/run3 | fork-first median | baseline median |
+|---|---|---|---|---|
+| fork-to-children-Active wall clock | 1.302s / 1.041s / 1.537s | 1.315s / 1.334s / 0.994s | **1.302s** | **1.315s** |
+| write blip (max PUT) | 526.6ms / 315.4ms / 782.7ms | 582.3ms / 631.7ms / 267.3ms | **526.6ms** | **582.3ms** |
+| put retries needed | 0 / 0 / 0 | 0 / 0 / 0 | **0** | **0** |
+
+Rung 7's own numbers (context, not a baseline — a different session,
+quoted only for direction, not magnitude) showed fork-first materially
+**slower** at this shape: 1.347s/616ms median vs. baseline's 1.149s/419ms
+(~17% and ~47% up respectively). Today's fresh numbers show the opposite
+sign at the median — fork-first fractionally **faster** (1.302s vs.
+1.315s) and with a **lower** median write blip (526.6ms vs. 582.3ms) —
+though the run-to-run spread within each configuration (fork-first's own
+cutover spans 1.041s–1.537s; its blip spans 315ms–783ms) is comparable in
+magnitude to the between-configuration delta either session reports, so
+neither session's median difference is a reliable signal on its own. The
+honest reading: **the RF=3 gap rung 7 reported has closed** — today's two
+medians sit within each other's own noise band, where rung 7's did not —
+consistent with, though not proof of, the range-aware
+`clone_to_filtered` commit (`c1874fc`, landed after rung 7, closing ADR
+0058's own "full clone then trim" G2 deferral) removing a real per-fork
+cost fork-first was paying at rung 7 that the baseline's copy-free
+in-place design never had to pay. This bench cannot isolate that commit's
+effect from ordinary session-to-session noise — it was not re-run with and
+without `c1874fc` in isolation — so this is reported as a plausible
+explanation, not a confirmed one, in the same spirit as rung 7's own
+"not confirmed by profiling" notes.
+
+### cluster>RF bench: the wider-than-RF measurement
+
+`tests/cluster_gt_rf_split_bench.rs` (fork-first tree, committed) and its
+close copy `tests/cluster_gt_rf_split_bench_f5.rs` (baseline worktree,
+uncommitted throwaway scaffolding) grow a 3-node RF=3 cluster by one node
+(`m0`, sorting lexically below every original node's id) immediately
+before kickoff — the identical recipe `tests/split_placing_completion.rs`
+uses to force a *real* placement move (`select_replicas` now prefers `m0`
+over one of the parent's own three) rather than a vacuous already-placed
+fork. A paced continuous writer (retry-counting `put`, same shape as the
+3-node bench) runs throughout. Three clocks on the fork-first tree: (a)
+kickoff → children Active (cutover/relief), (b) kickoff → directed-Placing
+fully converged (every child's `split_placing` entry `done`), (c) max
+write blip across the whole a→b window. The baseline has no separate (b) —
+under F5 the recruited learner is caught up and promoted to voter *before*
+the fork ever proposes, so cutover already IS full placement — so it
+measures only (a′) kickoff → cutover and (c′) max write blip.
+
+| | fork-first, run1/run2/run3 | fork-first median | F5 baseline, run1/run2/run3 | F5 baseline median |
+|---|---|---|---|---|
+| (a)/(a′) kickoff → relief | 1.656s / 1.441s / 1.477s | **1.477s** | DNC / DNC / DNC (>300s every run) | **did not converge** |
+| (b) kickoff → fully placed | 4.456s / DNC(>240s) / DNC(>240s) | **converged 1/3 runs** | n/a (a′ already is full placement, when it happens at all) | n/a |
+| (c)/(c′) max write blip | 1.422s / 1.200s / 1.336s | **1.336s** | 169.6ms / 300.9ms / 339.2ms | 300.9ms (not a real "blip" — see below) |
+| put retries needed | 0 / 0 / 0 | **0** | 0 / 0 / 0 | **0** |
+
+**The dual comparison, stated plainly, per this task's own instructions —
+do not collapse it:**
+
+- **Fork-first vs. baseline (a) vs. (a′), time to relief**: fork-first
+  wins decisively and reliably — **1.3–1.7s in every run**, regardless of
+  the sustained write load hitting the same tablet the whole time.
+  The F5 baseline **did not complete its split within a 5-minute budget in
+  any of the 3 runs** — not "slower," but observed to make **zero commit
+  progress** on the recruited learner's catch-up for the entire
+  measurement window in all three (see below). This is the sharpest,
+  most direct confirmation this ADR's bench program has produced of the
+  design's own central claim: decoupling the fork from the placement
+  decision means a splitting tablet's own write load cannot block the
+  split from relieving it, structurally, where the fused F5 design's own
+  "the fork can only proceed once every recruited home has caught up" gate
+  is exactly the mechanism a sustained write stream can starve.
+- **Fork-first (a) vs. (b), time to relief vs. time to fully placed**:
+  these are genuinely different numbers, and conflating them is exactly
+  what this task's instructions warned against. Relief is fast and
+  reliable (above). Full convergence to the directed-Placing target is
+  **not** reliably fast under this same load: it completed in 4.456s in
+  run 1, and did **not** complete within a 240s budget in runs 2 and 3.
+  Inspecting `/admin/status` at the end of both non-converged runs shows a
+  specific, reproducible shape: one child (`done: true`) had already
+  drifted off its own recorded target via a later, independent, legitimate
+  rebalance move (expected — ADR 0062 §2's own "once `done`, the tablet
+  rejoins ordinary rebalance's eligible population" rule; not a defect);
+  the **other** child sat with its live `replicas` already **exactly
+  matching** its own `split_placing` target — the completion loop's own
+  convergence predicate should therefore be satisfied — yet `done` stayed
+  `false` for the balance of a 240-second window. That is a genuinely
+  unexpected, reproducible (2 of 3 runs) shape this session did not
+  root-cause (out of scope for a bench-and-report task, per this task's
+  own instructions) — flagged here as a real, open finding rather than
+  smoothed over: **fork-first's own advertised "relief," not "fully
+  placed"**, is the number this bench actually delivers reliably at this
+  scale under load; "fully placed" carries a real, currently-uncharacterized
+  tail-latency (or possibly non-termination) risk that idle-cluster testing
+  (`split_placing_completion.rs`'s own e2e, and rung 7's RF=3 bench) never
+  exercised. This is worth a follow-up issue on its own, independent of
+  this ADR's original scope.
+- **F5 baseline's own `(c′)` numbers are not a real "write blip"** — they
+  are the ordinary observed max PUT latency (169.6–339.2ms) sampled
+  *during* a window where the split never actually cut over, so the
+  parent tablet never stopped serving in the first place (it stays
+  `Active`/`Splitting` — genuinely serving, not frozen — for as long as
+  Stage 1/2's catch-up gate is unsatisfied). Zero retries in every baseline
+  run confirms this: the client never saw a disruption, because the
+  disruption-causing event (cutover) never happened. This is a materially
+  **worse** outcome than any bounded blip, not a better one — a split that
+  silently never completes is a starvation/liveness failure, not a fast,
+  invisible one.
+
+**What the baseline's own diagnostics show, without further root-causing
+(flagged, not chased, per this task's scope)**: `/admin/raftkv` polled
+every 15s through all 3 baseline runs shows the parent tablet's own
+`commit_index` **frozen** for the entire multi-minute window (e.g. run 1:
+`commit_index` pinned at 2394 from the 15s sample through the 300s
+timeout, while `log_len` climbed from ~3,700 to ~25,000 and `learners`
+stayed `["m0"]` throughout) even though client `PutOk` acks kept arriving
+throughout with zero retries — a genuinely puzzling combination (a frozen
+committed-index alongside acking writes) this session does not have an
+explanation for and did not chase further; it may be an artifact of the
+admin/metrics sampling path rather than the real consensus state.
+Regardless of the exact mechanism, the **externally observable** fact
+across all 3 runs is unambiguous: the split-with-a-real-recruited-learner
+never completed within 5 minutes under a continuous write load to the
+splitting tablet, on this host, in this session, every time it was tried.
+
+**Verdict — did it improve?**
+
+- **At 3-node/RF=3**: no longer a regression (rung 7's own honest finding);
+  today's numbers put fork-first and the baseline within each other's
+  noise band, plausibly attributable to the range-aware clone commit that
+  landed between rung 7 and this amendment, though not confirmed in
+  isolation.
+- **At cluster>RF, time-to-relief**: **yes, decisively** — fork-first
+  relieves a splitting tablet in 1.3–1.7s regardless of sustained write
+  load; the F5 baseline failed to relieve it at all within 5 minutes, in
+  every run, under the identical load. This is the concrete quantification
+  this ADR's own design argument predicted and rung 7 could not produce.
+- **At cluster>RF, time-to-fully-placed**: **not shown to have improved,
+  and not comparable to the baseline at all** — the baseline never reaches
+  "fully placed" in this scenario either (it never even reaches "split
+  complete"), and fork-first's own post-cutover convergence loop failed to
+  reach `done` within a 240s budget in 2 of 3 runs despite (in one of
+  those two) the tablet's live replicas already matching its target. This
+  is reported as a genuine open question — this ADR's decoupling of
+  movement from placement demonstrably fixes availability under load, but
+  this session's own numbers do not show the *placement* half converging
+  reliably under the same load, and that gap deserves its own
+  investigation rather than being folded into a categorical "the ADR's
+  claim is confirmed."
 
 ## Amendment (2026-09-01): §3's completion loop never fires under load — issue #528, root cause and fix
 

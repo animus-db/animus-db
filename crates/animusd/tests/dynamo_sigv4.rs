@@ -250,7 +250,7 @@ fn json(body: &str) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn correctly_signed_request_round_trips_create_table_and_put_get() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -297,7 +297,7 @@ async fn correctly_signed_request_round_trips_create_table_and_put_get() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unsigned_request_is_rejected_with_missing_authentication_token() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -319,7 +319,7 @@ async fn unsigned_request_is_rejected_with_missing_authentication_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrong_secret_is_rejected_with_invalid_signature() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -345,7 +345,7 @@ async fn wrong_secret_is_rejected_with_invalid_signature() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_access_key_is_rejected_with_unrecognized_client() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -371,7 +371,7 @@ async fn unknown_access_key_is_rejected_with_unrecognized_client() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_x_amz_date_is_rejected_with_expired_signature() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -403,7 +403,7 @@ async fn stale_x_amz_date_is_rejected_with_expired_signature() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_stays_unauthenticated_on_an_auth_enabled_port() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = start_single_node_with_auth(dir.path(), test_credentials()).await;
     let addr = node.dynamo_addr();
 
@@ -420,7 +420,7 @@ async fn metrics_stays_unauthenticated_on_an_auth_enabled_port() {
 /// "still compiles."
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_without_dynamo_auth_accepts_unsigned_requests_as_before() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = node.dynamo_addr();
 

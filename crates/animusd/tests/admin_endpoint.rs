@@ -245,7 +245,7 @@ fn percent_encode(s: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_interface_surfaces_state_and_actions() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -444,7 +444,7 @@ async fn admin_interface_surfaces_state_and_actions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_data_write_dynamo() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
@@ -493,7 +493,7 @@ async fn admin_data_write_dynamo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_table_management_create_and_drop() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
@@ -570,7 +570,7 @@ async fn admin_table_management_create_and_drop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_backups_view_reflects_the_catalog() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
@@ -743,7 +743,7 @@ async fn seed_load_does_not_storm_cp_elections() {
     const MAX_TERM_DELTA: u64 = 3;
 
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let (s, _ct) = admin(
@@ -818,7 +818,7 @@ async fn seed_load_does_not_storm_cp_elections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_seed_writes_synthetic_keys() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
@@ -1015,7 +1015,7 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
     const POLLS: usize = 10;
 
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let a = nodes[0].admin_addr();
@@ -1162,7 +1162,7 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -1278,7 +1278,7 @@ async fn admin_raftkv_key_count_is_scoped_per_tablet_after_split() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_split_kicks_off_the_copy_based_workflow() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) =
             bring_up_with_split_mode(1, dir.path(), animusd::SplitMode::Copy).await;
         await_bootstrap(&nodes).await;
@@ -1410,7 +1410,7 @@ async fn admin_split_kicks_off_the_copy_based_workflow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) =
             bring_up_with_split_mode(4, dir.path(), animusd::SplitMode::InPlace).await;
         await_bootstrap(&nodes).await;

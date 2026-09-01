@@ -271,7 +271,7 @@ async fn await_cutover(node: &Node, budget: Duration) -> (u64, u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_split_workflow_cutover_completes_with_no_lost_writes() {
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -440,7 +440,7 @@ async fn split_build_tail_does_not_re_ship_the_bulk_image_row_by_row() {
     const MAX_CHILD_ENTRIES: u64 = 64;
 
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -506,7 +506,7 @@ async fn split_build_tail_does_not_re_ship_the_bulk_image_row_by_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn driver_kill_after_freeze_resumes_and_completes() {
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -720,7 +720,7 @@ async fn await_cutover_of(node: &Node, table: &str, parent: u64, budget: Duratio
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_splits_of_two_tables_both_complete() {
     timeout(Duration::from_secs(180), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -794,7 +794,7 @@ async fn concurrent_splits_of_two_tables_both_complete() {
 async fn bench_split_build_serve_latency_and_cutover_blip() {
     const N: usize = 2_000;
     timeout(Duration::from_secs(600), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -964,7 +964,7 @@ async fn await_children_active(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn split_completes_when_a_child_lives_off_the_parent_leader_node() {
     timeout(Duration::from_secs(300), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(5, dir.path()).await;
         await_bootstrap(&nodes).await;
 
@@ -1145,7 +1145,7 @@ async fn split_survives_losing_one_childs_leader_mid_build() {
     const N: usize = 400;
 
     timeout(Duration::from_secs(300), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         // 5 nodes vs RF 3: children get placement-chosen homes (fork F5), so
         // a child leader that is neither node 0 nor the parent's own leader
         // exists to be killed.
@@ -1385,7 +1385,7 @@ async fn probe_put_item_unthrottled_until_stopped(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn indexed_put_item_racing_the_freeze_window_retries_to_success() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let addr = nodes[0].dynamo_addr();
@@ -1451,7 +1451,7 @@ async fn indexed_put_item_racing_the_freeze_window_retries_to_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plain_put_item_racing_the_freeze_window_retries_to_success() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let addr = nodes[0].dynamo_addr();
@@ -1589,7 +1589,7 @@ async fn await_gsi_matches_exactly(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn indexed_put_item_unthrottled_flood_racing_the_split_converges_with_no_lost_gsi_updates() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         await_bootstrap(&nodes).await;
         let addr = nodes[0].dynamo_addr();

@@ -231,7 +231,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn cluster_grows_from_three_to_five_and_rebalances() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. Bring up a 3-node cluster whose *own* config declares only 3 nodes —
     // no reserved control seats, matching a real "we didn't plan to grow yet"
@@ -468,7 +468,7 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, NodeId, bool)> {
 /// exactly as the browser's cross-node fan-out does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (mut nodes, base_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&nodes).await;
@@ -644,7 +644,7 @@ async fn dashboard_health_recovers_after_grown_cluster_loses_an_original_node() 
 /// actual behavior change this port makes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn growth_node_observes_metadata_promptly_via_watch() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (base_nodes, base_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&base_nodes).await;

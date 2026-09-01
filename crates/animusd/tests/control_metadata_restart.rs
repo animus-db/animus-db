@@ -25,7 +25,6 @@ use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, StorageBackend, TableSchema,
     read_frame,
 };
-use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -85,7 +84,7 @@ async fn start_control(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node
 
 #[tokio::test(flavor = "multi_thread")]
 async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation. ---
@@ -224,7 +223,7 @@ async fn combined_node_restart_recovers_control_metadata_via_shared_engine() {
 /// its own address identity unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn ephemeral_control_only_restart_does_not_carry_over_metadata() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let addrs = animusd::RoleAddrs {
         id: animusd::config::node_id(0),
         role: animusd::config::NodeRole::Control,
