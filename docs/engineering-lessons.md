@@ -14626,6 +14626,49 @@ shape (concurrent siblings, sustained writes, real contention) exercises
 the mechanism for the first time, rather than assuming the rung-6 fix
 covers it structurally.
 
+## A `cache_matches_engine`-style differential oracle can pass while every command inside it is silently rejected — assert the materialized state, not just that two sides of a diff agree (copy-split deletion stack, layer 1)
+
+While porting `apply_engine.rs`'s `cache_matches_engine_through_a_mixed_
+scenario_and_a_restart` from the deprecated `MetaCommand::BeginSplit` to
+`BeginSplitInPlace`, the test's own "split round" turned out to have been a
+complete no-op since it was written: `nodes[leader].propose(..)` for the
+split silently returns `ApplyOutcome::Rejected` (epoch mismatch — something
+earlier in the same scenario bumps the parent tablet's epoch past the
+`Epoch::INITIAL` the split command hardcodes as its `expected_epoch`), and
+every downstream command in the scenario (a child's own stream seal, a
+second split round, the eventual `DropTableTablets`) silently no-ops right
+along with it. Every assertion in the test still passed the entire time,
+because `assert_cache_matches_engine`'s own invariant — "the apply task's
+published cache agrees with an independent rebuild of its own engine" —
+holds trivially for a command that never applied: both sides simply stay
+unchanged and agree. Confirmed by instrumenting the scenario directly
+(`eprintln!`ing `nodes[leader].metadata().tablets` and the propose's own
+`ProposeResult` at each step) rather than trusting the green run; a
+standalone `Metadata::apply` repro of the same command, minus one
+intervening command from the real scenario, proved the command itself was
+valid — narrowing the cause to a state difference the live scenario built
+up that a hand-written standalone repro didn't.
+
+**The general lesson**: a differential oracle (cache-vs-engine,
+delta-applied-vs-full-fetch, shadow-vs-real, etc.) only proves its two
+sides never *diverge* — it says nothing about whether either side actually
+*changed* the way the test's own comments claim. A long-running scenario
+test built from many `propose()` calls with no per-command outcome
+assertion is exactly the shape where this goes undetected for a long
+time: nothing crashes, nothing diverges, the test just silently stops
+exercising what it was written to exercise the moment an early command in
+the chain starts getting rejected (here, plausibly from the moment F11
+token-alignment or some other apply-gate was added after the test was
+originally written, though the actual cause turned out to be an unrelated
+stale hardcoded epoch). When a task requires touching a specific `propose`
+call in this kind of test, it's worth spot-checking with a debug print
+that the command you're touching actually applies — not just that the
+suite stays green — before concluding the port is faithful. Found and
+noted rather than fixed here (root-causing and correcting the stale-epoch
+assumption is an unrelated pre-existing bug, out of scope for a
+test-surface-porting layer with no production-code changes); the
+NOTE left in `apply_engine.rs` at both split call sites points here.
+
 ## Diagnose "my predicate never turns true" by instrumenting the state it READS, not its own bookkeeping (issues #532/#537)
 
 A learner catch-up predicate (`RaftCore::learner_caught_up`, keyed on

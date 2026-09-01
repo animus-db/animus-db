@@ -151,10 +151,12 @@ fn run(seed: u64) {
     ));
     // `CreateTablet` allows only one tablet per table (ADR 0023) — a real
     // second tablet on the same table comes only from a split, so drive
-    // `BeginSplit`/`CutoverSplit` (the copy-based, control-plane-only
-    // command pair — `animus-control`'s own `complete_backup_requires_
-    // every_pinned_tablet` test uses the identical shape) to end up with
-    // two `Active` tablets, ids 2 and 3.
+    // `BeginSplitInPlace`/`CutoverSplit` (the in-place, control-plane-only
+    // command pair — ADR 0062: children inherit the parent's own replicas
+    // verbatim) to end up with two `Active` tablets, ids 2 and 3. This is
+    // topology scaffolding only (the table is empty) — no data-plane fork
+    // is materialized here, and nothing in this test exercises the fork
+    // itself.
     assert!(matches!(
         node.propose(MetaCommand::CreateTablet {
             tablet: TabletId(1),
@@ -167,7 +169,7 @@ fn run(seed: u64) {
     sim.run_for(Duration::from_millis(50));
     let parent_epoch = node.metadata().tablets[&TabletId(1)].epoch;
     assert!(matches!(
-        node.propose(MetaCommand::BeginSplit {
+        node.propose(MetaCommand::BeginSplitInPlace {
             parent: TabletId(1),
             expected_epoch: parent_epoch,
             split_key: [0x80; TOKEN_BYTES].to_vec(),
