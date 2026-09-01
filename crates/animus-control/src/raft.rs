@@ -69,6 +69,93 @@ pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
 /// message granularity, never correctness.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1024;
 
+/// Maximum number of log entries shipped to one peer in a single
+/// `AppendEntries` message (issues #532/#537, ADR 0009's 2026-09-01
+/// amendment). Without this, [`replicate_to`](RaftCore::replicate_to) sent
+/// the ENTIRE outstanding tail (`next_index..=last_log_index`) in one
+/// message, and `replicate_now`'s wake-on-propose (no coalescing beyond the
+/// boolean `ProposeSignal`) fires that unbounded send again on every single
+/// propose — so a lagging peer (freshly added learner, or any voter behind
+/// more than a heartbeat) under a sustained per-entry proposer received an
+/// unbounded sequence of ever-larger, overlapping `AppendEntries` batches,
+/// each superseding the last before it could be fully processed and acked,
+/// permanently starving `next_index`'s advance (confirmed live: a learner
+/// pinned at a fixed `match_index` for an entire run while the leader's own
+/// log kept growing).
+///
+/// **Derivation**: the cap only has to stop the send from growing *without
+/// bound* — a real replicate round (WAL append + `fsync` on the receiving
+/// peer) costs roughly the same wall-clock time whether it carries a dozen
+/// entries or a few hundred, so shrinking the cap much below "a real
+/// catch-up distance" only *adds* round trips (each still paying that same
+/// fixed `fsync` cost) without shrinking per-round work by much — a net
+/// loss once a peer's replication round, not per-entry cloning, is the
+/// bottleneck (confirmed empirically: a small cap and no cap converged
+/// equally poorly under a disk-latency-throttled peer in this fix's own
+/// `SimEnv` centerpiece test, `animus-cp-data/tests/
+/// learner_catchup_under_load.rs`, before the value was widened here).
+/// `node.rs`'s `SNAPSHOT_THRESHOLD` (control plane) / `lib.rs`'s
+/// `COMPACT_THRESHOLD` (CP data plane) — both 64 — are the number of
+/// applied-but-uncompacted entries this plane keeps in the live log tail
+/// before compacting past a peer that hasn't caught up; a peer that falls
+/// more than roughly that far behind takes the (already-bounded,
+/// `SNAPSHOT_CHUNK_BYTES`-chunked) `InstallSnapshot` path via `next <=
+/// self.snapshot_index` regardless of this cap, so this path's own value
+/// only has to be reasonable for catch-up distances *inside* that window —
+/// **512**, comfortably larger than that window (covering it in one round
+/// trip in the common case) while still orders of magnitude below the
+/// unbounded growth observed in the field (a leader's log racing past
+/// 25,000 entries while a stuck peer's own `AppendEntries` kept growing to
+/// match). `handle_append_resp`'s success arm already re-invokes
+/// [`replicate_to`](RaftCore::replicate_to) immediately when more remains,
+/// so a peer needing several batches clears the backlog in back-to-back
+/// acked round trips, not one per external propose. This only bounds a
+/// *lagging* peer's traffic: an up-to-date peer's ordinary steady-state
+/// `AppendEntries` (one or a few fresh entries per propose) is far under
+/// this cap and unaffected.
+const MAX_APPEND_ENTRIES_BATCH: usize = 512;
+
+/// How a call site's `InstallSnapshot` chunk resend for an already-outstanding
+/// (unchanged) offset is bounded (issues #532/#537, ADR 0009's third
+/// 2026-09-01 amendment — the residual beyond `MAX_APPEND_ENTRIES_BATCH` and
+/// `COMPACT_DEFER_CEILING`). See [`RaftCore::snapshot_chunk_for`]'s doc for
+/// the full mechanism and [`RaftCore::snapshot_chunk_sent`]'s doc for the
+/// marker this gates against. A chunk for a genuinely NEW offset (real ack
+/// progress, or nothing sent to this peer yet) is never held back by either
+/// variant, at any call site — this only ever bounds a repeat of the exact
+/// chunk already in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SnapshotResend {
+    /// At most `0` resends of an unchanged offset from THIS call site before
+    /// the next one is suppressed — i.e. send once, then wait for either
+    /// real progress or a different trigger. This is `replicate_now`'s
+    /// (wake-on-propose's) own setting: it fires on every propose, so
+    /// letting it also resend an unmoved snapshot offset without limit is
+    /// exactly the write-rate flood this fix closes.
+    Capped(u32),
+    /// No cap — a resend of the SAME outstanding offset is always allowed.
+    /// Reserved for triggers that are themselves already bounded by
+    /// something other than write rate: a periodic heartbeat tick, a
+    /// peer's own `AppendEntries` success/reject response, an explicit
+    /// `WakeRequest` poke, a fresh leadership term. NOT used for the
+    /// ack-handler's own resend (`handle_install_snapshot_resp`) — see
+    /// that method's own doc for why a bounded cap, not `Always`, is what
+    /// belongs there.
+    Always,
+}
+
+/// The resend cap `handle_install_snapshot_resp` passes for its own
+/// ack-driven resend (`SnapshotResend::Capped`) — see that method's own
+/// doc. Not `0` (that starves the retransmit role the same way gating this
+/// call site out entirely did — see `snapshot_chunk_for`'s doc for the two
+/// rejected shapes) and not unbounded (that reproduces this fix's own
+/// flood, just gated behind an ack instead of a propose). `8` is small
+/// enough to bound worst-case volume by roughly an order of magnitude
+/// versus no cap at all, while comfortably covering the handful of
+/// overlapping in-flight acks a genuinely still-converging transfer
+/// produces before either real progress or the next heartbeat arrives.
+const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +538,36 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
     // a peer once it has fully installed the snapshot.
     snapshot_offset: BTreeMap<NodeId, u64>,
+    // Per-peer `(offset, resends)` of the last `InstallSnapshot` chunk
+    // actually SENT (issues #532/#537): `offset` is the byte offset last
+    // transmitted; `resends` counts how many times THAT SAME offset has
+    // been resent since it was first sent (reset to 0 whenever the offset
+    // itself changes). `snapshot_chunk_for` consults this against a
+    // caller's own `SnapshotResend::Capped(n)` to decide whether one more
+    // resend of an unchanged offset is still allowed. Distinct from
+    // `snapshot_offset` (the offset the peer has ACKED): this tracks what
+    // the leader last transmitted, which for a peer with an outstanding
+    // unacked chunk is normally the same offset repeatedly — exactly the
+    // case this map exists to bound. Cleared/removed at the identical
+    // points `snapshot_offset` itself is: per-peer once fully installed,
+    // wholesale on `snapshot_upto` invalidation (a moved base makes any
+    // prior offset meaningless), and on a fresh leadership term.
+    snapshot_chunk_sent: BTreeMap<NodeId, (u64, u32)>,
+    // Per-peer lifetime count of GENUINE `InstallSnapshot` chunk advances —
+    // bumped exactly once whenever `snapshot_chunk_for` builds a chunk for
+    // an offset it has never sent before (a capped RESEND of an
+    // already-attempted offset never bumps it). Test-observability only, no
+    // role in the resend decision itself: it's what lets a test measure
+    // "sends per genuinely distinct chunk" exactly, without externally
+    // polling `snapshot_offset` at some fixed cadence and undercounting
+    // whatever the poll interval is coarser than (found building this fix's
+    // own test — see `animus-cp-data/tests/snapshot_resend_bound.rs`).
+    // Deliberately NEVER cleared (not by `snapshot_upto` invalidation, not
+    // by transfer completion) — a lifetime total survives every restart, the
+    // same way `next_index`/`match_index` are never pruned for a peer this
+    // core has ever talked to, and the same way a `Metric` counter is never
+    // reset.
+    snapshot_chunk_advances: BTreeMap<NodeId, u64>,
 
     // Follower reassembly buffer for an in-progress chunked `InstallSnapshot`.
     incoming_snapshot: Option<IncomingSnapshot>,
@@ -613,6 +730,8 @@ where
             transfer_deadline: Nanos(0),
             first_term_index: 0,
             snapshot_offset: BTreeMap::new(),
+            snapshot_chunk_sent: BTreeMap::new(),
+            snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
             election_base: Duration::from_millis(150),
             heartbeat_interval: Duration::from_millis(50),
@@ -817,6 +936,7 @@ where
             // pass, so a deliberately fresh image is never dropped.
             self.snapshot_blob = None;
             self.snapshot_offset.clear();
+            self.snapshot_chunk_sent.clear();
         }
     }
 
@@ -829,6 +949,49 @@ where
     /// The current snapshot base index (0 if no snapshot has been taken).
     pub fn snapshot_index(&self) -> u64 {
         self.snapshot_index
+    }
+
+    /// Whether a chunked `InstallSnapshot` transfer is currently in flight
+    /// to at least one peer (a non-empty `snapshot_offset` — see that
+    /// field's own doc). `snapshot_upto` unconditionally invalidates every
+    /// in-flight transfer's own progress the moment the base moves again
+    /// (dropping the blob and clearing every peer's offset — required for
+    /// correctness, since the in-flight bytes were captured at the OLD
+    /// base and shipping them under a new `snapshot_index` would corrupt
+    /// the receiver). Under a sustained write stream that keeps
+    /// re-crossing a `DRIVER_APPLIED` driver's compaction threshold faster
+    /// than a lagging peer's own chunked transfer can complete, that
+    /// invalidation can repeat forever, so the peer's catch-up never
+    /// finishes (issues #532/#537's own residual finding beyond the
+    /// `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc). This
+    /// accessor is the fact a `DRIVER_APPLIED` driver's own
+    /// threshold-triggered compaction check needs to defer advancing the
+    /// base while an in-flight transfer still has a chance to land —
+    /// policy lives entirely in the driver (`animus-cp-data`'s
+    /// `apply_and_compact`), never here; this core stays a pure fact,
+    /// same as `snapshot_index` itself.
+    pub fn snapshot_transfer_in_flight(&self) -> bool {
+        !self.snapshot_offset.is_empty()
+    }
+
+    /// The byte offset `peer` has acked so far in an in-flight chunked
+    /// `InstallSnapshot` transfer (`None` if no transfer to `peer` is in
+    /// flight) — a pure read of [`snapshot_offset`](Self::snapshot_offset),
+    /// mirroring [`snapshot_transfer_in_flight`](Self::snapshot_transfer_in_flight)'s
+    /// "policy lives in the driver, this core stays a fact" shape. Exists
+    /// primarily so a test can observe transfer PROGRESS deterministically
+    /// (distinct offsets reached over a run) rather than only volume — see
+    /// `animus-cp-data/tests/snapshot_resend_bound.rs`.
+    pub fn snapshot_chunk_progress(&self, peer: &NodeId) -> Option<u64> {
+        self.snapshot_offset.get(peer).copied()
+    }
+
+    /// Lifetime count of GENUINE `InstallSnapshot` chunk advances shipped to
+    /// `peer` (`0` if none yet) — see
+    /// [`snapshot_chunk_advances`](Self::snapshot_chunk_advances)'s own doc
+    /// for exactly what counts and why it exists.
+    pub fn snapshot_chunk_advances(&self, peer: &NodeId) -> u64 {
+        self.snapshot_chunk_advances.get(peer).copied().unwrap_or(0)
     }
 
     /// Applied entries not yet covered by the snapshot — the log prefix a
@@ -1550,7 +1713,10 @@ where
                         return self.broadcast_quiesce();
                     }
                     self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
-                    return self.broadcast_append();
+                    // Heartbeat cadence (write-rate-independent) is one of
+                    // the bounded retries a genuinely stuck snapshot chunk
+                    // gets — always allowed (`SnapshotResend::Always`).
+                    return self.broadcast_append(SnapshotResend::Always);
                 }
                 Vec::new()
             }
@@ -1574,10 +1740,16 @@ where
     /// be shipped at once instead of waiting for the next heartbeat tick. Resets the
     /// heartbeat deadline (this send counts as the period's heartbeat, so the timer
     /// tick won't immediately re-broadcast). Empty on a non-leader.
+    ///
+    /// **`SnapshotResend::Capped(0)` (issues #532/#537)**: this fires on
+    /// every single propose, so for a peer mid-chunked-`InstallSnapshot` it
+    /// must never resend an already-outstanding offset more than once
+    /// before real progress or a different trigger arrives — see
+    /// `snapshot_chunk_for`'s own doc for the full mechanism this closes.
     pub fn replicate_now(&mut self, now: Nanos) -> Vec<Out<C>> {
         if self.role == Role::Leader {
             self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
-            self.broadcast_append()
+            self.broadcast_append(SnapshotResend::Capped(0))
         } else {
             Vec::new()
         }
@@ -2029,7 +2201,10 @@ where
                 self.departing.remove(&from);
             }
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-                return self.replicate_to(from).into_iter().collect();
+                return self
+                    .replicate_to(from, SnapshotResend::Always)
+                    .into_iter()
+                    .collect();
             }
             Vec::new()
         } else {
@@ -2037,7 +2212,9 @@ where
             if *ni > 1 {
                 *ni -= 1;
             }
-            self.replicate_to(from).into_iter().collect()
+            self.replicate_to(from, SnapshotResend::Always)
+                .into_iter()
+                .collect()
         }
     }
 
@@ -2243,6 +2420,7 @@ where
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
             self.snapshot_offset.remove(&from);
+            self.snapshot_chunk_sent.remove(&from);
             // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
             // flight, drop the materialized image instead of retaining a
             // whole-tablet copy in the core indefinitely — a later straggler
@@ -2258,13 +2436,45 @@ where
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
-                return self.replicate_to(from).into_iter().collect();
+                return self
+                    .replicate_to(from, SnapshotResend::Always)
+                    .into_iter()
+                    .collect();
             }
             return Vec::new();
         }
         // Still mid-transfer: record progress and ship the next chunk.
-        self.snapshot_offset.insert(from.clone(), next_offset);
-        self.replicate_to(from).into_iter().collect()
+        //
+        // **Monotonic guard, found building this fix.** A follower acks
+        // EVERY `InstallSnapshot` chunk it processes, including a stale
+        // duplicate that lands after its own buffer has already moved past
+        // that offset (`handle_install_snapshot`'s "a reordered/duplicate
+        // chunk is ignored" case) — such an ack still reports the
+        // follower's own CURRENT (unchanged) position, which is correct on
+        // its own. But under a flood of overlapping in-flight sends, acks
+        // can reach the leader in an order that does not track real
+        // progress: an ack generated for an EARLIER request can be
+        // processed by the leader AFTER a LATER one that already advanced
+        // things further (both are genuine, freshly-generated acks —
+        // nothing here is stale/reordered *network* delivery, only
+        // overlapping *requests* completing out of sequence). A bare
+        // `insert` let such an ack regress the leader's own tracked offset
+        // backward — confirmed directly: instrumenting the pre-fix code
+        // counted 217 such regressions in one run of
+        // `animus-cp-data/tests/learner_catchup_under_load.rs`, each
+        // stepping backward by exactly one chunk, which then cost several
+        // more round trips to recover from. `max` makes the tracked offset
+        // monotonic regardless of ack arrival order — independent of, and
+        // additive with, the resend cap below.
+        let entry = self.snapshot_offset.entry(from.clone()).or_insert(0);
+        *entry = (*entry).max(next_offset);
+        // `SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP)`, not `Always` and
+        // not `Capped(0)` — see `snapshot_chunk_for`'s own doc for why this
+        // one call site needs a genuine, nonzero-but-bounded cap rather than
+        // either extreme.
+        self.replicate_to(from, SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP))
+            .into_iter()
+            .collect()
     }
 
     // ---- role transitions & replication ---------------------------------
@@ -2452,10 +2662,14 @@ where
         self.maybe_advance_commit();
         self.apply();
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
-        self.broadcast_append()
+        // A fresh leadership term just cleared `snapshot_chunk_sent` above,
+        // so this makes no observable difference from `Capped(0)` here —
+        // `Always` for consistency with the other "this leader just did
+        // something noteworthy" call sites.
+        self.broadcast_append(SnapshotResend::Always)
     }
 
-    fn broadcast_append(&mut self) -> Vec<Out<C>> {
+    fn broadcast_append(&mut self, snapshot_resend: SnapshotResend) -> Vec<Out<C>> {
         // Include departing peers (see the `departing` field doc): a peer just
         // removed from `peers` still needs the removing entry replicated to it.
         // Include learners too (ADR 0058 Train 1): they receive
@@ -2467,7 +2681,7 @@ where
         let mut outs: Vec<Out<C>> = targets
             .iter()
             .cloned()
-            .filter_map(|p| self.replicate_to(p))
+            .filter_map(|p| self.replicate_to(p, snapshot_resend))
             .collect();
         // Send `TimeoutNow` only once the target has actually caught all the way
         // up to `last_log_index` — arming (`transfer_leadership`) only requires
@@ -2607,7 +2821,10 @@ where
         if self.role != Role::Leader {
             return Vec::new();
         }
-        self.replicate_to(from).into_iter().collect()
+        // An explicit poke from the peer itself, not write-rate spam.
+        self.replicate_to(from, SnapshotResend::Always)
+            .into_iter()
+            .collect()
     }
 
     /// A locally-woken **follower**'s "are you still there?" check (ADR 0044
@@ -2699,17 +2916,20 @@ where
 
     /// Build the right replication message for `peer`: an `InstallSnapshot` chunk
     /// if the entries it needs have been compacted away, otherwise
-    /// `AppendEntries`. `None` when a needed snapshot image is not materialized
-    /// yet (a `DRIVER_APPLIED` plane builds it lazily — see
+    /// `AppendEntries`, capped at [`MAX_APPEND_ENTRIES_BATCH`] entries (issues
+    /// #532/#537 — see that constant's doc for why an uncapped send is
+    /// unsafe under sustained write load, not merely inefficient). `None`
+    /// when a needed snapshot image is not materialized yet (a
+    /// `DRIVER_APPLIED` plane builds it lazily — see
     /// [`snapshot_chunk_for`](Self::snapshot_chunk_for)); the peer is simply
     /// retried on the next heartbeat once the driver supplies the image.
-    fn replicate_to(&mut self, peer: NodeId) -> Option<Out<C>> {
+    fn replicate_to(&mut self, peer: NodeId, snapshot_resend: SnapshotResend) -> Option<Out<C>> {
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
         // offset-addressed chunk for this peer.
         if next <= self.snapshot_index {
-            return self.snapshot_chunk_for(peer);
+            return self.snapshot_chunk_for(peer, snapshot_resend);
         }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
@@ -2717,6 +2937,7 @@ where
             .log
             .iter()
             .filter(|e| e.index >= next)
+            .take(MAX_APPEND_ENTRIES_BATCH)
             .cloned()
             .collect();
         Some((
@@ -2756,7 +2977,82 @@ where
     /// An **in-core** state machine keeps the eager cached image (`snapshot_upto`
     /// / install / recovery all set it — the control-plane driver-liveness fix),
     /// so its blob is always present here and the flag never fires.
-    fn snapshot_chunk_for(&mut self, peer: NodeId) -> Option<Out<C>> {
+    ///
+    /// **Resend cap (issues #532/#537, ADR 0009's third 2026-09-01
+    /// amendment).** `replicate_now`'s wake-on-propose calls `broadcast_append`
+    /// for every peer on every propose, and this method used to unconditionally
+    /// re-slice and re-send whatever chunk is still outstanding for a peer on
+    /// every one of those calls — so under a sustained proposer, a peer
+    /// mid-transfer received the SAME unacked chunk again and again, at write
+    /// rate, long before it could possibly have acked the last one (confirmed
+    /// live: 96,451 chunk sends for 196 offset transitions, the tracked offset
+    /// parked for a whole run). Compounding it, EVERY response the flood
+    /// provoked — even a duplicate, no-progress ack — fed straight back into
+    /// another unconditional resend (`handle_install_snapshot_resp`'s own
+    /// call), so the flood was self-sustaining once started, bounded only by
+    /// round-trip time, not by anything a caller controlled. Together this
+    /// congested the peer's single-consumer inbox badly enough that its
+    /// transfer couldn't complete inside `COMPACT_DEFER_CEILING`'s window, so
+    /// compaction eventually invalidated it (`snapshot_upto` unconditionally
+    /// drops in-flight progress when the base moves — required for
+    /// correctness, see that method's own doc) and it restarted from chunk 0,
+    /// forever.
+    ///
+    /// [`snapshot_chunk_sent`](Self::snapshot_chunk_sent) tracks the offset
+    /// last actually shipped to each peer and how many times it has been
+    /// resent since; a resend of the SAME offset is suppressed once the
+    /// caller's own `SnapshotResend::Capped(n)` budget is exhausted — a chunk
+    /// for a genuinely NEW offset (real ack progress, or nothing sent yet)
+    /// always ships immediately regardless, at every call site.
+    ///
+    /// **Both call sites need their own cap; neither is dispensable, and
+    /// the two tests that pin this down are looking at different
+    /// workloads for a reason.**
+    /// `animus-cp-data/tests/snapshot_resend_bound.rs` drives one propose
+    /// per scheduler turn (matching the field's own continuous-write
+    /// shape) — under it, `replicate_now`'s wake-on-propose genuinely fires
+    /// close to once per write, so capping wake-on-propose ALONE
+    /// (`Capped(0)`) already takes the measured sends-per-genuine-advance
+    /// ratio from several HUNDRED (the unfixed mechanism, matching the
+    /// field's own ~492-per-transition order of magnitude) down to roughly
+    /// 90 — most of this fix's own win, and confirmation that the field
+    /// diagnosis's own naming of wake-on-propose as the primary culprit
+    /// holds for that workload shape. `animus-cp-data/tests/
+    /// learner_catchup_under_load.rs` instead drives tight synchronous
+    /// bursts of ten proposes with no yield in between — under THAT shape,
+    /// `replicate_now`'s own wake is a single coalesced `AtomicBool`
+    /// (`ProposeSignal`, not a per-propose counter), so it already fires at
+    /// most once per burst regardless of `Capped(0)`; capping wake-on-propose
+    /// there changes little on its own, and the mechanism this test is
+    /// sensitive to is entirely the ack-handler's own resend
+    /// (`handle_install_snapshot_resp`, below). Two narrower shapes were
+    /// tried first and rejected against this test: skipping a mid-snapshot
+    /// peer from wake-on-propose entirely, and throttling wake-on-propose
+    /// by propose *count* (1-in-2, 1-in-20) — both regressed it (the
+    /// learner never caught up), for exactly the reason above: neither
+    /// prototype's throttle ever touched the ack-handler's own
+    /// self-sustaining cascade, which is what that test's convergence
+    /// actually depends on. A **zero** cap on the ack-handler's own call
+    /// site (identical treatment to wake-on-propose) was tried too and
+    /// regressed this same test — a genuinely stuck transfer needs *some*
+    /// bounded number of ack-driven retries to escape before the next
+    /// heartbeat, since under sustained write load `heartbeat_deadline` is
+    /// perpetually deferred by `replicate_now`'s own reset (see that
+    /// method's doc), so that backstop rarely fires in time on its own.
+    /// `SNAPSHOT_ACK_RESEND_CAP` (a small, nonzero, bounded count — see its
+    /// own doc) is what closes both findings at once: it preserves the
+    /// ack-handler's retransmit role (`learner_catchup_under_load.rs` stays
+    /// green) while still giving it a genuine worst-case ceiling —
+    /// `Always` there converges too and happens not to run away further in
+    /// `snapshot_resend_bound.rs`'s own one-seed measurement (~90 either
+    /// way), but has no STRUCTURAL bound of its own the way `Capped(n)`
+    /// does, which is the property this fix is actually supposed to
+    /// guarantee, not merely happen to exhibit on one workload.
+    fn snapshot_chunk_for(
+        &mut self,
+        peer: NodeId,
+        snapshot_resend: SnapshotResend,
+    ) -> Option<Out<C>> {
         let Some(serialized) = self.snapshot_blob.as_deref() else {
             self.snapshot_needed = true;
             return None;
@@ -2768,10 +3064,28 @@ where
             .copied()
             .unwrap_or(0)
             .min(total);
+        let resends_so_far = self
+            .snapshot_chunk_sent
+            .get(&peer)
+            .filter(|&&(last_offset, _)| last_offset == offset)
+            .map_or(0, |&(_, resends)| resends);
+        if let SnapshotResend::Capped(limit) = snapshot_resend
+            && resends_so_far > limit
+        {
+            return None;
+        }
+        if resends_so_far == 0 {
+            *self
+                .snapshot_chunk_advances
+                .entry(peer.clone())
+                .or_insert(0) += 1;
+        }
         let start = offset as usize;
         let end = (start + SNAPSHOT_CHUNK_BYTES).min(serialized.len());
         let data = serialized[start..end].to_vec();
         let done = end as u64 == total;
+        self.snapshot_chunk_sent
+            .insert(peer.clone(), (offset, resends_so_far.saturating_add(1)));
         Some((
             peer,
             RaftMsg::InstallSnapshot {

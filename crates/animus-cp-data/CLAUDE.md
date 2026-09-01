@@ -1300,6 +1300,34 @@ demand the identical action, so no disambiguation is needed.
     those records would wait on a round with no drainer.
     Compaction is skipped while `halted`. `is_stopped()` requires *both* tasks
     stopped (`stopped && apply_stopped`) before the GC deletes artifacts.
+
+    **A threshold-triggered compaction is deferred while a peer's snapshot
+    transfer is in flight (issues #532/#537, `COMPACT_DEFER_CEILING`).**
+    `snapshot_upto` unconditionally drops every peer's in-flight chunked
+    `InstallSnapshot` progress the instant the base moves again (required
+    for correctness, unchanged by this fix — see that method's own doc,
+    `animus-control`). Under sustained writes, ordinary `COMPACT_THRESHOLD`
+    pressure could re-cross faster than a lagging peer's own multi-chunk
+    transfer could complete, restarting it from chunk 0 forever — the
+    residual finding beyond `MAX_APPEND_ENTRIES_BATCH` alone (see that
+    constant's own doc, `animus-control`). `apply_and_compact` now checks
+    `RaftCore::snapshot_transfer_in_flight()` and skips a
+    `behind >= COMPACT_THRESHOLD`-only trigger (never an `image_needed` one
+    — a peer is actively waiting on that image) while some transfer is
+    genuinely in flight, up to `COMPACT_DEFER_CEILING` (`COMPACT_THRESHOLD
+    * 8`) past which compaction proceeds regardless, bounding the WAL even
+    against a transfer that will never complete. Policy lives entirely
+    here, in the driver; the core's own correctness argument is unchanged.
+    Regression: `tests/learner_catchup_under_load.rs` (proven red with
+    either this fix or the batch cap reverted, green with both). The real
+    `ProdEnv` end-to-end bench (`animusd/tests/
+    cluster_gt_rf_split_bench.rs`) still converged in only 1 of 3 runs on
+    the validating host with these first two fixes alone — closed by a
+    THIRD mechanism, unbounded `InstallSnapshot` chunk resend *frequency*
+    (`animus-control`'s `SnapshotResend` gate, ADR 0009's third 2026-09-01
+    amendment): 3 of 3 with all three fixes in place. See that amendment
+    for the full account and `animus-control/CLAUDE.md`'s matching entry
+    for the mechanism itself.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/

@@ -510,15 +510,25 @@ shallowest-over-budget cascade) is extracted as a free function,
 `next_compaction_plan(tables, opts)`, specifically so it's unit/property-
 testable without a live engine — see `compaction_policy_tests` in
 `lsm.rs` for the truth table and a cascade-termination property (ADR 0061
-rung A3). **Gotcha found while adding that property test, not fixed
-(behaviour-preserving refactor):** `LsmOptions::level_fanout` has no
-lower-bound validation. The per-level table budget is
+rung A3). **`LsmOptions::level_fanout` is validated at open (issue #441),
+not just documented as a gotcha.** The per-level table budget is
 `L1_TABLE_BUDGET * level_fanout^(level - 1)`, so with `level_fanout <= 1`
 the budget never grows with depth — a table set whose fully-merged size
 exceeds `L1_TABLE_BUDGET` (4) can cascade down through every level forever
-without ever settling. Worth a validation at `LsmOptions` construction if
-this is ever exposed to untrusted/operator config rather than fixed
-defaults.
+without ever settling (at `level_fanout == 0` this is worse: every level
+≥2 gets budget `0`, over budget the instant one table lands there).
+`LsmOptions::validate()` rejects `level_fanout <= 1` with
+`StorageError::InvalidLevelFanout`, called from `LsmEngine::open_with_metrics`
+(so both `open` and `open_with` inherit it) before any I/O — a fallible
+validate-on-open, matching this crate's existing entry-point-validation
+idiom (`StorageError::InvalidRange`/`NonMonotonicVersion` checked at the
+top of the relevant op) rather than a silent clamp. Every fixed-fanout
+construction in this crate's own tests/benches already used `>= 2`, so the
+fix changed no test's behavior; the pure `next_compaction_plan` free
+function itself is unchanged and still callable with any `level_fanout`
+(only the `LsmEngine::open*` boundary gates it), which is why
+`compaction_policy_tests` can keep constructing degenerate `opts` directly
+for its own truth-table cases.
 
 `cargo bench -p animus-storage` runs `benches/engine_bench.rs`: a
 hand-rolled (no criterion) macro-benchmark over **`ProdEnv`** comparing
