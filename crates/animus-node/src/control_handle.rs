@@ -683,6 +683,25 @@ impl<E: Env, R: RelayClient> ControlHandle<E, R> {
         }
     }
 
+    /// The voter this handle's own leader is currently handing leadership
+    /// off to, if a transfer is armed right now (`/admin/raft`, issue #313
+    /// — previously invisible short of reading the driver's own abort log).
+    /// `Local` reads its live `RaftNode::transfer_target()` directly —
+    /// `None` covers both "not this node's own transfer" (irrelevant if
+    /// this node isn't leader) and "no transfer armed," which is fine here
+    /// unlike [`config`](Self::config)'s `Option`: a transfer is
+    /// leader-local volatile state, not something "never observed yet" is
+    /// even a meaningful distinction for. `Remote` has no local `RaftCore`
+    /// to read at all and always answers `None` — the wire carries no
+    /// transfer-in-progress signal (unlike `control_voters`), so this is
+    /// honestly "unknown," not "none armed."
+    pub fn transfer_target(&self) -> Option<NodeId> {
+        match self {
+            Self::Local(raft) => raft.transfer_target(),
+            Self::Remote(_) => None,
+        }
+    }
+
     /// This handle's recording metrics sink (aggregated into the `/metrics`
     /// export alongside the raftkv-role sink). A `Remote` handle's sink is a
     /// permanent no-op (see [`RemoteControlClient`]'s doc) — the raftkv-role

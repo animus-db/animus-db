@@ -559,12 +559,32 @@ pub enum Metric {
     /// liveness signal for an operator, since correctness never depends on
     /// it firing.
     DynamoTransactWritesAmbiguous,
+
+    // --- Control-plane leadership transfer observability (issue #313)
+    // --- Appended after the ambiguous-transact-writes variant above; every
+    // earlier variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Recorded by
+    // `animus_control::node`'s driver loop, the one place that observes a
+    // leader-still-Leader `transfer_target` clear (never inside the pure
+    // `RaftCore`, which has no metrics handle — see ADR 0003's sync/driver
+    // split).
+    /// An armed leadership transfer (`RaftCore::transfer_leadership`) missed
+    /// its deadline while this node was still leader — the target never
+    /// stepped down in time (crashed after arming, fell behind, or a
+    /// dropped `TimeoutNow`/election round). Distinct from an ordinary
+    /// transfer *completing*, which clears `transfer_target` via this same
+    /// node stepping down to a higher term instead — that path never
+    /// increments this counter. A nonzero rate means the single
+    /// un-randomized `election_base` budget `transfer_leadership` arms is
+    /// too tight for this deployment's real round-trip latency; see
+    /// `animus-control/CLAUDE.md`'s "Leadership transfer" entry.
+    ControlTransferAborted,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 77] = [
+    pub const ALL: [Metric; 78] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -642,6 +662,7 @@ impl Metric {
         Metric::CpTxnRecoveryStuckInconclusive,
         Metric::CpTxnUnresolvedDecidedStuck,
         Metric::DynamoTransactWritesAmbiguous,
+        Metric::ControlTransferAborted,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -726,6 +747,7 @@ impl Metric {
             Metric::CpTxnRecoveryStuckInconclusive => "cp_txn_recovery_stuck_inconclusive",
             Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
             Metric::DynamoTransactWritesAmbiguous => "dynamo_transact_writes_ambiguous",
+            Metric::ControlTransferAborted => "control_transfer_aborted",
         }
     }
 
