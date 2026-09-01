@@ -883,6 +883,22 @@ per-tablet CP data plane (`animus-cp-data`).
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
 
+  **`replicate_to`'s `AppendEntries` batch is capped, not unbounded
+  (issues #532/#537, ADR 0009's 2026-09-01 amendment).**
+  `MAX_APPEND_ENTRIES_BATCH` (512, derivation in that constant's own doc)
+  bounds how many entries a single `AppendEntries` to a lagging peer may
+  carry — without it, `replicate_to` shipped the ENTIRE outstanding tail
+  every call, and `replicate_now`'s wake-on-propose (`animus-cp-data`'s own
+  driver, re-invoked on every single write) resent that unbounded, growing
+  tail on every propose, real unbounded CPU cost regardless of whether the
+  peer had acked the last one. `RaftCore::snapshot_transfer_in_flight()` is
+  the companion accessor a `DRIVER_APPLIED` driver's own compaction gate
+  consults to avoid a second, independent pathology once a peer falls back
+  to the chunked snapshot path — see `animus-cp-data/CLAUDE.md`'s
+  `COMPACT_DEFER_CEILING` entry for that half; this core only supplies the
+  fact, the policy lives entirely in the driver. See the ADR amendment for
+  the full mechanism and honest residual.
+
 - **Durable-before-visible mechanics + hand-driven gotchas.** The driver
   advances the durable watermark via `mark_durable_through` in `flush_wal`,
   immediately after `env.sync(WAL)` (passing the drain-time `last_log_index`);

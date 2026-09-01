@@ -69,6 +69,52 @@ pub trait StateMachine<C>: Default + Clone + Serialize + DeserializeOwned {
 /// message granularity, never correctness.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1024;
 
+/// Maximum number of log entries shipped to one peer in a single
+/// `AppendEntries` message (issues #532/#537, ADR 0009's 2026-09-01
+/// amendment). Without this, [`replicate_to`](RaftCore::replicate_to) sent
+/// the ENTIRE outstanding tail (`next_index..=last_log_index`) in one
+/// message, and `replicate_now`'s wake-on-propose (no coalescing beyond the
+/// boolean `ProposeSignal`) fires that unbounded send again on every single
+/// propose — so a lagging peer (freshly added learner, or any voter behind
+/// more than a heartbeat) under a sustained per-entry proposer received an
+/// unbounded sequence of ever-larger, overlapping `AppendEntries` batches,
+/// each superseding the last before it could be fully processed and acked,
+/// permanently starving `next_index`'s advance (confirmed live: a learner
+/// pinned at a fixed `match_index` for an entire run while the leader's own
+/// log kept growing).
+///
+/// **Derivation**: the cap only has to stop the send from growing *without
+/// bound* — a real replicate round (WAL append + `fsync` on the receiving
+/// peer) costs roughly the same wall-clock time whether it carries a dozen
+/// entries or a few hundred, so shrinking the cap much below "a real
+/// catch-up distance" only *adds* round trips (each still paying that same
+/// fixed `fsync` cost) without shrinking per-round work by much — a net
+/// loss once a peer's replication round, not per-entry cloning, is the
+/// bottleneck (confirmed empirically: a small cap and no cap converged
+/// equally poorly under a disk-latency-throttled peer in this fix's own
+/// `SimEnv` centerpiece test, `animus-cp-data/tests/
+/// learner_catchup_under_load.rs`, before the value was widened here).
+/// `node.rs`'s `SNAPSHOT_THRESHOLD` (control plane) / `lib.rs`'s
+/// `COMPACT_THRESHOLD` (CP data plane) — both 64 — are the number of
+/// applied-but-uncompacted entries this plane keeps in the live log tail
+/// before compacting past a peer that hasn't caught up; a peer that falls
+/// more than roughly that far behind takes the (already-bounded,
+/// `SNAPSHOT_CHUNK_BYTES`-chunked) `InstallSnapshot` path via `next <=
+/// self.snapshot_index` regardless of this cap, so this path's own value
+/// only has to be reasonable for catch-up distances *inside* that window —
+/// **512**, comfortably larger than that window (covering it in one round
+/// trip in the common case) while still orders of magnitude below the
+/// unbounded growth observed in the field (a leader's log racing past
+/// 25,000 entries while a stuck peer's own `AppendEntries` kept growing to
+/// match). `handle_append_resp`'s success arm already re-invokes
+/// [`replicate_to`](RaftCore::replicate_to) immediately when more remains,
+/// so a peer needing several batches clears the backlog in back-to-back
+/// acked round trips, not one per external propose. This only bounds a
+/// *lagging* peer's traffic: an up-to-date peer's ordinary steady-state
+/// `AppendEntries` (one or a few fresh entries per propose) is far under
+/// this cap and unaffected.
+const MAX_APPEND_ENTRIES_BATCH: usize = 512;
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -824,6 +870,29 @@ where
     /// The current snapshot base index (0 if no snapshot has been taken).
     pub fn snapshot_index(&self) -> u64 {
         self.snapshot_index
+    }
+
+    /// Whether a chunked `InstallSnapshot` transfer is currently in flight
+    /// to at least one peer (a non-empty `snapshot_offset` — see that
+    /// field's own doc). `snapshot_upto` unconditionally invalidates every
+    /// in-flight transfer's own progress the moment the base moves again
+    /// (dropping the blob and clearing every peer's offset — required for
+    /// correctness, since the in-flight bytes were captured at the OLD
+    /// base and shipping them under a new `snapshot_index` would corrupt
+    /// the receiver). Under a sustained write stream that keeps
+    /// re-crossing a `DRIVER_APPLIED` driver's compaction threshold faster
+    /// than a lagging peer's own chunked transfer can complete, that
+    /// invalidation can repeat forever, so the peer's catch-up never
+    /// finishes (issues #532/#537's own residual finding beyond the
+    /// `MAX_APPEND_ENTRIES_BATCH` cap — see that constant's doc). This
+    /// accessor is the fact a `DRIVER_APPLIED` driver's own
+    /// threshold-triggered compaction check needs to defer advancing the
+    /// base while an in-flight transfer still has a chance to land —
+    /// policy lives entirely in the driver (`animus-cp-data`'s
+    /// `apply_and_compact`), never here; this core stays a pure fact,
+    /// same as `snapshot_index` itself.
+    pub fn snapshot_transfer_in_flight(&self) -> bool {
+        !self.snapshot_offset.is_empty()
     }
 
     /// Applied entries not yet covered by the snapshot — the log prefix a
@@ -2692,8 +2761,11 @@ where
 
     /// Build the right replication message for `peer`: an `InstallSnapshot` chunk
     /// if the entries it needs have been compacted away, otherwise
-    /// `AppendEntries`. `None` when a needed snapshot image is not materialized
-    /// yet (a `DRIVER_APPLIED` plane builds it lazily — see
+    /// `AppendEntries`, capped at [`MAX_APPEND_ENTRIES_BATCH`] entries (issues
+    /// #532/#537 — see that constant's doc for why an uncapped send is
+    /// unsafe under sustained write load, not merely inefficient). `None`
+    /// when a needed snapshot image is not materialized yet (a
+    /// `DRIVER_APPLIED` plane builds it lazily — see
     /// [`snapshot_chunk_for`](Self::snapshot_chunk_for)); the peer is simply
     /// retried on the next heartbeat once the driver supplies the image.
     fn replicate_to(&mut self, peer: NodeId) -> Option<Out<C>> {
@@ -2710,6 +2782,7 @@ where
             .log
             .iter()
             .filter(|e| e.index >= next)
+            .take(MAX_APPEND_ENTRIES_BATCH)
             .cloned()
             .collect();
         Some((

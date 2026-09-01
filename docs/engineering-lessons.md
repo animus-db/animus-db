@@ -14625,3 +14625,71 @@ that class is closed — re-run the SAME symptom check whenever a new load
 shape (concurrent siblings, sustained writes, real contention) exercises
 the mechanism for the first time, rather than assuming the rung-6 fix
 covers it structurally.
+
+## Diagnose "my predicate never turns true" by instrumenting the state it READS, not its own bookkeeping (issues #532/#537)
+
+A learner catch-up predicate (`RaftCore::learner_caught_up`, keyed on
+`match_index`) never firing under sustained write load looks, from the
+caller's side, like a bug in the *caller* — the reconciler loop that
+decides when to check it, the settle window around it, the promotion
+sequencing. None of that was where the defect lived. The actual root
+cause was two layers below the symptom, inside the shared `RaftCore`
+(`animus-control`) that both the control plane and the CP data plane
+reuse: `replicate_to` sending an unbounded, ever-growing `AppendEntries`
+tail on every propose, and (found investigating the same symptom further)
+`snapshot_upto` invalidating an in-flight chunked transfer on every
+compaction crossing. **The generalizable move**: when a predicate never
+turns true, don't start by auditing the code that calls it or the
+bookkeeping around when it's checked — instrument the *live state the
+predicate itself reads* (here, `match_index`/`snapshot_offset` on the
+actual `RaftCore`) and watch it over time. A pinned or oscillating value,
+observed directly, points straight at the mechanism that's supposed to
+move it — which can live in a completely different crate than the one
+whose loop looks broken.
+
+## A `ProdEnv`-only real-time race can be perturbed away by any unrelated timing change — a fast converging run right after adding diagnostics proves nothing (issues #532/#537)
+
+The learner-stall reproduction above is a genuine real-time race: it
+converges reliably in seconds under `SimEnv` (no CPU-time cost model) and
+under *any* incidental change to real scheduling on the `ProdEnv` host —
+a background admin poller, a tracing subscriber initialized before
+bring-up, even the act of adding an `eprintln!` diagnostic to the loop
+under investigation. Every one of those perturbations shifts relative
+timing just enough to let the lagging peer's round complete before the
+next overlapping resend piles more work on top of it — the exact
+mechanism the fix closes, momentarily avoided by luck instead of by
+structure. **The trap this creates**: after instrumenting a suspected
+`ProdEnv` livelock, the very next run frequently "just works" — and that
+run proves *nothing* about whether the underlying defect is fixed, only
+that this particular perturbed timing happened not to trigger it this
+time. The only honest validation for this class of bug is the
+**unmodified** reproduction, re-run **after** the diagnostics are removed
+(or on a pristine checkout of the fix), ideally several times to see the
+pre-fix failure rate before touching anything — see this same investigation's
+own ADR 0009 amendment for a case where even a real fix, validated this
+way, still left a residual, unexplained pass rate on one host: don't let
+one lucky green run — pre-fix, mid-investigation, or post-fix — stand in
+for a repeated, unmodified measurement.
+
+## A fix that clearly improves the mechanism does not guarantee the same end-to-end pass rate — report both, don't let one imply the other (issues #532/#537)
+
+Two independent, well-reasoned fixes to a shared Raft core (an
+`AppendEntries` batch cap, and deferring compaction while a peer's
+snapshot transfer is in flight) produced an unambiguous, large
+improvement in a controlled `SimEnv` comparison — a learner that used to
+plateau at a fixed `match_index` for an entire run now cleared 10x+ more
+of an identical backlog before the same write window ended, and a direct
+before/after toggle of each fix (batch cap alone, compaction-defer alone,
+both, neither) showed exactly the additive contribution each one made.
+That same fix, validated against the real, unmodified `ProdEnv` bench
+(`animusd/tests/cluster_gt_rf_split_bench.rs`) 3 times, converged fully in
+only 1 of 3 runs — an unchanged ratio from this same bench's own pre-fix
+baseline, despite the successful run itself completing in a comparable
+time to before. **The lesson**: a mechanism-level improvement (proven via
+a controlled, isolatable comparison) and an end-to-end pass-rate
+improvement (proven via repeated runs of the real, unmodified
+reproduction) are two different claims, and evidence for one is not
+evidence for the other — report both numbers honestly rather than letting
+a convincing mechanism-level story imply an end-to-end result that the
+actual repeated runs did not show. A residual, unidentified contributing
+factor is flagged as an open follow-up rather than smoothed into "fixed."

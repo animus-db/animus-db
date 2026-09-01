@@ -207,3 +207,130 @@ pre-vote rounds do not move the stable leader's term, and it rejoins on heal wit
 no election; a genuine leader crash still elects a new leader at a higher term).
 The pre-existing hand-driven election tests (`follower_visibility`,
 `install_snapshot`, `driver_applied_sm`) now drive the pre-vote round explicitly.
+
+## Amendment (2026-09-01): a lagging peer under sustained write load could
+never catch up — issues #532/#537, two cooperating fixes
+
+**The problem.** A per-tablet CP-data Raft group (this core, reused
+unchanged by `animus-cp-data`) under a **sustained per-item writer** could
+leave a freshly-added learner — or any peer that fell behind — permanently
+stalled: `match_index` pinned at a fixed value for an entire run while the
+leader's own log raced ahead (confirmed live via instrumented state; the
+idle-cluster equivalent of the identical scenario promotes in seconds — the
+stall tracks write load, not topology). Two independent, cooperating
+mechanisms, both in this shared core, were found and fixed:
+
+**1. Unbounded `AppendEntries` batches.** `replicate_to` shipped a lagging
+peer the ENTIRE outstanding tail (`next_index..=last_log_index`) in a
+single message, cloned fresh
+(`self.log.iter().filter(|e| e.index >= next).cloned().collect()`) on
+every call — and `replicate_now`'s wake-on-propose (ADR 0017's
+single-write-latency fix, above) re-invokes `broadcast_append`/
+`replicate_to` on **every single propose**, with no coalescing beyond the
+boolean `ProposeSignal`. Under a sustained writer, a lagging peer therefore
+received an unbounded sequence of ever-larger, overlapping `AppendEntries`
+messages, each re-cloning a growing tail on the leader's own consensus
+loop regardless of whether the peer had acked the previous one — real,
+unbounded per-propose CPU cost, confirmed to hang a `SimEnv` test process
+for minutes of real wall-clock time at a large enough log/propose count,
+despite `SimEnv` charging **zero** virtual time for it (a purely
+wall-clock pathology, matching this issue's own "real-time race" framing).
+
+**The fix**: `MAX_APPEND_ENTRIES_BATCH` caps the entries a single
+`AppendEntries` may carry — **512**. Derivation: the cap only has to stop
+unbounded growth, not minimize batch size — a real replication round (WAL
+append + `fsync` on the receiving peer) costs roughly the same wall-clock
+time whether it carries a dozen entries or a few hundred, so shrinking the
+cap much below "a real catch-up distance" only adds round trips (each
+still paying that fixed cost) without shrinking per-round work
+meaningfully — a net loss once round latency, not per-entry cloning, is
+the bottleneck (confirmed empirically: a small cap and no cap converged
+equally poorly against a disk-latency-throttled peer before this value was
+widened). `COMPACT_THRESHOLD`/`SNAPSHOT_THRESHOLD` (both 64, the
+CP-data-plane and control-plane compaction windows respectively) already
+bound how far behind this path is ever exercised before a peer falls back
+to the chunked `InstallSnapshot` path instead — 512 is comfortably above
+that window (one round trip in the common case) while orders of magnitude
+below the unbounded growth observed in the field (a leader's log racing
+past 25,000 entries while a stuck peer's own message kept growing to
+match). `handle_append_resp`'s success arm already re-invokes
+`replicate_to` immediately when more remains, so a peer needing several
+batches clears the backlog in back-to-back acked round trips, not one per
+external propose — this cap only bounds a *lagging* peer's traffic; an
+up-to-date peer's steady-state traffic is far under it and unaffected.
+
+**Seeding was investigated and found already sound — no change made.** A
+freshly-added learner's `next_index`/`match_index` are not explicitly
+seeded at `apply_config`/`log_append` time; `replicate_to` falls through to
+`next_index.get(&peer).copied().unwrap_or(1).max(1)`, i.e. `next = 1`. This
+is the same conservative default classic Raft uses for a peer with no
+known state, and is exactly correct for a genuinely fresh learner (which
+needs the whole log, or a snapshot if the log has already compacted past
+index 1): `replicate_to`'s own `next <= self.snapshot_index` check routes
+it to the (already-bounded, chunked) `InstallSnapshot` path automatically
+whenever the log has compacted past that default. A narrower, real gap
+exists — `next_index`/`match_index` entries are never cleared on
+`remove_learner`/`RemoveMember`, so re-adding the *same* `NodeId` later
+(uncommon in production; ids are not deliberately reused) could inherit a
+stale, too-high `next_index` and fall back to a slow one-at-a-time
+`handle_append_resp` decrement instead of starting fresh — flagged as a
+narrow, out-of-scope follow-up, not exercised by this issue's own
+reproduction.
+
+**2. Snapshot-transfer invalidation under repeated compaction (found
+investigating this same issue; the residual finding beyond the batch cap
+alone).** Once a peer falls far enough behind to need the chunked
+`InstallSnapshot` path, `snapshot_upto` — called by a `DRIVER_APPLIED`
+driver's own apply task whenever `COMPACT_THRESHOLD`/`SNAPSHOT_THRESHOLD`
+is crossed — unconditionally drops **every** in-flight transfer's own
+progress the instant the base moves again (`snapshot_blob = None`,
+`snapshot_offset.clear()`): correct and necessary, since the in-flight
+bytes were captured at the OLD base and shipping them mislabeled with a
+new `snapshot_index` would corrupt the receiver. Under sustained writes,
+ordinary threshold-triggered compaction can re-cross faster than a lagging
+peer's own multi-chunk transfer (network round trips, `SNAPSHOT_CHUNK_
+BYTES`-sized chunks) can complete — restarting it from chunk 0 against a
+newer, larger image, forever. A `SimEnv` reproduction confirmed this
+directly: with the batch cap alone, a learner made real initial progress
+via ordinary `AppendEntries`, then plateaued permanently the moment it fell
+back to the snapshot path (see `animus-cp-data/tests/
+learner_catchup_under_load.rs`).
+
+**The fix**: `RaftCore::snapshot_transfer_in_flight()` is a new pure
+accessor (`!self.snapshot_offset.is_empty()`) a `DRIVER_APPLIED` driver's
+own compaction gate now consults. `animus-cp-data`'s `apply_and_compact`
+defers a **threshold**-triggered base advance (never an `image_needed` one
+— a peer is actively waiting on that image, so it must always proceed)
+while some peer's transfer is genuinely in flight, up to
+`COMPACT_DEFER_CEILING` (`COMPACT_THRESHOLD * 8`) — a bounded emergency
+ceiling past which compaction proceeds regardless, so the WAL still bounds
+even against a dead/partitioned/hopelessly-outpaced peer's transfer that
+will never complete. This is a **policy** change in the driver only — the
+core's own `snapshot_upto` correctness argument (an advance always
+invalidates every in-flight transfer) is completely unchanged; the driver
+now simply calls it less often under one specific, bounded condition.
+
+**Both fixes are additive to the shared `RaftCore`** (a new capped-length
+slice in `replicate_to`, a new read-only accessor) and change no wire
+format, no persisted state, and no existing safety invariant (log
+matching, commit safety, the `InstallSnapshot` chunking/O(chunk) property
+above). Regression: `animus-cp-data/tests/learner_catchup_under_load.rs`
+(the `SimEnv` centerpiece — a sustained per-item writer against a
+disk-latency-throttled fresh learner, proven red with either fix reverted,
+green with both in place) plus the existing `ANIMUS_LEARNER_SEEDS`/
+`ANIMUS_INPLACE_SPLIT_SEEDS` corpora and the `ANIMUS_RAFTKV_SEEDS`
+linearizability corpus, all held green over the modified replication path.
+
+**Honest residual, not closed by this amendment**: the real `ProdEnv`
+end-to-end proof (`animusd/tests/cluster_gt_rf_split_bench.rs`, unmodified)
+converged fully in 1 of 3 runs on the validating host post-fix (5.75s to
+full convergence) — a clear, substantial improvement over the pre-fix
+mechanism (confirmed via the same `SimEnv` scenario: real progress that
+used to plateau at a fixed point now clears 10x+ more of the backlog
+before the run's own write window ends), but the other 2 of 3 runs still
+did not reach `done` within the bench's 240s budget, an unchanged ratio
+from this same bench's own pre-fix baseline. A third, not-yet-identified
+contributing factor on this specific host/workload shape is suspected;
+flagged here rather than smoothed over, per this ADR's own "not confirmed"
+discipline elsewhere in this file, and recommended as a dedicated
+follow-up investigation.
