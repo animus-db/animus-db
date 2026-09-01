@@ -3557,6 +3557,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().learner_caught_up(id, threshold)
     }
 
+    /// The byte offset `peer` has acked so far in an in-flight chunked
+    /// `InstallSnapshot` transfer this node is leading — see
+    /// [`RaftCore::snapshot_chunk_progress`].
+    pub fn snapshot_chunk_progress(&self, peer: &NodeId) -> Option<u64> {
+        self.lock().snapshot_chunk_progress(peer)
+    }
+
+    /// Lifetime count of genuine `InstallSnapshot` chunk advances this node
+    /// (while leading) has shipped to `peer` — see
+    /// [`RaftCore::snapshot_chunk_advances`].
+    pub fn snapshot_chunk_advances(&self, peer: &NodeId) -> u64 {
+        self.lock().snapshot_chunk_advances(peer)
+    }
+
     /// Add `id` as a **learner** of this tablet group (ADR 0058 Train 1): a
     /// new, non-voting member that catches up via the ordinary
     /// `AppendEntries`/`InstallSnapshot` path before ever being promoted —

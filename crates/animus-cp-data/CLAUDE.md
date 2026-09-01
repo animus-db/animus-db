@@ -1319,11 +1319,15 @@ demand the identical action, so no disambiguation is needed.
     against a transfer that will never complete. Policy lives entirely
     here, in the driver; the core's own correctness argument is unchanged.
     Regression: `tests/learner_catchup_under_load.rs` (proven red with
-    either this fix or the batch cap reverted, green with both). **Honest
-    residual**: the real `ProdEnv` end-to-end bench
-    (`animusd/tests/cluster_gt_rf_split_bench.rs`) still converged in only
-    1 of 3 runs on the validating host post-fix — see the ADR 0009
-    amendment for the full account, including the un-smoothed-over gap.
+    either this fix or the batch cap reverted, green with both). The real
+    `ProdEnv` end-to-end bench (`animusd/tests/
+    cluster_gt_rf_split_bench.rs`) still converged in only 1 of 3 runs on
+    the validating host with these first two fixes alone — closed by a
+    THIRD mechanism, unbounded `InstallSnapshot` chunk resend *frequency*
+    (`animus-control`'s `SnapshotResend` gate, ADR 0009's third 2026-09-01
+    amendment): 3 of 3 with all three fixes in place. See that amendment
+    for the full account and `animus-control/CLAUDE.md`'s matching entry
+    for the mechanism itself.
   - This is also where `engine_applied` vs `last_applied` (Key invariants)
     comes from.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/

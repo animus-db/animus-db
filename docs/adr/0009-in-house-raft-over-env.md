@@ -334,3 +334,128 @@ contributing factor on this specific host/workload shape is suspected;
 flagged here rather than smoothed over, per this ADR's own "not confirmed"
 discipline elsewhere in this file, and recommended as a dedicated
 follow-up investigation.
+
+## Amendment (2026-09-01): the third mechanism behind the residual —
+unbounded `InstallSnapshot` chunk resend FREQUENCY — issues #532/#537
+
+**The problem, confirmed the third contributing factor the previous
+amendment's residual flagged.** Once a peer's transfer falls onto the
+chunked `InstallSnapshot` path (above), `replicate_now`'s wake-on-propose
+calls `broadcast_append` for every peer on every propose, and for that peer
+`snapshot_chunk_for` re-sliced and re-sent whatever chunk was still
+outstanding **unconditionally**, on every one of those calls — resending
+the identical unacked chunk at write rate, long before the peer could
+possibly have acked the last one (confirmed live on an instrumented bench
+run: 96,451 `InstallSnapshot` chunk sends for only 196 real offset
+transitions, the tracked offset parked at a fixed value for the whole run).
+Compounding it, the ack-handler's own resend
+(`handle_install_snapshot_resp`) was equally unconditional: every response
+the flood provoked — including a duplicate, no-progress ack from a chunk
+the follower had already superseded — fed straight back into another
+resend, so the flood was self-sustaining once started, bounded only by
+round-trip time rather than by anything either caller controlled. Together
+this congested the peer's own single-consumer inbox badly enough that its
+transfer could not complete inside the previous amendment's own
+`COMPACT_DEFER_CEILING` window, so ordinary threshold-triggered compaction
+eventually invalidated it anyway and it restarted from chunk 0 — repeating
+forever under sustained write load, exactly the residual the previous
+amendment left open.
+
+**A second, independent defect surfaced building this fix, not previously
+suspected**: under the pre-fix flood's own overlapping in-flight sends,
+acks can reach the leader in an order that does not track real progress —
+an ack generated for an EARLIER, already-superseded request can be
+processed by the leader AFTER a LATER one that already advanced things
+further (both are genuine, freshly-generated acks; nothing here is
+stale/reordered network delivery, only overlapping *requests* completing
+out of sequence). `handle_install_snapshot_resp`'s bare
+`self.snapshot_offset.insert(from, next_offset)` let such an ack regress
+the leader's own tracked offset backward — confirmed directly by
+instrumenting the pre-fix code: 217 such regressions in a single run of
+`animus-cp-data/tests/learner_catchup_under_load.rs`, each stepping
+backward by exactly one chunk. The pre-fix flood's own sheer resend volume
+papered over this (enough brute-force duplicate sends eventually
+re-advanced past any transient regression anyway, at the cost of the flood
+itself) — which is precisely why a naive throttle regressed convergence
+before this second defect was found and fixed structurally (see the two
+rejected prototypes below).
+
+**The fix, two parts.** (1) `RaftCore::snapshot_offset`'s update in
+`handle_install_snapshot_resp` is now `entry(from).max(next_offset)` —
+monotonic regardless of ack arrival order, closing the regression above
+independent of any resend policy. (2) A new `SnapshotResend` gate bounds a
+resend of an **unchanged** offset — never a genuinely new one, which always
+ships immediately at every call site — per caller: `replicate_now`
+(wake-on-propose) gets `Capped(0)` (send once, then wait for real progress
+or a different trigger); `handle_install_snapshot_resp`'s own ack-driven
+resend gets `Capped(SNAPSHOT_ACK_RESEND_CAP = 8)`; every other trigger
+(heartbeat tick, a peer's own `AppendEntries` response, an explicit
+`WakeRequest`, a fresh leadership term) keeps `Always`, since each is
+already bounded by something other than write rate. `RaftCore::
+snapshot_chunk_sent` (the per-peer `(offset, resend-count)` marker this
+gates against) and `RaftCore::snapshot_chunk_advances` (a lifetime,
+test-observability-only counter of genuine advances, never resends) are
+both additive core state, cleared/removed at exactly the points
+`snapshot_offset` itself already is (per-peer on transfer completion,
+wholesale on `snapshot_upto` invalidation, on a fresh leadership term) —
+same discipline the `MAX_APPEND_ENTRIES_BATCH`/`snapshot_transfer_in_flight`
+fixes above used, no wire format or persisted-state change.
+
+**Two narrower prototypes were tried first and rejected** against
+`animus-cp-data/tests/learner_catchup_under_load.rs` (the learner never
+caught up): skipping a mid-snapshot peer from wake-on-propose entirely, and
+throttling wake-on-propose by propose *count* (1-in-2, 1-in-20). Building
+the fix that actually converges surfaced why both failed, and it is
+**not** what it first looked like: `replicate_now`'s own wake is a single
+coalesced `AtomicBool` (`ProposeSignal`), not a per-propose counter, so
+under that test's own tight synchronous burst-of-ten-proposes shape it
+already fires at most once per burst regardless of either throttle — the
+convergence-breaking mechanism in THAT test is entirely the ack-handler's
+own self-sustaining cascade above, which neither prototype's throttle ever
+touched, compounded by the monotonic-regression defect neither prototype
+was designed to catch. A genuinely stuck transfer needs *some* bounded
+number of ack-driven retries to escape before the next heartbeat — under
+sustained write load `heartbeat_deadline` is perpetually deferred by
+`replicate_now`'s own reset on every propose, so that backstop rarely fires
+in time on its own — which is why `Capped(0)` on the ack-handler's own call
+site (tried too) also regressed this test, and why `SNAPSHOT_ACK_RESEND_CAP`
+is a small nonzero bound rather than either extreme.
+
+**Message volume is measurable under `SimEnv` even though it costs nothing
+there** — a genuinely new finding for this repo's testing doctrine, not
+just this fix: a resend flood advances no virtual time and (with `SimEnv`'s
+default zero network/disk delay) can cost near-zero real time too, so a
+test that only watches convergence timing (`learner_catchup_under_load.rs`)
+cannot by itself prove a flood is bounded — it could regress back to
+thousands of redundant sends per real chunk without ever going red. The
+fix for that: `animus-cp-data/tests/snapshot_resend_bound.rs`, threading a
+recording `MetricsHandle` (ADR 0015, `Metric::CpSnapshotShips`, already
+existing) as the numerator and the new `snapshot_chunk_advances` accessor
+as the exact denominator — deliberately not periodic external polling of
+`snapshot_offset`, which an earlier draft of this test tried and found
+silently undercounts (a genuine advance can happen well inside a single
+millisecond once a transfer is flowing, and a coarser poll just misses
+it, inflating the measured ratio regardless of how effective the fix
+actually is). That test also found that the two workload shapes matter for
+which mechanism dominates: driving one propose per scheduler turn (`SimEnv`
+never coalescing `replicate_now`'s wake the way a synchronous burst does)
+reproduces the field's own per-write flood and shows `Capped(0)` on
+wake-on-propose alone already cutting sends-per-genuine-advance from
+several hundred (matching the field's own ~492-per-transition order of
+magnitude) down to roughly 90; adding the ack-handler's own
+`SNAPSHOT_ACK_RESEND_CAP` trims that further to a smaller but still
+comparable figure at this one seed — the real win of the ack-side cap is
+not this particular measurement but that it gives the mechanism a genuine
+STRUCTURAL worst case, where `Always` there has none of its own at all.
+
+Regression: `animus-cp-data/tests/learner_catchup_under_load.rs` (unchanged,
+stays green — the guard both rejected prototypes failed) and the new
+`animus-cp-data/tests/snapshot_resend_bound.rs` (red on the unfixed
+mechanism, several hundred sends per genuine chunk advance; green with
+this fix, comfortably under a small bound). Full suites
+(`animus-control`, `animus-cp-data`, `ANIMUS_LEARNER_SEEDS=25`,
+`ANIMUS_RAFTKV_SEEDS=5`) held green over the modified path. The real
+`ProdEnv` end-to-end bench (`cluster_gt_rf_split_bench.rs`, unmodified)
+converged fully in 3 of 3 runs on the validating host with this fix on top
+of the previous amendment's — closing the residual that amendment left
+open, on this host and workload shape.
