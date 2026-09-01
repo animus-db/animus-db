@@ -1,21 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="-43 -43 86 86" role="img" aria-label="AnimusDB">
-  <circle cx="-26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
-  <circle cx="-26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
-  <circle cx="-26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
-  <circle cx="-13.07" cy="-22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-23 -23 46 46" role="img" aria-label="AnimusDB">
   <circle cx="-15.5" cy="-8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
   <circle cx="-15.5" cy="8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
-  <circle cx="-13.07" cy="22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
-  <circle cx="0" cy="-30.19" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
   <circle cx="0" cy="-17.89" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
   <circle cx="0" cy="0" r="8" fill="oklch(0.550 0.195 255.0)"></circle>
   <circle cx="0" cy="17.89" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
-  <circle cx="0" cy="30.19" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
-  <circle cx="13.07" cy="-22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
   <circle cx="15.5" cy="-8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
   <circle cx="15.5" cy="8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
-  <circle cx="13.07" cy="22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
-  <circle cx="26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
-  <circle cx="26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
-  <circle cx="26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
 </svg>
