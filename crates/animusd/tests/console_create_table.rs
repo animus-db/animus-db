@@ -131,7 +131,7 @@ fn assert_no_cluster_shape(body: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_minimal_table_appears_in_tables_list() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let console_addr = node.console_addr();
@@ -214,7 +214,7 @@ async fn create_minimal_table_appears_in_tables_list() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_full_table_declares_everything_exactly() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let console_addr = node.console_addr();
@@ -314,7 +314,7 @@ async fn create_full_table_declares_everything_exactly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_rejects_a_duplicate_name() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let console_addr = node.console_addr();
@@ -357,7 +357,7 @@ async fn create_table_rejects_a_duplicate_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_rejects_an_lsi_with_no_sort_key() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let console_addr = node.console_addr();

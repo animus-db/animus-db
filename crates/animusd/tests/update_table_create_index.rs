@@ -237,7 +237,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn create_index_on_populated_table_backfills_live_and_pre_existing_rows() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
         let addr = node.dynamo_addr();
@@ -359,7 +359,7 @@ async fn create_index_on_populated_table_backfills_live_and_pre_existing_rows() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_table_create_validation_rejects_bad_index_declarations() {
     timeout(Duration::from_secs(60), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
         let addr = node.dynamo_addr();
@@ -439,7 +439,7 @@ async fn update_table_create_validation_rejects_bad_index_declarations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn update_table_create_rejects_past_the_gsi_cap() {
     timeout(Duration::from_secs(60), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(tmp.path(), animusd::StorageBackend::default()).await;
         let addr = node.dynamo_addr();
@@ -494,7 +494,7 @@ async fn update_table_create_rejects_past_the_gsi_cap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn update_table_create_via_a_non_leader_node_converges_on_every_node() {
     timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up(3, dir.path()).await;
         let leader = nodes.iter().position(Node::is_control_leader).unwrap();
         let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();

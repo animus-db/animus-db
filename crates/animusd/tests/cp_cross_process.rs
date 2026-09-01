@@ -111,7 +111,7 @@ async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
 async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
     let n = 3;
     // One node per process — each gets its own edge state via `run_node`.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
 
@@ -199,7 +199,7 @@ async fn cp_op_on_a_non_leader_node_is_forwarded_to_the_leader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn batch_write_on_a_non_leader_node_is_forwarded() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;
@@ -272,7 +272,7 @@ async fn batch_write_on_a_non_leader_node_is_forwarded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn second_table_forwards_across_processes() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let client = |i: usize| config.nodes[i].client;

@@ -14,7 +14,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{Node, StorageBackend};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -137,7 +136,7 @@ fn error_code(body: &str) -> String {
 /// the row, poll converged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_backup_round_trip_survives_table_drop_and_janitor_reclaims() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -318,7 +317,7 @@ async fn create_backup_round_trip_survives_table_drop_and_janitor_reclaims() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_backup_rejects_an_unknown_table() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -337,7 +336,7 @@ async fn create_backup_rejects_an_unknown_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_and_delete_backup_reject_an_unknown_arn() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -363,7 +362,7 @@ async fn describe_and_delete_backup_reject_an_unknown_arn() {
 /// reached `AVAILABLE` yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_backup_rejects_a_still_creating_backup() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;
@@ -407,7 +406,7 @@ async fn delete_backup_rejects_a_still_creating_backup() {
 /// (`Metadata::backups`' own `BTreeMap` order).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_backups_paginates_with_limit_and_cursor() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
     let addr = config.nodes[0].dynamo;
     await_bootstrap(&node).await;

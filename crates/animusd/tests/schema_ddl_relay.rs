@@ -91,7 +91,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn schema_ddl_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     // The control-plane leader, and a *different* node to issue DDL against.
@@ -233,7 +233,7 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     use animus_control::{StreamSpec, StreamViewType};
     use animus_tablet::TabletId;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
@@ -420,7 +420,7 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
 /// node happens to be the leader).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn update_time_to_live_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
@@ -517,7 +517,7 @@ async fn update_time_to_live_on_a_follower_is_relayed_to_the_leader() {
 /// on the relay allowlist, or this times out on exactly this shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn update_continuous_backups_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
@@ -619,7 +619,7 @@ async fn update_continuous_backups_on_a_follower_is_relayed_to_the_leader() {
 /// times out on exactly this shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
@@ -736,7 +736,7 @@ async fn delete_backup_on_a_follower_is_relayed_to_the_leader() {
 /// be the leader).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn create_backup_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();
@@ -820,7 +820,7 @@ async fn create_backup_on_a_follower_is_relayed_to_the_leader() {
 /// destination tablet).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn restore_table_from_backup_on_a_follower_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
 
     let leader = nodes.iter().position(Node::is_control_leader).unwrap();

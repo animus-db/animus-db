@@ -253,7 +253,7 @@ fn leader_index(nodes: &[Node]) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn decommission_drains_removes_and_allows_id_reuse() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. Bring up a 3-node core; write through it.
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
@@ -556,7 +556,7 @@ async fn raftkv_groups(admin_addr: SocketAddr) -> Vec<(u64, animus_env::NodeId, 
 /// (`tests/cluster_growth.rs`) proves for a bare-crash shrink.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn dashboard_health_recovers_after_decommission_shrink() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
@@ -747,7 +747,7 @@ async fn dashboard_health_recovers_after_decommission_shrink() {
 /// then confirm the *same* `/admin/member/remove` call now succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn decommission_refuses_live_control_voter_then_succeeds_after_control_remove() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. Bring up a 3-node combined core (control voters {0,1,2}).
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;

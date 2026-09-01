@@ -288,7 +288,7 @@ async fn await_cutover_of(node: &Node, table: &str, parent: u64, budget: Duratio
 async fn bench_inplace_split_serve_latency_and_cutover_blip() {
     const N: usize = 2_000;
     timeout(Duration::from_secs(600), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_inplace(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 

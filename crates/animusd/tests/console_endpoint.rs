@@ -57,7 +57,7 @@ async fn raw(addr: SocketAddr, path: &str) -> (u16, String, String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
 
@@ -146,7 +146,7 @@ async fn console_serves_shell_assets_and_deep_links_on_combined_node() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn console_serves_shell_on_data_only_node() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (control_nodes, data_nodes, config) = support::bring_up_split(1, 1, dir.path()).await;
         support::await_leader(&control_nodes).await;
         let data_raftkv_ids: Vec<animus_env::NodeId> =
@@ -186,7 +186,7 @@ async fn console_serves_shell_on_data_only_node() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[should_panic(expected = "this node has no data role")]
 async fn console_addr_panics_on_control_only_node() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (control_nodes, data_nodes, _config) = support::bring_up_split(1, 1, dir.path()).await;
     support::await_leader(&control_nodes).await;
 

@@ -285,7 +285,7 @@ fn txn_key(prefix: &str, suffix: &str) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_abort() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;
@@ -459,7 +459,7 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn recovery_resolve_correctly_commits_both_tablets_of_a_two_tablet_transaction() {
     let n = 3;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(n, dir.path()).await;
     await_bootstrap(&nodes).await;
     let addr0 = config.nodes[0].client;

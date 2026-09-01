@@ -24,7 +24,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{ClientRequest, ClientResponse, Node, StorageBackend};
-use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -91,7 +90,7 @@ async fn stop(node: Node) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn data_survives_node_restart_on_disk() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     // --- First incarnation: write a durable key, then shut down cleanly. ---
@@ -181,7 +180,7 @@ async fn data_survives_node_restart_on_disk() {
 /// read is a converged-or-timeout poll, not a one-shot assert.
 #[tokio::test(flavor = "multi_thread")]
 async fn acked_write_survives_memory_backend_restart_via_raft_wal() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::Memory).await;

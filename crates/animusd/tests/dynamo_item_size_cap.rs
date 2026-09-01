@@ -125,7 +125,7 @@ fn large_but_legal_item(id: &str) -> String {
 /// write at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_item_rejects_a_post_update_result_over_the_cap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = support::start_single_node(dir.path(), StorageBackend::Memory).await;
     let addr = node.dynamo_addr();
 
@@ -179,7 +179,7 @@ async fn update_item_rejects_a_post_update_result_over_the_cap() {
 /// rather than something duplicated (and possibly missed) per call site.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transact_write_items_update_action_rejects_a_post_update_result_over_the_cap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (node, _config) = support::start_single_node(dir.path(), StorageBackend::Memory).await;
     let addr = node.dynamo_addr();
 

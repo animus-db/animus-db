@@ -342,7 +342,7 @@ async fn live_voters_leader(nodes: &[Node], tablet: u64) -> Option<(Vec<String>,
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
     timeout(Duration::from_secs(150), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (mut nodes, config) = bring_up_inplace(3, dir.path()).await;
         await_bootstrap(&nodes).await;
 

@@ -255,7 +255,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn node_joins_via_seed_with_no_expanded_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     // 1. Bring up a 3-node config core; create tables + write through it.
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;

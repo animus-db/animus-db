@@ -196,7 +196,7 @@ fn now_secs() -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn table_with_no_stream_reports_the_honest_disabled_answer() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -255,7 +255,7 @@ async fn table_with_no_stream_reports_the_honest_disabled_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_enabled_lists_shards_and_records_reflect_real_writes() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -368,7 +368,7 @@ async fn stream_enabled_lists_shards_and_records_reflect_real_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_once() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
@@ -486,7 +486,7 @@ async fn walking_a_shard_with_next_shard_iterator_visits_every_record_exactly_on
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_deletion_carries_the_service_user_identity_through_the_console() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) = start_single_node_fast_ttl(&dir.path().join("n")).await;
         let dynamo_addr = node.dynamo_addr();
         let console_addr = node.console_addr();

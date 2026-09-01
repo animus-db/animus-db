@@ -267,7 +267,7 @@ async fn await_replica(nodes: &[Node], id: &animus_env::NodeId, secs: u64) -> St
 /// and serves reads/writes both through itself and through the core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn no_node_join_becomes_active_and_gets_a_replica() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
@@ -308,7 +308,7 @@ async fn no_node_join_becomes_active_and_gets_a_replica() {
 /// by construction for the allocated path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn two_concurrent_allocated_joins_get_distinct_ids() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
@@ -358,7 +358,7 @@ async fn two_concurrent_allocated_joins_get_distinct_ids() {
 /// becomes `Active` and gains a real replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (control_nodes, data_nodes, _config) = support::bring_up_split(3, 2, dir.path()).await;
     support::await_leader(&control_nodes).await;
@@ -405,7 +405,7 @@ async fn data_only_allocated_join_becomes_active_and_gets_a_replica() {
 /// member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;
@@ -491,7 +491,7 @@ async fn ephemeral_identity_restart_gets_a_new_id_old_left_down_and_prunable() {
 /// expires, indistinguishable from "no seed answered").
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn follower_connected_seed_completes_the_allocate_node_id_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
 
     let (core_nodes, core_config) = bring_up(3, dir.path()).await;
     await_bootstrap(&core_nodes).await;

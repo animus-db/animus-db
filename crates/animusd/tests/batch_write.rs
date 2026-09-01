@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 use animusd::{Node, StorageBackend};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -98,7 +97,7 @@ fn batch_put_body_range(table: &str, start: usize, end: usize) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_write_round_trip_survives_restart() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
 
     let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
@@ -166,7 +165,7 @@ async fn batch_write_round_trip_survives_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batched_write_beats_per_key() {
     timeout(Duration::from_secs(60), async {
-        let dir = TempDir::new().unwrap();
+        let dir = support::panic_safe_tempdir();
         let node_dir = dir.path().join("node-0");
         let (node, config) = support::start_single_node(&node_dir, StorageBackend::default()).await;
         let dynamo_addr = config.nodes[0].dynamo;

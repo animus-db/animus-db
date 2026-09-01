@@ -223,7 +223,7 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn dropped_table_data_is_reclaimed_including_split_child() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (nodes, config, dirs) = bring_up(1, tmp.path()).await;
         await_bootstrap(&nodes).await;
         let client = nodes[0].client_addr();
@@ -363,7 +363,7 @@ async fn dropped_table_data_is_reclaimed_including_split_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn every_replica_reclaims_a_dropped_tables_files() {
     timeout(Duration::from_secs(120), async {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = support::panic_safe_tempdir();
         let (nodes, _config, dirs) = bring_up(3, tmp.path()).await;
         await_bootstrap(&nodes).await;
 

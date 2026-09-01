@@ -110,7 +110,7 @@ async fn fetch_tables(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tables_endpoint_projects_the_schema_catalog_correctly() {
     timeout(Duration::from_secs(30), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (node, _config) =
             support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
         let dynamo_addr = node.dynamo_addr();
