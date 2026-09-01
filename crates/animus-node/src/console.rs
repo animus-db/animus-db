@@ -64,6 +64,18 @@ pub struct KeySummary {
 /// `GlobalSecondaryIndexUpdates` decoder ignores `AttributeDefinitions`
 /// outright. Issue #319 covers both paths.
 ///
+/// **Only the wire-level `DescribeTable` echo half of #319 has since been
+/// fixed** (`animus_dynamo::wire::attribute_definitions` now lists every
+/// index key attribute, not just the base table's own — real DynamoDB's
+/// own `AttributeDefinitions` contract) — but it does so by rendering the
+/// same `key_types`-absent `"S"` placeholder every other untyped attribute
+/// already got, **not** by recording a genuine type anywhere; nothing
+/// upstream of that response builder changed. `IndexDef` still has no type
+/// field, so this struct's `Option` is unaffected and still correctly
+/// `None` for every index-only key attribute — restoring a real picker
+/// here still needs the type actually made durable first, exactly as this
+/// doc already said.
+///
 /// `None` renders as a bare attribute name rather than a fabricated `(S)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IndexKeySummary {
