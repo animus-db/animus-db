@@ -958,6 +958,12 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // directly by the placement reconciler off its own live `RaftNode`
         // handle, never through the wire relay.
         MetaCommand::CasTabletReplicas { .. } => false,
+        // Directed-Placing dwell-gated retarget (ADR 0062 §2, issue #528
+        // fix): proposed directly by the control-plane leader's own
+        // `reconcile_loop` off its own live `RaftNode` handle — the same
+        // class as `CasTabletReplicas` just above, never a tablet leader's
+        // own report (that's `MarkSplitPlacingDone`, which IS relayable).
+        MetaCommand::RetargetSplitPlacing { .. } => false,
         // See this function's own doc: destructive/housekeeping actions
         // whose only sanctioned caller already holds a live `RaftNode`
         // handle (or, for `RemoveMember`, is deliberately local-leader-only)
@@ -1412,6 +1418,11 @@ mod tests {
                 tablet: TabletId(1),
                 expected_epoch: Epoch::INITIAL,
                 replicas: vec![],
+            },
+            MetaCommand::RetargetSplitPlacing {
+                tablet: TabletId(2),
+                expected_epoch: Epoch::INITIAL,
+                target: Some(vec![nid(1)]),
             },
             MetaCommand::ExpireStreamShards {
                 rows: vec![],

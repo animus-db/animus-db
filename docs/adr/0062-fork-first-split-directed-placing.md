@@ -1008,3 +1008,114 @@ positively rules out a regression in write availability (zero retries,
 both configurations, every run) and leaves the fork-to-Active/write-blip
 comparison as a genuinely open question a wider-than-RF bench would need
 to answer.
+
+## Amendment (2026-09-01): §3's completion loop never fires under load — issue #528, root cause and fix
+
+**Symptom.** Under sustained write load with real host/CPU contention (not
+reproducible under light `SimEnv` conditions), a split child's
+`split_placing` entry could stay un-`done` indefinitely — the §3
+completion loop (`animusd::split_placing_completion`) never observed the
+convergence predicate it needs (`group.config() == t.replicas`, no
+learners, held for `SPLIT_PLACING_DONE_SETTLE`) because that predicate
+never actually held for long enough to settle.
+
+**Root cause: §2's third reconcile-loop phase (`Metadata::
+split_placing_reconcile`) recomputed `select_replicas` **fresh, off
+current membership, every single tick** — the design this ADR's original
+§2 text explicitly called for ("never trust or persist `SplitPlacing::
+target`... always recomputing `select_replicas` fresh"). Under sustained
+load, `animus-control`'s ordinary failure detector (ADR 0012) flaps
+members `Active`↔`Down` at a sub-second timescale (confirmed: dozens of
+`UpsertMember{Down}` proposals per node within a 240s window, momentarily
+all four candidates `Down` at once) — each flip changes which members
+`active_candidates` offers the placement engine, so `select_replicas`
+picks a **different** target essentially every tick (confirmed: the
+computed target flapped between two 3-of-4 candidate sets four times in
+~130 reconcile ticks). Each retarget bumps the child's epoch via a fresh
+`CasTabletReplicas` and restarts `animus-cp-data`'s `reconfigure_step`
+learner-phased sequencing (add-learner → catch-up → promote → remove)
+from scratch against a **new** node — the target moved faster than the
+mover could ever complete one cycle, a livelock one layer below both §2's
+own (otherwise-correct) per-tick logic and §3's own (otherwise-correct)
+completion predicate. A secondary, compounding finding: the ordinary
+repair phase (`Metadata::reconcile`) was **not** excluded for an un-done
+`split_placing` tablet, so it could independently propose a competing
+`CasTabletReplicas` for the same tablet in the same tick (harmless in
+isolation — the loser's CAS just rejects — but additional avoidable
+churn on top of the primary livelock).
+
+**Fix, implemented in `animus-control`** (issue #528, PR TBD by the
+orchestrator):
+
+1. **`SplitPlacing::target` is now authoritative, not a write-once
+   diagnostic.** The third reconcile phase drives toward the STORED target
+   **verbatim** while every one of its members is currently `Active` —
+   it no longer recomputes `select_replicas` on a healthy target at all,
+   which is what makes the target itself stop flapping.
+2. **A transiently-`Down` target member pauses the drive, never
+   retargets.** If any stored-target member is not currently `Active`,
+   the phase proposes nothing for that tablet this tick — never a
+   `CasTabletReplicas` toward a target with a dead member, and never an
+   immediate retarget either.
+3. **A genuinely-dead target member re-targets only past a dwell.**
+   `animus-control::node`'s `reconcile_loop` now tracks, per
+   `(tablet, target-member)`, how long that member has been
+   **continuously** non-`Active` (`env.now()`-keyed, `BTreeMap`, never
+   wall clock, never `HashMap` — the workspace's determinism rules apply
+   here exactly as everywhere else). Only once that duration exceeds
+   [`SPLIT_PLACING_RETARGET_DWELL`] (5s — ten times the failure detector's
+   own `DETECT_TIMEOUT`, comfortably past the sub-second flap noise this
+   incident's own investigation measured, and past the pre-existing
+   `SPLIT_PLACING_DONE_SETTLE` precedent of 1.5s for "how long an
+   observation must hold before it's trusted") does the leader recompute —
+   via [`replan`], not `select_replicas`, so a still-`Active` survivor of
+   the old target is kept and only the genuinely-gone member is replaced,
+   minimizing churn exactly the way ordinary repair already does for any
+   other tablet — and propose the result as a new, **replicated**
+   command, `MetaCommand::RetargetSplitPlacing { tablet, expected_epoch,
+   target }` (epoch-CAS'd against the child's own current epoch, the
+   `MarkSplitPlacingDone` discipline), rather than reaching for
+   `CasTabletReplicas` directly. Replicating the retarget itself is what
+   makes the new value stable for every subsequent tick and every replica
+   (including a newly elected leader), instead of re-deciding it locally
+   every time. `target: None` (unsatisfiable at cutover) keeps its
+   original "no stored value to protect, so keep retrying every tick"
+   stance — a successful recomputation there now *establishes* the first
+   stored target via the same command, rather than leaving the
+   diagnostic stuck at `None` forever once the live replicas converge.
+4. **Repair (`Metadata::reconcile`) now excludes any un-done
+   `split_placing` tablet**, the identical exclusion `rebalance_placement`
+   already had — the dwell-gated placing phase is the sole mover for that
+   tablet until `done`, closing the secondary compounding race named
+   above.
+
+`MetaCommand::RetargetSplitPlacing` is **not** on `is_relayable_command`'s
+allowlist (`animus-node::wire`) — like `CasTabletReplicas`, it is proposed
+directly by the control-plane leader off its own live `RaftNode` handle,
+never relayed from a follower.
+
+**What did NOT change**: §3's completion loop itself
+(`animusd::split_placing_completion`), its settle tracker, its leader
+gate, and `MarkSplitPlacingDone`'s own epoch-CAS — all correct as
+designed; the predicate they wait on simply never used to hold long enough
+to observe. `tests/split_placing_completion.rs` (`animusd`) stays green
+unmodified and is now a stronger proof than it was before this fix: it
+demonstrates the completion loop actually firing under the corrected §2
+mechanism, not merely that its own isolated logic is sound.
+
+**Regressions**: `crates/animus-control/src/meta.rs`'s unit tests
+(`split_placing_reconcile_does_not_retarget_on_a_flap`,
+`split_placing_reconcile_pauses_while_a_target_member_is_down_and_not_
+ready`, `split_placing_reconcile_retargets_once_ready_keeping_live_
+survivors`, the `retarget_split_placing_*` apply-arm suite, and
+`reconcile_skips_an_undone_split_placing_tablet_even_with_a_down_
+replica`) and `crates/animus-control/tests/placement_split_placing.rs`'s
+two new node-level, real-`reconcile_loop`-driven tests
+(`split_placing_phase_retargets_a_member_down_past_the_dwell`,
+`split_placing_phase_flapping_under_the_dwell_does_not_retarget`) —
+the latter proving the dwell gate live over `SimEnv`, not merely asserted
+from the pure decision function in isolation.
+
+See `docs/engineering-lessons.md`'s matching entry for the generalizable
+lesson this incident teaches about auditing a convergence loop's *inputs*,
+not just its own internal logic.

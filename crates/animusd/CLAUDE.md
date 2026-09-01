@@ -2762,6 +2762,24 @@ route below the edge through the same `ClientCtx` CP primitives.
   This loop's own convergence predicate reaches `done` for a
   multi-replica-difference target exactly like a one-replica one; no
   known gap remains.
+
+  **Issue #528 (this loop's own predicate never firing under sustained
+  load) was root-caused and fixed entirely in `animus-control` — this
+  file's own logic, settle tracker, and leader gate are unchanged.** The
+  actual defect was one layer below: the §2 reconcile-loop phase this
+  loop's own predicate depends on (`Metadata::split_placing_reconcile`)
+  used to recompute `select_replicas` fresh every tick, which under real
+  failure-detector flap moved the target itself faster than
+  `reconfigure_step` could ever converge — so `group.config() ==
+  t.replicas` simply never held long enough to settle, regardless of how
+  correct this loop's own settle-window logic was. Fixed by making
+  `split_placing[..].target` authoritative (driven toward verbatim while
+  healthy, dwell-gated before a genuinely-dead member triggers a
+  REPLICATED retarget) — see `crates/animus-control/CLAUDE.md`'s ADR 0062
+  entry and ADR 0062's 2026-09-01 amendment for the full mechanism.
+  `tests/split_placing_completion.rs` stays green, unmodified, and is now
+  a stronger proof than before: it demonstrates this loop actually firing
+  under the corrected upstream mechanism.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
