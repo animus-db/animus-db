@@ -236,9 +236,13 @@ async fn index_backfill_converges_to_active_once_every_tablet_reports() {
     // A table's second (and later) tablet only ever comes from a split
     // (ADR 0023/0044) — mint a genuine sibling so this test exercises a
     // real ≥2-tablet completion set, not a degenerate single-tablet one.
+    // This is topology scaffolding on an empty table only (ADR 0062: an
+    // in-place split's children inherit the parent's own replicas
+    // verbatim — the parent here has none, so the empty `Vec::new()`s
+    // below are still correct) — nothing here exercises the fork itself.
     call(
         client,
-        ClientRequest::ProposeSchema(MetaCommand::BeginSplit {
+        ClientRequest::ProposeSchema(MetaCommand::BeginSplitInPlace {
             parent: TabletId(500),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),
@@ -376,10 +380,12 @@ async fn a_tablet_that_appears_before_the_flip_blocks_it_until_it_also_reports()
 
     // A new tablet appears (a real split) before any tick could have
     // observed "every current tablet reported" as anything but momentarily
-    // true — from this point on, completion needs the child too.
+    // true — from this point on, completion needs the child too. Topology
+    // scaffolding only (empty table; ADR 0062's verbatim-replicas rule is
+    // trivially satisfied since the parent has none).
     call(
         client,
-        ClientRequest::ProposeSchema(MetaCommand::BeginSplit {
+        ClientRequest::ProposeSchema(MetaCommand::BeginSplitInPlace {
             parent: TabletId(600),
             expected_epoch: Epoch::INITIAL,
             split_key: b"m".to_vec(),

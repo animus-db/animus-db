@@ -249,16 +249,17 @@ async fn system_table_lists_every_seeded_entity_kind() {
         )
         .await;
 
-        // ---- SplitLineage: a copy-based split round --------------------------
-        // ADR 0050: Begin+Cutover on the (empty) bootstrap tablet — this
-        // test only asserts the SYSTEM keyspace's entity kinds (including
-        // `split_lineage`), never post-split data placement.
+        // ---- SplitLineage: an in-place split round ---------------------------
+        // ADR 0058/0062: BeginSplitInPlace+Cutover on the (empty) bootstrap
+        // tablet, children inheriting the parent's own replicas verbatim —
+        // this test only asserts the SYSTEM keyspace's entity kinds
+        // (including `split_lineage`), never post-split data placement.
         let meta = node.metadata();
         let source = animus_tablet::TabletId(1);
         let expected_epoch = meta.tablets[&source].epoch;
         let replicas = meta.tablets[&source].replicas.clone();
         let new_id = meta.next_free_tablet_id();
-        let cmd = animus_control::MetaCommand::BeginSplit {
+        let cmd = animus_control::MetaCommand::BeginSplitInPlace {
             parent: source,
             expected_epoch,
             split_key: b"m".to_vec(),
