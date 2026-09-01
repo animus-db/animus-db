@@ -2748,13 +2748,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   directly, so a live `split_placing` entry (and its `done` flag) is
   visible for free, the same "derive from already-replicated state, don't
   build a bespoke view" discipline every other diagnostic here follows.
-  **Known limitation carried forward, not this loop's to fix** (issue
-  #513): the loop's own convergence predicate is correct, but the
-  `reconfigure_step` convergence it observes can itself oscillate
-  indefinitely for a two-(or-more)-replica-difference target — so a child
-  whose fresh `select_replicas` target differs from its fork-inherited
-  replicas by more than one replica may never reach `done` at all, not
-  just slowly.
+  **Issue #513 (a suspected `reconfigure_step` oscillation for a
+  two-(or-more)-replica-difference target) was investigated and closed as
+  not reproducible** — see `crates/animusd/tests/
+  split_placing_two_replica_diff_e2e.rs`, `crates/animus-cp-data/tests/
+  reconfigure_multi_replica_diff.rs`, and `docs/engineering-lessons.md`.
+  This loop's own convergence predicate reaches `done` for a
+  multi-replica-difference target exactly like a one-replica one; no
+  known gap remains.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

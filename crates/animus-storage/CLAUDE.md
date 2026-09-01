@@ -398,6 +398,51 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   under a racing writer and, since the 2026-08-26 starvation fix, that
   `clone_to` *completes* promptly against a writer that never pauses for
   the whole call).
+- **`LsmEngine::clone_to_filtered(target_prefix, keep)` (ADR 0058 fork
+  closed, 2026-08-31) is `clone_to`'s range/kind-aware sibling — the
+  primitive `clone_to` itself now wraps** (`clone_to`'s own `keep` is just
+  `[([], None)]`, one range covering the whole keyspace, so it shares
+  `clone_to_filtered`'s exact cut/crash-safety contract unchanged). `keep`
+  is a set of half-open physical-key ranges (`(start, end)`, `end: None`
+  meaning unbounded above — the same convention `approx_bytes_in_range`
+  already uses). **Whole-file assignment**: a source SSTable whose own
+  `[min_key, max_key]` — already recorded in `SsTableMeta` at
+  flush/compaction time, so this needed no manifest format change and no
+  extra disk read — falls entirely outside every `keep` range is never
+  linked into the target's namespace at all (the free functions
+  `table_overlaps_keep`/`key_in_keep` in `lsm.rs`, unit-tested directly in
+  `lsm.rs`'s own `clone_filter_tests` module, are the extracted
+  predicates); a table straddling a `keep` boundary is still linked
+  **whole** — a caller's own post-clone `delete_range` trim step already
+  expects and correctly handles this (trimming a table that was never
+  linked is a harmless no-op on an absent range). The leftover-memtable
+  snapshot is filtered the identical way, key by key. Born to close ADR
+  0058's own rung-2 "full clone then trim" deferral (its G2 residual):
+  materializing an in-place split child (`animus-cp-data::host::
+  materialize_split_child`) now passes the child's own keep-set (its
+  declared range sliced through `KIND_BASE`/`KIND_LSI`/`KIND_FOOTPRINT`,
+  nothing of `KIND_CHANGE`/`KIND_CURSOR`) — closing the cold-child
+  dead-space debt (a sibling-half table is never linked, so there is
+  nothing left for that child's own compaction to eventually reclaim), the
+  per-engine size-accounting double-count across a split's two children,
+  and bounding (not eliminating — a straddling table still ships whole)
+  the disjoint-home learner's `InstallSnapshot` bytes. `EngineFactory::
+  clone_engine` (`animus-cp-data`) carries the analogous `keep` parameter;
+  `MemoryEngine`'s implementor ignores it (no per-file dead space to save
+  for an in-memory engine, and the caller's own trim step still runs
+  immediately after and makes the result correct either way). Tests:
+  `tests/lsm_clone_filtered.rs` (whole-file exclusion/straddling-file-
+  kept-whole via `SimEnv`, by `sstable_count()`/`sstable_views()` — not
+  just row content; crash-mid-clone safety through the filtered entry
+  point), `tests/lsm_clone_filtered_concurrent.rs` (real multi-thread
+  `ProdEnv`, mirroring `lsm_clone_concurrent.rs`'s own rationale — the
+  leftover-memtable filtering path specifically needs a genuine race,
+  since `clone_to_filtered`'s own internal `flush()` unconditionally
+  drains a non-empty memtable when nothing else is concurrently writing,
+  which is always true under `SimEnv`'s single-threaded, non-yielding disk
+  model), and `animus-cp-data/tests/inplace_split_dead_space.rs` (the
+  end-to-end, file-level proof over a real in-place split fork — see that
+  crate's own `CLAUDE.md`).
 - **Observability (ADR 0015) is observe-only and deterministic.** `LsmEngine`
   records `storage_*` counters through the `Env` metrics seam at the real LSM site
   that knows the outcome: a flush *after* its manifest swap (`storage_flushes`); a
