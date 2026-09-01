@@ -1096,6 +1096,23 @@ pub const RECOVERY_GRACE: Duration = Duration::from_secs(5);
 /// entries have been applied past the current snapshot base, bounding the WAL.
 const COMPACT_THRESHOLD: u64 = 64;
 
+/// Issues #532/#537's second finding: `RaftCore::snapshot_upto` unconditionally
+/// invalidates every peer's in-flight chunked `InstallSnapshot` transfer the
+/// moment the base moves again (required for correctness — see that method's
+/// own doc). Under a sustained write stream, ordinary `COMPACT_THRESHOLD`
+/// pressure can re-cross before a lagging peer's own transfer (network round
+/// trips, `SNAPSHOT_CHUNK_BYTES`-sized chunks) finishes, restarting it from
+/// chunk 0 against a newer, larger image forever — confirmed live (a
+/// learner's own `match_index` pinned for an entire run while the leader's
+/// log kept growing). This is the ceiling on how far a threshold-triggered
+/// compaction may be DEFERRED (below `apply_and_compact`'s own gate) to give
+/// an in-flight transfer a real chance to land before the next threshold
+/// crossing yanks it away again — a multiple of `COMPACT_THRESHOLD`, not a
+/// replacement for it, so the WAL still bounds even if a peer's transfer
+/// never completes (dead, partitioned, or hopelessly outpaced): compaction
+/// always proceeds once `behind` reaches this, transfer or not.
+const COMPACT_DEFER_CEILING: u64 = COMPACT_THRESHOLD * 8;
+
 /// [`RaftKvNode::reconfigure_step`]'s promotion-readiness threshold (ADR 0058
 /// Train 1's reconciler adoption): a learner within this many log entries of
 /// the leader's own `last_log_index()` (see
@@ -3538,6 +3555,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// trigger a promotion.
     pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
         self.lock().learner_caught_up(id, threshold)
+    }
+
+    /// The byte offset `peer` has acked so far in an in-flight chunked
+    /// `InstallSnapshot` transfer this node is leading — see
+    /// [`RaftCore::snapshot_chunk_progress`].
+    pub fn snapshot_chunk_progress(&self, peer: &NodeId) -> Option<u64> {
+        self.lock().snapshot_chunk_progress(peer)
+    }
+
+    /// Lifetime count of genuine `InstallSnapshot` chunk advances this node
+    /// (while leading) has shipped to `peer` — see
+    /// [`RaftCore::snapshot_chunk_advances`].
+    pub fn snapshot_chunk_advances(&self, peer: &NodeId) -> u64 {
+        self.lock().snapshot_chunk_advances(peer)
     }
 
     /// Add `id` as a **learner** of this tablet group (ADR 0058 Train 1): a
@@ -7671,18 +7702,29 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // transfer is in flight. A `KvState` WAL snapshot record carries only the unit
     // placeholder, so the threshold rewrite never needed the image bytes.
     let ea = engine_applied.load(Ordering::SeqCst);
-    let (behind, image_needed) = {
+    let (behind, image_needed, transfer_in_flight) = {
         let mut c = core.lock().expect("raftkv core poisoned");
         (
             ea.saturating_sub(c.snapshot_index()),
             c.take_snapshot_needed(),
+            c.snapshot_transfer_in_flight(),
         )
     };
+    // Issues #532/#537: a THRESHOLD-triggered base advance (never an
+    // `image_needed` one — a peer is actively waiting on that image, so it
+    // must always proceed) is deferred while some peer's chunked transfer is
+    // genuinely in flight, unless `behind` has grown enough that the WAL
+    // itself needs bounding regardless (`COMPACT_DEFER_CEILING`, that
+    // constant's own doc has the full reasoning). Below the ceiling this
+    // gives a real in-flight transfer a window to land before the next
+    // threshold crossing would otherwise yank it back to chunk 0 forever.
+    let threshold_hit =
+        behind >= COMPACT_THRESHOLD && (!transfer_in_flight || behind >= COMPACT_DEFER_CEILING);
     // Skip compaction once a shutdown is requested: it is only a WAL-bounding
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
-    if (behind >= COMPACT_THRESHOLD || image_needed) && !halted.load(Ordering::SeqCst) {
+    if (threshold_hit || image_needed) && !halted.load(Ordering::SeqCst) {
         // The on-demand image: a slow whole-engine scan, done with no locks held,
         // and only when a follower is actually waiting on a snapshot.
         let image = if image_needed {

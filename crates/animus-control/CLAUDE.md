@@ -896,6 +896,64 @@ per-tablet CP data plane (`animus-cp-data`).
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
 
+  **`replicate_to`'s `AppendEntries` batch is capped, not unbounded
+  (issues #532/#537, ADR 0009's 2026-09-01 amendment).**
+  `MAX_APPEND_ENTRIES_BATCH` (512, derivation in that constant's own doc)
+  bounds how many entries a single `AppendEntries` to a lagging peer may
+  carry — without it, `replicate_to` shipped the ENTIRE outstanding tail
+  every call, and `replicate_now`'s wake-on-propose (`animus-cp-data`'s own
+  driver, re-invoked on every single write) resent that unbounded, growing
+  tail on every propose, real unbounded CPU cost regardless of whether the
+  peer had acked the last one. `RaftCore::snapshot_transfer_in_flight()` is
+  the companion accessor a `DRIVER_APPLIED` driver's own compaction gate
+  consults to avoid a second, independent pathology once a peer falls back
+  to the chunked snapshot path — see `animus-cp-data/CLAUDE.md`'s
+  `COMPACT_DEFER_CEILING` entry for that half; this core only supplies the
+  fact, the policy lives entirely in the driver. See the ADR amendment for
+  the full mechanism and honest residual.
+
+  **A resend of an already-outstanding chunk is bounded per caller, not
+  unconditional (issues #532/#537, ADR 0009's THIRD 2026-09-01
+  amendment — the residual the batch-cap/compaction-defer fixes above left
+  open).** `snapshot_chunk_for` used to unconditionally re-slice and
+  re-send whatever chunk was still outstanding for a peer on every call,
+  from every caller — under a sustained proposer this meant the SAME
+  unacked chunk shipped again and again at write rate (confirmed live:
+  96,451 sends for 196 real offset transitions), and the ack-handler's own
+  equally-unconditional resend turned every response the flood provoked,
+  including a no-progress duplicate ack, into another send — a
+  self-sustaining loop bounded only by round-trip time. A `SnapshotResend`
+  gate now bounds a resend of an UNCHANGED offset per call site: `Capped(0)`
+  for `replicate_now` (wake-on-propose — fires on every write, so it may
+  never resend without new progress), `Capped(SNAPSHOT_ACK_RESEND_CAP)` for
+  `handle_install_snapshot_resp`'s own ack-driven resend (a small, nonzero
+  bound — see that constant's own doc for why neither `0` nor unbounded
+  works there), and `Always` everywhere else (heartbeat tick, a peer's own
+  `AppendEntries` response, `WakeRequest`, a fresh leadership term — each
+  already bounded by something other than write rate). A genuinely NEW
+  offset (real ack progress) always ships immediately at every call site,
+  never held back. A companion fix closes an independent defect found
+  building this one: `handle_install_snapshot_resp`'s tracked offset is now
+  updated via `max`, not a bare `insert` — under the pre-fix flood's own
+  overlapping in-flight sends, acks could reach the leader out of
+  real-progress order and regress the tracked offset backward (confirmed:
+  217 such regressions in one run), which the flood's own sheer volume had
+  been silently absorbing. See the ADR's third amendment for the full
+  account, including why two narrower prototypes (skip wake-on-propose
+  entirely; throttle it by propose count) were tried and rejected first —
+  `replicate_now`'s wake is a single coalesced `AtomicBool`
+  (`ProposeSignal`), so under `learner_catchup_under_load.rs`'s own
+  synchronous-burst workload it was never the flood's real amplifier in
+  that test to begin with; the ack-handler's cascade was.
+  `animus-cp-data/tests/snapshot_resend_bound.rs` is the dedicated
+  message-VOLUME regression (distinct from the pre-existing
+  convergence-timing one) — see that test's own module doc for why a
+  `Metric`-based measurement was necessary at all (`SimEnv` charges a
+  resend flood no virtual time and little real time, so a timing-only
+  test cannot see it) and why its denominator is an exact in-core counter
+  (`RaftCore::snapshot_chunk_advances`) rather than externally polling
+  `snapshot_offset`.
+
 - **Durable-before-visible mechanics + hand-driven gotchas.** The driver
   advances the durable watermark via `mark_durable_through` in `flush_wal`,
   immediately after `env.sync(WAL)` (passing the drain-time `last_log_index`);

@@ -14668,3 +14668,193 @@ noted rather than fixed here (root-causing and correcting the stale-epoch
 assumption is an unrelated pre-existing bug, out of scope for a
 test-surface-porting layer with no production-code changes); the
 NOTE left in `apply_engine.rs` at both split call sites points here.
+
+## Diagnose "my predicate never turns true" by instrumenting the state it READS, not its own bookkeeping (issues #532/#537)
+
+A learner catch-up predicate (`RaftCore::learner_caught_up`, keyed on
+`match_index`) never firing under sustained write load looks, from the
+caller's side, like a bug in the *caller* — the reconciler loop that
+decides when to check it, the settle window around it, the promotion
+sequencing. None of that was where the defect lived. The actual root
+cause was two layers below the symptom, inside the shared `RaftCore`
+(`animus-control`) that both the control plane and the CP data plane
+reuse: `replicate_to` sending an unbounded, ever-growing `AppendEntries`
+tail on every propose, and (found investigating the same symptom further)
+`snapshot_upto` invalidating an in-flight chunked transfer on every
+compaction crossing. **The generalizable move**: when a predicate never
+turns true, don't start by auditing the code that calls it or the
+bookkeeping around when it's checked — instrument the *live state the
+predicate itself reads* (here, `match_index`/`snapshot_offset` on the
+actual `RaftCore`) and watch it over time. A pinned or oscillating value,
+observed directly, points straight at the mechanism that's supposed to
+move it — which can live in a completely different crate than the one
+whose loop looks broken.
+
+## A `ProdEnv`-only real-time race can be perturbed away by any unrelated timing change — a fast converging run right after adding diagnostics proves nothing (issues #532/#537)
+
+The learner-stall reproduction above is a genuine real-time race: it
+converges reliably in seconds under `SimEnv` (no CPU-time cost model) and
+under *any* incidental change to real scheduling on the `ProdEnv` host —
+a background admin poller, a tracing subscriber initialized before
+bring-up, even the act of adding an `eprintln!` diagnostic to the loop
+under investigation. Every one of those perturbations shifts relative
+timing just enough to let the lagging peer's round complete before the
+next overlapping resend piles more work on top of it — the exact
+mechanism the fix closes, momentarily avoided by luck instead of by
+structure. **The trap this creates**: after instrumenting a suspected
+`ProdEnv` livelock, the very next run frequently "just works" — and that
+run proves *nothing* about whether the underlying defect is fixed, only
+that this particular perturbed timing happened not to trigger it this
+time. The only honest validation for this class of bug is the
+**unmodified** reproduction, re-run **after** the diagnostics are removed
+(or on a pristine checkout of the fix), ideally several times to see the
+pre-fix failure rate before touching anything — see this same investigation's
+own ADR 0009 amendment for a case where even a real fix, validated this
+way, still left a residual, unexplained pass rate on one host: don't let
+one lucky green run — pre-fix, mid-investigation, or post-fix — stand in
+for a repeated, unmodified measurement.
+
+## A fix that clearly improves the mechanism does not guarantee the same end-to-end pass rate — report both, don't let one imply the other (issues #532/#537)
+
+Two independent, well-reasoned fixes to a shared Raft core (an
+`AppendEntries` batch cap, and deferring compaction while a peer's
+snapshot transfer is in flight) produced an unambiguous, large
+improvement in a controlled `SimEnv` comparison — a learner that used to
+plateau at a fixed `match_index` for an entire run now cleared 10x+ more
+of an identical backlog before the same write window ended, and a direct
+before/after toggle of each fix (batch cap alone, compaction-defer alone,
+both, neither) showed exactly the additive contribution each one made.
+That same fix, validated against the real, unmodified `ProdEnv` bench
+(`animusd/tests/cluster_gt_rf_split_bench.rs`) 3 times, converged fully in
+only 1 of 3 runs — an unchanged ratio from this same bench's own pre-fix
+baseline, despite the successful run itself completing in a comparable
+time to before. **The lesson**: a mechanism-level improvement (proven via
+a controlled, isolatable comparison) and an end-to-end pass-rate
+improvement (proven via repeated runs of the real, unmodified
+reproduction) are two different claims, and evidence for one is not
+evidence for the other — report both numbers honestly rather than letting
+a convincing mechanism-level story imply an end-to-end result that the
+actual repeated runs did not show. A residual, unidentified contributing
+factor is flagged as an open follow-up rather than smoothed into "fixed."
+
+## An aggressive resend loop can be both a flood source AND the retransmit mechanism a regression test's own convergence depends on — a fix must separate the roles, not throttle the shared knob (issues #532/#537, ADR 0009's third amendment)
+
+The third mechanism behind the residual above (`InstallSnapshot` chunk
+resend *frequency*, as opposed to the *batch-size*/*compaction-timing*
+mechanisms the first two fixes closed) looked, at first, like a simple
+"throttle the resend" job: `replicate_now`'s wake-on-propose fires on
+every write and unconditionally re-sends whatever chunk is still
+outstanding, so gating that one call site should cut the flood. Two
+narrower shapes built on exactly that framing — skip a mid-snapshot peer
+from wake-on-propose entirely; throttle it by propose count (1-in-2,
+1-in-20) — both regressed `animus-cp-data/tests/
+learner_catchup_under_load.rs` (the existing regression test for the
+first two fixes): the learner stopped converging at all. The instinct at
+that point is to conclude "this test needs the flood, so some flood must
+stay" and hand-tune a smaller one back in. That instinct is wrong, and
+finding out why required instrumenting the *live per-peer state itself*
+(the same "watch the value the stuck predicate reads, don't audit the
+code around it" move as the entry above) rather than reasoning about the
+resend policy in the abstract:
+
+- **The wake-on-propose call site was never the flood's real amplifier in
+  this test.** `RaftCore::propose`'s wake-on-propose is a single coalesced
+  `AtomicBool` (`ProposeSignal`), not a per-propose counter — under this
+  test's own tight synchronous burst of ten proposes with no yield between
+  them, it already fires at most once per burst regardless of any throttle
+  applied to it. Gating it changed almost nothing about that test's own
+  message count. The actual flood in THAT test's own failure mode came
+  from a completely different call site: the ack-handler's own resend
+  (`handle_install_snapshot_resp`), which fires once per received message
+  — not coalesced at all — and answers every ack, including a stale
+  duplicate that carries no new information, with another unconditional
+  resend. That is a **self-sustaining loop**, bounded only by round-trip
+  time, and it is *also* — this is the double duty — the mechanism that
+  lets a genuinely stuck transfer recover before the next heartbeat
+  (`heartbeat_deadline` itself is perpetually deferred by wake-on-propose's
+  own reset on every write, so it rarely fires in time under sustained
+  load). Gating this call site down to zero-tolerance (the same treatment
+  correctly applied to wake-on-propose) reproduced the exact same
+  convergence failure the two rejected prototypes did — not because the
+  reasoning about wake-on-propose was wrong, but because it was answering
+  a question ("is *this* call site the flood source") that didn't
+  generalize to a *different* call site playing a *different* role.
+- **A second, independent defect was hiding under the flood's own volume**:
+  `handle_install_snapshot_resp`'s tracked offset had no monotonic guard,
+  so an ack processed out of real-progress order could regress it backward
+  — confirmed directly by instrumenting the pre-fix code (217 regressions
+  in one run, each one chunk backward). The pre-fix flood's sheer resend
+  volume papered over this bug by brute-forcing enough duplicate attempts
+  to re-advance past any transient regression anyway. A throttled resend
+  has no such slack — it fixes forward once per attempt, so a regression
+  it can't recover from in one round trip compounds instead of
+  self-healing. This is why *both* narrower-throttle prototypes failed
+  even with a reasonable resend budget: they were quietly exposed to a
+  bug the flood had been silently absorbing, and no amount of tuning the
+  throttle's own numeric cap would have fixed a monotonicity defect
+  underneath it.
+
+**The generalizable lesson**: when a fix targets "throttle this aggressive
+retry loop" and the *existing* regression test for a related, earlier fix
+breaks, don't assume the loop needs to stay aggressive — check whether the
+loop is doing two jobs at once (flooding, and legitimately carrying a
+recovery path a test depends on) and whether throttling it is silently
+exposing an unrelated bug the flood's own redundancy was masking. The fix
+that actually worked kept the resend cap **structurally separated by
+caller**: the call site diagnosed as the flood source (wake-on-propose)
+got a strict cap; the call site actually carrying the recovery role
+(the ack-handler) kept a bounded — not zero, not unlimited — cap of its
+own; and the masked regression got its own independent, unconditional fix
+(a `max`, not a bare `insert`) so the throttle didn't have to compensate
+for it. One shared numeric knob applied uniformly to "the resend
+mechanism" cannot express any of that — it was tried, twice, and failed
+both times for reasons that only became visible once the two roles were
+identified separately.
+
+## `SimEnv` message volume is a countable, testable quantity even though it costs nothing there (issues #532/#537, ADR 0009's third amendment)
+
+`SimEnv`'s virtual clock does not advance for sending a message (no
+network delay unless configured) and its disk model charges no time for
+an op unless a delay is configured — so a resend flood that would be
+catastrophic in real wall-clock or real network cost is, by design,
+**free** under `SimEnv`: it costs no virtual time and (with the model's
+own defaults) very little real time either. That is exactly why the
+existing convergence-timing regression test for this issue
+(`learner_catchup_under_load.rs`) could not, by itself, prove a resend fix
+actually bounds volume — it could regress all the way back to thousands
+of redundant sends per real chunk and still pass, since nothing about
+convergence *timing* would necessarily change enough to notice. The fix:
+a **separate** test asserting on message *count*, not time —
+`animus-cp-data/tests/snapshot_resend_bound.rs`, built on the
+already-existing deterministic, additive metrics seam (ADR 0015,
+`Metric::CpSnapshotShips`, threaded via `RaftKvNode::start_with_metrics`)
+for the numerator. The general point worth recording separately from this
+specific fix: **cost-under-simulation and cost-in-reality are different
+axes, and a test suite needs an assertion on each one it cares about** — a
+mechanism that is free to *exercise* under `SimEnv` (which is exactly what
+makes `SimEnv` good at finding it deterministically) can still be
+expensive in the real system the simulation stands in for, and only a
+test that directly counts the thing that's expensive in reality (messages
+sent, bytes moved, disk ops issued) — not one that infers it from timing —
+catches a regression in it.
+
+A second, narrower finding from building that same test: **the
+denominator matters as much as the numerator, and an externally-polled
+denominator quietly undercounts.** The first draft of this test polled
+the leader's own view of the peer's acked offset once per write round and
+counted distinct values observed — a reasonable-looking approach that
+turned out to badly underestimate real progress, because a genuine chunk
+advance can happen well inside a single millisecond once a transfer is
+flowing, and any poll coarser than that misses most of the transitions.
+The measured "sends per distinct offset" ratio came out far worse than
+reality on **already-fixed** code, which is a dangerous shape of bug in a
+test: it looks like a real, reproducible regression signal, but chasing it
+leads to tuning a knob that was never actually the problem. The fix was
+to stop inferring the denominator externally at all and instead add a
+tiny, exact, `#[cfg(test)]`-accessor-style counter *inside* the core
+(`RaftCore::snapshot_chunk_advances`, bumped exactly once per genuine
+new-offset chunk, at the one place — inside `snapshot_chunk_for` — that
+can never miss a transition) — the same "don't infer from the outside
+what the code already knows precisely on the inside" principle this
+repo's engineering practices already state for production accessors,
+applied here to a test's own measurement.
