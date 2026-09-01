@@ -65,7 +65,7 @@ fn split_round_trips_through_raft() {
         replicas: NODES.iter().copied().map(nid).collect(),
     });
     let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
-    nodes[l].propose(MetaCommand::BeginSplit {
+    nodes[l].propose(MetaCommand::BeginSplitInPlace {
         parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"m".to_vec(),
@@ -107,12 +107,15 @@ fn split_round_trips_through_raft() {
 /// range, exactly what two independent `auto_split_loop` instances (or an
 /// auto-split racing a manual admin trigger) can do — must not both commit.
 /// Before the `expected_epoch` CAS, both would apply (each split key is
-/// strictly inside the tablet's *original* range), minting two child tablet
-/// ids when the tablet's own per-group CP-data Raft can only ever host one
-/// real split, ever — leaving the loser permanently orphaned (observed live
-/// under sustained `--auto-split` bulk-seed load). With the CAS, only the
-/// first proposal to land in the log applies; the second is cleanly rejected
-/// once the epoch has moved, so no orphan tablet id is ever minted.
+/// strictly inside the tablet's *original* range), each recording a
+/// DIFFERING in-place intent on the SAME parent when a tablet can only ever
+/// carry one live split intent at a time — leaving the loser's own intent
+/// silently overwritten, never reachable again (observed live under
+/// sustained `--auto-split` bulk-seed load, the original copy-based-split
+/// shape of this hazard). With the CAS, only the first proposal to land in
+/// the log applies; the second is cleanly rejected once the epoch has
+/// moved, so only one intent (and, eventually, one real child pair) is ever
+/// recorded.
 #[test]
 fn racing_splits_at_the_same_epoch_only_one_applies() {
     let seed = 0x59_18;
@@ -129,7 +132,7 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
     sim.run_for(Duration::from_secs(2));
 
     let replicas: Vec<_> = NODES.iter().copied().map(nid).collect();
-    nodes[l].propose(MetaCommand::BeginSplit {
+    nodes[l].propose(MetaCommand::BeginSplitInPlace {
         parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"m".to_vec(),
@@ -138,7 +141,7 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
             (TabletId(3), replicas.clone()),
         ],
     });
-    nodes[l].propose(MetaCommand::BeginSplit {
+    nodes[l].propose(MetaCommand::BeginSplitInPlace {
         parent: TabletId(1),
         expected_epoch: Epoch::INITIAL,
         split_key: b"q".to_vec(),
@@ -152,17 +155,24 @@ fn racing_splits_at_the_same_epoch_only_one_applies() {
     }
     assert_eq!(
         meta.tablets.len(),
-        3,
-        "the losing begin-split must not mint orphan children (parent + one child pair)"
+        1,
+        "the losing begin-split-in-place must not mint anything at all — in-place split \
+         mints no tablet-map rows until cutover, which this test never reaches"
     );
+    let intent = meta.tablets[&TabletId(1)]
+        .inplace_split
+        .as_ref()
+        .expect("the winning proposal's intent must be recorded");
+    let won_first = intent.children[0].id == TabletId(2);
+    let won_second = intent.children[0].id == TabletId(4);
     assert!(
-        meta.tablets.contains_key(&TabletId(2)) ^ meta.tablets.contains_key(&TabletId(4)),
-        "exactly one of the two racing begin-splits should have won"
+        won_first ^ won_second,
+        "exactly one of the two racing begin-split-in-place proposals should have won: {intent:?}"
     );
     assert_eq!(
         meta.tablets[&TabletId(1)].range.end,
         None,
-        "a Splitting parent's own range is untouched (children carry the halves)"
+        "a Splitting parent's own range is untouched (the winning intent carries the split key)"
     );
 }
 
@@ -179,7 +189,7 @@ fn invalid_split_is_rejected_deterministically() {
     use animus_control::ApplyOutcome::Rejected;
     // Split key outside the range.
     assert!(matches!(
-        meta.apply(&MetaCommand::BeginSplit {
+        meta.apply(&MetaCommand::BeginSplitInPlace {
             parent: TabletId(1),
             expected_epoch: Epoch::INITIAL,
             split_key: b"q".to_vec(),
@@ -196,6 +206,19 @@ fn invalid_split_is_rejected_deterministically() {
 /// without it the new sibling would have no policy and be invisible to both the
 /// repair reconciler and the load rebalancer, so it would never be re-placed or
 /// balanced onto new members.
+///
+/// **Deliberately still `BeginSplit`** (copy-split deletion stack, layer 1):
+/// its whole subject — a child's `Metadata::policies` row existing
+/// immediately at BEGIN time, copied straight onto the freshly-minted
+/// `Building` row — is copy-workflow-specific mechanics with no in-place
+/// analogue at this point in that command's own lifecycle (`BeginSplitInPlace`
+/// copies no policy at all — there is no tablet row yet to attach one to;
+/// see that command's own doc). The equivalent in-place behavior (a policy
+/// inherited onto both children, but only at `CutoverSplit` — the in-place
+/// workflow's one and only chance to) is already covered by
+/// `meta::tests::cutover_split_in_place_activates_both_children_from_the_
+/// intent`. Left for the later layer that deletes the copy-based workflow
+/// to remove.
 #[test]
 fn split_child_inherits_the_source_policy() {
     use animus_control::ApplyOutcome::Applied;
