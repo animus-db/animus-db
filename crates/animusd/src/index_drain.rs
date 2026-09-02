@@ -1104,7 +1104,16 @@ async fn gsi_caught_up(group: &CpGroup) -> bool {
 /// retries from scratch, and by then this node's loop has had its chance to
 /// service the blocking tablet too). See `docs/engineering-lessons.md` for
 /// the full incident (issue #298).
-fn is_retryable_elsewhere(e: &str) -> bool {
+///
+/// `pub(crate)` (issue #572): [`seal_now`] and [`pitr_seal_now`]'s own
+/// commit-wait poll uses this exact `"; retry"` convention for their
+/// dueling-seal-loss error (see either function's commit-wait doc), and
+/// `ClientCtx::force_seal_tablet`/`force_pitr_seal_tablet`
+/// (`crate::schema`) reuse this same classifier on their `CpRoute::Local`
+/// route so a transient loss there gets the identical retry treatment their
+/// `CpRoute::Forward` branch already gives it — one retryability rule for
+/// this error family, not two ad hoc ones.
+pub(crate) fn is_retryable_elsewhere(e: &str) -> bool {
     e.ends_with("; retry")
 }
 

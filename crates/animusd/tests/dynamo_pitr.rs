@@ -12,6 +12,8 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use animusd::config::NodeRole;
@@ -35,6 +37,14 @@ const TEST_SEAL_KNOBS: StreamSealKnobs = StreamSealKnobs {
 /// Bring up a single node with [`TEST_SEAL_KNOBS`], retrying the port-TOCTOU
 /// race exactly like `support::start_single_node` does.
 async fn start_single_node_fast_seal(dir: &Path) -> (Node, ClusterConfig) {
+    start_single_node_with_knobs(dir, TEST_SEAL_KNOBS).await
+}
+
+/// [`start_single_node_fast_seal`] generalized to a caller-chosen
+/// [`StreamSealKnobs`] — the knob a test wants when it needs to tune how
+/// eagerly the periodic size-triggered seal arm (`INDEX_DRAIN_INTERVAL`,
+/// 200ms) fires, e.g. issue #572's dueling-seal race regression.
+async fn start_single_node_with_knobs(dir: &Path, knobs: StreamSealKnobs) -> (Node, ClusterConfig) {
     let mut last_err = None;
     for attempt in 0..10 {
         let addrs = support::free_addrs(6);
@@ -58,7 +68,7 @@ async fn start_single_node_fast_seal(dir: &Path) -> (Node, ClusterConfig) {
             dir,
             StorageBackend::default(),
             Duration::from_secs(600),
-            TEST_SEAL_KNOBS,
+            knobs,
             SegmentStoreConfig::default(),
             animusd::DEFAULT_STREAM_RETENTION,
         )
@@ -337,6 +347,121 @@ async fn enable_write_describe_disable_reenable_resets_the_window() {
             Some(2),
             "re-enable mints a fresh generation, never reusing the first"
         );
+    })
+    .await
+    .expect("did not converge in time");
+}
+
+/// Issue #572 regression: `UpdateContinuousBackups(disable)`'s own final
+/// seal (`ClientCtx::force_pitr_seal_tablet`) must retry a dueling-seal race
+/// against the periodic size-triggered arm (`pitr_tick`, `INDEX_DRAIN_
+/// INTERVAL` = 200ms) on the `CpRoute::Local` route exactly as it already
+/// does on `CpRoute::Forward` — not surface the transient "lost to a
+/// concurrent seal ...; retry" error as a hard 500.
+///
+/// A single-node cluster is deliberate: with one node, the tablet leader is
+/// always *this* node, so `resolve_cp_route` can only ever return
+/// `CpRoute::Local` — every disable call in this test exercises exactly the
+/// route the bug lives on, with no ambiguity about which branch ran.
+///
+/// The race itself needs both arms computing the identical `(tablet,
+/// next_epoch)` slot from overlapping stale views: a small `seal_bytes`
+/// keeps the periodic arm sealing on nearly every 200ms tick, and several
+/// concurrent `PutItem` writers keep running *through* each disable call
+/// (not just before it) so a periodic seal can commit mid-flight while the
+/// disable's own force-seal is still computing/proposing its own. One
+/// attempt reproduces only sporadically (the original report: 1 in 15) —
+/// so this loops many enable/write/disable cycles, each a fresh chance at
+/// the same race, and asserts every single disable succeeds. On unmodified
+/// `main` this fails intermittently with the exact reported signature
+/// (500, `SealPitrSegment(..) lost to a concurrent seal ...; retry`); after
+/// the fix every cycle converges to 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn disable_survives_concurrent_periodic_seal_on_local_route() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let racy_knobs = StreamSealKnobs {
+            seal_bytes: 48,
+            seal_age: Duration::from_secs(3600),
+        };
+        let (node, _config) = start_single_node_with_knobs(dir.path(), racy_knobs).await;
+        let table = "orders";
+        create_base_table(node.dynamo_addr(), table).await;
+
+        const CYCLES: u32 = 40;
+        const WRITERS: u32 = 8;
+        for cycle in 0..CYCLES {
+            let (status, body) = update_continuous_backups(node.dynamo_addr(), table, true).await;
+            assert_eq!(status, 200, "enable (cycle {cycle}) failed: {body}");
+
+            // Several writers hammer PutItem concurrently, kept running
+            // through the disable call below (stopped only afterward) so the
+            // periodic arm's own seal attempt can race the disable's.
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut writers = Vec::with_capacity(WRITERS as usize);
+            for w in 0..WRITERS {
+                let addr = node.dynamo_addr();
+                let table = table.to_string();
+                let stop = Arc::clone(&stop);
+                writers.push(tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        put_item_padded(addr, &table, &format!("c{cycle}-w{w}-{i}"), 24).await;
+                        i += 1;
+                    }
+                }));
+            }
+            // Give the periodic arm at least one full tick's worth of
+            // pending bytes to seal before racing the disable call.
+            sleep(Duration::from_millis(120)).await;
+
+            let (status, body) = update_continuous_backups(node.dynamo_addr(), table, false).await;
+
+            stop.store(true, Ordering::Relaxed);
+            for w in writers {
+                let _ = w.await;
+            }
+
+            assert_eq!(
+                status, 200,
+                "UpdateContinuousBackups(disable) failed on cycle {cycle} — issue #572's \
+                 dueling-seal race on the CpRoute::Local route: {body}"
+            );
+        }
+
+        // One more clean (non-racing) round proves the fix doesn't
+        // silently drop coverage across the stress loop above: every write
+        // in this fresh generation is fully accounted for by that
+        // generation's own sealed segments before the final disable.
+        let (status, body) = update_continuous_backups(node.dynamo_addr(), table, true).await;
+        assert_eq!(status, 200, "final re-enable failed: {body}");
+        let generation = node
+            .metadata()
+            .table_pitr(table)
+            .expect("PITR just enabled")
+            .generation;
+        const FINAL_WRITES: u64 = 12;
+        for i in 0..FINAL_WRITES {
+            put_item_padded(node.dynamo_addr(), table, &format!("final-{i}"), 40).await;
+        }
+        await_true(
+            20,
+            "this generation's PITR segments cover every final write",
+            || {
+                let meta = node.metadata();
+                let sealed: u64 = meta
+                    .pitr_segments
+                    .values()
+                    .filter(|r| r.table == table && r.generation == generation)
+                    .map(|r| r.count)
+                    .sum();
+                sealed >= FINAL_WRITES
+            },
+        )
+        .await;
+
+        let (status, body) = update_continuous_backups(node.dynamo_addr(), table, false).await;
+        assert_eq!(status, 200, "final disable failed: {body}");
     })
     .await
     .expect("did not converge in time");
