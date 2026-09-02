@@ -69,6 +69,15 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 
 ## What's non-obvious
 
+- **The operator's own container image is published (2026-09-02, S-07a).**
+  `ghcr.io/animus-db/animus-operator` is built from the root `Dockerfile`'s
+  `runtime-operator` stage (`docker build --target runtime-operator .`) and
+  pushed by `.github/workflows/image.yml`'s `animus-operator` matrix entry
+  on the same tag/push rules as `animusd`; `deploy/operator/deployment.yaml`
+  references it as a real image, not a placeholder. This doesn't change how
+  `scripts/e2e-kind.sh` runs the controller (still out-of-cluster via
+  `cargo run`, deliberately — see the e2e section below) or how local
+  development works.
 - **BTreeMap-only, same as every other crate (ADR 0003's determinism rule,
   lint-enforced via `clippy.toml`)** — even though this crate has no `Env`
   seam and nothing here is sim-tested (see the next bullet), the workspace

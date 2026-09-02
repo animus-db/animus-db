@@ -34,11 +34,6 @@ the still-true paragraph after the table.
 |---|---|---|
 | Read-path counters for ReadIndex vs eventual reads "missing" | (this audit's first pass) | `CpReadBarriersServed/TimedOut`, `CpEventualReads{Local,Forwarded,FellBack}` exist and surface in `/admin/metrics` |
 
-Still true, and worth stating so nobody re-audits: the operator's **own**
-container image is not published (`.github/workflows/image.yml` publishes
-`animusd` only); `Cargo.lock` is gitignored (`.gitignore:3`) yet that
-workflow lists it as a trigger path.
-
 ---
 
 ## 1. Wire surface (DynamoDB API)
@@ -334,9 +329,6 @@ workflow lists it as a trigger path.
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
-- **a. Operator image publish + `Cargo.lock`.** `image.yml` publishes
-  `animusd` only. Add an operator image job; commit `Cargo.lock`, drop it
-  from `.gitignore`, so the Docker build pins from it. Size S.
 - **b. `backupStore`/`segmentStore` CRD fields** mirrored into the
   ConfigMap/entrypoint. Size M. Depends S-06.
 - **c. `PodDisruptionBudget` builder** (`desired/poddisruptionbudget.rs`,
@@ -536,9 +528,8 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ## 5. Documentation
 
-Root `CLAUDE.md`'s ADR 0060 sentence stays (operator image still
-unpublished) until S-07a lands; `website/index.html` "Planned" pills stay
-until S-01.
+D-01 (the stale-prose sweep) and S-07a landed 2026-09-02. What remains
+here: `website/index.html`'s "Planned" pills stay until S-01 lands.
 
 ---
 
@@ -565,7 +556,6 @@ wave are independent and can run in parallel.
 
 | Wave | Items | Why here |
 |---|---|---|
-| 0 | S-07a | Cheapest, unblocks reproducible images |
 | 1 | W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1 | Small, ADR-free, no cross-deps |
 | 2 | W-01, W-10, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |

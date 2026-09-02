@@ -94,10 +94,10 @@ jobs:
       # binaries gated behind it (see `prod-liveness`) still get type-checked
       # on every push even though this job never runs them.
       - name: clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: build (--workspace --all-targets)
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       # Hosted runners give this job 2 cores, but the default test-threads
       # (= logical CPUs) lets cargo test run many heavyweight multi-node
@@ -120,7 +120,7 @@ jobs:
       # instead of a hand-maintained exclude list that silently drifts as
       # tests are added (see docs/engineering-lessons.md).
       - name: test (--workspace --exclude animusd)
-        run: cargo test --workspace --exclude animusd -- --test-threads=2
+        run: cargo test --workspace --exclude animusd --locked -- --test-threads=2
 
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
       # where this gate actually executes. The pinned action installs cargo-deny
@@ -219,7 +219,7 @@ jobs:
       # above for why there is no retry.
       - name: test animusd shard ${{ matrix.partition }}/4 (--lib --tests)
         run: |
-          cargo nextest run -p animusd --lib --tests \
+          cargo nextest run -p animusd --lib --tests --locked \
             -E 'not test(orphan_an_lsi_row)' \
             --partition count:${{ matrix.partition }}/4 \
             --profile ci
@@ -273,7 +273,7 @@ jobs:
 
       - name: test animusd LSI-orphan hammer pair
         run: |
-          cargo test -p animusd --test dynamo_index_writes \
+          cargo test -p animusd --test dynamo_index_writes --locked \
             -- --test-threads=1 orphan_an_lsi_row
 
   # The 5 scattered real-thread binaries outside animusd, each gated behind
@@ -311,14 +311,14 @@ jobs:
 
       - name: test scattered prod-heavy binaries
         run: |
-          cargo test -p animus-control --features prod-heavy \
+          cargo test -p animus-control --features prod-heavy --locked \
             --test prod_liveness --test control_membership_prod \
             -- --test-threads=1
-          cargo test -p animus-cp-data --features prod-heavy \
+          cargo test -p animus-cp-data --features prod-heavy --locked \
             --test prod_concurrent_ts_monotonic \
             --test prod_compaction_persist_round \
             -- --test-threads=1
-          cargo test -p animus-storage --features prod-heavy \
+          cargo test -p animus-storage --features prod-heavy --locked \
             --test lsm_concurrent --test idle_engine_cost \
             -- --test-threads=1
 

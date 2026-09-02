@@ -25,10 +25,10 @@ spec:
       serviceAccountName: animus-operator
       containers:
         - name: animus-operator
-          # The operator's own container image build is a follow-up (this
-          # PR ships the controller binary and manifests only) — this
-          # placeholder tag is what the eventual image-build change fills
-          # in.
+          # Published by .github/workflows/image.yml's `animus-operator`
+          # matrix entry (root Dockerfile's `runtime-operator` stage,
+          # S-07a, 2026-09-02) on every push to main and on version tags —
+          # same tag/push rules as the animusd image.
           image: ghcr.io/animus-db/animus-operator:latest
           args: ["run"]
           resources:

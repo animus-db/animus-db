@@ -3,8 +3,10 @@
 - **Status:** Accepted — the animusd groundwork (SIGTERM, hostname seeds,
   the string-keyed peer/route books, `advertise_host`), the container
   image, and the `animus-operator` MVP land in the same stacked series as
-  this ADR; the deferred list below (operator image publishing, TLS,
-  control-voter growth, …) remains future work.
+  this ADR; the deferred list below (TLS, control-voter growth, …) remains
+  future work. **2026-09-02:** operator image publishing and `Cargo.lock`
+  are no longer on that list — see Part 2's and the deferred list's own
+  notes below (S-07a).
 - **Date:** 2026-08-27
 - **Amends:** [ADR 0047](0047-intra-node-port.md) (this ADR is the design
   this repo's own `CLAUDE.md` and ADR 0047's Context section have promised
@@ -269,13 +271,26 @@ determinism guarantee is affected by this train.
 A multi-stage `Dockerfile` at the repo root: a `rust:1.96` builder stage
 producing the `animusd` and `animus` (`animus-cli`) binaries, copied into a
 `debian:bookworm-slim` runtime stage running as a **non-root** user, with
-`VOLUME /var/lib/animus` for the LSM data directory. `Cargo.lock` is
-**gitignored** in this repository — the image build therefore mints its
-own lockfile at build time rather than reusing a committed one; this is
-noted here explicitly rather than silently discovered as an
+`VOLUME /var/lib/animus` for the LSM data directory. `Cargo.lock` was
+**gitignored** in this repository at the time this ADR was accepted — the
+image build minted its own lockfile at build time rather than reusing a
+committed one, noted here explicitly rather than silently discovered as an
 irreproducible-build surprise later. A CI workflow builds the image on
 every PR (build-only, no push — a normal compile-and-smoke gate) and
-pushes `ghcr.io/animus-db/animusd` on `main` and on tags.
+pushes `ghcr.io/animus-db/animusd` on `main` and on tags. **2026-09-02
+(S-07a):** the operator's own controller binary (`animus-operator`, Part 3)
+now has a second stage in the same `Dockerfile` (`runtime-operator`,
+selected with `--target`) and a matching second image published by the
+same workflow, `ghcr.io/animus-db/animus-operator`, on the same tag/push
+rules — `deploy/operator/deployment.yaml`'s image reference is real, not a
+placeholder.
+
+**2026-09-02 (S-07a):** `Cargo.lock` is now committed — `.gitignore`'s
+`Cargo.lock` line is gone, `Dockerfile` `COPY`s it alongside `Cargo.toml`,
+and both the image build and CI's cargo build/test/clippy invocations pass
+`--locked` so the committed lock is authoritative (a manifest/lock drift
+now fails the build loudly instead of silently re-resolving). The
+supply-chain concession this Part's Consequences bullet named is closed.
 
 ### Part 3 — the operator (`animus-operator`)
 
@@ -473,11 +488,10 @@ closing first if a future operator version ever needed those knobs on a
   with its own release cadence relative to `animusd` — a CRD schema change
   is itself subject to this repository's no-back-compat stance (a
   `v1alpha1` bump, or a clean recreate, not a migration).
-- `Cargo.lock` being gitignored means the container image's dependency
+- ~~`Cargo.lock` being gitignored means the container image's dependency
   versions are whatever `cargo build` resolves at image-build time, not a
-  pinned, reviewed set — a supply-chain consideration worth a future
-  ADR/decision of its own if this project ever wants reproducible builds,
-  explicitly out of scope here.
+  pinned, reviewed set~~ — closed 2026-09-02 (S-07a, see Part 2's own note
+  above): `Cargo.lock` is committed and every image build is `--locked`.
 
 ## Delivery plan
 
