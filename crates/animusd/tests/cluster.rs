@@ -11,6 +11,8 @@ use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, read_frame, sta
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Send one request to a node's client address and return the reply.
 async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
@@ -76,7 +78,7 @@ async fn await_bootstrap(nodes: &[Node]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_serves_put_get_and_status_over_tcp() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

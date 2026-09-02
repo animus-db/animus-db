@@ -18,6 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     animusd::write_frame(&mut stream, &req).await.expect("send");
@@ -110,7 +112,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_process_split_cluster_serves_writes_and_reports_roles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     const CONTROL_N: usize = 3;
     const DATA_N: usize = 2;
 
@@ -224,7 +226,7 @@ async fn in_process_split_cluster_serves_writes_and_reports_roles() {
 /// every key, every run — no round-robin across addresses needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fixed_control_node_write_read_is_deterministic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     const CONTROL_N: usize = 3;
     const DATA_N: usize = 2;
 
@@ -296,7 +298,7 @@ async fn fixed_control_node_write_read_is_deterministic() {
 /// one-attempt write must land deterministically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_shot_first_write_through_control_node_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     const CONTROL_N: usize = 3;
     const DATA_N: usize = 2;
 

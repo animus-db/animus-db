@@ -33,6 +33,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 const BOOTSTRAP_TABLET: TabletId = TabletId(1);
 
 async fn await_bootstrap(nodes: &[Node]) {
@@ -55,7 +57,7 @@ async fn await_bootstrap(nodes: &[Node]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn data_node_failure_is_detected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let ip = "127.0.0.1".parse().unwrap();
     let nodes = start_cluster(bind_cluster(3, ip, dir.path()).await.unwrap())
         .await
@@ -193,7 +195,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cp_group_follows_tablet_replica_set() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(3, dir.path()).await;
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2]
@@ -376,7 +378,7 @@ async fn failure_auto_replaces_replica_onto_spare() {
     // ids 0..2) and node 3 is an idle spare. Killing a replica should
     // cascade: detector marks it Down -> reconciler swaps in the spare -> the group
     // reconfigures onto it and keeps serving.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(4, dir.path()).await;
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]

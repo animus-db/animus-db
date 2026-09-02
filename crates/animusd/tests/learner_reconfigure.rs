@@ -24,6 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -172,7 +174,7 @@ async fn put(clients: &[SocketAddr], key: &[u8], value: &[u8], secs: u64) {
 /// real TCP/time rather than `SimEnv`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn spare_replacement_passes_through_an_observable_learner_state_and_keeps_serving() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(4, dir.path()).await;
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3]

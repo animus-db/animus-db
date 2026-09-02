@@ -38,10 +38,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Bring up a single combined-mode node — a 1-of-1 Raft group self-elects on
 /// its first tick, so this is fast and needs no port-TOCTOU retry loop (a
-/// fresh `tempfile::tempdir()` + freshly-bound `:0` ports per call is enough
-/// isolation for one node).
+/// fresh `support::panic_safe_tempdir()` + freshly-bound `:0` ports per call
+/// is enough isolation for one node).
 async fn bring_up_one(dir: &std::path::Path) -> Node {
     let addrs = free_addrs(6);
     let node_cfg = animusd::RoleAddrs {
@@ -167,7 +169,7 @@ async fn await_status<F: Fn(&Value) -> bool>(addr: SocketAddr, pred: F, what: &s
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn system_table_lists_every_seeded_entity_kind() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
         // ADR 0047: this file seeds several intra-only entity kinds via bare
@@ -424,7 +426,7 @@ async fn system_table_lists_every_seeded_entity_kind() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn system_table_pagination_is_gapless_and_duplicate_free() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let node = bring_up_one(dir.path()).await;
         await_bootstrap(&node).await;
         // ADR 0047: this file seeds several intra-only entity kinds via bare

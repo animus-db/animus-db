@@ -27,6 +27,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -99,7 +101,7 @@ async fn await_response(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eventual_reads_converge_on_every_node_while_consistent_reads_are_immediate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -250,7 +252,7 @@ async fn eventual_reads_converge_on_every_node_while_consistent_reads_are_immedi
 /// or the row lingering forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_converges_to_absence_on_an_eventual_read() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

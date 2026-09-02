@@ -49,6 +49,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -121,7 +123,7 @@ async fn await_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> bool
 /// closes for both ops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -344,7 +346,7 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
 /// group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -521,7 +523,7 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
 /// the kind-writes payload entirely" at the wire level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -600,7 +602,7 @@ async fn transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row() {
 /// its own LSI forever).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_old() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -949,7 +951,7 @@ async fn await_settled_alt(addr: SocketAddr, key_json: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
     let _serial = hammer_serial().lock().await;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -1080,7 +1082,7 @@ async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row() {
     let _serial = hammer_serial().lock().await;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -65,7 +67,7 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
 /// exists for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -145,7 +147,7 @@ async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
 /// via the intra port now — see `intra_port_split.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_kind_scan_is_refused() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

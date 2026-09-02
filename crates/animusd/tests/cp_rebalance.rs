@@ -23,6 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 const TABLES: [&str; 6] = ["kv0", "kv1", "kv2", "kv3", "kv4", "kv5"];
 
 async fn await_bootstrap(nodes: &[Node]) {
@@ -234,7 +236,7 @@ async fn await_value(clients: &[SocketAddr], table: &str, key: &[u8], want: &[u8
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
 async fn cluster_grown_to_five_nodes_rebalances_existing_tablets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let (nodes, config) = bring_up(5, dir.path()).await;
     await_bootstrap(&nodes).await;
     let raftkv_ids = config.data_ids(); // [0, 1, 2, 3, 4]

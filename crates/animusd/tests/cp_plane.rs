@@ -30,6 +30,8 @@ use animusd::{
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 const CP_TABLE: &str = "cp_t";
 
 async fn call(addr: std::net::SocketAddr, req: ClientRequest) -> ClientResponse {
@@ -61,7 +63,7 @@ async fn await_bootstrap(nodes: &[Node]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn reads_and_writes_route_through_the_raft_group() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -182,7 +184,7 @@ async fn reads_and_writes_route_through_the_raft_group() {
 /// (node ids `0..3`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_member_addresses_register_and_replicate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -231,7 +233,7 @@ async fn cp_member_addresses_register_and_replicate() {
 /// served by the new group (its election takes a moment).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cp_tablet_splits_and_both_halves_serve() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -361,7 +363,7 @@ async fn cp_tablet_splits_and_both_halves_serve() {
 /// liveness check the deterministic sim cannot give (root CLAUDE.md rule).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn single_write_latency_is_low() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -459,7 +461,7 @@ async fn single_write_latency_is_low() {
 /// this proves the same general split-triggering behavior via bytes instead.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_when_it_grows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -554,7 +556,7 @@ async fn tablet_auto_splits_when_it_grows() {
 /// right at the first large key).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -725,7 +727,7 @@ async fn tablet_auto_splits_on_bytes_with_skewed_value_sizes() {
 /// guaranteed now — see the root `CLAUDE.md`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn already_split_tablet_splits_again_once_it_regrows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

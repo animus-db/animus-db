@@ -20,6 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// A tiny retention window — never the 24h production default (this
 /// codebase's own testing discipline, see `StreamSealKnobs::default`'s
 /// precedent). 2s, not smaller: several of this file's tests need to seal
@@ -295,7 +297,7 @@ fn metric_value(text: &str, name: &str) -> Option<u64> {
 /// just the catalog row disappearing).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_phase_expiry_removes_the_row_and_every_replicas_object() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), TINY_RETENTION).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -397,7 +399,7 @@ async fn two_phase_expiry_removes_the_row_and_every_replicas_object() {
 /// durability-over-availability tradeoff, not a bug this test is about).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expiry_survives_a_control_leader_kill_mid_sweep() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster_with_store(
         3,
         dir.path(),
@@ -501,7 +503,7 @@ async fn expiry_survives_a_control_leader_kill_mid_sweep() {
 /// current *last* epoch is never physically removed while it still exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reader_never_sees_an_empty_success_gap_across_expiry() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), TINY_RETENTION).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -594,7 +596,7 @@ async fn reader_never_sees_an_empty_success_gap_across_expiry() {
 /// throughout, since retention never elapses in this test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     // 4 nodes, K=3 (the default): exactly one spare candidate beyond
     // whichever 3 the placement view chose for this shard.
     let nodes = start_streamed_cluster(4, dir.path(), Duration::from_secs(600)).await;
@@ -692,7 +694,7 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
 /// accumulates independently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disable_grace_lifecycle_end_to_end_with_reenable_coexistence() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), TINY_RETENTION).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -813,7 +815,7 @@ async fn disable_grace_lifecycle_end_to_end_with_reenable_coexistence() {
 /// retention-zero rule reacting to the schema's own disappearance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_table_cascade_converges_via_the_janitor() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     // A generous retention (600s): if this test ever passed only because
     // retention itself elapsed rather than the drop-table rule, this would
     // time out instead of passing for the wrong reason.
@@ -867,7 +869,7 @@ async fn drop_table_cascade_converges_via_the_janitor() {
 /// converge to zero via the same janitor sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mid_grace_drop_removes_both_coexisting_labels() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), Duration::from_secs(600)).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -950,7 +952,7 @@ async fn mid_grace_drop_removes_both_coexisting_labels() {
 /// the "observability lands with the mechanism" house rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_reflect_a_completed_retention_cycle() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), TINY_RETENTION).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -1044,7 +1046,7 @@ async fn grow_and_await_cutover(nodes: &[Node], table: &str) -> TabletId {
 /// one 200ms tick and turns this red.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_parents_shards_are_not_reaped_early() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), Duration::from_secs(3600)).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -1100,7 +1102,7 @@ async fn retired_parents_shards_are_not_reaped_early() {
 /// the final row forever and turns this red.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_parents_final_shard_expires_by_retention() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), TINY_RETENTION).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();

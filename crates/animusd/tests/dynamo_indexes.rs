@@ -11,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -120,7 +122,7 @@ async fn await_gsi_query(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_paginates_a_whole_table() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -211,7 +213,7 @@ async fn scan_paginates_a_whole_table() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_write_then_query() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -311,7 +313,7 @@ async fn gsi_write_then_query() {
 /// as a live pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_skips_deleted_items_and_paginates() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

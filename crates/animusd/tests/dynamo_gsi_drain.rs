@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -128,7 +130,7 @@ async fn await_row_count(addr: SocketAddr, table: &str, want: usize, what: &str)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_drain_materializes_and_prunes_a_gsis_rows() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

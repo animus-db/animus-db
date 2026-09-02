@@ -33,6 +33,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Short relative to this test's own idle-wait margin (below), long enough
 /// that ordinary election/heartbeat/bootstrap settle traffic has long died
 /// down before the idle clock starts counting for real — mirrors every
@@ -137,7 +139,7 @@ const TABLE: &str = "quiesce_t";
 /// fork H's reconciler-driven wake plays no part in this specific test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn write_after_leader_kill_of_a_quiesced_group_converges() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let ip = "127.0.0.1".parse().unwrap();
     let bound = bind_cluster(3, ip, dir.path()).await.unwrap();
     let clients: Vec<SocketAddr> = bound.iter().map(animusd::BoundNode::client_addr).collect();
@@ -253,7 +255,7 @@ async fn write_after_leader_kill_of_a_quiesced_group_converges() {
 /// `host::Reconciler` — introduces no regression on the ordinary path).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn quiescence_enabled_does_not_disrupt_ordinary_traffic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let ip = "127.0.0.1".parse().unwrap();
     let bound = bind_cluster(3, ip, dir.path()).await.unwrap();
     let clients: Vec<SocketAddr> = bound.iter().map(animusd::BoundNode::client_addr).collect();
