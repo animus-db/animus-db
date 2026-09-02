@@ -62,6 +62,7 @@ fn ack_all(core: &mut RaftCore, from: NodeId) {
             term: core.term(),
             success: true,
             match_index: core.last_log_index(),
+            needs_snapshot: false,
         },
         NOW,
         7,

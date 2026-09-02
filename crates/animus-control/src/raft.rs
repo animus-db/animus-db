@@ -233,6 +233,21 @@ pub enum RaftMsg<C = MetaCommand> {
         success: bool,
         /// Highest log index now known to match on the follower.
         match_index: u64,
+        /// **Issue #554.** Echoes the responder's own
+        /// [`RaftCore::state_machine_behind`] — `true` when its state
+        /// machine (never touched by this message, which is purely a log
+        /// fact) is behind its own log's compacted start and needs a fresh
+        /// `InstallSnapshot` regardless of `match_index`/`next_index`, which
+        /// the log tail alone can satisfy with nothing left to signal a gap.
+        /// `#[serde(default)]` so an older wire peer (which never sets this)
+        /// decodes to `false` — the pre-existing behavior, never a hazard on
+        /// its own (a leader that never learns about a gap just doesn't
+        /// proactively close it; the replica itself still refuses to serve
+        /// reads or campaign while behind, see `state_machine_behind`'s
+        /// doc). Always `false` for the in-core control plane, which never
+        /// sets `state_machine_behind` at all.
+        #[serde(default)]
+        needs_snapshot: bool,
     },
     /// One **offset-addressed chunk** of the leader's state-machine snapshot,
     /// shipped to a follower whose log has fallen behind the leader's compacted
@@ -483,6 +498,30 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    // Leader-only (issue #554): the highest `snapshot_index` this leader has
+    // FULLY shipped and had acknowledged (`handle_install_snapshot_resp`'s
+    // completion branch) to each peer via a `needs_snapshot`-triggered
+    // `InstallSnapshot`. Read by `handle_append_resp`'s own `needs_snapshot`
+    // handling to avoid a livelock: `needs_snapshot: true` stays true on
+    // every one of a behind peer's `AppendEntriesResp`s until ITS OWN async
+    // apply task actually merges the install into its engine (see
+    // `animus-cp-data`'s per-loop-iteration live feed, `drive`'s doc) — a
+    // window that can span several of this peer's own heartbeat acks. Without
+    // this map, EVERY one of those still-true acks would force `next_index`
+    // back to 1 and restart a fresh chunked transfer from scratch, even
+    // though the peer already has (and is simply still digesting) a complete
+    // one — a self-sustaining cycle that never lets `next_index` stay past
+    // `snapshot_index` long enough for the peer to finish, confirmed live
+    // (`docs/engineering-lessons.md`'s matching entry). Once a value here is
+    // `>= self.snapshot_index`, a further `needs_snapshot: true` from that
+    // peer is a known-stale echo of an already-served request and is not
+    // re-triggered — `self.snapshot_index` moving again (a fresh compaction
+    // outpacing a still-slow peer) naturally invalidates the entry and lets
+    // a genuinely new request through. Volatile, like `next_index`/
+    // `match_index` themselves — never persisted or snapshotted, and
+    // harmlessly stale-but-safe if a peer id is reused (worst case: one
+    // needless resend cycle, not a correctness issue).
+    snapshot_served_through: BTreeMap<NodeId, u64>,
     // Leader-only, volatile liveness bookkeeping (ADR 0037 hardening PR2): the
     // `now` at which this leader last heard an `AppendEntriesResp` (success OR
     // reject — either proves the peer is up and reachable) from each peer.
@@ -626,6 +665,33 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `set_snapshot_blob`. Never raised by an in-core state machine (its blob is
     // kept eagerly).
     snapshot_needed: bool,
+    // **Needs-snapshot state** (issue #554, `DRIVER_APPLIED` planes only —
+    // never set for the in-core control plane, see `animus-cp-data`'s
+    // `applied.rs` module doc for the full mechanism). `true` once the
+    // driver, at `drive()` start, finds its own engine's durable applied
+    // watermark strictly below this node's recovered `snapshot_index`: the
+    // log's own compacted prefix is gone, and the engine — freshly
+    // rebuilt/wiped, or otherwise never caught up that far — holds none of
+    // it either. A replica in this state must not be trusted to serve a
+    // linearizable or replica-local read (both already gate on the
+    // `DRIVER_APPLIED` `engine_applied` watermark, which the driver seeds at
+    // the same low value, so this alone already blocks reads with no
+    // further change needed) and must not become leader (gated below,
+    // mirroring the learner `is_voter()` gate exactly) — a leader built on
+    // an incomplete engine could ship a corrupt `InstallSnapshot` image to a
+    // perfectly healthy follower. It keeps voting, appending, and committing
+    // normally: the log and hard state are intact and valid regardless of
+    // what the engine holds. Every `AppendEntriesResp` this node builds
+    // while a follower echoes this flag (`needs_snapshot`) so its leader —
+    // regardless of `next_index`, which the log tail alone can satisfy —
+    // ships a fresh `InstallSnapshot` built at the leader's OWN current
+    // applied index (at or ahead of anything this replica's log start could
+    // possibly require). Recomputed LIVE by the driver, every loop
+    // iteration (never a one-shot latch — see
+    // [`set_state_machine_behind`](Self::set_state_machine_behind)'s own
+    // doc for why a latch produced a real livelock). Default `false`; only
+    // ever set via that method.
+    state_machine_behind: bool,
 
     // --- Quiescence (ADR 0044 phase-1 PR3). `None` (the default, set by every
     // constructor) is byte-identical to pre-PR3 behavior: the entry predicate
@@ -724,6 +790,7 @@ where
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            snapshot_served_through: BTreeMap::new(),
             last_contact: BTreeMap::new(),
             departing: BTreeMap::new(),
             transfer_target: None,
@@ -743,6 +810,7 @@ where
             snapshot_blob: None,
             pending_install: None,
             snapshot_needed: false,
+            state_machine_behind: false,
             pending: Vec::new(),
             persisted_hard: (0, None),
             snapshot_dirty: false,
@@ -1851,7 +1919,8 @@ where
                 term,
                 success,
                 match_index,
-            } => self.handle_append_resp(from, term, success, match_index, now),
+                needs_snapshot,
+            } => self.handle_append_resp(from, term, success, match_index, needs_snapshot, now),
             RaftMsg::InstallSnapshot {
                 term,
                 leader,
@@ -2102,6 +2171,7 @@ where
                     term: self.current_term,
                     success: false,
                     match_index: 0,
+                    needs_snapshot: self.state_machine_behind,
                 },
             )];
         }
@@ -2113,6 +2183,11 @@ where
         // The leader's prev is behind our snapshot: those entries are already in
         // our snapshot, so report we match up to the snapshot and let the leader
         // resend from there. (Common right after we compacted past the leader.)
+        // Issue #554: this is exactly the shape a `state_machine_behind`
+        // replica hits on every ordinary heartbeat once its log has fully
+        // caught up to the leader's — the log tail matches, so without
+        // `needs_snapshot` the leader would never learn this replica's own
+        // engine is still missing everything before `snapshot_index`.
         if prev_log_index < self.snapshot_index {
             return vec![(
                 leader,
@@ -2120,6 +2195,7 @@ where
                     term: self.current_term,
                     success: true,
                     match_index: self.snapshot_index,
+                    needs_snapshot: self.state_machine_behind,
                 },
             )];
         }
@@ -2135,6 +2211,7 @@ where
                     term: self.current_term,
                     success: false,
                     match_index: 0,
+                    needs_snapshot: self.state_machine_behind,
                 },
             )];
         }
@@ -2167,6 +2244,7 @@ where
                 term: self.current_term,
                 success: true,
                 match_index,
+                needs_snapshot: self.state_machine_behind,
             },
         )]
     }
@@ -2177,6 +2255,7 @@ where
         term: u64,
         success: bool,
         match_index: u64,
+        needs_snapshot: bool,
         now: Nanos,
     ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
@@ -2190,9 +2269,6 @@ where
         if success {
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(match_index);
-            self.next_index.insert(from.clone(), match_index + 1);
-            self.maybe_advance_commit();
-            self.apply();
             if self
                 .departing
                 .get(&from)
@@ -2200,6 +2276,57 @@ where
             {
                 self.departing.remove(&from);
             }
+        }
+        if needs_snapshot {
+            // Issue #554: `from`'s own state machine is behind its own log's
+            // compacted start — its log tail may well already match ours
+            // (this can arrive on a `success` response), so nothing about
+            // `next_index`/`match_index` would otherwise signal a gap.
+            //
+            // **Already served, just still digesting — don't re-trigger.**
+            // `needs_snapshot` stays `true` on EVERY one of `from`'s own
+            // `AppendEntriesResp`s until ITS OWN async apply task actually
+            // merges a completed install into its engine (a window spanning
+            // several of its own heartbeat acks — see `animus-cp-data`'s
+            // per-loop-iteration live feed, `drive`'s doc). Blindly forcing
+            // `next_index` back to 1 on every one of those acks would
+            // restart a fresh chunked transfer before the peer ever
+            // finishes digesting the LAST one — a self-sustaining cycle
+            // that never lets it catch up, confirmed live (`docs/
+            // engineering-lessons.md`'s matching entry). `snapshot_served_
+            // through` is the fix: once this leader has fully shipped `from`
+            // a snapshot AT OR PAST its current `snapshot_index`, further
+            // `needs_snapshot: true` acks for that same base are known-stale
+            // echoes and are left alone — `self.snapshot_index` moving again
+            // (a fresh compaction outpacing a still-slow peer) naturally
+            // invalidates the entry and lets a genuinely new request through.
+            let already_served = self
+                .snapshot_served_through
+                .get(&from)
+                .is_some_and(|&served| served >= self.snapshot_index);
+            if !already_served {
+                // Resetting `next_index` down into the snapshot region is
+                // exactly what `replicate_to`'s own `next <= snapshot_index`
+                // check already knows how to turn into a chunked transfer
+                // (built at THIS leader's current applied index via the
+                // existing lazy-image path), reusing every bit of that
+                // machinery — chunking, the resend cap, the `DRIVER_APPLIED`
+                // on-demand image build. `match_index` (above, when
+                // `success`) is left untouched: it is a genuine fact about
+                // log agreement, unrelated to what the engine holds.
+                self.next_index.insert(from.clone(), 1);
+            }
+            self.maybe_advance_commit();
+            self.apply();
+            return self
+                .replicate_to(from, SnapshotResend::Always)
+                .into_iter()
+                .collect();
+        }
+        if success {
+            self.next_index.insert(from.clone(), match_index + 1);
+            self.maybe_advance_commit();
+            self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
                 return self
                     .replicate_to(from, SnapshotResend::Always)
@@ -2256,7 +2383,26 @@ where
 
         // Already at least this far along: drop any partial transfer and just
         // acknowledge our position (the leader will stop sending chunks).
-        if last_index <= self.snapshot_index {
+        //
+        // **Issue #554: this short-circuit is exactly wrong for a
+        // `state_machine_behind` node**, and is in fact THE scenario the
+        // whole mechanism exists to fix — its own log-derived `snapshot_index`
+        // is precisely the fact this node cannot trust: a wiped/rebuilt
+        // engine reopened fresh keeps the OLD, still-valid `snapshot_index`
+        // from its intact log, so an incoming offer at that SAME index
+        // (the overwhelmingly common case: the offer is built at the
+        // leader's own current base, which the follower's log already
+        // matched before its engine was lost) would otherwise be silently
+        // discarded here as "redundant," never reaching `pending_install`,
+        // never touching the empty engine at all — the exact silent-data-
+        // loss-disguised-as-a-no-op this whole design closes. While behind,
+        // fall through to the normal reassembly path unconditionally instead
+        // (safe even if `last_index` turns out to be strictly below this
+        // node's own `snapshot_index` in some rarer divergent-compaction-
+        // cadence case: installing a slightly-older-but-still-valid image is
+        // wasted work, never incorrect — the log tail still replays over it
+        // afterward, and per-key LWW makes any overlap idempotent).
+        if last_index <= self.snapshot_index && !self.state_machine_behind {
             self.incoming_snapshot = None;
             return vec![(
                 leader,
@@ -2433,6 +2579,15 @@ where
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
             self.next_index.insert(from.clone(), last_index + 1);
+            // Issue #554: record that `from` has now been fully served a
+            // snapshot at (at least) `last_index` — see `snapshot_served_
+            // through`'s own doc and `handle_append_resp`'s `needs_snapshot`
+            // handling, the sole reader.
+            let served = self
+                .snapshot_served_through
+                .entry(from.clone())
+                .or_insert(0);
+            *served = (*served).max(last_index);
             self.maybe_advance_commit();
             self.apply();
             if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
@@ -2539,7 +2694,14 @@ where
     fn start_pre_vote(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
         // A node removed from the configuration must not campaign (mirrors
         // `start_election`): it can't win and would only disrupt the survivors.
-        if !self.is_voter() {
+        // Issue #554: a node whose own state machine is behind its own log's
+        // compacted start must not campaign either, for the same reason a
+        // learner never does (`is_voter()`, above) — winning would make it
+        // leader over an engine missing everything the log already
+        // discarded, which (unlike a learner) it CAN do here since its log
+        // is otherwise fully caught up. Mirrors that gate exactly; see
+        // `state_machine_behind`'s own doc.
+        if !self.is_voter() || self.state_machine_behind {
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
@@ -2579,7 +2741,11 @@ where
         // A node removed from the configuration must not campaign (it cannot win
         // and would only disrupt the surviving voters). It stays a quiet follower
         // until it learns it is gone, then idles (ADR 0017 C).
-        if !self.is_voter() {
+        // Issue #554: same gate as `start_pre_vote`'s own — this is a second,
+        // independent entry point (`handle_pre_vote_resp`'s own majority
+        // check can reach here without going back through `start_pre_vote`),
+        // so both need the check, not just one.
+        if !self.is_voter() || self.state_machine_behind {
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
@@ -3111,6 +3277,49 @@ where
     /// control plane never raises it.
     pub fn take_snapshot_needed(&mut self) -> bool {
         std::mem::replace(&mut self.snapshot_needed, false)
+    }
+
+    /// Whether this node's own state machine is behind its own log's
+    /// compacted start (issue #554) — see [`set_state_machine_behind`]
+    /// (Self::set_state_machine_behind)'s doc for the full mechanism. Read
+    /// by the driver to decide whether to merge freshly-committed effects
+    /// into the engine this pass (it must not, while behind — see
+    /// `animus-cp-data::apply_and_compact`).
+    #[must_use]
+    pub fn state_machine_behind(&self) -> bool {
+        self.state_machine_behind
+    }
+
+    /// Set (or clear) the needs-snapshot state (issue #554). Only ever
+    /// called by a `DRIVER_APPLIED` plane's own driver — never by the
+    /// in-core control plane, for which this stays permanently `false` and
+    /// every dependent behavior (the campaign gate below, the
+    /// `needs_snapshot` field on this node's own `AppendEntriesResp`s) is
+    /// therefore inert.
+    ///
+    /// **Call this LIVE, every driver loop iteration** — recomputed fresh
+    /// from `engine_applied.load() < self.snapshot_index()` each time —
+    /// never as a one-shot latch set at `drive()` start and cleared later by
+    /// a *different* async task (the apply task, once an install lands).
+    /// `animus-cp-data`'s consensus loop does exactly this, in the same
+    /// lock acquisition as `set_quiesce_engine_caught_up`, mirroring that
+    /// method's own established "feed the one external input the core has
+    /// no visibility into itself, once per iteration, before `tick`" idiom.
+    /// A driver-latched version was tried first and produced a real,
+    /// reproducible **livelock**: `snapshot_index` advances synchronously
+    /// the instant this node's own `handle_install_snapshot` completes a
+    /// transfer, but the async apply task that actually merges the install
+    /// into the engine — and would clear a latch — runs on its own separate
+    /// schedule, so every `AppendEntriesResp` built in that window still
+    /// echoed `needs_snapshot: true`, and a leader (correctly, from what it
+    /// was told) kept resetting the peer's `next_index` back to 1 before it
+    /// ever finished digesting the transfer it just received. See
+    /// `docs/engineering-lessons.md`'s matching entry and ADR 0009's
+    /// 2026-09-02 addendum for the full account, including the leader-side
+    /// half of the fix this alone was not sufficient for
+    /// (`snapshot_served_through`).
+    pub fn set_state_machine_behind(&mut self, behind: bool) {
+        self.state_machine_behind = behind;
     }
 
     fn maybe_advance_commit(&mut self) {

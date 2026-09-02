@@ -57,6 +57,7 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
+mod applied;
 pub mod backup;
 mod ceiling;
 pub mod cluster_segment_store;
@@ -6238,8 +6239,29 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         .expect("raftkv core poisoned")
         .drain_pending_install();
     if let Some((last_index, bytes)) = pending_install {
-        install_engine_image(storage, kind_scopes, &bytes).await;
+        // Issue #554: the durable applied watermark rides in the SAME
+        // `merge_batch` as every row this image installs — `install_engine_
+        // image` takes `last_index` for exactly this — so the watermark and
+        // the data it attests to are crash-consistent: a torn write here can
+        // only ever understate progress (this node re-detects `state_machine_
+        // behind` and re-requests), never overstate it.
+        install_engine_image(storage, kind_scopes, &bytes, tablet, last_index).await;
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
+        // Belt, not the buckle: the consensus loop's own per-iteration live
+        // feed (`engine_applied.load() < c.snapshot_index()`, see `drive`'s
+        // doc) is what actually keeps `state_machine_behind` correct and
+        // race-free — a one-shot clear here alone was tried first and
+        // produced a livelock (that loop runs independently of this apply
+        // task, so a response built in the gap between this install landing
+        // and the loop's next iteration would otherwise still echo stale
+        // `needs_snapshot: true`). This clear is now redundant with that
+        // live feed but harmless (the loop overwrites it on its very next
+        // iteration regardless) and gives this exact moment — right after
+        // the install this node was waiting on — a head start rather than
+        // waiting on the loop's own cadence.
+        core.lock()
+            .expect("raftkv core poisoned")
+            .set_state_machine_behind(false);
         // Witnessing point (ADR 0018 §2 amendment): a snapshot can carry
         // versions this node has never seen minted, so fold in the engine's
         // new high-water mark before this node ever mints/compares again.
@@ -6272,11 +6294,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         did_work = true;
     }
 
+    // Issue #554: while this node's own engine is behind its log's compacted
+    // start, do NOT drain and merge committed log-tail effects — those
+    // entries' indices are necessarily all > the OLD `snapshot_index` (that
+    // is what `RaftCore::apply` buffers into `pending_apply` in the first
+    // place, see its own doc), so merging them and advancing `engine_applied`
+    // to their index would leapfrog straight over the still-missing prefix,
+    // making a hollow engine falsely report itself caught up — precisely the
+    // bug this whole mechanism exists to close. Simply leave them queued in
+    // the core (`pending_apply` keeps accumulating, harmlessly — see
+    // `applied.rs`'s module doc) until an install (above) closes the gap;
+    // this node keeps voting/appending/committing normally in the meantime
+    // (`RaftCore::apply` itself is untouched), only the async merge into the
+    // engine is deferred. Applying is naturally idempotent (per-key LWW), so
+    // whatever sits queued from before the gap was noticed merges harmlessly
+    // once this resumes.
+    let state_machine_behind = core
+        .lock()
+        .expect("raftkv core poisoned")
+        .state_machine_behind();
     // Apply the now-durable committed commands to the engine, in commit order.
     // The packed HLC commit timestamp is the MVCC version: per-key LWW then
     // reproduces the agreed cross-group order, and re-applying on recovery is
     // idempotent (the same command always computes the same `ts`).
-    let effects = core.lock().expect("raftkv core poisoned").drain_apply();
+    let effects = if state_machine_behind {
+        Vec::new()
+    } else {
+        core.lock().expect("raftkv core poisoned").drain_apply()
+    };
     if !effects.is_empty() {
         metrics.incr_by(Metric::CpApplies, effects.len() as u64);
     }
@@ -7679,6 +7724,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     flush_pending(storage, &mut pending, metrics, halted).await;
     // Publish the watermark: the engine now holds all effects through `max_index`,
     // so linearizable reads may serve up to it and compaction may snapshot up to it.
+    // (Issue #554's DURABLE watermark marker is written only at compaction/
+    // install time, not here on every ordinary pass — see the compaction
+    // block below for why.)
     if max_index > 0 {
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
     }
@@ -7779,10 +7827,63 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // seconds. Now compaction completes the round it consumed (after
                 // its `replace` lands, below), and the buffered acks go out.
                 let (_superseded, round) = persist_round::drain_for_round(&mut c, persist);
-                (Some((buf, round)), lli)
+                (Some((buf, round, c.snapshot_index())), lli)
             }
         };
-        if let Some((bytes, round)) = bytes {
+        if let Some((bytes, round, new_snapshot_index)) = bytes {
+            // Issue #554: the durable applied-watermark marker is written
+            // ONLY here (compaction/on-demand-image time), never on every
+            // ordinary apply pass. Two reasons:
+            // (1) **Correctness granularity matches exactly.** The
+            //     needs-snapshot check is `engine watermark <
+            //     RaftCore::snapshot_index()` — and `snapshot_index` itself
+            //     only ever changes right here (`snapshot_upto`, or an
+            //     `InstallSnapshot`, already handled separately) — so the
+            //     marker only ever needs to track THIS value, never anything
+            //     finer-grained. Between compactions, `snapshot_index` is
+            //     fixed, so a marker that is merely stale (behind the
+            //     engine's true progress) can never be BELOW it either,
+            //     since the marker and `snapshot_index` are set from the
+            //     identical `ea`/`c.snapshot_index()` value at every write —
+            //     they can only ever drift apart if the engine holding the
+            //     marker is wiped, exactly the case this exists to catch.
+            // (2) **Avoids a real dead-space regression.** A marker written
+            //     on every commit rides into whatever SSTable that commit's
+            //     own flush produces; since its own reserved-namespace key
+            //     sorts above every row kind's own byte range (`applied.rs`'s
+            //     doc), any single-kind table that also carries it no longer
+            //     LOOKS single-kind to `LsmEngine::clone_to_filtered`'s
+            //     whole-file `[min_key, max_key]` overlap check — its
+            //     inflated `max_key` spuriously overlaps every OTHER kind's
+            //     own `keep` range too, defeating split's whole-file
+            //     dead-space exclusion for that table (never a correctness
+            //     bug — `trim_split_child` backstops it regardless — but a
+            //     real, avoidable regression to the ADR 0058 dead-space win,
+            //     caught by `tests/inplace_split_dead_space.rs`). Compaction
+            //     is far rarer (every `COMPACT_THRESHOLD` applies, or an
+            //     on-demand image build) than an ordinary commit, so this
+            //     keeps the same risk profile `seal.rs`/`ceiling.rs`'s own
+            //     markers already carry — never eliminated, but not worsened
+            //     into "every write, every table."
+            //
+            // Written durably BEFORE the WAL rewrite below (not after): a
+            // crash between the two leaves the marker CAUGHT UP but the
+            // recovered `snapshot_index` still at its OLD (lower) value —
+            // never behind, and the untouched, un-truncated WAL still holds
+            // the tail `RaftCore::apply` needs to safely re-deliver the
+            // identical (idempotent) effects the marker already reflects.
+            // The reverse order would instead risk the (still-safe, merely
+            // wasteful) opposite: a crash leaving `snapshot_index` already
+            // advanced but the marker stale, falsely requesting a fresh
+            // snapshot this replica didn't need.
+            storage
+                .merge(
+                    &applied::applied_marker_key(tablet),
+                    &applied::encode_applied_value(new_snapshot_index),
+                    new_snapshot_index,
+                )
+                .await
+                .expect("raftkv applied watermark marker (compaction)");
             match env.replace(wal, &bytes).await {
                 Ok(()) => {
                     // Physically durable now — advance both watermarks (the log
@@ -7920,10 +8021,23 @@ async fn engine_image<S: StorageEngine>(
 /// The wire image carries *logical* keys (stripped by the sender's
 /// `engine_image`); each is re-prefixed to *this* replica's own `scope`
 /// before writing into the (possibly shared) engine.
+///
+/// **Issue #554**: every row plus the durable applied-watermark marker
+/// (`applied.rs`, at `last_index` — the snapshot's own index) land in ONE
+/// `merge_batch` call, so a receiving replica can never observe the image's
+/// rows without the watermark that attests to them, or vice versa. Before
+/// this, each row merged through its own awaited, unbatched call — durable
+/// per call (this crate's `merge`/`merge_tombstone` contract), just not
+/// atomic with the others, which would have left a window where a crash
+/// mid-install could durably hold some rows with no watermark yet — safe on
+/// its own re-detection (this node just requests another snapshot), but
+/// needlessly so when batching the whole install is no more work.
 async fn install_engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     bytes: &[u8],
+    tablet: u64,
+    last_index: u64,
 ) {
     let entries: Vec<ImageEntry> = match codec::decode_image(bytes) {
         Ok(e) => e,
@@ -7932,6 +8046,7 @@ async fn install_engine_image<S: StorageEngine>(
             return;
         }
     };
+    let mut ops: Vec<MergeOp> = Vec::with_capacity(entries.len() + 1);
     for (kind, key, value, version) in entries {
         // An unknown kind can only come from a peer that knows a row kind this
         // build does not (ALL_KINDS grew). Dropping it is the safe read: this
@@ -7942,21 +8057,20 @@ async fn install_engine_image<S: StorageEngine>(
             continue;
         };
         let physical = scope.physical(&key);
-        match value {
-            Some(v) => {
-                storage
-                    .merge(&physical, &v, version)
-                    .await
-                    .expect("install put");
-            }
-            None => {
-                storage
-                    .merge_tombstone(&physical, version)
-                    .await
-                    .expect("install tombstone");
-            }
-        }
+        ops.push(match value {
+            Some(v) => MergeOp::put(physical, v, version),
+            None => MergeOp::tombstone(physical, version),
+        });
     }
+    ops.push(MergeOp::put(
+        applied::applied_marker_key(tablet),
+        applied::encode_applied_value(last_index),
+        last_index,
+    ));
+    storage
+        .merge_batch(ops)
+        .await
+        .expect("raftkv install snapshot image");
 }
 
 /// The shared-state bundle handed to the driver tasks, built once in
@@ -8155,15 +8269,49 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());
         *core.lock().expect("raftkv core poisoned") = recovered;
     }
-    // The durable engine already reflects the applied state up to the recovered
-    // apply cursor (its writes preceded the WAL fsync that recorded them), and the
-    // log tail re-applies idempotently as commit re-advances. Seed `engine_applied`
-    // at that cursor so a read right after restart doesn't wait for the base to be
-    // re-merged (it never is — only the tail is).
-    engine_applied.store(
-        core.lock().expect("raftkv core poisoned").last_applied(),
-        Ordering::SeqCst,
-    );
+    // Issue #554: seed `engine_applied` from the ENGINE'S OWN durable applied
+    // watermark (`applied.rs`), never from `core.last_applied()`. Right after
+    // `RaftCore::recovered`, `last_applied` always equals the recovered
+    // `snapshot_index` — a fact about where the LOG's own compaction left
+    // off, not about what the engine holds. That is a sound proxy only when
+    // the engine and the log both survived the restart intact (the seed and
+    // the true watermark coincide); it silently overstates progress the
+    // moment the engine did not (a wiped/rebuilt engine reopened fresh,
+    // `host.rs`'s destroy-and-reopen recovery) — the fresh engine holds
+    // NOTHING, yet the old seed claimed it was caught up through
+    // `snapshot_index`. The marker is 0 for a fresh/empty engine, exactly
+    // like every other never-yet-written key, which is the correct seed in
+    // that case. See `applied.rs`'s module doc for the full account.
+    let applied_marker = applied::applied_marker_key(stream);
+    let engine_watermark = storage
+        .get(&applied_marker)
+        .await
+        .expect("system-keyspace engine read (cp applied watermark)")
+        .and_then(|v| applied::decode_applied_value(&v.value))
+        .unwrap_or(0);
+    engine_applied.store(engine_watermark, Ordering::SeqCst);
+    // Needs-snapshot state (issue #554): the engine's own watermark is below
+    // the log's own compacted start — the prefix through `snapshot_index` is
+    // gone from both the log (compacted) and the engine (never merged, or
+    // lost and rebuilt fresh). Only an `InstallSnapshot` from a caught-up
+    // peer can close this gap; see `RaftCore::state_machine_behind`'s doc
+    // for what this replica does — and does not do — while it is set.
+    {
+        let mut c = core.lock().expect("raftkv core poisoned");
+        let behind = engine_watermark < c.snapshot_index();
+        c.set_state_machine_behind(behind);
+        if behind {
+            metrics.incr(Metric::CpEngineNeedsSnapshot);
+            tracing::warn!(
+                tablet = stream,
+                engine_watermark,
+                snapshot_index = c.snapshot_index(),
+                "raftkv: this replica's own engine is behind its log's compacted \
+                 start (issue #554) — refusing reads/campaigning until a fresh \
+                 InstallSnapshot closes the gap"
+            );
+        }
+    }
     // Rebuild this group's in-memory sealed-range set from the engine's own
     // durable marker keys (ADR 0018 §2 amendment) — the deterministic
     // recovery source, deliberately NOT the recovered log tail: compaction
@@ -8370,6 +8518,33 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             let mut c = core.lock().expect("raftkv core poisoned");
             let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
             c.set_quiesce_engine_caught_up(caught_up);
+            // Issue #554: feed the needs-snapshot state LIVE, every loop
+            // iteration, from the two always-current facts — never latched.
+            // `drive()`'s own one-time seeding (at start, from the durable
+            // watermark) still runs first so the very first outbound message
+            // this node ever builds is already correct; this is what keeps
+            // it correct afterward too, and — critically — what closes it
+            // the INSTANT it stops being true. `state_machine_behind` can't
+            // be a driver-cleared latch the way `set_state_machine_behind`'s
+            // OTHER caller (the apply task's `pending_install` branch) makes
+            // it look: a latch cleared only by the async apply task leaves a
+            // window, between the consensus loop synchronously adopting a
+            // just-installed snapshot's `snapshot_index` and the apply task
+            // actually draining that same install into the engine, where
+            // this node's `AppendEntriesResp` would still report
+            // `needs_snapshot: true` — a stale ack processed by the leader
+            // AFTER it already completed the transfer would then reset
+            // `next_index` straight back down and restart the whole cycle,
+            // forever, with `engine_applied` never reaching `snapshot_index`
+            // — a real livelock this exact race produced (caught building
+            // this fix, `docs/engineering-lessons.md`'s matching entry).
+            // Recomputing live off `engine_applied`/`snapshot_index` instead
+            // has no such window: the moment `snapshot_index` itself
+            // advances (synchronously, inside `handle_install_snapshot`'s
+            // own complete branch — see that method's doc), THIS read sees
+            // it in the very same tick, before any response can go out.
+            let engine_behind = engine_applied.load(Ordering::SeqCst) < c.snapshot_index();
+            c.set_state_machine_behind(engine_behind);
             // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
             // non-empty `TxnTracker` (this group has a pending 2PC intent or
             // a decided-but-unresolved record still owed a resolve) always
@@ -8839,15 +9014,32 @@ mod kind_scope_tests {
                 Vec::new(),
                 Some(b"zzzz".to_vec()),
             )));
-            install_engine_image(&dst, &dst_scopes, &image).await;
+            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
 
             let mut src_rows = src.entries_with_tombstones().await.unwrap();
-            let mut dst_rows = dst.entries_with_tombstones().await.unwrap();
+            // Issue #554: the install also writes the durable applied-watermark
+            // marker (`applied.rs`) in the same batch as the image's own rows —
+            // a real row in `dst`'s engine, but not part of the image itself, so
+            // it is excluded here rather than expected to match `src` (which
+            // never had one written at all).
+            let marker_key = applied::applied_marker_key(1);
+            let mut dst_rows: Vec<_> = dst
+                .entries_with_tombstones()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(k, ..)| k != &marker_key)
+                .collect();
             src_rows.sort();
             dst_rows.sort();
             assert_eq!(
                 src_rows, dst_rows,
                 "the installed engine must be byte-identical to the source"
+            );
+            assert_eq!(
+                dst.get(&marker_key).await.unwrap().map(|v| v.value),
+                Some(applied::encode_applied_value(42)),
+                "the installed applied watermark must reflect the snapshot's own index"
             );
         });
     }

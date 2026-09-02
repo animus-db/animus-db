@@ -579,12 +579,27 @@ pub enum Metric {
     /// too tight for this deployment's real round-trip latency; see
     /// `animus-control/CLAUDE.md`'s "Leadership transfer" entry.
     ControlTransferAborted,
+
+    // --- CP data-plane needs-snapshot state (issue #554) --- Appended after
+    // the leadership-transfer-observability variant above; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animus-cp-data`'s `drive`.
+    /// This replica's own engine, at `drive()` start, was found behind its
+    /// own recovered `RaftCore::snapshot_index` — the log's own compacted
+    /// prefix is gone from the engine too (a wiped/rebuilt engine reopened
+    /// fresh, or any other way the two fell out of sync). The replica
+    /// refuses reads and campaigning until a fresh `InstallSnapshot` closes
+    /// the gap (`RaftCore::state_machine_behind`). A nonzero rate is
+    /// expected whenever the reconciler's engine-loss recovery fires past
+    /// the compaction threshold; see `animus-cp-data/CLAUDE.md`'s
+    /// "needs-snapshot state" entry.
+    CpEngineNeedsSnapshot,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 78] = [
+    pub const ALL: [Metric; 79] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -663,6 +678,7 @@ impl Metric {
         Metric::CpTxnUnresolvedDecidedStuck,
         Metric::DynamoTransactWritesAmbiguous,
         Metric::ControlTransferAborted,
+        Metric::CpEngineNeedsSnapshot,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -748,6 +764,7 @@ impl Metric {
             Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
             Metric::DynamoTransactWritesAmbiguous => "dynamo_transact_writes_ambiguous",
             Metric::ControlTransferAborted => "control_transfer_aborted",
+            Metric::CpEngineNeedsSnapshot => "cp_engine_needs_snapshot",
         }
     }
 
