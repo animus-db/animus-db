@@ -1099,6 +1099,36 @@ fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     run_scenario_on(scenario, mem_engine, None)
 }
 
+/// Run one scenario, identifying it by `name`/`seed` — under `--nocapture`
+/// via an `eprintln!` before the run starts, and unconditionally (regardless
+/// of output capturing) by catching a panic from inside `run` and re-raising
+/// it with `scenario=<name> seed=<seed>` prepended. Every corpus loop below
+/// goes through this rather than calling `run_scenario`/`run_scenario_on`/
+/// `run_scenario_wal_faults` directly, closing the gap issue #554 found: a
+/// panic in engine setup (e.g. `lsm_engine`'s `.expect("open lsm engine")`
+/// on a `StopRestart` reopen) fires *before* `assert_scenario_ok`'s own
+/// seed-carrying assertions ever run for that scenario, so without this a
+/// setup panic loses which of the corpus's many scenarios triggered it —
+/// unreplayable via `ANIMUS_SEED` with no seed to replay. Mirrors
+/// `assert_scenario_ok`'s own `(seed={})` message convention.
+fn run_scenario_identified<F>(s: &Scenario, run: F) -> ScenarioResult
+where
+    F: FnOnce() -> ScenarioResult + std::panic::UnwindSafe,
+{
+    eprintln!("scenario={} seed={}", s.name, s.seed);
+    match std::panic::catch_unwind(run) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|m| m.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            panic!("scenario={} seed={}: {msg}", s.name, s.seed);
+        }
+    }
+}
+
 /// The WAL-faults pass: `scenario` over `MemoryEngine`, with
 /// `torn_tail_on_crash`/`corrupt_on_crash` armed globally for the whole run
 /// (see [`run_scenario_on`]'s doc on `wal_disk_config`). Only ever called from
@@ -1269,7 +1299,7 @@ fn raftkv_corpus_is_linearizable() {
     let mut total_ok_writes = 0usize;
     let mut faulted_with_acks = 0usize;
     for s in &scenarios {
-        let r = run_scenario(s);
+        let r = run_scenario_identified(s, || run_scenario(s));
         // Serializability is a SAFETY property — it must hold on every scenario.
         // Convergence + durability are EVENTUAL — the poll gives them room to
         // heal; only budget exhaustion is a genuine failure.
@@ -1332,7 +1362,7 @@ fn raftkv_wal_faults_corpus_is_linearizable() {
     let mut ran = 0usize;
     let mut ok_writes = 0usize;
     for s in &scenarios {
-        let r = run_scenario_wal_faults(s);
+        let r = run_scenario_identified(s, || run_scenario_wal_faults(s));
         // A failure here is a genuine finding, never a reason to weaken this
         // pass (see `wal_fault_disk_config`'s doc) — the assertion stays
         // exactly as hard as every other tier's.
@@ -1523,7 +1553,7 @@ fn raftkv_lsm_representative_is_linearizable() {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("representative LSM scenario {name} not in the corpus"));
-        let r = run_scenario_on(s, lsm_engine, None);
+        let r = run_scenario_identified(s, || run_scenario_on(s, lsm_engine, None));
         assert_scenario_ok("lsm", s, &r);
         ran += 1;
         ok_writes += r.ok_writes;
@@ -1548,7 +1578,7 @@ fn raftkv_lsm_full_corpus_is_linearizable() {
     let scenarios = corpus();
     let mut faulted_with_acks = 0usize;
     for s in &scenarios {
-        let r = run_scenario_on(s, lsm_engine, None);
+        let r = run_scenario_identified(s, || run_scenario_on(s, lsm_engine, None));
         assert_scenario_ok("lsm", s, &r);
         if !s.faults.is_empty() && r.ok_writes > 0 {
             faulted_with_acks += 1;

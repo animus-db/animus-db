@@ -14,13 +14,25 @@
 //! 4. A crash *mid-compaction* (merged SSTable written but the manifest not yet
 //!    swapped) loses nothing and reads no torn table: recovery keeps the old
 //!    inputs, the orphan merged file is ignored.
+//! 5. A **lying** flush `sync` (`DiskConfig::set_fsync_lie_prob`), revealed by a
+//!    later process exit (`Simulator::stop`, mirroring `raftkv_linearizable.rs`'s
+//!    `StopRestart`): properties 1-4 above assume an *honest* disk, and here the
+//!    manifest swap and the WAL-segment GC that follow a flush both commit the
+//!    instant the lying `sync` returns `Ok`, with nothing in `LsmEngine` able to
+//!    tell a lie from a genuine sync ahead of time. This layer's job is to fail
+//!    **loudly** on reopen (an ordinary `Err`, detected and reported) rather
+//!    than silently serving an engine short a table's data — the property this
+//!    scenario pins. Recovering the *replica* is a layer up: issue #554
+//!    proposes the host reconciler treat an unopenable engine as lost and
+//!    rebuild it fresh from the group, not yet built — see `open`'s own doc and
+//!    `docs/engineering-lessons.md`.
 //!
 //! **Corpus shape** (ADR 0061 rung B1, house corpus doctrine): follows the
 //! standard `animus_test::corpus` scaffolding every fault-injection corpus in
 //! this repo uses (see `raftkv_linearizable.rs`/`reconciler_corpus.rs` for the
 //! canonical worked examples) — a frozen, name-seeded scenario list (one cell
 //! per property above, each a `fn(seed: u64)`), depth knob
-//! **`ANIMUS_LSM_CRASH_SEEDS`** (default 1 = the 5 frozen cells, byte-identical
+//! **`ANIMUS_LSM_CRASH_SEEDS`** (default 1 = the 6 frozen cells, byte-identical
 //! to this file's own pre-corpus form — none of these scenarios' outcomes
 //! depend on the sim seed at all, since none of them spawn concurrent tasks or
 //! touch `DiskConfig`'s randomness, but the seed is threaded through anyway to
@@ -32,7 +44,7 @@
 //! vs. `DiskConfig`-driven fault injection there).
 
 use animus_env::nid;
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{DiskConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
@@ -217,6 +229,72 @@ fn scenario_crash_mid_compaction_keeps_old_tables(seed: u64) {
     });
 }
 
+/// 5. A flush whose SSTable-file `sync` **lies** (returns `Ok` without actually
+///    promoting the file's buffered bytes to durable — `DiskConfig::
+///    set_fsync_lie_prob`, ADR 0061 Decision 3), revealed by a following process
+///    exit (`Simulator::stop`, the same primitive `raftkv_linearizable.rs`'s
+///    `StopRestart` nemesis uses): the manifest is *already* durably swapped to
+///    reference the now-empty table and the WAL segments the flush judged "now
+///    covered" are *already* removed, both committed the instant the lying
+///    `sync` returned `Ok` — nothing in `LsmEngine` can tell a lie from an
+///    honest sync ahead of the crash that reveals it. Root cause of issue
+///    #554's nightly `corpus-deep` failure
+///    (`raftkv_lsm_full_corpus_is_linearizable`, scenario
+///    `fsync_lie_stop_restart_early_3_s03`). What this scenario pins is that
+///    `open` still fails **loudly** on reopen — an ordinary `Err`, never a
+///    panic escaping this crate or a silent, incomplete-but-successful open.
+///    That's this layer's whole job here: recovering the *replica* belongs
+///    one layer up, in `animus-cp-data`'s host reconciler — issue #554
+///    proposes treating an unopenable engine as lost and rebuilding it fresh
+///    from the group (Raft catch-up), the same recovery the corpus's
+///    `MemoryEngine` tier already gets on every restart; not yet built. A
+///    future change that makes `open` swallow this and continue anyway
+///    (serving missing/stale data) would be a correctness regression, not a
+///    fix — this test exists to catch that.
+fn scenario_fsync_lie_flush_survives_as_a_clean_open_error(seed: u64) {
+    let sim = Simulator::new(seed);
+    {
+        let e = open(&sim);
+        block_on(async {
+            // Ordinary, honestly-synced writes — durable in the WAL (and
+            // readable) before the lie is ever armed.
+            e.put(b"a", b"1", 1).await.unwrap();
+            e.put(b"b", b"2", 2).await.unwrap();
+        });
+        // Arm the lie for exactly the flush that follows: its SSTable file's
+        // `sync` returns `Ok` but leaves the bytes buffered, not durable.
+        let mut lying = DiskConfig::default();
+        lying.set_fsync_lie_prob(1.0);
+        sim.set_disk_config(lying);
+        block_on(e.flush_now()).unwrap();
+        assert_eq!(
+            e.sstable_count(),
+            1,
+            "seed={seed}: expected exactly one (lyingly-synced) flushed table"
+        );
+        // Disarm before the crash, mirroring `raftkv_linearizable.rs`'s own
+        // `HealAll` reset — keeps this scenario isolated to the one lying sync.
+        sim.set_disk_config(DiskConfig::default());
+    }
+    // Process exit reveals the lie: the SSTable file's whole un-synced buffer
+    // (its only copy of the flushed data) is dropped.
+    sim.stop(nid(0));
+
+    let result = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts()));
+    let err = match result {
+        Ok(_) => panic!(
+            "seed={seed}: expected a clean open error after the lying flush was \
+             revealed by a crash, engine opened successfully instead"
+        ),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("corrupt sstable index"),
+        "seed={seed}: expected a clean 'corrupt sstable index' open error, got: {msg}"
+    );
+}
+
 /// A flush followed by leveled compaction both actually happen: many writes
 /// trigger repeated flushes, L0→L1(+) compaction fires repeatedly, the L0 (flush)
 /// tier never exceeds its trigger, the live table count stays far below the flush
@@ -351,6 +429,10 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_crash_mid_compaction_keeps_old_tables
         ),
         scenario!(
+            "fsync_lie_flush_survives_as_a_clean_open_error",
+            scenario_fsync_lie_flush_survives_as_a_clean_open_error
+        ),
+        scenario!(
             "flush_then_compaction_happen_and_keep_data",
             scenario_flush_then_compaction_happen_and_keep_data
         ),
@@ -378,7 +460,7 @@ fn lsm_crash_corpus_runs_every_scenario() {
 fn lsm_crash_corpus_names_and_seeds_are_unique_and_frozen() {
     let cells = scenario_cells();
     assert!(
-        cells.len() >= 5,
+        cells.len() >= 6,
         "corpus shrank unexpectedly to {} cells",
         cells.len()
     );

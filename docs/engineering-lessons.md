@@ -3758,6 +3758,41 @@ debugging anything that feels like it might have happened before.
   bug's mechanism can be isolated from the full system it was found in
   without losing what makes it true, prefer the isolated, deterministic
   proof over a bigger fixture that merely makes the race *more likely*.
+- **An `.expect()` in a corpus's own engine-setup helper loses the seed the
+  moment it panics — the failure fires before `assert_scenario_ok`'s own
+  seed-carrying message ever runs (2026-09-02, issue #554).**
+  `raftkv_linearizable.rs`'s LSM tier reopens a node's durable engine via
+  `lsm_engine()` (`LsmEngine::open_with(..).expect("open lsm engine")`),
+  called both for the initial open and for the `StopRestart` nemesis's
+  reopen. Every OTHER panic in this corpus's runner (`assert_scenario_ok`)
+  carries `scenario={name} seed={seed}` in its message by construction —
+  but a panic *before* that point, inside the scenario's own setup, has no
+  such message, and nothing upstream prints which of the corpus's ~1000+
+  scenarios was even running. `corpus-deep`'s nightly `ANIMUS_RAFTKV_LSM=1
+  ANIMUS_RAFTKV_SEEDS=40` run hit exactly this for two consecutive nights
+  (byte-identical panic both times — deterministic, not a flake) with no
+  way to replay it. **Fix**: every corpus loop in the file (there were
+  four: the plain corpus, the WAL-faults pass, the LSM representative
+  subset, and the LSM full corpus) now runs each scenario through a shared
+  `run_scenario_identified(s, || run(s))` wrapper — `eprintln!`s
+  `scenario={name} seed={seed}` before the run (visible under
+  `--nocapture`, the CI convention every corpus step already uses) *and*
+  `std::panic::catch_unwind`s the run, re-panicking with the same prefix
+  regardless of output buffering. This immediately identified the actual
+  failing scenario (`fsync_lie_stop_restart_early_3_s03`,
+  seed=15482874842363184593) on the very next repro run, replayable at
+  `ANIMUS_RAFTKV_SEEDS=4` (or any depth covering that seed variant) in
+  under two minutes instead of the full 40-seed, ~3-minute nightly sweep.
+  **General rule**: any fault-injection corpus whose scenario-runner
+  function bakes seed reporting into its own *assertion* messages
+  (`assert_scenario_ok`-shaped) has a structural blind spot for anything
+  that panics *before* that function runs — engine/fixture setup chief
+  among them, since setup is exactly the code least likely to have been
+  written with "this might panic mid-corpus" in mind. Wrap the *whole*
+  per-scenario call, not just the assertions, the same way this fix does;
+  the wrapper is generic over any `FnOnce() -> ScenarioResult`, so it costs
+  nothing to reuse from every loop in a corpus file, not just the one that
+  happened to be gated in CI.
 - **A converged-or-timeout poll on a `ConsistentRead: false` read proves one
   replica converged, not the group (2026-09-02, issue #559, ADR 0055).**
   `dynamo_index_scan.rs`'s `gsi_scan_paginates_and_drains_all_rows` polled a
@@ -8920,6 +8955,44 @@ debugging anything that feels like it might have happened before.
   time. See ADR 0062's 2026-09-01 amendment for the full incident,
   investigation, and fix; `crates/animus-control/CLAUDE.md`'s ADR 0062
   entry for the as-built mechanism.
+- **A lying `sync` revealed by a crash isn't a storage-layer bug to fix —
+  the fix is one layer up, and the corpus already proves what it looks
+  like (2026-09-02, issue #554, `LsmEngine`).** Root-caused `corpus-deep`'s
+  nightly `raftkv_lsm_full_corpus_is_linearizable` failure (scenario
+  `fsync_lie_stop_restart_early_3_s03`, seed=15482874842363184593) to a
+  precise interleaving, neither of the issue's own two starting
+  hypotheses: `LsmEngine::flush` writes a new SSTable, calls
+  `env.sync(&file)`, and — trusting its `Ok` — swaps the manifest and
+  `remove`s the WAL segments that data is now believed durably captured
+  in. Under `DiskConfig::set_fsync_lie_prob`, that `sync` can return `Ok`
+  while leaving the bytes buffered — invisible at flush time (a read-back
+  merges buffered+durable, indistinguishable from honest). A later crash
+  (`Simulator::stop`, modelling `StopRestart`) drops the file's un-synced
+  buffer, its only on-disk copy, since the fallback WAL segments were
+  already removed. `LsmEngine::open` already does the right thing here —
+  a loud `Err` (`corrupt sstable index: ...`), never a silent short open;
+  the panic was the test harness's own `.expect()` on that `Err` (fixed
+  separately, same issue).
+  **The system-level answer was already sitting in the corpus**: its
+  `MemoryEngine` tier restarts every `StopRestart` victim with a
+  genuinely empty engine and rebuilds it purely from the node's durable
+  Raft WAL plus the leader's on-demand snapshot, and passes every
+  `fsync_lie_stop_restart` cell — an empty engine has nothing a lying
+  sync could have corrupted. That's the correct recovery for `LsmEngine`
+  too: when a replica's local engine won't open, treat it as lost —
+  destroy its files (`EngineFactory::destroy` already exists in
+  `animus-cp-data::host`) and reopen fresh, letting Raft rebuild it from
+  the group — rather than today's `ensure_engine`
+  (`animus-cp-data/src/host.rs`, ~line 893-906), which warns and retries
+  the same open forever and never heals. **Proposed, not built**: that
+  fix belongs in the reconciler (and the corpus's own `lsm_engine()`
+  helper should mirror it), not in `animus-storage` — storage's job stops
+  at detecting and loudly reporting the lie, which it already does;
+  issue #554 tracks the reconciler-side fix as a maintainer decision.
+  What shipped here: the residual named in `lsm.rs`'s "Crash safety" doc
+  and `animus-storage/CLAUDE.md`, plus a regression
+  (`lsm_crash.rs::fsync_lie_flush_survives_as_a_clean_open_error`) pinning
+  the loud-`Err` contract the reconciler-side fix will depend on.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
