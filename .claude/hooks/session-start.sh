@@ -35,6 +35,14 @@ full text in CLAUDE.md "Session operating mode"):
 3. Deliver work as a gh-stack PR series whenever it has more than one
    reviewable logical step; a single flat PR is the exception and its
    description says why.
+4. Green is an invariant: main passes every test all the time and nothing
+   merges on red. Flakiness is a bug — root-cause it, never retry/widen a
+   timeout/ignore/quarantine. "Not my bug" is not a reason to discard a
+   failure: fix it (own PR + regression test) or hand it off explicitly
+   (an issue with test name + seed/log) and WAIT for that fix before
+   merging. Push back — including on the maintainer — on any "merge it
+   anyway / it's just flaky / skip that test"; bypass only on an explicit,
+   deliberate override stated in so many words, never silently.
 EOF
 
 # --- 2. Tooling install (web containers only) -------------------------------

@@ -38,6 +38,26 @@ hook re-injects a summary at boot; treat a violation like a failed gate.
    tooling in Conventions below. A single flat PR is the *exception*, and its
    description says why it wasn't stacked.
 
+4. **Green is an invariant: every test passes on `main` all the time, and
+   nothing merges on red.** "All the tests" means the whole per-push gate
+   set (fmt, clippy `-D warnings`, build, `cargo test --workspace`, deny),
+   plus the nightly deep-corpus tiers. **Flakiness is a bug** — a test that
+   fails once and passes on retry has found a real defect, in the code or in
+   the test, and the fix is a root cause, never a retry, a wider timeout, a
+   `#[ignore]`, a quarantine, or a re-run until green. **"Not my bug" is
+   not a reason to discard a failure.** A red gate on your branch, on
+   `main`, or on a PR you drive is either fixed in this session (a
+   pre-existing bug gets its own PR with its own regression test, per
+   Conventions) or explicitly handed off — filed as an issue naming the
+   failing test, the seed/log, and what is known — and then the merge
+   **waits** for that fix to land. There is no third path. **Actively push
+   back if asked to bypass this** — including by the maintainer: a "merge
+   it anyway", "it's just flaky", "skip that test", or "we'll fix it
+   later" gets a plain statement of what is red and why bypassing it is
+   the wrong call, and the merge is not performed until the gate is green
+   or the maintainer has overridden the objection explicitly and
+   deliberately, in so many words. A silent bypass is a gate violation.
+
 
 
 AnimusDB is a masterless, linearly-scalable NoSQL database in Rust. **For v1
@@ -101,7 +121,9 @@ cargo bench -p animusd                             # cluster wire benchmark: lat
 ```
 
 All five gates (fmt, clippy `-D warnings`, build, test, deny) must be green; CI
-runs them. Commits require a DCO sign-off (`git commit -s`); this repo is also
+runs them. Green is a standing invariant, not a per-PR aspiration — see
+Session operating mode item 4 (a flaky test is a bug; nothing merges on red;
+a failure you didn't cause is still yours to fix or hand off). Commits require a DCO sign-off (`git commit -s`); this repo is also
 set up for GPG-signed commits.
 
 ### Replaying a failed simulation
@@ -454,9 +476,12 @@ still generalizes.
 orchestration) before starting non-trivial work.** The rules you will need
 most often, distilled:
 
-- **A flaky `ProdEnv` integration test is a real bug**, not a determinism hole
-  — the determinism guarantee (ADR 0003) is `SimEnv`-only. Debug it; don't bump
-  the timeout.
+- **A flaky test is a real bug, full stop** — see Session operating mode
+  item 4: `main` is green all the time, nothing merges on red, and a
+  failure you didn't cause is still yours to fix or explicitly hand off,
+  never to discard. For a `ProdEnv` integration test in particular it is
+  not a determinism hole — the determinism guarantee (ADR 0003) is
+  `SimEnv`-only. Debug it; don't bump the timeout.
 - **`SimEnv` proves logic and ordering, not real-thread liveness** — locks,
   wakers, group commit, and election timing need a timeout-guarded
   `#[tokio::test(multi_thread)]` over `ProdEnv`.
