@@ -130,19 +130,24 @@ jobs:
         with:
           command: check
 
-  # The retried real-thread ProdEnv tier (issues #280/#286), sharded.
+  # The real-thread ProdEnv tier (issues #280/#286), sharded.
   #
   # Real-thread liveness/concurrency properties (election timing, group
   # commit, lock-free races) can only be observed over genuine OS threads —
   # SimEnv proves logic and ordering, not real-thread liveness (see
   # CLAUDE.md's Testing section). On this repo's 2-vCPU shared runners those
   # tests' timing/convergence budgets are contended by everything else on the
-  # box, so a bounded retry (2 attempts) is a stopgap for runner-class
-  # starvation, not a license to ignore failures: the house doctrine still
-  # applies — "a flaky ProdEnv integration test is a real bug", not a
-  # determinism hole. A test that fails BOTH attempts blocks merge exactly
-  # like `gates`; the retry only absorbs transient contention, never a
-  # reproducible failure.
+  # box, but a first-attempt failure here is red exactly like `gates` — no
+  # retry. This tier used to give itself a 2-attempt retry loop as a
+  # stopgap for runner-class contention; it silently absorbed 3 real flakes
+  # in 7 runs before anyone noticed (issues #555, #559, #561, all fixed on
+  # `main`; see docs/engineering-lessons.md's 2026-09-02 Testing entry). A
+  # retry that reruns a whole test binary can't tell "genuine timing
+  # starvation" from "a real bug that happens not to reproduce every time" —
+  # it just hides the difference, which is exactly what CLAUDE.md's item 4
+  # ("a flaky test is a real bug, full stop") rules out. The sharding below
+  # is the actual fix for contention (give each real-thread test a runner
+  # with nothing else on its 2 vCPUs), not a retry sitting on top of it.
   #
   # This tier used to be one job running everything (111 binaries, 507
   # tests) at `--test-threads=1`, ~18 min of serial test time alone. Three
@@ -210,19 +215,14 @@ jobs:
       # that file for why. `count:${{ matrix.partition }}/4` is nextest's
       # own test-count-balanced partitioning — not a hand-maintained list of
       # which binaries go in which shard, so it stays balanced as tests are
-      # added or removed.
-      - name: test animusd shard ${{ matrix.partition }}/4 (--lib --tests, 2 attempts)
+      # added or removed. Single attempt — see this job group's own comment
+      # above for why there is no retry.
+      - name: test animusd shard ${{ matrix.partition }}/4 (--lib --tests)
         run: |
-          for attempt in 1 2; do
-            if cargo nextest run -p animusd --lib --tests \
-                 -E 'not test(orphan_an_lsi_row)' \
-                 --partition count:${{ matrix.partition }}/4 \
-                 --profile ci; then
-              exit 0
-            fi
-            echo "::warning::animusd prod-liveness shard ${{ matrix.partition }}/4 failed on attempt ${attempt}/2"
-          done
-          exit 1
+          cargo nextest run -p animusd --lib --tests \
+            -E 'not test(orphan_an_lsi_row)' \
+            --partition count:${{ matrix.partition }}/4 \
+            --profile ci
 
   # `dynamo_index_writes.rs`'s two cross-node "hammer" tests
   # (`cross_node_racing_unconditional_puts_never_orphan_an_lsi_row` and
@@ -271,16 +271,10 @@ jobs:
         with:
           cache-targets: "false"
 
-      - name: test animusd LSI-orphan hammer pair (2 attempts)
+      - name: test animusd LSI-orphan hammer pair
         run: |
-          for attempt in 1 2; do
-            if cargo test -p animusd --test dynamo_index_writes \
-                 -- --test-threads=1 orphan_an_lsi_row; then
-              exit 0
-            fi
-            echo "::warning::animusd hammer-pair tests failed on attempt ${attempt}/2"
-          done
-          exit 1
+          cargo test -p animusd --test dynamo_index_writes \
+            -- --test-threads=1 orphan_an_lsi_row
 
   # The 5 scattered real-thread binaries outside animusd, each gated behind
   # its crate's opt-in `prod-heavy` feature (see `gates`'s test step
@@ -315,24 +309,18 @@ jobs:
         with:
           cache-targets: "false"
 
-      - name: test scattered prod-heavy binaries (2 attempts)
+      - name: test scattered prod-heavy binaries
         run: |
-          for attempt in 1 2; do
-            if cargo test -p animus-control --features prod-heavy \
-                 --test prod_liveness --test control_membership_prod \
-                 -- --test-threads=1 \
-               && cargo test -p animus-cp-data --features prod-heavy \
-                 --test prod_concurrent_ts_monotonic \
-                 --test prod_compaction_persist_round \
-                 -- --test-threads=1 \
-               && cargo test -p animus-storage --features prod-heavy \
-                 --test lsm_concurrent --test idle_engine_cost \
-                 -- --test-threads=1; then
-              exit 0
-            fi
-            echo "::warning::scattered prod-heavy tests failed on attempt ${attempt}/2"
-          done
-          exit 1
+          cargo test -p animus-control --features prod-heavy \
+            --test prod_liveness --test control_membership_prod \
+            -- --test-threads=1
+          cargo test -p animus-cp-data --features prod-heavy \
+            --test prod_concurrent_ts_monotonic \
+            --test prod_compaction_persist_round \
+            -- --test-threads=1
+          cargo test -p animus-storage --features prod-heavy \
+            --test lsm_concurrent --test idle_engine_cost \
+            -- --test-threads=1
 
   # The required-check aggregate: branch protection names "prod-liveness" as
   # a single required status, so this job exists purely to keep that name
