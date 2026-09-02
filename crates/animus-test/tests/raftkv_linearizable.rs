@@ -83,7 +83,7 @@ use std::time::Duration;
 
 use animus_control::ProposeResult;
 use animus_cp_data::RaftKvNode;
-use animus_env::{Clock, EnvExt, Rng, nid};
+use animus_env::{Clock, Disk, EnvExt, Rng, nid};
 use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
 use animus_storage::{LsmEngine, LsmOptions, MemoryEngine, StorageEngine};
 use animus_test::corpus::{self, SeedVariant};
@@ -430,7 +430,138 @@ fn corpus_cells() -> Vec<Scenario> {
             (Duration::from_millis(2200), Nemesis::LeaderMinority),
         ],
     ));
+    // Issue #554: a restart whose victim's own log has ALREADY compacted
+    // past `COMPACT_THRESHOLD` (64) before the fault lands — every other
+    // `stop_restart`/`fsync_lie_stop_restart` cell above applies only
+    // ~10-17 entries per replica (well under the threshold), so a
+    // wiped/lost engine reopened fresh on THOSE cells only ever exercises
+    // log replay, never the needs-snapshot request/install path (`RaftCore::
+    // state_machine_behind`, `animus-cp-data::applied`) that closes the gap
+    // where a compacted-away prefix would otherwise be silently lost.
+    //
+    // **A wide `keyspace` (not the frozen cells' `3`) is load-bearing, not
+    // cosmetic — a narrow one makes this cell structurally unable to detect
+    // the bug at all, regardless of fault timing**, and this was confirmed
+    // empirically while building this cell (an earlier `keyspace: 3` draft
+    // passed cleanly on unmodified `main`, silently vacuous). Every write is
+    // a **single-writer, whole-list-append** payload (`run_write`'s own doc:
+    // the client's locally-tracked list, not a storage-side read-modify-
+    // write), and `client_loop` picks a random key from each client's own
+    // fixed *owned* set every round — with a narrow keyspace each client
+    // owns only a handful of keys and rewrites the same ones on nearly every
+    // round, so a key's TRUE final value is always among the last few
+    // entries committed, which always lands in the log's uncompacted TAIL
+    // (post the last `COMPACT_THRESHOLD` boundary): `final_state`'s per-key
+    // read can then NEVER observe the compacted-prefix loss this issue
+    // causes, no matter when the restart fault fires — there is always a
+    // later write, by construction, that already carries the compacted
+    // prefix's content forward in the same list payload. A wide keyspace
+    // (many owned keys per client relative to `rounds`, `read_pct: 0` so
+    // every round is a write) instead gives most touched keys exactly ONE
+    // write each (birthday/coupon-collector coverage, see
+    // `compaction_crossing_workload`'s own doc for the math) — mirroring
+    // `animus-cp-data/tests/engine_wipe_needs_snapshot.rs`'s primitive-level
+    // design (90 DISTINCT keys, one write each) at the corpus level. A
+    // single-write key's true final value has no later write to fall back
+    // on, so if its entry was compacted away and the engine wiped, the
+    // wiped replica's own final read for that key is the only place the
+    // loss can surface.
+    //
+    // **The fault also lands once the workload has genuinely drained,
+    // measured empirically, not assumed from round/poll-interval
+    // arithmetic** (unlike every other `stop_restart`/`fsync_lie_
+    // stop_restart` cell above): each write's own commit-confirmation loop
+    // (`run_write`, a `linearizable_get` poll under contention from 3
+    // concurrent single-leader clients) costs far more real per-round time
+    // than the bare `POLL` gap alone — this workload's own clients drain in
+    // ~7.6s wall-clock-equivalent virtual time, confirmed by instrumentation
+    // while building this cell, not by estimating `rounds * POLL`.
+    // `COMPACTION_CROSSING_FAULT_AT` carries a large margin past that
+    // measured drain time so no write after the wipe can still land on the
+    // recovering replica and paper over a gap by chance — belt-and-
+    // suspenders with the wide keyspace above (which already rules out
+    // self-healing for single-write keys specifically), not a substitute
+    // for it.
+    //
+    // Meaningful on BOTH engine tiers, for different reasons: `mem_engine`
+    // returns a genuinely fresh `MemoryEngine::new()` on EVERY invocation
+    // (including this cell's own `StopRestart` reopen), so the plain
+    // variant below exercises the exact #554 bug on that tier already,
+    // no additional fault needed. `lsm_engine`'s reopen normally recovers
+    // the SAME on-disk state intact (no gap to close) — only a genuinely
+    // corrupted/lost LSM engine exercises the destroy-and-reopen path
+    // (`lsm_engine`'s own doc), which is what pairing `FsyncLie` ahead of
+    // the `StopRestart` produces (a lied-to `sync` the following crash
+    // reveals as lost bytes, `LsmEngine::open`'s loud `Backend("corrupt
+    // sstable index: ...")` contract) — mirroring `fsync_lie_stop_restart_*`
+    // above, just past the compaction threshold instead of under it.
+    out.push(compaction_crossing_workload(
+        "compaction_crossing_stop_restart_3",
+        vec![(COMPACTION_CROSSING_FAULT_AT, Nemesis::StopRestart)],
+    ));
+    out.push(compaction_crossing_workload(
+        "compaction_crossing_fsync_lie_stop_restart_3",
+        vec![
+            (
+                COMPACTION_CROSSING_FAULT_AT - FSYNC_LIE_REVEAL_GAP,
+                Nemesis::FsyncLie,
+            ),
+            (COMPACTION_CROSSING_FAULT_AT, Nemesis::StopRestart),
+        ],
+    ));
     out
+}
+
+/// When the `compaction_crossing_*` cells' restart fault fires (issue #554):
+/// a large margin past this workload's own MEASURED natural drain time
+/// (~7.6s, all 3 clients' `client_loop`s done — instrumented while building
+/// this cell; `rounds * POLL` alone badly underestimates it, since each
+/// write's own commit-confirmation poll under 3-client leader contention
+/// costs far more real per-round time than the bare inter-round `POLL` gap)
+/// so the fault lands once the workload has genuinely drained, not
+/// mid-flight — see `corpus_cells`' own doc, right above where this is
+/// used, for why that placement (not timing relative to
+/// `COMPACT_THRESHOLD`, which is crossed far earlier) is what actually
+/// makes these cells detect the bug, together with the wide keyspace below.
+const COMPACTION_CROSSING_FAULT_AT: Duration = Duration::from_millis(12000);
+
+/// A workload sized to cross `COMPACT_THRESHOLD` (64) per replica well
+/// before its restart fault fires (issue #554) — every other cell in this
+/// corpus applies far too few entries (`rounds: 6` or `10`, mostly reads at
+/// `read_pct: 45`) to ever exercise a replica whose log has already
+/// compacted before a wiped/lost engine is reopened fresh. `rounds: 30` at
+/// `read_pct: 0` (3 clients, every round a write) commits `30 * 3 = 90`
+/// entries over the group's life — the fault (`COMPACTION_CROSSING_
+/// FAULT_AT`) fires only once all of them have already committed,
+/// comfortably past `COMPACT_THRESHOLD` (crossed once, at 64).
+///
+/// **`keyspace: 200` (66-67 keys owned per client) is deliberately wide, not
+/// merely large** — see `corpus_cells`' own doc, right above where this is
+/// used, for why a narrow keyspace makes this cell structurally unable to
+/// detect the bug at all. With `rounds: 30` write attempts per client drawn
+/// (uniformly, with replacement) from ~66 owned keys, the birthday/coupon-
+/// collector expectation is well over half of them landing on a key that
+/// client never touches again — confirmed directly (not merely estimated)
+/// by running this exact cell against unmodified `main`: it fails with
+/// dozens of "lost acknowledged append" durability violations and a
+/// matching set of non-convergent keys (see this crate's own CLAUDE.md /
+/// the issue #554 PR description for the exact failing output). Most
+/// single-write keys land before the run's one compaction and are never
+/// rewritten again, which is exactly what makes a wiped replica's inability
+/// to recover the compacted prefix observable in `final_state`'s per-key
+/// read.
+fn compaction_crossing_workload(name: &str, faults: Vec<(Duration, Nemesis)>) -> Scenario {
+    Scenario {
+        seed: corpus::name_seed(name),
+        name: name.to_string(),
+        replicas: 3,
+        clients: 3,
+        rounds: 30,
+        keyspace: 200,
+        read_pct: 0,
+        faults,
+        window: DEEP_WINDOW,
+    }
 }
 
 /// Seeds per structural cell (`ANIMUS_RAFTKV_SEEDS`, default 1) — the *depth* knob
@@ -543,8 +674,51 @@ fn lsm_opts() -> LsmOptions {
 /// env-scoped disk. Re-opening the same prefix is the recovery path: the engine
 /// replays its own WAL + manifest, then the Raft driver replays `raftkv.wal` on
 /// top (idempotent re-apply).
+///
+/// **On an `open` error, destroy this prefix's files and reopen fresh —
+/// mirroring `animus-cp-data::host::Reconciler::ensure_engine`'s own
+/// destroy-and-reopen recovery (issue #554, ADR 0031's 2026-09-02
+/// addendum)**, the same shape `animusd::LsmTabletFactory::destroy` uses in
+/// production (list every file under this prefix, remove each). This is
+/// exactly the scenario `fsync_lie_stop_restart_*`/
+/// `compaction_crossing_fsync_lie_stop_restart_3` exist to trigger: a lied-to
+/// `sync` a following crash reveals as genuinely lost bytes, which
+/// `LsmEngine::open` reports as a loud `Err` (`corrupt sstable index: ...`,
+/// never a silent short/wrong open) rather than something recoverable by
+/// retrying the same open. Before this, that `Err` reached the bare
+/// `.expect("open lsm engine")` below and panicked the whole test process,
+/// losing which of the corpus's many scenarios triggered it — this crate's
+/// own `docs/engineering-lessons.md` issue #554 entries have the full
+/// incident and the corpus-seed-identity fix (`run_scenario_identified`,
+/// PR #558) that closed the *other* half of that gap (naming the seed even
+/// when setup itself panics). The corpus's own `compaction_crossing_*`
+/// cells (`corpus_cells`' own doc) are what actually exercise this path with
+/// the replica's log already compacted past `COMPACT_THRESHOLD` — proving
+/// this destroy-and-reopen converges via the needs-snapshot mechanism
+/// (`RaftCore::state_machine_behind`), not merely via log replay, the same
+/// distinction `animus-cp-data/tests/engine_wipe_needs_snapshot.rs` proves
+/// at the primitive level.
 fn lsm_engine(sim: &Simulator, id: u64) -> LsmEngine<SimEnv> {
-    block_on(LsmEngine::open_with(sim.env(nid(id)), "lsm/", lsm_opts())).expect("open lsm engine")
+    let env = sim.env(nid(id));
+    block_on(async {
+        match LsmEngine::open_with(env.clone(), "lsm/", lsm_opts()).await {
+            Ok(engine) => engine,
+            Err(e) => {
+                eprintln!(
+                    "lsm_engine: open failed for node {id} ({e}) — destroying \
+                     and reopening fresh (issue #554)"
+                );
+                for f in env.list().await.unwrap_or_default() {
+                    if f.starts_with("lsm/") {
+                        let _ = env.remove(&f).await;
+                    }
+                }
+                LsmEngine::open_with(env, "lsm/", lsm_opts())
+                    .await
+                    .expect("open lsm engine after destroy-and-reopen")
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1162,27 @@ fn final_state<S: StorageEngine + 'static>(
     map
 }
 
+/// Merge several [`animus_test::CheckReport`]s into one: `ok` iff every one
+/// of them is, violations concatenated in order. Used by [`run_scenario_on`]
+/// to fold a per-replica durability/convergence check (one report per
+/// replica, or per replica-pair) into the single report the rest of the
+/// runner expects — see that function's doc for why every replica is
+/// checked instead of just two fixed indices (issue #554).
+fn combine_reports(
+    seed: u64,
+    reports: impl Iterator<Item = animus_test::CheckReport>,
+) -> animus_test::CheckReport {
+    let mut violations = Vec::new();
+    for r in reports {
+        violations.extend(r.violations);
+    }
+    animus_test::CheckReport {
+        ok: violations.is_empty(),
+        violations,
+        seed,
+    }
+}
+
 /// Run `scenario` over the engine tier `factory` builds. The `MemoryEngine`
 /// wrapper [`run_scenario`] is the always-on default; [`lsm_engine`] is the
 /// durable tier. `wal_disk_config`, when `Some`, is set globally once at
@@ -1045,20 +1240,50 @@ fn run_scenario_on<S: StorageEngine + 'static>(
     let cycles = check_cycles(&history);
 
     // Converged-or-timeout poll for the eventual properties: a lagging follower
-    // may still be catching up at the fixed drain, so
-    // re-read in bounded increments and stop early once both hold.
-    let last = group.replicas - 1;
-    let mut a = final_state(&group.nodes, 0, keys);
-    let mut b = final_state(&group.nodes, last, keys);
-    let mut durability = check_durability(&history, &a);
-    let mut convergence = check_convergence(scenario.seed, &a, &b);
+    // may still be catching up at the fixed drain, so re-read in bounded
+    // increments and stop early once both hold.
+    //
+    // Checked against **every** replica, not just indices {0, replicas-1}
+    // (issue #554 finding): `Nemesis::StopRestart`'s victim is "the current
+    // leader, or the first live replica" — an index that moves around with
+    // the leader election outcome, essentially arbitrary per seed/scenario,
+    // and for a >2-replica group can land on neither endpoint. A check that
+    // only ever reads the two fixed endpoints can silently never inspect
+    // the one replica an outage actually hit, so a real durability/
+    // convergence violation on that replica goes undetected. Reading every
+    // replica is cheap (`local_get` is a local read, no network round trip)
+    // and makes this a genuine full-group property instead of a two-corner
+    // sample.
+    let all_states = |group: &Group<S>| -> Vec<BTreeMap<Key, Vec<u64>>> {
+        (0..group.replicas)
+            .map(|i| final_state(&group.nodes, i, keys))
+            .collect()
+    };
+    let mut states = all_states(&group);
+    let mut durability = combine_reports(
+        scenario.seed,
+        states.iter().map(|s| check_durability(&history, s)),
+    );
+    let mut convergence = combine_reports(
+        scenario.seed,
+        states[1..]
+            .iter()
+            .map(|s| check_convergence(scenario.seed, &states[0], s)),
+    );
     let poll_deadline = group.sim.now().0 + CONVERGENCE_BUDGET.as_nanos() as u64;
     while !(convergence.ok && durability.ok) && group.sim.now().0 < poll_deadline {
         group.sim.run_for(CONVERGENCE_POLL_STEP);
-        a = final_state(&group.nodes, 0, keys);
-        b = final_state(&group.nodes, last, keys);
-        durability = check_durability(&history, &a);
-        convergence = check_convergence(scenario.seed, &a, &b);
+        states = all_states(&group);
+        durability = combine_reports(
+            scenario.seed,
+            states.iter().map(|s| check_durability(&history, s)),
+        );
+        convergence = combine_reports(
+            scenario.seed,
+            states[1..]
+                .iter()
+                .map(|s| check_convergence(scenario.seed, &states[0], s)),
+        );
     }
 
     let ok_writes = history
