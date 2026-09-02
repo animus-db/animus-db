@@ -1,0 +1,21 @@
+# cargo-nextest config for the sharded `prod-liveness` CI tier
+# (.github/workflows/ci.yml). See that workflow for why this tier exists
+# (real-thread ProdEnv liveness tests, contention-sensitive on shared
+# 2-vCPU runners) and why it runs under nextest instead of `cargo test`.
+[profile.ci]
+# One shard's failure must never hide what the other tests in the same
+# shard would have reported — this mirrors corpus-deep.yml's
+# `continue-on-error` + "run every step" scheme, at the per-test level
+# instead of per-step. Without this, nextest's fail-fast default would stop
+# a shard at its first failing test, and CLAUDE.md's "green is an
+# invariant" doctrine depends on seeing every failure in one run, not just
+# the first.
+fail-fast = false
+# Matches the plain `cargo test -- --test-threads=1` this tier used before
+# nextest: these are real-thread liveness/concurrency tests whose
+# timing/convergence budgets are contended by anything else running
+# concurrently on the runner's 2 vCPUs (issues #280/#286). nextest already
+# isolates each test into its own process (stricter than cargo test's
+# threads-in-one-process model); this keeps them from also running
+# concurrently with each other inside one shard.
+test-threads = 1

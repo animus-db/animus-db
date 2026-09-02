@@ -86,8 +86,21 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
+# Explicit and minimal, rather than inheriting whatever the repo/org default
+# token permissions happen to be: `contents: read` for checkout, `issues:
+# write` for the "Open or update a red-nightly issue" step (also covers
+# reading issues/labels — there is no separate `issues: read`).
+permissions:
+  contents: read
+  issues: write
+
 env:
   CARGO_TERM_COLOR: always
+  # Same rationale as ci.yml: no incremental compilation (every run builds
+  # from a fresh checkout) and no debug info (backtraces still resolve
+  # symbol names via RUST_BACKTRACE=1, just not source line numbers).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   deep-corpus:
@@ -314,8 +327,12 @@ jobs:
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
       # be skipped by the same default sequential-steps behavior this whole
-      # continue-on-error scheme exists to route around.
+      # continue-on-error scheme exists to route around. Also records which
+      # corpora failed as a step output (`failed_corpora`, comma-separated)
+      # so the "Open or update a red-nightly issue" step below doesn't have
+      # to re-derive the same outcome table from scratch.
       - name: Report corpus results
+        id: report
         if: always()
         run: |
           declare -A outcomes=(
@@ -337,11 +354,90 @@ jobs:
             [control]="${{ steps.control.outcome }}"
           )
           failed=0
+          failed_names=()
           for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
               failed=1
+              failed_names+=("${name}")
             fi
           done
+          IFS=,
+          echo "failed_corpora=${failed_names[*]}" >> "$GITHUB_OUTPUT"
+          unset IFS
           exit "${failed}"
+
+      # Opens a new "corpus-deep red: <date>" issue on the first red night,
+      # or comments on the existing one if last night was already red — so
+      # a run staying red for a stretch shows up as one growing thread
+      # (title still naming the FIRST red date, each comment a fresh
+      # "still red" ping) instead of a new issue every night nobody reads.
+      # `if: failure()` fires exactly when "Report corpus results" above
+      # exited 1 (the only step in this job that isn't `continue-on-error`).
+      # Exists because the nightly ran red for 16 days before anyone
+      # noticed (issue #554) — `continue-on-error` on every corpus step
+      # keeps the *run* informative once someone looks, but nothing before
+      # this made someone look.
+      - name: Open or update a red-nightly issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "nightly-red";
+            const titlePrefix = "corpus-deep red:";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const failedCorpora = "${{ steps.report.outputs.failed_corpora }}"
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+
+            // Idempotent: creating a label that already exists 422s, which
+            // is exactly the steady-state case (every night after the
+            // first) — ignore only that, rethrow anything else.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+                color: "b60205",
+                description: "corpus-deep's nightly deep-corpus run failed",
+              });
+            } catch (err) {
+              if (err.status !== 422) throw err;
+            }
+
+            const commentBody = [
+              `**corpus-deep** failed on this run: ${runUrl}`,
+              "",
+              failedCorpora.length > 0
+                ? "Failed corpora:\n" + failedCorpora.map((name) => `- \`${name}\``).join("\n")
+                : "(no per-corpus outcome captured — see the run for details)",
+            ].join("\n");
+
+            const { data: openRedIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+              per_page: 100,
+            });
+            const existing = openRedIssues.find((issue) => issue.title.startsWith(titlePrefix));
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: commentBody,
+              });
+            } else {
+              const today = new Date().toISOString().slice(0, 10);
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `${titlePrefix} ${today}`,
+                body: commentBody,
+                labels: [label],
+              });
+            }
