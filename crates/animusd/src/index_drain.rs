@@ -3761,8 +3761,24 @@ mod stream_sealer_tests {
     }
 
     /// **Age trigger** on an otherwise quiet table: a tiny `--stream-seal-age`
-    /// seals a couple of items whose combined bytes never approach the (huge)
-    /// size threshold.
+    /// eventually seals every quiet write, covering the tablet's own hot tail
+    /// completely — proven by converging on the **total** `count` summed
+    /// across every `(tablet, _)` row reaching the number of writes issued,
+    /// never a single row's own count against a fixed real-time window
+    /// (issue #570).
+    ///
+    /// **The original assertion was timing-dependent, not property-based**:
+    /// it waited for exactly one `stream_shards` row to exist and asserted
+    /// its `count == 2`, which only holds if both `put_item_padded` calls
+    /// land within the same 300ms `seal_age` window as each other. On a
+    /// loaded runner the first write's own latency (initial leader election,
+    /// first tablet host, the stream's first change) can by itself exceed
+    /// 300ms, so the age trigger can seal shard 0 with `count == 1` before
+    /// the second write ever lands — which then belongs to shard 1. The age
+    /// trigger behaved exactly as designed in that run; the test's
+    /// assumption about the *timing* of two independent requests was wrong,
+    /// not the property it meant to prove (a quiet table's tail gets sealed
+    /// by age, covering every write, whether via one seal or several).
     ///
     /// **This is also the never-sealed-fallback regression (ADR 0042 fork
     /// G)**: this tablet has no `stream_shards` catalog row at all when the
@@ -3792,12 +3808,26 @@ mod stream_sealer_tests {
             put_item_padded(node.dynamo_addr(), table, "k1", 4).await;
 
             let tablet = only_tablet(&node, table);
-            await_true(20, "the age trigger seals a quiet table's tail", || {
-                node.metadata().stream_shards.contains_key(&(tablet, 0))
-            })
+            let sealed_rows = || {
+                node.metadata()
+                    .stream_shards
+                    .range((tablet, 0)..=(tablet, u64::MAX))
+                    .map(|(_, row)| row.clone())
+                    .collect::<Vec<_>>()
+            };
+            await_true(
+                20,
+                "the age trigger seals a quiet table's tail, covering both writes \
+                 across one or more seals",
+                || sealed_rows().iter().map(|row| row.count).sum::<u64>() == 2,
+            )
             .await;
-            let row = node.metadata().stream_shards[&(tablet, 0)].clone();
-            assert_eq!(row.count, 2, "both quiet writes are covered by one seal");
+            let rows = sealed_rows();
+            assert!(
+                !rows.is_empty(),
+                "the age trigger must have committed at least one seal (size never trips \
+                 in this test)"
+            );
         })
         .await
         .expect("did not converge in time");
