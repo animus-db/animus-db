@@ -205,11 +205,15 @@ fn sks(body: &str) -> Vec<String> {
 async fn a_segmented_fleet_sees_every_item_exactly_once() {
     let (_dir, nodes, addrs) = setup().await;
 
-    // The unsegmented truth.
+    // The unsegmented truth. `ConsistentRead: true` (ADR 0055, issue #561):
+    // this baseline becomes `expected` below, compared against `seen`, which
+    // is built entirely from the segments' own `ConsistentRead: true` reads
+    // — an eventually-consistent baseline could undercount and make a fully
+    // caught-up `seen` look like it invented rows.
     let (status, whole) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events"}"#,
+        r#"{"TableName":"events","ConsistentRead":true}"#,
     )
     .await;
     assert_eq!(status, 200, "plain scan failed: {whole}");
@@ -258,10 +262,14 @@ async fn a_segmented_fleet_sees_every_item_exactly_once() {
 async fn segments_actually_partition_rather_than_each_returning_everything() {
     let (_dir, nodes, addrs) = setup().await;
 
+    // `ConsistentRead: true` throughout (ADR 0055, issue #561): `total_rows`
+    // and the two segment sizes are three separate requests whose row counts
+    // must sum exactly, so no one of them may be answered by a replica the
+    // others weren't.
     let (_, whole) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events"}"#,
+        r#"{"TableName":"events","ConsistentRead":true}"#,
     )
     .await;
     let total_rows = sks(&whole).len();
@@ -269,7 +277,9 @@ async fn segments_actually_partition_rather_than_each_returning_everything() {
 
     let mut sizes = Vec::new();
     for segment in 0..2 {
-        let body = format!(r#"{{"TableName":"events","Segment":{segment},"TotalSegments":2}}"#);
+        let body = format!(
+            r#"{{"TableName":"events","ConsistentRead":true,"Segment":{segment},"TotalSegments":2}}"#
+        );
         let (_, resp) = dynamo_retry(addrs[0], "DynamoDB_20120810.Scan", &body).await;
         sizes.push(sks(&resp).len());
     }
@@ -291,6 +301,19 @@ async fn segments_actually_partition_rather_than_each_returning_everything() {
 
 /// Pagination composes with segmentation: paging a segment to exhaustion
 /// yields that segment's rows, and a cursor never escapes into a neighbour.
+///
+/// The paginated walk and the final reassembly check both use
+/// `ConsistentRead: true` (a base-table `Scan` accepts it, unlike a GSI
+/// one — ADR 0055, issue #561): with the wire default (`false`), each page
+/// is served by whichever replica the connecting node's eventual-read
+/// routing picks that moment — its own local replica, or a forwarded hop to
+/// a sibling — and that choice is not fixed across pages even against one
+/// fixed address (`addrs[1]` here). Pagination/segment-slicing correctness
+/// is what this test proves, not read consistency, so it asks for the
+/// linearizable read rather than assuming the data stays stable across the
+/// walk — see `dynamo_index_scan.rs`'s `gsi_scan_paginates_and_drains_all_
+/// rows` (issue #559) for the same mechanism where the GSI-only API forced
+/// the other fix (converge every replica first).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_segment_paginates_within_its_own_slice() {
     let (_dir, nodes, addrs) = setup().await;
@@ -307,7 +330,8 @@ async fn a_segment_paginates_within_its_own_slice() {
                 None => String::new(),
             };
             let body = format!(
-                r#"{{"TableName":"events","Segment":{segment},"TotalSegments":3,"Limit":1{esk}}}"#
+                r#"{{"TableName":"events","ConsistentRead":true,
+                        "Segment":{segment},"TotalSegments":3,"Limit":1{esk}}}"#
             );
             let (status, resp) = dynamo_retry(addrs[1], "DynamoDB_20120810.Scan", &body).await;
             assert_eq!(status, 200, "segment {segment} page failed: {resp}");
@@ -327,7 +351,7 @@ async fn a_segment_paginates_within_its_own_slice() {
     let (_, whole) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events"}"#,
+        r#"{"TableName":"events","ConsistentRead":true}"#,
     )
     .await;
     let mut expected = sks(&whole);
