@@ -8984,15 +8984,21 @@ debugging anything that feels like it might have happened before.
   `animus-cp-data::host`) and reopen fresh, letting Raft rebuild it from
   the group — rather than today's `ensure_engine`
   (`animus-cp-data/src/host.rs`, ~line 893-906), which warns and retries
-  the same open forever and never heals. **Proposed, not built**: that
-  fix belongs in the reconciler (and the corpus's own `lsm_engine()`
-  helper should mirror it), not in `animus-storage` — storage's job stops
-  at detecting and loudly reporting the lie, which it already does;
-  issue #554 tracks the reconciler-side fix as a maintainer decision.
-  What shipped here: the residual named in `lsm.rs`'s "Crash safety" doc
-  and `animus-storage/CLAUDE.md`, plus a regression
+  the same open forever and never heals. That fix belongs in the
+  reconciler (and the corpus's own `lsm_engine()` helper should mirror
+  it), not in `animus-storage` — storage's job stops at detecting and
+  loudly reporting the lie, which it already does. **Built**: `host.rs`'s
+  `ensure_engine`/`materialize_split_child` now destroy-and-reopen on a
+  first `open` failure (ADR 0031's 2026-09-02 addendum) — but building it
+  surfaced a second, deeper gap first (a fresh engine silently believing
+  itself caught up to a compacted log it holds none of), closed
+  separately; see the entry immediately below this one for that
+  discovery and the needs-snapshot mechanism that actually makes this
+  destroy-and-reopen recovery safe past a replica's own compaction point.
+  What shipped here first: the residual named in `lsm.rs`'s "Crash
+  safety" doc and `animus-storage/CLAUDE.md`, plus a regression
   (`lsm_crash.rs::fsync_lie_flush_survives_as_a_clean_open_error`) pinning
-  the loud-`Err` contract the reconciler-side fix will depend on.
+  the loud-`Err` contract the reconciler-side fix depends on.
 - **A state machine's applied watermark must be the state machine's own,
   never the log's; a log that matches the leader proves nothing about the
   engine beneath it (2026-09-02, issue #554).** Building the reconciler-side

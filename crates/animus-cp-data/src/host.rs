@@ -35,7 +35,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use animus_env::nid;
-use animus_env::{Env, NodeId};
+use animus_env::{Env, Metric, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
@@ -888,9 +888,38 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         }
     }
 
-    /// Get-or-open `tablet`'s own engine, caching the handle. `None` (with a
-    /// warn) if the factory fails to open it — the caller skips the action;
-    /// `plan` re-emits it next tick.
+    /// Get-or-open `tablet`'s own engine, caching the handle.
+    ///
+    /// **Engine-loss recovery (issue #554).** A first `factory.open` failure
+    /// is treated as a lost/corrupt local engine, never a reason to keep
+    /// retrying the same open forever: this node's own **Raft WAL/hard-state**
+    /// (`raftkv.wal.<tablet>`, `wal_file`) is a namespace entirely disjoint
+    /// from the engine's own durable files (`EngineFactory::destroy`'s own
+    /// doc — an `animusd::LsmTabletFactory` never touches anything but its
+    /// `db-t{tablet}-` prefix), so destroying the engine and reopening fresh
+    /// forfeits no vote and cannot double-vote. Raft then rebuilds this
+    /// tablet's state the same way it always rebuilds a caught-up-on-restart
+    /// replica: this node's own recovered log tail replays into the fresh
+    /// engine, and — for a replica whose log had already been compacted past
+    /// what it now needs — the leader's on-demand `InstallSnapshot` covers
+    /// the rest. This is exactly the recovery the fault-injection corpus's
+    /// `MemoryEngine` tier already gets on **every** restart (`mem_engine()`
+    /// returns a fresh `MemoryEngine::new()` unconditionally) and already
+    /// passes every `stop_restart`/`fsync_lie_stop_restart` cell over — see
+    /// `docs/engineering-lessons.md`'s issue #554 entry for the full
+    /// evidence, including a residual this destroy-and-reopen recovery does
+    /// **not** independently prove safe (the corpus's own workload sizes stay
+    /// well under the Raft log's own compaction threshold, so they never
+    /// exercise a replica whose own log was already compacted before its
+    /// engine was lost).
+    ///
+    /// **Bounded to one destroy-and-reopen attempt per call** (never a
+    /// destroy/open loop): a first `open` error destroys and reopens once;
+    /// if the fresh open also fails, this falls back to the pre-existing
+    /// warn-and-skip behavior unchanged — a disk that fails every open
+    /// (not just this one tablet's files) must not spin destroying and
+    /// recreating tablet after tablet. Either way `None` means the caller
+    /// skips the action and `plan` re-emits it next tick.
     async fn ensure_engine(&mut self, tablet: TabletId) -> Option<S> {
         if let Some(engine) = self.engines.get(&tablet) {
             return Some(engine.clone());
@@ -901,8 +930,35 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 Some(engine)
             }
             Err(e) => {
-                tracing::warn!(tablet = tablet.0, %e, "reconciler: opening tablet engine");
-                None
+                tracing::warn!(
+                    tablet = tablet.0,
+                    %e,
+                    "reconciler: opening tablet engine failed — treating as lost, \
+                     destroying and reopening fresh (issue #554)"
+                );
+                self.env.metrics().incr(Metric::CpEngineOpenFailed);
+                self.factory.destroy(tablet).await;
+                match self.factory.open(tablet).await {
+                    Ok(engine) => {
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            "reconciler: rebuilt tablet engine from nothing after an open \
+                             failure — Raft will repopulate it from the group"
+                        );
+                        self.env.metrics().incr(Metric::CpEngineRebuilt);
+                        self.engines.insert(tablet, engine.clone());
+                        Some(engine)
+                    }
+                    Err(e2) => {
+                        tracing::warn!(
+                            tablet = tablet.0,
+                            %e2,
+                            "reconciler: reopening tablet engine after destroy also failed"
+                        );
+                        self.env.metrics().incr(Metric::CpEngineRebuildFailed);
+                        None
+                    }
+                }
             }
         }
     }
@@ -1262,26 +1318,45 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         bootstrap_voters: BTreeSet<NodeId>,
         campaign: bool,
     ) {
-        let engine = if self.factory.probe(child.id).await {
+        // Issue #554, same shape as `ensure_engine`'s own doc: a `probe`
+        // hit whose `open` then fails is treated as a lost/corrupt engine,
+        // not a reason to keep retrying the same open forever. Unlike an
+        // ordinary hosted tablet, this recovery is unconditionally simple
+        // here — the child's own Raft group has never started (no WAL/
+        // committed state of its own to lose), so destroying the corrupt
+        // clone and falling through to an ordinary fresh re-clone from the
+        // parent (below) is always correct: the parent's CURRENT engine
+        // state is authoritative regardless of which attempt produced the
+        // target, exactly like the G4 contract's own "crash before step 1"
+        // case this re-enters.
+        let mut rebuilding = false;
+        let already_cloned = if self.factory.probe(child.id).await {
             // G4 step 1 already committed on an earlier attempt (a crash
             // landed after the clone but before the group started) — never
             // re-clone (the target may already be trimmed, or may already
             // hold group state a second clone would clobber). Just recover
             // the handle.
             match self.factory.open(child.id).await {
-                Ok(engine) => engine,
+                Ok(engine) => Some(engine),
                 Err(e) => {
                     tracing::warn!(
                         child = child.id.0,
                         parent = parent.0,
                         %e,
-                        "reconciler: reopening a split child's already-cloned engine"
+                        "reconciler: reopening a split child's already-cloned engine failed \
+                         — treating as lost, destroying and re-cloning fresh (issue #554)"
                     );
-                    self.state.release_unconfirmed_host(child.id);
-                    self.state.split_forming.remove(&child.id);
-                    return;
+                    self.env.metrics().incr(Metric::CpEngineOpenFailed);
+                    self.factory.destroy(child.id).await;
+                    rebuilding = true;
+                    None
                 }
             }
+        } else {
+            None
+        };
+        let engine = if let Some(engine) = already_cloned {
+            engine
         } else {
             // The parent is a currently-hosted tablet — reuse its own
             // already-open engine handle rather than asking the factory to
@@ -1343,6 +1418,15 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 self.state.release_unconfirmed_host(child.id);
                 self.state.split_forming.remove(&child.id);
                 return;
+            }
+            if rebuilding {
+                tracing::warn!(
+                    child = child.id.0,
+                    parent = parent.0,
+                    "reconciler: rebuilt a split child's engine from a fresh clone after its \
+                     earlier clone was found lost"
+                );
+                self.env.metrics().incr(Metric::CpEngineRebuilt);
             }
             engine
         };

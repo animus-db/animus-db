@@ -987,6 +987,31 @@ ADR 0050 Train B rung-7 sweep.
   fixed as part of the same change that closed `teardown`'s mirror hole,
   below). Regression: `tests/reconciler.rs::
   reconciler_recovers_a_tablet_after_a_transient_engine_open_failure`.
+- **Engine-loss recovery (issue #554, ADR 0031's 2026-09-02 addendum):
+  `ensure_engine`'s (and `materialize_split_child`'s) first `open` failure
+  is treated as a lost/corrupt local engine, not a transient fault to
+  warn-and-retry forever.** Bounded to ONE destroy-and-reopen attempt per
+  call (`factory.destroy` then a fresh `factory.open`) — a second failure
+  falls back to the pre-existing warn-and-skip, so a genuinely unhealthy
+  disk (every open failing, not just one tablet's) doesn't spin
+  destroying/recreating tablet after tablet. Safe because this node's own
+  Raft WAL/hard-state (`wal_file`) lives in a namespace an `EngineFactory`
+  implementor's `destroy` never touches — no vote is forfeit, no
+  double-vote is possible. `CpEngineOpenFailed`/`CpEngineRebuilt`/
+  `CpEngineRebuildFailed` (ADR 0015) observe the outcome. **This
+  destroy-and-reopen alone is NOT sufficient to prove recovery safe past
+  a replica's own compaction point** — that is entirely the separate
+  needs-snapshot mechanism's job (`applied.rs`, `RaftCore::
+  state_machine_behind`, this file's own matching entry above): a first
+  version of this recovery, built and regression-tested BEFORE that
+  mechanism existed, passed at 20 writes (below `COMPACT_THRESHOLD` = 64)
+  and silently lost the whole compacted prefix at 90 (past it) — see
+  `docs/engineering-lessons.md`'s matching entry for the discovery.
+  Regression: `tests/reconciler.rs::
+  a_corrupt_replica_engine_is_destroyed_and_rebuilt_from_the_group` (90
+  writes, past the threshold, proving the FULL recovery — destroy/reopen
+  plus needs-snapshot — restores every pre-corruption key and preserves
+  Raft safety, exactly one leader, no split-brain artifact).
 - **`Reconciler::tick(&mut self, view: &MetadataView)` is the whole
   per-tick contract**: gather `TabletFacts` from its own hosted nodes
   (`gather_facts`), call `plan` exactly once, then execute the returned
