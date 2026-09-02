@@ -12,6 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -66,7 +68,7 @@ async fn dynamo(addr: std::net::SocketAddr, target: &str, body: &str) -> (u16, S
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_table_query_and_conditional_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -207,7 +209,7 @@ async fn create_table_query_and_conditional_writes() {
 /// mask the race, timeout-guarded like every real-time `animusd` test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_conditional_puts_one_wins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

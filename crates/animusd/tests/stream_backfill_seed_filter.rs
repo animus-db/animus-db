@@ -51,6 +51,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
+mod support;
+
 /// Seal knobs tuned to never fire during this test's short lifetime — the
 /// table's one tablet keeps exactly one **open** shard throughout, so the
 /// test never needs to walk a sealed/open lineage (`tests/streams_e2e.rs`'s
@@ -340,7 +342,7 @@ async fn walk_lineage(addr: SocketAddr, stream_arn: &str) -> (Vec<Value>, Vec<Va
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), no_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -445,7 +447,7 @@ async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
 /// filtered the seed markers while delivering every real write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backfill_seed_markers_never_surface_from_sealed_shards_either() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();

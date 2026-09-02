@@ -31,9 +31,10 @@ use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, NodeStatus, TableSchema,
     read_frame,
 };
-use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+
+mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
@@ -181,7 +182,7 @@ async fn read_mirror_from_disk(dir: &std::path::Path) -> animus_control::Metadat
 
 #[tokio::test(flavor = "multi_thread")]
 async fn control_only_mirror_engine_survives_a_real_process_restart() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let addrs = role_addrs(nid(0));
 
@@ -257,7 +258,7 @@ async fn control_only_mirror_engine_survives_a_real_process_restart() {
 /// `LsmEngine` handle reopened over the same directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn control_only_schema_and_tablet_map_survive_a_hard_restart() {
-    let dir = TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let node_dir = dir.path().join("node-0");
     let addrs = role_addrs(nid(0));
 

@@ -13,6 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -95,7 +97,7 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn document_set_types_projection_and_return_values() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -197,7 +199,7 @@ async fn document_set_types_projection_and_return_values() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_gsis_composite_gsi_and_lsi() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

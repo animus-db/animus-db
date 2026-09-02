@@ -29,6 +29,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Ceiling for [`dynamo_retrying`]/[`get_records_allow_trim`]'s bounded
 /// retry loop against a **known, self-resolving** transient (the ADR 0050
 /// F8 freeze→cutover blip on the write path, and the analogous "not the
@@ -760,7 +762,7 @@ async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
 /// either file's own dedicated tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_and_stream_coexist_and_both_converge() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let addr = nodes[0].dynamo_addr();
@@ -841,7 +843,7 @@ async fn gsi_and_stream_coexist_and_both_converge() {
 /// `GetRecords` from `TRIM_HORIZON`) completes cleanly after the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lsm_restart_preserves_streams_and_walk_completes() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let dir_path = dir.path().to_path_buf();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), &dir_path)
         .await
@@ -954,7 +956,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
 /// `ClusterSegmentStore`'s per-node `<node dir>/segments`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fs_segment_store_opt_in_smoke() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let store_dir = dir.path().join("shared-segments");
     std::fs::create_dir_all(&store_dir).unwrap();
     let nodes = start_streamed_cluster_full(
@@ -1075,7 +1077,7 @@ async fn fs_segment_store_opt_in_smoke() {
 /// different, seal-arm-timing cause instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster_full(
         3,
         dir.path(),
@@ -1322,7 +1324,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
 /// separately rather than chased down here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster_full(
         3,
         dir.path(),
@@ -1451,7 +1453,7 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_status_survives_a_populated_stream_shard_catalog() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let dynamo_addr = nodes[0].dynamo_addr();
@@ -1534,7 +1536,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
 /// Status` once `stream_shards` is populated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let dynamo_addr = nodes[0].dynamo_addr();
@@ -1604,7 +1606,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
 /// both `op` shapes the route accepts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let admin_addr = nodes[0].admin_addr();
@@ -1724,7 +1726,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
 /// routing change here must not weaken that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_data_dynamo_proxy_rejects_unknown_op_cleanly() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(1, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
     let admin_addr = nodes[0].admin_addr();
@@ -1797,7 +1799,7 @@ async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u
 /// request), asserting exactly-once delivery across every cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delivery() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
 
@@ -2004,7 +2006,7 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
 /// an existing plain table" guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain_one() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     // Large seal knobs: the burst below must accumulate in `KIND_CHANGE`
     // rather than sealing (and hence trimming) mid-burst, so the tracker
     // sees a clean, strongly-rising byte level rather than seal-driven
@@ -2140,7 +2142,7 @@ async fn all_stream_shards(addr: SocketAddr, stream_arn: &str) -> Vec<Value> {
 /// across the full three-generation lineage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = support::panic_safe_tempdir();
     let nodes = start_streamed_cluster(3, dir.path(), tiny_seal_knobs()).await;
     await_bootstrap(&nodes).await;
 

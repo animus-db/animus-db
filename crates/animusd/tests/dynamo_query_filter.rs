@@ -22,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -165,8 +167,8 @@ fn extract_last_evaluated_key(body: &str) -> Option<String> {
 /// | a3 | X   | s3    | odd    |
 /// | a4 | X   | s4    | even   |
 /// | a5 | X   | s5    | odd    |
-async fn setup() -> (tempfile::TempDir, Vec<Node>, Vec<SocketAddr>) {
-    let dir = tempfile::tempdir().unwrap();
+async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

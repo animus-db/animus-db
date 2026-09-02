@@ -23,6 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// The oversized attribute that pushes the base item past one write unit.
 const BLOB: &str = concat!(
     "0123456789012345678901234567890123456789012345678901234567890123",
@@ -130,8 +132,8 @@ async fn capacity_of(addr: SocketAddr, target: &str, body: &str) -> Value {
 
 /// A 3-node cluster with table `caps` (composite `pk`/`sk`), a `KEYS_ONLY` GSI
 /// on `cat` and an `ALL`-projecting LSI on `score`.
-async fn setup() -> (tempfile::TempDir, Vec<Node>, Vec<SocketAddr>) {
-    let dir = tempfile::tempdir().unwrap();
+async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

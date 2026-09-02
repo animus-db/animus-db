@@ -29,6 +29,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -98,7 +100,7 @@ fn last_evaluated_table_name(body: &str) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_tables_sorts_paginates_and_excludes_gsi_hidden_tables() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -173,7 +175,7 @@ async fn list_tables_sorts_paginates_and_excludes_gsi_hidden_tables() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_table_removes_it_and_a_repeat_delete_is_not_found() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
@@ -245,7 +247,7 @@ async fn delete_table_removes_it_and_a_repeat_delete_is_not_found() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_table_through_a_follower_connected_node_is_relayed_to_the_leader() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

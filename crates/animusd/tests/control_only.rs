@@ -27,6 +27,8 @@ use animusd::{
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 /// Reserve `count` free loopback ports (bind :0, read addr, release).
 fn free_addrs(count: usize) -> Vec<SocketAddr> {
     let ls: Vec<std::net::TcpListener> = (0..count)
@@ -144,7 +146,7 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn control_only_cluster_elects_leader_and_serves_status() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, _config) = bring_up_control(3, dir.path()).await;
         await_leader(&nodes).await;
 
@@ -274,7 +276,7 @@ async fn control_only_cluster_elects_leader_and_serves_status() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn schema_ddl_via_control_node_commits_and_relays() {
     timeout(Duration::from_secs(60), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
         let (nodes, config) = bring_up_control(3, dir.path()).await;
         await_leader(&nodes).await;
 
@@ -374,7 +376,7 @@ async fn force_active(nodes: &[Node], id: animus_env::NodeId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
     timeout(Duration::from_secs(90), async {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = support::panic_safe_tempdir();
 
         // A control-only trio (indices 0..3) plus one combined-mode data
         // node (index 3) reaching it via the ADR 0030 growth-node mirror —

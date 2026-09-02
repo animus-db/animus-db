@@ -15,6 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -205,8 +207,8 @@ async fn drain_scan_pages(addr: SocketAddr, request_prefix: &str, limit: usize) 
 /// | p1 | a2 | A   | 12    | 92   |
 /// | p2 | b0 | B   | 13    | 93   |
 /// | p2 | b1 | A   | 14    | 94   |
-async fn setup() -> (tempfile::TempDir, Vec<Node>, SocketAddr) {
-    let dir = tempfile::tempdir().unwrap();
+async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, SocketAddr) {
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

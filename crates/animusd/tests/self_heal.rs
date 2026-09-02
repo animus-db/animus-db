@@ -17,6 +17,8 @@ use animusd::{ClientRequest, ClientResponse, Node, bind_cluster, start_cluster};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect to node");
     animusd::write_frame(&mut stream, &req).await.expect("send");
@@ -74,7 +76,7 @@ async fn await_bootstrap(nodes: &[Node]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assembled_node_handles_concurrent_client_load_without_deadlock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();

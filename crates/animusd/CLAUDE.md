@@ -3189,8 +3189,7 @@ surfaces.
 `support/mod.rs` holds the shared bring-up helpers (port-TOCTOU retries,
 split-cluster bring-up), **and `support::PanicSafeTempDir`/
 `support::panic_safe_tempdir()` (issue #511)** — the drop-in replacement
-for `tempfile::tempdir().unwrap()`/`TempDir::new().unwrap()` every one of
-the 59 `tests/*.rs` files that already `mod support;` now uses: it leaks
+for `tempfile::tempdir().unwrap()`/`TempDir::new().unwrap()`: it leaks
 its directory (`std::mem::forget`) instead of removing it on a
 *panicking* drop, so a mid-test assertion failure can no longer cascade
 into the control-plane WAL's unconditional `.expect("wal append"/"wal
@@ -3198,14 +3197,30 @@ sync")` panic (`animus-control::node::persist_wal` has no `halted`-gate at
 all — see that crate's own CLAUDE.md entry — and `Drop for Node`
 deliberately only latches CP-group `halted` flags, never aborting the
 still-live background driver tasks a panic's own unwind can race). A
-normal, non-panicking drop is byte-identical to `TempDir`. **Not covered**:
-the ~40 files that never pull in `mod support;` (several hand-roll their
-own bring-up, e.g. `dynamo_index_scan.rs::setup()` — see that function's
-own issue #273 doc) still construct a bare `TempDir` directly and remain
-exposed to the same cascade; `docs/engineering-lessons.md` names the
-mechanism and this file's own doc comment on `PanicSafeTempDir` has the
-full account. Regression (deterministic, no ProdEnv, no timing
-dependency): `tests/panic_safe_teardown.rs`.
+normal, non-panicking drop is byte-identical to `TempDir`. **Every one of
+the 101 `tests/*.rs` files now `mod support;` and uses it** — the
+migration originally scoped to the 59 files already pulling in `mod
+support` (PR #533) was completed for the remaining ~42 hand-rolled-fixture
+files in the issue #511 residual sweep (including the original #273 site,
+`dynamo_index_scan.rs::setup()`), a purely mechanical `mod support;` +
+`support::panic_safe_tempdir()` swap with no fixture restructuring. **Not
+covered, and structurally can't be**: eight in-crate `#[cfg(test)] mod`s
+inside `src/` construct a bare `TempDir` directly and remain exposed to
+the same cascade, since `tests/support` is a separate crate (each `tests/
+*.rs` file) these modules can't reach —
+`dynamo.rs::stream_write_path_tests`, `index_drain.rs::{
+gsi_drain_cursor_tests, stream_sealer_tests}`, `lib.rs::{
+confirm_futility_tests, forward_transport_failure_tests,
+halted_shutdown_tests, issue_412_tests, issue_298_conflict_tests}`,
+`segment_janitor.rs::orphan_reap_tests`, and
+`admin.rs::system_table_tests`. Closing this residual would need a
+production-side (not test-only) panic-safe temp-dir helper shared across
+`src/`, which is a separate, deliberately-not-attempted design decision —
+see `docs/engineering-lessons.md`'s matching entry.
+`docs/engineering-lessons.md` names the mechanism and this file's own doc
+comment on `PanicSafeTempDir` has the full account. Regression
+(deterministic, no ProdEnv, no timing dependency):
+`tests/panic_safe_teardown.rs`.
 
 ## Benchmark
 

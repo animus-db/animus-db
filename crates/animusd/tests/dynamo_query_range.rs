@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
+mod support;
+
 async fn await_bootstrap(nodes: &[Node]) {
     let ready = async {
         loop {
@@ -126,8 +128,8 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
 /// Every item in partition `pk = "p1"` carries the same numeric text in
 /// `sk`/`value`/`alt`, so one fixture serves all three read paths without
 /// three separate value tables to keep straight.
-async fn setup() -> (tempfile::TempDir, Vec<Node>, Vec<SocketAddr>) {
-    let dir = tempfile::tempdir().unwrap();
+async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
+    let dir = support::panic_safe_tempdir();
     let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
         .await
         .unwrap();
