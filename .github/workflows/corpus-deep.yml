@@ -88,6 +88,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Same rationale as ci.yml: no incremental compilation (every run builds
+  # from a fresh checkout) and no debug info (backtraces still resolve
+  # symbol names via RUST_BACKTRACE=1, just not source line numbers).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   deep-corpus:

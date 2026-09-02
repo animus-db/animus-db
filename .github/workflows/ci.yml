@@ -24,6 +24,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No incremental compilation (every job builds from a fresh checkout, so
+  # incremental's bookkeeping is pure overhead here) and no debug info. A
+  # local clean `cargo build --workspace --all-targets` measured 2.5 min
+  # without debuginfo vs. 4.5 min under CI's prior default (full debuginfo)
+  # — most of the `gates` job's ~5.7 min of compile time. Panics/backtraces
+  # stay useful without debuginfo: `RUST_BACKTRACE=1` still resolves symbol
+  # names, it just can't attach source line numbers to them.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   # The hard, single-attempt, per-push gate: deterministic SimEnv suites only.
@@ -62,6 +71,14 @@ jobs:
       # job's target/ dir is much larger than corpus-deep's (which builds only
       # 4 test binaries). Cache just the registry + git deps, not target/, so
       # cache restore doesn't itself eat the disk headroom freed above.
+      #
+      # Left at `cache-targets: "false"` even now that CARGO_PROFILE_DEV_DEBUG=0
+      # shrinks the target dir: no CI measurement yet shows it now fits the
+      # cache usefully (upload/restore of a still-multi-GB dir can cost more
+      # than the compile time it would save, and it eats into this repo's
+      # shared 10 GB cache budget). Flip it only once a CI run's actual
+      # target/ size after this change justifies it — not as a side effect of
+      # this diff.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
