@@ -400,14 +400,30 @@ workflow lists it as a trigger path.
   `desired/test_support.rs::test_cluster`. Size S–M.
 - **ADR:** amendment notes on 0061.
 
-### C-05 `SharedWal` (built, unwired)
+### C-05 `SharedWal` (built, unwired): keep, wire later
 
-- **Plan:** one benchmark PR (fsync count, many groups per node,
-  post-quiescence). If no motivation remains, delete
-  `crates/animus-control/src/shared_wal.rs` and its export
-  (`lib.rs:67`), amend ADR 0028/0044. Otherwise wire it into
-  `animus-cp-data`'s persist path with a cross-tablet ordering corpus.
-- **Size:** S (delete) or L (wire). Recommendation: delete.
+- **Measured 2026-09-02** (`SimEnv`, exact `Disk::sync` count,
+  single-voter groups, throwaway harness not committed): a burst of one
+  write to each of K active groups on one node costs K fsyncs, one per
+  group's own WAL file, with no cross-group coalescing (K=1 → 1, K=32 →
+  32). A burst of 32 writes to one group costs 1 fsync, so
+  `persist_round.rs`'s group commit works but is scoped per group.
+- **Why the earlier delete recommendation was wrong:** ADR 0048's
+  "apply-poll term dominated" finding is about idle cost, which quiescence
+  closes. `SharedWal` targets active-load cross-group fsync count, which
+  quiescence never touches. `persist_round.rs`'s own doc names this
+  shape (a split multiplying concurrently fsyncing groups) as the root
+  of the issue #279 livelock.
+- **Plan:** wire `SharedWal` into `animus-cp-data`'s persist path
+  (`persist_wal` and the apply task's compaction rewrite) with a
+  cross-tablet ordering corpus, segment GC, and crash-mid-roll fault
+  injection. Gate the work on a `ProdEnv` wall-clock benchmark at
+  realistic tablet density first: concurrent fsyncs to different files
+  may already be cheap on some media.
+- **Files:** `crates/animus-control/src/shared_wal.rs` (stays as is),
+  `crates/animus-cp-data/src/lib.rs` persist path.
+- **ADR:** amend 0028 on wiring. **PRs:** (1) `ProdEnv` benchmark;
+  (2) wire behind a flag + corpus; (3) cutover. **Size:** L.
 
 ---
 
@@ -549,12 +565,12 @@ wave are independent and can run in parallel.
 
 | Wave | Items | Why here |
 |---|---|---|
-| 0 | C-05 (delete path), S-07a | Cheapest, unblock accurate PR descriptions and reproducible images |
+| 0 | S-07a | Cheapest, unblocks reproducible images |
 | 1 | W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1 | Small, ADR-free, no cross-deps |
 | 2 | W-01, W-10, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
-| 5 | S-04 → S-05, S-07b–d, C-02 | S-05 strictly after S-04; S-07b after S-06 |
+| 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04; S-07b after S-06 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
 
 Open issues mapped: #375 → W-01, #319 → W-05. The flaky-test issues
