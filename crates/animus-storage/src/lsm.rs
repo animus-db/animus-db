@@ -116,8 +116,23 @@
 //!   un-flushed segment is never lost. A new segment's first record is `sync`ed
 //!   before its write is acked, so a half-created (un-synced) segment a crash drops
 //!   carried no ack.
+//! - **A lied-to `sync` (issue #554)**: if a flush's/compaction's SSTable
+//!   `sync` (`animus_sim::DiskConfig::set_fsync_lie_prob`) returns `Ok`
+//!   without landing the bytes, the manifest swap and the following
+//!   WAL-segment/superseded-input removal both commit as if it were honest —
+//!   nothing here can tell the difference ahead of the crash that reveals it.
+//!   This module's job in that case is exactly what it already does: `open`
+//!   fails loudly (`corrupt sstable index: ...`) rather than silently serving
+//!   a short engine. Recovering the *replica* is a layer up — issue #554
+//!   proposes the host reconciler treat an unopenable engine as lost, destroy
+//!   its files, and reopen fresh, letting Raft rebuild it from the group,
+//!   the same recovery the `MemoryEngine` tier already gets on every
+//!   restart; that's a design decision for the maintainer, not yet built.
+//!   See `crates/animus-storage/CLAUDE.md` and `docs/engineering-lessons.md`.
 //!
-//! These properties are argued here and exercised in `tests/lsm_crash.rs`.
+//! These properties (including the lied-to-`sync` case, pinned by
+//! `tests/lsm_crash.rs`'s `fsync_lie_flush_survives_as_a_clean_open_error`)
+//! are argued here and exercised in `tests/lsm_crash.rs`.
 //!
 //! ## Cloning (ADR 0058 rung 2)
 //!

@@ -325,6 +325,25 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   a crash mid-GC recovers the pre-GC inputs. Argued in `lsm.rs` module docs,
   exercised in `lsm_crash.rs` + `lsm_wal_rotation.rs` + `lsm_gc.rs`.
 
+  **A lied-to `sync` (issue #554, 2026-09-02, scenario
+  `fsync_lie_stop_restart_early_3_s03`, seed=15482874842363184593):** if a
+  flush's/compaction's SSTable `sync` (`DiskConfig::set_fsync_lie_prob`)
+  returns `Ok` without actually landing the bytes, `LsmEngine` has no way to
+  tell — the manifest swap and the WAL-segment/superseded-input removal that
+  follow both commit as if it were honest. A later crash that reveals the
+  lie then finds the manifest naming a table with no recoverable data on this
+  node's disk; reopen correctly fails loudly
+  (`StorageError::Backend("corrupt sstable index: ...")`) rather than
+  silently serving a short engine — this layer's job stops at detect-and-
+  report. Regression: `lsm_crash.rs::fsync_lie_flush_survives_as_a_clean_
+  open_error` pins that loud-`Err` contract. **The recovery is a layer up**:
+  issue #554 proposes the `animus-cp-data` host reconciler treat an
+  unopenable engine as lost, destroy its files (`EngineFactory::destroy`
+  already exists) and reopen fresh, letting Raft rebuild it from the group —
+  the same path the `MemoryEngine` tier already takes on every restart. Not
+  yet built; a maintainer design decision, tracked by issue #554. See
+  `lsm.rs`'s own "Crash safety" doc and `docs/engineering-lessons.md`.
+
 - **`LsmEngine::clone_to(target_prefix)` (ADR 0058 rung 2) clones an engine's
   durable state into a NEW, independent engine at SSTable-file granularity**
   — the prerequisite for a later in-place split's local materialization
