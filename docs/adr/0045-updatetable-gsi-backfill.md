@@ -541,5 +541,8 @@ warn against:
   the original design didn't anticipate, and its own correctness posture is
   "residual race window narrowed, not proven zero" — an honest gap, not a
   silent one, but a gap nonetheless.
-- **A table streamed mid-backfill sees phantom no-image records** — a real,
-  named, accepted limitation rather than a corner case nobody noticed.
+- **A table streamed mid-backfill would have seen phantom no-image
+  records** — a real, named limitation at the time this section was
+  written, but **closed by the "E1 mark + filter" fix (2026-08-16)**; see
+  the "Named follow-ups" section above for the mechanism and its
+  regression tests.

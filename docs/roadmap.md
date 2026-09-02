@@ -25,21 +25,13 @@ The next free ADR number at the time of writing is **0063**.
 
 ## 0. Corrections: the docs say "missing", the code says "built"
 
-These are not feature gaps. They are prose that lags the code and should be
-fixed in one docs PR (**D-01** below) before anyone plans work against them.
+These are not feature gaps. They are prose that lags the code. Most of the
+rows this section used to carry were fixed by the stale-prose sweep; what's
+left is the one row below with nowhere in the docs to point a fix at, plus
+the still-true paragraph after the table.
 
 | Prose claim | Where | Reality |
 |---|---|---|
-| ADR 0041 GSI/LSI is "Proposed" | `docs/adr/README.md`, `docs/adr/0041-*.md:3` | Implemented; ADR 0045's backfill depends on it |
-| ADR 0052 "console screens are follow-up PRs" | `docs/adr/README.md` | PR1–PR6 shipped; all three screens exist |
-| ADR 0059 "PITR pending" | `docs/adr/README.md:67` | Train 3 implemented (ADR body says so) |
-| ADR 0060 "Proposed — design-only, not scheduled" | `docs/adr/README.md` | Accepted; `crates/animus-operator` + `deploy/operator` + kind e2e exist |
-| "CP data plane records no metrics at all" | `docs/adr/0015-observability.md:67-77` | ~20 `Cp*` variants in `animus-env/src/metrics.rs:143-320` |
-| "There is no PITR" | `website/compatibility.html:150` | Contradicts the table 16 lines above it |
-| "leaderless AP data plane with tunable quorum consistency" | `docs/getting-started.md:3-5` | AP plane deleted (ADR 0019) |
-| ADR 0045 "phantom no-image records — accepted limitation" | `docs/adr/0045-*.md` Consequences (~line 544) | Closed 2026-08-16 by the `seeded` mark + filter, per the same ADR's own Update note (~line 476) |
-| ADR 0042 multi-consumer trim policy "deferred" | ADR 0042 Context section | Built in Round 2 (§8–9); §16's follow-up list no longer carries it |
-| `/admin/metrics/history` "backs the dashboard's sparklines" | `crates/animusd/src/lib.rs:6325,6571,8281`, `admin.rs:1406` | No dashboard file calls it (see U-01) |
 | Read-path counters for ReadIndex vs eventual reads "missing" | (this audit's first pass) | `CpReadBarriersServed/TimedOut`, `CpEventualReads{Local,Forwarded,FellBack}` exist and surface in `/admin/metrics` |
 
 Still true, and worth stating so nobody re-audits: the operator's **own**
@@ -528,11 +520,9 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ## 5. Documentation
 
-### D-01 Stale-prose sweep
-
-One PR fixing every row in section 0, plus: root `CLAUDE.md`'s ADR 0060
-sentence stays (operator image still unpublished) until S-07a lands;
-`website/index.html` "Planned" pills stay until S-01.
+Root `CLAUDE.md`'s ADR 0060 sentence stays (operator image still
+unpublished) until S-07a lands; `website/index.html` "Planned" pills stay
+until S-01.
 
 ---
 
@@ -559,7 +549,7 @@ wave are independent and can run in parallel.
 
 | Wave | Items | Why here |
 |---|---|---|
-| 0 | D-01, C-05 (delete path), S-07a | Cheapest, unblock accurate PR descriptions and reproducible images |
+| 0 | C-05 (delete path), S-07a | Cheapest, unblock accurate PR descriptions and reproducible images |
 | 1 | W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1 | Small, ADR-free, no cross-deps |
 | 2 | W-01, W-10, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
