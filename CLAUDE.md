@@ -75,7 +75,7 @@ first need a wire that can express it).
 
 Status: pre-alpha. For *what's implemented* and *why*, read the ADR index
 ([`docs/adr/README.md`](docs/adr/README.md)) and the per-crate guides below —
-this file does not keep a feature changelog.
+this file does not keep a feature changelog. For what is *not* implemented yet, and the plan for each gap, read [`docs/roadmap.md`](docs/roadmap.md).
 
 **No back-compat until further notice.** There are no migration paths and no
 wire/WAL/on-disk-format compatibility guarantees between revisions — assume
