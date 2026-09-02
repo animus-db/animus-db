@@ -17,14 +17,42 @@
 //! assertion failure into a second, unrelated `.expect()` panic that
 //! obscures it.
 //!
-//! This suite proves the fix — `support::PanicSafeTempDir` — deterministically,
-//! with no ProdEnv cluster and no timing dependency at all: it isolates the
-//! exact mechanism (does a panicking unwind remove a directory a background
-//! operation is actively using?) with a real background thread racing a
-//! real panic, coordinated by explicit signals rather than sleeps, so the
-//! outcome never depends on scheduling luck.
+//! This suite proves the fix — `support::PanicSafeTempDir` — with no ProdEnv
+//! cluster: it isolates the exact mechanism (does a panicking unwind remove
+//! a directory a background operation is actively using?) with a real
+//! background thread racing a real panic, coordinated by explicit signals
+//! (wait for the writer's first successful write) rather than sleeps
+//! wherever the property allows it.
+//!
+//! **A caveat on "no timing dependency": the `bare_tempdir_*` (red) test
+//! deliberately races a live writer thread against `std::fs::
+//! remove_dir_all` itself — that race IS the vulnerability being
+//! isolated — so which side wins is genuine, unpredictable OS scheduling.**
+//! `remove_dir_all` can finish cleanly (directory gone), or its final
+//! `rmdir` can lose to the writer recreating `wal` in the unlink-vs-rmdir
+//! window and fail "directory not empty" — an error `TempDir::drop`
+//! silently swallows, leaving the directory behind. An earlier version of
+//! this test asserted `!path.exists()` alone, i.e. only the first outcome;
+//! under load the second is real and flaked CI (issue #555), and a naive
+//! "or the writer observed an I/O error" fix still isn't enough — the
+//! writer can win that specific recreate race *without* ever seeing an
+//! error either. What actually IS deterministic, independent of which way
+//! that race lands: `remove_dir_all`'s directory listing is taken strictly
+//! after the writer has already reported itself live, so it is guaranteed
+//! to unlink the exact file (inode) the writer was using at that point —
+//! whatever exists at that path afterwards, if anything, can only be a
+//! *different* inode. The red test asserts on that inode identity instead
+//! of on timing, so its verdict is decided the instant the panicking drop
+//! returns, with no polling required; it separately gives the writer a
+//! brief, bounded window purely to enrich the proof with an observed
+//! not-found error when the race happens to land that way, but the
+//! pass/fail verdict never depends on that window. The **green** test has
+//! a much smaller timing dependency of its own (it waits briefly to
+//! observe continued successful progress), but nothing in it races a
+//! directory removal, since `PanicSafeTempDir` never calls one on a
+//! panicking drop.
 
-use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,17 +92,19 @@ impl BackgroundWriter {
                         successes2.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(e) => {
-                        // Record only the first error — mirrors
+                        // Record the first error and stop — mirrors
                         // `persist_wal`'s own `.expect()`, which would have
-                        // panicked (and stopped the loop) on the first one.
+                        // panicked (and so also stopped) on this first one.
+                        // Stopping here, rather than looping to retry, keeps
+                        // `first_error` a stable, final signal once set and
+                        // keeps this thread from re-creating `wal` forever
+                        // against a directory a panicking `TempDir::drop`
+                        // may still be racing to remove.
                         let mut slot = first_error2.lock().unwrap();
                         if slot.is_none() {
                             *slot = Some(e.to_string());
                         }
-                        // Keep looping in this test (unlike the real
-                        // `.expect()`) so we can also observe recovery —
-                        // but a single observed error is already the
-                        // failure this test is checking for.
+                        break;
                     }
                 }
                 // A tight loop, no sleep: maximizes the chance of actually
@@ -121,13 +151,27 @@ impl BackgroundWriter {
 /// part of `Drop` — including when that `Drop` runs mid-panic-unwind — so a
 /// background operation still actively using the directory (the shape of
 /// the control-plane WAL driver task `support::PanicSafeTempDir`'s own doc
-/// describes) observes a real I/O error immediately after.
+/// describes) gets torn out from under it. See the module doc for why the
+/// assertion below is decided by the file's identity (its inode), not by
+/// which side of the removal-vs-recreate race happens to win (issue #555).
 #[test]
 fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
+    let wal_path = path.join("wal");
     let writer = BackgroundWriter::start(path.clone());
     writer.wait_until_live();
+
+    // The inode the writer is actively using right before the drop. This
+    // is what makes the assertion below deterministic: `remove_dir_all`'s
+    // directory listing is taken strictly after `wait_until_live` returned
+    // (the panic, and so the drop, only happens below), so it is guaranteed
+    // to see — and unlink — precisely this inode. Whatever exists at
+    // `wal_path` afterwards can only be this same inode if `remove_dir_all`
+    // never got around to unlinking it at all, which cannot happen.
+    let original_ino = std::fs::metadata(&wal_path)
+        .expect("wal file must exist once the writer has reported itself live")
+        .ino();
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let _dir = dir; // moved in: its Drop runs as part of THIS unwind
@@ -140,37 +184,60 @@ fn bare_tempdir_removes_its_directory_out_from_under_a_live_background_writer_on
         .unwrap_or("<non-&str panic payload>");
     assert_eq!(panic_msg, "ORIGINAL_ASSERTION_FAILURE_MARKER");
 
-    // The directory is gone the instant the panicking Drop ran.
-    assert!(
-        !path.exists(),
-        "a bare TempDir must remove its directory even on a panicking drop \
-         (this is the pre-existing tempfile behavior the fix works around, \
-         not the fix itself)"
-    );
+    // `catch_unwind` does not return until the unwind — and so the
+    // panicking `Drop for TempDir`, and its `remove_dir_all` — has run to
+    // completion, so there is nothing left to wait for on that front: the
+    // outcome is already decided. Read it off the filesystem now:
+    //  - the directory may be gone entirely (`!path.exists()`) — removal
+    //    won outright;
+    //  - or it may persist with a `wal` entry whose inode differs from
+    //    `original_ino` — the writer won the *name*, by recreating `wal`
+    //    in the window between `remove_dir_all` unlinking it and the final
+    //    `rmdir` (which then fails "directory not empty" and is swallowed
+    //    by `TempDir::drop`), but the *original* file is still gone;
+    //  - `stat`ing `wal_path` may itself fail (`NotFound`) if it is
+    //    observed in the instant between that unlink and the writer's next
+    //    recreate — also proof the original is gone.
+    // Any of the three is proof this specific file was torn out from under
+    // the writer; there is no fourth outcome, so nothing here is racy.
+    let current_ino = std::fs::metadata(&wal_path).ok().map(|m| m.ino());
+    let torn_out_by_inode = !path.exists() || current_ino != Some(original_ino);
 
-    // Give the still-live background writer a moment to hit the now-missing
-    // directory and record a real I/O error — this is the failure mode
+    // Also give the writer a brief, bounded window to report a real I/O
+    // error against the now-missing directory — the failure mode
     // `persist_wal`'s bare `.expect("wal append")`/`.expect("wal sync")`
-    // would turn into a masking panic in the real driver task.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut observed_error = None;
-    while std::time::Instant::now() < deadline {
-        if let Some(e) = writer.first_error.lock().unwrap().clone() {
-            observed_error = Some(e);
-            break;
-        }
+    // would turn into a masking panic in the real driver task. This is
+    // purely to enrich the proof above with the error-kind check below
+    // when the race happens to land that way; the pass/fail verdict never
+    // depends on whether this window catches it.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut observed_error = writer.first_error.lock().unwrap().clone();
+    while observed_error.is_none() && std::time::Instant::now() < deadline {
+        observed_error = writer.first_error.lock().unwrap().clone();
         thread::yield_now();
     }
-    let (_successes, _) = writer.stop_and_join();
-    let observed_error = observed_error
-        .expect("background writer must observe an I/O error against a removed directory");
+    let (_successes, first_error_at_join) = writer.stop_and_join();
+    let observed_error = observed_error.or(first_error_at_join);
+
     assert!(
-        io::Error::new(io::ErrorKind::NotFound, observed_error.clone()).kind()
-            == io::ErrorKind::NotFound
-            || observed_error.contains("o such file")
-            || observed_error.contains("No such file"),
-        "expected a not-found-shaped I/O error, got: {observed_error}"
+        torn_out_by_inode || observed_error.is_some(),
+        "a bare TempDir's panicking drop must tear the directory out from under a live \
+         writer: expected the directory gone, the `wal` file's inode to have changed, or \
+         the writer to have observed an I/O error, but `wal_path` still resolves to its \
+         original inode ({original_ino}) at {path:?} and the writer never errored"
     );
+    if let Some(observed_error) = observed_error {
+        assert!(
+            observed_error.contains("o such file") || observed_error.contains("No such file"),
+            "expected a not-found-shaped I/O error, got: {observed_error}"
+        );
+    }
+
+    // Clean up manually: the inode-mismatch outcome above means the
+    // directory can persist (with a writer-recreated `wal` inside) even
+    // though the ORIGINAL file was torn out from under it — don't leak
+    // that leftover across repeated local runs.
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// **Green** (the fix): `support::PanicSafeTempDir` leaks its directory on a

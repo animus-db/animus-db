@@ -119,6 +119,36 @@ async fn await_gsi_scan(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> b
     }
 }
 
+/// [`await_gsi_scan`]'s multi-node form: poll `body` on **every** address
+/// until each one satisfies `accept`.
+///
+/// Load-bearing since ADR 0055, and only since then (see
+/// `dynamo_query_pagination.rs`'s identical-purpose
+/// `await_gsi_query_everywhere`, which this mirrors for `Scan`). A
+/// `ConsistentRead: false` read (the wire default, and a GSI `Scan`'s *only*
+/// option — `ConsistentRead: true` against one is a `ValidationException`,
+/// ADR 0041 §5) is served from *any* replica's own applied engine state
+/// (ADR 0055 §4): this node's own replica if it passes the local freshness
+/// gate, otherwise one forwarded hop to a deterministically-chosen sibling
+/// replica. Which of those actually answers is not fixed across requests —
+/// a request that lands locally one moment and gets forwarded the next
+/// samples two different, independently-lagging replicas — so converging
+/// [`await_gsi_scan`] against a single node (even the one
+/// [`drain_scan_pages`] will keep talking to) proves nothing about whether
+/// *every* replica the walk might end up sampling has caught up. Converging
+/// on every node's own address first closes that gap: once every replica
+/// independently reports `accept`, no request the walk issues afterward —
+/// local or forwarded — can land on a replica still missing a row.
+async fn await_gsi_scan_everywhere(
+    addrs: &[SocketAddr],
+    body: &str,
+    accept: impl Fn(&str) -> bool + Copy,
+) {
+    for &addr in addrs {
+        await_gsi_scan(addr, body, accept).await;
+    }
+}
+
 /// Extract the raw `LastEvaluatedKey` JSON object verbatim from a scan
 /// response body — brace-matched, since it can be an arbitrary
 /// AttributeValue map shape (a base cursor is `{pk,sk}`; a GSI cursor also
@@ -263,15 +293,26 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, SocketAddr) {
 /// `LastEvaluatedKey` — first a converged-or-timeout poll on the unpaginated
 /// scan (the drain is asynchronous), then a `Limit`-paginated walk over the
 /// now-stable data collecting every distinct item exactly once.
+///
+/// The convergence poll runs against **every** node, not just the one the
+/// walk itself talks to (`await_gsi_scan_everywhere`, ADR 0055): pagination
+/// correctness is what this test proves, and a `ConsistentRead: false` walk
+/// (a GSI `Scan` accepts no other consistency, `gsi_scan_rejects_consistent_
+/// read` below) can be answered by whichever replica of the tablet the
+/// serving node's own eventual-read routing picks that moment — its own
+/// local replica, or a forwarded hop to a sibling one — and that choice can
+/// differ page to page even against one fixed address. Converging on only
+/// one node proved only that *that node's* replica had all 5 rows at that
+/// instant; it said nothing about a replica the walk gets forwarded to a
+/// moment later. Issue #559: converging on one node let a page get served
+/// by a sibling replica that had not yet applied `sk=b1`'s index row, so the
+/// walk exhausted the index one row early and dropped it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gsi_scan_paginates_and_drains_all_rows() {
-    let (_dir, _nodes, addr) = setup().await;
+    let (_dir, nodes, addr) = setup().await;
 
-    // Wait for the drain to materialize all 5 rows before pagination-testing
-    // against them (pagination correctness is a separate concern from the
-    // drain's own eventual consistency).
-    await_gsi_scan(
-        addr,
+    await_gsi_scan_everywhere(
+        &nodes.iter().map(Node::dynamo_addr).collect::<Vec<_>>(),
         r#"{"TableName":"events","IndexName":"by-cat"}"#,
         |b| b.contains("\"Count\":5"),
     )
