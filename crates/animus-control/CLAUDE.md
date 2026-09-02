@@ -296,9 +296,8 @@ per-tablet CP data plane (`animus-cp-data`).
   read-visibility lag. See "What's non-obvious" for the driver mechanics and
   hand-driven gotchas.
 
-- **`BeginSplit`'s apply arm also enforces F11 token alignment on a
-  streamed table (ADR 0042 §14, growth PR2) — `BeginSplitInPlace`'s own
-  arm carries the identical check.** A split key that isn't exactly
+- **`BeginSplitInPlace`'s apply arm enforces F11 token alignment on a
+  streamed table (ADR 0042 §14, growth PR2).** A split key that isn't exactly
   `TOKEN_BYTES` (8) long is rejected outright when the source tablet's
   table has a stream (`self.table_stream(table).is_some()`) — an
   apply-time structural seatbelt: `animusd`'s `ClientCtx::trigger_split`
@@ -311,92 +310,79 @@ per-tablet CP data plane (`animus-cp-data`).
   still rejects at the pre-existing `KeyRange::split_at` "strictly inside" guard
   rather than accepting a zero-width sibling).
 
-- **Epoch-CAS discipline on `BeginSplit`/`CutoverSplit`/`CasTabletReplicas`.** Every
-  tablet-mutating command is a compare-and-swap on the tablet's epoch, evaluated
-  identically on every replica, so accept/reject is consistent and racing
-  proposers can't both commit. (`MergeTablets` — ADR 0033, carrying *two*
-  expected epochs since it read two tablets from one snapshot — was removed
-  by ADR 0044; tablets are split-only.) Any new tablet-mutating command must
-  adopt the same guard.
+- **Epoch-CAS discipline on `BeginSplitInPlace`/`CutoverSplit`/
+  `CasTabletReplicas`.** Every tablet-mutating command is a compare-and-swap
+  on the tablet's epoch, evaluated identically on every replica, so
+  accept/reject is consistent and racing proposers can't both commit.
+  (`MergeTablets` — ADR 0033, carrying *two* expected epochs since it read
+  two tablets from one snapshot — was removed by ADR 0044; tablets are
+  split-only.) Any new tablet-mutating command must adopt the same guard.
 
-- **The ADR 0050 copy-based split lifecycle (Train B rung 3):
-  `BeginSplit`/`CutoverSplit`.** `BeginSplit` (epoch-CAS + a state gate:
-  parent must be `Active`) marks the parent `Splitting` — range and rows
-  untouched, it serves until the workflow's freeze — and mints two
-  `Building` children over the half-ranges at the command's own
-  (proposer/placement-chosen, fork F5) replica homes, policy inherited,
-  allocator floor enforced, F11 token-alignment seatbelt (above). `CutoverSplit` (epoch-CAS; parent must be
-  `Splitting`; recomputes the children from the map — the two `Building`
-  tablets inside the parent's range — rather than trusting carried ids)
-  atomically activates both children, **removes** the parent (tablet +
-  policy; the reconciler reclaims it as ordinary hosted-but-absent), and
-  writes `Metadata::split_lineage[child] = SplitLineage {parent,
-  parents_final_epoch, cutover_wall_ms}` — fork F9, recorded at the one
-  moment the parent's shard chain is complete (never pruned; the B6
-  `ParentShardId` source). Wall time rides the command
+- **The copy-based split lifecycle (ADR 0050 Train B rung 3:
+  `BeginSplit`/`CutoverSplit`'s copy branch) was deleted whole 2026-09-01**
+  (the copy-split-deletion stack, Layers A/B1/B2 — see `docs/adr/0058-*.md`'s
+  2026-09-01 as-built note and `docs/adr/0050-*.md`'s matching amendment),
+  retrievable from git history. `MetaCommand::BeginSplit` — its enum
+  variant, apply arm, mirror arm, and `is_relayable_command`
+  classification — no longer exists; `CutoverSplit` survives as one apply
+  arm, not two branches (below). The in-place lifecycle that follows is
+  now the sole split mechanism.
+
+- **The in-place split lifecycle (ADR 0058 Train 2 rung 3, directed by ADR
+  0062): `BeginSplitInPlace`/`CutoverSplit`.** `BeginSplitInPlace`
+  (epoch-CAS + a state gate: parent must be `Active`, F11 seatbelt above,
+  monotonic child-id allocator) mints **no** `Building` tablet-map rows at
+  all — it records the intent directly on the parent
+  (`Tablet::inplace_split = Some(InPlaceSplitIntent{split_key, children})`,
+  `animus-tablet`) and marks it `Splitting`, full stop. There is nothing
+  physical to place a policy on yet, so no policy copy happens here. The
+  data plane's own `KvCommand::SplitTablet` (`animus-cp-data`) — not this
+  command — is what actually materializes the two children, entirely
+  outside control-plane Raft; this command only ever sees the *intent*,
+  never the fork itself.
+
+  `CutoverSplit` (epoch-CAS; parent must be `Splitting` — its own apply arm
+  creates both children's tablet-map rows DIRECTLY from the parent's own
+  intent's `(id, replicas)` pairs; a `Splitting` parent carrying no intent
+  is structurally impossible (`BeginSplitInPlace` is the sole path into
+  `Splitting`) and is rejected defensively rather than trusted with an
+  `.expect()`) atomically activates both children, **removes** the parent
+  (tablet + policy; the reconciler reclaims it as ordinary
+  hosted-but-absent), and writes `Metadata::split_lineage[child] =
+  SplitLineage {parent, parents_final_epoch, cutover_wall_ms}` — fork F9,
+  recorded at the one moment the parent's shard chain is complete (never
+  pruned; the B6 `ParentShardId` source). Wall time rides the command
   (`cutover_wall_ms`), `SealStreamShard::seal_wall_ms`'s discipline — the
   state machine has no clock. The zero-copy split's own command and
   provenance maps (`SplitTablet`, `split_parents`, `stream_split_basis`)
-  were deleted in the Train B rung-7 sweep — `split_lineage` is the sole
-  split-provenance record. Placement (`reconcile_placement`/`rebalance_placement`) skips
-  every non-`Active` tablet — the mid-split set is frozen. Mirror arms +
-  `syskv::EntityKind::SplitLineage` follow the usual per-entity
-  conventions. **As of the copy-split deletion stack's layer 1**,
-  `apply_engine.rs`'s differential oracle no longer drives a `BeginSplit`
-  round at all — it was ported to the in-place command below, since the
-  same mirror-correctness property has no reason to prove itself twice;
-  `BeginSplit`'s own remaining direct coverage is `meta.rs`'s in-file
-  tests (the still-Building-children-specific ones) and `tablet_split.rs`'s
-  fixed-seed regressions.
+  were deleted in the ADR 0050 Train B rung-7 sweep, and its build/
+  copy-based command and provenance stayed only through `split_lineage`
+  either way — `split_lineage` is the sole split-provenance record.
+  Placement (`reconcile_placement`/`rebalance_placement`) skips every
+  non-`Active` tablet — the mid-split set is frozen.
 
-- **The ADR 0058 Train 2 rung 3 in-place split lifecycle:
-  `BeginSplitInPlace`/`CutoverSplit`'s in-place branch.** Same epoch-CAS +
-  `Active`-state gate + F11 seatbelt + monotonic child-id allocator as
-  `BeginSplit`, but mints **no** `Building` tablet-map rows at all — it
-  records the intent directly on the parent
-  (`Tablet::inplace_split = Some(InPlaceSplitIntent{split_key, children})`,
-  `animus-tablet`) and marks it `Splitting`, full stop. There is nothing
-  physical to place a policy on yet, so (unlike `BeginSplit`) no policy
-  copy happens here. The data plane's own `KvCommand::SplitTablet`
-  (`animus-cp-data`) — not this command — is what actually materializes
-  the two children, entirely outside control-plane Raft; this command only
-  ever sees the *intent*, never the fork itself.
-
-  `CutoverSplit` gained an in-place branch, selected by
-  `source.inplace_split.is_some()`: instead of scanning the tablet map for
-  `Building` children (none exist), it creates both children's tablet-map
-  rows DIRECTLY from the intent's own `(id, replicas)` pairs. **Since ADR
-  0062 (superseding this paragraph's own original text), each `replicas`
-  is that child's FORK-TIME homes — the parent's own current replicas,
-  verbatim, identical for both children, never placement-chosen** — a
-  child's eventual *final* home is a separate decision this same apply arm
-  also makes (below), not something the intent carries. It also inherits
-  the parent's policy **at this moment** — the in-place workflow's only
-  chance to, since there was no tablet row to attach it to at
-  `BeginSplitInPlace` time. Otherwise identical to the copy-based branch:
-  `split_lineage` written for both (fork F9, unchanged), parent removed.
-  **G1 (ADR 0058's own "Open forks" table, decided 2026-08-25, reversing
-  that ADR's own Stage 4 draft text): the GSI-drain/backfill-seeder
-  cutover vetoes stay PRE-cutover, caller-side, exactly as in the
-  copy-based workflow** — this command's own apply never gated on drain
-  state in either branch, so nothing about this in-place branch needed to
-  change to honor that decision; `animusd`'s in-place split driver
-  (`index_drain.rs::inplace_split_driver_tick`) runs those vetoes before
-  ever proposing this command, mirroring `split_driver_tick`'s existing
-  shape for the copy-based endgame. Mirror arms follow the usual
-  per-entity conventions (`BeginSplitInPlace`: parent row + allocator
-  counter only; `CutoverSplit`'s existing arm extended to also mirror each
-  child's policy, unconditionally — a harmless duplicate write for the
-  copy-based branch, the only source for the in-place one). Tests:
-  `meta::tests::begin_split_in_place_*`/`cutover_split_in_place_*`,
-  mirroring the copy-based tests' own shape scenario-for-scenario;
-  `apply_engine.rs`'s `cache_matches_engine_through_a_mixed_scenario_and_a_
-  restart` (its `BeginSplit` round ported here, copy-split deletion stack
-  layer 1) and `cache_matches_engine_through_directed_placing` for the
+  **Since ADR 0062**, each `replicas` in the intent is that child's
+  FORK-TIME homes — the parent's own current replicas, verbatim, identical
+  for both children, never placement-chosen — a child's eventual *final*
+  home is a separate decision this same apply arm also makes (below), not
+  something the intent carries. `CutoverSplit` inherits the parent's
+  policy **at this moment** — the in-place workflow's only chance to,
+  since there was no tablet row to attach it to at `BeginSplitInPlace`
+  time. **G1 (ADR 0058's own "Open forks" table, decided 2026-08-25,
+  reversing that ADR's own Stage 4 draft text): the GSI-drain/
+  backfill-seeder cutover vetoes stay PRE-cutover, caller-side** — this
+  command's own apply never gates on drain state; `animusd`'s in-place
+  split driver (`index_drain.rs::inplace_split_driver_tick`) runs those
+  vetoes before ever proposing this command. Mirror arms + `syskv::
+  EntityKind::SplitLineage` follow the usual per-entity conventions
+  (`BeginSplitInPlace`: parent row + allocator counter only; `CutoverSplit`'s
+  arm also mirrors each child's policy). Tests: `meta::tests::
+  begin_split_in_place_*`/`cutover_split_in_place_*`; `apply_engine.rs`'s
+  `cache_matches_engine_through_a_mixed_scenario_and_a_restart` and
+  `cache_matches_engine_through_directed_placing` for the
   differential-oracle proof; `mirror.rs`'s own
   `rebuild_from_engine_matches_direct_apply` for `BeginSplitInPlace`'s
-  write-derivation shape specifically (parent row + counter, no `Building`
-  rows — otherwise unexercised by that file before the same port).
+  write-derivation shape (parent row + counter, no `Building` rows).
 
 - **ADR 0062: directed Placing — `Metadata::split_placing` +
   `MetaCommand::MarkSplitPlacingDone`.** A split child's *final* replica
@@ -501,14 +487,18 @@ per-tablet CP data plane (`animus-cp-data`).
   derives its whole manifest stub (an owned `TableSchema` clone + the
   table's current tablet list) from **already-agreed `Metadata` at apply
   time**, never from anything the proposer captured — the same
-  determinism argument `BeginSplit`'s child ranges and `CutoverSplit`'s
-  child recomputation already rest on (see `docs/engineering-lessons.md`'s
-  entry on this). The tablet list feeding `pinned_tablets` filters out
-  `TabletState::Building` rows — during a copy-based split's (ADR 0050)
-  build/tail window `tablets_for_table` can return the `Splitting` parent
-  plus its two not-yet-cutover `Building` children all at once, and only
-  the parent is the current authoritative owner of the range (see
-  `docs/engineering-lessons.md`'s entry on this fix). `CompleteBackup` requires every pinned tablet to have a
+  determinism argument `BeginSplitInPlace`'s child-id mint and
+  `CutoverSplit`'s child materialization already rest on (see
+  `docs/engineering-lessons.md`'s entry on this). The tablet list feeding
+  `pinned_tablets` filters out `TabletState::Building` rows — a `Building`
+  tablet today is a restore's not-yet-activated destination (ADR 0059 §7);
+  the now-deleted copy-based split's own build/tail window used to leave up
+  to three live rows covering one key range at once (the still-
+  authoritative `Splitting` parent plus its two not-yet-cutover `Building`
+  children), which is what originally motivated this filter (see
+  `docs/engineering-lessons.md`'s entry on this fix) — the filter is a
+  no-op on the in-place split path today (which mints no `Building` rows
+  at all) but is still load-bearing for the restore case. `CompleteBackup` requires every pinned tablet to have a
   progress row; `RecordBackupTabletComplete` is idempotent on an identical
   repeat but rejects a genuinely differing one outright (no repair-update
   path yet, unlike `SealStreamShard`'s replicas-only allowance).
@@ -589,8 +579,8 @@ per-tablet CP data plane (`animus-cp-data`).
   no AWS-defined "restore id" to echo back). `BeginRestore` mints exactly
   **one** `Building` tablet over the whole ring for the target table
   (`Tablet::with_table` + `state = Building`, the identical monotonic-
-  allocator-floor seatbelt `CreateTablet`/`BeginSplit` already enforce) plus
-  the `Seeding` row — the ADR's own as-built decision to mint a *fresh*
+  allocator-floor seatbelt `CreateTablet`/`BeginSplitInPlace` already
+  enforce) plus the `Seeding` row — the ADR's own as-built decision to mint a *fresh*
   single-tablet layout rather than mirror the backup's historical
   multi-tablet topology (see the ADR's Train 2 amendment for the full
   reasoning: this needs no `range` field anywhere, since a single
@@ -1240,7 +1230,7 @@ seed's exact timing (`wait_for_snapshot_transfer_in_flight`).
 (2-3 concurrent proposers racing `CreateTableSchema`, same-table or
 distinct-name), `Workload::PlainChurn` (non-contending `UpsertMember`, the
 non-vacuity floor), `Workload::AllocatorRace` (several proposers racing
-`CreateTablet`/`BeginSplit` against ONE shared table/tablet, hammering
+`CreateTablet`/`BeginSplitInPlace` against ONE shared table/tablet, hammering
 `Metadata::next_tablet_id`/`next_free_tablet_id()`), `Workload::RegisterCas`
 (several proposers each claiming a distinct node id then attempting one
 deterministic differing-re-registration collision against their own claim —

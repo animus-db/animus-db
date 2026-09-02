@@ -398,8 +398,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// The copy-based workflow this call used to also be able to select
     /// (ADR 0050: `MetaCommand::BeginSplit`, placement-chosen final homes,
     /// fork F5) was deleted in the copy-split-deletion endgame's Layer B1
-    /// (`docs/adr/0058-*.md` rung 4) — `MetaCommand::BeginSplit` itself
-    /// stays defined (production-dead) pending Layer B2. Confirms by
+    /// (`docs/adr/0058-*.md` rung 4); `MetaCommand::BeginSplit` itself was
+    /// deleted in Layer B2. Confirms by
     /// observing the parent's own state become `Splitting` (state-based,
     /// replacing the old zero-copy epoch-advance confirm: a rebalance's
     /// `CasTabletReplicas` also bumps the epoch, so an epoch advance alone

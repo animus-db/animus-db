@@ -255,18 +255,19 @@ pub type TableName = String;
 /// inputs (the design's own "same inputs on every replica" requirement).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitChild {
-    /// The child's tablet id, minted from the same monotonic allocator a
-    /// copy-based split's `Building` children use — reserved (never
-    /// reused) the instant the intent is recorded, even though (unlike a
-    /// copy-based `Building` child) no [`Tablet`] map entry exists for it
-    /// until `MetaCommand::CutoverSplit` activates it.
+    /// The child's tablet id, minted from the same monotonic allocator
+    /// every other tablet-id mint uses (`CreateTablet`/`BeginRestore`) —
+    /// reserved (never reused) the instant the intent is recorded, even
+    /// though no [`Tablet`] map entry exists for it until
+    /// `MetaCommand::CutoverSplit` activates it.
     pub id: TabletId,
     /// The child's replica set **at fork time** (ADR 0062 rung 4,
     /// "fork first, always local") — the parent's own current replicas,
     /// identical for both children, never placement-chosen. This
     /// superseded fork F5's original meaning ("the child's placement-chosen
-    /// FINAL replica set", inherited from the copy-based design, where the
-    /// **union** of both children's replica sets was what the parent's own
+    /// FINAL replica set", inherited from the now-deleted copy-based
+    /// design, where the **union** of both children's replica sets was what
+    /// the parent's own
     /// group added as learners, ADR 0058 Train 2 Stage 1) — there is no
     /// learner union any more; every replica named here already hosts the
     /// parent, so nothing needs recruiting before the fork can proceed.
@@ -283,15 +284,13 @@ pub struct SplitChild {
 /// minted — the smallest representation that lets every node's reconciler
 /// (`animus-cp-data::host`) discover "this hosted tablet is splitting
 /// in-place, here are its two children's ids/homes" from replicated
-/// `Metadata` alone, with **no** `Building` tablet-map entries (unlike the
-/// copy-based workflow — no data has moved yet, so there is nothing to
-/// place a routable-but-empty entry over). `split_key` is carried
-/// verbatim, not re-derived, so every replica splits the parent's range
-/// identically ([`KeyRange::split_at`]).
+/// `Metadata` alone, with **no** `Building` tablet-map entries — no data
+/// has moved yet, so there is nothing to place a routable-but-empty entry
+/// over. `split_key` is carried verbatim, not re-derived, so every replica
+/// splits the parent's range identically ([`KeyRange::split_at`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InPlaceSplitIntent {
-    /// The key the parent's range splits at (left half first, matching the
-    /// copy-based `BeginSplit` convention).
+    /// The key the parent's range splits at (left half first).
     pub split_key: Vec<u8>,
     /// Exactly two children, left half first.
     pub children: [SplitChild; 2],
@@ -327,32 +326,42 @@ pub struct Tablet {
     #[serde(default)]
     pub state: TabletState,
     /// This parent's **in-place split intent** (ADR 0058 Train 2 rung 3),
-    /// if a `MetaCommand::BeginSplitInPlace` is mid-workflow on it —
-    /// `None` for every ordinary tablet and for a copy-based `Splitting`
-    /// parent (whose children instead get real `Building` map entries).
-    /// `#[serde(default)]` keeps every pre-existing snapshot loading as
-    /// `None`.
+    /// set the instant a `MetaCommand::BeginSplitInPlace` marks it
+    /// `Splitting` — `Some` for the whole mid-workflow window, `None` for
+    /// every other tablet (this is now the sole path into `Splitting`, so
+    /// the two states move together). `#[serde(default)]` keeps every
+    /// pre-existing snapshot loading as `None`.
     #[serde(default)]
     pub inplace_split: Option<InPlaceSplitIntent>,
 }
 
-/// A tablet's lifecycle state (ADR 0050, copy-based splits).
+/// A tablet's lifecycle state.
 ///
 /// - `Active` — the steady state: routable, rebalance-eligible, splittable.
-/// - `Building` — a split child being seeded by the split driver: hosted (its
-///   group runs, its engine fills) but **unroutable** and frozen for
-///   placement until `CutoverSplit` activates it.
-/// - `Splitting` — a split parent mid-workflow: still fully serving (reads
-///   AND writes, until the B5 freeze) but frozen for placement and not
-///   re-splittable; removed from the tablet map at cutover.
+/// - `Building` — under construction, not yet serving: today, a restore's
+///   freshly-minted destination tablet (`MetaCommand::BeginRestore`, ADR
+///   0059 §7) between `BeginRestore` and `CompleteRestore`. Hosted (its
+///   group runs, its engine opens) but **unroutable** until activated. The
+///   now-deleted copy-based split workflow (ADR 0050) used to mint a split
+///   child in this state too — no split path does any more (ADR 0058's
+///   in-place split, the sole survivor, activates both children directly
+///   from `Active`).
+/// - `Splitting` — an in-place split parent mid-workflow (ADR 0058 Train 2
+///   rung 3): still fully serving (reads AND writes) but frozen for
+///   placement and not re-splittable, carrying its own
+///   [`InPlaceSplitIntent`] (`Tablet::inplace_split`) until
+///   `CutoverSplit` activates both children and removes it from the
+///   tablet map.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabletState {
     /// Routable, rebalance-eligible, splittable — the steady state.
     #[default]
     Active,
-    /// A split child under construction: hosted but unroutable.
+    /// Under construction, not yet serving: today, a restore's
+    /// not-yet-activated destination tablet.
     Building,
-    /// A split parent mid-workflow: serving, but frozen for placement.
+    /// An in-place split parent mid-workflow: serving, but frozen for
+    /// placement.
     Splitting,
 }
 
@@ -399,12 +408,11 @@ impl Tablet {
         }
     }
 
-    /// Whether client routing may serve keys from this tablet (ADR 0050): an
-    /// `Active` tablet always; a `Splitting` parent still serves (reads AND
-    /// writes) until the split workflow's freeze/cutover; a `Building` split
-    /// child never does — its range **overlaps its parent's** (the parent's
-    /// range is not narrowed at `BeginSplit`), so routing to it would serve
-    /// a half-copied engine.
+    /// Whether client routing may serve keys from this tablet: an `Active`
+    /// tablet always; a `Splitting` in-place-split parent still serves
+    /// (reads AND writes) right up to `CutoverSplit`; a `Building` tablet
+    /// (today, only a not-yet-activated restore destination) never does —
+    /// it has no committed contents yet.
     #[must_use]
     pub fn is_routable(&self) -> bool {
         !matches!(self.state, TabletState::Building)

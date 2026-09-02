@@ -799,22 +799,16 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // `RegisterCpAddr` (a follower-connected node has no other way to
         // reach the control leader).
         | MetaCommand::RegisterNodeAddrs { .. }
-        // Copy-based split workflow (ADR 0050): `trigger_split` proposes
-        // `BeginSplit` from whichever node's admin/auto-split surface
-        // fired it, and the split driver (B4/B5) proposes `CutoverSplit`
-        // from the parent's own leader node — both need the identical
-        // follower-connected relay path `SplitTablet` already has.
-        | MetaCommand::BeginSplit { .. }
-        | MetaCommand::CutoverSplit { .. }
-        // In-place split workflow (ADR 0058 Train 2 rung 3): the SAME
-        // relay reasoning as the copy-based `BeginSplit`/`CutoverSplit`
-        // pair above — `trigger_split` (in-place mode) proposes
-        // `BeginSplitInPlace` from whichever node's admin/auto-split
-        // surface fired it, and `CutoverSplit` here is proposed by the
-        // parent's own leader node once its data-plane fork has
-        // completed and its pre-cutover vetoes pass, exactly the same
-        // follower-connected relay need.
+        // In-place split workflow (ADR 0058 Train 2 rung 3): `trigger_split`
+        // proposes `BeginSplitInPlace` from whichever node's admin/
+        // auto-split surface fired it, and `CutoverSplit` is proposed by
+        // the parent's own leader node once its data-plane fork has
+        // completed and its pre-cutover vetoes pass — both need the
+        // identical follower-connected relay path `SplitTablet` already
+        // has (the same relay reasoning the now-deleted copy-based
+        // `BeginSplit`/`CutoverSplit` pair, ADR 0050, used to carry).
         | MetaCommand::BeginSplitInPlace { .. }
+        | MetaCommand::CutoverSplit { .. }
         // Provision-at-create (ADR 0023): a `CreateTable` on a follower-connected
         // client relays the table's tablet creation + RF policy to the control
         // leader. Scoped to one tablet per table by the state machine's guard.
@@ -1285,12 +1279,6 @@ mod tests {
             MetaCommand::RegisterNodeAddrs {
                 node: nid(1),
                 addrs: addrs.clone(),
-            },
-            MetaCommand::BeginSplit {
-                parent: TabletId(1),
-                expected_epoch: Epoch::INITIAL,
-                split_key: vec![1],
-                children: [(TabletId(2), vec![]), (TabletId(3), vec![])],
             },
             MetaCommand::CutoverSplit {
                 parent: TabletId(1),

@@ -264,19 +264,25 @@ tablet's **immutable** declared `range` — physical keys are
 (ADR 0041 §3) is the
 multi-kind atomic batch backing materialized secondary indexes and the
 change log; `KvCommand::SeedBatch` (ADR 0050 Train B rung 4, codec v19) is
-the split-build driver's history-transfer command — `SeedRow`s
+a version-carrying row-merge command — `SeedRow`s
 (`(kind, logical, value-or-tombstone, version)`) merge-applied at their
 **carried** versions with the stored bytes verbatim (intent envelopes
 included), emitting nothing into the child's change log and witnessing the
 batch's max version into the group's HLC (`propose_seed_batch` /
-`seed_rows_kind` are the driver's propose/read pair; `tests/seed_batch.rs`
-+ `ANIMUS_SPLIT_SEEDS` is its corpus); `KvCommand::Freeze` (ADR 0050 rung
-5, codec v20) is the split-cutover freeze — a whole-range entry of the
-existing sealed-set discipline whose durable seal marker re-latches
-`is_frozen()` at group start, refusing every later-ordered USER mutation
-(base/LSI — a consumer-bookkeeping `KindBatch` still applies) while reads
-keep serving; `propose_freeze` is idempotent and `tests/freeze.rs` is its
-suite; **`KvCommand::SplitTablet`** (ADR 0058 Train 2 rung 3, codec v23) is
+`seed_rows_kind` are its propose/read pair; `tests/seed_batch.rs` +
+`ANIMUS_SPLIT_SEEDS` is its corpus). **Originally built for the now-deleted
+copy-based split-build driver, its sole surviving consumer is the restore
+driver** (`animusd::backup_restore`, ADR 0059 §7) seeding a restore's
+destination tablet from a backup's captured chunks; `KvCommand::Freeze`
+(ADR 0050 rung 5, codec v20) is the split-cutover freeze — a whole-range
+entry of the existing sealed-set discipline whose durable seal marker
+re-latches `is_frozen()` at group start, refusing every later-ordered USER
+mutation (base/LSI — a consumer-bookkeeping `KindBatch` still applies)
+while reads keep serving; `propose_freeze` is idempotent and
+`tests/freeze.rs` is its suite. **`KvCommand::Freeze` itself is
+production-dead as of the copy-split-deletion stack (2026-09-01)** — the
+in-place split never needed it (see this file's own "The freeze" entry
+below); **`KvCommand::SplitTablet`** (ADR 0058 Train 2 rung 3, codec v23) is
 the **in-place split's** single-entry atomic fork — reuses `Freeze`'s exact
 whole-range seal/`frozen` discipline for the ordering fence (the two
 workflows share the flag-selected `frozen` latch, mutually exclusive per
@@ -487,13 +493,19 @@ State once here; cross-referenced from the sections below.
   - **The freeze** (`seal.rs`, `KvCommand::Freeze`) closes the one residual
     witnessing alone cannot: an in-flight write from the parent's own
     leader, still in its commit pipeline when the split cutover happens. The
-    split-build driver proposes `Freeze` through the parent's own log; apply
-    rejects any later-ordered mutating entry, regardless of that entry's own
-    `ts`, because within one group log order and HLC order coincide — the
-    **log position** is authoritative. (The zero-copy split's range-scoped
-    seal, its `ProposeSeal` reconciler action, and the `parent_seal_observed`
-    host gate were deleted in the rung-7 sweep — a copy-based child never
-    shares rows with its parent, so there is no handoff to seal.)
+    now-deleted copy-based split-build driver used to propose `Freeze`
+    through the parent's own log; apply rejects any later-ordered mutating
+    entry, regardless of that entry's own `ts`, because within one group log
+    order and HLC order coincide — the **log position** is authoritative.
+    (The zero-copy split's range-scoped seal, its `ProposeSeal` reconciler
+    action, and the `parent_seal_observed` host gate were deleted in the
+    rung-7 sweep — a copy-based child never shares rows with its parent, so
+    there is no handoff to seal.) **`KvCommand::Freeze` itself is
+    production-dead as of the copy-split-deletion stack (2026-09-01)** — no
+    remaining caller proposes it (the in-place split, ADR 0058, never needed
+    a freeze at all: `CutoverSplit` fires only after both children are
+    already fully formed) — kept, not deleted, since nothing in that stack's
+    scope touched `animus-cp-data`'s own `KvCommand` enum.
 - **CAS is decided at *apply* time, not propose time** — this is what makes it
   linearizable and contention-correct. `RaftCore` agrees only the order; `Cas`
   rides through as opaque data. Apply evaluates it in commit order against the
