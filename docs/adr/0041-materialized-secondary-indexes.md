@@ -1,6 +1,7 @@
 # ADR 0041 — Materialized secondary indexes: GSI as a hidden table (async, over a change log), LSI colocated (atomic)
 
-- **Status:** Proposed
+- **Status:** Accepted — implemented; ADR 0045 covers `UpdateTable` GSI
+  add/drop with backfill on an already-populated table
 - **Date:** 2026-08-13
 - **Amends:** [ADR 0013](0013-replicated-schemas.md) (the index *definitions* it
   replicated now have index *data* to match),

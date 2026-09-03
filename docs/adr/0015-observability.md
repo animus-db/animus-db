@@ -95,6 +95,19 @@ integration; the seam itself does **no** HTTP.
   Recording is observe-only — it changes **no** quorum semantics, and all public
   signatures stay additive/stable.
 
+- **Correction (2026-09-02):** the 2026-08-06 audit note above is now stale on
+  its CP-data-plane claim. `animus-env/src/metrics.rs` carries an extensive
+  `Cp*` counter family — over 100 variants covering proposals, commits,
+  applies (with apply-batch sizes), read barriers, the ADR 0055 eventual-read
+  path (`CpEventualReads{Local,Forwarded,FellBack}`), snapshots
+  (triggers/image-builds/ships/installs), reconfigure, read-ceiling proposals,
+  uncertainty restarts, transaction recovery, quiesce/unquiesce, and
+  `AppendEntries` sends, among others — recorded at the real per-tablet-group
+  call sites via the same additive pattern this ADR establishes, and surfaced
+  through `/admin/metrics` (ADR 0020). The data-plane observation above about
+  the dead-in-v1 `data_*` counters (the deleted AP plane) still holds as
+  written. See `docs/roadmap.md` §0 for the audit that caught the drift.
+
 - **What the storage engine records (ADR 0004/0008).** The on-disk `LsmEngine`
   records, at the real LSM site that knows the *outcome* (not merely a schedule),
   all observe-only and deterministic (counters only, no wall clock): `storage_flushes`

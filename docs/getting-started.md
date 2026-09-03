@@ -1,9 +1,10 @@
 # Getting started
 
-AnimusDB is a masterless, linearly-scalable NoSQL database (Dynamo lineage): a
-leaderless AP data plane with tunable quorum consistency, paired with a small
-strongly-consistent Raft control plane. This page gets you from a checkout to a
-running node and shows where runtime metrics surface (ADR 0015).
+AnimusDB is a masterless, linearly-scalable NoSQL database. For v1 (ADR 0019)
+it is strongly-consistent (CP): a leaderful per-tablet Raft data plane
+(linearizable single-tablet reads/writes) under a small Raft control plane
+that owns cluster metadata. This page gets you from a checkout to a running
+node and shows where runtime metrics surface (ADR 0015).
 
 > Status: **pre-alpha.** For *what* is implemented and *why*, read the ADR index
 > ([`docs/adr/README.md`](adr/README.md)) and the per-crate `CLAUDE.md` guides.

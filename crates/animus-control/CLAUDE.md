@@ -214,7 +214,11 @@ per-tablet CP data plane (`animus-cp-data`).
   coordinator that serializes concurrent tablet WAL writers into one file
   with coalesced `append`+`sync`. **Built and unit-tested but UNWIRED** — no
   `animusd`/`animus-cp-data` code constructs one; every tablet still writes
-  its own WAL file. Wire-in-or-delete is an open decision (see ADR 0028).
+  its own WAL file. **Keep (measured 2026-09-02, see
+  `docs/roadmap.md` C-05):** a burst across K active groups on one node
+  costs K fsyncs with no cross-group coalescing, a cost quiescence (ADR
+  0048) does not address, so this is the right mechanism and wiring it
+  into `animus-cp-data`'s persist path is a dedicated L-sized PR.
 
 - **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
   key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =

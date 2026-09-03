@@ -44,7 +44,9 @@ old and new item images, trimmed behind whichever consumer is furthest
 behind. §4a of that ADR named the plan explicitly: *"Streams becomes a
 second consumer of the same log... Only the record format, the ordering, and
 the trim are settled [t]here"* — shards, iterators, view-type projection,
-the wire surface, and a real multi-consumer trim policy were deferred. This
+the wire surface, and a real multi-consumer trim policy were deferred.
+(That trim policy is no longer deferred — built in Round 2, see §8/§9
+below; §16's follow-up list does not carry it.) This
 ADR specifies that: DynamoDB Streams, AWS's own change-data-capture API for a
 table (`GetRecords`/`GetShardIterator`/`DescribeStream`/`ListStreams`, the
 `DynamoDBStreams_20120810` service).

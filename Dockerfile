@@ -1,20 +1,28 @@
-# AnimusDB container image.
+# AnimusDB container image(s).
 #
-# Multi-stage: a `rust:1.96` builder (matching the toolchain pinned in
-# rust-toolchain.toml / the workspace `rust-version`) release-builds the two
-# runnable binaries, then a `debian:bookworm-slim` runtime stage carries only
-# those binaries plus the glibc/libssl userland they link against. Distroless
-# was considered and rejected here: bookworm-slim keeps a shell + package
-# manager available for interactive debugging inside a running container,
-# which matters more for an early, pre-alpha, ops-heavy database than the
-# extra few MB distroless would save.
+# Multi-stage: one `rust:1.96` builder (matching the toolchain pinned in
+# rust-toolchain.toml / the workspace `rust-version`) release-builds every
+# runnable binary — `animusd`, `animus` (the CLI), and `animus-operator` —
+# then two separate `debian:bookworm-slim` runtime stages each carry only
+# the binaries their image needs plus the glibc/libssl userland they link
+# against. Distroless was considered and rejected here: bookworm-slim keeps
+# a shell + package manager available for interactive debugging inside a
+# running container, which matters more for an early, pre-alpha, ops-heavy
+# database than the extra few MB distroless would save.
 #
-# No ENTRYPOINT flags are baked in beyond the binary itself — every
-# deployment mode (`--cluster`, `--config --node`, `join`, `control`,
-# `data`, ...; see crates/animusd/CLAUDE.md) is selected by whoever runs the
-# image, via `docker run ... animusd <args>`. In particular `--dir` (the
-# on-disk data path) is never defaulted here: it must be passed explicitly
-# and should point at the mounted /var/lib/animus volume.
+# `docker build .` (no `--target`) produces the `runtime` stage — the
+# animusd node image, unchanged default. `docker build --target
+# runtime-operator .` produces the `animus-operator` controller image (see
+# `.github/workflows/image.yml`'s `build` job matrix and
+# `deploy/operator/deployment.yaml`).
+#
+# No ENTRYPOINT flags are baked into the `animusd` image beyond the binary
+# itself — every deployment mode (`--cluster`, `--config --node`, `join`,
+# `control`, `data`, ...; see crates/animusd/CLAUDE.md) is selected by
+# whoever runs the image, via `docker run ... animusd <args>`. In
+# particular `--dir` (the on-disk data path) is never defaulted here: it
+# must be passed explicitly and should point at the mounted /var/lib/animus
+# volume.
 
 # syntax=docker/dockerfile:1
 
@@ -27,10 +35,13 @@ ARG BASE_REGISTRY=docker.io/library
 FROM ${BASE_REGISTRY}/rust:1.96 AS builder
 WORKDIR /build
 
-# Cargo.lock is deliberately gitignored in this workspace (see repo
-# .gitignore), so only the manifest is copied ahead of the source — `cargo
-# build` mints its own lock file from the registry cache mount below.
-COPY Cargo.toml ./
+# Cargo.lock is committed (S-07a, 2026-09-02 — see docs/adr/0060-kubernetes-
+# operator.md's Part 2 amendment) so every image build resolves the exact
+# dependency set CI tested, not whatever `cargo build` happens to pick up
+# fresh from the registry that day. `--locked` below makes that authoritative:
+# the build fails loudly instead of silently re-resolving if the manifest and
+# lock ever drift apart.
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # BuildKit cache mounts persist the cargo registry/git checkouts and the
@@ -48,6 +59,9 @@ COPY crates ./crates
 # real CI, a developer's own machine) it mounts nothing, the `-f` test
 # short-circuits, and cargo uses the image's normal trust store; the cert
 # is never baked into a layer either way.
+# Built once, all three binaries in one pass — a single cache-mounted
+# compile that both runtime stages below draw `COPY --from=builder` from,
+# rather than a separate build per image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
@@ -56,11 +70,51 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       if [ -s /tmp/ccrca.crt ]; then \
         export SSL_CERT_FILE=/tmp/ccrca.crt CARGO_HTTP_CAINFO=/tmp/ccrca.crt; \
       fi; \
-      cargo build --release -p animusd -p animus-cli \
+      cargo build --release --locked -p animusd -p animus-cli -p animus-operator \
     ' \
     && cp target/release/animusd /build/animusd \
-    && cp target/release/animus /build/animus
+    && cp target/release/animus /build/animus \
+    && cp target/release/animus-operator /build/animus-operator
 
+# --- animus-operator image (docker build --target runtime-operator .) ---
+#
+# Placed BEFORE the default `runtime` stage below deliberately: with no
+# `--target`, `docker build .` builds whichever stage is declared LAST in
+# the file, and that default has to stay `animusd` (every existing caller —
+# `scripts/e2e-kind.sh`, this file's own header comment, a developer running
+# a bare `docker build .`) — so `runtime-operator` cannot be the final
+# `FROM` even though it is the newer of the two.
+#
+# The `animus-operator` controller (crates/animus-operator, ADR 0060 Part
+# 3): a `kube-rs` controller that runs as a single `Deployment` replica
+# in-cluster (deploy/operator/deployment.yaml), never as a StatefulSet
+# workload with a data volume of its own — it only talks to the Kubernetes
+# API server and, for scale-down drains, to an `animusd` pod's admin port.
+FROM ${BASE_REGISTRY}/debian:bookworm-slim AS runtime-operator
+
+LABEL org.opencontainers.image.source="https://github.com/animus-db/animus-db" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.title="animus-operator" \
+      org.opencontainers.image.description="AnimusDB Kubernetes operator (AnimusCluster controller)"
+
+# ca-certificates is required here (unlike the animusd runtime stage below):
+# `animus-operator` talks to the Kubernetes API server over TLS via `kube`'s
+# rustls-platform-verifier stack, which needs a real trust store to verify
+# that connection.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 animus-operator \
+    && useradd --system --uid 1000 --gid animus-operator --shell /usr/sbin/nologin animus-operator
+
+COPY --from=builder /build/animus-operator /usr/local/bin/animus-operator
+
+USER animus-operator:animus-operator
+
+ENTRYPOINT ["animus-operator"]
+CMD ["run"]
+
+# --- animusd image (default target — docker build . with no --target) ---
 FROM ${BASE_REGISTRY}/debian:bookworm-slim AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/animus-db/animus-db" \

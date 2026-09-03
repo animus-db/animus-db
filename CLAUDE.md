@@ -405,8 +405,13 @@ truth; this map is just for navigation.
   for what it does and does not prove, including a sandbox environment that
   cannot run it at all (no `CAP_SYS_RESOURCE`, which `kind`'s own
   control-plane bootstrap needs independent of anything here). The
-  operator's own container image is not yet published — it runs
-  out-of-cluster (or from a locally built image) until that lands.
+  operator's own container image is published as `ghcr.io/animus-db/
+  animus-operator` (the root `Dockerfile`'s `runtime-operator` stage,
+  `.github/workflows/image.yml`'s `animus-operator` matrix entry, S-07a,
+  2026-09-02) alongside `animusd`, and `deploy/operator/deployment.yaml`
+  references it — running the controller out-of-cluster (`cargo run -p
+  animus-operator -- run`) remains supported for local iteration and is
+  what the e2e smoke still does.
 
 ## Conventions
 
