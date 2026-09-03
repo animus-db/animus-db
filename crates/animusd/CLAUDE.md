@@ -1509,6 +1509,31 @@ plus the frozen split parent's retryable refusal (`frozen_refusal` +
 pre-propose key∈declared-range guard survives in the kind-write path purely
 as a routing-bug tripwire (immutable range, no lock).
 
+**A routed operation's error policy must be identical on `CpRoute::Local`
+and `CpRoute::Forward` (issue #572).** `force_seal_tablet`/
+`force_pitr_seal_tablet` (`schema.rs`) resolve the tablet leader, then split
+on whether that leader is this node (`Local`) or another one (`Forward`);
+the `Forward` arm has always retried a transient `ClientResponse::Error`
+inside its own `loop { .. deadline .. }` (`SCHEMA_COMMIT_TIMEOUT`/
+`SCHEMA_POLL_INTERVAL`). The `Local` arm used to call
+`index_drain::seal_now`/`pitr_seal_now` once and return the first `Err`
+verbatim — but that call has a documented dueling-seal race against the
+periodic `seal_tick`/`pitr_tick` arm (same tick, `INDEX_DRAIN_INTERVAL`):
+when the periodic arm commits the same `(tablet, next_epoch)` slot first
+with a shorter range, the call returns a transient `"; retry"`-suffixed
+error (`index_drain::is_retryable_elsewhere`, made `pub(crate)` for exactly
+this reuse), not a permanent one. Both `Local` arms now retry that same
+error class inside their own `loop`, using the identical classifier the
+periodic-arm-retry code elsewhere already relies on, so a request that used
+to succeed or 500 depending on nothing but whether it happened to land on
+the tablet leader's own node now behaves the same either way. When adding
+or touching *any* `ClientCtx` method with a `Local`/`Forward` split, check
+that a transient failure gets the same retry treatment on both arms —
+"passes only when forwarded" is the same bimodal-per-process-flake family
+as the missed-forwarding-allowlist lesson (see CLAUDE.md's "When adding a
+variant to a replicated/forwarded command enum" note and
+`docs/engineering-lessons.md`).
+
 ## Multi-participant transactions (ADR 0018 §2)
 
 `ClientCtx::cp_txn(writes, preconditions, write_conditions) ->

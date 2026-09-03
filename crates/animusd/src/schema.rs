@@ -867,6 +867,20 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// converges when this node hosts no replica of `tablet` (see the
     /// helper's doc); the outer loop here still re-resolves between chases
     /// as its converged-or-timeout backstop.
+    ///
+    /// **The `CpRoute::Local` branch retries too (issue #572).**
+    /// [`index_drain::seal_now`]'s own commit-wait has a documented
+    /// dueling-seal race against the periodic `seal_tick` arm (every
+    /// `INDEX_DRAIN_INTERVAL`): when the periodic arm commits the same
+    /// `(tablet, next_epoch)` slot first with a shorter range, `seal_now`
+    /// returns its `"; retry"`-suffixed transient error
+    /// ([`index_drain::is_retryable_elsewhere`]) rather than a permanent
+    /// one. The `Forward` branch below already retries that shape until
+    /// `deadline`; this branch must give the identical error policy —
+    /// otherwise the exact same disable request succeeds or fails 500
+    /// depending only on whether it happened to land on the tablet
+    /// leader's own node, a bimodal per-process flake (see
+    /// `docs/engineering-lessons.md`).
     pub(crate) async fn force_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
         let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
@@ -880,9 +894,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     let Some(table) = table else {
                         return Err("no such tablet".into());
                     };
-                    return index_drain::seal_now(self, &table, tablet, &leader)
-                        .await
-                        .map(|_| ());
+                    match index_drain::seal_now(self, &table, tablet, &leader).await {
+                        Ok(_) => return Ok(()),
+                        Err(e)
+                            if self.env.now() >= deadline
+                                || !index_drain::is_retryable_elsewhere(&e) =>
+                        {
+                            return Err(e);
+                        }
+                        Err(_) => {} // dueling seal vs. the periodic arm; retry below
+                    }
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::ForceSeal { tablet: tablet.0 };
@@ -914,7 +935,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// Force one PITR seal pass of `tablet`'s own hot tail (ADR 0059 §9,
     /// Train 3's disable-triggered final seal) — the PITR twin of
     /// [`force_seal_tablet`](Self::force_seal_tablet), identical shape and
-    /// identical forwarding discipline.
+    /// identical forwarding discipline, **including its `CpRoute::Local`
+    /// retry-on-dueling-seal fix (issue #572)** — see that function's own
+    /// doc for the race and why both routes must share one error policy.
     pub(crate) async fn force_pitr_seal_tablet(&self, tablet: TabletId) -> Result<(), String> {
         let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
@@ -928,9 +951,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     let Some(table) = table else {
                         return Err("no such tablet".into());
                     };
-                    return index_drain::pitr_seal_now(self, &table, tablet, &leader)
-                        .await
-                        .map(|_| ());
+                    match index_drain::pitr_seal_now(self, &table, tablet, &leader).await {
+                        Ok(_) => return Ok(()),
+                        Err(e)
+                            if self.env.now() >= deadline
+                                || !index_drain::is_retryable_elsewhere(&e) =>
+                        {
+                            return Err(e);
+                        }
+                        Err(_) => {} // dueling seal vs. the periodic arm; retry below
+                    }
                 }
                 Some(CpRoute::Forward(addr)) => {
                     let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };

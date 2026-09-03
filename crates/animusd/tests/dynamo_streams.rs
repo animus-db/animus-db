@@ -13,6 +13,8 @@
 //! external `tests/` crate cannot reach; see that module's own doc.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use animus_control::Metadata;
@@ -1384,4 +1386,166 @@ async fn pre_enable_marker_records_never_surface_on_the_stream() {
         events[0]["dynamodb"]["Keys"]["id"]["S"], "real",
         "the delivered event must be the post-enable write: {events:?}"
     );
+}
+
+/// One `PutItem` with a `pad_len`-byte `val` attribute, over a fresh
+/// connection — the same padded-write shape `tests/dynamo_pitr.rs` uses to
+/// force the periodic seal arm past `seal_bytes` quickly.
+async fn put_item_padded(addr: SocketAddr, table: &str, id: &str, pad_len: usize) {
+    let pad = "x".repeat(pad_len);
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        &format!(
+            r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"val":{{"S":"{pad}"}}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "PutItem({id}) failed: {body}");
+}
+
+/// Issue #572 regression, the stream twin of `dynamo_pitr.rs`'s
+/// `disable_survives_concurrent_periodic_seal_on_local_route`: the
+/// disable-triggered final seal (`ClientCtx::force_seal_tablet`, F12-b) must
+/// retry a dueling-seal race against the periodic size-triggered arm
+/// (`seal_tick`, `INDEX_DRAIN_INTERVAL` = 200ms) on the `CpRoute::Local`
+/// route exactly as it already does on `CpRoute::Forward` — not surface the
+/// transient "lost to a concurrent seal ...; retry" error as a hard 500.
+///
+/// A single-node cluster is deliberate: with one node, the tablet leader is
+/// always *this* node, so `resolve_cp_route` can only ever return
+/// `CpRoute::Local` — every `UpdateTable` disable in this test exercises
+/// exactly the route the bug lives on. A small `seal_bytes` keeps the
+/// periodic arm sealing on nearly every tick; several concurrent `PutItem`
+/// writers keep running *through* each disable call (not just before it) so
+/// a periodic seal can commit mid-flight while the disable's own force-seal
+/// is still computing/proposing its own. One attempt reproduces only
+/// sporadically (the original report: 1 in 15), so this loops many
+/// enable/write/disable cycles, each a fresh chance at the same race, and
+/// asserts every single disable succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn disable_survives_concurrent_periodic_seal_on_local_route() {
+    let racy_knobs = StreamSealKnobs {
+        seal_bytes: 48,
+        seal_age: Duration::from_secs(3600),
+    };
+    let disable = async {
+        let dir = support::panic_safe_tempdir();
+        let nodes = start_streamed_cluster(1, dir.path(), racy_knobs).await;
+        await_bootstrap(&nodes).await;
+        let addr = nodes[0].dynamo_addr();
+        let table = "t";
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"t",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "StreamSpecification":{"StreamEnabled":true,
+                    "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        const CYCLES: u32 = 40;
+        const WRITERS: u32 = 8;
+        for cycle in 0..CYCLES {
+            if cycle > 0 {
+                let (status, body) = dynamo(
+                    addr,
+                    "DynamoDB_20120810.UpdateTable",
+                    r#"{"TableName":"t","StreamSpecification":
+                        {"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+                )
+                .await;
+                assert_eq!(status, 200, "re-enable (cycle {cycle}) failed: {body}");
+            }
+
+            // Several writers hammer PutItem concurrently, kept running
+            // through the disable call below (stopped only afterward) so
+            // the periodic arm's own seal attempt can race the disable's.
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut writers = Vec::with_capacity(WRITERS as usize);
+            for w in 0..WRITERS {
+                let table = table.to_string();
+                let stop = Arc::clone(&stop);
+                writers.push(tokio::spawn(async move {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        put_item_padded(addr, &table, &format!("c{cycle}-w{w}-{i}"), 24).await;
+                        i += 1;
+                    }
+                }));
+            }
+            // Give the periodic arm at least one full tick's worth of
+            // pending bytes to seal before racing the disable call.
+            sleep(Duration::from_millis(120)).await;
+
+            let (status, body) = dynamo(
+                addr,
+                "DynamoDB_20120810.UpdateTable",
+                r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#,
+            )
+            .await;
+
+            stop.store(true, Ordering::Relaxed);
+            for w in writers {
+                let _ = w.await;
+            }
+
+            assert_eq!(
+                status, 200,
+                "UpdateTable(disable) failed on cycle {cycle} — issue #572's dueling-seal \
+                 race on the CpRoute::Local route: {body}"
+            );
+        }
+
+        // One more clean (non-racing) round proves the fix doesn't
+        // silently drop coverage across the stress loop above: every write
+        // in this fresh label is fully accounted for by that label's own
+        // sealed shards before the final disable.
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.UpdateTable",
+            r#"{"TableName":"t","StreamSpecification":
+                {"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "final re-enable failed: {body}");
+        let label = field(&body, "LatestStreamLabel");
+        await_stream_label_everywhere(&nodes, table, &label).await;
+        const FINAL_WRITES: u64 = 12;
+        for i in 0..FINAL_WRITES {
+            put_item_padded(addr, table, &format!("final-{i}"), 40).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let sealed: u64 = nodes[0]
+                .metadata()
+                .stream_shards
+                .values()
+                .filter(|r| r.table == table && r.label == label)
+                .map(|r| r.count)
+                .sum();
+            if sealed >= FINAL_WRITES {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "this label's stream shards never covered every final write"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.UpdateTable",
+            r#"{"TableName":"t","StreamSpecification":{"StreamEnabled":false}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "final disable failed: {body}");
+    };
+    timeout(Duration::from_secs(90), disable)
+        .await
+        .expect("did not converge in time");
 }
