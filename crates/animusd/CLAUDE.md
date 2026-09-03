@@ -1534,6 +1534,23 @@ as the missed-forwarding-allowlist lesson (see CLAUDE.md's "When adding a
 variant to a replicated/forwarded command enum" note and
 `docs/engineering-lessons.md`).
 
+**The same error family shows up a third time, in a route that is neither
+`Local` nor `Forward` (issue #580).** `inplace_split_driver_tick`'s own two
+final-seal exhaustion loops (`while seal_now(..)?.is_some() {}` and the
+`pitr_seal_now` twin, immediately inside `change_consumer_loop`'s
+`Splitting` arm) call the identical `seal_now`/`pitr_seal_now` primitives
+above and are exposed to the identical dueling-seal race against the
+periodic `seal_tick`/`pitr_tick` arm — but used `?` to propagate *any*
+`Err`, transient included, aborting the whole tick (every downstream veto
+and the `CutoverSplit` propose) rather than just retrying the loop. Fixed
+the same way as #572: `continue` on `index_drain::is_retryable_elsewhere`,
+propagate everything else. The lesson generalizes past "Local vs. Forward"
+— any two call sites that can independently invoke the same racy primitive
+must classify its errors identically, however different their own control
+flow looks; grep for other `seal_now`/`pitr_seal_now` (or any primitive
+documented as having a dueling-write race) call sites before adding a new
+one, not just the two `ClientCtx::force_*` methods this was first found in.
+
 ## Multi-participant transactions (ADR 0018 §2)
 
 `ClientCtx::cp_txn(writes, preconditions, write_conditions) ->

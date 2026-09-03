@@ -392,7 +392,29 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                 // arms are production-dead pending Layer B2's deletion, so
                 // no live parent can lack `Tablet::inplace_split` here).
                 if let Err(e) = inplace_split_driver_tick(&ctx, &meta, tablet, &group).await {
-                    tracing::debug!(tablet = tablet.0, error = %e, "inplace split: tick failed");
+                    // `warn!`, not `debug!` (issue #580): this arm covers
+                    // the split endgame's own `seal_now`/`pitr_seal_now`
+                    // exhaustion loops and the `CutoverSplit` propose
+                    // itself, and this crate's own tests/CI run with no
+                    // tracing subscriber wired up at all — a `debug!` here
+                    // is invisible at *every* level in that harness, and
+                    // even where a subscriber IS attached (the real
+                    // `animusd` binary's own `otel::init_tracing`, whose
+                    // `RUST_LOG`-less fallback is `"info"`) `debug!` still
+                    // wouldn't clear the bar. A losing dueling-seal retry
+                    // is otherwise silently retried on the next 200ms tick
+                    // with nothing to show for it in a run's logs, which is
+                    // exactly what left this arm's own failure mode
+                    // (`CutoverSplit` proposed against a tablet with zero
+                    // sealed shards) invisible until a fixed-deadline test
+                    // poll timed out with no clue why.
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        epoch = tablet_row.map(|t| t.epoch.0),
+                        state = ?tablet_row.map(|t| t.state),
+                        error = %e,
+                        "inplace split: tick failed"
+                    );
                 }
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the

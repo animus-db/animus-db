@@ -1101,6 +1101,21 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let label = field(&body, "LatestStreamLabel");
     let stream_arn = format!("arn:aws:dynamodb:animus:0:table/events/stream/{label}");
 
+    // The table's very first tablet — captured before any write, while
+    // `tablets_for` can only ever return the one root — is the ONE tablet
+    // in whatever lineage this run produces that is guaranteed to have
+    // accumulated real pending change-log bytes before it ever seals: it is
+    // the tablet the size trigger fires against (see issue #580). A child
+    // (or, under a cascade, a grandchild) minted purely by the in-place
+    // fork inherits data but not pending change-log records, and can
+    // legitimately reach its OWN `CutoverSplit` with nothing to seal
+    // (`seal_now`'s "never seal an empty segment" rule, ADR 0043 §A3) —
+    // so it, or an intermediate tablet picked out of `split_lineage` by the
+    // loop below, is not a safe thing to assert "sealed at least once"
+    // against. Assert that property on `root`, never on whatever the
+    // lineage walk below happens to land on.
+    let root = tablets_for(&nodes[0].metadata(), "events")[0];
+
     // A round-robin of "which node issues this request" — the every-node
     // sweep. `filler` pads each item well past the byte threshold quickly.
     let filler = "x".repeat(256);
@@ -1175,13 +1190,22 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     // exactly the same way as a closed one). Depending on where the split
     // key landed, the child can legitimately have received little or no
     // traffic yet — asserting it must have sealed would be over-strict.
+    //
+    // Asserted against `root`, NOT `parent` (issue #580): `parent` above is
+    // whichever immediate parent the lineage walk happened to land on, and
+    // under a cascade that can legitimately be a tablet that itself never
+    // had a pending change-log record to seal before it re-split (see
+    // `root`'s own doc comment above). `root` is the one tablet in the
+    // whole run guaranteed to have taken real writes before ever splitting,
+    // so its own `stream_shards` entry is not timing-dependent on how many
+    // generations the split cascaded through.
     await_true(
         20,
-        "the parent tablet never sealed at least one shard",
+        "the root tablet never sealed at least one shard",
         || {
             let meta = nodes[0].metadata();
             meta.stream_shards
-                .range((parent, 0)..=(parent, u64::MAX))
+                .range((root, 0)..=(root, u64::MAX))
                 .next()
                 .is_some()
         },
