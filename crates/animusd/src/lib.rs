@@ -6322,7 +6322,9 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
     /// Ring buffer of periodic `metrics_json()` snapshots, filled by
-    /// [`metrics_sample_loop`] — backs `/admin/metrics/history`'s sparklines.
+    /// [`metrics_sample_loop`] — intended to back dashboard sparklines
+    /// (not yet rendered — see docs/roadmap.md U-01) via
+    /// `/admin/metrics/history`.
     /// A plain `std::sync::Mutex` is fine: every access is a quick lock/mutate/
     /// drop with no `.await` held across it.
     metrics_history: Arc<Mutex<VecDeque<MetricsSample>>>,
@@ -6568,8 +6570,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
-    /// for the admin `/admin/metrics/history` view (ADR 0020) backing the
-    /// dashboard's sparklines. Cloned out from under the lock so the caller
+    /// for the admin `/admin/metrics/history` view (ADR 0020), intended to
+    /// back dashboard sparklines (not yet rendered — see docs/roadmap.md
+    /// U-01). Cloned out from under the lock so the caller
     /// never holds it across serialization.
     pub(crate) fn metrics_history(&self) -> Vec<MetricsSample> {
         self.metrics_history
@@ -8278,7 +8281,8 @@ pub(crate) struct MetricsSample {
 
 /// Appends a [`MetricsSample`] to `ctx`'s ring buffer every
 /// [`METRICS_SAMPLE_INTERVAL`], capped at [`METRICS_HISTORY_CAP`] entries —
-/// backing the dashboard's metrics-history sparklines (`/admin/metrics/history`).
+/// intended to back dashboard sparklines (not yet rendered — see
+/// docs/roadmap.md U-01) via `/admin/metrics/history`.
 /// Real wall-clock sleep/timestamp: `animusd` is outside the `Env` determinism
 /// boundary (ADR 0003 only binds sim-tested core crates), so this is exactly
 /// as legitimate as the other `tokio::time`-driven loops in this file.

@@ -15310,3 +15310,148 @@ re-implemented — by the `Local` arm) rather than leaving it implicit in
 transient failure of the underlying primitive get the same treatment on
 both arms? If not, that's not a stylistic inconsistency, it's a
 correctness gap a client can observe as a coin-flip 500.
+
+## An ADR's own "Update"/"Amendment" note closing a gap doesn't retroactively fix every other place that gap is cited — the fix has to be applied at each citation site independently (D-01 stale-prose sweep, 2026-09-02)
+
+Auditing `docs/roadmap.md`'s section 0 against the code (per-row, always
+re-verify by grepping before touching prose — never trust the roadmap's own
+characterization of "reality," it's exactly the kind of secondhand claim
+that can itself drift) surfaced the same shape of bug twice: ADR 0045's
+"phantom no-image records" limitation was already marked fixed by a
+dated "Update" note earlier in the *same file* (its own §"Named
+follow-ups" section, ~70 lines above), but the ADR's **Consequences**
+section still listed it as an accepted, permanent limitation — nobody had
+gone back to the second citation once the first was updated. Likewise ADR
+0042's Context section still described the multi-consumer trim policy as
+"deferred" long after §8/§9 built it and §16's follow-up list stopped
+carrying it. **The general lesson**: when a design note documents a gap in
+more than one place (a Context/motivation section *and* a Consequences/
+follow-ups section is the classic split — one frames the problem, the
+other tracks its resolution), closing the gap only in the tracking section
+leaves the framing section stale, and a reader who lands on the framing
+section first has no signal to look further. Grep the whole document (or
+the whole file, for a claim that might be restated in prose elsewhere) for
+every citation of a gap before declaring it closed, not just the section
+whose job is to track resolutions — and when only one citation site can be
+fixed in scope, leave a one-line pointer at the other rather than silence.
+A second, smaller instance of the same root cause: `docs/roadmap.md`
+itself carried a "backs the dashboard's sparklines" doc-comment claim
+copied across four separate call sites in two files
+(`animusd::lib.rs` ×3, `admin.rs` ×1) — one grep for the exact phrase
+found all four, but a narrower grep scoped to just the file named in the
+bug report would have missed three of them silently.
+
+## A prior "delete it" recommendation can conflate two different costs that share a symptom — measure the specific one before trusting it (roadmap C-05, `SharedWal`)
+
+`animus-control::shared_wal.rs` (ADR 0028) is a built-and-unit-tested,
+never-wired multi-tenant WAL I/O coordinator, and `docs/roadmap.md`'s C-05
+carried a "delete" recommendation resting on ADR 0048's quiescence
+finding — "the apply-poll term dominated" the per-group idle cost. Read
+at face value that sounds like it settles the WAL question too: if
+per-group overhead isn't the bottleneck, why would coalescing per-group
+WAL files be? But ADR 0048's finding was about **idle** cost (heartbeat
+ticking, the apply task's own idle poll) for a group with nothing to do —
+a cost quiescence genuinely closes, no fsync involved at all until a
+group wakes. `SharedWal`'s whole reason to exist is a completely
+different cost: **active-write** fsync count when *multiple groups have
+something to persist at the same moment*. Quiescence doesn't touch that
+case — a quiesced group isn't fsyncing regardless, and an active one
+fsyncs exactly as often whether or not its idle siblings are ticking.
+
+A cheap, exact `SimEnv` measurement (single-voter tablet groups so the
+count isolates WAL persistence from network/quorum effects — see the
+task write-up for the harness shape, not committed) settled it directly:
+a burst across `K` concurrently-active groups on one node costs `K`
+separate `fsync`s (`K=1` → 1 sync, `K=32` → 32 syncs, zero cross-group
+coalescing), while a burst to the *same* group already coalesces for
+free (32 writes to one group before its persist round runs → 1 sync —
+the existing `persist_round.rs` group-commit batching working exactly as
+designed, just scoped to one group). The amplification is real, it is
+specifically cross-group under concurrent load, and quiescence's own
+finding says nothing about it either way — `persist_round.rs`'s own
+module doc already named the live version of this (a split multiplying
+"the concurrently `fsync`ing groups") as the actual root cause behind a
+real production livelock (issue #279), which should have been the
+first place to check before trusting the idle-cost finding as a proxy.
+
+**The general lesson**: when a prior recommendation to delete unwired
+infrastructure cites evidence from a *related* optimization, check
+whether that evidence is about the *same* cost the infrastructure
+addresses, or merely a *neighboring* one that happens to share a
+symptom (here: "per-group overhead on a busy tablet fleet"). Idle-time
+cost and active-load cost are different failure modes with different
+fixes even when they show up in the same subsystem; a fix for one is not
+evidence against the other, and the cheap way to tell them apart is
+usually a small, targeted, throwaway measurement rather than trusting
+the adjacent finding's prose to generalize. See `docs/roadmap.md`'s C-05
+entry (2026-09-02) for the numbers and the resulting "keep, defer wiring"
+decision.
+
+## A workflow can list a gitignored file as a trigger path for years without anyone noticing the file never exists in CI (`Cargo.lock`, S-07a, 2026-09-02)
+
+`.github/workflows/image.yml` listed `Cargo.lock` in both its `push` and
+`pull_request` `paths:` filters since the image workflow was written
+(ADR 0060 Part 2), while `.gitignore:3` gitignored that same file the
+entire time. Neither side was wrong in isolation — a `paths:` filter on a
+file that happens not to exist just never fires on that file — but the
+combination meant the trigger path was silent dead weight and, more
+importantly, that every image build (CI and any real deployment) resolved
+its own dependency versions fresh from the registry at build time with no
+committed, reviewed lockfile pinning them: a supply-chain gap that sat
+undetected because nothing about it *fails* — a missing lock doesn't error,
+it just silently makes every build a little less reproducible than it
+looks. Caught only by an explicit audit (`docs/roadmap.md`'s S-07a) cross-
+referencing `.gitignore` against every workflow's `paths:` list, not by any
+test or gate. **The general lesson**: a `paths:` filter (or any config that
+*names* a file) is not evidence the file is tracked — grep `.gitignore`
+for anything a workflow, Dockerfile `COPY`, or path filter names, especially
+for lockfiles (`Cargo.lock`, `package-lock.json`, `poetry.lock`, ...) where
+"gitignored" is a very easy default to reach for early in a project and a
+very easy thing to forget to revisit once the project ships reproducible
+builds as a goal.
+
+**A second, smaller lesson from the same change**: `cargo deny check` does
+not accept `--locked` (confirmed via `cargo deny check --help`, which lists
+no such flag) — it always resolves against whatever `Cargo.lock` is present
+on disk (or fails outright if none exists and none can be generated), so
+committing the lock is what makes its output reproducible, not a flag on
+its own invocation. Don't assume every `cargo <subcommand>`-shaped CLI
+tool shares `cargo build`/`cargo test`'s flag surface; check `--help` on
+the actual tool before adding a flag to a wrapped invocation.
+
+**A third lesson, on multi-image Dockerfiles**: adding a second published
+image (`animus-operator`, alongside the existing `animusd` image) did not
+need a second Dockerfile — the existing root `Dockerfile` was already a
+multi-stage build of the whole workspace with one shared `builder` stage,
+so the natural extension was one more `FROM ... AS <name>` runtime stage
+drawing from the same builder (`COPY --from=builder`) and a second
+`docker build --target <name>` invocation, matrixed in CI
+(`docker/build-push-action`'s `target:` input) with a distinct GHA cache
+`scope` per target so the two parallel matrix jobs don't race writing the
+same cache key. A `crates/<crate>/Dockerfile` per binary is the right call
+only when the binaries genuinely don't share a build (different toolchain,
+different base image, unrelated dependency graphs) — here they're two
+binaries from the same `cargo build` invocation, so one Dockerfile with one
+shared compile stage is strictly less duplication than two.
+
+**A near-miss caught only by re-reading the finished file, not by any
+gate**: the first draft appended the new `runtime-operator` stage *after*
+the pre-existing `runtime` stage, textually at the bottom of the file where
+a new addition naturally goes. That silently changes `docker build .`'s
+behavior with no `--target` flag — Docker builds whichever stage is
+declared **last** in the file, not the first, and not the one historically
+treated as "the" image. Every caller that matrices explicitly
+(`.github/workflows/image.yml`'s new `target:` input) was fine either way,
+but `scripts/e2e-kind.sh` and the Dockerfile's own header-comment example
+both call `docker build -t animusd:e2e .` with no `--target`, and would
+have silently started building and tagging the *operator* binary as
+`animusd:e2e` — a wrong-binary bug with no error message anywhere, only a
+container that fails at `docker run` in a completely unrelated way (or,
+worse, "succeeds" by running the wrong thing). Nothing in `cargo fmt`/
+`clippy`/`cargo test` can catch this class of bug — it lives entirely in
+Dockerfile stage order, which no gate parses. **The general lesson**: when
+adding a new stage to a multi-stage Dockerfile that already has an implicit
+default consumer (anything that builds it with no `--target`), the new
+stage goes *before* the existing default in file order, never after —
+check `grep -n '^FROM' Dockerfile` after any such edit and confirm the last
+line is still the stage every no-`--target` caller expects.

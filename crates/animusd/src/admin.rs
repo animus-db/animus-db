@@ -1403,8 +1403,9 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
     json!({ "counters": counters, "is_leader": is_leader, "stream_change_rates": stream_change_rates })
 }
 
-/// This node's metrics-history ring buffer (ADR 0020), backing the
-/// dashboard's sparklines — a real live snapshot each `/admin/metrics` sample,
+/// This node's metrics-history ring buffer (ADR 0020), intended to back
+/// dashboard sparklines (not yet rendered — see docs/roadmap.md U-01) —
+/// a real live snapshot each `/admin/metrics` sample,
 /// not a cluster-wide aggregate (the same "per-node sink" caveat `/admin/
 /// metrics` itself carries).
 fn metrics_history_view(ctx: &ClientCtx) -> Value {

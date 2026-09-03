@@ -57,9 +57,12 @@ e2e section for what it does and does not prove.
   (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`) carries. There is
   nothing else to clean up (no external backup store, no DNS record) so
   this is a deliberate v1 scope cut, not a known gap.
-- **The operator's own container image is not yet built/published** —
-  `deployment.yaml` references `ghcr.io/animus-db/animus-operator:latest`
-  as a placeholder; building and publishing that image is a follow-up.
+- ~~The operator's own container image is not yet built/published~~ —
+  closed 2026-09-02 (S-07a). The root `Dockerfile`'s `runtime-operator`
+  stage builds it, and `.github/workflows/image.yml`'s `animus-operator`
+  matrix entry publishes `ghcr.io/animus-db/animus-operator` on the same
+  tag/push rules as `animusd` — `deployment.yaml`'s image reference is real,
+  not a placeholder.
 - **`spec.autoSplitBytes` is accepted but not yet wired to a flag** —
   `animusd`'s `--config FILE --node I`/`animusd data --config FILE --node I`
   invocations (what every pod in this deployment shape runs) don't accept
