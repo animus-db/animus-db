@@ -22,9 +22,10 @@
 //!    tell a lie from a genuine sync ahead of time. This layer's job is to fail
 //!    **loudly** on reopen (an ordinary `Err`, detected and reported) rather
 //!    than silently serving an engine short a table's data — the property this
-//!    scenario pins. Recovering the *replica* is a layer up: issue #554
-//!    proposes the host reconciler treat an unopenable engine as lost and
-//!    rebuild it fresh from the group, not yet built — see `open`'s own doc and
+//!    scenario pins. Recovering the *replica* is a layer up and is built:
+//!    issue #554's `animus-cp-data` host reconciler
+//!    (`Reconciler::ensure_engine`) treats an unopenable engine as lost and
+//!    rebuilds it fresh from the group — see `open`'s own doc and
 //!    `docs/engineering-lessons.md`.
 //!
 //! **Corpus shape** (ADR 0061 rung B1, house corpus doctrine): follows the
@@ -244,13 +245,15 @@ fn scenario_crash_mid_compaction_keeps_old_tables(seed: u64) {
 ///    `open` still fails **loudly** on reopen — an ordinary `Err`, never a
 ///    panic escaping this crate or a silent, incomplete-but-successful open.
 ///    That's this layer's whole job here: recovering the *replica* belongs
-///    one layer up, in `animus-cp-data`'s host reconciler — issue #554
-///    proposes treating an unopenable engine as lost and rebuilding it fresh
-///    from the group (Raft catch-up), the same recovery the corpus's
-///    `MemoryEngine` tier already gets on every restart; not yet built. A
-///    future change that makes `open` swallow this and continue anyway
-///    (serving missing/stale data) would be a correctness regression, not a
-///    fix — this test exists to catch that.
+///    one layer up, in `animus-cp-data`'s host reconciler, and is built —
+///    issue #554's `Reconciler::ensure_engine` treats an unopenable engine
+///    as lost and rebuilds it fresh from the group (Raft catch-up,
+///    including the needs-snapshot mechanism for a replica whose log had
+///    already compacted past what the fresh engine holds), the same
+///    recovery the corpus's `MemoryEngine` tier already gets on every
+///    restart. A future change that makes `open` swallow this and continue
+///    anyway (serving missing/stale data) would be a correctness
+///    regression, not a fix — this test exists to catch that.
 fn scenario_fsync_lie_flush_survives_as_a_clean_open_error(seed: u64) {
     let sim = Simulator::new(seed);
     {

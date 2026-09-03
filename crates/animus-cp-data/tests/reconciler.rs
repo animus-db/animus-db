@@ -15,13 +15,13 @@
 //! actually stop) — such a call must be spawned and driven via `run_for`,
 //! never bare `block_on`'d, or it hangs forever with no panic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_cp_data::host::{EngineFactory, MemoryTabletEngines, MetadataView, Reconciler};
 use animus_cp_data::{RaftKvNode, StorageScope};
-use animus_env::{Clock, EnvExt, nid};
+use animus_env::{Clock, Env, EnvExt, Metric, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
@@ -417,6 +417,20 @@ impl EngineFactory<MemoryEngine> for FaultyTabletEngines {
 /// `LocalState::release_unconfirmed_host` on a factory failure, so `plan`
 /// genuinely retries every tick, and the tablet recovers the moment the
 /// factory starts succeeding again.
+///
+/// **Four injected failures, not two (issue #554).** Since `ensure_engine`
+/// now treats its own first `open` error as a lost engine and immediately
+/// destroys-and-retries once inline (`host.rs`'s own doc), a single
+/// `ensure_engine` call can burn up to *two* of `FaultyTabletEngines`'
+/// injected failures (the original attempt, then the destroy-and-reopen
+/// retry) before giving up for that tick. Four failures therefore still
+/// exhausts across exactly two ticks — mirroring the pre-#554 two-tick
+/// shape this test was written to prove — with the third tick's very first
+/// `open` (no more failures queued) succeeding on the FIRST attempt, not the
+/// retry, so this test's own tablet is never actually destroyed (`engines`
+/// never sees a corrupt/destroyed engine here; that path has its own
+/// dedicated regression, `a_corrupt_replica_engine_is_destroyed_and_
+/// rebuilt_from_the_group`, below).
 #[test]
 fn reconciler_recovers_a_tablet_after_a_transient_engine_open_failure() {
     let seed = 0x0FA0_77EC;
@@ -424,7 +438,7 @@ fn reconciler_recovers_a_tablet_after_a_transient_engine_open_failure() {
     let base_env = sim.env(nid(BASE));
 
     let engines = FaultyTabletEngines::new();
-    engines.fail_open_n_times(TabletId(1), 2);
+    engines.fail_open_n_times(TabletId(1), 4);
     let reconciler_engines = engines.clone();
 
     let done = Arc::new(Mutex::new(false));
@@ -451,20 +465,22 @@ fn reconciler_recovers_a_tablet_after_a_transient_engine_open_failure() {
         // A fresh, single-replica tablet placed on this node from tick one.
         let v = view([tablet(1, b"", None, vec![BASE])]);
 
-        // Tick 1: the factory's first injected failure — Host must be
-        // skipped, with no live handle established.
+        // Tick 1: `ensure_engine`'s own inline destroy-and-retry burns the
+        // first two injected failures (original attempt + retry, both
+        // fail) — Host must be skipped, with no live handle established.
         reconciler.tick(&v).await;
         *hf1.lock().unwrap() = Some(reconciler.hosted_node(TabletId(1)).is_some());
 
-        // Tick 2: the factory's second (last) injected failure — same
-        // outcome, and critically the claim must NOT be stranded: `plan`
-        // must still consider this tablet unhosted, or it would never be
-        // retried again.
+        // Tick 2: the last two injected failures — same outcome, and
+        // critically the claim must NOT be stranded: `plan` must still
+        // consider this tablet unhosted, or it would never be retried
+        // again.
         reconciler.tick(&v).await;
         *hf2.lock().unwrap() = Some(reconciler.hosted_node(TabletId(1)).is_some());
         *cf2.lock().unwrap() = Some(reconciler.local_state().hosted.contains(&TabletId(1)));
 
-        // Tick 3: the factory now succeeds — proving the claim really was
+        // Tick 3: no failures left — the factory's first attempt succeeds
+        // directly (no destroy involved) — proving the claim really was
         // released (not just stuck), `plan` re-emits `Host` and it lands.
         reconciler.tick(&v).await;
         task_env.sleep(Duration::from_secs(2)).await; // elect (single voter)
@@ -506,4 +522,268 @@ fn reconciler_recovers_a_tablet_after_a_transient_engine_open_failure() {
     // successful open) — a real recovery, not just a live handle with no
     // backing store.
     assert!(block_on(engines.probe(TabletId(1))));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #554: a hosted tablet's local engine, found lost/corrupt after a
+// (simulated) crash, is destroyed and rebuilt from the group rather than
+// warned-and-retried forever.
+// ---------------------------------------------------------------------------
+
+/// Models a real durable engine (`LsmEngine`) whose files exist but fail to
+/// open — `LsmEngine::open`'s loud `Backend("corrupt sstable index: ...")`
+/// contract (`animus-storage/CLAUDE.md`, issue #554/#558) — until
+/// `EngineFactory::destroy` wipes them, after which a fresh `open` succeeds.
+/// `corrupt` is settable independently of any prior `open`/`destroy` call, so
+/// a test can simulate "this replica's engine was fine, then a crash left it
+/// unreadable" without needing to actually touch bytes.
+#[derive(Clone, Default)]
+struct CorruptibleTabletEngines {
+    inner: MemoryTabletEngines,
+    corrupt: Arc<Mutex<BTreeSet<u64>>>,
+}
+
+impl CorruptibleTabletEngines {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every `open` for `tablet` on this node fails from now on, until a
+    /// `destroy` clears the mark.
+    fn corrupt(&self, tablet: TabletId) {
+        self.corrupt
+            .lock()
+            .expect("corrupt set poisoned")
+            .insert(tablet.0);
+    }
+}
+
+#[async_trait::async_trait]
+impl EngineFactory<MemoryEngine> for CorruptibleTabletEngines {
+    async fn open(&self, tablet: TabletId) -> Result<MemoryEngine, String> {
+        if self
+            .corrupt
+            .lock()
+            .expect("corrupt set poisoned")
+            .contains(&tablet.0)
+        {
+            return Err(format!(
+                "corrupt sstable index for tablet {} (simulated, issue #554)",
+                tablet.0
+            ));
+        }
+        self.inner.open(tablet).await
+    }
+
+    async fn probe(&self, tablet: TabletId) -> bool {
+        self.inner.probe(tablet).await
+    }
+
+    async fn destroy(&self, tablet: TabletId) {
+        self.corrupt
+            .lock()
+            .expect("corrupt set poisoned")
+            .remove(&tablet.0);
+        self.inner.destroy(tablet).await;
+    }
+
+    async fn clone_engine(
+        &self,
+        source: &MemoryEngine,
+        target: TabletId,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<MemoryEngine, String> {
+        self.inner.clone_engine(source, target, keep).await
+    }
+}
+
+/// Issue #554's own end-to-end regression: a **3-replica** group, real
+/// writes through the elected leader, then one follower's own local engine
+/// found corrupt after a simulated crash+reconciler-restart — proving the
+/// approved design (`host.rs`'s `ensure_engine` doc): destroy the corrupt
+/// engine, reopen fresh, and let Raft rebuild it from the group. Unlike
+/// `reconciler_recovers_a_tablet_after_a_transient_engine_open_failure`
+/// above (a never-before-hosted tablet, nothing at risk), this scenario
+/// starts the victim replica with **real prior data already caught up**, so
+/// a correct recovery must actually restore it, not merely re-host an empty
+/// group.
+#[test]
+fn a_corrupt_replica_engine_is_destroyed_and_rebuilt_from_the_group() {
+    let seed = 0x5541_7719; // "issue 554" mnemonic
+    let mut sim = Simulator::new(seed);
+
+    const A: u64 = 310;
+    const B: u64 = 311;
+    const C: u64 = 312;
+    let ids = [A, B, C];
+
+    let mut engines: BTreeMap<u64, CorruptibleTabletEngines> = BTreeMap::new();
+    for &id in &ids {
+        engines.insert(id, CorruptibleTabletEngines::new());
+    }
+
+    let driver_env = sim.env(nid(900));
+    let done = Arc::new(Mutex::new(false));
+    let done2 = Arc::clone(&done);
+    let engines_task = engines.clone();
+    let sim_in_task = sim.clone();
+    let sim_env_for = {
+        let sim = sim_in_task.clone();
+        move |id: u64| sim.env(nid(id))
+    };
+    let rebuilt_metric = Arc::new(Mutex::new(0u64));
+    let open_failed_metric = Arc::new(Mutex::new(0u64));
+    let rebuilt_metric2 = Arc::clone(&rebuilt_metric);
+    let open_failed_metric2 = Arc::clone(&open_failed_metric);
+
+    driver_env.clone().spawn_task(async move {
+        let mut reconcilers: BTreeMap<u64, Reconciler<SimEnv, MemoryEngine>> = BTreeMap::new();
+        for &id in &ids {
+            reconcilers.insert(
+                id,
+                Reconciler::new(
+                    sim_env_for(id),
+                    engines_task[&id].clone(),
+                    nid(id),
+                    |_t, _n| {},
+                    |_t| {},
+                ),
+            );
+        }
+
+        let v = view([tablet(1, b"", None, vec![A, B, C])]);
+        for &id in &ids {
+            reconcilers.get_mut(&id).unwrap().tick(&v).await;
+        }
+        let a_env = sim_env_for(A);
+        a_env.sleep(Duration::from_secs(2)).await; // elect
+
+        // Write real data through the group's actual leader.
+        let handles: BTreeMap<u64, KvNode> = ids
+            .iter()
+            .map(|&id| {
+                (
+                    id,
+                    reconcilers[&id].hosted_node(TabletId(1)).unwrap().clone(),
+                )
+            })
+            .collect();
+        let leader_id = *ids
+            .iter()
+            .find(|&&id| handles[&id].is_leader())
+            .expect("a leader exists");
+        const N: u64 = 90; // past COMPACT_THRESHOLD (64) — issue #554
+        for i in 0..N {
+            handles[&leader_id].put(
+                format!("k{i:02}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            );
+        }
+        a_env.sleep(Duration::from_secs(2)).await; // replicate + apply
+
+        // The victim is any non-leader replica.
+        let victim = *ids.iter().find(|&&id| id != leader_id).unwrap();
+
+        // Sanity: the victim is genuinely caught up BEFORE the corruption —
+        // otherwise "recovery restores real data" wouldn't be testing
+        // anything the transient-failure test above doesn't already cover.
+        assert_eq!(
+            handles[&victim].engine_applied_index(),
+            handles[&leader_id].engine_applied_index(),
+            "victim must be caught up before its engine is corrupted"
+        );
+        for i in 0..N {
+            assert_eq!(
+                handles[&victim]
+                    .local_get(format!("k{i:02}").as_bytes())
+                    .await,
+                Some(format!("v{i}").into_bytes()),
+                "victim must hold real data before its engine is corrupted"
+            );
+        }
+
+        // Simulate a crash: the process (and thus this node's in-memory
+        // reconciler + `RaftKvNode` driver/apply tasks) is gone; the WAL
+        // survives on disk (`Simulator::stop`'s contract), but this
+        // specific tablet's engine files are now unreadable.
+        sim_in_task.stop(nid(victim));
+        engines_task[&victim].corrupt(TabletId(1));
+        let victim_reconciler: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
+            sim_env_for(victim),
+            engines_task[&victim].clone(),
+            nid(victim),
+            |_t, _n| {},
+            |_t| {},
+        );
+        reconcilers.insert(victim, victim_reconciler);
+
+        // Tick the victim's fresh reconciler: `ensure_engine`'s first `open`
+        // fails (corrupt), destroys, reopens fresh, and hosts normally —
+        // Raft (the still-intact recovered WAL/log tail) then rebuilds it.
+        reconcilers.get_mut(&victim).unwrap().tick(&v).await;
+        *open_failed_metric2.lock().unwrap() = sim_env_for(victim)
+            .metrics()
+            .get(Metric::CpEngineOpenFailed);
+        *rebuilt_metric2.lock().unwrap() =
+            sim_env_for(victim).metrics().get(Metric::CpEngineRebuilt);
+
+        let recovered = reconcilers[&victim]
+            .hosted_node(TabletId(1))
+            .expect("the victim must be re-hosted after destroy-and-reopen")
+            .clone();
+
+        // Converged-or-timeout poll: the fresh engine must catch up to the
+        // group's own committed data (log replay, or — for whichever
+        // interleaving the leader's own compaction happened to reach — an
+        // `InstallSnapshot`).
+        let target = handles[&leader_id].engine_applied_index();
+        let mut caught_up = false;
+        for _ in 0..80 {
+            if recovered.engine_applied_index() >= target {
+                caught_up = true;
+                break;
+            }
+            a_env.sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            caught_up,
+            "the rebuilt engine never caught up to the leader's committed index"
+        );
+        for i in 0..N {
+            assert_eq!(
+                recovered.local_get(format!("k{i:02}").as_bytes()).await,
+                Some(format!("v{i}").into_bytes()),
+                "the rebuilt engine must hold every write that predates the corruption"
+            );
+        }
+
+        // Raft safety: still exactly one leader, and the victim's own
+        // recovered replica agrees with the leader on the current term (no
+        // split-brain artifact from the destroy-and-rebuild).
+        let leaders = ids.iter().filter(|&&id| handles[&id].is_leader()).count()
+            + usize::from(recovered.is_leader());
+        assert_eq!(
+            leaders, 1,
+            "exactly one leader must exist after the engine-loss recovery"
+        );
+
+        *done2.lock().unwrap() = true;
+    });
+
+    poll_until(
+        &mut sim,
+        Duration::from_secs(40),
+        Duration::from_secs(1),
+        "the engine-loss recovery scenario never completed",
+        || *done.lock().unwrap(),
+    );
+
+    assert!(
+        *open_failed_metric.lock().unwrap() >= 1,
+        "CpEngineOpenFailed must record the corrupt open"
+    );
+    assert!(
+        *rebuilt_metric.lock().unwrap() >= 1,
+        "CpEngineRebuilt must record the successful destroy-and-reopen"
+    );
 }

@@ -526,3 +526,148 @@ never quiesces, ADR 0048 fork G). The latter is also a small belt this plane has
 and the data plane does not: its timer arm is always present, so the loop's
 `fully_durable` release is re-evaluated at least once per heartbeat interval
 regardless of any wake.
+
+### Addendum (2026-09-02): the engine-persisted applied watermark and the needs-snapshot state (issue #554)
+
+A replica's Raft log and its `StorageEngine` are two independently durable
+things sharing a node id, and this plane's `drive()` used to seed its
+in-memory `engine_applied` watermark from `RaftCore::recovered`'s
+`core.last_applied()` — which `recovered` sets to the replica's own
+`snapshot_index`, a fact purely about where the **log's own compaction** left
+off. That seed is sound only when the engine and the log both survived a
+restart intact. It silently overstates progress the moment they don't: an
+engine destroyed and reopened fresh (the reconciler's engine-loss recovery,
+`animus-cp-data/CLAUDE.md`'s matching entry) holds nothing, yet the old seed
+claimed it was caught up through `snapshot_index` — and because the log
+tail from `snapshot_index + 1` onward still matched the leader's,
+`RaftCore::replicate_to`'s `next_index <= snapshot_index` check never fired,
+so the leader never shipped a fresh `InstallSnapshot`. Everything the log's
+own compaction had already discarded (the whole prefix through
+`snapshot_index`) was silently and permanently gone from that replica.
+Reproduced deterministically with a 3-replica `SimEnv` test: 90 writes (past
+`COMPACT_THRESHOLD` = 64), wipe a caught-up follower's engine, restart with a
+fresh one — the follower reported itself caught up and a pre-wipe key read
+back `None`. See `docs/engineering-lessons.md`'s matching Code-patterns
+entry: *a state machine's applied watermark must be the state machine's own,
+never the log's; a log that matches the leader proves nothing about the
+engine beneath it.*
+
+**The fix, three parts, no log truncation anywhere** (truncating acked
+entries breaks election safety and was never on the table):
+
+1. **An engine-persisted applied watermark** (`animus-cp-data::applied`, a
+   new module mirroring `seal.rs`/`ceiling.rs`'s own engine-global marker
+   discipline exactly — same `RESERVED_NAMESPACE` prefix, same
+   disjointness proof, keyed by tablet alone). Written **only** at the two
+   moments `RaftCore::snapshot_index` itself can change — compaction
+   (`RaftCore::snapshot_upto`, via `storage.merge` before the WAL rewrite,
+   so a crash between the two can only leave the marker AHEAD of the
+   recovered `snapshot_index`, never behind it — the safe direction) and
+   install (`install_engine_image`, in the SAME `merge_batch` as the
+   received image's own rows) — deliberately **not** on every ordinary
+   commit. That was the first design tried and reverted: a marker written
+   into the same memtable batch as ordinary per-commit rows defeats
+   `LsmEngine::clone_to_filtered`'s whole-file split dead-space exclusion
+   for any table it rides in (its key sorts above every row kind's own
+   byte range, so a table carrying it no longer looks single-kind to that
+   check) — never a correctness bug (`trim_split_child` backstops it
+   regardless), but a real, needless regression to this plane's own
+   dead-space win, caught live by `tests/inplace_split_dead_space.rs`.
+   `drive()` reads the marker back at startup (0 for a fresh/empty engine)
+   instead of trusting the log's own idea of where compaction left off.
+
+2. **A needs-snapshot state, shared with the control plane's `RaftCore`
+   but inert there.** `RaftCore` gains `state_machine_behind` (default
+   `false`, set only by a `DRIVER_APPLIED` plane's own driver — the
+   in-core control plane never calls the setter, so every dependent
+   behavior below is a no-op for it). Rather than a driver-latched
+   one-shot flag, this plane's consensus loop recomputes it **live, every
+   loop iteration**, from the two always-current facts
+   (`engine_applied.load() < core.snapshot_index()`) — mirroring
+   `set_quiesce_engine_caught_up`'s own established "feed the one external
+   input the core has no visibility into itself, once per iteration,
+   before `tick`" pattern exactly. A one-shot latch cleared only by the
+   async apply task was tried first and produced a real livelock (below).
+   While behind, the replica: refuses linearizable AND replica-local
+   reads (both already gate on `engine_applied`, which the driver seeds
+   at the true, low value — no further change needed, this falls out of
+   part 1 for free); refuses to campaign (`start_pre_vote`/
+   `start_election` gain the identical gate `is_voter()` already has for a
+   learner, so a behind node can still vote for others but can never win
+   an election and become leader over an incomplete engine that might
+   otherwise ship a corrupt `InstallSnapshot` image to a perfectly healthy
+   third replica); and keeps voting, appending, and committing normally
+   otherwise (the log and hard state are intact and valid regardless of
+   what the engine holds) — only the async merge of committed effects
+   into the engine is deferred (`apply_and_compact` skips draining
+   `RaftCore::drain_apply` while behind, leaving effects queued in the
+   core; applying is idempotent per-key LWW, so nothing queued from before
+   the gap was noticed is lost or misapplied once this resumes).
+
+3. **The follower-to-leader request path.** `RaftMsg::AppendEntriesResp`
+   gains one `#[serde(default)]` field, `needs_snapshot: bool` — every
+   response a behind replica builds echoes its live
+   `state_machine_behind`, regardless of whether the log check that
+   produced the response was a success or a reject (the overwhelmingly
+   common case is a `success` heartbeat ack: the log tail matches, so
+   nothing else in the message would signal a gap). The leader's
+   `handle_append_resp`, on `needs_snapshot: true`, resets `next_index`
+   for that peer down to 1 — which is all `replicate_to`'s pre-existing
+   `next <= snapshot_index` check needs to switch to the chunked
+   `InstallSnapshot` path, reusing chunking, the resend cap, and the
+   `DRIVER_APPLIED` on-demand lazy image build (`take_snapshot_needed`)
+   entirely unchanged, built at the leader's own CURRENT applied index —
+   at or ahead of anything the follower's log start could require, by
+   construction (the leader's committed state never trails a caught-up
+   follower's). No new message type, no new ack semantics: the smallest
+   change that could reuse 100% of the existing snapshot machinery.
+
+   **Two correctness gaps found only by running this, both fixed as part
+   of the same change, not follow-ups:**
+   - `RaftCore::handle_install_snapshot`'s pre-existing "already at least
+     this far along" short-circuit (`last_index <= self.snapshot_index` ⇒
+     drop the transfer, just ack) is precisely wrong for a behind replica
+     — its own log-derived `snapshot_index` is exactly the fact it cannot
+     trust, and the overwhelmingly common #554 shape is `last_index ==
+     self.snapshot_index` (the log fully matched before the engine was
+     lost), so this branch was silently discarding the very offer meant
+     to fix the gap, forever, with the engine never touched. Now gated on
+     `&& !self.state_machine_behind`.
+   - **A livelock**, found and killed live while proving this: a leader
+     that blindly resets `next_index` to 1 on *every* `needs_snapshot:
+     true` ack — rather than only the first — restarts a fresh chunked
+     transfer before the peer ever finishes digesting the last one,
+     because `needs_snapshot` stays `true` on every one of the peer's own
+     acks until *its* apply task actually merges the completed install
+     (a window spanning several of its own heartbeat round trips). Fixed
+     by `snapshot_served_through: BTreeMap<NodeId, u64>` (leader-only,
+     volatile, like `next_index`/`match_index`): once this leader has
+     fully shipped a peer a snapshot at or past its current
+     `snapshot_index`, further `needs_snapshot: true` acks for that same
+     base are known-stale echoes and are left alone; a fresh compaction
+     outpacing a still-slow peer naturally invalidates the entry and lets
+     a genuinely new request through. Confirmed: without this, the
+     regression test below never converges within its budget — `next_index`
+     oscillates between 1 and past-`snapshot_index` forever and
+     `engine_applied` never leaves 0.
+
+**Wire codec**: `animus-cp-data::codec`'s hand-rolled binary `AppendEntriesResp`
+encoding needed its own explicit `needs_snapshot` arm (version bump to `24`)
+— `#[serde(default)]` only protects the WAL's `serde_json` path, never this
+one (see that module's own doc, and the `learners` field's identical
+lesson at version `22`).
+
+**Regression**: `animus-cp-data/tests/engine_wipe_needs_snapshot.rs` — a
+3-replica `SimEnv` test crossing `COMPACT_THRESHOLD`, wiping a follower's
+engine (fresh `MemoryEngine`, WAL intact) mid-run and asserting
+`engine_applied_index` convergence, every pre-wipe key reading back
+correctly, and a linearizable read of a pre-compaction key succeeding
+through the eventual leader; a second scenario wipes the group's own
+**leader** — confirmed to always come back as a plain follower (leadership
+is never persisted, `RaftCore::recovered` never restores `Role::Leader`),
+so it simply rejoins as a temporarily-behind follower and the design's own
+campaign gate stops it from winning re-election until it has genuinely
+caught up, closing the "wiped node is the leader" design fork explicitly
+rather than leaving it implicit. See `crates/animus-test/tests/
+raftkv_linearizable.rs`'s LSM-tier compaction-crossing cells for the same
+property proven over the nightly corpus.

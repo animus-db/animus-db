@@ -123,12 +123,16 @@
 //!   nothing here can tell the difference ahead of the crash that reveals it.
 //!   This module's job in that case is exactly what it already does: `open`
 //!   fails loudly (`corrupt sstable index: ...`) rather than silently serving
-//!   a short engine. Recovering the *replica* is a layer up — issue #554
-//!   proposes the host reconciler treat an unopenable engine as lost, destroy
-//!   its files, and reopen fresh, letting Raft rebuild it from the group,
-//!   the same recovery the `MemoryEngine` tier already gets on every
-//!   restart; that's a design decision for the maintainer, not yet built.
-//!   See `crates/animus-storage/CLAUDE.md` and `docs/engineering-lessons.md`.
+//!   a short engine. Recovering the *replica* is a layer up — issue #554's
+//!   `animus-cp-data` host reconciler (`Reconciler::ensure_engine`) treats an
+//!   unopenable engine as lost, destroys its files, and reopens fresh,
+//!   letting Raft rebuild it from the group (log replay for the tail, and —
+//!   for a replica whose log had already compacted past what the fresh
+//!   engine needs — a leader-shipped `InstallSnapshot` via the needs-snapshot
+//!   mechanism, `animus-control::raft::RaftCore::state_machine_behind`), the
+//!   same recovery the `MemoryEngine` tier already gets on every restart.
+//!   See `crates/animus-storage/CLAUDE.md`, `crates/animus-cp-data/CLAUDE.md`,
+//!   and `docs/engineering-lessons.md`.
 //!
 //! These properties (including the lied-to-`sync` case, pinned by
 //! `tests/lsm_crash.rs`'s `fsync_lie_flush_survives_as_a_clean_open_error`)

@@ -579,12 +579,56 @@ pub enum Metric {
     /// too tight for this deployment's real round-trip latency; see
     /// `animus-control/CLAUDE.md`'s "Leadership transfer" entry.
     ControlTransferAborted,
+
+    // --- CP data-plane needs-snapshot state (issue #554) --- Appended after
+    // the leadership-transfer-observability variant above; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animus-cp-data`'s `drive`.
+    /// This replica's own engine, at `drive()` start, was found behind its
+    /// own recovered `RaftCore::snapshot_index` — the log's own compacted
+    /// prefix is gone from the engine too (a wiped/rebuilt engine reopened
+    /// fresh, or any other way the two fell out of sync). The replica
+    /// refuses reads and campaigning until a fresh `InstallSnapshot` closes
+    /// the gap (`RaftCore::state_machine_behind`). A nonzero rate is
+    /// expected whenever the reconciler's engine-loss recovery fires past
+    /// the compaction threshold; see `animus-cp-data/CLAUDE.md`'s
+    /// "needs-snapshot state" entry.
+    CpEngineNeedsSnapshot,
+
+    // --- Tablet-host reconciler engine-loss recovery (issue #554) ---
+    // Appended after the needs-snapshot-state variant above; every earlier
+    // variant's slot and the text-export order stay stable, so
+    // the snapshot remains byte-reproducible. Recorded by `animus-cp-data`'s
+    // `host::Reconciler::ensure_engine`/`materialize_split_child` (the G4
+    // re-open branch) — see `EngineFactory::destroy`'s call sites for the
+    // full mechanism.
+    /// This node's own `EngineFactory::open` for a hosted (or split-child)
+    /// tablet failed — treated as a corrupt/lost local engine, not a
+    /// transient fault. Counts every occurrence, including one immediately
+    /// followed by a successful destroy-and-reopen.
+    CpEngineOpenFailed,
+    /// Following a [`Self::CpEngineOpenFailed`], `EngineFactory::destroy`
+    /// plus a fresh `EngineFactory::open` succeeded — the tablet's engine
+    /// was rebuilt from nothing and Raft (log replay plus, for a replica
+    /// whose own log has been compacted since the loss, the leader's
+    /// on-demand `InstallSnapshot`) repopulates it. The reconciler hosts the
+    /// tablet normally from here; no operator action needed, though a
+    /// nonzero rate is worth watching (see `animus-cp-data/CLAUDE.md`'s
+    /// "engine-loss recovery" entry).
+    CpEngineRebuilt,
+    /// The fresh `EngineFactory::open` after a [`Self::CpEngineOpenFailed`]
+    /// `destroy` **also** failed — this node's disk itself is unhealthy
+    /// (not just one tablet's files), not a one-off corruption. The
+    /// reconciler does not retry the destroy a second time in the same
+    /// action; it falls back to the pre-existing warn-and-skip behavior, and
+    /// `plan` re-emits the action next tick.
+    CpEngineRebuildFailed,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 78] = [
+    pub const ALL: [Metric; 82] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -663,6 +707,10 @@ impl Metric {
         Metric::CpTxnUnresolvedDecidedStuck,
         Metric::DynamoTransactWritesAmbiguous,
         Metric::ControlTransferAborted,
+        Metric::CpEngineNeedsSnapshot,
+        Metric::CpEngineOpenFailed,
+        Metric::CpEngineRebuilt,
+        Metric::CpEngineRebuildFailed,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -748,6 +796,10 @@ impl Metric {
             Metric::CpTxnUnresolvedDecidedStuck => "cp_txn_unresolved_decided_stuck",
             Metric::DynamoTransactWritesAmbiguous => "dynamo_transact_writes_ambiguous",
             Metric::ControlTransferAborted => "control_transfer_aborted",
+            Metric::CpEngineNeedsSnapshot => "cp_engine_needs_snapshot",
+            Metric::CpEngineOpenFailed => "cp_engine_open_failed",
+            Metric::CpEngineRebuilt => "cp_engine_rebuilt",
+            Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
         }
     }
 

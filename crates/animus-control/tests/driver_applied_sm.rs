@@ -188,6 +188,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
                     term: src.term(),
                     success: true,
                     match_index: index,
+                    needs_snapshot: false,
                 },
                 now,
                 7,

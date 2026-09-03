@@ -471,3 +471,78 @@ this fix, comfortably under a small bound). Full suites
 converged fully in 3 of 3 runs on the validating host with this fix on top
 of the previous amendment's — closing the residual that amendment left
 open, on this host and workload shape.
+
+### Addendum (2026-09-02): `state_machine_behind` and `AppendEntriesResp::needs_snapshot` (issue #554)
+
+The core protocol type gains two small, purely additive pieces so a
+`DRIVER_APPLIED` plane can tell its leader "my state machine is behind its
+own log's compacted start, regardless of what my log tail says" — see ADR
+0017's own 2026-09-02 addendum for the full mechanism and the bug it
+closes (an engine wiped and reopened fresh behind an already-compacted
+log, silently reporting itself caught up). This lives here rather than
+purely in `animus-cp-data` because `RaftCore` is the shared sync core (ADR
+0016/0017), so the change is:
+
+- A new `RaftCore` field, `state_machine_behind: bool` — default `false`,
+  set only via the new `set_state_machine_behind` setter. **Never called
+  by the in-core control plane** (`animus-control::node`'s driver), which
+  makes every dependent behavior below permanently inert for that plane:
+  `Metadata`'s own async apply task (ADR 0038) already seeds its
+  `engine_applied` from the system-keyspace engine's own durable watermark
+  key (`node.rs`'s `meta_apply_loop`, not `core.last_applied()`) — the
+  identical fix ADR 0017's addendum describes for the data plane — so the
+  control plane does not have this bug's *active* trigger today. It is
+  not immune to the same *class* of gap in principle (nothing currently
+  destroys-and-reopens a control node's system-keyspace engine the way
+  `animus-cp-data::host`'s reconciler does for a tablet's engine), but
+  building that detection/request path for a mechanism with no live caller
+  would be speculative, untestable machinery — flagged here, not built.
+- `start_pre_vote`/`start_election` both gain `|| self.state_machine_behind`
+  alongside their existing `!self.is_voter()` campaign gate — mirroring
+  exactly how a learner is already kept from campaigning, for the same
+  underlying reason (a `state_machine_behind` node's log looks perfectly
+  eligible; only its engine is untrustworthy, so it must not become
+  leader and risk shipping a corrupt `InstallSnapshot` image to a healthy
+  peer). Two independent gate sites, not one, since `handle_pre_vote_resp`
+  can reach `start_election` directly on a pre-vote majority without going
+  back through `start_pre_vote`.
+- `RaftMsg::AppendEntriesResp` gains `needs_snapshot: bool`
+  (`#[serde(default)]`, so an older wire peer that never sets it decodes
+  to `false` — harmless: a replica that never learns about a gap simply
+  doesn't proactively close it early, and still refuses reads/campaigning
+  on its own regardless). `handle_append_resp` threads it through and, on
+  `true`, resets the peer's `next_index` to 1 (letting the pre-existing
+  `replicate_to`/`snapshot_chunk_for` `next <= snapshot_index` check do
+  the rest) **unless** a new leader-side map, `snapshot_served_through:
+  BTreeMap<NodeId, u64>`, already shows this peer fully served at or past
+  the leader's current `snapshot_index` — without that guard, a leader
+  that resets on *every* still-true ack (not just the first) restarts a
+  fresh chunked transfer before the peer ever finishes digesting the last
+  one, a genuine, reproducible livelock (confirmed live building this:
+  `next_index` oscillating between 1 and past-`snapshot_index` forever,
+  the peer's `engine_applied` never advancing past 0) — see ADR 0017's
+  addendum for the full account and the fix's other half (making
+  `state_machine_behind` a live, per-loop-iteration recomputation on the
+  `DRIVER_APPLIED` side rather than a driver-latched one-shot flag, which
+  turned out to be necessary but not sufficient on its own).
+- `handle_install_snapshot`'s "already at least this far along" fast path
+  (`last_index <= self.snapshot_index` ⇒ drop the transfer, just ack —
+  the *correct* behavior for an ordinary caught-up replica) is additionally
+  gated `&& !self.state_machine_behind`: for a behind replica this is
+  precisely the wrong call, since its own `snapshot_index` is exactly the
+  fact it cannot trust, and `last_index == self.snapshot_index` is the
+  overwhelmingly common #554 shape (the log matched before the engine was
+  lost) — without this the offer meant to fix the gap was being silently
+  discarded, every time, with the engine never touched.
+
+Wire codec: `animus-cp-data::codec`'s hand-rolled binary framing needed its
+own explicit encode/decode arm for the new field (version bump), per this
+crate's standing rule that `#[serde(default)]` only protects the
+`serde_json` WAL path, never a hand-rolled one — see `animus-cp-data/
+CLAUDE.md`'s `codec.rs` entry.
+
+Regression: `animus-control`'s existing suite (unchanged, stays green —
+every dependent behavior above is inert when `state_machine_behind` is
+never set, which no control-plane call site does);
+`animus-cp-data/tests/engine_wipe_needs_snapshot.rs` is the live proof
+over the `DRIVER_APPLIED` plane that actually exercises this.

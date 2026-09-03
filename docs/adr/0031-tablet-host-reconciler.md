@@ -287,3 +287,55 @@ closes) and ADR 0029 (the release-GC and reconfigure mechanics the reconciler
 subsumes); it builds on ADR 0026 Stage B (stream addressing) and ADR 0009 (the
 durable-before-visible frontier `metadata_watch` mirrors) without changing
 either.
+
+### Addendum (2026-09-02): engine-loss recovery (issue #554)
+
+`Reconciler::ensure_engine` and `materialize_split_child` (the split-fork
+handle-open path) both gain the identical, minimal recovery: a first
+`EngineFactory::open` failure is now treated as a lost/corrupt local engine,
+never a reason to warn-and-retry the same open forever. This node's own
+**Raft WAL/hard-state** (`raftkv.wal.<tablet>`, `animus-cp-data::wal_file`)
+lives in a namespace entirely disjoint from the engine's own durable files
+(every real `EngineFactory` implementor's own `destroy` touches only its
+engine-file prefix, never the WAL — see that trait's own doc), so destroying
+the engine and reopening fresh forfeits no vote and cannot double-vote: the
+tablet's Raft group state (term, log, commit index) is completely untouched.
+Bounded to **one** destroy-and-reopen attempt per call, never a destroy/open
+loop — a second failure after the fresh open falls back to the pre-existing
+warn-and-skip behavior (`plan` re-emits the action next tick), so a disk that
+fails every open (not just one tablet's files) doesn't spin destroying and
+recreating tablet after tablet. Three metrics
+(`CpEngineOpenFailed`/`CpEngineRebuilt`/`CpEngineRebuildFailed`, ADR 0015)
+observe the outcome.
+
+Raft then rebuilds the fresh engine's state the same way it already rebuilds
+any caught-up-on-restart replica's: this node's own recovered log tail
+replays into it, and — for a replica whose log had already been compacted
+past what the now-empty engine needs — the leader's on-demand
+`InstallSnapshot` covers the rest via the **needs-snapshot** mechanism (ADR
+0009/0017's 2026-09-02 addenda): the engine-persisted applied watermark
+(`animus-cp-data::applied`) reads back 0 from the fresh engine, is found
+below the replica's own recovered `snapshot_index`, and the replica requests
+a fresh snapshot rather than silently believing itself caught up. This
+reconciler-side mechanism and that core-level one are deliberately separate
+changes with a clean boundary: this ADR's own destroy-and-reopen is *never*,
+by itself, sufficient to prove recovery safe past a replica's own compaction
+point — that proof is entirely the needs-snapshot mechanism's, and is what
+closes a gap building this reconciler-side half first surfaced (see
+`docs/engineering-lessons.md`'s matching entry for the discovery). A
+90-write regression (past `COMPACT_THRESHOLD` = 64) proved a naive
+destroy-and-reopen alone, without the needs-snapshot mechanism, silently
+lost the whole compacted prefix, while the identical scenario at 20 writes
+(below the threshold) passed — which is exactly why this ADR's own
+regression
+(`tests/reconciler.rs::a_corrupt_replica_engine_is_destroyed_and_rebuilt_
+from_the_group`) writes past the threshold, not merely enough to exercise
+the destroy/reopen call itself.
+
+For `materialize_split_child` specifically, the recovery is simpler still:
+a `probe(child.id)` hit whose `open` then fails means the G4 fork's earlier
+attempt already cloned data into `child.id`'s namespace but crashed before
+the group ever started — that clone has no committed group state of its own
+to lose, so destroying the corrupt clone and falling through to an ordinary
+fresh re-clone from the parent's own CURRENT state is always correct,
+mirroring the G4 contract's own "crash before step 1" case this re-enters.

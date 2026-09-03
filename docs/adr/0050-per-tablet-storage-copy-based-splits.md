@@ -735,3 +735,21 @@ restore driver (`animusd::backup_restore`, [ADR 0059](0059-backup-and-restore.md
 §7) is now its sole surviving consumer, seeding a restore's destination
 tablet from a backup's captured chunks the identical way the old split
 driver used to seed a fresh child.
+
+### Addendum (2026-09-02): engine-loss recovery reuses Decision 1's own private-engine boundary (issue #554)
+
+Decision 1's per-tablet private engine — one engine per tablet, files named
+by tablet id, nothing shared across tablets — is exactly what makes
+`Reconciler::ensure_engine`'s destroy-and-reopen recovery (ADR 0031's
+matching 2026-09-02 addendum) safe: a corrupt/lost tablet's engine can be
+destroyed and rebuilt in isolation, touching no other tablet's data (a
+`StorageScope`-fenced shared engine, the pre-Decision-1 design, could not
+offer this — destroying "one tablet's share" of a shared engine has no
+clean meaning). The recovery is otherwise unrelated to this ADR's own split
+machinery, except that `materialize_split_child`'s own engine-open path
+(the G4 fork's handle-recovery step) gets the identical treatment for the
+identical reason — see ADR 0031's addendum for the full mechanism, and ADR
+0009/0017's for the needs-snapshot half that makes recovery past a
+replica's own compaction point actually safe (destroy-and-reopen alone is
+not — see `docs/engineering-lessons.md`'s matching entry for the gap this
+closes).

@@ -336,13 +336,20 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   (`StorageError::Backend("corrupt sstable index: ...")`) rather than
   silently serving a short engine — this layer's job stops at detect-and-
   report. Regression: `lsm_crash.rs::fsync_lie_flush_survives_as_a_clean_
-  open_error` pins that loud-`Err` contract. **The recovery is a layer up**:
-  issue #554 proposes the `animus-cp-data` host reconciler treat an
-  unopenable engine as lost, destroy its files (`EngineFactory::destroy`
-  already exists) and reopen fresh, letting Raft rebuild it from the group —
-  the same path the `MemoryEngine` tier already takes on every restart. Not
-  yet built; a maintainer design decision, tracked by issue #554. See
-  `lsm.rs`'s own "Crash safety" doc and `docs/engineering-lessons.md`.
+  open_error` pins that loud-`Err` contract. **The recovery is a layer up,
+  and is built**: the `animus-cp-data` host reconciler
+  (`Reconciler::ensure_engine`/`materialize_split_child`) treats an
+  unopenable engine as lost, destroys its files (`EngineFactory::destroy`)
+  and reopens fresh, letting Raft rebuild it from the group — the same path
+  the `MemoryEngine` tier already takes on every restart — bounded to one
+  destroy-and-reopen attempt per call (ADR 0031's 2026-09-02 addendum). A
+  replica whose log had already compacted past what the fresh engine holds
+  is covered by the separate needs-snapshot mechanism (ADR 0009/0017's
+  2026-09-02 addenda, `animus-cp-data::applied` +
+  `RaftCore::state_machine_behind`) — destroy-and-reopen alone is not
+  sufficient past that point; see `animus-cp-data/CLAUDE.md`'s matching
+  entries. See `lsm.rs`'s own "Crash safety" doc and
+  `docs/engineering-lessons.md`.
 
 - **`LsmEngine::clone_to(target_prefix)` (ADR 0058 rung 2) clones an engine's
   durable state into a NEW, independent engine at SSTable-file granularity**

@@ -164,7 +164,17 @@ const MAGIC: u8 = 0xCB;
 /// doc): a `split_key: Vec<u8>` plus two `animus_tablet::SplitChild`
 /// `(id, replicas)` pairs and the standard trailing `ts`. Same house
 /// convention: a clean bump, no cross-version compatibility.
-const VERSION: u8 = 23;
+/// `24` (issue #554): `RaftMsg::AppendEntriesResp` gained a `needs_snapshot:
+/// bool` field (the follower-to-leader "my state machine is behind its own
+/// log's compacted start" signal — see `animus_control::raft::RaftCore::
+/// state_machine_behind`'s doc), encoded with `put_bool`/`c.bool()!` right
+/// after `match_index`, matching `success`'s own encoding. Same house
+/// convention: a clean bump, no cross-version compatibility (the `serde`
+/// side's own `#[serde(default)]` is unrelated — it only protects the WAL's
+/// `serde_json` path, per this crate's own doc: "a field added to the
+/// shared `LogEntry`/`RaftMsg` types needs an explicit encode/decode arm
+/// here too").
+const VERSION: u8 = 24;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -910,11 +920,13 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             term,
             success,
             match_index,
+            needs_snapshot,
         } => {
             put_u8(out, 5);
             put_u64(out, *term);
             put_bool(out, *success);
             put_u64(out, *match_index);
+            put_bool(out, *needs_snapshot);
         }
         RaftMsg::InstallSnapshot {
             term,
@@ -1020,6 +1032,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             term: c.u64()?,
             success: c.bool()?,
             match_index: c.u64()?,
+            needs_snapshot: c.bool()?,
         },
         6 => RaftMsg::InstallSnapshot {
             term: c.u64()?,
@@ -1441,6 +1454,7 @@ mod tests {
                 term: 7,
                 success: true,
                 match_index: 23,
+                needs_snapshot: true,
             },
             RaftMsg::InstallSnapshot {
                 term: 7,

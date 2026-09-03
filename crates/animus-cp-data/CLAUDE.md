@@ -720,6 +720,84 @@ State once here; cross-referenced from the sections below.
   the engine. Linearizable reads therefore gate on the separate
   **`engine_applied`** atomic the apply task advances after each merge —
   **never** `last_applied` (else a read could observe past the engine).
+- **The engine-persisted applied watermark and the needs-snapshot state
+  (issue #554, ADR 0017's 2026-09-02 addendum, ADR 0009's matching one).**
+  `drive()` used to seed `engine_applied` from `core.last_applied()`, sound
+  only because that value equals `snapshot_index` — a fact about the LOG's
+  own compaction, not the engine — right after `RaftCore::recovered`. That
+  seed silently overstates progress the instant the engine doesn't match the
+  log (an engine destroyed and reopened fresh behind an already-compacted
+  log — the host reconciler's engine-loss recovery, below — while the WAL
+  survives): the fresh engine holds nothing, yet the seed claimed it was
+  caught up through `snapshot_index`, and since the log tail still matched
+  the leader's, no `InstallSnapshot` was ever triggered — the whole
+  compacted prefix silently gone. **`applied.rs`** is the fix: a durable,
+  engine-global marker (`seal.rs`/`ceiling.rs`'s own disjointness discipline)
+  holding the highest index this tablet's OWN engine has merged, written
+  **only** at compaction (`RaftCore::snapshot_upto`, before the WAL rewrite)
+  and install (`install_engine_image`, same `merge_batch` as the image's own
+  rows) — **deliberately not on every commit**: a first draft that did defeat
+  `LsmEngine::clone_to_filtered`'s whole-file split dead-space exclusion for
+  any table the marker rode along in (its key sorts above every row kind's
+  own byte range, so a table carrying it no longer looks single-kind to that
+  check) — never a correctness bug (`trim_split_child` backstops it
+  regardless), but a real regression to that optimization on nearly every
+  split instead of rarely, caught by `tests/inplace_split_dead_space.rs`.
+  `drive()` reads this marker back at startup instead of `core.last_applied()`.
+
+  `RaftCore::state_machine_behind` (shared with `animus-control`, permanently
+  inert there — see ADR 0009's addendum) is `true` whenever `engine_applied <
+  snapshot_index`; this plane's consensus loop recomputes it **live, every
+  loop iteration** (`engine_applied.load() < c.snapshot_index()`, same lock
+  acquisition as `set_quiesce_engine_caught_up`, mirroring that established
+  "feed the one external input the core can't see itself" pattern), never as
+  a driver-latched one-shot flag — a latch cleared only by the async apply
+  task left a window that produced a real, reproducible **livelock** while
+  building this (see below). While behind: reads already refuse themselves
+  (both linearizable and replica-local gate on `engine_applied`, seeded low —
+  no extra code needed); campaigning is refused (`start_pre_vote`/
+  `start_election` gain the identical `is_voter()`-style gate a learner
+  already has, so a behind node can vote for others but never become leader
+  over an incomplete engine); `apply_and_compact` skips draining
+  `RaftCore::drain_apply` (committed effects just queue in the core —
+  applying is idempotent per-key LWW, so nothing is lost once this resumes).
+  `RaftMsg::AppendEntriesResp::needs_snapshot` (`#[serde(default)]`, and its
+  own explicit `codec.rs` encode/decode arm, version `24` — `#[serde(default)]`
+  only protects the `serde_json` WAL path) echoes this live flag on every
+  response a behind replica builds; the leader's `handle_append_resp` resets
+  that peer's `next_index` to 1 on `true`, which is all the pre-existing
+  `replicate_to`/`snapshot_chunk_for` `next <= snapshot_index` check needs to
+  ship a fresh chunked `InstallSnapshot` — built at the LEADER's own current
+  applied index, reusing chunking/the resend cap/the lazy on-demand image
+  build entirely unchanged.
+
+  **Two gaps found only by running this, fixed as part of the same change:**
+  `RaftCore::handle_install_snapshot`'s pre-existing "already at least this
+  far along" short-circuit (`last_index <= self.snapshot_index` ⇒ drop the
+  transfer, just ack) is precisely backwards for a behind replica — its own
+  `snapshot_index` is exactly what it can't trust, and `last_index ==
+  self.snapshot_index` is the overwhelmingly common #554 shape — so it was
+  silently discarding the very offer meant to fix the gap; now gated `&&
+  !self.state_machine_behind`. And the **livelock**: a leader that resets
+  `next_index` to 1 on *every* `needs_snapshot: true` ack (not just the
+  first) restarts a fresh transfer before the peer ever finishes digesting
+  the last one, because `needs_snapshot` stays `true` on every one of the
+  peer's own acks until *its* apply task actually merges the completed
+  install — a window spanning several of its own heartbeat round trips.
+  Fixed by `RaftCore::snapshot_served_through: BTreeMap<NodeId, u64>`
+  (leader-only, volatile like `next_index`/`match_index`): once a peer is
+  fully served at or past the leader's current `snapshot_index`, further
+  `needs_snapshot: true` echoes are known-stale and left alone; a fresh
+  compaction outpacing a still-slow peer naturally invalidates the entry.
+  Confirmed live: without this guard, `next_index` oscillates between 1 and
+  past-`snapshot_index` forever and `engine_applied` never leaves 0.
+
+  Regression: `tests/engine_wipe_needs_snapshot.rs` (a 3-replica `SimEnv`
+  test crossing `COMPACT_THRESHOLD`, wiping a follower's — and separately
+  the leader's — engine mid-run with the WAL intact) and the corpus mirror
+  in `animus-test/tests/raftkv_linearizable.rs`. See `docs/engineering-
+  lessons.md`'s Code-patterns entry: *a state machine's applied watermark
+  must be the state machine's own, never the log's.*
 - **Durable-before-visible** (ADR 0009): effects are only drained for fsynced
   entries, and the engine write follows the WAL `fsync`.
 - **Write-conflict push + the logged read ceiling — the serializability half
@@ -909,6 +987,31 @@ ADR 0050 Train B rung-7 sweep.
   fixed as part of the same change that closed `teardown`'s mirror hole,
   below). Regression: `tests/reconciler.rs::
   reconciler_recovers_a_tablet_after_a_transient_engine_open_failure`.
+- **Engine-loss recovery (issue #554, ADR 0031's 2026-09-02 addendum):
+  `ensure_engine`'s (and `materialize_split_child`'s) first `open` failure
+  is treated as a lost/corrupt local engine, not a transient fault to
+  warn-and-retry forever.** Bounded to ONE destroy-and-reopen attempt per
+  call (`factory.destroy` then a fresh `factory.open`) — a second failure
+  falls back to the pre-existing warn-and-skip, so a genuinely unhealthy
+  disk (every open failing, not just one tablet's) doesn't spin
+  destroying/recreating tablet after tablet. Safe because this node's own
+  Raft WAL/hard-state (`wal_file`) lives in a namespace an `EngineFactory`
+  implementor's `destroy` never touches — no vote is forfeit, no
+  double-vote is possible. `CpEngineOpenFailed`/`CpEngineRebuilt`/
+  `CpEngineRebuildFailed` (ADR 0015) observe the outcome. **This
+  destroy-and-reopen alone is NOT sufficient to prove recovery safe past
+  a replica's own compaction point** — that is entirely the separate
+  needs-snapshot mechanism's job (`applied.rs`, `RaftCore::
+  state_machine_behind`, this file's own matching entry above): a first
+  version of this recovery, built and regression-tested BEFORE that
+  mechanism existed, passed at 20 writes (below `COMPACT_THRESHOLD` = 64)
+  and silently lost the whole compacted prefix at 90 (past it) — see
+  `docs/engineering-lessons.md`'s matching entry for the discovery.
+  Regression: `tests/reconciler.rs::
+  a_corrupt_replica_engine_is_destroyed_and_rebuilt_from_the_group` (90
+  writes, past the threshold, proving the FULL recovery — destroy/reopen
+  plus needs-snapshot — restores every pre-corruption key and preserves
+  Raft safety, exactly one leader, no split-brain artifact).
 - **`Reconciler::tick(&mut self, view: &MetadataView)` is the whole
   per-tick contract**: gather `TabletFacts` from its own hosted nodes
   (`gather_facts`), call `plan` exactly once, then execute the returned

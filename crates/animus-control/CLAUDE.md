@@ -934,6 +934,38 @@ per-tablet CP data plane (`animus-cp-data`).
   `install_snapshot.rs::large_snapshot_ships_in_o_chunk_time_not_o_state` +
   `tests/prod_liveness.rs`.
 
+  **`state_machine_behind` + `AppendEntriesResp::needs_snapshot` (issue
+  #554, ADR 0009's 2026-09-02 addendum): a follower-to-leader "I need a
+  fresh `InstallSnapshot` regardless of `next_index`" signal, for a replica
+  whose log tail matches its leader's but whose OWN state machine is behind
+  its own log's compacted start** (an engine destroyed and reopened fresh
+  behind an already-compacted log — `animus-cp-data`'s reconciler engine-
+  loss recovery is the live trigger; see that crate's CLAUDE.md and ADR
+  0017's matching addendum for the full mechanism this core-level piece
+  supports). `RaftCore::state_machine_behind` is set only by a
+  `DRIVER_APPLIED` plane's own driver — **the control plane never calls the
+  setter, so it stays permanently `false` here**, making
+  `AppendEntriesResp::needs_snapshot`, the `start_pre_vote`/`start_election`
+  campaign gate, and `handle_install_snapshot`'s state-machine-behind
+  fallthrough all dead code paths for `Metadata`. Not because the control
+  plane is structurally immune to the same *class* of gap (nothing today
+  destroys-and-reopens a control node's system-keyspace engine the way the
+  data-plane reconciler does for a tablet — `Metadata`'s own apply task
+  already seeds `engine_applied` from the engine's own durable watermark
+  key, `node.rs`'s `meta_apply_loop`, not `core.last_applied()` — but that
+  alone means no *active* trigger exists yet, not that one could never
+  exist) — flagged, not built, since a detection/request path with no live
+  caller would be speculative, untestable machinery.
+  `snapshot_served_through: BTreeMap<NodeId, u64>` (leader-only, volatile
+  like `next_index`/`match_index`) is the companion piece that stops a
+  leader from restarting a fresh transfer on every one of a behind peer's
+  still-`needs_snapshot: true` acks before the peer finishes digesting the
+  last one — a real livelock without it (see ADR 0009's addendum for the
+  full incident). Regression: `animus-cp-data/tests/
+  engine_wipe_needs_snapshot.rs` is the only live exerciser; this crate's
+  own suite stays green unchanged, by construction, since nothing here ever
+  sets the flag.
+
   **`replicate_to`'s `AppendEntries` batch is capped, not unbounded
   (issues #532/#537, ADR 0009's 2026-09-01 amendment).**
   `MAX_APPEND_ENTRIES_BATCH` (512, derivation in that constant's own doc)
