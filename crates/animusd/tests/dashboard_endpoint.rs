@@ -823,6 +823,55 @@ async fn dashboard_u01_render_only_fixes() {
             "the ring buffer is served under \"samples\": {history_body}"
         );
 
+        // ---- 5. SYSTEM_TABLE_KINDS extended to all 16 EntityKind variants --
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        // Pin the expected 16 segment strings by constructing every real
+        // `EntityKind` variant and reading its own `as_str()` — this crate
+        // has no `EntityKind::ALL`/iterator to derive the list from
+        // (`syskv.rs`), so a future 17th variant needs both this array and
+        // `SYSTEM_TABLE_KINDS` updated by hand; this at least proves the 16
+        // that exist today are exactly the 16 the dropdown lists, spelled
+        // exactly the way `EntityKind::from_segment` expects them back.
+        use animus_control::syskv::EntityKind;
+        let expected_kinds: [&str; 16] = [
+            EntityKind::Tablet.as_str(),
+            EntityKind::Member.as_str(),
+            EntityKind::Schema.as_str(),
+            EntityKind::Policy.as_str(),
+            EntityKind::NodeAddrs.as_str(),
+            EntityKind::Counter.as_str(),
+            EntityKind::CpMemberAddr.as_str(),
+            EntityKind::StreamShard.as_str(),
+            EntityKind::IndexBackfill.as_str(),
+            EntityKind::SplitLineage.as_str(),
+            EntityKind::SplitPlacing.as_str(),
+            EntityKind::Backup.as_str(),
+            EntityKind::BackupProgress.as_str(),
+            EntityKind::Restore.as_str(),
+            EntityKind::PitrSegment.as_str(),
+            EntityKind::PitrBaseBackup.as_str(),
+        ];
+        for kind in expected_kinds {
+            assert!(
+                storage_js.contains(&format!("[\"{kind}\",")),
+                "SYSTEM_TABLE_KINDS lists the real EntityKind segment {kind:?}: {storage_js}"
+            );
+            // `EntityKind::from_segment` recognizes every one of these, so a
+            // round trip through it is a live cross-check that the pinned
+            // literal actually decodes back to the variant it came from —
+            // not just a string that happens to match.
+            assert!(
+                EntityKind::from_segment(kind.as_bytes()).is_some(),
+                "{kind:?} round-trips through EntityKind::from_segment"
+            );
+        }
+        assert!(
+            !storage_js.contains("[\"keyspace\","),
+            "the stray [\"keyspace\", ...] dropdown entry (never a real EntityKind \
+             segment, always returned zero rows) is dropped, not carried forward: {storage_js}"
+        );
+
         nodes[0].shutdown_graceful().await;
     })
     .await

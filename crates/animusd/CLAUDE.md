@@ -872,7 +872,9 @@ reusing the captured config is the point of the test.
   (`cp_read_barriers_served`/`_timed_out`,
   `cp_eventual_reads_local`/`_forwarded`/`_fell_back`,
   `cp_uncertainty_restarts`) from `/admin/metrics/history` on a new Overview
-  card.
+  card; and `dashboard_storage.js`'s `SYSTEM_TABLE_KINDS` extended to all 16
+  `EntityKind` variants (`animus-control::syskv`), dropping a stray
+  `"keyspace"` entry that never matched any real `EntityKind` segment.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

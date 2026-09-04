@@ -46,13 +46,19 @@ function updateControlStorageNodeOptions() {
 // The system-keyspace BROWSE section (plan-syskv-ui, an ADR 0038 addendum) —
 // nested in the same "Control system keyspace" card, reusing `ctl-node`'s
 // control-role-only node selector so it never offers a node with no local
-// control engine at all. The kind filter lists EVERY EntityKind, including
-// the internal/legacy bookkeeping ones (Counter/CpMemberAddr) — full
-// transparency by the project owner's own call, labeled rather than hidden,
-// since hiding them would make "what does this node actually store" a lie
-// by omission. (A third such kind, NodeIdAlloc — the ADR 0036 allocator's
-// idempotency ledger — was removed in ADR 0040 PR4 along with the allocator
-// itself.)
+// control engine at all. The kind filter lists EVERY `EntityKind`
+// (`syskv.rs`), including the internal/legacy/lower-visibility ones
+// (Counter/CpMemberAddr) — full transparency by the project owner's own
+// call, labeled rather than hidden, since hiding them would make "what does
+// this node actually store" a lie by omission. (A third such kind,
+// NodeIdAlloc — the ADR 0036 allocator's idempotency ledger — was removed in
+// ADR 0040 PR4 along with the allocator itself.) docs/roadmap.md U-01:
+// extended from the original 7 real kinds (plus a stray "keyspace" entry
+// that never matched any real `EntityKind::from_segment` segment and so
+// could never return a row — dropped here, not carried forward) to all 16
+// `EntityKind` variants as of this list's own writing; each value is that
+// variant's own `as_str()` segment — keep this list and that `match` in sync
+// by hand (this crate has no `EntityKind::ALL`/iterator to derive it from).
 const SYSTEM_TABLE_KINDS = [
   ["", "(all kinds)"],
   ["tablet", "tablet"],
@@ -60,9 +66,17 @@ const SYSTEM_TABLE_KINDS = [
   ["schema", "schema"],
   ["policy", "policy"],
   ["node_addrs", "node_addrs"],
-  ["keyspace", "keyspace"],
   ["counter", "counter (internal)"],
   ["cp_member_addr", "cp_member_addr (legacy)"],
+  ["stream_shard", "stream_shard"],
+  ["index_backfill", "index_backfill"],
+  ["split_lineage", "split_lineage"],
+  ["split_placing", "split_placing"],
+  ["backup", "backup"],
+  ["backup_progress", "backup_progress"],
+  ["restore", "restore"],
+  ["pitr_segment", "pitr_segment"],
+  ["pitr_base_backup", "pitr_base_backup"],
 ];
 
 // The forward-only pager's cursor for the CURRENTLY DISPLAYED page — `null`
