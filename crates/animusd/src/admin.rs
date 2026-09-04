@@ -1425,19 +1425,53 @@ fn metrics_history_view(ctx: &ClientCtx) -> Value {
     json!({ "samples": ctx.metrics_history() })
 }
 
+/// How many of the control plane's own election timeouts a `leader_within`
+/// read (issue #595) tolerates with no fresh contact before `/admin/health`
+/// gives up on "recently had a leader" and degrades to 503.
+///
+/// Sized in election timeouts, not a flat duration, because the failure
+/// mode this exists to survive is itself measured in election timeouts:
+/// `RaftCore::start_pre_vote` clears the raw `leader_id` belief
+/// (`RaftCore::leader`) the instant a node's OWN election timer lapses —
+/// one missed heartbeat window is enough, even though the real leader may
+/// be, and usually is, fully healthy. `3×` gives a couple of heartbeat
+/// misses' worth of slack (a single scheduling stall, a slow GC pause, one
+/// dropped UDP-equivalent heartbeat) before treating the node as genuinely
+/// leaderless — small enough that a truly leaderless node (a real outage,
+/// a stuck election) still flips to `503` within roughly one second at the
+/// default 150ms election base, not tens of seconds.
+const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
+
 fn health(ctx: &ClientCtx) -> (u16, Value) {
     let r = &ctx.control;
+    // The raw, pre-vote-driven consensus belief (see `RaftCore::leader`'s
+    // own doc) — kept in the body, unchanged, as an honest diagnostic:
+    // `control_leader_known` still means exactly what it always has.
     let leader_known = r.leader().is_some();
+    // Issue #595: the READINESS signal instead uses `leader_within`'s
+    // hysteresis, so a follower whose own election timer merely lapsed
+    // (no evidence the real leader is unhealthy) does not flip this node's
+    // Kubernetes readiness probe (ADR 0060) to not-ready on every transient
+    // one-sided delay of one election timeout or more. A genuinely
+    // leaderless node still degrades to 503, just after
+    // `HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS` election timeouts of no
+    // fresh contact rather than after exactly one. See
+    // `docs/engineering-lessons.md`'s matching entry and ADR 0012/0060 for
+    // the full account.
+    let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+    let leader_recent = r.leader_within(health_grace).is_some();
     let hosts_cp = !ctx.edge.hosted_groups().is_empty();
     let body = json!({
-        "ok": leader_known,
+        "ok": leader_recent,
         "control_leader_known": leader_known,
+        "control_leader_recent": leader_recent,
         "is_control_leader": r.is_leader(),
         "hosts_cp": hosts_cp,
     });
-    // 503 until the control plane has a leader (the readiness signal); 200 once
-    // it does (whether this node leads or follows).
-    (if leader_known { 200 } else { 503 }, body)
+    // 503 until the control plane has had a RECENT leader (the readiness
+    // signal, hysteresis-gated per issue #595); 200 once it does (whether
+    // this node leads or follows).
+    (if leader_recent { 200 } else { 503 }, body)
 }
 
 // ---- operator actions ---------------------------------------------------
