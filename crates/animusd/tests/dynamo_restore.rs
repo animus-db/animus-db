@@ -194,7 +194,7 @@ async fn restore_serves_exactly_the_backup_time_rows_with_a_queryable_gsi() {
         addr,
         "DynamoDB_20120810.CreateTable",
         r#"{"TableName":"orders","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
-            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"status","AttributeType":"S"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-status",
                  "KeySchema":[{"AttributeName":"status","KeyType":"HASH"}]}]}"#,

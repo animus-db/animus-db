@@ -3787,23 +3787,60 @@ impl Metadata {
     /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4). An
     /// epoch above 0 names the same tablet's own previous epoch, always
     /// derived (a routine seal can never race itself). An epoch-0 shard
-    /// names the parent tablet's own FINAL sealed shard as frozen in
-    /// [`Metadata::split_lineage`] at cutover (ADR 0050, fork F9). `None`
-    /// for a genuine root (an epoch-0 shard whose tablet was never a split
-    /// child, or whose parent never sealed).
+    /// names the NEAREST split-lineage ancestor's own FINAL sealed shard
+    /// (ADR 0050, fork F9; the walk-past-an-unsealed-ancestor behavior is
+    /// ADR 0043's 2026-09-04 amendment, issue #588). `None` only for a
+    /// genuine root: an epoch-0 shard whose tablet was never a split child
+    /// at all, or whose entire split-lineage chain — every ancestor, all
+    /// the way back — never sealed a shard of its own.
     #[must_use]
     pub fn stream_shard_parent_id(&self, tablet: TabletId, epoch: u64) -> Option<String> {
         if epoch > 0 {
             return Some(shard_id_string(tablet, epoch - 1));
         }
-        // ADR 0050 rung 5: a copy-based split child's epoch-0 shard names
-        // its parent's FINAL sealed shard via `split_lineage` — written at
-        // `CutoverSplit`'s own apply, the one moment the parent's chain is
-        // complete and immutable, so this needs no freezing defense layers
-        // at all (fork F9).
+        // A split child's epoch-0 shard names its parent's FINAL sealed
+        // shard via `split_lineage` — written at `CutoverSplit`'s own
+        // apply, the one moment the parent's chain is complete and
+        // immutable, so this needs no freezing defense layers at all
+        // (fork F9).
+        //
+        // **Issue #588**: `SplitLineage::parents_final_epoch` is
+        // legitimately `None` whenever the immediate parent itself never
+        // sealed anything of its own before it split further — not a race,
+        // a documented case (ADR 0043 §A3's "never seal an empty segment"):
+        // a fast cascade can produce an intermediate tablet that inherits
+        // bytes from ITS OWN parent's fork but takes zero direct writes
+        // before splitting again. Stopping at that `None` used to strand
+        // every descendant with a permanently-null `ParentShardId`, even
+        // though an earlier ancestor's real sealed history is right there
+        // in `split_lineage` one hop further up — walk past it instead: a
+        // never-sealed parent's own epoch-0 "parent shard" is, by this
+        // exact same definition, ITS parent's final sealed shard, so
+        // recursing on `(lineage.parent, 0)` finds the nearest ancestor
+        // that ever actually sealed something, however many un-sealed
+        // hops lie between. Bounded by `split_lineage.len() + 1` recursive
+        // steps at most (it is a tree, never cyclic — the same bound
+        // `live_split_descendants`'s own forward DFS uses) so a corrupted/
+        // cyclic map can never spin this forever.
+        self.stream_shard_parent_id_bounded(tablet, self.split_lineage.len())
+    }
+
+    /// [`stream_shard_parent_id`](Self::stream_shard_parent_id)'s own
+    /// epoch-0 recursive step (issue #588) — `budget` is decremented on
+    /// every hop through an unsealed ancestor and the walk gives up
+    /// (`None`) if it ever reaches zero, rather than trusting
+    /// `split_lineage` to stay acyclic under a hypothetically corrupted
+    /// state. A legitimate tree can never exhaust this budget: each hop
+    /// visits a distinct tablet id (`split_lineage` is a tree keyed
+    /// child → parent) and `split_lineage.len()` upper-bounds how many
+    /// distinct tablets can possibly be children in it at all.
+    fn stream_shard_parent_id_bounded(&self, tablet: TabletId, budget: usize) -> Option<String> {
         let lineage = self.split_lineage.get(&tablet)?;
-        let parent_epoch = lineage.parents_final_epoch?;
-        Some(shard_id_string(lineage.parent, parent_epoch))
+        match lineage.parents_final_epoch {
+            Some(parent_epoch) => Some(shard_id_string(lineage.parent, parent_epoch)),
+            None if budget == 0 => None,
+            None => self.stream_shard_parent_id_bounded(lineage.parent, budget - 1),
+        }
     }
 
     /// `tablet`'s effective PITR watermark (ADR 0059 §9) — the identical
@@ -9955,6 +9992,107 @@ mod tests {
             m.stream_shard_parent_id(TabletId(2), 0),
             Some("shardId-1-2".to_owned()),
             "the split child's epoch-0 parent is retired tablet 1's final shard"
+        );
+    }
+
+    /// Issue #588: a cascading split can legitimately produce an
+    /// intermediate tablet that takes zero direct writes of its own before
+    /// splitting further (ADR 0043 §A3's "never seal an empty segment" —
+    /// not a race, the documented case `docs/engineering-lessons.md`'s
+    /// #580 entry names as a known-but-unaddressed edge case). Its own
+    /// `SplitLineage::parents_final_epoch` is legitimately `None` forever,
+    /// but its grandchildren must still resolve a real `ParentShardId` —
+    /// the nearest ancestor's own final sealed shard, walking past however
+    /// many never-sealed intermediate hops lie in between (ADR 0043's
+    /// 2026-09-04 amendment).
+    ///
+    /// Tree built here: 1 seals once, then splits into {2, 3}. 2 splits
+    /// again into {4, 5} **without ever sealing anything of its own** —
+    /// `split_lineage[2].parents_final_epoch == Some(_)` (tablet 1's real
+    /// final epoch), but tablet 2's OWN chain in `stream_shards` stays
+    /// empty. 4 and 5 must still resolve back to tablet 1's final shard,
+    /// not `None`. 3 (which DOES seal before its own further split into
+    /// {6, 7}) proves the ordinary one-hop case is unaffected by the walk.
+    #[test]
+    fn stream_shard_parent_id_walks_past_an_ancestor_that_never_sealed() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "events", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("events".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        // Tablet 1's own real, final sealed shard.
+        m.apply(&seal(&m, "events", "L1", 1, 0, 100));
+
+        // 1 -> {2, 3}: ordinary first-generation split.
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x4000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
+        assert_eq!(
+            m.split_lineage[&TabletId(2)].parents_final_epoch,
+            Some(0),
+            "test setup: tablet 2's own lineage names tablet 1's real final epoch"
+        );
+
+        // 2 -> {4, 5}: tablet 2 splits again having sealed NOTHING of its
+        // own (no `seal()` call for tablet 2 anywhere in this test) — the
+        // exact issue #588 shape.
+        split_tablet(
+            &mut m,
+            TabletId(2),
+            0x2000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(4),
+        );
+        assert_eq!(
+            m.split_lineage[&TabletId(4)].parents_final_epoch,
+            None,
+            "test setup: tablet 4's immediate parent (2) never sealed anything"
+        );
+        assert!(
+            m.stream_shard_chain("events", "L1", TabletId(2))
+                .next()
+                .is_none(),
+            "test setup: tablet 2 truly has zero sealed shards of its own"
+        );
+
+        // 3 seals once before ITS OWN further split into {6, 7} — the
+        // ordinary, unaffected one-hop case, proven alongside the walked
+        // case so a regression that broke the common path would show up
+        // here too.
+        m.apply(&seal(&m, "events", "L1", 3, 0, 150));
+        split_tablet(
+            &mut m,
+            TabletId(3),
+            0x6000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(6),
+        );
+
+        // The walked case: 4 and 5's epoch-0 `ParentShardId` must name
+        // tablet 1's real final shard (shardId-1-0), NOT `None` — walking
+        // straight past tablet 2's own empty chain.
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(4), 0),
+            Some("shardId-1-0".to_owned()),
+            "must walk past tablet 2's never-sealed lineage to tablet 1's real final shard"
+        );
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(5), 0),
+            Some("shardId-1-0".to_owned())
+        );
+
+        // The unaffected one-hop case: 6's parent link stays exactly
+        // tablet 3's own final shard.
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(6), 0),
+            Some("shardId-3-0".to_owned())
         );
     }
 }

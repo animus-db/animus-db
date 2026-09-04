@@ -138,6 +138,75 @@ impl DynamoAuthConfig {
     }
 }
 
+/// Cluster-wide operational knobs reachable from a [`ClusterConfig`] file
+/// (S-06) — previously these reached only `animusd --cluster N`'s in-process
+/// dev CLI flags (`run_in_process_cluster`/`run_in_process_split_cluster`),
+/// never a per-process real deployment (`--config`/`--node`, `animusd
+/// control`, `animusd data`). Every field is `#[serde(default)]` so an
+/// absent `cluster_settings` section (every pre-S-06 config) deserializes
+/// with every knob defaulting exactly as omitting its CLI flag already
+/// does. Units and semantics mirror the corresponding `animusd` CLI flag
+/// byte-for-byte (`main.rs`'s own module doc) — a `_secs` field is the
+/// flag's raw seconds value, never a [`std::time::Duration`], so this type
+/// stays trivially `Serialize`/`Deserialize`.
+///
+/// **Not every field applies on every deployment shape** — a node applies
+/// only the subset its own role can act on, and silently ignores the rest
+/// (the same config file is commonly deployed to every process in a
+/// cluster, control-only and data-only alike, so an inapplicable field
+/// present in it is normal, not a misconfiguration):
+/// - `orphan_sweep_after_secs` only matters to a node that runs a local
+///   control `RaftNode` (a combined `--config`/`--node` node or `animusd
+///   control`) — a data-only node has none and ignores it.
+/// - `stream_retention_secs` only matters to whichever node happens to be
+///   the control-plane **leader** (the segment janitor's own gate) — a
+///   data-only node's `ControlHandle` is always `Remote`, so it never runs
+///   that loop and ignores the field too.
+/// - The other five fields (`auto_split_bytes`, `auto_split_change_rate`,
+///   `quiesce_after_secs`, `stream_seal_bytes`, `stream_seal_age_secs`)
+///   apply to any data-hosting node (combined or data-only).
+///
+/// A CLI flag naming the same knob **and** a config file's `cluster_
+/// settings` section setting it is a hard startup error, checked field by
+/// field — the identical "specify it one way, not both" shape
+/// `apply_dynamo_auth_flag` (ADR 0057) already uses for `dynamo_auth`,
+/// never a silent precedence rule (see `main.rs`'s
+/// `resolve_cluster_settings`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterSettings {
+    /// `--auto-split-bytes B` (ADR 0034): a led tablet's own scoped bytes
+    /// threshold that triggers an auto-split.
+    #[serde(default)]
+    pub auto_split_bytes: Option<u64>,
+    /// `--auto-split-change-rate RATE` (ADR 0042 §14): a streamed led
+    /// tablet's own smoothed change-append rate (bytes/sec) threshold that
+    /// also triggers an auto-split.
+    #[serde(default)]
+    pub auto_split_change_rate: Option<u64>,
+    /// `--orphan-sweep-after SECS` (ADR 0040 PR6): the control-plane
+    /// leader's own never-activated-registration reclaim grace period; `0`
+    /// disables the sweep.
+    #[serde(default)]
+    pub orphan_sweep_after_secs: Option<u64>,
+    /// `--quiesce-after SECS` (ADR 0044 phase-1 PR7 / ADR 0048): the
+    /// idle-before-quiescing grace period for a data-plane CP group; `0`
+    /// disables quiescence entirely.
+    #[serde(default)]
+    pub quiesce_after_secs: Option<u64>,
+    /// `--stream-seal-bytes B` (ADR 0042 §13): the DynamoDB Streams
+    /// sealer's size trigger.
+    #[serde(default)]
+    pub stream_seal_bytes: Option<u64>,
+    /// `--stream-seal-age SECS` (ADR 0042 §13): the DynamoDB Streams
+    /// sealer's age trigger.
+    #[serde(default)]
+    pub stream_seal_age_secs: Option<u64>,
+    /// `--stream-retention SECS` (ADR 0042 §13 / ADR 0043 §A9): the segment
+    /// janitor's own retention grace period.
+    #[serde(default)]
+    pub stream_retention_secs: Option<u64>,
+}
+
 /// A whole-cluster configuration shared (identically) by every node's process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -148,6 +217,13 @@ pub struct ClusterConfig {
     /// to pre-ADR-0057 behavior. See [`DynamoAuthConfig`]'s own doc.
     #[serde(default)]
     pub dynamo_auth: Option<DynamoAuthConfig>,
+    /// Cluster-wide operational knobs (auto-split, quiesce, orphan-sweep,
+    /// stream-seal — S-06) — `None` (every pre-S-06 config) leaves every
+    /// knob at its CLI-flag-omitted default, byte-identical to before this
+    /// section existed. See [`ClusterSettings`]'s own doc for field-by-field
+    /// applicability and the CLI-flag-conflict contract.
+    #[serde(default)]
+    pub cluster_settings: Option<ClusterSettings>,
 }
 
 impl ClusterConfig {
@@ -181,6 +257,7 @@ impl ClusterConfig {
         Self {
             nodes,
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -216,6 +293,7 @@ impl ClusterConfig {
         Self {
             nodes,
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -503,5 +581,64 @@ mod tests {
         let err = ClusterConfig::from_json(&cfg.to_json())
             .expect_err("an empty dynamo_auth credentials map must be rejected at load");
         assert!(err.to_string().contains("credentials map is empty"));
+    }
+
+    // --- `cluster_settings` (S-06) ---------------------------------------
+
+    #[test]
+    fn cluster_settings_defaults_to_none_and_round_trips_absent() {
+        // A generated config carries no `cluster_settings` section, and it
+        // survives a JSON round trip as `None` — byte-identical to
+        // pre-S-06 behavior.
+        let cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(cfg.cluster_settings.is_none());
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(parsed.cluster_settings.is_none());
+
+        // An old-shaped config JSON with no `cluster_settings` key at all
+        // must still parse (`#[serde(default)]`, never a breaking
+        // requirement on an existing config file).
+        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let parsed = ClusterConfig::from_json(&bare).unwrap();
+        assert!(parsed.cluster_settings.is_none());
+    }
+
+    #[test]
+    fn cluster_settings_round_trips_every_field() {
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.cluster_settings = Some(ClusterSettings {
+            auto_split_bytes: Some(1_000_000),
+            auto_split_change_rate: Some(500),
+            orphan_sweep_after_secs: Some(120),
+            quiesce_after_secs: Some(10),
+            stream_seal_bytes: Some(4_194_304),
+            stream_seal_age_secs: Some(3600),
+            stream_retention_secs: Some(86_400),
+        });
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
+    }
+
+    #[test]
+    fn cluster_settings_partial_section_defaults_the_rest() {
+        // A hand-written config that sets only one field must not require
+        // every other field — each is independently `#[serde(default)]`.
+        let cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        let text = serde_json::json!({
+            "nodes": cfg.nodes,
+            "cluster_settings": { "auto_split_bytes": 2_000_000 }
+        })
+        .to_string();
+        let parsed = ClusterConfig::from_json(&text).unwrap();
+        let settings = parsed
+            .cluster_settings
+            .expect("a present section parses even with only one field set");
+        assert_eq!(settings.auto_split_bytes, Some(2_000_000));
+        assert_eq!(settings.quiesce_after_secs, None);
+        assert_eq!(settings.orphan_sweep_after_secs, None);
+        assert_eq!(settings.stream_seal_bytes, None);
+        assert_eq!(settings.stream_seal_age_secs, None);
+        assert_eq!(settings.stream_retention_secs, None);
+        assert_eq!(settings.auto_split_change_rate, None);
     }
 }

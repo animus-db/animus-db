@@ -2182,6 +2182,91 @@ pub(crate) struct AdminInfo {
     /// tablet as "over threshold, about to split" without hardcoding the
     /// value.
     pub(crate) auto_split_bytes_threshold: Option<u64>,
+    /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
+    /// root path — see [`StoreView`]. `None` on a control-only node: it
+    /// never provisions one ([`BoundControlNode::start_control_with`] takes
+    /// no `backup_store_config` at all — the capture driver only ever runs
+    /// on a node hosting the tablet it captures).
+    pub(crate) backup_store: Option<StoreView>,
+    /// This node's own **streams** segment store (ADR 0043 §A7b), same
+    /// redaction and the same control-only-node absence as
+    /// [`backup_store`](Self::backup_store) — the sealer only ever runs on a
+    /// node hosting the tablet it seals.
+    pub(crate) segment_store: Option<StoreView>,
+    /// The ADR 0048 quiescence threshold this node's reconciler was
+    /// actually started with, in milliseconds — `None` when quiescence is
+    /// off (`0`, or a data-only node whose config carries no
+    /// `cluster_settings.quiesce_after_secs`, S-06's only route to the knob
+    /// there) or structurally inapplicable (a control-only node hosts no
+    /// CP-data tablet to quiesce). See `crates/animusd/CLAUDE.md`'s
+    /// Quiescence section.
+    pub(crate) quiesce_after_ms: Option<u64>,
+    /// Whether this node's client DynamoDB port enforces SigV4 (ADR 0057) —
+    /// `Some(true)`/`Some(false)` on a role that binds the dynamo listener
+    /// (combined/data), `None` on a control-only node (the listener is
+    /// never bound there, so "enabled" doesn't apply — mirrors
+    /// [`dynamo_addr`](Self::dynamo_addr)'s own `None`).
+    pub(crate) auth_enabled: Option<bool>,
+    /// The configured SigV4 credential store's access key **ids** — never
+    /// the secret keys, which never leave [`ClientCtx::dynamo_auth`].
+    /// `Some` only when [`auth_enabled`](Self::auth_enabled) is
+    /// `Some(true)`; `None` whenever it is or `Some(false)` (nothing
+    /// configured — a validated `dynamo_auth` section can't be empty) or
+    /// `None` (not applicable to this role).
+    pub(crate) auth_access_key_ids: Option<Vec<String>>,
+    /// The OTLP endpoint tracing export currently resolves to
+    /// (`otel::resolved_endpoint`, ADR 0027) — `None` when
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is unset/empty, i.e. export is off.
+    /// Process-wide, not per-role, but captured here alongside every other
+    /// admin-view fact rather than re-read from the environment on every
+    /// `/admin/config` request.
+    pub(crate) otlp_endpoint: Option<String>,
+}
+
+/// A redacted description of one of this node's configured
+/// [`SegmentStoreHandle`]/[`BackupStoreHandle`] instances, for the admin
+/// `/admin/config` view (ADR 0020) — kind (`"cluster"`/`"fs"`) plus, for the
+/// `fs` opt-in, its configured root path. **Never** a credential: neither
+/// variant carries one today (`Cluster` dials cluster peers over the same
+/// internal `Env` network every other intra-cluster RPC already uses;
+/// `Fs`/`FsSegmentStore` is a bare local/shared directory with no
+/// authentication of its own) — an S3-backed variant, when one lands, is
+/// the thing to extend this type for, not something to bolt onto the view
+/// function.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StoreView {
+    pub(crate) kind: &'static str,
+    pub(crate) path: Option<String>,
+}
+
+impl From<&SegmentStoreConfig> for StoreView {
+    fn from(config: &SegmentStoreConfig) -> Self {
+        match config {
+            SegmentStoreConfig::Cluster => StoreView {
+                kind: "cluster",
+                path: None,
+            },
+            SegmentStoreConfig::Fs(path) => StoreView {
+                kind: "fs",
+                path: Some(path.display().to_string()),
+            },
+        }
+    }
+}
+
+impl From<&BackupStoreConfig> for StoreView {
+    fn from(config: &BackupStoreConfig) -> Self {
+        match config {
+            BackupStoreConfig::Cluster => StoreView {
+                kind: "cluster",
+                path: None,
+            },
+            BackupStoreConfig::Fs(path) => StoreView {
+                kind: "fs",
+                path: Some(path.display().to_string()),
+            },
+        }
+    }
 }
 
 /// Project the replicated schema catalog into animusd console's own
@@ -2377,6 +2462,55 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
     }
 }
 
+/// This table's continuous-backups (PITR) status, console-shaped (U-03,
+/// ADR 0059 §9) — reuses [`dynamo::pitr_description`] verbatim (the exact
+/// computation `DescribeContinuousBackups` already performs) rather than
+/// re-deriving the restore window a second way; `None` when PITR is
+/// disabled (`PitrDescription::enabled == false`), mirroring
+/// [`console::PitrStatus`]'s own doc on why `Option` replaces an inner
+/// `enabled` field here.
+fn console_pitr_status(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Option<console::PitrStatus> {
+    let d = dynamo::pitr_description(ctx, meta, table);
+    d.enabled.then_some(console::PitrStatus {
+        earliest_restorable_ms: d.earliest_restorable_ms,
+        latest_restorable_ms: d.latest_restorable_ms,
+    })
+}
+
+/// This table's own on-demand backups, console-shaped (U-03, ADR 0059
+/// §3/§4) — `meta.backups` filtered to rows naming `table`, excluding a
+/// PITR base snapshot (an internal, `System`-typed backup — see
+/// [`console::BackupSummary`]'s own doc) and any row already `Expired`/
+/// `Failed` (the identical "already gone" filter [`visible_backup`]/
+/// [`list_backups`] apply, generalized here to one table's own rows).
+/// `meta.backups` is a `BTreeMap<BackupId, _>`, so this is already in
+/// ascending backup-id order with no separate sort. **Deliberately never
+/// includes a backup whose *source table* was later dropped** — this is
+/// the live-table detail page (see [`console::TableDetail::backups`]'s own
+/// doc); a backup outliving its source table is reached only via
+/// `DescribeBackup`/`ListBackups` directly, never through here.
+fn console_table_backups(meta: &Metadata, table: &str) -> Vec<console::BackupSummary> {
+    meta.backups
+        .iter()
+        .filter(|(id, row)| row.table == table && !meta.pitr_base_backups.contains(*id))
+        .filter(|(_, row)| {
+            !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            )
+        })
+        .map(|(backup_id, row)| console::BackupSummary {
+            backup_id: backup_id.clone(),
+            status: dynamo::backup_wire_status(&row.status).to_string(),
+            created_wall_ms: row.manifest.created_wall_ms,
+        })
+        .collect()
+}
+
 /// Project one table's full configuration for animusd console's table page
 /// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
 /// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
@@ -2389,7 +2523,16 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
 /// `is_index_table_name` check here is belt-and-suspenders, matching that
 /// function's own comment on why it keeps the filter despite the invariant
 /// holding elsewhere today).
-fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDetail> {
+///
+/// **U-03**: also projects `pitr`/`backups` (via [`console_pitr_status`]/
+/// [`console_table_backups`] above) — needs `ctx` (not just `meta`) purely
+/// for `dynamo::pitr_description`'s `ctx.env.wall_now()` read (ADR 0051
+/// discipline: the pure catalog carries no clock of its own).
+fn console_table_detail(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Option<console::TableDetail> {
     if animus_dynamo::index::is_index_table_name(table) {
         return None;
     }
@@ -2439,6 +2582,8 @@ fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDe
         lsis,
         stream: console_stream_summary(schema),
         ttl: console_ttl_summary(schema),
+        pitr: console_pitr_status(ctx, meta, table),
+        backups: console_table_backups(meta, table),
     })
 }
 
@@ -2687,6 +2832,44 @@ impl console::ConsoleBackend for ClientCtx {
                 .collect();
             body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
         }
+        // Roadmap W-11: `AttributeDefinitions` must cover every key
+        // attribute the request's own `KeySchema` names — the base table's
+        // (already declared above) *and* every GSI/LSI's own hash/sort
+        // attribute. This form collects no type for an index-only key
+        // attribute (`CreateGsiRequest`/`CreateLsiRequest` carry key
+        // attribute *names* only — see `console::CreateTableRequest`'s own
+        // doc for why that's a deliberate console-form scope cut, not a
+        // mechanism gap), so default each to `"S"`, the same default
+        // `schema::column_type_for(None)` already applies bridge-side.
+        let declared: std::collections::BTreeSet<String> = body["AttributeDefinitions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["AttributeName"].as_str().map(str::to_owned))
+            .collect();
+        let mut extra_names: Vec<String> = Vec::new();
+        for g in &req.gsis {
+            if !g.hash_attribute.trim().is_empty() {
+                extra_names.push(g.hash_attribute.clone());
+            }
+            if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
+                extra_names.push(sort.to_owned());
+            }
+        }
+        for l in &req.lsis {
+            if !l.sort_attribute.trim().is_empty() {
+                extra_names.push(l.sort_attribute.clone());
+            }
+        }
+        let mut seen = declared;
+        let defs = body["AttributeDefinitions"].as_array_mut().unwrap();
+        for name in extra_names {
+            if seen.insert(name.clone()) {
+                defs.push(serde_json::json!({
+                    "AttributeName": name, "AttributeType": "S",
+                }));
+            }
+        }
         if req.stream_enabled {
             body["StreamSpecification"] = serde_json::json!({
                 "StreamEnabled": true,
@@ -2723,13 +2906,13 @@ impl console::ConsoleBackend for ClientCtx {
         }
 
         let meta = self.metadata_fresh().await;
-        console_table_detail(&meta, table_name).ok_or_else(|| {
+        console_table_detail(self, &meta, table_name).ok_or_else(|| {
             console::ConsoleError::new(500, "table created but not found in the catalog")
         })
     }
 
     async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
-        console_table_detail(&self.effective_metadata(), table)
+        console_table_detail(self, &self.effective_metadata(), table)
     }
 
     async fn add_gsi(
@@ -2758,35 +2941,39 @@ impl console::ConsoleBackend for ClientCtx {
                 "AttributeName": sort_attribute, "KeyType": "RANGE",
             }));
         }
-        // Issue #319: an `AttributeDefinitions` entry for each attribute the
-        // request actually gave a type for — `UpdateTable`'s GSI-create
-        // decoder now reads it (`wire::decode_update_table`), so a type
-        // supplied here really does survive into the catalog. An omitted
-        // type (the common case, and every pre-#319 caller) sends no entry
-        // for that attribute, the identical untyped shape as before.
-        let mut attribute_definitions = Vec::new();
-        if let Some(ty) = console_validate_attribute_type(req.hash_attribute_type.as_deref())? {
+        // Issue #319: an `AttributeDefinitions` entry carries the request's
+        // own declared type when it gave one — `UpdateTable`'s GSI-create
+        // decoder reads it (`wire::decode_update_table`), so a type
+        // supplied here really does survive into the catalog. Roadmap
+        // W-11: unlike before, an entry is now sent even when the request
+        // gave no type — `wire::decode_update_table` now rejects a
+        // `GlobalSecondaryIndexUpdates` `Create` whose own key attribute(s)
+        // have no `AttributeDefinitions` entry at all, so an omitted type
+        // (this form has no picker for it, unlike the Add-GSI form's own
+        // optional fields) defaults to `"S"`, the same default
+        // `schema::column_type_for(None)` already applies bridge-side —
+        // this genuinely widens what gets recorded (`hash_attribute_type`
+        // is `Some(String)` now, not `None`); see
+        // `docs/engineering-lessons.md`'s W-11 entry.
+        let hash_ty =
+            console_validate_attribute_type(req.hash_attribute_type.as_deref())?.unwrap_or("S");
+        let mut attribute_definitions = vec![serde_json::json!({
+            "AttributeName": req.hash_attribute, "AttributeType": hash_ty,
+        })];
+        if let Some(sort_attribute) = sort_attribute {
+            let sort_ty =
+                console_validate_attribute_type(req.sort_attribute_type.as_deref())?.unwrap_or("S");
             attribute_definitions.push(serde_json::json!({
-                "AttributeName": req.hash_attribute, "AttributeType": ty,
+                "AttributeName": sort_attribute, "AttributeType": sort_ty,
             }));
         }
-        if let (Some(sort_attribute), Some(ty)) = (
-            sort_attribute,
-            console_validate_attribute_type(req.sort_attribute_type.as_deref())?,
-        ) {
-            attribute_definitions.push(serde_json::json!({
-                "AttributeName": sort_attribute, "AttributeType": ty,
-            }));
-        }
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "TableName": table,
+            "AttributeDefinitions": attribute_definitions,
             "GlobalSecondaryIndexUpdates": [
                 {"Create": {"IndexName": req.index_name, "KeySchema": key_schema}}
             ],
         });
-        if !attribute_definitions.is_empty() {
-            body["AttributeDefinitions"] = serde_json::Value::Array(attribute_definitions);
-        }
         let payload = serde_json::to_vec(&body).unwrap_or_default();
         let (status, resp_body) =
             crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
@@ -3258,6 +3445,8 @@ fn spawn_common_tail(
     control: ControlHandle,
     edge: ClusterEdgeState,
     data: Option<DataRole>,
+    segment_store: SegmentStoreHandle,
+    backup_store: BackupStoreHandle,
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
@@ -3283,6 +3472,8 @@ fn spawn_common_tail(
         edge,
         env,
         data,
+        segment_store,
+        backup_store,
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -3685,6 +3876,15 @@ impl BoundNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            backup_store: Some((&backup_store_config).into()),
+            segment_store: Some((&segment_store_config).into()),
+            quiesce_after_ms: (!quiesce_after.is_zero())
+                .then_some(quiesce_after.as_millis() as u64),
+            auth_enabled: Some(dynamo_auth.is_some()),
+            auth_access_key_ids: dynamo_auth
+                .as_ref()
+                .map(|creds| creds.keys().cloned().collect()),
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         // Keep a clone of the one internal env so [`Node::shutdown`] can abort
@@ -3827,8 +4027,6 @@ impl BoundNode {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
-            segment_store,
-            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
         };
@@ -3836,6 +4034,8 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             edge.clone(),
             Some(data_role),
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -4304,6 +4504,7 @@ impl Node {
         Ok(BoundControlNode {
             id,
             env,
+            dir,
             internal_addr,
             client_listener,
             client_addr,
@@ -4634,6 +4835,15 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct BoundControlNode {
     id: NodeId,
     env: ProdEnv,
+    /// This node's own data directory (ADR 0040 PR1's `--dir`) — **not**
+    /// where the dedicated system-keyspace engine lives (that's
+    /// `dir.join("internal")`, via `ProdEnv::bind`); this is the directory
+    /// [`build_segment_store`]/[`build_backup_store`] root their own local
+    /// `FsSegmentStore` building block at (`dir.join("segments")`), mirroring
+    /// [`BoundNode::dir`]/[`BoundDataNode::dir`] (W-10, ADR 0043 §A9 — a
+    /// control-only node now provisions these handles too, see
+    /// [`start_control_with`](Self::start_control_with)'s doc).
+    dir: PathBuf,
     internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
@@ -4717,6 +4927,22 @@ impl BoundControlNode {
     /// of the apply task's published cache (`Metadata: DRIVER_APPLIED`)
     /// rather than an optional shadow mirror.
     ///
+    /// `segment_store_config`/`backup_store_config`/`stream_retention` (W-10,
+    /// ADR 0043 §A9's control-only-leader gap — closed): this node's own
+    /// [`SegmentStoreHandle`]/[`BackupStoreHandle`], built exactly the way
+    /// [`BoundNode::start_with_streams`]/[`BoundDataNode::
+    /// start_data_with_streams`] build theirs (`build_segment_store`/
+    /// `build_backup_store`, rooted at `self.dir.join("segments")`) —
+    /// **unlike [`DataRole`], never gated on running the data role**: a
+    /// control-only node can genuinely become the control-plane leader (ADR
+    /// 0035) and needs these handles to physically delete/repair stream
+    /// segment objects and reclaim backup objects for as long as it leads
+    /// (`segment_janitor`/`backup_janitor`/`backup_completion`/
+    /// `pitr_janitor`, all spawned below) — see each module's own doc for
+    /// what a control-only leader used to skip. `stream_retention` threads
+    /// through to the segment janitor exactly as [`BoundNode::
+    /// start_with_streams`]'s own parameter of the same name does.
+    ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
     #[allow(clippy::too_many_arguments)]
@@ -4729,6 +4955,9 @@ impl BoundControlNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
+        segment_store_config: SegmentStoreConfig,
+        backup_store_config: BackupStoreConfig,
+        stream_retention: Duration,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4757,6 +4986,16 @@ impl BoundControlNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold: None,
+            // A control-only node never provisions a backup/segment store,
+            // never runs the tablet-host reconciler (nothing to quiesce),
+            // and never binds the dynamo listener (so SigV4 enforcement
+            // doesn't apply) — see each field's own doc on `AdminInfo`.
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         let control_metrics = self.env.metrics();
@@ -4766,6 +5005,11 @@ impl BoundControlNode {
         let engine_env = self.env.clone();
         // Keep a clone for peer-sync (below) before the env is consumed.
         let sync_env = self.env.clone();
+        // Keep a clone for `segment_store`/`backup_store` (below, built
+        // after `raft` exists — also before `self.env` is consumed by the
+        // `RaftNode::start_with_orphan_sweep_after` call inside the match
+        // just below).
+        let store_env = self.env.clone();
         // Keep a clone of this control-only node's dedicated engine for admin
         // introspection (`/admin/storage/control`, ADR 0038 PR4) — a second,
         // read-only handle onto the same live engine; the apply task's own
@@ -4813,10 +5057,36 @@ impl BoundControlNode {
         let edge = ClusterEdgeState::new();
         edge.register_control(raft.clone());
 
+        // This node's stream-shard segment store (ADR 0043 §A7b) — see
+        // `BoundNode::start_with_streams`'s identical construction; `control`
+        // here is `ControlHandle::Local`, which `ControlPlacementView` reads
+        // through unchanged. **W-10 (ADR 0043 §A9's control-only-leader gap,
+        // closed)**: unlike `DataRole`'s fields, this is provisioned
+        // regardless of data role — see `ClientCtx::segment_store`'s own doc
+        // for why it lives outside `DataRole`.
+        let segment_store = build_segment_store(
+            &store_env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            self.id.clone(),
+            &segment_store_config,
+        );
+        // This node's backup store (ADR 0059 §1) — see `segment_store`'s
+        // doc immediately above for why this is provisioned here too.
+        let backup_store = build_backup_store(
+            &store_env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            self.id.clone(),
+            &backup_store_config,
+        );
+
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge,
             None,
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -4855,20 +5125,19 @@ impl BoundControlNode {
 
         // The segment janitor (ADR 0043 §A9, round-3 PR7): a control-only
         // node can genuinely become the control-plane leader (ADR 0035
-        // split deployment), so it needs this loop too — retention
-        // *marking* and the drop-table retention-zero rule need only
-        // `Metadata`, which this node has. See `segment_janitor.rs`'s own
-        // doc for the documented gap this leaves (phases 2/3 — object
-        // deletion and replica repair — need a `SegmentStoreHandle`, which
-        // no control-only node provisions; a **pure** split deployment
-        // therefore never runs those two phases today). No CLI/config knob
-        // exists yet for a control-only node's own retention period —
-        // mirroring `StreamSealKnobs`/`SegmentStoreConfig`'s own documented
-        // "the split-deployment CLI path is a named follow-up" precedent —
-        // so this always uses the production default.
+        // split deployment), so it needs this loop too. **W-10 (closed)**:
+        // every phase now runs here, not just retention *marking* and the
+        // drop-table retention-zero rule — phases 2/3 (object deletion,
+        // replica repair) have a real `SegmentStoreHandle` to work with
+        // (`segment_store`, built above), the identical handle a combined
+        // or data-only leader's own leadership stint would use. See
+        // `segment_janitor.rs`'s own module doc for the full design.
+        // `stream_retention` threads through from the caller exactly as
+        // `BoundNode::start_with_streams`'s own parameter of the same name
+        // does — no longer hardcoded to the production default.
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
-            DEFAULT_STREAM_RETENTION,
+            stream_retention,
         )));
 
         // The secondary-index backfill-completion aggregator (ADR 0045 §4):
@@ -4882,40 +5151,37 @@ impl BoundControlNode {
 
         // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
         // 1 PR③): a control-only node can genuinely become the control-plane
-        // leader (ADR 0035 split deployment), so it needs this loop too —
-        // *failing* a stuck backup needs only `Metadata`, but *completing*
-        // one needs a `BackupStoreHandle` to durably `put` the manifest,
-        // which no control-only node provisions — see
-        // `backup_completion.rs`'s own doc for the documented gap this
-        // leaves (a pure split deployment's control-only leader marks a
-        // fully-captured backup ready but cannot itself flip it to
-        // `Available`, until a data-capable node takes the lead instead).
+        // leader (ADR 0035 split deployment), so it needs this loop too.
+        // **W-10 (closed)**: *completing* a backup (durably `put`-ing the
+        // manifest) now works here too — `ctx.backup_store` (built above)
+        // is a real handle regardless of data role. See
+        // `backup_completion.rs`'s own doc for the full design.
         tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
             ctx.clone(),
         )));
 
         // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): a
         // control-only node can genuinely become the control-plane leader
-        // (ADR 0035 split deployment), so it needs this loop too — the
-        // *mark* half (a wire `DeleteBackup` proposing `MarkBackupDeleted`)
-        // needs only `Metadata`, but the actual object reclaim needs a
-        // `BackupStoreHandle`, which no control-only node provisions — see
-        // `backup_janitor.rs`'s own doc for the documented gap this leaves
-        // (identical shape to the segment janitor's own, above): rows
-        // accumulate marked-but-unreclaimed until a data-capable node takes
-        // the lead instead.
+        // (ADR 0035 split deployment), so it needs this loop too. **W-10
+        // (closed)**: the actual object reclaim now works here too, via the
+        // same `ctx.backup_store` handle every other node shape uses — see
+        // `backup_janitor.rs`'s own doc for the full design.
         tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
         )));
 
         // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3): a
         // control-only node can genuinely become the control-plane leader
-        // (ADR 0035 split deployment), so it needs both loops too — the
-        // identical documented gap as the segment/backup janitors above:
-        // marking needs only `Metadata`, but the snapshot loop's own
-        // `BeginBackup` capture and the retention loop's own segment-object
-        // reclaim both need a data role no control-only node provisions
-        // (see `pitr_janitor.rs`'s own doc).
+        // (ADR 0035 split deployment), so it needs both loops too. **W-10
+        // (closed)**: the retention loop's own segment-object reclaim now
+        // works here too, via `ctx.backup_store`. The snapshot loop's own
+        // `BeginBackup` **capture** step is unaffected by this fix and stays
+        // structurally inert on a control-only leader for an unrelated
+        // reason — capture is per-tablet, leader-side (`backup_capture.rs`),
+        // and a control-only node never hosts (so never leads) a CP-data
+        // tablet; a control-only leader still correctly proposes
+        // `BeginBackup`/tags rows, it just never has a tablet of its own to
+        // capture from — see `pitr_janitor.rs`'s own doc.
         tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
             ctx.clone(),
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -5105,6 +5371,7 @@ impl BoundDataNode {
             stream_seal_knobs,
             segment_store_config,
             None,
+            Duration::ZERO,
             None,
             BackupStoreConfig::default(),
         )
@@ -5127,6 +5394,13 @@ impl BoundDataNode {
     /// backup store handle too (ADR 0059's own asymmetry is that a
     /// *control-only* node gets none — see [`BoundControlNode::
     /// start_control_with`], which takes no such parameter at all).
+    ///
+    /// `quiesce_after` (ADR 0044 phase-1 / ADR 0048, S-06): closes the
+    /// documented gap this method used to have (see `animusd/CLAUDE.md`'s
+    /// Quiescence section, pre-S-06) — a data-only node's own tablet-host
+    /// reconciler now enables quiescence exactly like [`BoundNode::
+    /// start_with_growth`]'s combined-mode reconciler does, same
+    /// `Duration::ZERO`-disables/`MIN_QUIESCE_AFTER`-floor contract.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5142,6 +5416,7 @@ impl BoundDataNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
+        quiesce_after: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
@@ -5186,6 +5461,18 @@ impl BoundDataNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            backup_store: Some((&backup_store_config).into()),
+            segment_store: Some((&segment_store_config).into()),
+            // S-06 wired `quiesce_after` through this data-only path (via
+            // `cluster_settings.quiesce_after_secs`), so report it exactly
+            // as the combined-mode assembly does: `null` only when disabled.
+            quiesce_after_ms: (!quiesce_after.is_zero())
+                .then_some(quiesce_after.as_millis() as u64),
+            auth_enabled: Some(dynamo_auth.is_some()),
+            auth_access_key_ids: dynamo_auth
+                .as_ref()
+                .map(|creds| creds.keys().cloned().collect()),
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         let envs = vec![self.env.clone()];
@@ -5231,8 +5518,6 @@ impl BoundDataNode {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
-            segment_store,
-            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
         };
@@ -5240,6 +5525,8 @@ impl BoundDataNode {
             control,
             edge.clone(),
             Some(data_role),
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -5266,7 +5553,7 @@ impl BoundDataNode {
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
         // shape to `BoundNode::start_with`'s.
-        let reconciler = {
+        let mut reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
             let base_id = my_id.clone();
@@ -5298,6 +5585,20 @@ impl BoundDataNode {
                 )),
             }
         };
+        // ADR 0044 phase-1 / ADR 0048 (S-06 closes the documented gap this
+        // path used to have): identical contract to `BoundNode::
+        // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
+        // (every pre-S-06 call site) disables it entirely, zero behavior
+        // change.
+        if !quiesce_after.is_zero() {
+            debug_assert!(
+                quiesce_after >= MIN_QUIESCE_AFTER,
+                "quiesce_after ({quiesce_after:?}) must be at least \
+                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) or 0 to disable \
+                 quiescence — see that constant's own doc"
+            );
+            reconciler.enable_quiescence(quiesce_after);
+        }
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
         // to register members against; that is entirely the control
@@ -5359,9 +5660,8 @@ impl BoundDataNode {
 
         // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
         // just above. No test-tunable interval knob on this data-only path
-        // yet (mirrors `quiesce_after`'s own documented gap for
-        // `start_data_with_growth`, `animusd/CLAUDE.md`'s Quiescence
-        // section) — always the production default.
+        // yet (unlike `quiesce_after`, which closed its own equivalent gap
+        // here — S-06) — always the production default.
         tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
             ctx.clone(),
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
@@ -6285,16 +6585,6 @@ struct DataRole {
     /// wait for its own group to form" from "this node hosts nothing for the tablet,
     /// so forward."
     pub(crate) base_id: NodeId,
-    /// This node's stream-shard [`SegmentStoreHandle`] (ADR 0043 §A7b) — the
-    /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
-    /// `change_consumer_loop` seal arm's only consumer today.
-    pub(crate) segment_store: SegmentStoreHandle,
-    /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — a
-    /// second, backup-dedicated store handle alongside `segment_store`
-    /// above, built from its own `--backup-store` CLI knob. Consumed by the
-    /// per-tablet capture driver (`backup_capture.rs`) and the completion
-    /// aggregator (`backup_completion.rs`) since ADR 0059 Train 1 PR③.
-    pub(crate) backup_store: BackupStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,
     /// Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
@@ -6347,6 +6637,28 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// [`DataRole`]'s doc. `None` on a control-only node (ADR 0035 PR3).
     /// Access via [`data`](Self::data), not directly.
     data: Option<DataRole>,
+    /// This node's stream-shard [`SegmentStoreHandle`] (ADR 0043 §A7b) — the
+    /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
+    /// `change_consumer_loop` seal arm's only consumer today. **Provisioned
+    /// on every node shape, including a control-only one (W-10, ADR 0043
+    /// §A9's control-only-leader gap, closed):** unlike [`DataRole`]'s own
+    /// fields, this is never gated on running the data role — a
+    /// control-only node can genuinely become the control-plane leader (ADR
+    /// 0035) and, as the `segment_janitor` loop's own module doc
+    /// describes, its retention-reclaim and replica-repair phases need this
+    /// handle regardless of whether the leader also hosts tablets. Lives at
+    /// the top level of [`ClientCtx`] rather than inside [`DataRole`]
+    /// precisely so it is never behind that `Option`.
+    pub(crate) segment_store: SegmentStoreHandle,
+    /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — the
+    /// `segment_store` field's twin for the on-demand backup/PITR
+    /// subsystem's own, independently-configured object namespace. Consumed
+    /// by the per-tablet capture driver (`backup_capture.rs`), the
+    /// completion aggregator (`backup_completion.rs`), and the backup/PITR
+    /// janitors. **Provisioned on every node shape, including a
+    /// control-only one (W-10)** — see `segment_store`'s doc above for why
+    /// this lives here rather than inside [`DataRole`].
+    pub(crate) backup_store: BackupStoreHandle,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -6438,18 +6750,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         self.data
             .as_ref()
             .expect("ClientCtx::data called on a control-only node (ADR 0035 PR3)")
-    }
-
-    /// Like [`data`](Self::data), but a non-panicking `Option` — for a path
-    /// that genuinely may run on a control-only node and must degrade
-    /// gracefully instead of asserting a data role exists. The segment
-    /// janitor (`segment_janitor.rs`, ADR 0043 §A9, round-3 PR7) is the one
-    /// caller today: it may run on **any** node that can become the
-    /// control-plane leader, including a control-only one (ADR 0035),
-    /// which has no [`SegmentStoreHandle`] at all — see that module's own
-    /// doc for the documented scope this gates.
-    pub(crate) fn data_opt(&self) -> Option<&DataRole> {
-        self.data.as_ref()
     }
 
     /// This node's best available **cache-tolerant** view of the cluster's
@@ -9658,6 +9958,15 @@ pub async fn start_split_cluster_with_growth(
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
+                // `--segment-store`/`--backup-store` don't thread through
+                // this dev-only split-cluster path yet (a documented gap
+                // matching `--quiesce-after`'s own, `main.rs`'s module doc) —
+                // this still closes W-10's own gap for this path, since the
+                // default `Cluster` store is a real, working handle, not the
+                // total absence a control-only leader used to have.
+                SegmentStoreConfig::default(),
+                BackupStoreConfig::default(),
+                DEFAULT_STREAM_RETENTION,
             )
             .await?,
         );
@@ -9679,6 +9988,11 @@ pub async fn start_split_cluster_with_growth(
                 StreamSealKnobs::default(),
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
+                // `--quiesce-after` doesn't thread through the
+                // `--cluster-control`/`--cluster-data` dev path yet — the
+                // same documented gap `run`'s own module doc names (S-06
+                // scoped only the three real deployment paths).
+                Duration::ZERO,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
             )
@@ -9810,6 +10124,8 @@ pub async fn run_node_with_streams_and_quiesce_after(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -9851,6 +10167,8 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
@@ -9893,6 +10211,56 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        None,
+        None,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams_quiesce_and_backup_store`], but also exposes
+/// **auto-split** (ADR 0034 / ADR 0042 §14, S-06) instead of pinning both
+/// triggers at `None` — `--config FILE --node I`'s only route to auto-split
+/// at all before S-06 (previously reachable solely via `--cluster N`'s
+/// dev-only in-process mode). `main.rs`'s `run_single` is this function's
+/// one real caller; every other existing call site above keeps compiling
+/// and behaving identically at `None`/`None` (no auto-split, unchanged).
+/// TTL sweep interval and PITR snapshot cadence stay pinned at their own
+/// production defaults, same as [`run_node_with_streams_quiesce_and_backup_
+/// store`] — a caller needing those tunable too calls [`run_node_with_
+/// streams_quiesce_and_ttl_sweep_interval`] directly.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_cluster_settings(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        auto_split_bytes,
+        auto_split_change_rate,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -9910,6 +10278,18 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// discipline — never wait out a real minute) calls this directly, or its
 /// single-knob convenience sibling [`run_node_with_ttl_sweep_interval`].
 ///
+/// `auto_split_bytes`/`auto_split_change_rate` (ADR 0034 / ADR 0042 §14,
+/// S-06): threaded straight to [`BoundNode::start_with_growth`]'s own knobs
+/// of the same name — `None` (every existing call site below) is
+/// byte-identical to before this pair of parameters existed. `--config
+/// FILE --node I`'s only path to auto-split before S-06 was none at all
+/// (only `--cluster N`'s dev in-process mode had the CLI flags); `main.rs`'s
+/// `run_single` is this pair's one real caller, reached by calling this
+/// innermost layer directly rather than growing every wrapper above by two
+/// more parameters — the same "call the innermost layer directly for a
+/// knob its wrappers don't expose" convention `dynamo_auth`
+/// (`run_node_data`'s doc) already established.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -9923,6 +10303,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     ttl_sweep_interval: Duration,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
@@ -9984,13 +10366,13 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
+            auto_split_bytes,
             admin_addrs,
             orphan_sweep_after,
             stream_seal_knobs,
             segment_store_config,
             stream_retention,
-            None,
+            auto_split_change_rate,
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
@@ -10027,6 +10409,8 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        None,
+        None,
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10089,6 +10473,42 @@ pub async fn run_node_control_with_orphan_sweep_after(
     backend: StorageBackend,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Node> {
+    run_node_control_with_stores(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+    )
+    .await
+}
+
+/// Like [`run_node_control_with_orphan_sweep_after`], but also configures
+/// this control-only node's own [`SegmentStoreHandle`]/[`BackupStoreHandle`]/
+/// stream-retention period (W-10, ADR 0043 §A9's control-only-leader gap —
+/// closed) instead of the `Cluster`/`Cluster`/[`DEFAULT_STREAM_RETENTION`]
+/// defaults — the innermost layer, mirroring [`BoundNode::
+/// start_with_streams`]'s own layered-wrapper convention: `animusd control`'s
+/// `--segment-store`/`--backup-store` CLI flags thread through here exactly
+/// as the combined path's own flags of the same name thread through
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`].
+///
+/// # Errors
+/// As [`run_node_control`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_control_with_stores(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+    stream_retention: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -10137,6 +10557,9 @@ pub async fn run_node_control_with_orphan_sweep_after(
             admin_addrs,
             backend,
             orphan_sweep_after,
+            segment_store_config,
+            backup_store_config,
+            stream_retention,
         )
         .await
 }
@@ -10169,6 +10592,87 @@ pub async fn run_node_data(
     index: usize,
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
+) -> std::io::Result<Node> {
+    run_node_data_with_cluster_settings(
+        config,
+        index,
+        dir,
+        backend,
+        None,
+        None,
+        Duration::ZERO,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
+}
+
+/// Like [`run_node_data`], but also configures the DynamoDB Streams sealer's
+/// own size/age knobs and segment-store selection — the data-only sibling of
+/// [`BoundNode::start_with_streams`]'s own layered-wrapper convention: every
+/// existing `run_node_data` call site keeps compiling and behaving
+/// identically (production knobs, the default `Cluster` store); a test that
+/// needs tiny seal thresholds (this codebase's own testing discipline —
+/// never wait out a 4-hour age trigger) calls this directly. Pairs with
+/// [`run_node_control_with_stores`]'s own `stream_retention` parameter for a
+/// genuine split-topology segment-janitor test (see `tests/stream_janitor.rs`).
+/// A thin wrapper over [`run_node_data_with_cluster_settings`] with every
+/// S-06 cluster-settings knob at its pre-S-06 default.
+///
+/// # Errors
+/// As [`run_node_data`].
+pub async fn run_node_data_with_streams(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+) -> std::io::Result<Node> {
+    run_node_data_with_cluster_settings(
+        config,
+        index,
+        dir,
+        backend,
+        None,
+        None,
+        Duration::ZERO,
+        stream_seal_knobs,
+        segment_store_config,
+    )
+    .await
+}
+
+/// Like [`run_node_data`], but also exposes the knobs `animusd data
+/// --config`'s own `cluster_settings`-carrying [`ClusterConfig`] can now
+/// reach (S-06): auto-split (ADR 0034 / ADR 0042 §14), quiescence (ADR 0044
+/// phase-1 / ADR 0048), and the Streams sealer's size/age triggers (ADR
+/// 0042 §13) — every one of these applies to a data-hosting node exactly as
+/// it does on the combined-mode path (`run_node_with_streams_quiesce_and_
+/// ttl_sweep_interval`'s own doc), unlike `orphan_sweep_after`/
+/// `stream_retention`, which stay unreachable here since a data-only node
+/// runs no local control `RaftNode` and is never a control-plane leader —
+/// see [`config::ClusterSettings`]'s own doc for the full per-field
+/// applicability breakdown. Every default
+/// below (`None`/`Duration::ZERO`/[`StreamSealKnobs::default`]/
+/// [`SegmentStoreConfig::default`]) is byte-identical to [`run_node_data`]'s
+/// own pre-S-06 behavior. `segment_store_config` is W-10's own knob (the
+/// same one [`run_node_data_with_streams`] exposes); `animusd data --config`
+/// has no flag for it yet, so `main.rs` passes the default.
+///
+/// # Errors
+/// As [`run_node_data`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_data_with_cluster_settings(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -10249,11 +10753,12 @@ pub async fn run_node_data(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
+            auto_split_bytes,
             admin_addrs,
-            StreamSealKnobs::default(),
-            SegmentStoreConfig::default(),
-            None,
+            stream_seal_knobs,
+            segment_store_config,
+            auto_split_change_rate,
+            quiesce_after,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
             // CLI flag reaches `animusd data --config` yet, so this always
@@ -10825,6 +11330,11 @@ async fn finish_data_join(
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
             None,
+            // `--quiesce-after` doesn't reach a seed/join startup yet — the
+            // same documented gap `animusd`'s own module doc names for
+            // `join`/`data --seed` (S-06 scoped only the three real
+            // `--config`/`--node`-shaped deployment paths).
+            Duration::ZERO,
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
@@ -11000,6 +11510,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -11400,6 +11911,7 @@ mod forward_transport_failure_tests {
         ClusterConfig {
             nodes,
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -11626,6 +12138,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -11841,6 +12354,7 @@ mod issue_412_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -12083,7 +12597,7 @@ mod simenv_client_ctx_tests {
     /// `data: None` (no `DataRole`, ADR 0035 PR3's control-only shape) is
     /// deliberate, not a shortcut: neither `cp_kind_write_raw` nor `cp_get`
     /// — the two production methods this harness drives — ever calls
-    /// `self.data()`/`self.data_opt()` (verified by reading both call
+    /// `self.data()` (verified by reading both call
     /// chains, not assumed), so a `DataRole` is not needed to prove this
     /// rung's claim. Building one for real would need `SegmentStoreHandle`/
     /// `BackupStoreHandle`, both of which hardcode `FsSegmentStore`/
@@ -12124,6 +12638,14 @@ mod simenv_client_ctx_tests {
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],
             auto_split_bytes_threshold: None,
+            // This harness never builds a real `DataRole`/dynamo listener
+            // (`data: None` below) — see `AdminInfo`'s own field docs.
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
         });
 
         let ctx: SimClientCtx = ClientCtx {
@@ -12136,6 +12658,13 @@ mod simenv_client_ctx_tests {
             // node id in one `Simulator` shares one virtual clock).
             env: sim.env(nid(0)),
             data: None,
+            // Neither `cp_kind_write_raw` nor `cp_get` ever reads these (see
+            // this function's own doc) — the `Fs` variant is a placeholder
+            // that never touches the filesystem until `put`/`get`/`delete`
+            // is actually called (`FsSegmentStore::new`'s own doc), so no
+            // real store or `ProdEnv` is needed just to satisfy the field.
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
@@ -12377,6 +12906,7 @@ mod issue_298_conflict_tests {
                 console: addrs[5],
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 

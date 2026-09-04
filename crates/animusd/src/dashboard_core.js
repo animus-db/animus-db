@@ -1,8 +1,8 @@
 "use strict";
 // Shared state, fetch helpers, formatting utilities, theme, and tab routing
 // for animusd admin (ADR 0021's "AnimusDB Console"). `dashboard_overview.js`, `dashboard_placement.js`,
-// `dashboard_tablets.js`, `dashboard_txns.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
-// `dashboard_storage.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
+// `dashboard_tablets.js`, `dashboard_txns.js`, `dashboard_streams.js`, `dashboard_browser.js`,
+// `dashboard_storage.js`, and `dashboard_backups.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
 // txnViewsByTablet, autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
 // activateTab, gotoStorage, splitHiddenTable);
@@ -14,7 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // State assembled each refresh.
-let STATE = { status: null, nodes: [], peersErr: null };
+let STATE = { status: null, backups: null, restores: null, nodes: [], peersErr: null };
 
 // ---- this node's own role (ADR 0035 PR7) ----
 // `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
@@ -506,6 +506,15 @@ async function loadAll() {
   }
   let status = null;
   try { status = await getJSON(SEED, "/admin/status"); } catch (e) { /* shown per-panel */ }
+  // `/admin/backups`/`/admin/restores` (docs/roadmap.md U-02) read the same
+  // replicated `Metadata` every node mirrors — a single fetch against SEED,
+  // like `status` just above, never a per-node fan-out (unlike `/admin/txns`,
+  // which is per-hosted-tablet driver state that only exists on the node
+  // that actually holds it).
+  let backups = null;
+  try { backups = await getJSON(SEED, "/admin/backups"); } catch (e) { /* shown per-panel */ }
+  let restores = null;
+  try { restores = await getJSON(SEED, "/admin/restores"); } catch (e) { /* shown per-panel */ }
 
   const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
     : [SEED.replace(/^https?:\/\//, "")];
@@ -547,7 +556,7 @@ async function loadAll() {
     return node;
   }));
 
-  STATE = { status, nodes, peersErr: STATE.peersErr };
+  STATE = { status, backups, restores, nodes, peersErr: STATE.peersErr };
   render();
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }
@@ -564,6 +573,7 @@ function render() {
   renderStorageSelectors();
   renderBrowserTables();
   renderSeedTables();
+  renderBackups();
   renderNode();
   // Rebuild the Dynamo editor's skeleton only when the effective table
   // changed (first load, table created/dropped, or a manual switch) — never
@@ -607,9 +617,15 @@ function render() {
 // control-plane Raft state to derive that map from, so it gets neither tab,
 // the same reasoning `tablets`' own placement in this table already
 // documents.
+// "backups" (ADR 0059, docs/roadmap.md U-02) is gated exactly like
+// "placement": a single-fetch view over replicated `Metadata` (`/admin/
+// backups`/`/admin/restores`, plus `schemas[*].pitr`, all already covered
+// by `status`) with no per-node fan-out at all — a data-only node has no
+// local control-plane Raft state to read that catalog from, the same
+// reasoning `placement`'s own placement in this table already documents.
 const ROLE_TABS = {
-  control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"],
-  combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"],
+  control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"],
+  combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups", "node"],
   data: ["node", "browser", "streams"],
 };
 // The currently-visible tab set — starts as the superset (`combined`) until

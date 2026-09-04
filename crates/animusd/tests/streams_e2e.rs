@@ -770,7 +770,7 @@ async fn gsi_and_stream_coexist_and_both_converge() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -865,7 +865,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"orders",
+        r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -973,7 +973,7 @@ async fn fs_segment_store_opt_in_smoke() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1091,7 +1091,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1241,10 +1241,28 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
             panic!("node {i}: child shard {child_shard} missing from DescribeStream: {body}")
         });
         // The child's own entry must carry a non-null `ParentShardId`
-        // naming a shard of the parent tablet (the exact epoch is not
-        // pinned here — `stream_shard_parent_id` is derived, not stored,
-        // ADR 0043 §A8 — only that the lineage link exists at all, which
-        // requires the parent to have sealed at least once by now).
+        // naming a shard that actually exists. **Not necessarily a shard of
+        // the immediate `parent` tablet** (issue #588): under a cascade,
+        // `parent` here is whichever immediate parent the lineage scan
+        // above happened to land on, and that tablet can legitimately have
+        // sealed nothing of its own before it re-split further (the same
+        // "can legitimately reach its own CutoverSplit with nothing ever
+        // sealed" case `root`'s own doc above names) — `stream_shard_
+        // parent_id` walks past a never-sealed intermediate ancestor to
+        // the nearest one that DID seal (ADR 0043's 2026-09-04 amendment),
+        // so the id to check for is whatever that derivation actually
+        // resolves to, not `parent.0` itself. It must resolve to `Some`
+        // here: `child`'s own lineage chain traces back to `root`, which
+        // the poll above already proved has sealed at least once.
+        let expected_parent_shard = node
+            .metadata()
+            .stream_shard_parent_id(child, 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "node {i}: child {child:?}'s split-lineage chain never resolves to any \
+                     sealed ancestor, despite root ({root:?}) having sealed"
+                )
+            });
         // A window straddling the match, not just following it — the
         // wire encoding's field order within one shard object is not
         // pinned by this test, and `ParentShardId` can precede `ShardId`.
@@ -1252,8 +1270,8 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         let end = (pos + 400).min(body.len());
         let window = &body[start..end];
         assert!(
-            window.contains(&format!("shardId-{}-", parent.0)),
-            "node {i}: child shard's ParentShardId must name a shard of the parent tablet: {window}"
+            window.contains(&expected_parent_shard),
+            "node {i}: child shard's ParentShardId must be {expected_parent_shard}: {window}"
         );
     }
 
@@ -1362,7 +1380,7 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"orders",
+        r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1496,7 +1514,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1569,7 +1587,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1643,6 +1661,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
         "/admin/data/dynamo",
         Some(
             r#"{"op":"CreateTable","payload":{"TableName":"t",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}}"#,
@@ -1830,7 +1849,7 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets",
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -2052,7 +2071,7 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"hot_stream",
+        r#"{"TableName":"hot_stream","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -2064,7 +2083,7 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"plain_table",
+        r#"{"TableName":"plain_table","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -2173,7 +2192,7 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"casc",
+        r#"{"TableName":"casc","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,

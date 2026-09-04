@@ -5,6 +5,26 @@
   PR3 `ClusterSegmentStore` → PR4 segment codec + shard catalog + merge
   guard → PR5 the sealer → PR6 read path + wire API → PR7 segment janitor →
   PR8 lineage corpus + `ProdEnv` e2e + nightly (this PR).
+- **2026-09-04 note (W-10, closed):** §A9's own "control-only-leader scope
+  gap" — a control-only leader could mark stream-shard rows expired but had
+  no `SegmentStoreHandle` to physically delete objects or repair replicas,
+  since that handle lived only on a node with a data role — is closed.
+  `SegmentStoreHandle`/`BackupStoreHandle` are now provisioned on the
+  control-only assembly path too (`BoundControlNode::start_control_with`,
+  `animusd`), moved off `DataRole` onto `ClientCtx` itself so they are
+  never gated on data role for any node shape. A **pure** split deployment
+  (control-only nodes are the only control voters) now reclaims stream
+  segments — and, inheriting the identical fix, reclaims/completes backups
+  and PITR segments — correctly on its own. See `crates/animusd/CLAUDE.md`'s
+  `segment_janitor.rs`/`backup_janitor.rs`/`backup_completion.rs`/
+  `pitr_janitor.rs` entries for the full account and
+  `tests/stream_janitor.rs::
+  segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+  for the regression. `pitr_snapshot_loop`'s own `BeginBackup` *capture*
+  step remains structurally inert on a control-only leader for an
+  unrelated, unfixable reason (capture is per-tablet leader-side, and a
+  control-only node never hosts a tablet) — this fix is about the
+  *reclaim*/*completion* halves, not capture.
 - **2026-08-16 note:** [ADR 0050](0050-per-tablet-storage-copy-based-splits.md)
   (implemented 2026-08-17) retires §A4's zero-copy split-lineage machinery —
   the frozen `stream_split_basis`, the `in_declared_range` read-side fence,
@@ -793,22 +813,27 @@ condition is ever true (`!meta.tablets.contains_key(tablet)`), so even a
 tablet's own last epoch is safely, fully reclaimable once its table is
 truly gone.
 
-**The control-only-leader scope gap.** Retention *marking* and the
-drop-table rule above need only `Metadata` — cheap on any node that can
-become control leader. Object deletion and replica repair need a
-`SegmentStoreHandle`, which today only exists on a node with a data role.
-A **control-only** leader (a genuine ADR 0035 split deployment) therefore
-marks rows and reacts to drops correctly, but cannot physically delete
-objects or repair replicas for as long as it leads — rows accumulate,
-marked but un-reclaimed, until a data-role node takes over leadership
-instead. In a **pure** split deployment (control-only nodes are the *only*
-control voters), this never happens at all today. This is a real,
-deliberate deferral — extending `SegmentStoreHandle` provisioning to a
-control-only node is its own follow-up, out of this PR's scope — not a
-correctness bug: a marked row is already invisible to `DescribeStream` and,
-once its object happens to be gone, inaccessible via `GetRecords` too; the
-residual is purely "this specific node shape's own leadership stint cannot
-finish the physical reclaim," never a stale or incorrect read.
+**The control-only-leader scope gap — closed (W-10, 2026-09-04).** Retention
+*marking* and the drop-table rule above need only `Metadata` — cheap on any
+node that can become control leader. Object deletion and replica repair
+need a `SegmentStoreHandle` — which, at this PR's own original writing,
+existed only on a node with a data role. A **control-only** leader (a
+genuine ADR 0035 split deployment) used to mark rows and react to drops
+correctly, but could not physically delete objects or repair replicas for
+as long as it led — rows would accumulate, marked but un-reclaimed, until a
+data-role node took over leadership instead; a **pure** split deployment
+(control-only nodes are the *only* control voters) never ran phases 2/3 at
+all. **`SegmentStoreHandle` provisioning was extended to the control-only
+assembly path** (`animusd::BoundControlNode::start_control_with`), the
+follow-up this paragraph originally deferred: the handle moved off
+`animusd`'s `DataRole` onto its `ClientCtx` directly, so it is never gated
+on running the data role for any node shape. A control-only leader now
+completes every phase of this loop exactly like a combined or data-only
+leader would, including in a pure split deployment. See
+`crates/animusd/CLAUDE.md`'s `segment_janitor.rs` entry and
+`tests/stream_janitor.rs::
+segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` for
+the mechanism and regression.
 
 ### Rejected alternatives
 

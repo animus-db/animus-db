@@ -142,7 +142,7 @@ async fn table_detail_projects_full_configuration() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"simple",
+            r#"{"TableName":"simple","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -246,7 +246,7 @@ async fn add_and_drop_gsi_round_trip() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders",
+            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -274,14 +274,16 @@ async fn add_and_drop_gsi_round_trip() {
         assert_eq!(resp["gsi"]["name"], "by-status");
         assert_eq!(resp["gsi"]["hash_attribute"]["name"], "status");
         // No declared type: this request gave no `hash_attribute_type`
-        // (issue #319's fields are optional), so `add_gsi` sent no
-        // `AttributeDefinitions` entry and the console reports `null`
-        // rather than an invented `"S"` — see
-        // `add_gsi_records_a_declared_attribute_type` below for the
-        // positive case, where a type genuinely round-trips.
-        assert!(
-            resp["gsi"]["hash_attribute"]["attribute_type"].is_null(),
-            "an added GSI's key attribute must not claim a type: {body}"
+        // (issue #319's fields are optional). Roadmap W-11: `AttributeDefinitions`
+        // must now cover every key attribute a request's `KeySchema` names, so
+        // `add_gsi` defaults an omitted type to `"S"` rather than sending no
+        // entry at all (`wire::decode_update_table` would otherwise reject the
+        // `GlobalSecondaryIndexUpdates` `Create` outright) — see
+        // `add_gsi_records_a_declared_attribute_type` below for the case where a
+        // genuinely different type round-trips instead of this default.
+        assert_eq!(
+            resp["gsi"]["hash_attribute"]["attribute_type"], "S",
+            "an added GSI's key attribute defaults to a declared S type: {body}"
         );
         assert!(resp["gsi"]["sort_attribute"].is_null());
         assert_eq!(
@@ -363,7 +365,7 @@ async fn add_gsi_records_a_declared_attribute_type() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"readings",
+            r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -434,7 +436,7 @@ async fn add_gsi_rejects_an_unknown_attribute_type() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders",
+            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -468,7 +470,7 @@ async fn stream_toggle_round_trips() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"events",
+            r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -530,7 +532,7 @@ async fn ttl_set_and_clear_round_trips() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"sessions",
+            r#"{"TableName":"sessions","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -592,7 +594,7 @@ async fn delete_table_works() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"scratch",
+            r#"{"TableName":"scratch","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -627,6 +629,150 @@ async fn delete_table_works() {
         let (status, body) =
             console(console_addr, "DELETE", "/console/api/tables/scratch", "").await;
         assert_eq!(status, 404, "double-delete: {body}");
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// U-03: `GET /console/api/tables/{name}` gains `pitr` and `backups`. A
+/// table with neither enabled/created shows `pitr: null` and an empty
+/// `backups` array — never an omitted field, and never a fabricated
+/// non-empty answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn table_detail_with_no_pitr_or_backups_is_null_and_empty() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"plain",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = console(console_addr, "GET", "/console/api/tables/plain", "").await;
+        assert_eq!(status, 200, "table detail failed: {body}");
+        let d = json(&body);
+        assert!(d["pitr"].is_null(), "no PITR enabled: {body}");
+        assert!(
+            d["backups"].as_array().unwrap().is_empty(),
+            "no backups created: {body}"
+        );
+        assert_no_cluster_shape(&body);
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// U-03's round trip: enable continuous backups (PITR) and create an
+/// on-demand backup, then confirm the table detail page reports both — the
+/// exact fields `DescribeContinuousBackups`/`ListBackups` themselves would
+/// report, sourced from the same catalog reads (`animusd::dynamo::
+/// pitr_description`/`backup_wire_status`), never re-derived — and nothing
+/// cluster-shaped alongside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn table_detail_shows_pitr_status_and_backups() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"orders",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.UpdateContinuousBackups",
+            r#"{"TableName":"orders",
+                "PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "UpdateContinuousBackups(enable) failed: {body}"
+        );
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateBackup",
+            r#"{"TableName":"orders","BackupName":"snap-1"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateBackup failed: {body}");
+        let backup_arn = json(&body)["BackupDetails"]["BackupArn"]
+            .as_str()
+            .expect("BackupArn")
+            .to_string();
+
+        // The `backups` list is an eventual property, not a one-shot one:
+        // enabling PITR makes `pitr_snapshot_loop` propose its first base
+        // snapshot (`BeginBackup`) and only THEN tag it
+        // (`MarkBackupPitrBase`, a second commit), so for a few ms that
+        // internal row is indistinguishable from a user's own `CreateBackup`
+        // and the projection transiently shows two rows. Poll until the tag
+        // lands rather than asserting the first read (converged-or-timeout,
+        // per `docs/engineering-lessons.md`); the transient wire-level
+        // visibility itself is tracked as its own issue.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let (d, body) = loop {
+            let (status, body) =
+                console(console_addr, "GET", "/console/api/tables/orders", "").await;
+            assert_eq!(status, 200, "table detail failed: {body}");
+            let d = json(&body);
+            if d["backups"].as_array().map(Vec::len) == Some(1) {
+                break (d, body);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "backups did not converge to exactly the user's one: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        let pitr = &d["pitr"];
+        assert!(!pitr.is_null(), "PITR enabled: {body}");
+        assert!(
+            pitr["earliest_restorable_ms"].as_u64().unwrap() > 0,
+            "earliest_restorable_ms: {body}"
+        );
+        assert!(
+            pitr["latest_restorable_ms"].as_u64().unwrap() > 0,
+            "latest_restorable_ms: {body}"
+        );
+
+        let backups = d["backups"].as_array().unwrap();
+        assert_eq!(backups.len(), 1, "exactly one backup: {body}");
+        assert_eq!(backups[0]["backup_id"], backup_arn);
+        let status_label = backups[0]["status"].as_str().unwrap();
+        assert!(
+            status_label == "CREATING" || status_label == "AVAILABLE",
+            "unexpected status {status_label}: {body}"
+        );
+        assert!(
+            backups[0]["created_wall_ms"].as_u64().unwrap() > 0,
+            "created_wall_ms: {body}"
+        );
+        assert_no_cluster_shape(&body);
 
         node.shutdown_graceful().await;
     })

@@ -5,7 +5,11 @@
 //! shard chains and a live-tail poller. A Transactions view (ADR 0018 §2/PR7,
 //! docs/roadmap.md U-01) is an eighth — a read-only render of `/admin/txns`,
 //! gated like Tablets (both are cluster-wide views a data-only node can't
-//! derive without local control-plane `Metadata`). Which views are shown is gated on
+//! derive without local control-plane `Metadata`). A Backups view (ADR 0059,
+//! docs/roadmap.md U-02) is a ninth — a render of `/admin/backups`/
+//! `/admin/restores` plus gated Create/Delete/Restore/PITR actions, gated
+//! like Placement (same reasoning: no per-node fan-out, just replicated
+//! `Metadata` a data-only node can't read locally). Which views are shown is gated on
 //! this node's own role (control/data/combined,
 //! `admin.rs::config_view`'s `role` field) — see `dashboard_core.js`'s
 //! `ROLE_TABS`; Streams is shown for combined/data, never control-only (a
@@ -26,11 +30,14 @@
 //! (`admin.rs::static_asset`) instead of inlined in one document. `CORE_JS`
 //! holds shared state/fetch/routing/theme/data-derivation utilities every
 //! other module depends on; `OVERVIEW_JS`/`PLACEMENT_JS`/`TABLETS_JS`/
-//! `TXNS_JS`/`STREAMS_JS`/`BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the eight
-//! views' own render logic, loaded in that order (each may call functions
-//! defined earlier, since plain `<script src>` tags share one global scope) —
-//! `STREAMS_JS` loads before `BROWSER_JS` because the Data Browser's
-//! per-table Stream row (enable/disable) reuses its `viewTypeLabel` helper.
+//! `TXNS_JS`/`STREAMS_JS`/`BROWSER_JS`/`STORAGE_JS`/`BACKUPS_JS`/`NODE_JS`
+//! are the nine views' own render logic, loaded in that order (each may call
+//! functions defined earlier, since plain `<script src>` tags share one
+//! global scope) — `STREAMS_JS` loads before `BROWSER_JS` because the Data
+//! Browser's per-table Stream row (enable/disable) reuses its
+//! `viewTypeLabel` helper, and `BROWSER_JS` loads before `BACKUPS_JS`
+//! because the Backups view's table pickers (Create backup, PITR) reuse its
+//! `dynamoTables()` helper.
 //!
 //! Read-only mostly — the Data Browser (item CRUD, table DDL, the per-table
 //! stream enable/disable toggle, and the bulk-seed tool, which writes real
@@ -101,6 +108,14 @@ pub(crate) const BROWSER_JS: &str = include_str!("dashboard_browser.js");
 /// (not part of the source design, preserved from the pre-redesign dashboard
 /// so no capability is lost).
 pub(crate) const STORAGE_JS: &str = include_str!("dashboard_storage.js");
+/// The Backups view (ADR 0059, docs/roadmap.md U-02): a read-only render of
+/// `/admin/backups`/`/admin/restores` plus per-table PITR status (from
+/// `/admin/status`'s `schemas[*].pitr`, already fetched), and four gated
+/// actions — Create backup, Delete backup, Restore from backup, and
+/// per-table PITR enable/disable — each behind a `window.confirm` and
+/// posted through the `/admin/data/dynamo` proxy the Data Browser's own
+/// mutations already use. Role-gated like Placement (`ROLE_TABS`).
+pub(crate) const BACKUPS_JS: &str = include_str!("dashboard_backups.js");
 /// The Node view (ADR 0035 PR7): a data-only node's dedicated page — its own
 /// identity/health/control-plane mirror status, hosted tablets, a
 /// node-scoped storage debug panel, and a link to a reachable

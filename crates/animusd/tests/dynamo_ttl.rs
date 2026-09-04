@@ -52,6 +52,7 @@ async fn start_single_node_fast_ttl(dir: &Path) -> (Node, ClusterConfig) {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         };
         match animusd::run_node_with_ttl_sweep_interval(
             &config,
@@ -128,7 +129,9 @@ async fn create_table(addr: SocketAddr, table: &str) {
         addr,
         "DynamoDB_20120810.CreateTable",
         &format!(
-            r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )
     .await;
@@ -500,7 +503,7 @@ async fn ttl_deletion_is_visible_in_the_stream_with_a_service_user_identity() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
     )
     .await;

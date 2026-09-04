@@ -138,7 +138,7 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"items",
+        r#"{"TableName":"items","AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"tag","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[
@@ -357,7 +357,7 @@ async fn transact_write_items_maintains_lsi_and_gsi_across_a_split_table() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"indexed",
+        r#"{"TableName":"indexed","AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"tag","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[
@@ -534,7 +534,7 @@ async fn transact_write_items_abort_leaves_no_lsi_row_and_no_gsi_row() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"indexed",
+        r#"{"TableName":"indexed","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"tag","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-tag",
@@ -613,7 +613,7 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"items",
+        r#"{"TableName":"items","AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[
@@ -964,7 +964,7 @@ async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
     let (status, body) = dynamo(
         addr_a,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"race",
+        r#"{"TableName":"race","AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[
@@ -1095,7 +1095,7 @@ async fn cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row(
     let (status, body) = dynamo(
         addr_a,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"race_txn",
+        r#"{"TableName":"race_txn","AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[

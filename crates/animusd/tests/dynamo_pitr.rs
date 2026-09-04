@@ -61,6 +61,7 @@ async fn start_single_node_with_knobs(dir: &Path, knobs: StreamSealKnobs) -> (No
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         };
         match animusd::run_node_with_streams(
             &config,
@@ -136,7 +137,9 @@ async fn create_base_table(addr: SocketAddr, table: &str) {
         addr,
         "DynamoDB_20120810.CreateTable",
         &format!(
-            r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )
     .await;

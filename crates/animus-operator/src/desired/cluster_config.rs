@@ -68,6 +68,46 @@ pub struct RoleAddrs {
     pub advertise_host: Option<String>,
 }
 
+/// Mirrors `animusd::config::ClusterSettings`'s JSON shape field-for-field
+/// (S-06) — cluster-wide operational knobs (auto-split, quiesce,
+/// orphan-sweep, stream-seal) `animusd` now reads from a config file's own
+/// `cluster_settings` section on every deployment shape, not just
+/// `--cluster N`'s dev-only in-process CLI flags. This crate only ever
+/// populates the two fields the CRD exposes today
+/// (`auto_split_bytes`/`quiesce_after_secs`, see
+/// [`build_cluster_config`]) — the rest stay `None`, `#[serde(skip_
+/// serializing_if = "Option::is_none")]` so an unset field is simply
+/// absent from the emitted JSON rather than a null, exactly like every
+/// other optional field this mirror already has.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_split_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_split_change_rate: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_sweep_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiesce_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_seal_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_seal_age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_retention_secs: Option<u64>,
+}
+
+impl ClusterSettings {
+    /// Whether every field is unset — used to leave [`ClusterConfig::
+    /// cluster_settings`] entirely absent from the generated JSON rather
+    /// than emitting an empty `"cluster_settings": {}"` object when the
+    /// spec sets none of the fields this crate populates.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Mirrors `animusd::config::ClusterConfig`'s JSON shape. `dynamo_auth` is
 /// deliberately never populated by this crate — credentials are instead
 /// supplied via the `--dynamo-auth PATH` flag against a mounted `Secret`
@@ -75,9 +115,14 @@ pub struct RoleAddrs {
 /// `animusd` startup error, so leaving the config file's own section absent
 /// (`#[serde(default)]` on the `animusd` side) is the only choice that
 /// composes with that flag.
+///
+/// `cluster_settings` (S-06) mirrors `animusd::config::ClusterConfig`'s own
+/// field of the same name — see [`ClusterSettings`]'s own doc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub nodes: Vec<RoleAddrs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_settings: Option<ClusterSettings>,
 }
 
 /// The pod id `animusd` sees for ordinal `i` of cluster `name`: `"{name}-{i}"`.
@@ -119,7 +164,30 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
         })
         .collect();
 
-    ClusterConfig { nodes }
+    // S-06: the two knobs the CRD exposes today map straight onto the
+    // generated config's own `cluster_settings` section — this is what
+    // makes both of them reach *every* pod (combined and data-role alike),
+    // closing the `--quiesce-after`/`--auto-split-bytes` gaps
+    // `AnimusClusterSpec`'s own field docs used to describe (both flags
+    // only ever reached combined-role pods, or nothing at all). Left
+    // entirely absent (not an empty `{}` object) when the spec sets
+    // neither, so an unchanged spec's generated `cluster.json` stays
+    // byte-identical to before this section existed.
+    let cluster_settings = ClusterSettings {
+        auto_split_bytes: spec.auto_split_bytes,
+        quiesce_after_secs: spec.quiesce_after_secs,
+        ..ClusterSettings::default()
+    };
+    let cluster_settings = if cluster_settings.is_empty() {
+        None
+    } else {
+        Some(cluster_settings)
+    };
+
+    ClusterConfig {
+        nodes,
+        cluster_settings,
+    }
 }
 
 /// Serialize `config` to pretty JSON, the same `serde_json::to_string_pretty`
@@ -166,18 +234,27 @@ pub const DYNAMO_AUTH_FILE_NAME: &str = "credentials.json";
 /// not just its usage-string doc comment — see this crate's `CLAUDE.md` for
 /// the full support table):
 /// - combined role (`animusd --config FILE --node I`, ordinals
-///   `< control_nodes`): `--dir`, `--ephemeral`, `--quiesce-after`,
-///   `--split-mode`, `--dynamo-auth`.
+///   `< control_nodes`): `--dir`, `--ephemeral`, `--split-mode`,
+///   `--dynamo-auth`.
 /// - data role (`animusd data --config FILE --node I`, ordinals
 ///   `>= control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth` only —
-///   **not** `--quiesce-after`/`--split-mode` (rejected as unknown
-///   arguments by that subcommand today).
+///   **not** `--split-mode` (rejected as an unknown argument by that
+///   subcommand today).
 ///
-/// `spec.autoSplitBytes` is **never** emitted as a flag here on either
-/// branch: neither `--config/--node` invocation accepts
-/// `--auto-split-bytes` at all (only the dev-only `--cluster N` in-process
-/// mode does) — see [`AnimusClusterSpec::auto_split_bytes`]'s own doc for
-/// why the spec field is kept anyway.
+/// **`spec.quiesceAfterSecs`/`spec.autoSplitBytes` are never emitted as
+/// flags here on either branch (S-06)** — both now reach `animusd` through
+/// [`build_cluster_config`]'s own `cluster_settings` section of the
+/// generated `cluster.json` instead, which every pod (combined and
+/// data-role alike) reads regardless of which `animusd` subcommand it
+/// execs. Emitting `--quiesce-after` here too, on top of the config
+/// section, would in fact be a **hard `animusd` startup error** on the
+/// combined branch — its CLI flag and the config file's own section
+/// setting the same field is refused, not silently reconciled (the same
+/// "specify it one way, not both" contract `--dynamo-auth` already uses on
+/// this crate's own side, see this file's own doc). This is also what
+/// closes `auto_split_bytes`'s pre-S-06 gap: no `animusd` subcommand ever
+/// accepted `--auto-split-bytes` as a flag, only `--cluster N`'s dev-only
+/// in-process mode did.
 #[must_use]
 pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     let control_nodes = spec.control_nodes_or_default();
@@ -189,9 +266,6 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     if ephemeral {
         both_flags.push_str(" --ephemeral");
         data_flags.push_str(" --ephemeral");
-    }
-    if let Some(secs) = spec.quiesce_after_secs {
-        both_flags.push_str(&format!(" --quiesce-after {secs}"));
     }
     if let Some(mode) = &spec.split_mode {
         both_flags.push_str(&format!(" --split-mode {mode}"));
@@ -275,6 +349,53 @@ mod tests {
             ]
         });
         assert_eq!(value, expected);
+    }
+
+    // --- `cluster_settings` (S-06) ---------------------------------------
+
+    #[test]
+    fn cluster_settings_section_is_absent_when_the_spec_sets_neither_field() {
+        // The default spec's generated config carries no `cluster_settings`
+        // key at all — not even an empty `{}` — so it round-trips against
+        // an `animusd` build that predates the section too, and an
+        // unchanged spec's generated `cluster.json` stays byte-identical to
+        // before S-06.
+        let cfg = build_cluster_config("c", "ns", &spec(3));
+        assert!(cfg.cluster_settings.is_none());
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value.get("cluster_settings").is_none(),
+            "expected no cluster_settings key, got {value}"
+        );
+    }
+
+    #[test]
+    fn cluster_settings_section_reflects_auto_split_and_quiesce() {
+        let mut s = spec(3);
+        s.auto_split_bytes = Some(50_000_000);
+        s.quiesce_after_secs = Some(10);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            value["cluster_settings"],
+            serde_json::json!({
+                "auto_split_bytes": 50_000_000,
+                "quiesce_after_secs": 10
+            }),
+            "got {value}"
+        );
+    }
+
+    #[test]
+    fn cluster_settings_section_reflects_only_the_field_the_spec_sets() {
+        let mut s = spec(3);
+        s.quiesce_after_secs = Some(5);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let settings = cfg
+            .cluster_settings
+            .expect("one field set is enough for the section to appear");
+        assert_eq!(settings.quiesce_after_secs, Some(5));
+        assert_eq!(settings.auto_split_bytes, None);
     }
 
     #[test]
@@ -384,6 +505,9 @@ mod tests {
 
     #[test]
     fn entrypoint_never_emits_auto_split_bytes() {
+        // S-06: reaches `animusd` through the config file's own
+        // `cluster_settings.auto_split_bytes` section instead — see
+        // `cluster_settings_section_reflects_auto_split_and_quiesce` below.
         let mut s = spec(3);
         s.auto_split_bytes = Some(1_000_000);
         let script = entrypoint_script(&s);
@@ -391,17 +515,28 @@ mod tests {
     }
 
     #[test]
-    fn entrypoint_omits_quiesce_and_split_mode_on_data_branch_only() {
+    fn entrypoint_never_emits_quiesce_after() {
+        // S-06: like `auto_split_bytes` above, `--quiesce-after` moved from
+        // a CLI flag (combined-role pods only) to the config file's own
+        // `cluster_settings.quiesce_after_secs` section, which every pod
+        // reads regardless of role — emitting it here too would in fact be
+        // a hard `animusd` startup error on the combined branch (the same
+        // field set both ways).
+        let mut s = spec(3);
+        s.quiesce_after_secs = Some(7);
+        let script = entrypoint_script(&s);
+        assert!(!script.contains("quiesce-after"));
+    }
+
+    #[test]
+    fn entrypoint_omits_split_mode_on_data_branch_only() {
         let mut s = spec(4);
         s.control_nodes = Some(2);
-        s.quiesce_after_secs = Some(7);
         s.split_mode = Some("inplace".to_string());
         let script = entrypoint_script(&s);
         // Split the script at the `else` to inspect each branch in isolation.
         let (both_branch, data_branch) = script.split_once("else").unwrap();
-        assert!(both_branch.contains("--quiesce-after 7"));
         assert!(both_branch.contains("--split-mode inplace"));
-        assert!(!data_branch.contains("--quiesce-after"));
         assert!(!data_branch.contains("--split-mode"));
     }
 

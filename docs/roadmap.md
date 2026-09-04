@@ -38,35 +38,6 @@ the still-true paragraph after the table.
 
 ## 1. Wire surface (DynamoDB API)
 
-### W-01 UpdateExpression extensions (issue #375)
-
-- **Gap:** only `SET a = :v`, `REMOVE a`, `ADD`, `DELETE`. No
-  `if_not_exists()`, `list_append()`, arithmetic `SET a = a + :x`, or
-  nested-path targets (`a.b.c`, `a[0]`). The most likely thing to break an
-  existing app.
-- **Plan:** extend the tokenizer (already emits `LParen`/`RParen` with
-  depth tracking, forward-built for this) and `parse_update_clauses`;
-  evaluate function calls and arithmetic at the leader against `raw_old`
-  under the same `rmw_lock` scope ADD already uses; make `apply_update`
-  path-aware.
-- **Reuse:** `condition::add_numeric` (decimal bignum) for `+`/`-`;
-  `resolve_attr_name`'s alias logic for path targets; `Projection::apply`'s
-  path reconstruction for nested writes.
-- **Files:** `crates/animus-dynamo/src/wire.rs` (`tokenize_update_expression`
-  ~1651, `parse_update_clauses` ~1834, `resolve_attr_name` ~1973,
-  `apply_update` ~3962); `crates/animusd/src/dynamo.rs`
-  (`kind_write_item_at_leader` ~5733, both `apply_update` call sites).
-- **Tests:** `wire.rs` inline `decode_update_expression` cases (~6380);
-  `crates/animusd/tests/dynamo_updated_return_values.rs`,
-  `dynamo_documents.rs`.
-- **ADR:** none (additive grammar within a documented subset).
-- **PRs:** (1) function calls `if_not_exists`/`list_append`, SET only;
-  (2) arithmetic operands, `+`/`-` as first-class tokens; (3) nested-path
-  SET/REMOVE targets (touches `apply_update`'s data model).
-- **Size:** M + S + L.
-- **Depends:** W-02 landed 2026-09-04; PR3 reuses its `PathSegment::{Field,
-  Index}` type from `wire.rs`.
-
 ### W-03 Order-preserving encoding for `N` sort keys
 
 - **Gap:** `AttributeValue::key_bytes()` writes `N` as raw decimal text, so
@@ -96,22 +67,6 @@ the still-true paragraph after the table.
 - **Depends:** W-05 landed 2026-09-04; `schema.rs`'s bridge now carries
   index key attribute types, so this can start at any time.
 
-### W-11 `AttributeDefinitions` must cover every key attribute
-
-- **Gap:** DynamoDB rejects a `CreateTable`/`UpdateTable` whose key schema
-  (table or index) names an attribute absent from `AttributeDefinitions`;
-  this adapter accepts it and falls back to `S`. Found while landing W-05:
-  most of the repo's own test fixtures omit `AttributeDefinitions` even
-  for base keys, so enforcing it is a fixture sweep, not a one-liner.
-- **Plan:** a `ValidationException` in `decode_create_table`/
-  `decode_update_table` when any hash/sort attribute of the table or of a
-  created index has no declared type; sweep the fixtures under
-  `crates/animusd/tests` and the console's create-table path to declare
-  types; update `website/compatibility.html`.
-- **Files:** `crates/animus-dynamo/src/wire.rs`; `crates/animusd/tests/*`.
-- **Tests:** `wire.rs` decode cases; every fixture the sweep touches.
-- **ADR:** none. **PRs:** one. **Size:** S–M (mechanical breadth).
-
 ### W-07 PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`)
 
 - **Gap:** absent. Deliberately sized honestly: a new parser, a new error
@@ -129,7 +84,8 @@ the still-true paragraph after the table.
   discipline.
 - **PRs:** (1) ADR; (2) SELECT → Query/Scan; (3) INSERT/UPDATE/DELETE;
   (4) Batch; (5) ExecuteTransaction. **Size:** XL.
-- **Depends:** soft: after W-01 if its tokenizer generalises.
+- **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
+  2026-09-04) if it generalises.
 
 ### W-08 Per-table throttling
 
@@ -161,20 +117,8 @@ the still-true paragraph after the table.
   from `kind_write_item_at_leader`; new `auto_split_loop` gate
   (`lib.rs:8485-8520`) and `--auto-split-ops-rate` knob.
 - **ADR:** amendment note closing ADR 0034's deferred bullet.
-- **PRs:** one. **Size:** M. **Depends:** S-06 so the knob is reachable
-  from real deployments.
-
-### W-10 Stream sealing from a control-only leader (ADR 0043)
-
-- **Gap:** a control-only leader can mark catalog rows but has no
-  `SegmentStoreHandle` (`DataRole`, `lib.rs:6231`), so it cannot delete,
-  reclaim, or repair segment objects.
-- **Plan:** provision `SegmentStoreHandle`/`BackupStoreHandle` on the
-  control-only assembly path (`main.rs` role assembly, ADR 0035) instead
-  of gating on data role.
-- **Tests:** extend the segment-janitor tests with a control-only
-  topology.
-- **ADR:** none (ADR 0043 names the fix). **PRs:** one. **Size:** M.
+- **PRs:** one. **Size:** M. **Depends:** none (S-06 landed 2026-09-04: a new knob
+  goes in `cluster_settings`).
 
 ---
 
@@ -263,30 +207,10 @@ the still-true paragraph after the table.
 - **PRs:** (1) export trio; (2) import trio; (3) corpus. **Size:** L.
 - **Depends:** S-04.
 
-### S-06 Cluster knobs reachable from real deployments
-
-- **Gap:** `--auto-split-bytes` and `--auto-split-change-rate` reach only
-  `run_in_process_cluster`/`run_in_process_split_cluster`
-  (`main.rs:1081,1154`); `run_single` (~684), `run_control` (~736),
-  `run_data` (~804) never see them. The operator CRD has the fields but
-  never emits them. `ClusterConfig` has no settings section at all.
-- **Plan:** `ClusterConfig::cluster_settings: Option<ClusterSettings>`
-  (auto-split, quiesce, orphan-sweep, stream-seal knobs) loaded on all
-  three real paths, CLI flag conflict is a hard error exactly like
-  `apply_dynamo_auth_flag`; operator mirror emits the section.
-- **Files:** `crates/animusd/src/config.rs:143,150,316-330`,
-  `main.rs`; `crates/animus-operator/src/desired/cluster_config.rs`,
-  `crd.rs:107-121`.
-- **Tests:** `config.rs` round-trip + conflict tests (~469-506); operator
-  golden JSON.
-- **ADR:** amendment notes on 0034, 0040, 0048.
-- **PRs:** (1) config section + wiring; (2) operator mirror; (3) guide
-  table sweep. **Size:** M. **Blocks:** W-09, S-07b.
-
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
 - **b. `backupStore`/`segmentStore` CRD fields** mirrored into the
-  ConfigMap/entrypoint. Size M. Depends S-06.
+  ConfigMap/entrypoint. Size M. (S-06 landed 2026-09-04.)
 - **c. `PodDisruptionBudget` builder** (`desired/poddisruptionbudget.rs`,
   pure-builder pattern + golden test). Size S.
 - **d. `controlNodes` growth via the CRD**: controller drives ADR 0037
@@ -392,30 +316,6 @@ tests: `admin_endpoint.rs`. CLI arg parsing is unit-tested via `admin_request`
 mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 `window.confirm` guard.
 
-### U-02 Backups tab
-
-- View over `/admin/backups` + `/admin/restores` (`admin.rs:1265,1352`);
-  gated Create/Delete/Restore/PITR enable-disable through the dynamo
-  proxy (wire ops at `dynamo.rs:1030-1090`). Role-gated to control +
-  combined like `placement`.
-- **Tests:** `dashboard_endpoint.rs`; backend nets already exist.
-- **PRs:** one. **Size:** M.
-
-### U-03 Console per-table backup/PITR status
-
-- `TableDetail` (`console.rs:182-190`) gains `pitr` and a trimmed
-  `backups` list (id, status, created only — table-scoped, so allowed by
-  ADR 0052's no-cluster-shape rule). One or two `ConsoleBackend` methods.
-- **Tests:** `tests/console_table_config.rs`. **PRs:** one. **Size:** M.
-
-### U-04 Data Browser: TTL row + one-call create-table form
-
-- `#br-dy-ttl` next to `#br-dy-stream` (`dashboard.html:201`) via
-  `Describe/UpdateTimeToLive`; `#br-dy-table-form` (`dashboard.html:162`)
-  sends GSIs, LSIs, stream, TTL following `console::CreateTableRequest`'s
-  two-call shape.
-- **PRs:** two. **Size:** S + M.
-
 ### U-05 Control-plane visibility, lineage, and infrastructure actions
 
 - Render `/admin/control/members` (`admin.rs:1754`) on the Node tab
@@ -433,16 +333,6 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
   `control-remove` arms a transfer internally). If confirmed, add
   `POST /admin/control/transfer` before its button. Size S.
 
-### U-06 Config view fields (folds in auth and tracing views)
-
-- Thread `backup_store`, `segment_store`, `quiesce_after`, `auth_enabled`
-  + access key ids (never secrets), resolved OTLP endpoint into
-  `AdminInfo` (precedent `auto_split_bytes_threshold`, `lib.rs:2178`) and
-  `config_view` (`admin.rs:478-514`). Expect a compiler-driven fan-out
-  across every `AdminInfo` literal.
-- **Tests:** `admin_endpoint.rs`/`dashboard_endpoint.rs` config
-  assertions. **PRs:** one. **Size:** M.
-
 ### U-07 New observability routes
 
 - `GET /admin/backup-store`: store config, object counts (live `list`
@@ -456,7 +346,7 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
   (ADR 0024/0040). Size L.
 - `GET /admin/segment-store`: placement per shard (already inside
   `ClusterSegmentStore`) plus counts. Size M.
-- Each renders on the Backups tab (U-02) or Storage tab.
+- Each renders on the Backups tab (landed with U-02) or Storage tab.
 
 ### U-08 CLI parity
 
@@ -471,8 +361,8 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ## 5. Documentation
 
-D-01 (the stale-prose sweep) and S-07a landed 2026-09-02; wave 1 landed
-2026-09-04. What remains
+D-01 (the stale-prose sweep) and S-07a landed 2026-09-02; waves 1 and 2
+landed 2026-09-04. What remains
 here: `website/index.html`'s "Planned" pills stay until S-01 lands.
 
 ---
@@ -501,12 +391,14 @@ wave are independent and can run in parallel.
 | Wave | Items | Why here |
 |---|---|---|
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
-| 2 | W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
+| 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
-| 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04; S-07b after S-06 |
+| 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
 
-Open issues mapped: #375 → W-01 (#319 closed by W-05). The flaky-test issues
+Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
+from wave 2's own findings: #590 (the operator still emits the deleted
+`--split-mode` flag) and #591 (a `control_only` relay-budget flake). The flaky-test issues
 (#280, #298, #418, #447, #539) are correctness work under the green
 invariant, not roadmap items, and take precedence over any wave.

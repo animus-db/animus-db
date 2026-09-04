@@ -249,6 +249,7 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -351,6 +352,9 @@ async fn join_control_nonvoter(
                 admin_addrs,
                 animusd::StorageBackend::Memory,
                 animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::SegmentStoreConfig::default(),
+                animusd::BackupStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
             )
             .await
             .expect("open the growth control-only node's system-keyspace engine");

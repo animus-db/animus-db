@@ -705,6 +705,7 @@ async fn bring_up_split_durable(
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let control_dirs: Vec<PathBuf> = (0..control_n)
             .map(|i| dir.join(format!("a{attempt}-c{i}")))

@@ -78,7 +78,7 @@ async fn lsi_query_succeeds_through_every_node_including_non_leaders() {
     let (status, body) = dynamo(
         create_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"ts","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[

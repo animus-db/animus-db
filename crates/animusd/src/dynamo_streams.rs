@@ -473,7 +473,6 @@ async fn get_records_sealed(
     // actually lived at.
     let seg_id = row.object_id.as_str();
     let bytes = ctx
-        .data()
         .segment_store
         .get_sealed(&row.replicas, seg_id)
         .await

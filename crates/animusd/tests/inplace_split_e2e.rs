@@ -81,6 +81,7 @@ async fn bring_up_inplace(
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -700,7 +701,7 @@ async fn inplace_split_stream_shard_walks_parent_to_children_without_loss_or_dup
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"streamed",
+            r#"{"TableName":"streamed","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
                     "StreamViewType":"NEW_IMAGE"}}"#,

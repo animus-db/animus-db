@@ -136,7 +136,7 @@ async fn scan_paginates_a_whole_table() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"docs",
+        r#"{"TableName":"docs","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -227,7 +227,7 @@ async fn gsi_write_then_query() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -324,7 +324,7 @@ async fn scan_skips_deleted_items_and_paginates() {
     let (status, _) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"docs","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"docs","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
     assert_eq!(status, 200);

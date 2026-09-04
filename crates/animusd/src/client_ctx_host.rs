@@ -26,26 +26,30 @@ impl ControlLeaderHost<ProdEnv> for ClientCtx {
     }
 }
 
+/// **W-10 (ADR 0043 §A9's control-only-leader gap, closed)**: every method
+/// here now always answers `Some(..)` — `ClientCtx::backup_store` is
+/// provisioned on every node shape, including a control-only one, unlike
+/// `DataRole`'s own fields (see that field's own doc). The trait itself
+/// stays `Option`-returning (a genuinely store-less host is still a valid,
+/// generically testable shape — see `animus_node::backup_janitor`'s own
+/// `ControlOnlyStore` test double), this impl just never exercises the
+/// `None` arm any more.
 #[async_trait]
 impl BackupObjectStore for ClientCtx {
     async fn backup_put(&self, id: &str, bytes: &[u8]) -> Option<std::io::Result<Vec<NodeId>>> {
-        let data = self.data_opt()?;
-        Some(data.backup_store.put(id, bytes).await)
+        Some(self.backup_store.put(id, bytes).await)
     }
 
     async fn backup_list_local(&self, prefix: &str) -> Option<std::io::Result<Vec<String>>> {
-        let data = self.data_opt()?;
-        Some(data.backup_store.list_local(prefix).await)
+        Some(self.backup_store.list_local(prefix).await)
     }
 
     async fn backup_delete_local(&self, id: &str) -> Option<std::io::Result<()>> {
-        let data = self.data_opt()?;
-        Some(data.backup_store.delete_local(id).await)
+        Some(self.backup_store.delete_local(id).await)
     }
 
     async fn backup_delete_at(&self, replicas: &[NodeId], id: &str) -> Option<std::io::Result<()>> {
-        let data = self.data_opt()?;
-        Some(data.backup_store.delete(replicas, id).await)
+        Some(self.backup_store.delete(replicas, id).await)
     }
 }
 

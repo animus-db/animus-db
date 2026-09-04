@@ -185,7 +185,7 @@ async fn drop_table_cascades_to_its_gsis_hidden_table() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"users",
+            r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "GlobalSecondaryIndexes":[
                     {"IndexName":"by-email",

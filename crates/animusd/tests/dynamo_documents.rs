@@ -110,7 +110,7 @@ async fn document_set_types_projection_and_return_values() {
     let (status, _) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"profiles",
+        r#"{"TableName":"profiles","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -241,7 +241,7 @@ async fn multiple_gsis_composite_gsi_and_lsi() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"actor","AttributeType":"S"},{"AttributeName":"kind","AttributeType":"S"},{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"},{"AttributeName":"ts","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[

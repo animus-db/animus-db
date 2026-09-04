@@ -28,10 +28,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// configured (the default; no collector is ever required to run a node or
 /// the test suite).
 pub fn init_tracing(instance_id: &str) -> Option<SdkTracerProvider> {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+    init_tracing_with_endpoint(instance_id, resolved_endpoint().as_deref())
+}
+
+/// The OTLP endpoint tracing export currently resolves to — the same
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` read [`init_tracing`] performs (empty
+/// filtered out the same way), factored out so the admin `/admin/config`
+/// view (ADR 0020, `AdminInfo::otlp_endpoint`) can report it without
+/// duplicating the lookup. `None` when export isn't configured — the same
+/// meaning [`init_tracing`] gives an unset/empty var.
+pub fn resolved_endpoint() -> Option<String> {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
-        .filter(|e| !e.is_empty());
-    init_tracing_with_endpoint(instance_id, endpoint.as_deref())
+        .filter(|e| !e.is_empty())
 }
 
 /// The implementation behind [`init_tracing`], taking the OTLP endpoint as an

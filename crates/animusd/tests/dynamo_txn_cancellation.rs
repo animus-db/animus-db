@@ -55,6 +55,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;

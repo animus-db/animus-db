@@ -142,7 +142,7 @@ async fn scan_paginates_and_visits_every_item_exactly_once() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"widgets",
+            r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -324,7 +324,7 @@ async fn put_get_delete_item_round_trip() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"sessions",
+            r#"{"TableName":"sessions","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;

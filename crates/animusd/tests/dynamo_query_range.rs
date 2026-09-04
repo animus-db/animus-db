@@ -141,9 +141,7 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
         addrs[0],
         "DynamoDB_20120810.CreateTable",
         r#"{"TableName":"readings",
-            "AttributeDefinitions":[
-                {"AttributeName":"pk","AttributeType":"S"},
-                {"AttributeName":"sk","AttributeType":"N"}],
+            "AttributeDefinitions":[{"AttributeName":"alt","AttributeType":"S"},{"AttributeName":"device","AttributeType":"S"},{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"value","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[

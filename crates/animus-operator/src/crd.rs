@@ -104,19 +104,27 @@ pub struct AnimusClusterSpec {
     /// The client-facing dynamo port's own `Service`.
     #[serde(default)]
     pub client_service: ClientServiceSpec,
-    /// `--quiesce-after SECS` (combined-role pods only — see
-    /// `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table).
+    /// The idle-before-quiescing grace period for a data-plane CP group
+    /// (ADR 0044 phase-1 / ADR 0048). **S-06**: emitted into the generated
+    /// `cluster.json`'s `cluster_settings.quiesce_after_secs` section
+    /// (`desired::cluster_config::build_cluster_config`), not a CLI flag —
+    /// this now applies to **every** pod, combined and data-role alike (an
+    /// `animusd` data-only node had no route to quiescence at all before
+    /// S-06 closed that gap; see `crates/animus-operator/CLAUDE.md`'s
+    /// CLI-flag-support table for the full before/after picture).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiesce_after_secs: Option<u64>,
     /// `--split-mode {copy,inplace}` (combined-role pods only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_mode: Option<String>,
-    /// **Not currently wired into `entrypoint.sh`** — `animusd`'s
-    /// `--config FILE --node I` invocation (what every pod in this
-    /// deployment shape runs) does not accept `--auto-split-bytes` today;
-    /// that flag exists only on the dev-only `--cluster N` in-process mode.
-    /// Kept on the spec for forward compatibility and documented loudly
-    /// here and in the crate guide rather than silently dropped.
+    /// The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
+    /// **S-06**: like `quiesce_after_secs` above, now emitted into the
+    /// generated `cluster.json`'s `cluster_settings.auto_split_bytes`
+    /// section rather than a CLI flag — `--auto-split-bytes` itself only
+    /// ever existed on the dev-only `--cluster N` in-process mode, so this
+    /// field went from **never wired into `entrypoint.sh` at all** to
+    /// reaching every pod (combined and data-role) through the config file
+    /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_split_bytes: Option<u64>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB

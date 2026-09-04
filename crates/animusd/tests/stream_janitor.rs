@@ -305,7 +305,7 @@ async fn two_phase_expiry_removes_the_row_and_every_replicas_object() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -413,7 +413,7 @@ async fn expiry_survives_a_control_leader_kill_mid_sweep() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -511,7 +511,7 @@ async fn reader_never_sees_an_empty_success_gap_across_expiry() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_IMAGE"}}"#,
@@ -606,7 +606,7 @@ async fn repair_re_replicates_to_a_fresh_target_after_a_replica_node_dies() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -702,7 +702,7 @@ async fn disable_grace_lifecycle_end_to_end_with_reenable_coexistence() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -827,7 +827,7 @@ async fn drop_table_cascade_converges_via_the_janitor() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -878,7 +878,7 @@ async fn mid_grace_drop_removes_both_coexisting_labels() {
     let (status, _) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -960,7 +960,7 @@ async fn metrics_reflect_a_completed_retention_cycle() {
     let (status, _) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -1054,7 +1054,7 @@ async fn retired_parents_shards_are_not_reaped_early() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"rt",
+        r#"{"TableName":"rt","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1110,7 +1110,7 @@ async fn retired_parents_final_shard_expires_by_retention() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"re",
+        r#"{"TableName":"re","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1161,5 +1161,262 @@ async fn retired_parents_final_shard_expires_by_retention() {
             || async { !tokio::fs::try_exists(&path).await.unwrap_or(true) },
         )
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W-10 (ADR 0043 §A9's control-only-leader gap, closed): a genuine split
+// deployment, no combined-mode node anywhere.
+// ---------------------------------------------------------------------------
+
+/// Bring up a **genuine split deployment** — `control_n` control-only nodes
+/// (`animusd control`'s `run_node_control_with_stores`) plus `data_n`
+/// data-only nodes (`animusd data`'s `run_node_data_with_streams`), no
+/// combined-mode node anywhere — with tiny stream-seal/retention knobs
+/// (this codebase's own testing discipline). Mirrors `tests/support::
+/// bring_up_split`'s bring-up shape (including its port-TOCTOU retry
+/// discipline) plus this file's own `start_streamed_cluster_with_store`'s
+/// tiny-knobs threading, neither of which alone covers this combination —
+/// `bring_up_split` always uses production stream knobs (`run_node_control`/
+/// `run_node_data`'s own defaults), and `start_streamed_cluster_with_store`
+/// only ever brings up combined-mode nodes (`bind_cluster`). Returns the
+/// data nodes' own directories alongside the nodes (`segment_path` needs
+/// them, and — unlike `bind_cluster`'s deterministic `node-{i}` naming —
+/// this bring-up's own retry loop makes the directory name depend on which
+/// attempt finally succeeded).
+async fn start_split_streamed_cluster(
+    control_n: usize,
+    data_n: usize,
+    dir: &Path,
+    retention: Duration,
+    seal_knobs: StreamSealKnobs,
+) -> (Vec<Node>, Vec<Node>, Vec<PathBuf>, animusd::ClusterConfig) {
+    let total = control_n + data_n;
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(total * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..total)
+            .map(|i| {
+                let role = if i < control_n {
+                    animusd::config::NodeRole::Control
+                } else {
+                    animusd::config::NodeRole::Data
+                };
+                animusd::RoleAddrs {
+                    id: animusd::config::node_id(i),
+                    role,
+                    internal: addrs[6 * i],
+                    client: addrs[6 * i + 1],
+                    dynamo: addrs[6 * i + 2],
+                    admin: addrs[6 * i + 3],
+                    intra: addrs[6 * i + 4],
+                    console: addrs[6 * i + 5],
+                    advertise_host: None,
+                }
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+
+        let mut control_nodes = Vec::new();
+        let mut data_nodes = Vec::new();
+        let mut data_dirs = Vec::new();
+        let mut failed = false;
+        for i in 0..control_n {
+            match animusd::run_node_control_with_stores(
+                &config,
+                i,
+                dir.join(format!("a{attempt}-c{i}")),
+                StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                SegmentStoreConfig::default(),
+                animusd::BackupStoreConfig::default(),
+                retention,
+            )
+            .await
+            {
+                Ok(n) => control_nodes.push(n),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            for i in control_n..total {
+                let node_dir = dir.join(format!("a{attempt}-d{i}"));
+                match animusd::run_node_data_with_streams(
+                    &config,
+                    i,
+                    node_dir.clone(),
+                    StorageBackend::Memory,
+                    seal_knobs,
+                    SegmentStoreConfig::default(),
+                )
+                .await
+                {
+                    Ok(n) => {
+                        data_nodes.push(n);
+                        data_dirs.push(node_dir);
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !failed {
+            return (control_nodes, data_nodes, data_dirs, config);
+        }
+        for n in control_nodes.iter().chain(data_nodes.iter()) {
+            n.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up split streamed cluster after retries (ports kept getting stolen)");
+}
+
+/// **The whole point of W-10**: a control-only leader (necessarily one of
+/// this test's control-only trio — a data-only node never registers a local
+/// control `RaftNode`, so it can never lead) reclaims a sealed stream's
+/// segment objects on its own, with no data-role node ever needing to take
+/// the lead. Before this fix, `segment_janitor_tick`'s phases 2/3 (object
+/// deletion, replica repair) skipped unconditionally on every control-only
+/// leader (`ctx.data_opt() == None`, `crate::segment_janitor`'s own
+/// pre-fix doc) — a row here would be marked `expired` forever (still
+/// correctly invisible to `DescribeStream`, per that module's own
+/// documented residual, but never physically reclaimed) rather than
+/// converging to fully removed the way this test asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader() {
+    let dir = support::panic_safe_tempdir();
+    let (control_nodes, data_nodes, data_dirs, _config) =
+        start_split_streamed_cluster(3, 2, dir.path(), TINY_RETENTION, tiny_seal_knobs()).await;
+
+    support::await_leader(&control_nodes).await;
+    let data_ids: Vec<animus_env::NodeId> = (0..data_nodes.len())
+        .map(|i| animusd::config::node_id(3 + i))
+        .collect();
+    support::await_data_nodes_active(&control_nodes, &data_ids).await;
+
+    let addr = data_nodes[0].dynamo_addr();
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    // Two writes, each sealed before the next — see the identical happy-path
+    // test's own doc for why: the janitor's "never remove a tablet's own
+    // current max epoch" guard means epoch 0 only becomes reclaimable once a
+    // LATER epoch exists.
+    let all_nodes: Vec<&Node> = control_nodes.iter().chain(data_nodes.iter()).collect();
+    let (status, _) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"t","Item":{"id":{"S":"p1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    await_true(
+        20,
+        "chain length 1 for `t` never reached on every node",
+        || {
+            all_nodes.iter().all(|n| {
+                let meta = n.metadata();
+                meta.has_table_schema("t") && chain_len(&meta, tablet_for(&meta, "t")) >= 1
+            })
+        },
+    )
+    .await;
+    let (status, _) = dynamo(
+        addr,
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"t","Item":{"id":{"S":"p2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    await_true(
+        20,
+        "chain length 2 for `t` never reached on every node",
+        || {
+            all_nodes.iter().all(|n| {
+                let meta = n.metadata();
+                meta.has_table_schema("t") && chain_len(&meta, tablet_for(&meta, "t")) >= 2
+            })
+        },
+    )
+    .await;
+
+    let meta0 = control_nodes[0].metadata();
+    let (tablet, epoch) = first_sealed(&meta0, "t");
+    assert_eq!(epoch, 0, "the first-sealed shard must be epoch 0");
+    let row = meta0.stream_shards[&(tablet, epoch)].clone();
+    assert_eq!(
+        row.replicas.len(),
+        data_nodes.len(),
+        "K = min(DEFAULT_K, candidates) — only the 2 data-only nodes are \
+         placement candidates (a control-only node never claims `Metadata::\
+         members`, so it's never chosen as a replica target itself): {row:?}"
+    );
+    for id in &row.replicas {
+        assert!(
+            data_ids.contains(id),
+            "every recorded replica must be a data-only node, never a \
+             control-only one: {row:?}"
+        );
+    }
+
+    // Confirm the object genuinely landed on every recorded replica's own
+    // disk before asserting it's later gone.
+    for (i, node_dir) in data_dirs.iter().enumerate() {
+        let path = segment_path(node_dir, &row.object_id);
+        assert!(
+            tokio::fs::metadata(&path).await.is_ok(),
+            "data node {i}'s own segment file must exist before expiry: {path:?}"
+        );
+    }
+
+    // Past retention: the row is removed from every node's own catalog —
+    // control AND data alike — driven entirely by whichever control-only
+    // node currently leads.
+    await_true(
+        20,
+        "row was never removed from every node's catalog",
+        || {
+            all_nodes
+                .iter()
+                .all(|n| !n.metadata().stream_shards.contains_key(&(tablet, epoch)))
+        },
+    )
+    .await;
+
+    // ...and its object is genuinely gone from every replica's own disk —
+    // the physical reclaim step (phase 1b) that a control-only leader used
+    // to skip entirely.
+    for (i, node_dir) in data_dirs.iter().enumerate() {
+        let path = segment_path(node_dir, &row.object_id);
+        await_true_async(
+            10,
+            &format!("data node {i}'s segment file was never reclaimed"),
+            || async { !tokio::fs::try_exists(&path).await.unwrap_or(true) },
+        )
+        .await;
+    }
+
+    for n in &control_nodes {
+        n.shutdown_graceful().await;
+    }
+    for n in &data_nodes {
+        n.shutdown_graceful().await;
     }
 }

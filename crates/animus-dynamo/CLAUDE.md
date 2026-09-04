@@ -306,7 +306,9 @@ comment for its full type/method inventory.
   whichever side changed) — see `animusd`'s `tests/dynamo_updated_return_values.rs`.
 - **`UpdateItem`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems`** are
   decoded here and run at the `animusd` edge. `UpdateItem` is read-modify-write
-  of one item applying `SET`/`REMOVE` (upsert when absent); `BatchWriteItem`
+  of one item applying `SET`/`REMOVE`/`ADD`/`DELETE` (upsert when absent) —
+  see the dedicated `UpdateExpression` bullet below (issue #375/W-01) for the
+  full grammar; `BatchWriteItem`
   applies `Put`/`Delete` per request (no batch atomicity — a DynamoDB-faithful
   design choice, unlike `TransactWriteItems` below). **`TransactWriteItems` is
   atomic since ADR 0018 §2/PR7**: every condition-gated `Put`/`Delete`/`Update`/
@@ -397,10 +399,57 @@ comment for its full type/method inventory.
   so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
   reached by the raw client protocol's plain writes, not ordinary
   `TransactWriteItems` contention).
-- `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
-  arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
-  in `wire.rs`) — see the `wire` entry point above and this crate's own unit
-  tests. **`Query` now paginates exactly like `Scan`**
+- `BatchGetItem` is implemented (`decode_batch_get` in `wire.rs`).
+- **`UpdateExpression` (issue #375/roadmap W-01) is now the full documented
+  subset**: `SET path = expr` (`expr` is one `UpdateOperand` — a `:value`, a
+  document path read from the item, or `if_not_exists(path, default)`/
+  `list_append(a, b)` — or `operand + operand`/`operand - operand`, exactly
+  one arithmetic operator, both sides `N`), `REMOVE path`, `ADD path :v`, and
+  `DELETE path :v`, in any order, any number of clauses. Every target/
+  operand `path` is a full **document path** (`a`, `a.b`, `a[0]`,
+  `#n.b[1]`) — the identical [`PathSegment`]-based grammar
+  `ProjectionExpression` uses (W-02), reused verbatim via
+  `parse_update_path`/`parse_projection_path` in `wire.rs` rather than
+  reimplemented; `SET`/`REMOVE` were the first to gain this (ADD/DELETE
+  followed, since it turned out to be "trivial" once the get/set/remove
+  document-path primitives existed for `SET`/`REMOVE`). Grammar built in
+  three layers, each its own commit: function calls (`if_not_exists`/
+  `list_append`, SET-only) first, then `+`/`-` arithmetic as first-class
+  tokens (`UpdateToken::Plus`/`Minus` — an unaliased attribute name
+  containing a literal `+`/`-` needs `#alias`, mirroring the pre-existing
+  `.`/`[` rule), then nested-path targets last (the data-model change to
+  `UpdateAction`/`UpdateOperand`, from a bare `String` to `Vec<PathSegment>`).
+  **Evaluation happens at apply time** (`eval_update_expr`/
+  `eval_update_operand` in `wire.rs`, called from `apply_update` — which
+  itself always runs at the leader, under the same `rmw_lock`-guarded scope
+  ADD's read-modify-write already used, via `animusd::dynamo::
+  kind_write_item_at_leader`; nothing new needed there, since `apply_update`'s
+  signature/call sites are unchanged), against the item as the fold has
+  built it so far — a documented simplification of DynamoDB's own
+  within-one-expression ordering semantics (see `UpdateOperand`'s own doc),
+  not a modeled property. `SET`'s target path validates that every segment
+  but the last already exists before evaluating the expression
+  (`document_path_parent_exists`) — `SET a.b = :v` on an absent `a` is a
+  `ValidationException` ("The document path provided in the update
+  expression is invalid for update"), matching AWS; only the *final*
+  segment may be new, and a list index past the current length **appends**
+  rather than padding (AWS's own documented `SET list[n]` behavior beyond
+  bounds). `REMOVE` on a missing path (including a missing parent) is a
+  no-op, and `REMOVE a[i]` compacts the list (`Vec::remove`, no sparse
+  hole). **Overlapping targets in one expression are rejected**
+  (`validate_no_overlapping_targets`, `O(n²)` in the action count, always
+  small) — `SET a = :x, a.b = :y` is a `ValidationException` ("Two document
+  paths overlap with each other"), checked across every action's target
+  (`SET`/`REMOVE`/`ADD`/`DELETE` alike) by prefix comparison of their
+  `Vec<PathSegment>`s. `condition::negate_numeric` is new (issue #375 PR2)
+  — `SET a = a - :x` is implemented as `add_numeric(a, negate_numeric(x))`,
+  DynamoDB's only subtraction path, the identical "add a negated operand"
+  shape this module's own differential-test `negate` helper already
+  exercised `add_numeric` with, now exposed for production use rather than
+  test-only. **Residual gap**: within-expression path-read ordering (see
+  above) — DynamoDB's own semantics here are not fully pinned down or
+  tested against; this crate documents its own choice rather than claiming
+  exact AWS fidelity on that one point. **`Query` now paginates exactly like `Scan`**
   (`decode_query` parses `Limit`/`ExclusiveStartKey` the same way
   `decode_scan` does, sharing the decode helpers; found and closed while
   building animusd console's Items tab, ADR 0052 PR4, which needed it and

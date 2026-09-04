@@ -145,6 +145,7 @@ fn single_node_config() -> ClusterConfig {
             advertise_host: None,
         }],
         dynamo_auth: None,
+        cluster_settings: None,
     }
 }
 
@@ -229,6 +230,7 @@ pub async fn bring_up_deadline(
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -290,6 +292,7 @@ pub async fn grow_deadline(
         let expanded = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -605,6 +608,7 @@ pub async fn bring_up_split(
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
 
         let mut control_nodes = Vec::new();
