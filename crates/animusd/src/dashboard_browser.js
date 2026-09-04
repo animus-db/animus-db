@@ -12,6 +12,8 @@
 // `tabletsForTable`, reused below for the Indexes card's backfill-progress
 // count — a stream shard count and an index backfill count both need "every
 // tablet currently mapped to this table", the same live-topology lookup).
+// docs/roadmap.md U-04 added the TTL row (beside the Stream row, same
+// enable/disable-via-`/admin/data/dynamo` shape).
 
 // ---- DynamoDB: schema helpers (shared by Scan/Query/item forms) ----
 // Excludes a GSI's own hidden `<base>$<index>` materialization table
@@ -167,6 +169,7 @@ function renderDynamoFields() {
   renderIndexSelector(schema);
   renderIndexesSection(schema);
   renderStreamRow(schema);
+  renderTtlRow(schema);
 }
 
 // ---- DynamoDB Streams: enable/disable (ADR 0042/0043) ----
@@ -231,6 +234,82 @@ async function disableStream() {
   });
   if (status >= 300) {
     const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+// ---- DynamoDB TTL: enable/disable (ADR 0051) ----
+// A table's TTL toggle lives here, right beside the Stream row above and for
+// the identical reason (a per-table action, not a cluster-wide view). Status
+// is read straight off `schema.ttl` — already part of the /admin/status
+// payload this view polls, the same replicated-catalog fact
+// `dynamo::describe_time_to_live`'s own `meta.table_ttl(table)` read would
+// answer — so no extra `DescribeTimeToLive` round trip is needed to render
+// current state; enable/disable post the real `UpdateTimeToLive` op through
+// the same `/admin/data/dynamo` proxy every other Data Browser mutation
+// uses, behind `window.confirm`. AWS requires `AttributeName` on every call,
+// including a disable, so the disable path always echoes the currently
+// enabled attribute back.
+function renderTtlRow(schema) {
+  const el = $("br-dy-ttl");
+  if (!schema) { el.innerHTML = ""; return; }
+  const ttl = schema.ttl;
+  if (ttl) {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>TTL</h2>
+      <div class="row" style="justify-content:space-between">
+        <div class="row">${pill("ok", "ENABLED")}<span class="mono">${esc(ttl.attribute_name)}</span></div>
+        <div class="row"><span class="muted" id="br-dy-ttl-msg"></span><button class="danger-text" id="br-dy-ttl-disable">Disable</button></div>
+      </div>
+    </div>`;
+    $("br-dy-ttl-disable").addEventListener("click", disableTtl);
+  } else {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>TTL</h2>
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">no TTL enabled</span>
+        <div class="row">
+          <span class="muted" id="br-dy-ttl-msg"></span>
+          <input type="text" id="br-dy-ttl-attr" placeholder="attribute" style="width:130px">
+          <button id="br-dy-ttl-enable">Enable</button>
+        </div>
+      </div>
+    </div>`;
+    $("br-dy-ttl-enable").addEventListener("click", enableTtl);
+  }
+}
+
+async function enableTtl() {
+  const table = dyTable;
+  const attr = $("br-dy-ttl-attr").value.trim();
+  if (!attr) { $("br-dy-ttl-msg").textContent = "attribute name is required"; return; }
+  if (!window.confirm(`Enable TTL on “${table}” using attribute “${attr}”? An item whose “${attr}” attribute holds a past epoch second becomes eligible for background deletion.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTimeToLive",
+    payload: { TableName: table, TimeToLiveSpecification: { Enabled: true, AttributeName: attr } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-ttl-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+async function disableTtl() {
+  const table = dyTable;
+  const schema = dynamoTables()[table];
+  const attr = schema && schema.ttl && schema.ttl.attribute_name;
+  if (!attr) return;
+  if (!window.confirm(`Disable TTL on “${table}”? Items already past expiry are not deleted immediately — only future expiry stops being enforced.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTimeToLive",
+    payload: { TableName: table, TimeToLiveSpecification: { Enabled: false, AttributeName: attr } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-ttl-msg");
     if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
     return;
   }

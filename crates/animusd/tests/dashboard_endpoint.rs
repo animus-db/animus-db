@@ -1053,3 +1053,112 @@ async fn dashboard_u02_backups_tab() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
+/// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
+/// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The
+/// actual `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics already have
+/// their own full end-to-end coverage (`tests/dynamo_ttl.rs`), so this test
+/// only proves: the shell carries the new row beside the Stream row,
+/// `dashboard_browser.js` renders it from `schema.ttl` (the same
+/// already-fetched `/admin/status` fact `dynamo::describe_time_to_live`
+/// itself reads) and posts the real `UpdateTimeToLive` op/payload shape
+/// behind `window.confirm`, and that exact shape — enable, then disable
+/// with the same `AttributeName` AWS requires on both calls — is accepted
+/// by the real wire through the admin proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u04_ttl_row() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #br-dy-ttl beside #br-dy-stream -------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let stream_pos = shell
+            .find(r#"id="br-dy-stream""#)
+            .expect("shell carries #br-dy-stream");
+        let ttl_pos = shell
+            .find(r#"id="br-dy-ttl""#)
+            .expect("shell carries #br-dy-ttl");
+        assert!(
+            ttl_pos > stream_pos && ttl_pos - stream_pos < 200,
+            "#br-dy-ttl sits immediately beside #br-dy-stream: {shell}"
+        );
+
+        // ---- dashboard_browser.js renders it and posts the real op ---------
+        let (s, _, browser_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_browser.js").await;
+        assert_eq!(s, 200, "dashboard_browser.js is served");
+        assert!(
+            browser_js.contains("function renderTtlRow")
+                && browser_js.contains("function enableTtl")
+                && browser_js.contains("function disableTtl"),
+            "dashboard_browser.js defines the TTL row's render + enable/disable handlers: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("schema.ttl"),
+            "renderTtlRow reads the already-fetched schema.ttl, no extra DescribeTimeToLive round trip: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("UpdateTimeToLive")
+                && browser_js.contains("TimeToLiveSpecification")
+                && browser_js.contains("AttributeName"),
+            "the TTL row posts the real UpdateTimeToLive op with its real payload shape: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("Enable TTL on") && browser_js.contains("Disable TTL on"),
+            "both enable and disable are gated behind their own window.confirm: {browser_js}"
+        );
+
+        // ---- the exact payload shape round-trips through the real wire -----
+        let (s, ct_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable widgets: {ct_body}");
+
+        let (s, en_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "enable TTL: {en_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        assert_eq!(
+            status["schemas"]["tables"]["widgets"]["ttl"]["attribute_name"].as_str(),
+            Some("expiresAt"),
+            "TTL is enabled with the declared attribute: {status_body}"
+        );
+
+        let (s, dis_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":false,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "disable TTL: {dis_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        assert!(
+            status["schemas"]["tables"]["widgets"]["ttl"].is_null(),
+            "TTL is disabled: {status_body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}

@@ -1006,6 +1006,25 @@ reusing the captured config is the point of the test.
   Data Browser's static-form convention, since a per-row target-table
   prompt has no natural home in a persistent form the way Create-backup's
   table+name pair does.
+
+  **docs/roadmap.md U-04** (`dashboard_browser.js`) added a `#br-dy-ttl`
+  row beside `#br-dy-stream` (`renderTtlRow`, called from
+  `renderDynamoFields` alongside `renderStreamRow`) — same shape as the
+  Stream row: current state read straight off the already-fetched
+  `schema.ttl` (`/admin/status`, the identical replicated-catalog fact
+  `dynamo::describe_time_to_live`'s own `meta.table_ttl(table)` read
+  answers, so no extra `DescribeTimeToLive` round trip), enable/disable
+  posted through the existing `/admin/data/dynamo` proxy behind
+  `window.confirm` with the real `UpdateTimeToLive{TableName,
+  TimeToLiveSpecification:{Enabled,AttributeName}}` shape — `AttributeName`
+  is sent on **both** calls (AWS requires it even to disable, to name the
+  attribute being disabled), so `disableTtl` reads it back off `schema.ttl`
+  rather than asking the user to retype it. Tests:
+  `tests/dashboard_endpoint.rs::dashboard_u04_ttl_row` (the same
+  render-markers-plus-live-round-trip structure as U-01/U-02's own tests
+  above) — the actual `UpdateTimeToLive`/`DescribeTimeToLive` wire
+  mechanics keep their full end-to-end coverage in `tests/dynamo_ttl.rs`,
+  unchanged by this item.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
