@@ -1764,10 +1764,16 @@ chase recovers via a live replica in a few seconds rather than dead-ending
 near the full `CLIENT_TIMEOUT`. See `docs/engineering-lessons.md`'s
 matching Testing entry for the general lesson (a hint-chasing forward's
 per-candidate timeout must be a bounded slice of the overall deadline,
-never the whole remaining budget) and why no `SimEnv` shape can reach this
-mechanism today (the cross-node relay is a free function hardcoded to a
-real `TcpStream`, not routed through `E: Env`'s `Network` seam or the `R:
-RelayClient` capability trait).
+never the whole remaining budget). **This specific test still can't move
+to `SimEnv`** even though `forward_to_tablet_leader` itself is now relay-
+generic (ADR 0061 rung C3d) — what it actually proves is
+`AnimusdRelayClient`'s own real-transport timeout behavior
+(`relay_request_with_timeout`'s `RELAY_HOP_TIMEOUT`/
+`RELAY_TRANSPORT_FAILURE` split against a real, deliberately-stalling
+`TcpListener` stub), which has no `SimEnv` analogue to test against —
+`SimRelayClient`'s own timeout races `env.sleep()` against a `Pending`
+poll, a different mechanism with its own coverage (`animus_node::
+sim_relay::tests`), not a second implementation of this one.
 
 **The hop cap above regressed the property it was supposed to leave
 intact — a genuinely slow-but-LIVE leader must still be waited out (issue
@@ -3623,6 +3629,49 @@ genericization this rung did not attempt.
   target-directory growth for this whole crate — safe to run as the actual
   gate 2 command from the disk-discipline section above, unlike `cargo
   build -p animusd --all-targets`, which is exactly what fills the disk.
+
+### C3d landed: `two_node_relay_tests`, a real two-node relay smoke (ADR 0061)
+
+The blocker this section's own "What it cannot drive" list did **not**
+name — because it wasn't a gap in this harness, it was simply the next
+rung — is closed: `ClientCtx<E, R>` now carries a `relay: R` field, and
+`forward_to_tablet_leader`/`ClientCtx::relay`/`read_path.rs`'s
+`relay_stale_read`/`schema.rs`'s `propose_schema` broadcast fallback all
+call `self.relay.relay(..)` instead of the free `relay_request`/
+`relay_request_with_timeout` functions directly. `animus_node::
+sim_relay::SimRelayClient<E: Env>` is the sim-only, `Network`-backed
+implementor this buys — see that module's own doc (`animus-node/
+CLAUDE.md`'s own entry, and ADR 0061's 2026-09-04 amendment) for the
+stream allocation, the `addr == NodeId::to_string()` convention, and the
+`req_id`-correlated wire shape.
+
+`lib.rs`'s `two_node_relay_tests` (a sibling `#[cfg(test)] mod` to
+`simenv_client_ctx_tests`, same in-crate-for-private-handles reason) is
+the proof this actually works end to end: two `ClientCtx<SimEnv,
+SimRelayClient<SimEnv>>`s on two distinct `SimEnv` node ids, sharing one
+control `RaftNode<SimEnv>` (`Arc`-backed clones, so both see the identical
+replicated `Metadata` with no propagation delay) but each with its own
+`ClusterEdgeState` — node A hosts the sole tablet replica, node B hosts
+none. Node B's `cp_kind_write_raw`/`cp_get` calls resolve `CpRoute::
+Forward` and carry the request to node A over a real `SimRelayClient`
+wire; node A's own relay server (`relay_a.serve(..)`, closed over a clone
+of `ctx_a`) answers through `forwarding::handle_relayed_request` — the
+same `E`/`R`-generic dispatcher production's own `handle_request`
+delegates its `Status`/`Forwarded`/`ProposeSchema` arms to. A third,
+direct `cp_get` on `ctx_a` confirms the write landed on node A's own
+engine, not merely echoed back through the relay's own bookkeeping.
+
+**What this still does not drive, unchanged from the blocker above**:
+`ClientCtx::propose_schema`'s *local-propose fast path* is still
+`ProdEnv`-locked (`ClusterEdgeState::control`'s own concrete typing) —
+`two_node_relay_tests` seeds schema the same way `simenv_client_ctx_tests`
+does, proposing directly on the shared control `RaftNode`. What changed is
+that `propose_schema`'s *relay* branches are now genuinely reachable
+(under `SimEnv` they're the only branches that can ever fire, since the
+fast path's own field structurally can't hold a `SimEnv` handle) — this
+rung's own smoke doesn't happen to call `propose_schema` at all, so it
+doesn't exercise that specific path, but nothing about the relay seam
+itself blocks a follow-on test that does.
 
 ## Tests
 

@@ -191,12 +191,16 @@ C2 (above) landed five of the six leaf background loops behind narrow host
 traits; `segment_janitor` stays in `animusd` (see rung C2's own entry for
 why). Rung C3 (above) landed the client-frame codec's pure half, the
 `RelayClient` capability trait, and `ControlHandle`/`RemoteControlClient`
-themselves — but **not** `ClientCtx::relay` or any call site reaching relay
-*through* `ClientCtx` (`propose_schema`, `cp_serve_forwarded`'s
-forwarding), which stay `ClientCtx`-entangled and move with it in C5. Rung
-C4 (below) lands the HTTP wire edges (C4a/b/c/d) — `dynamo.rs`'s
-`run_operation`/DDL handlers are explicitly **not** part of C4; they fold
-into C5 (see C4's own entry for why).
+themselves. **`ClientCtx::relay` and every call site reaching relay
+*through* `ClientCtx` (`forward_to_tablet_leader`, `propose_schema`'s
+broadcast fallback, `read_path.rs`'s `relay_stale_read`) are now
+relay-generic too (rung C3d, 2026-09-04)** — `ClientCtx<E, R>` carries its
+own `relay: R` field and every one of those call sites goes through it —
+but this did **not** need `ClientCtx` itself to move: it stayed exactly
+where the seventh 2026-08-28 amendment (below) later decided it would stay
+permanently, generic in place. Rung C4 (below) lands the HTTP wire edges
+(C4a/b/c/d) — `dynamo.rs`'s `run_operation`/DDL handlers are explicitly
+**not** part of C4; they fold into C5 (see C4's own entry for why).
 
 **One cross-crate discipline gap this creates until C5, narrowed (not
 closed) by a small follow-on hardening**: `cp_serve_forwarded`'s gating
@@ -241,9 +245,9 @@ a `RelayClient` capability trait") turned out to be four sub-rungs once
 scoped (the third 2026-08-28 amendment) — a literal "move relay onto
 `Network`" was rejected outright (it would collapse ADR 0047's `intra`
 port into `internal`, a production wire-topology change this ADR
-disclaims). This crate implements C3a–C3c; **C3d (a `Network`-backed,
-`req_id`-correlated, sim-only `RelayClient`) is deliberately deferred to
-Phase D** — nothing here builds request/reply correlation.
+disclaims). This crate implements C3a–C3c below; **C3d (a `Network`-backed,
+`req_id`-correlated, sim-only `RelayClient`) has since landed too** — see
+its own section, "What's here (rung C3d)", right after this one.
 
 - **`codec`** (C3a) — the **pure** half of the length-prefixed client-frame
   wire codec: `MAX_FRAME_LEN` (64 MiB), `encode_client_frame` (serde_json
@@ -290,6 +294,57 @@ Phase D** — nothing here builds request/reply correlation.
   `RelayClient` implementor wrapping the crate's unchanged
   `relay_request_with_timeout`), plus that implementor itself — see that
   crate's own `CLAUDE.md` entry.
+
+## What's here (rung C3d)
+
+The fourth C3 sub-rung, landed 2026-09-04 (ADR 0061's matching amendment
+has the full design) — the piece that actually lets a multi-node cluster
+talk inside `SimEnv`, since C3a–C3c above only built the seam `R:
+RelayClient` threads through, with `AnimusdRelayClient` (a real socket) as
+its one implementor.
+
+- **`sim_relay::SimRelayClient<E: Env>`** — a second `RelayClient`
+  implementor, this one over the `Network` seam (ADR 0026) instead of a
+  socket. Reserves `RELAY_STREAM = u64::MAX - 2` (the module doc's own
+  table gathers every other reserved-stream constant in the workspace and
+  explains the choice); addresses a peer by `NodeId::to_string()` (a
+  `SimEnv` node has no host:port, and `NodeId` is fundamentally a string,
+  so this needs no separate lookup table — `SimRelayClient::relay` parses
+  `addr` back via `NodeId::new_unchecked`, the literal inverse of
+  `Display`); and correlates request/reply by a `req_id` + `Pending`-slot
+  map, the identical shape `animus_cp_data::cluster_segment_store` already
+  established (a monotonic per-client counter, not an `Rng` draw, so a
+  test's other seeded draws are undisturbed) — `Network`'s own
+  `send_stream`/`recv_stream` have no built-in correlation, exactly the
+  gap the third 2026-08-28 amendment identified and this rung closes.
+  `(node, stream)` is single-consumer, and a relaying node is both a
+  client (awaiting replies to its own outbound calls) and a server
+  (answering inbound ones) on that one stream — so `SimRelayClient::new`
+  unconditionally spawns the one receive loop both roles share
+  (`env.spawn_task`), and `serve(handler)` only ever *installs* a handler
+  into it (an `Arc<Mutex<Option<Handler>>>` the loop reads), never starts
+  or stops anything; a node that never calls `serve` still receives its
+  own outbound calls' replies, it just answers every inbound request with
+  a fixed "no handler installed" error rather than hanging. Four unit
+  tests here (`sim_relay::tests`, `#[cfg(test)]` in-module): a round trip,
+  a partitioned peer timing out cleanly, a late reply after timeout never
+  matching a *later* request's `req_id`, and several concurrent
+  outstanding requests to one peer each resolving to their own caller.
+  This module needs no `ClientCtx` and knows nothing about `animusd` — the
+  handler `serve` installs is a plain `Fn(ClientRequest) -> Fut` closure,
+  supplied by the caller (`animusd`'s `forwarding::
+  handle_relayed_request`, closed over a cloned `ClientCtx<E, R>`).
+
+`animusd`'s own contribution — threading `ClientCtx<E, R>`'s existing
+relay call sites (`forward_to_tablet_leader`, `ClientCtx::relay`,
+`read_path.rs`'s `relay_stale_read`, `schema.rs`'s `propose_schema`
+broadcast fallback) through a new `relay: R` field instead of the free
+`relay_request`/`relay_request_with_timeout` functions, plus the generic
+`forwarding::handle_relayed_request<E, R>` dispatcher production's own
+`handle_request` now delegates its `Status`/`Forwarded`/`ProposeSchema`
+arms to — is entirely in that crate; see `animusd/CLAUDE.md`'s own C3d
+section (beside its SimEnv `ClientCtx` harness entry) for the full design
+and the `two_node_relay_tests` end-to-end proof.
 
 ## What's here (rung C4a/C4b/C4c/C4d — the HTTP edges)
 

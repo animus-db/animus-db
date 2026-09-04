@@ -722,6 +722,120 @@ confirms the seventh amendment's redirection (stop moving code, prove
 the residual findings above are refinements to *what the proof covers*, not
 corrections to *how it should be built*.
 
+#### 2026-09-04 amendment — C3d landed: a sim-only `Network`-backed `RelayClient`, and the relay seam threaded through `ClientCtx`
+
+C3d (the third 2026-08-28 amendment's own table) is done — the piece the
+eighth amendment's own closing note flagged as still missing before a
+`SimCluster` could talk to itself: `animus_node::sim_relay::SimRelayClient
+<E: Env>`, plus threading `ClientCtx`'s own relay call sites through the
+`R: RelayClient` field this rung adds, so the seam C3b/C3c built is
+actually load-bearing end to end rather than reachable only by
+`AnimusdRelayClient`.
+
+**Stream allocation.** `SimRelayClient` reserves `RELAY_STREAM = u64::MAX -
+2` (`animus_node::sim_relay`, whose module doc carries the full table
+gathered by grepping every existing reserved-stream constant in the
+workspace: `PRIMARY_STREAM` = 0, a CP data-plane tablet's own group =
+`tablet.0`, `BACKUP_SEGMENT_STREAM` = `u64::MAX - 1`, `SEGMENT_STREAM` =
+`u64::MAX`) — disjoint from all three, and from every plausible `tablet.0`
+(small, sequential, nowhere near `u64::MAX`).
+
+**Address convention.** A `SimEnv` node has no host:port, so
+`RelayClient::relay`'s `addr: String` is defined to be exactly
+`NodeId::to_string()` under this implementor — `SimRelayClient::relay`
+parses it back via `NodeId::new_unchecked` (the literal inverse of
+`Display`), never a separate `String -> NodeId` lookup table. A fixture
+that wants a sim node's `client_route`/`intra_route` entry writes
+`id.to_string()` as the address, precisely the shape `SimCluster` (D1)
+must use for its own route tables.
+
+**One stream, two roles.** `(node, stream)` is single-consumer (ADR 0026),
+and a node acting as a relay is both the *client* sending `relay()` calls
+out and the *server* answering another node's calls, on the identical
+stream — a reply to this node's own outbound call and an inbound request
+both arrive on `RELAY_STREAM`. `SimRelayClient` follows `animus_cp_data::
+cluster_segment_store::serve_loop`'s own precedent rather than a
+direction-demultiplexed pair of streams: one wire enum (`RelayWire::
+{Request, Reply}`, `req_id`-correlated exactly like that module's own
+`Pending` slots — a monotonic per-client counter, not an `Rng` draw, so it
+never perturbs a test's other seeded draws), one receive loop dispatching
+on which variant arrived. `SimRelayClient::new` spawns that loop
+unconditionally (not `serve`, which only *installs a handler* into an
+`Arc<Mutex<Option<Handler>>>` the already-running loop reads) — a node
+that never calls `serve` still needs the loop running to receive its own
+outbound calls' replies, the opposite of what the eighth amendment's own
+"answers none until `serve` is called" phrasing (written before this rung
+built the thing) implied.
+
+**The generic relayed-request dispatcher.** `forwarding::
+handle_relayed_request<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, req:
+ClientRequest) -> ClientResponse` covers exactly the three `ClientRequest`
+variants a `ClientCtx<E, R>` method actually relays today —
+`Forwarded` (`forward_to_tablet_leader`/`read_path.rs`'s
+`relay_stale_read`, delegating to `cp_serve_forwarded`), `ProposeSchema`
+(`schema.rs`'s single-hint relay and its ADR 0030 broadcast fallback,
+gated on `is_relayable_command`), and `Status` (`RemoteControlClient::
+metadata_fresh`, rung C3c) — everything else answers a plain
+`ClientResponse::Error("not relayable under sim")`, deliberately not an
+attempt at `ClientRequest`'s full surface (the plain client-facing ops
+never reach a node-to-node relay at all). **Production's `handle_request`
+now delegates its `Status`/`Forwarded`/`ProposeSchema` arms to this exact
+function** — a pure refactor (each arm's body moved verbatim), so there is
+one dispatch table for the relayed set, never two independently-maintained
+copies; every other arm (`Put`/`Get`/`SplitTablet`/`JoinInfo`/
+`WatchMetadata`/`Txn`/the internal tablet-addressed RPCs) stays exactly
+where it was, unmoved and unmodified.
+
+**Relay threading.** `ClientCtx<E, R>` gains a `relay: R` field (alongside
+the pre-existing `control: GenericControlHandle<E, R>`, which already
+carried its own `R` for `RemoteControlClient`'s `Status` fetch, rung C3c —
+this is every *other* relay call `ClientCtx`'s own methods make directly).
+`forward_to_tablet_leader`, `ClientCtx::relay`, `read_path.rs`'s
+`relay_stale_read`, and `schema.rs`'s `propose_schema` broadcast fallback
+all now call `self.relay.relay(..)` instead of the free `relay_request`/
+`relay_request_with_timeout` functions. **Production behavior is
+byte-for-byte unchanged**: `AnimusdRelayClient::relay` is the same
+unmodified wrapper over `relay_request_with_timeout` it always was
+(rung C3b); `spawn_common_tail`'s `ClientCtx` struct literal sets `relay:
+AnimusdRelayClient` — a zero-sized `Default` value — and every other field
+and call site is untouched. `relay_request`/`relay_request_with_timeout`
+themselves are unchanged and still exist, now called from exactly two
+places (`AnimusdRelayClient::relay`, and `remote_metadata_watch_loop`,
+which sits outside the five seam-clean modules and keeps calling the free
+function directly — unrelated to this rung's scope).
+
+**Proof.** `animus-node`'s own tests (`sim_relay::tests`, four of them:
+request/reply round trip, a partitioned peer timing out cleanly, a late
+reply after timeout never matching a later request's `req_id`, and several
+concurrent outstanding requests to one peer each resolving to their own
+caller) exercise the implementor in isolation. `animusd`'s
+`two_node_relay_tests` (sibling to the eighth amendment's own single-node
+`simenv_client_ctx_tests`) is the end-to-end proof this rung's own brief
+asked for: two `ClientCtx<SimEnv, SimRelayClient<SimEnv>>`s, one per
+`SimEnv` node id, node B (no local tablet replica) forwarding a real
+`cp_kind_write_raw`/`cp_get` round trip to node A's own locally-led tablet
+through the real relay wire — `forward_to_tablet_leader` resolving
+`CpRoute::Forward`, carrying it over `SimRelayClient`, `forwarding::
+handle_relayed_request` serving it via `cp_serve_forwarded` against the
+real local leader — with a third, direct `cp_get` on node A confirming the
+write actually landed on its own engine, not merely echoed back through
+the relay's own bookkeeping.
+
+**What this does not attempt.** Schema DDL through `ClientCtx::
+propose_schema`'s *local-propose fast path* is still unreachable under
+`SimEnv` for the identical, pre-existing reason the eighth amendment
+recorded: `ClusterEdgeState::control` is concretely `RaftNode<ProdEnv>`-
+typed regardless of `E`. What changed is that `propose_schema`'s *relay*
+branches are now reachable (they always fall through to them under
+`SimEnv`, since the fast path's own field can never hold a `SimEnv`
+handle) — sufficient for `two_node_relay_tests`' own write/read proof,
+which never calls `propose_schema` at all (it seeds schema by proposing
+directly on the shared control `RaftNode`, the same bypass every `SimEnv`
+`ClientCtx` fixture in this crate uses). A `SimCluster` that needs a
+genuine multi-voter control quorum reaching agreement on a `ProposeSchema`
+call still needs its own answer to that question — this rung does not
+supply one, and isn't trying to.
+
 ### Phase D — the payoff
 
 | Rung | Work |

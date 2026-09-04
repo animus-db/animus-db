@@ -3529,6 +3529,7 @@ fn spawn_common_tail(
         remote_metadata: Arc::new(Mutex::new(None)),
         control_storage,
         dynamo_auth,
+        relay: AnimusdRelayClient,
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -6780,6 +6781,28 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// "explicitly out of scope: rotation, dynamic credential API") — cheap
     /// to clone onto each connection's `ClientCtx`, never locked.
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    /// This node's own outbound [`RelayClient`] (ADR 0061 rung C3d) — the
+    /// cross-node relay primitive every CP forward
+    /// ([`forwarding::ClientCtx::forward_to_tablet_leader`], the plain
+    /// [`forwarding::ClientCtx::relay`] wrapper, the eventual-read one-hop
+    /// relay in `read_path.rs`) and `schema.rs`'s `propose_schema`
+    /// broadcast fallback now go through, instead of calling the free
+    /// [`relay_request`]/[`relay_request_with_timeout`] functions directly
+    /// (as they all did before this rung — those two functions are
+    /// unchanged and still exist, now called from exactly one place each:
+    /// `AnimusdRelayClient::relay` and `remote_metadata_watch_loop`).
+    /// Production's is [`AnimusdRelayClient`] — a zero-sized wrapper over
+    /// the identical unchanged `relay_request_with_timeout`, so production
+    /// behavior is byte-for-byte the same as before this field existed. A
+    /// sim-only `animus_node::sim_relay::SimRelayClient<E>` is the second
+    /// implementor this seam exists for — it is what actually lets a
+    /// multi-node cluster talk inside `SimEnv` (Phase D's `SimCluster`).
+    /// Distinct from `self.control`'s own relay use ([`GenericControlHandle
+    /// <E, R>`]'s `Remote` arm, rung C3c): that one is scoped to
+    /// `RemoteControlClient::metadata_fresh`'s single `Status` fetch and
+    /// lives inside the control handle itself; this field is every *other*
+    /// relay call `ClientCtx`'s own methods make directly.
+    relay: R,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -9128,13 +9151,17 @@ async fn handle_request(
         // `remote_metadata_sync_loop`'s own polling: its seeds are always the
         // pre-growth control nodes (genuine voters, where this is a plain
         // passthrough), so no mirror ever feeds another mirror.
-        ClientRequest::Status => ClientResponse::Status {
-            metadata: ctx.effective_metadata(),
-            leader_hint: ctx.control_leader_hint(),
-            intra_leader_hint: ctx.intra_control_leader_hint(),
-            watermark: ctx.control.metadata_watch().latest(),
-            control_voters: ctx.control.config().unwrap_or_default(),
-        },
+        //
+        // This arm, `Forwarded` and `ProposeSchema` below all delegate to
+        // `forwarding::handle_relayed_request` (ADR 0061 rung C3d) — the
+        // `E: Env`/`R: RelayClient`-generic dispatcher a sim-only
+        // `SimRelayClient`'s serve loop also calls. A pure refactor: each
+        // arm's body was moved there verbatim, so this is the exact same
+        // code running, not a second, independently-maintained copy — see
+        // that function's own doc for why only these three arms qualify.
+        req @ (ClientRequest::Status
+        | ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)) => forwarding::handle_relayed_request(ctx, req).await,
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
         // on the request type, so there is no unscoped data op to reject here.
@@ -9214,27 +9241,6 @@ async fn handle_request(
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
-        }
-        // A CP op forwarded from another node (cross-process routing, ADR 0017
-        // #3b): serve locally iff we are the leader; never re-forward. The
-        // enclosing `client_request` span (in `handle_connection`) was already
-        // re-parented onto the originating node's trace (ADR 0027) before this
-        // request reached here.
-        ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
-        // A metadata command relayed to the control leader (A2 schema DDL, or a
-        // Phase 2.3a CP-address registration). Gate to the relayable set, then
-        // propose iff we are the leader (no re-relay — bounded one hop; the
-        // relayer retries with fresh routing).
-        ClientRequest::ProposeSchema(command) => {
-            if !is_relayable_command(&command) {
-                ClientResponse::Error("command not allowed over the relay path".into())
-            } else {
-                // Propose on the control leader (locally if we are it, else relay
-                // toward it). The caller confirms the commit via replicated
-                // `Metadata`. Cannot loop: a relay only targets a known leader.
-                ctx.propose_schema(&command).await;
-                ClientResponse::PutOk
-            }
         }
         // Join discovery (ADR 0032 PR2): any node answers from its own
         // knowledge — no forwarding, no leader resolution needed.
@@ -13385,9 +13391,10 @@ mod simenv_client_ctx_tests {
     use super::*;
 
     /// This harness is single-node: the one tablet it hosts is always led
-    /// locally, so nothing here ever needs to relay to another node. A real
-    /// `Network`-backed `RelayClient` (ADR 0061's deferred C3d) is Phase
-    /// D's job, not this rung's — see `crates/animusd/CLAUDE.md`.
+    /// locally, so nothing here ever needs to relay to another node — see
+    /// `two_node_relay_tests` below (ADR 0061 rung C3d, landed) for a real
+    /// `Network`-backed relay between two `SimEnv` node ids, using
+    /// `animus_node::SimRelayClient` instead of this stand-in.
     #[derive(Clone, Copy, Debug, Default)]
     struct NeverRelay;
 
@@ -13500,6 +13507,7 @@ mod simenv_client_ctx_tests {
             remote_metadata: Arc::new(Mutex::new(None)),
             control_storage: None,
             dynamo_auth: None,
+            relay: NeverRelay,
         };
 
         (sim, ctx, control, kv)
@@ -13567,7 +13575,7 @@ mod simenv_client_ctx_tests {
         let (mut sim, ctx, _control, _kv) = single_node_ctx(seed);
         sim.run_for(Duration::from_millis(200));
 
-        let read_result = spawn_and_capture(&mut sim, &ctx, {
+        let read_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             async move {
                 ctx.cp_get("nonexistent-table", b"whatever".to_vec(), false)
@@ -13589,13 +13597,16 @@ mod simenv_client_ctx_tests {
     /// single local write/read (`CLIENT_TIMEOUT` itself is 10s; every call
     /// here is local-only, so it either confirms within a handful of the
     /// exponential-backoff confirm-poll ticks or it never will).
-    fn spawn_and_capture<T, F>(sim: &mut Simulator, ctx: &SimClientCtx, fut: F) -> Option<T>
+    /// Spawns onto `env` (not tied to any one `ClientCtx<E, R>` binding, so
+    /// this same helper backs both the single-node `NeverRelay` fixture and
+    /// the two-node `SimRelayClient` one below).
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
         let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
-        let env = ctx.env.clone();
+        let env = env.clone();
         let out = slot.clone();
         env.spawn_task(async move {
             let result = fut.await;
@@ -13635,7 +13646,7 @@ mod simenv_client_ctx_tests {
         // confirm-poll backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`) under a
         // virtual clock, spawned so the sim's own executor can actually
         // drive any `env.sleep()` inside it forward.
-        let write_result = spawn_and_capture(&mut sim, &ctx, {
+        let write_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
             let key = key.clone();
@@ -13654,7 +13665,7 @@ mod simenv_client_ctx_tests {
         // The read: `ClientCtx::cp_get` — the exact method
         // `handle_request`'s `ClientRequest::Get` arm calls, exercising the
         // production route -> local-resolve loop.
-        let read_result = spawn_and_capture(&mut sim, &ctx, {
+        let read_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
             let key = key.clone();
@@ -13664,6 +13675,301 @@ mod simenv_client_ctx_tests {
             read_result,
             Some(ClientResponse::Value(Some(value))),
             "the read must observe the write through the production read path (seed={seed})"
+        );
+    }
+}
+
+/// Two-node `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` smoke (ADR 0061
+/// rung C3d, the third 2026-08-28 amendment's own closing rung) — the
+/// end-to-end proof that threading `R: RelayClient` through
+/// `forward_to_tablet_leader`/`cp_serve_forwarded` (this rung's Deliverable
+/// B) actually lets two nodes talk inside one `SimEnv` run, not merely that
+/// each compiles generically. Node B (no local tablet replica) forwards a
+/// `cp_kind_write_raw`/`cp_get` round trip to node A's own locally-led
+/// tablet through a real [`animus_node::SimRelayClient`] — the same
+/// production `ClientCtx` methods [`simenv_client_ctx_tests`] above drives
+/// single-node, now genuinely crossing a (simulated) network hop. This is
+/// what commit 2 (ADR 0061 rung D1's `SimCluster`) generalises to N nodes.
+#[cfg(test)]
+mod two_node_relay_tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, StorageScope};
+    use animus_env::{EnvExt, nid};
+    use animus_node::SimRelayClient;
+    use animus_sim::{SimEnv, Simulator};
+
+    use super::*;
+
+    type TwoNodeClientCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
+    fn placeholder_addr() -> SocketAddr {
+        "127.0.0.1:1".parse().expect("valid placeholder addr")
+    }
+
+    /// A one-voter control `RaftNode<SimEnv>` (node 0, shared — `Arc`-backed
+    /// clones, per `RaftNode`'s own doc — by both nodes' `ClientCtx`, so
+    /// both observe the identical replicated `Metadata` with no propagation
+    /// delay, exactly like two real `Local` control voters would once
+    /// caught up) plus a one-voter CP data-plane `RaftKvNode<SimEnv,
+    /// MemoryEngine>` (tablet 1, a whole-ring range) hosted **only** on
+    /// node A (id `n1`) — node B (id `n2`) has an empty
+    /// `ClusterEdgeState` and so structurally cannot serve the tablet
+    /// locally, forcing every CP op it originates through
+    /// `forward_to_tablet_leader`'s relay path. `data: None` on both, for
+    /// the identical reason `single_node_ctx`'s own doc gives (neither
+    /// `cp_kind_write_raw` nor `cp_get`/`cp_serve_forwarded`'s `KindWrite`/
+    /// `Get` arms ever read `self.data()`).
+    #[allow(clippy::too_many_lines)] // one wiring function for a two-node fixture — see its own doc for why it isn't split further
+    fn two_node_ctx(
+        seed: u64,
+    ) -> (
+        Simulator,
+        TwoNodeClientCtx,
+        TwoNodeClientCtx,
+        RaftNode<SimEnv>,
+    ) {
+        let sim = Simulator::new(seed);
+        let control: RaftNode<SimEnv> =
+            RaftNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
+        let tablet = TabletId(1);
+        let kv: RaftKvNode<SimEnv, MemoryEngine> = RaftKvNode::start_scoped(
+            sim.env(nid(1)),
+            vec![nid(1)],
+            MemoryEngine::new(),
+            StorageScope::new(KeyRange::whole()),
+        );
+
+        // Node A (`n1`) hosts the tablet locally.
+        let edge_a = ClusterEdgeState::<SimEnv>::new();
+        edge_a.register_raftkv(tablet, CpGroup::Mem(kv.clone()));
+        let relay_a: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(1)));
+        let admin_a = Arc::new(AdminInfo {
+            node_id: Some(nid(1)),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: vec![nid(0)],
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+        let ctx_a: TwoNodeClientCtx = ClientCtx {
+            control: GenericControlHandle::Local(control.clone()),
+            edge: edge_a,
+            env: sim.env(nid(1)),
+            data: None,
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
+            // Node A never forwards outward in this test — empty routes.
+            client_route: Arc::new(Mutex::new(BTreeMap::new())),
+            intra_route: Arc::new(Mutex::new(BTreeMap::new())),
+            admin: admin_a,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            relay: relay_a.clone(),
+        };
+
+        // Node A answers relayed requests through the generic dispatcher
+        // (ADR 0061 rung C3d Deliverable A) closed over its own `ctx_a`.
+        let ctx_a_for_server = ctx_a.clone();
+        relay_a.serve(move |req| {
+            let ctx_a = ctx_a_for_server.clone();
+            async move { forwarding::handle_relayed_request(&ctx_a, req).await }
+        });
+
+        // Node B (`n2`) hosts nothing locally — every CP op it originates
+        // must forward. Its `intra_route` names node A's own address under
+        // `SimRelayClient`'s addr convention (module doc: `addr ==
+        // NodeId::to_string()`), mirroring how a real `SimCluster` (ADR
+        // 0061 rung D1) would populate this same map.
+        let edge_b = ClusterEdgeState::<SimEnv>::new();
+        let relay_b: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(2)));
+        let admin_b = Arc::new(AdminInfo {
+            node_id: Some(nid(2)),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: vec![nid(0)],
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+        let mut intra_route_b = BTreeMap::new();
+        intra_route_b.insert(nid(1), nid(1).to_string());
+        let ctx_b: TwoNodeClientCtx = ClientCtx {
+            control: GenericControlHandle::Local(control.clone()),
+            edge: edge_b,
+            env: sim.env(nid(2)),
+            data: None,
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
+            client_route: Arc::new(Mutex::new(BTreeMap::new())),
+            intra_route: Arc::new(Mutex::new(intra_route_b)),
+            admin: admin_b,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            relay: relay_b,
+        };
+
+        (sim, ctx_a, ctx_b, control)
+    }
+
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let env = env.clone();
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        sim.run_for(Duration::from_secs(2));
+        slot.lock().expect("result slot poisoned").take()
+    }
+
+    #[test]
+    fn node_b_forwards_a_write_and_a_read_to_node_as_tablet_leader_through_the_sim_relay() {
+        run(0x5C3D_0001);
+    }
+
+    #[test]
+    fn node_b_forwards_a_write_and_a_read_to_node_as_tablet_leader_through_the_sim_relay_seed2() {
+        run(0x5C3D_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_two_node_relay_from_an_explicit_env_seed`.
+    #[test]
+    fn replays_two_node_relay_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5C3D_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, ctx_a, ctx_b, control) = two_node_ctx(seed);
+        sim.run_for(Duration::from_millis(500));
+
+        let table = "orders";
+        let tablet = TabletId(1);
+        // Seed schema/tablet directly on the control `RaftNode` — the same
+        // `propose_schema`-bypass every `SimEnv` `ClientCtx` fixture in
+        // this crate uses (see `simenv_client_ctx_tests::seed_schema`'s own
+        // doc for exactly why). `control` is shared between `ctx_a`/`ctx_b`
+        // (both `ControlHandle::Local`, same underlying `RaftNode`), so
+        // both observe the commit immediately.
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                // Node A's own `RaftKvNode` was started with `vec![nid(1)]`
+                // (`two_node_ctx`) — this must match for `ctx_b`'s
+                // `resolve_cp_route` fallback to name node A as the forward
+                // target at all.
+                replicas: vec![nid(1)],
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_millis(200));
+        assert!(
+            ctx_b.effective_metadata().has_table_tablet(table),
+            "node B's own control read must see the seeded schema/tablet (seed={seed})"
+        );
+
+        let key = b"item-1".to_vec();
+        let value = b"hello from node B, relayed to node A".to_vec();
+
+        // The write: `ClientCtx::cp_kind_write_raw` called on node B, which
+        // has no local replica of `tablet` — `cp_route` resolves to
+        // `CpRoute::Forward`, and `cp_forward`/`forward_to_tablet_leader`
+        // carry it to node A over the real `SimRelayClient` wire, where
+        // `forwarding::handle_relayed_request`'s `Forwarded` arm serves it
+        // via `cp_serve_forwarded` against the real local `kv` leader.
+        let write_result = spawn_and_capture(&mut sim, &ctx_b.env, {
+            let ctx_b = ctx_b.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            let value = value.clone();
+            async move {
+                ctx_b
+                    .cp_kind_write_raw(&table, vec![(KIND_BASE, key, Some(value))], Vec::new())
+                    .await
+            }
+        });
+        assert_eq!(
+            write_result,
+            Some(Ok(())),
+            "the forwarded write must land through the real relay wire (seed={seed})"
+        );
+
+        // The read: `ClientCtx::cp_get`, also called on node B — same
+        // forward-to-leader path, this time carrying `ClientRequest::Get`.
+        let read_result = spawn_and_capture(&mut sim, &ctx_b.env, {
+            let ctx_b = ctx_b.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            async move { ctx_b.cp_get(&table, key, false).await }
+        });
+        assert_eq!(
+            read_result,
+            Some(ClientResponse::Value(Some(value))),
+            "the forwarded read must observe the earlier forwarded write (seed={seed})"
+        );
+
+        // Confirm node A's own local engine actually holds it too — a
+        // direct (never-forwarded, since A leads the tablet itself)
+        // `cp_get` on `ctx_a`, proving the forward genuinely landed on
+        // node A's own engine rather than merely round-tripping through
+        // the relay wire's own bookkeeping.
+        let local_read = spawn_and_capture(&mut sim, &ctx_a.env, {
+            let ctx_a = ctx_a.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            async move { ctx_a.cp_get(&table, key, false).await }
+        });
+        assert_eq!(
+            local_read,
+            Some(ClientResponse::Value(Some(
+                b"hello from node B, relayed to node A".to_vec()
+            ))),
+            "node A's own local engine must hold the value the forward delivered (seed={seed})"
         );
     }
 }

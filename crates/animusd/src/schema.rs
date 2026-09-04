@@ -18,8 +18,7 @@ use crate::{
     MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult,
     RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
     SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT,
-    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key,
-    relay_request_with_timeout, topology,
+    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -183,11 +182,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // Issue #585: this is the identical hinted-retry-chase shape
         // `forward_to_tablet_leader` has (many known candidates, try each in
         // turn until one connects), so it gets the same per-candidate
-        // transport-timeout cap (`FORWARD_HOP_TIMEOUT`, via
-        // `relay_request_with_timeout` directly) rather than `self.relay`'s
-        // flat `CLIENT_TIMEOUT` — a reachable-but-slow candidate must not be
-        // able to consume the whole timeout on one hop and starve every
-        // candidate still left in this broadcast.
+        // transport-timeout cap (`FORWARD_HOP_TIMEOUT`, via `self.relay`
+        // (the `R: RelayClient` field, ADR 0061 rung C3d) directly) rather
+        // than the `ClientCtx::relay` method's flat `CLIENT_TIMEOUT` — a
+        // reachable-but-slow candidate must not be able to consume the whole
+        // timeout on one hop and starve every candidate still left in this
+        // broadcast.
         for (id, addr) in self.intra_route_snapshot() {
             // Self-skip by id, not by address string: this node's own
             // `intra_route` entry is `advertised_addr(self)`, which a bind
@@ -199,12 +199,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 continue;
             }
             if !matches!(
-                relay_request_with_timeout(
-                    addr,
-                    &ClientRequest::ProposeSchema(command.clone()),
-                    FORWARD_HOP_TIMEOUT,
-                )
-                .await,
+                self.relay
+                    .relay(
+                        addr,
+                        &ClientRequest::ProposeSchema(command.clone()),
+                        FORWARD_HOP_TIMEOUT,
+                    )
+                    .await,
                 ClientResponse::Error(_)
             ) {
                 return true;
