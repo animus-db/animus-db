@@ -429,9 +429,9 @@ async fn dashboard_role_gating_split_deployment() {
         // backup/segment store (ADR 0059 §1's asymmetry with control-only),
         // and binds the dynamo listener (so `auth_enabled` is `Some(false)`
         // — this deployment has no `dynamo_auth` section — never `null`).
-        // `quiesce_after_ms` stays `null`: the data-only path has no
-        // quiescence knob wired yet (documented gap,
-        // `crates/animusd/CLAUDE.md`'s Quiescence section).
+        // `quiesce_after_ms` is `null` here because this fixture's config
+        // carries no `cluster_settings.quiesce_after_secs` (S-06's only
+        // route to the knob on a data-only node), so quiescence is off.
         assert_eq!(
             cfg["backup_store"]["kind"].as_str(),
             Some("cluster"),
@@ -444,7 +444,7 @@ async fn dashboard_role_gating_split_deployment() {
         );
         assert!(
             cfg["quiesce_after_ms"].is_null(),
-            "data-only quiescence is a documented gap: {cfg}"
+            "data-only quiescence is off without cluster_settings: {cfg}"
         );
         assert_eq!(
             cfg["auth_enabled"].as_bool(),

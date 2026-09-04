@@ -2193,14 +2193,13 @@ pub(crate) struct AdminInfo {
     /// [`backup_store`](Self::backup_store) — the sealer only ever runs on a
     /// node hosting the tablet it seals.
     pub(crate) segment_store: Option<StoreView>,
-    /// This node's own tablet-host reconciler quiescence threshold (ADR
-    /// 0048), in milliseconds, iff quiescence is actually enabled for it —
-    /// `None` when disabled (`--quiesce-after 0`/the default at every entry
-    /// point except `--cluster N --quiesce-after SECS`) **or** structurally
-    /// inapplicable: a control-only node hosts no CP-data tablet to
-    /// quiesce, and a data-only node has no quiescence knob wired at all
-    /// yet (`start_data_with_growth`'s own documented gap — see
-    /// `crates/animusd/CLAUDE.md`'s Quiescence section).
+    /// The ADR 0048 quiescence threshold this node's reconciler was
+    /// actually started with, in milliseconds — `None` when quiescence is
+    /// off (`0`, or a data-only node whose config carries no
+    /// `cluster_settings.quiesce_after_secs`, S-06's only route to the knob
+    /// there) or structurally inapplicable (a control-only node hosts no
+    /// CP-data tablet to quiesce). See `crates/animusd/CLAUDE.md`'s
+    /// Quiescence section.
     pub(crate) quiesce_after_ms: Option<u64>,
     /// Whether this node's client DynamoDB port enforces SigV4 (ADR 0057) —
     /// `Some(true)`/`Some(false)` on a role that binds the dynamo listener
@@ -5464,10 +5463,11 @@ impl BoundDataNode {
             auto_split_bytes_threshold,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
-            // No quiescence knob on this data-only path yet (documented gap
-            // — see `AdminInfo::quiesce_after_ms`'s own doc and
-            // `crates/animusd/CLAUDE.md`'s Quiescence section).
-            quiesce_after_ms: None,
+            // S-06 wired `quiesce_after` through this data-only path (via
+            // `cluster_settings.quiesce_after_secs`), so report it exactly
+            // as the combined-mode assembly does: `null` only when disabled.
+            quiesce_after_ms: (!quiesce_after.is_zero())
+                .then_some(quiesce_after.as_millis() as u64),
             auth_enabled: Some(dynamo_auth.is_some()),
             auth_access_key_ids: dynamo_auth
                 .as_ref()

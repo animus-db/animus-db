@@ -296,3 +296,33 @@ should switch to `--auto-split-bytes B` (a byte value tuned for the
 workload) or `--auto-split-change-rate RATE` for a streamed table; there is
 no drop-in numeric equivalent (bytes and keys are different units), so this
 is a deliberate re-tuning, not a mechanical substitution.
+
+## Amendment (2026-09-04, S-06): reachable from `--config`/`--node` and
+`animusd data --config` via a config-file section, not just `--cluster N`
+
+The paragraph immediately above ("`--config`/`--node` (the real per-process
+deployment) never had an auto-split flag of any kind to begin with") was
+true when written and is the gap S-06 closes — **not** by adding a
+`--auto-split-bytes`/`--auto-split-change-rate` CLI flag to `--config`/
+`--node` or `animusd data --config` (neither subcommand gained one), but by
+giving `ClusterConfig` its own `cluster_settings: Option<ClusterSettings>`
+section (`crates/animusd/src/config.rs`) that both real deployment shapes
+now read: `run_single` (`--config`/`--node`) and `run_data_config`
+(`animusd data --config`) both thread `cluster_settings.auto_split_bytes`/
+`auto_split_change_rate` down to `BoundNode::start_with_growth`/
+`BoundDataNode::start_data_with_growth`'s own parameters of the same name —
+the same knobs `--cluster N`'s `--auto-split-bytes`/`--auto-split-change-
+rate` flags already fed, just reached through a config file instead of a
+dev-only in-process CLI flag. A `--cluster N` CLI flag and the identical
+config-file field being set on the same `--config`/`--node` invocation is a
+hard startup error (`main.rs`'s `resolve_cluster_settings`), never a silent
+precedence rule.
+
+Still a documented gap: `--cluster-control`/`--cluster-data` (the
+in-process split-deployment dev mode) and the standalone `control`/`join`
+subcommands have no route to this section at all — S-06 scoped only the
+three real `--config`/`--node`-shaped deployment paths. See
+`crates/animusd/CLAUDE.md`'s config.rs module-map entry and `animusd::
+config::ClusterSettings`'s own doc for the full field list and per-role
+applicability, and ADR 0040/0048's own amendment notes for the same
+mechanism's `orphan_sweep_after_secs`/`quiesce_after_secs` fields.

@@ -175,6 +175,32 @@ reusing the captured config is the point of the test.
   `BoundControlNode::start_control_with` hardcodes `None` at its own
   `spawn_common_tail` call — a control-only node never binds the dynamo
   listener, so nothing there would ever read the field.
+- **`cluster_settings: Option<ClusterSettings>` (S-06)** — cluster-wide
+  operational knobs (auto-split, quiesce, orphan-sweep, stream-seal)
+  reachable from a config file on every real deployment shape
+  (`--config`/`--node`, `animusd control`, `animusd data --config`), not
+  just `--cluster N`'s dev-only in-process CLI flags — the gap the root
+  `CLAUDE.md`'s auto-split entry and ADR 0034/0040/0048's amendment notes
+  describe. `ClusterSettings`'s seven fields mirror their CLI flags
+  field-for-field (a `_secs` field is the flag's raw seconds value, never a
+  `Duration`), each independently `#[serde(default)]`, and its own doc
+  comment has the full per-field applicability table (a data-only node
+  ignores `orphan_sweep_after_secs`/`stream_retention_secs`; a control-only
+  node acts on `orphan_sweep_after_secs` alone). `main.rs`'s
+  `resolve_cluster_settings` merges this section against whatever CLI flags
+  the invocation actually gave, field by field — the same "specify it one
+  way, not both" hard-error contract `apply_dynamo_auth_flag` uses for
+  `dynamo_auth`, not a silent precedence rule; the merge is per-field, so an
+  operator may still set *different* knobs on each side. This is
+  `--config`/`--node`'s and `animusd data --config`'s only route to
+  auto-split at all (previously reachable solely via `--cluster N`), and
+  the config-file route that finally lets `animusd data --config` reach
+  quiescence too (see the Quiescence section below, and `start_data_with_
+  growth`'s own new `quiesce_after` parameter). Adding this field hit the
+  identical `error[E0063]` fan-out `dynamo_auth` describes just above —
+  ~55 `ClusterConfig { .. }` literals across `src/`+`tests/` needed a
+  `cluster_settings: None,` line, again compiler-enumerated rather than
+  grepped.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -867,9 +893,10 @@ reusing the captured config is the point of the test.
   credential; `null` on a control-only node, which provisions neither),
   `quiesce_after_ms` (the ADR 0048 threshold this node's reconciler was
   actually started with, `null` when quiescence is off **or**
-  structurally inapplicable — control-only always, and data-only today,
-  since `start_data_with_growth` has no quiescence knob wired yet, see the
-  Quiescence section below), `auth_enabled`/`auth_access_key_ids` (ADR
+  structurally inapplicable — control-only always; a data-only node
+  reports it since S-06 wired `cluster_settings.quiesce_after_secs`
+  through `start_data_with_growth`, see the Quiescence section below),
+  `auth_enabled`/`auth_access_key_ids` (ADR
   0057's SigV4 gate — the access key **ids** only, never the secret; both
   `null` on a control-only node, which never binds the dynamo listener,
   `Some(false)`/`null` when the role has the listener but no `dynamo_auth`
@@ -2235,7 +2262,8 @@ crate's `CLAUDE.md`. This crate's own contribution:
   `CpGroup::is_quiesced()`/`RaftKvNode::is_quiesced()` are pure frozen
   accessors, so an open dashboard tab cannot un-quiesce a fleet.
 - **Production wiring**: `--quiesce-after SECS` (`main.rs`) threads through
-  `--config`/`--node` (`run_node_with_streams_and_quiesce_after` →
+  `--config`/`--node` (`run_single` → `run_node_with_cluster_settings` →
+  `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
   `BoundNode::start_with_growth`) and `--cluster N`
   (`start_cluster_with_growth_and_quiesce_after`) — **defaults ON at 5s**
   (`main::DEFAULT_QUIESCE_AFTER_SECS`; `0` disables). See that constant's
@@ -2244,15 +2272,27 @@ crate's `CLAUDE.md`. This crate's own contribution:
   sustained mixed load with real inter-process latency) — a
   maintainer-reviewable call, not a settled fact. Not yet wired for the
   `--cluster-control`/`--cluster-data` split-deployment dev path or the
-  standalone `control`/`data`/`join` subcommands (documented gaps in
-  `main.rs`'s own module doc).
+  standalone `control`/`join` subcommands (documented gaps in `main.rs`'s
+  own module doc). **`animusd data --config` also reaches it now (S-06)** —
+  `BoundDataNode::start_data_with_growth` gained its own `quiesce_after`
+  parameter and `enable_quiescence` call (mirroring the combined-mode
+  reconciler's), closing what used to be a hardcoded `Duration::ZERO` on
+  every data-only node; not via a CLI flag of its own, but through the same
+  `ClusterConfig::cluster_settings.quiesce_after_secs` config-file section
+  `--config`/`--node` also reads (`ClusterSettings`'s own doc in
+  `config.rs` has the field-by-field applicability breakdown, and the root
+  `CLAUDE.md`'s auto-split entry / ADR 0034/0040/0048's amendment notes
+  cover the section as a whole). A CLI flag and the config section setting
+  the *same* field is a hard startup error (`resolve_cluster_settings` in
+  `main.rs`), the identical "one way, not both" contract `--dynamo-auth`
+  already uses.
 - **`/admin/config`'s `quiesce_after_ms`** (roadmap U-06) reports the actual
   threshold this node's own reconciler was started with — `null` when it's
-  `0`/disabled, and also `null` on a data-only node today (the "not yet
-  wired" gap just above means `start_data_with_growth` has no
-  `quiesce_after` parameter to report at all, not merely a `0` value) and
-  on a control-only node (structurally inapplicable — no CP-data tablet to
-  quiesce). See `admin.rs::config_view`, above.
+  `0`/disabled (on a data-only node that means no
+  `cluster_settings.quiesce_after_secs` in its config, since S-06 is the
+  only route to the knob there — there is still no `data --config` CLI
+  flag) and on a control-only node (structurally inapplicable — no CP-data
+  tablet to quiesce). See `admin.rs::config_view`, above.
 
 Tests: `index_drain.rs`'s own `stream_sealer_tests` module (in-crate, needs
 private `CpGroup` access) covers the veto end to end
