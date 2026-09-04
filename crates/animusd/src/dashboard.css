@@ -185,6 +185,11 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .stat-tile .value { font: 500 27px var(--font-mono); letter-spacing: -0.03em; }
 .stat-tile .value.live { display: inline-block; }
 .stat-tile .sub { font: 400 12px var(--font-ui); color: var(--text2); margin-top: 4px; }
+/* Read-path sparklines (docs/roadmap.md U-01): an inline-SVG polyline reusing
+   the stat-tile slot's own `.sub` line — `currentColor` picks up this rule's
+   own `color`, so the chart tints with the theme's accent in both palettes
+   without a second hardcoded color. */
+.stat-tile .sub .sparkline { color: var(--accent); display: block; margin-top: 2px; }
 
 /* A node id (ADR 0040 PR5): pre-ADR-0040 ids were short integers that never
    overflowed a fixed-width column; a self-minted id is a 22-char base64url

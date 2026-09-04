@@ -29,13 +29,20 @@ let SELF = { ok: false, base: SEED };
 
 async function loadSelf() {
   try {
-    const [config, raft, raftkv, health] = await Promise.all([
+    // `metricsHistory` (docs/roadmap.md U-01) backs the Overview read-path
+    // sparklines — this node's own `/admin/metrics/history` ring buffer,
+    // fetched alongside everything else `SELF` already carries. Per-node,
+    // not cluster-aggregated (the same "one sink" caveat `/admin/metrics`
+    // itself carries) — deliberately, since a sparkline of a SUM across
+    // nodes would hide which node is actually doing the work.
+    const [config, raft, raftkv, health, metricsHistory] = await Promise.all([
       getJSON(SEED, "/admin/config"),
       getJSON(SEED, "/admin/raft").catch(() => null),
       getJSON(SEED, "/admin/raftkv").catch(() => null),
       getJSON(SEED, "/admin/health").catch(() => null),
+      getJSON(SEED, "/admin/metrics/history").catch(() => null),
     ]);
-    SELF = { base: SEED, config, raft, raftkv, health, ok: true };
+    SELF = { base: SEED, config, raft, raftkv, health, metricsHistory, ok: true };
     ROLE = config.role || "combined";
   } catch (e) {
     SELF = { base: SEED, ok: false, error: String(e) };
@@ -148,6 +155,35 @@ function humanBytes(n) {
     i++;
   } while (v >= 1024 && i < units.length - 1);
   return `${v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
+}
+
+// A small, dependency-free inline-SVG sparkline (docs/roadmap.md U-01) — no
+// canvas, no charting library (ADR 0021 §1's "no build toolchain/CDN" rules
+// out pulling one in for this). `values` is a plain array of numbers, oldest
+// first — the same order `/admin/metrics/history`'s `samples` ring already
+// comes in, so a caller passes a plain `.map()` over it with no reshaping.
+// Renders one `<polyline>` scaled to fit `w`x`h` (defaults 90x24, sized for a
+// stat-tile-sized slot); a flat/empty/single-point series draws a flat
+// mid-height line rather than dividing by zero — a real min==max is not an
+// error, just nothing to show relative motion for. Uses `currentColor` so a
+// call site colors it via CSS (`.sparkline`) rather than baking a palette
+// choice in here.
+function sparkline(values, w, h) {
+  w = w || 90;
+  h = h || 24;
+  if (!values || values.length === 0) return `<svg width="${w}" height="${h}" class="sparkline"></svg>`;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  const n = values.length;
+  const pts = values.map((v, i) => {
+    const x = n === 1 ? w / 2 : (i / (n - 1)) * (w - 2) + 1;
+    const y = span === 0 ? h / 2 : h - 1 - ((v - min) / span) * (h - 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="sparkline">
+    <polyline points="${esc(pts)}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"></polyline>
+  </svg>`;
 }
 
 // A tablet range boundary on the hash ring (ADR 0022): the first 8 key bytes are

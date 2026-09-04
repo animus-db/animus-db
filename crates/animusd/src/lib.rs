@@ -6322,8 +6322,8 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
     /// Ring buffer of periodic `metrics_json()` snapshots, filled by
-    /// [`metrics_sample_loop`] — intended to back dashboard sparklines
-    /// (not yet rendered — see docs/roadmap.md U-01) via
+    /// [`metrics_sample_loop`] — backs the Overview tab's read-path
+    /// sparklines (docs/roadmap.md U-01, `dashboard_overview.js`) via
     /// `/admin/metrics/history`.
     /// A plain `std::sync::Mutex` is fine: every access is a quick lock/mutate/
     /// drop with no `.await` held across it.
@@ -6570,10 +6570,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
-    /// for the admin `/admin/metrics/history` view (ADR 0020), intended to
-    /// back dashboard sparklines (not yet rendered — see docs/roadmap.md
-    /// U-01). Cloned out from under the lock so the caller
-    /// never holds it across serialization.
+    /// for the admin `/admin/metrics/history` view (ADR 0020), backing the
+    /// Overview tab's read-path sparklines (docs/roadmap.md U-01). Cloned
+    /// out from under the lock so the caller never holds it across
+    /// serialization.
     pub(crate) fn metrics_history(&self) -> Vec<MetricsSample> {
         self.metrics_history
             .lock()
@@ -8281,8 +8281,8 @@ pub(crate) struct MetricsSample {
 
 /// Appends a [`MetricsSample`] to `ctx`'s ring buffer every
 /// [`METRICS_SAMPLE_INTERVAL`], capped at [`METRICS_HISTORY_CAP`] entries —
-/// intended to back dashboard sparklines (not yet rendered — see
-/// docs/roadmap.md U-01) via `/admin/metrics/history`.
+/// backs the Overview tab's read-path sparklines (docs/roadmap.md U-01) via
+/// `/admin/metrics/history`.
 /// Real wall-clock sleep/timestamp: `animusd` is outside the `Env` determinism
 /// boundary (ADR 0003 only binds sim-tested core crates), so this is exactly
 /// as legitimate as the other `tokio::time`-driven loops in this file.

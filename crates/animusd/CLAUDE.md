@@ -865,9 +865,14 @@ reusing the captured config is the point of the test.
   (`dashboard_txns.js`, read-only `/admin/txns`, gated like Tablets in
   `ROLE_TABS`), full per-replica Raft detail (commit/durable/snapshot
   index/log length, plus the group's live voters/learners) in the Tablets
-  tab's `renderTabletDetail`, and a `believes_alive` badge (the control
-  leader's own real-time failure-detector verdict, ADR 0012) next to each
-  data member row in Overview.
+  tab's `renderTabletDetail`, a `believes_alive` badge (the control leader's
+  own real-time failure-detector verdict, ADR 0012) next to each data member
+  row in Overview, and a dependency-free inline-SVG `sparkline()` shared
+  component in `dashboard_core.js`, charting the six CP read-path counters
+  (`cp_read_barriers_served`/`_timed_out`,
+  `cp_eventual_reads_local`/`_forwarded`/`_fell_back`,
+  `cp_uncertainty_restarts`) from `/admin/metrics/history` on a new Overview
+  card.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

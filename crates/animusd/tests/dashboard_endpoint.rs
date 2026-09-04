@@ -780,6 +780,49 @@ async fn dashboard_u01_render_only_fixes() {
             "renderOverview surfaces the control leader's own believes_alive verdict per member: {overview_js}"
         );
 
+        // ---- 4. Sparklines from /admin/metrics/history as a shared component,
+        //         charting the six CP read-path counters on Overview --------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("function sparkline"),
+            "dashboard_core.js defines a shared sparkline() component: {core_js}"
+        );
+        assert!(
+            core_js.contains("/admin/metrics/history"),
+            "dashboard_core.js fetches this node's own metrics-history ring: {core_js}"
+        );
+        assert!(
+            overview_js.contains("sparkline("),
+            "renderOverview renders sparklines: {overview_js}"
+        );
+        for counter in [
+            "cp_read_barriers_served",
+            "cp_read_barriers_timed_out",
+            "cp_eventual_reads_local",
+            "cp_eventual_reads_forwarded",
+            "cp_eventual_reads_fell_back",
+            "cp_uncertainty_restarts",
+        ] {
+            assert!(
+                overview_js.contains(counter),
+                "the Overview read-path sparklines chart {counter}: {overview_js}"
+            );
+        }
+        // The route itself already serves real samples the sparklines can
+        // read (`admin_endpoint.rs` covers `/admin/metrics/history`'s own
+        // shape more thoroughly; this just proves the render-only wiring
+        // reaches a real 200).
+        let (s, _, history_body) = raw(admin_addr, "GET", "/admin/metrics/history").await;
+        assert_eq!(s, 200, "GET /admin/metrics/history: {history_body}");
+        assert!(
+            serde_json::from_str::<Value>(&history_body)
+                .expect("metrics history is JSON")
+                .get("samples")
+                .is_some(),
+            "the ring buffer is served under \"samples\": {history_body}"
+        );
+
         nodes[0].shutdown_graceful().await;
     })
     .await
