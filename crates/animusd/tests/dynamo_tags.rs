@@ -19,6 +19,10 @@
 //!   land on a control-plane follower silently times out instead of
 //!   relaying (the exact bimodal per-process flake that lesson warns
 //!   about) — mirrors `schema_ddl_relay.rs`'s own per-command relay tests.
+//! - `describe_limits_reports_the_static_ceiling` and
+//!   `describe_endpoints_reports_this_nodes_own_address` cover the other
+//!   two roadmap W-06 ops — cheap, table-less reads with no relay/catalog
+//!   involvement, so they live here rather than in a new file.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -381,6 +385,55 @@ async fn tag_resource_on_a_follower_is_relayed_to_the_leader() {
     .await;
     assert_eq!(status, 200, "body: {body}");
     assert!(body.contains("\"Value\":\"prod\""), "body: {body}");
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describe_limits_reports_the_static_ceiling() {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(addr, "DynamoDB_20120810.DescribeLimits", "{}").await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["AccountMaxReadCapacityUnits"], 80_000);
+    assert_eq!(v["AccountMaxWriteCapacityUnits"], 80_000);
+    assert_eq!(v["TableMaxReadCapacityUnits"], 40_000);
+    assert_eq!(v["TableMaxWriteCapacityUnits"], 40_000);
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describe_endpoints_reports_this_nodes_own_address() {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(1, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(addr, "DynamoDB_20120810.DescribeEndpoints", "{}").await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let endpoints = v["Endpoints"].as_array().expect("Endpoints array");
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        endpoints[0]["Address"].as_str().expect("Address"),
+        addr.to_string()
+    );
+    assert_eq!(endpoints[0]["CachePeriodInMinutes"], 1440);
 
     for n in &nodes {
         n.shutdown_graceful().await;

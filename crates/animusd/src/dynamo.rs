@@ -1095,6 +1095,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             untag_resource(ctx, &table, &tag_keys).await
         }
         Operation::ListTagsOfResource { table } => list_tags_of_resource(ctx, meta, &table),
+        Operation::DescribeLimits => describe_limits(),
+        Operation::DescribeEndpoints => describe_endpoints(ctx),
     }
 }
 
@@ -1278,6 +1280,33 @@ fn list_tags_of_resource(
     let empty = BTreeMap::new();
     let tags = meta.table_tags(table).unwrap_or(&empty);
     Ok(wire::list_tags_of_resource_response(tags))
+}
+
+// --- DescribeLimits / DescribeEndpoints (roadmap W-06) ---------------------
+
+/// `DescribeLimits`: a pure, static read — see [`wire::describe_limits_response`]'s
+/// own doc for why these four values are honest constants, not anything
+/// this adapter measures or tracks.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_limits() -> Result<String, WireError> {
+    Ok(wire::describe_limits_response())
+}
+
+/// `DescribeEndpoints`: this node's own bound DynamoDB listen address — the
+/// same value `/admin/config`'s `addrs.dynamo` already reports
+/// (`admin.rs::config_view`), read here via the identical `ctx.admin`
+/// field. Always `Some` in practice: this handler is reachable only through
+/// the DynamoDB wire edge itself, whose listener a control-only node never
+/// binds (ADR 0035 PR3) — the same structural guarantee
+/// [`ClientCtx::data`]'s own panic doc relies on.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_endpoints(ctx: &ClientCtx) -> Result<String, WireError> {
+    let address = ctx
+        .admin
+        .dynamo_addr
+        .expect("DescribeEndpoints is only reachable via the bound DynamoDB listener")
+        .to_string();
+    Ok(wire::describe_endpoints_response(&address))
 }
 
 // --- PITR (ADR 0059 §9, Train 3) -------------------------------------------

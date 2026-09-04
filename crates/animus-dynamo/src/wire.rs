@@ -1048,6 +1048,14 @@ pub enum Operation {
         /// The target table, recovered from `ResourceArn`.
         table: String,
     },
+    /// `DescribeLimits` (roadmap W-06): a pure, static read of this
+    /// adapter's account/table capacity ceilings. No fields to decode —
+    /// AWS's own request body is `{}`.
+    DescribeLimits,
+    /// `DescribeEndpoints` (roadmap W-06): this node's own DynamoDB
+    /// endpoint address, for SDK client discovery. No fields to decode —
+    /// AWS's own request body is `{}`.
+    DescribeEndpoints,
 }
 
 /// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
@@ -1125,7 +1133,12 @@ impl Operation {
             // own "no single table" shape.
             | Operation::DescribeBackup { .. }
             | Operation::ListBackups { .. }
-            | Operation::DeleteBackup { .. } => None,
+            | Operation::DeleteBackup { .. }
+            // `DescribeLimits`/`DescribeEndpoints` (roadmap W-06) address no
+            // table at all — an account-wide static read and a pure
+            // node-address read, respectively.
+            | Operation::DescribeLimits
+            | Operation::DescribeEndpoints => None,
         }
     }
 }
@@ -1510,6 +1523,8 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "ListTagsOfResource" => Ok(Operation::ListTagsOfResource {
             table: resource_arn_table(obj)?,
         }),
+        "DescribeLimits" => Ok(Operation::DescribeLimits),
+        "DescribeEndpoints" => Ok(Operation::DescribeEndpoints),
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -5129,6 +5144,71 @@ pub fn list_tags_of_resource_response(tags: &BTreeMap<String, String>) -> String
     serde_json::to_string(&Value::Object(obj)).expect("list-tags response serializes")
 }
 
+/// `DescribeLimits`' static account-wide read capacity ceiling (roadmap
+/// W-06) — real DynamoDB's own documented on-demand default.
+pub const ACCOUNT_MAX_READ_CAPACITY_UNITS: u64 = 80_000;
+/// `DescribeLimits`' static account-wide write capacity ceiling.
+pub const ACCOUNT_MAX_WRITE_CAPACITY_UNITS: u64 = 80_000;
+/// `DescribeLimits`' static per-table read capacity ceiling.
+pub const TABLE_MAX_READ_CAPACITY_UNITS: u64 = 40_000;
+/// `DescribeLimits`' static per-table write capacity ceiling.
+pub const TABLE_MAX_WRITE_CAPACITY_UNITS: u64 = 40_000;
+
+/// The JSON body for a successful `DescribeLimits` (roadmap W-06): AWS's
+/// documented on-demand-default shape, `{AccountMaxReadCapacityUnits,
+/// AccountMaxWriteCapacityUnits, TableMaxReadCapacityUnits,
+/// TableMaxWriteCapacityUnits}`. This adapter has no provisioned-capacity
+/// billing meter at all (root `CLAUDE.md`'s "no RCUs/WCUs to plan
+/// around") — these four constants are reported honestly as a static
+/// ceiling an SDK's own tooling can probe, never derived from anything
+/// this adapter tracks.
+#[must_use]
+pub fn describe_limits_response() -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "AccountMaxReadCapacityUnits".into(),
+        Value::from(ACCOUNT_MAX_READ_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "AccountMaxWriteCapacityUnits".into(),
+        Value::from(ACCOUNT_MAX_WRITE_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "TableMaxReadCapacityUnits".into(),
+        Value::from(TABLE_MAX_READ_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "TableMaxWriteCapacityUnits".into(),
+        Value::from(TABLE_MAX_WRITE_CAPACITY_UNITS),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("describe-limits response serializes")
+}
+
+/// How long an SDK is told it may cache a `DescribeEndpoints` result before
+/// asking again — AWS's own documented default.
+pub const DESCRIBE_ENDPOINTS_CACHE_PERIOD_MINUTES: u64 = 1440;
+
+/// The JSON body for a successful `DescribeEndpoints` (roadmap W-06):
+/// `{"Endpoints":[{"Address": .., "CachePeriodInMinutes": 1440}]}` — a
+/// single entry naming the caller's own node (`animusd::dynamo::
+/// describe_endpoints` supplies its own bound DynamoDB listen address; this
+/// crate has no notion of "the cluster's other nodes").
+#[must_use]
+pub fn describe_endpoints_response(address: &str) -> String {
+    let mut endpoint = Map::new();
+    endpoint.insert("Address".into(), Value::String(address.to_owned()));
+    endpoint.insert(
+        "CachePeriodInMinutes".into(),
+        Value::from(DESCRIBE_ENDPOINTS_CACHE_PERIOD_MINUTES),
+    );
+    let mut obj = Map::new();
+    obj.insert(
+        "Endpoints".into(),
+        Value::Array(vec![Value::Object(endpoint)]),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("describe-endpoints response serializes")
+}
+
 /// A table's point-in-time recovery (PITR) configuration and restorable
 /// window (ADR 0059 §9), as both `UpdateContinuousBackups` and
 /// `DescribeContinuousBackups` render it. `animusd` derives every field
@@ -8095,6 +8175,38 @@ mod tests {
             "ACTIVE",
         );
         assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
+    }
+
+    #[test]
+    fn decodes_describe_limits() {
+        match decode_request("DynamoDB_20120810.DescribeLimits", b"{}").unwrap() {
+            Operation::DescribeLimits => {}
+            other => panic!("expected DescribeLimits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_limits_response_shape() {
+        let body = describe_limits_response();
+        assert!(body.contains("\"AccountMaxReadCapacityUnits\":80000"));
+        assert!(body.contains("\"AccountMaxWriteCapacityUnits\":80000"));
+        assert!(body.contains("\"TableMaxReadCapacityUnits\":40000"));
+        assert!(body.contains("\"TableMaxWriteCapacityUnits\":40000"));
+    }
+
+    #[test]
+    fn decodes_describe_endpoints() {
+        match decode_request("DynamoDB_20120810.DescribeEndpoints", b"{}").unwrap() {
+            Operation::DescribeEndpoints => {}
+            other => panic!("expected DescribeEndpoints, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_endpoints_response_shape() {
+        let body = describe_endpoints_response("127.0.0.1:8000");
+        assert!(body.contains("\"Address\":\"127.0.0.1:8000\""));
+        assert!(body.contains("\"CachePeriodInMinutes\":1440"));
     }
 
     // --- Backups (ADR 0059, Train 1 PR④) -----------------------------------
