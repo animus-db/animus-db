@@ -15,9 +15,9 @@ use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
-    RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT,
-    SnapshotRead, TxnAbortReason, decide, dynamo, index_drain, median_split_key, relay_request,
-    relay_request_with_timeout, topology,
+    FORWARD_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL,
+    STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo, index_drain,
+    median_split_key, relay_request, relay_request_with_timeout, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -395,6 +395,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// transport failure now gets the identical "no hint" treatment a
     /// live-but-mid-election refusal already gets — try another known
     /// replica — rather than a terminal `return resp`.
+    ///
+    /// **A reachable-but-slow candidate is bounded too (issue #585), not
+    /// just an outright-dead one.** The fix above only helps once a
+    /// transport failure has actually happened; each hop's own transport
+    /// timeout used to be `remaining` — the *entire* time left before
+    /// `deadline` — handed whole to [`relay_request_with_timeout`]. A
+    /// candidate that accepts the TCP connection but is merely slow (a
+    /// loaded sandbox, a starved disk) or simply never answers isn't a
+    /// transport failure at all until its own timeout fires — so it could
+    /// consume the *whole* remaining budget on one hop, leaving the loop
+    /// nothing to retry with: it would find `now >= deadline` immediately
+    /// after and give up having tried exactly one replica, bimodally,
+    /// under load. Each hop's timeout is now capped to
+    /// [`FORWARD_HOP_TIMEOUT`] (see that constant's own doc for the sizing
+    /// rationale) — `remaining.min(FORWARD_HOP_TIMEOUT)` below — so a slow
+    /// candidate can eat at most one hop's worth of budget, never the
+    /// whole chase's; the overall [`CLIENT_TIMEOUT`] ceiling on the whole
+    /// sequence is unchanged, since the final hop before `deadline` still
+    /// gets whatever (smaller) time is actually left.
     pub(crate) async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
@@ -407,13 +426,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             tried.insert(next.clone());
             let remaining = deadline.duration_since(self.env.now());
+            // Issue #585: cap this hop's own transport timeout to
+            // `FORWARD_HOP_TIMEOUT` rather than handing it the whole
+            // `remaining` budget — see `FORWARD_HOP_TIMEOUT`'s own doc and
+            // this method's doc above. The final hop before `deadline`
+            // still gets the smaller of the two, so the overall
+            // `CLIENT_TIMEOUT` ceiling is unchanged.
             let resp = relay_request_with_timeout(
                 next.clone(),
                 &ClientRequest::Forwarded {
                     request: Box::new(request.clone()),
                     traceparent: crate::otel::current_traceparent(),
                 },
-                remaining,
+                remaining.min(FORWARD_HOP_TIMEOUT),
             )
             .await;
             let ClientResponse::Error(e) = &resp else {

@@ -1514,6 +1514,52 @@ test's own 30s victim-detection poll) yet the fix was still provable
 red-before/green-after via a fully deterministic isolation of the exact
 mechanism.
 
+**A reachable-but-slow candidate can starve the chase too, not just a dead
+one (issue #585, fixed).** Issue #316's fix above only helps once a
+transport failure has actually happened; each hop's own transport timeout
+used to be `remaining = deadline.duration_since(self.env.now())` — the
+*entire* time left before the chase's own overall deadline — handed whole
+to a single `relay_request_with_timeout` call. A candidate that accepts the
+TCP connection but is merely slow (a loaded sandbox, a starved disk) or
+simply never answers isn't a transport failure at all until its own
+timeout fires, so it could consume the *whole* remaining `CLIENT_TIMEOUT`
+budget on that one hop — the loop would then find `now >= deadline`
+immediately after and give up having tried exactly **one** replica, even
+with two other live replicas (one the tablet's real leader) reachable in
+well under a second the whole time. Observed as a bimodal `admin_endpoint`
+failure in a loaded sandbox — a different test each time, always
+`RELAY_TRANSPORT_FAILURE` — never reproduced on CI. Fixed by capping every
+hop's own transport timeout to `FORWARD_HOP_TIMEOUT` (2s,
+`remaining.min(FORWARD_HOP_TIMEOUT)`, `lib.rs`) instead of the whole
+remaining budget — see that constant's own doc for the sizing rationale
+(comfortably above a healthy hop's real round trip, while still leaving
+room for several more hops inside `CLIENT_TIMEOUT`). **The identical
+per-candidate-gets-the-whole-timeout shape also existed in
+`ClientCtx::propose_schema`'s own broadcast-to-every-known-address chase**
+(the ADR 0030 growth-node fallback, `schema.rs`) — fixed the same way,
+calling `relay_request_with_timeout` directly with `FORWARD_HOP_TIMEOUT`
+instead of `self.relay`'s flat `CLIENT_TIMEOUT`. `remote_metadata_watch_
+loop`'s long-poll (`WATCH_METADATA_CLIENT_TIMEOUT`, deliberately *longer*
+than `CLIENT_TIMEOUT` since it must outlive the serving node's own
+`WATCH_METADATA_SERVER_TIMEOUT` park) is the one call site that
+legitimately needs its own long single timeout and was left unchanged —
+see that constant's own doc. Regression:
+`forward_hop_timeout_tests::forward_to_tablet_leader_bounds_each_hop_so_a_
+slow_candidate_cannot_starve_the_chase` (`lib.rs`, beside
+`forward_transport_failure_tests` above and for the identical reason — a
+real-socket `ProdEnv` test, since `forwarding.rs` carries the same hard
+`#[deny(clippy::disallowed_methods)]`): a real raw `TcpListener` stub
+rebinds the deterministic first-guess replica's own former intra address
+and accepts every connection but never writes a reply, proving the fixed
+chase recovers via a live replica in a few seconds rather than dead-ending
+near the full `CLIENT_TIMEOUT`. See `docs/engineering-lessons.md`'s
+matching Testing entry for the general lesson (a hint-chasing forward's
+per-candidate timeout must be a bounded slice of the overall deadline,
+never the whole remaining budget) and why no `SimEnv` shape can reach this
+mechanism today (the cross-node relay is a free function hardcoded to a
+real `TcpStream`, not routed through `E: Env`'s `Network` seam or the `R:
+RelayClient` capability trait).
+
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
 formation window, or a crashed leader), one exhausted pass is not a failure.
