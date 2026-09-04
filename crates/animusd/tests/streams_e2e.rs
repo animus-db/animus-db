@@ -1241,10 +1241,28 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
             panic!("node {i}: child shard {child_shard} missing from DescribeStream: {body}")
         });
         // The child's own entry must carry a non-null `ParentShardId`
-        // naming a shard of the parent tablet (the exact epoch is not
-        // pinned here — `stream_shard_parent_id` is derived, not stored,
-        // ADR 0043 §A8 — only that the lineage link exists at all, which
-        // requires the parent to have sealed at least once by now).
+        // naming a shard that actually exists. **Not necessarily a shard of
+        // the immediate `parent` tablet** (issue #588): under a cascade,
+        // `parent` here is whichever immediate parent the lineage scan
+        // above happened to land on, and that tablet can legitimately have
+        // sealed nothing of its own before it re-split further (the same
+        // "can legitimately reach its own CutoverSplit with nothing ever
+        // sealed" case `root`'s own doc above names) — `stream_shard_
+        // parent_id` walks past a never-sealed intermediate ancestor to
+        // the nearest one that DID seal (ADR 0043's 2026-09-04 amendment),
+        // so the id to check for is whatever that derivation actually
+        // resolves to, not `parent.0` itself. It must resolve to `Some`
+        // here: `child`'s own lineage chain traces back to `root`, which
+        // the poll above already proved has sealed at least once.
+        let expected_parent_shard = node
+            .metadata()
+            .stream_shard_parent_id(child, 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "node {i}: child {child:?}'s split-lineage chain never resolves to any \
+                     sealed ancestor, despite root ({root:?}) having sealed"
+                )
+            });
         // A window straddling the match, not just following it — the
         // wire encoding's field order within one shard object is not
         // pinned by this test, and `ParentShardId` can precede `ShardId`.
@@ -1252,8 +1270,8 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
         let end = (pos + 400).min(body.len());
         let window = &body[start..end];
         assert!(
-            window.contains(&format!("shardId-{}-", parent.0)),
-            "node {i}: child shard's ParentShardId must name a shard of the parent tablet: {window}"
+            window.contains(&expected_parent_shard),
+            "node {i}: child shard's ParentShardId must be {expected_parent_shard}: {window}"
         );
     }
 

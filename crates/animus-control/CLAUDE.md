@@ -379,7 +379,19 @@ per-tablet CP data plane (`animus-cp-data`).
   hosted-but-absent), and writes `Metadata::split_lineage[child] =
   SplitLineage {parent, parents_final_epoch, cutover_wall_ms}` — fork F9,
   recorded at the one moment the parent's shard chain is complete (never
-  pruned; the B6 `ParentShardId` source). Wall time rides the command
+  pruned; the B6 `ParentShardId` source). **`parents_final_epoch` is
+  legitimately `None`** whenever the parent itself never sealed a shard of
+  its own before it split further (a fast cascade's intermediate tablet —
+  ADR 0043 §A3's "never seal an empty segment" — not a bug, and not the
+  same thing as "no ancestor in this chain ever sealed anything").
+  `Metadata::stream_shard_parent_id` — the sole reader of this field —
+  accounts for this: a `None` here makes it walk one hop further up
+  `split_lineage` (`lineage.parent`) rather than stopping, so a
+  descendant's `ParentShardId` still resolves to the nearest REAL sealed
+  ancestor, however many never-sealed hops lie in between (issue #588,
+  2026-09-04; see that ADR's Fork F9 entry for the full incident — the
+  fix is entirely in the derived read, `split_lineage` itself writes
+  exactly as before). Wall time rides the command
   (`cutover_wall_ms`), `SealStreamShard::seal_wall_ms`'s discipline — the
   state machine has no clock. The zero-copy split's own command and
   provenance maps (`SplitTablet`, `split_parents`, `stream_split_basis`)

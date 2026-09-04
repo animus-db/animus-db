@@ -3787,23 +3787,60 @@ impl Metadata {
     /// `(tablet, epoch)`'s own `ParentShardId` (ADR 0042 §2/ADR 0043 §A4). An
     /// epoch above 0 names the same tablet's own previous epoch, always
     /// derived (a routine seal can never race itself). An epoch-0 shard
-    /// names the parent tablet's own FINAL sealed shard as frozen in
-    /// [`Metadata::split_lineage`] at cutover (ADR 0050, fork F9). `None`
-    /// for a genuine root (an epoch-0 shard whose tablet was never a split
-    /// child, or whose parent never sealed).
+    /// names the NEAREST split-lineage ancestor's own FINAL sealed shard
+    /// (ADR 0050, fork F9; the walk-past-an-unsealed-ancestor behavior is
+    /// ADR 0043's 2026-09-04 amendment, issue #588). `None` only for a
+    /// genuine root: an epoch-0 shard whose tablet was never a split child
+    /// at all, or whose entire split-lineage chain — every ancestor, all
+    /// the way back — never sealed a shard of its own.
     #[must_use]
     pub fn stream_shard_parent_id(&self, tablet: TabletId, epoch: u64) -> Option<String> {
         if epoch > 0 {
             return Some(shard_id_string(tablet, epoch - 1));
         }
-        // ADR 0050 rung 5: a copy-based split child's epoch-0 shard names
-        // its parent's FINAL sealed shard via `split_lineage` — written at
-        // `CutoverSplit`'s own apply, the one moment the parent's chain is
-        // complete and immutable, so this needs no freezing defense layers
-        // at all (fork F9).
+        // A split child's epoch-0 shard names its parent's FINAL sealed
+        // shard via `split_lineage` — written at `CutoverSplit`'s own
+        // apply, the one moment the parent's chain is complete and
+        // immutable, so this needs no freezing defense layers at all
+        // (fork F9).
+        //
+        // **Issue #588**: `SplitLineage::parents_final_epoch` is
+        // legitimately `None` whenever the immediate parent itself never
+        // sealed anything of its own before it split further — not a race,
+        // a documented case (ADR 0043 §A3's "never seal an empty segment"):
+        // a fast cascade can produce an intermediate tablet that inherits
+        // bytes from ITS OWN parent's fork but takes zero direct writes
+        // before splitting again. Stopping at that `None` used to strand
+        // every descendant with a permanently-null `ParentShardId`, even
+        // though an earlier ancestor's real sealed history is right there
+        // in `split_lineage` one hop further up — walk past it instead: a
+        // never-sealed parent's own epoch-0 "parent shard" is, by this
+        // exact same definition, ITS parent's final sealed shard, so
+        // recursing on `(lineage.parent, 0)` finds the nearest ancestor
+        // that ever actually sealed something, however many un-sealed
+        // hops lie between. Bounded by `split_lineage.len() + 1` recursive
+        // steps at most (it is a tree, never cyclic — the same bound
+        // `live_split_descendants`'s own forward DFS uses) so a corrupted/
+        // cyclic map can never spin this forever.
+        self.stream_shard_parent_id_bounded(tablet, self.split_lineage.len())
+    }
+
+    /// [`stream_shard_parent_id`](Self::stream_shard_parent_id)'s own
+    /// epoch-0 recursive step (issue #588) — `budget` is decremented on
+    /// every hop through an unsealed ancestor and the walk gives up
+    /// (`None`) if it ever reaches zero, rather than trusting
+    /// `split_lineage` to stay acyclic under a hypothetically corrupted
+    /// state. A legitimate tree can never exhaust this budget: each hop
+    /// visits a distinct tablet id (`split_lineage` is a tree keyed
+    /// child → parent) and `split_lineage.len()` upper-bounds how many
+    /// distinct tablets can possibly be children in it at all.
+    fn stream_shard_parent_id_bounded(&self, tablet: TabletId, budget: usize) -> Option<String> {
         let lineage = self.split_lineage.get(&tablet)?;
-        let parent_epoch = lineage.parents_final_epoch?;
-        Some(shard_id_string(lineage.parent, parent_epoch))
+        match lineage.parents_final_epoch {
+            Some(parent_epoch) => Some(shard_id_string(lineage.parent, parent_epoch)),
+            None if budget == 0 => None,
+            None => self.stream_shard_parent_id_bounded(lineage.parent, budget - 1),
+        }
     }
 
     /// `tablet`'s effective PITR watermark (ADR 0059 §9) — the identical
