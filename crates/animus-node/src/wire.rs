@@ -787,6 +787,11 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // follower-connected `UpdateTimeToLive` must reach the control
         // leader.
         | MetaCommand::SetTableTtl { .. }
+        // Resource tagging (roadmap W-06): schema-catalog class, same relay
+        // reason as `SetTableTtl` — a follower-connected `TagResource`/
+        // `UntagResource` must reach the control leader.
+        | MetaCommand::TagResource { .. }
+        | MetaCommand::UntagResource { .. }
         // Stream-shard catalog commit (ADR 0042/0043): a tablet leader's
         // own seal proposal, from wherever that leader actually runs — see
         // this function's own doc for why `ExpireStreamShards` is
@@ -1207,6 +1212,8 @@ mod tests {
             sort_attribute: Some("x".to_string()),
             projection: IndexProjection::All,
             status: IndexStatus::active(),
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         };
         let addrs = NodeAddrs {
             internal: String::new(),
@@ -1258,6 +1265,14 @@ mod tests {
                 spec: Some(TtlSpec {
                     attribute_name: "expires_at".to_string(),
                 }),
+            },
+            MetaCommand::TagResource {
+                table: table.clone(),
+                tags: BTreeMap::from([("env".to_string(), "prod".to_string())]),
+            },
+            MetaCommand::UntagResource {
+                table: table.clone(),
+                tag_keys: vec!["env".to_string()],
             },
             MetaCommand::SealStreamShard {
                 table: table.clone(),

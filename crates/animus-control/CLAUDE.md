@@ -171,6 +171,30 @@ per-tablet CP data plane (`animus-cp-data`).
   changing the attribute in place (no disable/re-enable round trip) is
   `Applied` — see the variant's own doc before copying `SetTableStream`'s
   shape for a future replicated-config command that also has no label.
+  **`TableSchema::tags: BTreeMap<String, String>`** (roadmap W-06, DynamoDB
+  `TagResource`/`UntagResource`/`ListTagsOfResource`) is a third shape,
+  neither `StreamSpec`'s label-carrying nor `TtlSpec`'s no-label-single-
+  value one: it **merges** rather than replaces, so `MetaCommand::
+  TagResource`/`UntagResource`'s apply arms are per-key set/remove, and
+  (unlike `SetTableTtl`) a caller checking whether its own write committed
+  must compare per-key membership, never the whole map — see
+  `docs/engineering-lessons.md`'s entry on this for the general form.
+  `Metadata::table_tags` mirrors `table_ttl`/`table_pitr`'s read-accessor
+  shape (empty map rather than `None` for a known table with no tags, since
+  a tag set has no "disabled" state to distinguish from "empty").
+
+  **`IndexDef` carries `hash_attribute_type`/`sort_attribute_type: Option<
+  ColumnType>` (issue #319/W-05)** — the DynamoDB `AttributeType` an
+  index's own hash/sort key attribute was declared with, resolved by
+  `animus_dynamo::schema::index_to_control` from a `CreateTable`/
+  `UpdateTable` call's own `AttributeDefinitions` when the caller supplied
+  one; `#[serde(default)]`, `None` for a pre-existing definition or an
+  attribute nobody ever declared a type for (still renders `DescribeTable`'s
+  honest `S` placeholder, never a fabricated type). Every one of this
+  struct's ~24 existing construction sites across this crate, `animus-node`,
+  `animus-test`, and `animusd`'s tests needed both new fields added —
+  compiler-enumerated via `error[E0063]`, the same fan-out pattern root
+  `CLAUDE.md`'s "a future 8th port" entry describes for `RoleAddrs`.
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`). **`Metadata` is

@@ -69,6 +69,7 @@
     <button class="navlink active" data-tab="overview">Overview</button>
     <button class="navlink" data-tab="placement">Placement</button>
     <button class="navlink" data-tab="tablets">Tablets</button>
+    <button class="navlink" data-tab="txns">Transactions</button>
     <button class="navlink" data-tab="browser">Data Browser</button>
     <button class="navlink" data-tab="streams">Streams</button>
     <button class="navlink" data-tab="storage">Storage</button>
@@ -85,6 +86,10 @@
       </div>
       <div class="card" id="ov-banner"></div>
       <div class="card"><div class="stat-tiles" id="ov-tiles"></div></div>
+      <div class="card">
+        <div class="section-head"><span class="title">Read path (last ~2h, this node)</span></div>
+        <div class="stat-tiles" id="ov-readpath"></div>
+      </div>
       <div class="grid-2">
         <div>
           <div class="section-head"><span class="title">Nodes</span>
@@ -142,6 +147,22 @@
           </div>
         </div>
         <div class="tablet-detail" id="tb-detail" style="display:none"></div>
+      </div>
+    </section>
+
+    <section id="txns" class="view-max">
+      <div class="view-head">
+        <h1>Transactions</h1>
+        <span class="muted" id="tx-summary"></span>
+      </div>
+      <div class="card"><div class="stat-tiles" id="tx-tiles"></div></div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>Pending</h2>
+        <div id="tx-pending-body"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card scroll">
+        <h2>Unresolved decided</h2>
+        <div id="tx-unresolved-body"><div class="empty">loading…</div></div>
       </div>
     </section>
 
@@ -400,6 +421,7 @@
 <script src="/admin/ui/dashboard_overview.js"></script>
 <script src="/admin/ui/dashboard_placement.js"></script>
 <script src="/admin/ui/dashboard_tablets.js"></script>
+<script src="/admin/ui/dashboard_txns.js"></script>
 <script src="/admin/ui/dashboard_streams.js"></script>
 <script src="/admin/ui/dashboard_browser.js"></script>
 <script src="/admin/ui/dashboard_storage.js"></script>

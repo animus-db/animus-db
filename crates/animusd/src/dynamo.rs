@@ -162,7 +162,7 @@
 //! nothing to backfill. `UpdateTable` (adding an index to a populated table)
 //! will need a real backfill when it lands (ADR 0041 §5).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
@@ -494,7 +494,11 @@ fn error_status(err: &WireError) -> u16 {
 
 /// Whether `op` is a DDL mutation that names a table by identity
 /// (`CreateTable`/`UpdateTable`/`DeleteTable`/`UpdateTimeToLive`) — see
-/// [`reject_internal_table`]'s `ddl` parameter.
+/// [`reject_internal_table`]'s `ddl` parameter. `TagResource`/
+/// `UntagResource` join this set for the same reason `UpdateTimeToLive`/
+/// `UpdateContinuousBackups` do (a mutation of the table's own catalog
+/// entry, not a data op) — `ListTagsOfResource`, a pure read, does not,
+/// exactly like `DescribeTimeToLive`/`DescribeContinuousBackups`.
 fn is_ddl_mutation(op: &Operation) -> bool {
     matches!(
         op,
@@ -503,6 +507,8 @@ fn is_ddl_mutation(op: &Operation) -> bool {
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
             | Operation::UpdateContinuousBackups { .. }
+            | Operation::TagResource { .. }
+            | Operation::UntagResource { .. }
     )
 }
 
@@ -577,7 +583,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             stream,
             index_update,
-        } => update_table(ctx, &table, stream, index_update).await,
+            key_types,
+        } => update_table(ctx, &table, stream, index_update, &key_types).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
         Operation::ListTables {
@@ -1084,6 +1091,13 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             )
             .await
         }
+        Operation::TagResource { table, tags } => tag_resource(ctx, &table, &tags).await,
+        Operation::UntagResource { table, tag_keys } => {
+            untag_resource(ctx, &table, &tag_keys).await
+        }
+        Operation::ListTagsOfResource { table } => list_tags_of_resource(ctx, meta, &table),
+        Operation::DescribeLimits => describe_limits(),
+        Operation::DescribeEndpoints => describe_endpoints(ctx),
     }
 }
 
@@ -1168,6 +1182,132 @@ fn describe_time_to_live(
         attribute_name: ttl.map(|t| t.attribute_name.clone()),
     };
     Ok(wire::describe_time_to_live_response(&desc))
+}
+
+// --- Resource tagging (roadmap W-06) ---------------------------------------
+
+/// `TagResource`: add or overwrite tags on a table — the same commit-wait
+/// shape [`update_time_to_live`] already uses, just against
+/// `MetaCommand::TagResource`.
+///
+/// The convergence check waits for **each requested `(key, value)` pair
+/// specifically**, not exact map equality against a snapshot taken before
+/// proposing — a concurrent, unrelated `TagResource`/`UntagResource` on the
+/// same table (a different key entirely) must not make this call spin past
+/// its deadline just because the *whole* map no longer matches what it
+/// computed before proposing.
+async fn tag_resource(
+    ctx: &ClientCtx,
+    table: &str,
+    tags: &BTreeMap<String, String>,
+) -> Result<String, WireError> {
+    if !metadata_fresh(ctx).await.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::TagResource {
+            table: table.to_owned(),
+            tags: tags.clone(),
+        })
+        .await;
+        if let Some(current) = metadata_fresh(ctx).await.table_tags(table)
+            && tags.iter().all(|(k, v)| current.get(k) == Some(v))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "TagResource did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    Ok(wire::tag_or_untag_resource_response())
+}
+
+/// `UntagResource`: remove tags from a table by key — [`tag_resource`]'s
+/// mirror, with the identical per-key (rather than whole-map) convergence
+/// check.
+async fn untag_resource(
+    ctx: &ClientCtx,
+    table: &str,
+    tag_keys: &[String],
+) -> Result<String, WireError> {
+    if !metadata_fresh(ctx).await.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::UntagResource {
+            table: table.to_owned(),
+            tag_keys: tag_keys.to_vec(),
+        })
+        .await;
+        if let Some(current) = metadata_fresh(ctx).await.table_tags(table)
+            && tag_keys.iter().all(|k| !current.contains_key(k))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UntagResource did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    Ok(wire::tag_or_untag_resource_response())
+}
+
+/// `ListTagsOfResource`: a pure read of the replicated catalog, mirroring
+/// [`describe_time_to_live`]'s shape exactly.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn list_tags_of_resource(
+    _ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let empty = BTreeMap::new();
+    let tags = meta.table_tags(table).unwrap_or(&empty);
+    Ok(wire::list_tags_of_resource_response(tags))
+}
+
+// --- DescribeLimits / DescribeEndpoints (roadmap W-06) ---------------------
+
+/// `DescribeLimits`: a pure, static read — see [`wire::describe_limits_response`]'s
+/// own doc for why these four values are honest constants, not anything
+/// this adapter measures or tracks.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_limits() -> Result<String, WireError> {
+    Ok(wire::describe_limits_response())
+}
+
+/// `DescribeEndpoints`: this node's own bound DynamoDB listen address — the
+/// same value `/admin/config`'s `addrs.dynamo` already reports
+/// (`admin.rs::config_view`), read here via the identical `ctx.admin`
+/// field. Always `Some` in practice: this handler is reachable only through
+/// the DynamoDB wire edge itself, whose listener a control-only node never
+/// binds (ADR 0035 PR3) — the same structural guarantee
+/// [`ClientCtx::data`]'s own panic doc relies on.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_endpoints(ctx: &ClientCtx) -> Result<String, WireError> {
+    let address = ctx
+        .admin
+        .dynamo_addr
+        .expect("DescribeEndpoints is only reachable via the bound DynamoDB listener")
+        .to_string();
+    Ok(wire::describe_endpoints_response(&address))
 }
 
 // --- PITR (ADR 0059 §9, Train 3) -------------------------------------------
@@ -1787,7 +1927,12 @@ async fn provision_restore_target(
                         idx.name()
                     )));
                 }
-                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key);
+                // `RestoreTableFromBackup`'s `GlobalSecondaryIndexOverride` carries
+                // no `AttributeDefinitions` on the wire (issue #319's residual for
+                // this path only, see `index_to_control`'s own doc) — `&[]` leaves
+                // every resolved type `None`, matching this bridge's pre-existing
+                // behavior for this caller exactly.
+                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key, &[]);
                 def.status = IndexStatus::Creating;
                 out.push(def);
             }
@@ -2186,7 +2331,7 @@ async fn create_table(
     // it). We compare against the replicated `table_indexes` set by name to know it
     // committed.
     for index in indexes {
-        let def = schema_bridge::index_to_control(index, &schema.partition_key);
+        let def = schema_bridge::index_to_control(index, &schema.partition_key, key_types);
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
             ctx.propose_schema(&MetaCommand::CreateTableIndex {
@@ -2365,6 +2510,7 @@ async fn update_table(
     table: &str,
     stream: Option<wire::StreamUpdate>,
     index_update: Option<wire::IndexUpdate>,
+    key_types: &[(String, String)],
 ) -> Result<String, WireError> {
     if !metadata_fresh(ctx).await.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2385,7 +2531,7 @@ async fn update_table(
             wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
         },
         (None, Some(update)) => match update {
-            wire::IndexUpdate::Create(index) => create_index(ctx, table, &index).await?,
+            wire::IndexUpdate::Create(index) => create_index(ctx, table, &index, key_types).await?,
             wire::IndexUpdate::Delete(index) => drop_index(ctx, table, &index).await?,
         },
         // Unreachable via the wire decoder (it always sets exactly one), but
@@ -2433,7 +2579,10 @@ async fn update_table(
 ///   total.
 ///
 /// Bridges the validated declaration to the control-plane `IndexDef` via
-/// [`schema_bridge::index_to_control`], **overriding its status to
+/// [`schema_bridge::index_to_control`] (`key_types` is this call's own
+/// decoded `AttributeDefinitions`, ADR 0045 §6's issue #319 fix — resolves
+/// the new index's own key attribute type(s) instead of leaving them
+/// `None`), **overriding its status to
 /// `Creating`** — that function's own doc: its default `Active` is correct
 /// only for `create_table`'s always-empty-by-construction caller, and this is
 /// the caller its doc names as needing the override. Proposes
@@ -2455,6 +2604,7 @@ async fn create_index(
     ctx: &ClientCtx,
     table: &str,
     index: &animus_dynamo::SecondaryIndex,
+    key_types: &[(String, String)],
 ) -> Result<(), WireError> {
     let animus_dynamo::SecondaryIndex::Global(gsi) = index else {
         return Err(WireError::validation(
@@ -2494,7 +2644,7 @@ async fn create_index(
              {MAX_GSI_PER_TABLE} allowed per table"
         )));
     }
-    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key);
+    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key, key_types);
     def.status = IndexStatus::Creating;
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
@@ -2721,8 +2871,13 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         )));
     };
     let dynamo_schema = schema_bridge::to_dynamo(control_schema);
-    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let mut key_types = schema_bridge::key_attribute_types(control_schema);
     let index_defs = meta.table_indexes(table);
+    // Issue #319: extend the base table's own typed key columns with every
+    // index's own declared hash/sort attribute type, so `AttributeDefinitions`
+    // reports a real type for an index-only key attribute instead of always
+    // defaulting to `S` — see `schema_bridge::index_attribute_types`'s doc.
+    key_types.extend(schema_bridge::index_attribute_types(index_defs));
     let indexes = schema_bridge::indexes_to_dynamo(index_defs);
     // The Fork-D side channel (`wire::describe_table_response`'s doc): each
     // index's real replicated-catalog status, kept separate from
@@ -2770,8 +2925,10 @@ async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError>
         )));
     };
     let dynamo_schema = schema_bridge::to_dynamo(control_schema);
-    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let mut key_types = schema_bridge::key_attribute_types(control_schema);
     let index_defs = meta.table_indexes(table);
+    // Issue #319 — see `describe_table`'s identical merge for why.
+    key_types.extend(schema_bridge::index_attribute_types(index_defs));
     let indexes = schema_bridge::indexes_to_dynamo(index_defs);
     let index_statuses: Vec<(String, IndexStatus)> = index_defs
         .iter()

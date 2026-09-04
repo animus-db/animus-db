@@ -136,6 +136,17 @@ pub fn to_dynamo(schema: &ControlSchema) -> TableSchema {
 /// alternate sort attribute and, by the catalog's convention, hashes by
 /// `base_partition_key` (DynamoDB LSIs share the base partition key).
 ///
+/// `key_types` is the request's own decoded `AttributeDefinitions` (the same
+/// `(AttributeName, AttributeType)` pairs [`to_control`] resolves the base
+/// table's key columns from) — resolving `hash_attribute`'s/`sort_attribute`'s
+/// own declared type from it (issue #319) is what lets `DescribeTable` later
+/// report a real type for an index-only key attribute instead of always
+/// defaulting to `S`. Pass `&[]` when the caller has no `AttributeDefinitions`
+/// in hand (e.g. `RestoreTableFromBackup`'s `GlobalSecondaryIndexOverride`,
+/// which carries no attribute types on the wire at all) — every resolved
+/// field is then simply `None`, identical to this function's behavior before
+/// these fields existed.
+///
 /// The returned definition's `status` is always [`IndexStatus::Active`] — today's
 /// sole caller is `CreateTable`, whose indexes are always empty-by-construction
 /// (ADR 0041 §5), so `Active` is correct as-is. A future `UpdateTable`-driven
@@ -143,12 +154,24 @@ pub fn to_dynamo(schema: &ControlSchema) -> TableSchema {
 /// explicitly override `status` to `Creating` on the returned value before
 /// proposing it — this bridge does not know which caller it serves.
 #[must_use]
-pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> IndexDef {
+pub fn index_to_control(
+    index: &SecondaryIndex,
+    base_partition_key: &str,
+    key_types: &[(String, String)],
+) -> IndexDef {
+    let declared_type = |name: &str| {
+        key_types
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| column_type_for(Some(t.as_str())))
+    };
     match index {
         SecondaryIndex::Global(g) => IndexDef {
             name: g.name.clone(),
             kind: IndexKind::Global,
+            hash_attribute_type: declared_type(&g.key_attribute),
             hash_attribute: g.key_attribute.clone(),
+            sort_attribute_type: g.sort_attribute.as_deref().and_then(declared_type),
             sort_attribute: g.sort_attribute.clone(),
             projection: projection_to_control(&g.projection),
             status: IndexStatus::Active,
@@ -156,12 +179,44 @@ pub fn index_to_control(index: &SecondaryIndex, base_partition_key: &str) -> Ind
         SecondaryIndex::Local(l) => IndexDef {
             name: l.name.clone(),
             kind: IndexKind::Local,
+            hash_attribute_type: declared_type(base_partition_key),
             hash_attribute: base_partition_key.to_owned(),
+            sort_attribute_type: declared_type(&l.sort_attribute),
             sort_attribute: Some(l.sort_attribute.clone()),
             projection: projection_to_control(&l.projection),
             status: IndexStatus::Active,
         },
     }
+}
+
+/// The reverse of [`index_to_control`]'s new type resolution: the
+/// `(AttributeName, AttributeType)` pairs for every one of `indexes`'
+/// own declared key attributes that actually has a recorded type (issue
+/// #319) — `None` entries (a pre-existing definition, or one whose
+/// `AttributeDefinitions` never covered it) are simply omitted, so a
+/// caller merging this into a base [`key_attribute_types`] map never
+/// overwrites a real entry with a placeholder. Used by `DescribeTable`/
+/// `DeleteTable`'s response building (`animusd::dynamo`) to extend the
+/// base table's own typed key columns with each index's own typed ones
+/// before handing the merged map to `wire::describe_table_response`/
+/// `delete_table_response` — the AWS-faithful `AttributeDefinitions`
+/// coverage those two already build from a plain `key_types` map that,
+/// until now, only ever contained the base table's own key column types.
+#[must_use]
+pub fn index_attribute_types(indexes: &[IndexDef]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for idx in indexes {
+        if let Some(ty) = idx.hash_attribute_type {
+            out.push((
+                idx.hash_attribute.clone(),
+                attribute_type_for(ty).to_owned(),
+            ));
+        }
+        if let (Some(name), Some(ty)) = (idx.sort_attribute.as_deref(), idx.sort_attribute_type) {
+            out.push((name.to_owned(), attribute_type_for(ty).to_owned()));
+        }
+    }
+    out
 }
 
 /// Recover the DynamoDB [`SecondaryIndex`] declaration from a control-plane
@@ -257,11 +312,67 @@ mod tests {
             sort_attribute: Some("created".into()),
             projection: IndexProjection::Include(vec!["name".into()]),
         });
-        let def = index_to_control(&dynamo, "id");
+        let def = index_to_control(&dynamo, "id", &[]);
         assert_eq!(def.kind, IndexKind::Global);
         assert_eq!(def.hash_attribute, "email");
         assert_eq!(def.sort_attribute.as_deref(), Some("created"));
+        assert_eq!(
+            def.hash_attribute_type, None,
+            "no AttributeDefinitions given"
+        );
+        assert_eq!(def.sort_attribute_type, None);
         assert_eq!(index_to_dynamo(&def), dynamo);
+    }
+
+    /// Issue #319: a GSI's own hash/sort attribute type, declared in
+    /// `AttributeDefinitions`, is resolved onto the returned [`IndexDef`] —
+    /// and [`index_attribute_types`] recovers exactly those two entries back
+    /// out, the shape `DescribeTable`'s response building merges into its
+    /// base `key_types` map.
+    #[test]
+    fn gsi_key_types_resolve_from_attribute_definitions_and_back() {
+        let dynamo = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-score".into(),
+            key_attribute: "score".into(),
+            sort_attribute: Some("rank".into()),
+            projection: IndexProjection::All,
+        });
+        let key_types = [
+            ("id".to_owned(), "S".to_owned()),
+            ("score".to_owned(), "N".to_owned()),
+            ("rank".to_owned(), "B".to_owned()),
+        ];
+        let def = index_to_control(&dynamo, "id", &key_types);
+        assert_eq!(def.hash_attribute_type, Some(ColumnType::Number));
+        assert_eq!(def.sort_attribute_type, Some(ColumnType::Binary));
+
+        let recovered = index_attribute_types(std::slice::from_ref(&def));
+        assert_eq!(
+            recovered,
+            vec![
+                ("score".to_owned(), "N".to_owned()),
+                ("rank".to_owned(), "B".to_owned()),
+            ]
+        );
+    }
+
+    /// A pre-existing (or `AttributeDefinitions`-less) [`IndexDef`] — both
+    /// type fields `None` — contributes nothing to
+    /// [`index_attribute_types`]'s output, so merging it into a base
+    /// `key_types` map can never clobber a real entry with a placeholder.
+    #[test]
+    fn index_attribute_types_omits_untyped_fields() {
+        let def = index_to_control(
+            &SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "by-email".into(),
+                key_attribute: "email".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            }),
+            "id",
+            &[],
+        );
+        assert!(index_attribute_types(std::slice::from_ref(&def)).is_empty());
     }
 
     #[test]
@@ -271,11 +382,17 @@ mod tests {
             sort_attribute: "ts".into(),
             projection: IndexProjection::KeysOnly,
         });
-        let def = index_to_control(&dynamo, "pk");
+        let def = index_to_control(&dynamo, "pk", &[("pk".into(), "N".into())]);
         assert_eq!(def.kind, IndexKind::Local);
         // The LSI hashes by the base partition key in the control model.
         assert_eq!(def.hash_attribute, "pk");
         assert_eq!(def.sort_attribute.as_deref(), Some("ts"));
+        // The base partition key's own declared type resolves onto the
+        // LSI's `hash_attribute_type` too — it's the same attribute, so this
+        // is accurate, not redundant bookkeeping that could drift.
+        assert_eq!(def.hash_attribute_type, Some(ColumnType::Number));
+        // `ts` was never in `AttributeDefinitions` here — unknown, not `S`.
+        assert_eq!(def.sort_attribute_type, None);
         assert_eq!(index_to_dynamo(&def), dynamo);
         // LSIs are always `Active` by construction (ADR 0045 §6): they are
         // create-time-only in real DynamoDB, so nothing in this codebase ever

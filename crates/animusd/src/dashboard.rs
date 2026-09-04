@@ -2,7 +2,10 @@
 //! from the admin port for manual cluster testing and operation — Overview,
 //! Placement, Tablets, Data Browser, and Storage. ADR 0035 PR7 adds a sixth
 //! view, Node; a Streams view (ADR 0042/0043) is a seventh — DynamoDB Streams'
-//! shard chains and a live-tail poller. Which views are shown is gated on
+//! shard chains and a live-tail poller. A Transactions view (ADR 0018 §2/PR7,
+//! docs/roadmap.md U-01) is an eighth — a read-only render of `/admin/txns`,
+//! gated like Tablets (both are cluster-wide views a data-only node can't
+//! derive without local control-plane `Metadata`). Which views are shown is gated on
 //! this node's own role (control/data/combined,
 //! `admin.rs::config_view`'s `role` field) — see `dashboard_core.js`'s
 //! `ROLE_TABS`; Streams is shown for combined/data, never control-only (a
@@ -23,9 +26,9 @@
 //! (`admin.rs::static_asset`) instead of inlined in one document. `CORE_JS`
 //! holds shared state/fetch/routing/theme/data-derivation utilities every
 //! other module depends on; `OVERVIEW_JS`/`PLACEMENT_JS`/`TABLETS_JS`/
-//! `STREAMS_JS`/`BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the seven views' own
-//! render logic, loaded in that order (each may call functions defined
-//! earlier, since plain `<script src>` tags share one global scope) —
+//! `TXNS_JS`/`STREAMS_JS`/`BROWSER_JS`/`STORAGE_JS`/`NODE_JS` are the eight
+//! views' own render logic, loaded in that order (each may call functions
+//! defined earlier, since plain `<script src>` tags share one global scope) —
 //! `STREAMS_JS` loads before `BROWSER_JS` because the Data Browser's
 //! per-table Stream row (enable/disable) reuses its `viewTypeLabel` helper.
 //!
@@ -33,7 +36,9 @@
 //! stream enable/disable toggle, and the bulk-seed tool, which writes real
 //! DynamoDB items) and the Streams tab's live-tail poller carry the real
 //! mutations/reads; the ADR 0020 gated operator actions (split/flush/compact/
-//! reconfigure/drain) and the ADR 0018 transaction view are not yet surfaced.
+//! reconfigure/drain) are not yet surfaced. The ADR 0018 transaction view
+//! (`TXNS_JS`) is now surfaced, read-only — no manual resolution action, by
+//! design (`CpTxnView`'s own doc).
 
 /// The console's page shell, embedded at compile time.
 pub(crate) const HTML: &str = include_str!("dashboard.html");
@@ -77,6 +82,11 @@ pub(crate) const OVERVIEW_JS: &str = include_str!("dashboard_overview.js");
 pub(crate) const PLACEMENT_JS: &str = include_str!("dashboard_placement.js");
 /// The Tablets view: filterable list + raft-group/storage detail panel.
 pub(crate) const TABLETS_JS: &str = include_str!("dashboard_tablets.js");
+/// The Transactions view (ADR 0018 §2/PR7, docs/roadmap.md U-01): a read-only
+/// render of `/admin/txns`, merged cluster-wide the same way `TABLETS_JS`
+/// merges `/admin/raftkv` — pending and unresolved-decided multi-participant
+/// transaction records per hosted tablet.
+pub(crate) const TXNS_JS: &str = include_str!("dashboard_txns.js");
 /// The Streams view (ADR 0042/0043): a list of currently-enabled and
 /// disabled-but-in-grace-window DynamoDB Streams, per-node stream metric
 /// tiles (the console's first `/admin/metrics` consumer), and a detail panel

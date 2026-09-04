@@ -2271,17 +2271,27 @@ fn console_key_summary(schema: &TableSchema, column_name: &str) -> console::KeyS
 
 /// The same projection for an *index* key attribute, which — unlike a base
 /// table's own key — may genuinely have no declared type to report. See
-/// [`console::IndexKeySummary`]: `IndexDef` stores only the attribute name,
-/// so a type exists only when that attribute is also a declared column of
-/// the base table. `None` (rather than [`console_key_summary`]'s `"S"`
-/// fallback) so the console renders a bare name instead of asserting a type
-/// nobody recorded.
-fn console_index_key_summary(schema: &TableSchema, column_name: &str) -> console::IndexKeySummary {
+/// [`console::IndexKeySummary`]. Resolution order: the base table's own
+/// typed columns first (an index attribute that happens to also be a base
+/// key, e.g. an LSI's hash — always the base partition key), then
+/// `declared_type` — the index's own `hash_attribute_type`/
+/// `sort_attribute_type` off its `IndexDef` (issue #319: a GSI's own key
+/// attribute, or an LSI's alternate sort, is never a base column, so it can
+/// only ever be recorded there). `None` (rather than [`console_key_summary`]'s
+/// `"S"` fallback) when neither source has one, so the console renders a
+/// bare name instead of asserting a type nobody recorded.
+fn console_index_key_summary(
+    schema: &TableSchema,
+    column_name: &str,
+    declared_type: Option<animus_control::ColumnType>,
+) -> console::IndexKeySummary {
     console::IndexKeySummary {
         name: column_name.to_string(),
         attribute_type: schema
             .column(column_name)
-            .map(|c| animus_dynamo::schema::attribute_type_for(c.ty).to_string()),
+            .map(|c| c.ty)
+            .or(declared_type)
+            .map(|ty| animus_dynamo::schema::attribute_type_for(ty).to_string()),
     }
 }
 
@@ -2353,11 +2363,15 @@ fn console_projection_summary(p: &animus_control::IndexProjection) -> console::P
 fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> console::GsiDetail {
     console::GsiDetail {
         name: idx.name.clone(),
-        hash_attribute: console_index_key_summary(schema, &idx.hash_attribute),
+        hash_attribute: console_index_key_summary(
+            schema,
+            &idx.hash_attribute,
+            idx.hash_attribute_type,
+        ),
         sort_attribute: idx
             .sort_attribute
             .as_deref()
-            .map(|a| console_index_key_summary(schema, a)),
+            .map(|a| console_index_key_summary(schema, a, idx.sort_attribute_type)),
         status: console_index_status_label(idx.status).to_string(),
         projection: console_projection_summary(&idx.projection),
     }
@@ -2409,7 +2423,11 @@ fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDe
             let sort_name = idx.sort_attribute.as_deref().unwrap_or_default();
             console::LsiDetail {
                 name: idx.name.clone(),
-                sort_attribute: console_index_key_summary(schema, sort_name),
+                sort_attribute: console_index_key_summary(
+                    schema,
+                    sort_name,
+                    idx.sort_attribute_type,
+                ),
             }
         })
         .collect();
@@ -2422,6 +2440,29 @@ fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDe
         stream: console_stream_summary(schema),
         ttl: console_ttl_summary(schema),
     })
+}
+
+/// Normalize and validate a console-supplied attribute type (issue #319's
+/// [`console::AddGsiRequest::hash_attribute_type`]/`sort_attribute_type`)
+/// into DynamoDB's own `AttributeType` (`S`/`N`/`B`) — case-insensitively,
+/// so `"n"`/`"N"` both work. `None`/empty input is not an error (the type is
+/// optional — see that field's own doc) and yields `Ok(None)`, meaning
+/// "send no `AttributeDefinitions` entry for this attribute." Anything else
+/// unrecognized is a `ValidationException`-shaped `400`, matching real
+/// DynamoDB's own rejection of an unknown `AttributeType`.
+fn console_validate_attribute_type(
+    raw: Option<&str>,
+) -> Result<Option<&'static str>, console::ConsoleError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) if s.eq_ignore_ascii_case("S") => Ok(Some("S")),
+        Some(s) if s.eq_ignore_ascii_case("N") => Ok(Some("N")),
+        Some(s) if s.eq_ignore_ascii_case("B") => Ok(Some("B")),
+        Some(other) => Err(console::ConsoleError::new(
+            400,
+            format!("unknown attribute type `{other}` (expected S, N, or B)"),
+        )),
+    }
 }
 
 /// Translate a `dynamo::execute_routed` failure (a DynamoDB wire error JSON
@@ -2708,25 +2749,44 @@ impl console::ConsoleBackend for ClientCtx {
         let mut key_schema = vec![serde_json::json!({
             "AttributeName": req.hash_attribute, "KeyType": "HASH",
         })];
-        if let Some(sort_attribute) = req
+        let sort_attribute = req
             .sort_attribute
             .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
+            .filter(|s| !s.trim().is_empty());
+        if let Some(sort_attribute) = sort_attribute {
             key_schema.push(serde_json::json!({
                 "AttributeName": sort_attribute, "KeyType": "RANGE",
             }));
         }
-        // Deliberately no `AttributeDefinitions`: this adapter's
-        // `GlobalSecondaryIndexUpdates` decoder never reads one (issue #319),
-        // so sending types here would look like it recorded them while the
-        // index read back untyped. See `console::AddGsiRequest`.
-        let body = serde_json::json!({
+        // Issue #319: an `AttributeDefinitions` entry for each attribute the
+        // request actually gave a type for — `UpdateTable`'s GSI-create
+        // decoder now reads it (`wire::decode_update_table`), so a type
+        // supplied here really does survive into the catalog. An omitted
+        // type (the common case, and every pre-#319 caller) sends no entry
+        // for that attribute, the identical untyped shape as before.
+        let mut attribute_definitions = Vec::new();
+        if let Some(ty) = console_validate_attribute_type(req.hash_attribute_type.as_deref())? {
+            attribute_definitions.push(serde_json::json!({
+                "AttributeName": req.hash_attribute, "AttributeType": ty,
+            }));
+        }
+        if let (Some(sort_attribute), Some(ty)) = (
+            sort_attribute,
+            console_validate_attribute_type(req.sort_attribute_type.as_deref())?,
+        ) {
+            attribute_definitions.push(serde_json::json!({
+                "AttributeName": sort_attribute, "AttributeType": ty,
+            }));
+        }
+        let mut body = serde_json::json!({
             "TableName": table,
             "GlobalSecondaryIndexUpdates": [
                 {"Create": {"IndexName": req.index_name, "KeySchema": key_schema}}
             ],
         });
+        if !attribute_definitions.is_empty() {
+            body["AttributeDefinitions"] = serde_json::Value::Array(attribute_definitions);
+        }
         let payload = serde_json::to_vec(&body).unwrap_or_default();
         let (status, resp_body) =
             crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
@@ -6322,8 +6382,8 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// (ADR 0020). `Arc` so cloning the ctx onto each connection is cheap.
     admin: Arc<AdminInfo>,
     /// Ring buffer of periodic `metrics_json()` snapshots, filled by
-    /// [`metrics_sample_loop`] — intended to back dashboard sparklines
-    /// (not yet rendered — see docs/roadmap.md U-01) via
+    /// [`metrics_sample_loop`] — backs the Overview tab's read-path
+    /// sparklines (docs/roadmap.md U-01, `dashboard_overview.js`) via
     /// `/admin/metrics/history`.
     /// A plain `std::sync::Mutex` is fine: every access is a quick lock/mutate/
     /// drop with no `.await` held across it.
@@ -6570,10 +6630,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
-    /// for the admin `/admin/metrics/history` view (ADR 0020), intended to
-    /// back dashboard sparklines (not yet rendered — see docs/roadmap.md
-    /// U-01). Cloned out from under the lock so the caller
-    /// never holds it across serialization.
+    /// for the admin `/admin/metrics/history` view (ADR 0020), backing the
+    /// Overview tab's read-path sparklines (docs/roadmap.md U-01). Cloned
+    /// out from under the lock so the caller never holds it across
+    /// serialization.
     pub(crate) fn metrics_history(&self) -> Vec<MetricsSample> {
         self.metrics_history
             .lock()
@@ -8281,8 +8341,8 @@ pub(crate) struct MetricsSample {
 
 /// Appends a [`MetricsSample`] to `ctx`'s ring buffer every
 /// [`METRICS_SAMPLE_INTERVAL`], capped at [`METRICS_HISTORY_CAP`] entries —
-/// intended to back dashboard sparklines (not yet rendered — see
-/// docs/roadmap.md U-01) via `/admin/metrics/history`.
+/// backs the Overview tab's read-path sparklines (docs/roadmap.md U-01) via
+/// `/admin/metrics/history`.
 /// Real wall-clock sleep/timestamp: `animusd` is outside the `Env` determinism
 /// boundary (ADR 0003 only binds sim-tested core crates), so this is exactly
 /// as legitimate as the other `tokio::time`-driven loops in this file.

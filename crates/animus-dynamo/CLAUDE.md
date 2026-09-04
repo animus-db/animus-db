@@ -31,6 +31,21 @@ comment for its full type/method inventory.
   replicated catalog (ADR 0013).
 - `schema` — the pure bridge between this crate's DynamoDB `TableSchema` and
   `animus_control`'s replicated `TableSchema`/`IndexDef`, both directions.
+  **`index_to_control` resolves an index's own `hash_attribute_type`/
+  `sort_attribute_type` (issue #319/W-05) from its `key_types` parameter**
+  — the same decoded `AttributeDefinitions` pairs `to_control` already
+  resolves the base table's key columns from — so a `CreateTable`/
+  `UpdateTable` caller that declares an index-only key attribute's type
+  gets it durably recorded on `IndexDef`, not just the base table's own
+  keys. `index_attribute_types(&[IndexDef]) -> Vec<(String, String)>` is
+  the reverse direction: the `(name, type)` pairs `animusd::dynamo::
+  describe_table`/`delete_table` `.extend()` onto their own base
+  `key_types` map before calling `wire::describe_table_response`/
+  `delete_table_response` — see that pair's own doc, and
+  `docs/engineering-lessons.md`'s "threading a per-attribute type through a
+  bridge" entry for why this is a name-keyed edge merge rather than a
+  field threaded through `SecondaryIndex`/`GlobalSecondaryIndex`/
+  `LocalSecondaryIndex` (registry.rs), which never needed to carry it.
 - `storage_key(pk, sk)` — the data-plane key for an item.
 - `index` (**ADR 0041 — the codec every layer of materialized secondary
   indexes is built on**: the write path, the GSI drain, and the native index
@@ -49,8 +64,28 @@ comment for its full type/method inventory.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/BatchGetItem/TransactWriteItems/TransactGetItems/UpdateTable/
-  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
-  plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
+  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive/
+  TagResource/UntagResource/ListTagsOfResource/DescribeLimits/
+  DescribeEndpoints, plus the response encoders). **Resource tagging
+  (roadmap W-06)**: `table_arn`/`parse_table_arn` are this adapter's own
+  table-ARN codec (`arn:aws:dynamodb:animus:0:table/<table>`, mirroring
+  `stream_arn`/`backup_arn`'s identical placeholder-region/account
+  convention with no further suffix) — `TagResource`/`UntagResource`/
+  `ListTagsOfResource`'s `ResourceArn` decodes through it, and it also now
+  backs `TableArn` in `table_description_object` (`CreateTable`/
+  `DescribeTable`/`UpdateTable`/`DeleteTable`'s shared response builder),
+  which didn't render one before this. A malformed or non-table `ResourceArn`
+  (e.g. a well-formed *stream* ARN) is a decode-time `ValidationException`
+  here; a well-formed table ARN naming a table that doesn't exist is
+  `animusd`'s call (`ResourceNotFoundException`, since only it holds the
+  replicated catalog). `TableSchema::tags: BTreeMap<String, String>`
+  (`animus-control`) is wire metadata only — nothing here or in
+  `animus-control` interprets a tag's key or value. `DescribeLimits`/
+  `DescribeEndpoints` decode to unit-like variants (no request fields, table()
+  → `None`) — `DescribeLimits`' response is four honest static constants
+  (this adapter has no capacity-billing meter at all); `DescribeEndpoints`'
+  is built by `animusd` from its own bound DynamoDB listen address, since
+  this crate has no node identity to report. `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
   `decode_predicate`/`decode_select` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`/`Select`
   contract, so fixing one fixes both; do not fork them.
   One gotcha: `GetItem`/`Query`/
@@ -237,15 +272,32 @@ comment for its full type/method inventory.
   base64url** pair (`base64url_encode`/`base64url_decode`, strict/canonical
   decode) — the display encoding for `animusd`'s admin/dashboard surfaces, not
   used by the DynamoDB wire itself.
-- **Projection** supports **dotted document paths**: `ProjectionExpression` is a
-  comma-separated list of paths `a.b.c` (with `#alias` placeholders per segment via
-  `ExpressionAttributeNames`), or the legacy `AttributesToGet` array (top-level
-  names). `Projection::apply` reconstructs the nested map structure a path reaches
-  (`a.b` ⇒ `{a:{b:..}}`). A list-index path (`a[0]`, any `[`) is still rejected.
-  Projection is applied at the edge (`animusd`) after the read; for `Scan` the
-  `FilterExpression` sees the whole item *before* projection trims it. An index
-  `Query` with no explicit projection falls back to the index's declared
-  `IndexProjection`.
+- **Projection** supports **dotted document paths and list-index segments**
+  (W-02): `ProjectionExpression` is a comma-separated list of paths `a.b.c`/
+  `a[0]`/`a[0].b`/`matrix[1][2]` (with `#alias` placeholders per `.`-separated
+  segment, resolved via `ExpressionAttributeNames` — the index suffix rides
+  straight through an alias unchanged), or the legacy `AttributesToGet` array
+  (top-level names only, no `.`/`[` — unchanged). Each path decodes to
+  `Vec<PathSegment>` (`Field(String)`/`Index(usize)`, `wire::parse_projection_path`),
+  not a plain string, so `Projection::apply` never re-parses at apply time.
+  `Projection::apply` reconstructs the nested structure a path reaches: a
+  `Field` chain rebuilds nested `M`s (`a.b` ⇒ `{a:{b:..}}`); an `Index`
+  reconstructs the parent `L` **compacted** to just the selected elements, in
+  ascending index order — DynamoDB's own documented contract ("project `a[1]`
+  and `a[3]`" yields a two-element list, not a sparse one). Implemented via an
+  intermediate `Proj` accumulator tree (`Empty`/`Whole`/`Map`/`List`, the
+  `List` variant keeping a sorted `BTreeMap<usize, Proj>` until a final
+  `finalize` pass compacts it) rather than mutating `Item`/`AttributeValue`
+  directly — needed because a list projection must merge overlapping/nested
+  index selections (`a[1]` and `a[1].b`) before it knows how many elements the
+  final compacted list has. An out-of-range index, or an index applied to a
+  non-`L` value, yields nothing for that path, exactly like a `Field` into a
+  non-`M`/absent key. Malformed index syntax (`a[`, `a[x]`, `a[-1]`, unbalanced
+  brackets) is a decode-time `ValidationException` (`parse_index_chain`) — the
+  digits-only check is what rejects a negative index. Projection is applied at
+  the edge (`animusd`) after the read; for `Scan` the `FilterExpression` sees
+  the whole item *before* projection trims it. An index `Query` with no
+  explicit projection falls back to the index's declared `IndexProjection`.
 - **`ReturnValues`** supports `NONE` (default) and `ALL_OLD` on Put/Delete; the
   edge reads the prior item once (reusing it for any `ConditionExpression` check,
   so there is no double read) and `write_response` echoes it under `Attributes`.
@@ -345,8 +397,7 @@ comment for its full type/method inventory.
   so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
   reached by the raw client protocol's plain writes, not ordinary
   `TransactWriteItems` contention).
-- **Still deferred** (don't represent as a full adapter): list-index document
-  paths (`a[0]`). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
+- `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
   arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
   in `wire.rs`) — see the `wire` entry point above and this crate's own unit
   tests. **`Query` now paginates exactly like `Scan`**

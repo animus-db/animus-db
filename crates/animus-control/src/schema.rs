@@ -259,6 +259,27 @@ pub struct IndexDef {
     /// `MetaCommand::SetIndexStatus` (so it replicates); see [`IndexStatus`].
     #[serde(default = "IndexStatus::active")]
     pub status: IndexStatus,
+    /// The DynamoDB `AttributeType` (`S`/`N`/`B`) [`hash_attribute`](Self::hash_attribute)
+    /// was declared with in `AttributeDefinitions` (issue #319). `CreateTable`/
+    /// `UpdateTable`'s `AttributeDefinitions` array covers every key attribute
+    /// in the table, base **and** index alike, but before this field nothing
+    /// recorded an index-only attribute's own declared type — `DescribeTable`'s
+    /// `AttributeDefinitions` had to default every one of them to `S`
+    /// regardless of what the client actually declared. `None` when the
+    /// caller's `AttributeDefinitions` didn't cover this attribute, or for an
+    /// index definition minted before this field existed
+    /// (`#[serde(default)]` — an implementation convenience per root
+    /// `CLAUDE.md`'s no-back-compat stance, not a migration guarantee); either
+    /// way the response falls back to the same `S` placeholder as before.
+    #[serde(default)]
+    pub hash_attribute_type: Option<ColumnType>,
+    /// The declared type of [`sort_attribute`](Self::sort_attribute), when the
+    /// index has one — `None` whenever `sort_attribute` is `None`, and also
+    /// (like [`hash_attribute_type`](Self::hash_attribute_type)) when the
+    /// caller's `AttributeDefinitions` didn't cover it or the definition
+    /// predates this field.
+    #[serde(default)]
+    pub sort_attribute_type: Option<ColumnType>,
 }
 
 /// One column's declared name and type. The name is stored as written
@@ -335,6 +356,21 @@ pub struct TableSchema {
     /// through `MetaCommand::UpdateContinuousBackups` (so it replicates).
     #[serde(default)]
     pub pitr: Option<PitrSpec>,
+    /// This table's **resource tags** (`TagResource`/`UntagResource`/
+    /// `ListTagsOfResource`, DynamoDB's own generic key-value tagging), if
+    /// any. Empty (never `None`) for a table with no tags — unlike
+    /// `stream`/`ttl`/`pitr`, a tag set has no notion of "disabled" to
+    /// distinguish from "empty," so a plain `BTreeMap` is the natural
+    /// representation. `#[serde(default)]` for the same additive-field
+    /// reason as `indexes`/`stream`/`ttl`/`pitr`. **Wire metadata only**:
+    /// nothing in this crate or `animus-dynamo` interprets a tag's key or
+    /// value — they are recorded verbatim and echoed back by
+    /// `ListTagsOfResource`, never consumed by placement, billing, or any
+    /// other mechanism. Mutated only through `MetaCommand::{TagResource,
+    /// UntagResource}` (so they replicate); a tag key is unique within a
+    /// table (`TagResource` overwrites an existing key's value).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -372,6 +408,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -397,6 +434,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -418,6 +456,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -704,6 +743,8 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         }
     }
 
@@ -788,6 +829,8 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         }];
         assert_eq!(s.validate(), Err(SchemaError::LocalIndexMissingSort));
     }
@@ -803,6 +846,8 @@ mod tests {
             sort_attribute: Some("ts".into()),
             projection: IndexProjection::KeysOnly,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         });
         assert!(s.validate().is_ok());
     }

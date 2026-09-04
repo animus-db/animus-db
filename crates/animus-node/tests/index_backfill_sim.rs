@@ -100,6 +100,8 @@ fn zero_tablets_never_flip_under_sim() {
                 sort_attribute: None,
                 projection: IndexProjection::All,
                 status: IndexStatus::Creating,
+                hash_attribute_type: None,
+                sort_attribute_type: None,
             },
         }),
         animus_control::raft::ProposeResult::Accepted { .. }
@@ -145,6 +147,8 @@ fn run(seed: u64) {
                 sort_attribute: None,
                 projection: IndexProjection::All,
                 status: IndexStatus::Creating,
+                hash_attribute_type: None,
+                sort_attribute_type: None,
             },
         }),
         animus_control::raft::ProposeResult::Accepted { .. }

@@ -243,11 +243,12 @@
   // LSIs are create-time-only), any GSIs (name, hash [+ sort] attribute,
   // projection), a stream, and TTL. Every attribute *name* stays free text
   // (the console's standing rule); every index key attribute stays
-  // name-only, no type control — tracing `CreateTable`'s own decoder found
-  // it never records one, not even here (`console.rs::CreateTableRequest`'s
-  // doc has the full trace) — so offering one would be a control whose
-  // value cannot survive its own round trip, the same defect issue #319
-  // already found on the Config tab's Add-GSI form.
+  // name-only, no type control — a deliberate scope cut for *this form*,
+  // not a mechanism gap: `CreateTable` genuinely records a real type for an
+  // index key attribute now (issue #319, closed), this form just doesn't
+  // collect one (see `console.rs::CreateTableRequest`'s own doc). The
+  // Config tab's Add-GSI form below (`saveGsi`) *does* offer one, since
+  // that path's own gap is what #319 was filed for.
   //
   // The sort-key toggle defaults **on** (not off): an earlier draft of this
   // form gated the LSI section on the sort key being present — correct,
@@ -543,6 +544,9 @@
 
   const TABLE_API_PREFIX = "/console/api/tables/";
   const STREAM_VIEW_TYPES = ["NEW_AND_OLD_IMAGES", "NEW_IMAGE", "OLD_IMAGE", "KEYS_ONLY"];
+  // DynamoDB's own `AttributeType` — a genuinely closed set (issue #319:
+  // the Add-GSI form's type picker below).
+  const ATTRIBUTE_TYPES = ["S", "N", "B"];
 
   function tableApiPath(name, tail) {
     return TABLE_API_PREFIX + encodeURIComponent(name) + (tail ? `/${tail}` : "");
@@ -562,10 +566,9 @@
   }
 
   // A segmented control for one of DynamoDB's genuinely closed sets (the
-  // stream view type) — never for a free-text attribute name (see the module
-  // doc / `console.rs`'s own doc on why a picker would misrepresent the data
-  // model there), and never for an attribute *type* on the Add-GSI form,
-  // whose value this adapter cannot persist (issue #319).
+  // stream view type, an attribute type) — never for a free-text attribute
+  // name (see the module doc / `console.rs`'s own doc on why a picker would
+  // misrepresent the data model there).
   function segmented(field, options, selected) {
     return `<div class="segmented" data-field="${esc(field)}">${options
       .map(
@@ -858,9 +861,11 @@
           <label class="field">Hash attribute
             <input type="text" class="attr-input" id="gsi-hash-attr" placeholder="attribute name" autocomplete="off">
           </label>
+          <div class="field">Hash attribute type (optional)${segmented("gsi-hash-attr-type", ATTRIBUTE_TYPES, null)}</div>
           <label class="field">Sort attribute (optional)
             <input type="text" class="attr-input" id="gsi-sort-attr" placeholder="attribute name" autocomplete="off">
           </label>
+          <div class="field">Sort attribute type (optional)${segmented("gsi-sort-attr-type", ATTRIBUTE_TYPES, null)}</div>
           <div class="edit-actions">
             <button type="button" class="btn-save" id="gsi-save">Add index</button>
             <button type="button" class="btn-cancel" id="gsi-cancel">Cancel</button>
@@ -908,11 +913,19 @@
       errEl.classList.remove("hidden");
       return;
     }
-    // Names only — a GSI's key attribute carries no durable type on this
-    // adapter's `UpdateTable` path (issue #319), so the form asks for none.
+    // Issue #319: the type pickers are optional — an unselected one sends no
+    // type, and the index reads back untyped exactly as it always did.
     const req = { index_name: indexName, hash_attribute: hashAttribute };
+    const hashAttributeType = segmentedValue(scope, "gsi-hash-attr-type");
+    if (hashAttributeType) {
+      req.hash_attribute_type = hashAttributeType;
+    }
     if (sortAttribute) {
       req.sort_attribute = sortAttribute;
+      const sortAttributeType = segmentedValue(scope, "gsi-sort-attr-type");
+      if (sortAttributeType) {
+        req.sort_attribute_type = sortAttributeType;
+      }
     }
     const saveBtn = scope.querySelector("#gsi-save");
     saveBtn.disabled = true;

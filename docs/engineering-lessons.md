@@ -3977,6 +3977,38 @@ debugging anything that feels like it might have happened before.
   that entry above); removing the retry is what made the bug visible
   instead of invisible-but-still-there.
 
+- **A process-boundary crate's own real-`tokio::time::sleep` bounded-retry
+  loop (the kind ADR 0061 Decision 4 explicitly allows outside the `Env`
+  seam — `animus-operator`'s scale-down drain poll, `animus-cli`'s
+  process-boundary loops) still needs its bound proven by a test, and
+  `#[tokio::test(start_paused = true)]` proves it without ten minutes of
+  real wall-clock wait or touching the production code at all** —
+  `tokio`'s virtual clock auto-advances to the next pending timer whenever
+  nothing else is runnable, so a 120-iteration × 5s poll loop that never
+  satisfies its completion condition resolves near-instantly, and the test
+  still exercises the *real* `tokio::time::sleep` call the lint-allowed
+  code actually makes (ADR 0061 rung E1, `animus-operator`'s
+  `drain_and_remove_node_is_bounded_when_drain_never_completes`). This is
+  the outside-the-`Env`-seam analogue of the `SimEnv`
+  converged-or-timeout-poll rule earlier in this section: don't assert a
+  bound by reading the source and trusting it, prove it by making the
+  never-succeeds case happen and checking the loop actually stops.
+- **When a seam trait is driven by a multi-threaded async runtime
+  (`kube::runtime::Controller::run`, here), prefer `#[async_trait]` over
+  hand-written RPITIT** (`-> impl Future<Output = ...> + Send`) **for a new
+  test-fakeable seam, even though the trait is only ever used generically
+  and never as `dyn`** — RPITIT's implicit-capture rules and the fact that
+  `async fn` sugar in a trait does not itself require the resulting future
+  to be `Send` make it easy to write a seam that compiles standalone but
+  fails only when a caller needs `Send` (a multi-threaded reconciler, a
+  `tokio::spawn`ed task), several call sites away from the trait
+  definition. `async_trait` boxes the future and is already the
+  established pattern for every other seam trait in this workspace
+  (`animus-env`'s `Env`/`StorageEngine`, ADR 0061 rung E1's
+  `ClusterApi`/`AdminOps`) — matching it costs one small dependency and one
+  boxed allocation per call, never on a hot path for a controller
+  reconcile loop.
+
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
   formatting into a caller's own error type is not the same guarantee as
@@ -15677,3 +15709,109 @@ timing-dependent by construction, and this repo's own stated policy (see
 flaky. Correctness here rests on the change being a direct, minimal mirror
 of #572's already-reviewed fix to the identical predicate on a materially
 identical race, not on a new test proving it.
+
+## A commit-wait convergence check on a mergeable/settable field must test membership, not whole-value equality (roadmap W-06, `TagResource`/`UntagResource`)
+
+`SetTableTtl`/`SetTableStream`/`UpdateContinuousBackups`'s commit-wait loops
+(propose → poll `metadata_fresh()` → compare against the value just
+proposed → retry-or-succeed) all get away with a whole-value equality check
+(`meta.table_ttl(table) == spec.as_ref()`) because each of those fields is a
+**replace**: the whole `Option<Spec>` is what the command sets, so "did my
+value land" and "does the field now equal what I proposed" are the same
+question.
+
+A tag set is different: `TagResource`/`UntagResource` **merge** into
+`TableSchema::tags` (insert/remove specific keys), so two independent
+callers tagging the *same table* with *different keys* are both legitimate
+and don't conflict. A commit-wait loop that captured "the whole map I
+expect after my write" up front and compared for exact equality would spin
+past its deadline the moment a concurrent, unrelated tag mutation landed in
+between — the field is real and correct, just not byte-identical to the
+snapshot taken before proposing. The fix: check only that **the keys this
+call cares about** now hold the wanted values (`tags.iter().all(|(k, v)|
+current.get(k) == Some(v))` for `TagResource`, `tag_keys.iter().all(|k|
+!current.contains_key(k))` for `UntagResource`) — the same "did *my* effect
+take hold" question the whole-equality checks answer for a replace-shaped
+field, expressed correctly for a merge-shaped one. Generalizes to any future
+replicated command that merges into a collection rather than replacing a
+scalar/struct field: reach for the SetTableTtl precedent's exact-equality
+convergence check only when the command truly replaces the field wholesale.
+
+## A test that asserts "a stale value is not carried forward" via a bare substring search can be defeated by your own commit-message-shaped comment (roadmap U-01, 2026-09-04)
+
+Extending `dashboard_storage.js`'s `SYSTEM_TABLE_KINDS` dropdown to all 16
+real `EntityKind` variants (`animus-control::syskv`) also meant dropping a
+stray `["keyspace", "keyspace"]` entry that had never matched any real
+`EntityKind::from_segment` segment (selecting it always returned zero
+rows — a latent, harmless-but-confusing pre-existing bug, fixed in the same
+change since it's literally the same list this bullet touches, not a
+separate drive-by). The regression test asserted the fix the obvious way:
+`!storage_js.contains("\"keyspace\"")`. It failed — not because the entry
+survived, but because the doc comment directly above the array, explaining
+*why* `"keyspace"` was dropped, contains the literal substring `"keyspace"`
+too. A plain `.contains()`/`!.contains()` check against a whole served JS
+file (or any other whole-text asset) can't distinguish "the thing exists as
+data" from "the thing is merely *mentioned*", and a comment describing a
+removal is exactly the shape of text likely to reintroduce the very string
+the assertion is checking the absence of. The fix: narrow the checked
+substring to the actual syntactic shape being asserted against
+(`["keyspace",` — the array-literal-entry shape, not the bare word), which
+a normal-prose comment is very unlikely to accidentally reproduce. General
+form: an absence assertion over unstructured text should search for the
+narrowest fragment that could only appear in the construct being tested
+for, not the shortest string that seems to identify it — the same
+"structure, not substring" caution `docs/engineering-lessons.md` already
+applies to log/metric assertions applies here too.
+
+## Threading a per-attribute type through a bridge doesn't require widening every plain-data struct along the way — a side-channel merge at the edge can be enough (issue #319, W-05)
+
+`IndexDef`'s new `hash_attribute_type`/`sort_attribute_type` (ADR 0013's
+catalog) needed to reach `DescribeTable`'s `AttributeDefinitions` response
+without inventing a genuine per-index type anywhere it didn't already
+belong. The tempting shape — mirror the new fields onto `animus-dynamo`'s
+own local `GlobalSecondaryIndex`/`LocalSecondaryIndex` (`registry.rs`), the
+type every layer between the wire decoder and the response builder already
+passes around — would have meant updating every one of that struct's ~27
+existing construction sites across `wire.rs`'s decoders, `animusd::dynamo`,
+`console.rs`, and every test file building one by hand, on top of the 24
+sites `IndexDef` itself already needed (root `CLAUDE.md`'s own "a future
+8th port" entry already names this exact E0063 fan-out pattern as
+expected/compiler-enumerated, but expected doesn't mean warranted here).
+
+Tracing the actual data flow found the type never needs to ride
+`SecondaryIndex` at all: `DescribeTable`'s response builder
+(`wire::attribute_definitions`) already takes a flat `key_types:
+&[(String, String)]` name→type map and a *separate* `indexes: &[SecondaryIndex]`
+for the name coverage — it was already designed to resolve type by **name
+lookup**, not by reading a type off the index struct itself. So the fix is
+a pure edge-side merge: `animus_dynamo::schema::index_attribute_types(&[IndexDef])
+-> Vec<(String, String)>` extracts `(name, type)` pairs straight from the
+catalog's own `IndexDef`s (which DO now carry the real type), and
+`animusd::dynamo::describe_table`/`delete_table` `.extend()` it onto the
+base table's own `key_types` before calling the unchanged response builder.
+Zero changes to `SecondaryIndex`/`GlobalSecondaryIndex`/`LocalSecondaryIndex`
+or their ~27 sites; only `IndexDef`'s own 24 sites (the catalog type that
+actually needed to durably carry the value) were touched. The general
+form: before widening a struct that's constructed in dozens of places to
+carry a new value, check whether the value's only consumer already
+resolves by a decoupled key (a name, an id) rather than by reading the
+struct's own field — if so, a merge at the one edge that has both sources
+in hand is strictly less invasive than threading the field through
+everything in between, and produces the identical observable behavior.
+
+A related, deliberately-not-done change from the same investigation: the
+roadmap item's own wording asked to check whether `CreateTable`/`UpdateTable`
+already rejects an index key attribute missing from `AttributeDefinitions`
+(real DynamoDB does) and add it if not. It doesn't — and grepping
+`crates/animusd/tests/*.rs` for `GlobalSecondaryIndexes`/`AttributeDefinitions`
+co-occurrence found the *base table's own* key attributes go undeclared in
+`AttributeDefinitions` in the large majority of this repo's own CreateTable
+fixtures too (e.g. `dynamo_indexes.rs::gsi_write_then_query` declares
+neither `id` nor `email`), not just index-only ones — this adapter has
+always treated `AttributeDefinitions` as fully optional, a wider and older
+design choice than #319's own scope. Adding the strict AWS rejection would
+therefore have broken dozens of pre-existing tests across files this task's
+own validation gate never reaches, for a behavior change far larger than
+the "M"-sized item described. Left unenforced, documented here and in the
+session report, rather than either silently expanding the diff's blast
+radius or silently skipping the question asked.

@@ -860,7 +860,21 @@ reusing the captured config is the point of the test.
   `console.rs`** (below) despite the naming overlap — this is the
   **operator** surface (cluster health/placement/Raft/storage) on the
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
-  deliberately addressed" for the full disambiguation.
+  deliberately addressed" for the full disambiguation. **docs/roadmap.md
+  U-01 (render-only, no backend change)** added a Transactions tab
+  (`dashboard_txns.js`, read-only `/admin/txns`, gated like Tablets in
+  `ROLE_TABS`), full per-replica Raft detail (commit/durable/snapshot
+  index/log length, plus the group's live voters/learners) in the Tablets
+  tab's `renderTabletDetail`, a `believes_alive` badge (the control leader's
+  own real-time failure-detector verdict, ADR 0012) next to each data member
+  row in Overview, and a dependency-free inline-SVG `sparkline()` shared
+  component in `dashboard_core.js`, charting the six CP read-path counters
+  (`cp_read_barriers_served`/`_timed_out`,
+  `cp_eventual_reads_local`/`_forwarded`/`_fell_back`,
+  `cp_uncertainty_restarts`) from `/admin/metrics/history` on a new Overview
+  card; and `dashboard_storage.js`'s `SYSTEM_TABLE_KINDS` extended to all 16
+  `EntityKind` variants (`animus-control::syskv`), dropping a stray
+  `"keyspace"` entry that never matched any real `EntityKind` segment.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
@@ -915,7 +929,18 @@ reusing the captured config is the point of the test.
   `add_gsi`/`drop_gsi`/`set_stream`/`set_ttl` build the same JSON body a
   real DynamoDB client would and call `crate::dynamo::execute_routed` (the
   identical function the real edge and `POST /admin/data/dynamo` already
-  call) rather than re-deriving `MetaCommand` proposals directly, while
+  call) rather than re-deriving `MetaCommand` proposals directly — **since
+  issue #319/W-05, `add_gsi` also builds an `AttributeDefinitions` entry
+  for each of `AddGsiRequest`'s new optional `hash_attribute_type`/
+  `sort_attribute_type` fields** (validated case-insensitively against
+  `S`/`N`/`B` by `console_validate_attribute_type`, a `400` on anything
+  else) so a type the console form's picker declares survives into the
+  replicated catalog exactly like a real DynamoDB `UpdateTable` call's own
+  `AttributeDefinitions` would — `console.js`'s Add-GSI form (`saveGsi`)
+  is the only console screen with this control; the create-table form's
+  `CreateGsiRequest`/`CreateLsiRequest` remain deliberately type-less (a
+  console-form scope cut, not a mechanism gap — see `console.rs`'s own
+  `CreateTableRequest` doc), while
   `delete_table` — not a DynamoDB wire operation at all — calls the same
   `ClientCtx::drop_table` `admin.rs::action_drop_table` does. A GSI and an
   LSI render from two distinct types/templates (`GsiDetail`/`gsiRowHtml` vs.
@@ -2347,6 +2372,27 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ttl_expired: bool`). `MetaCommand::SetTableTtl` is on the
   `is_relayable_command` allowlist beside `SetTableStream` — regression:
   `tests/schema_ddl_relay.rs`.
+
+  **Resource tagging (roadmap W-06).** `TagResource`/`UntagResource`/
+  `ListTagsOfResource` ride the same replicated-catalog shape (`dynamo::
+  tag_resource`/`untag_resource` commit-wait `MetaCommand::TagResource`/
+  `UntagResource` exactly like `update_time_to_live`; `list_tags_of_resource`
+  is a pure `meta.table_tags(table)` read). **Gotcha, not obvious from the
+  TTL precedent above**: the commit-wait convergence check is **per-key
+  membership**, not whole-map equality — `TagResource`/`UntagResource`
+  *merge* into `TableSchema::tags` rather than replacing it wholesale (unlike
+  `TtlSpec`, which `update_time_to_live` can safely compare for exact
+  equality since the whole `Option<Spec>` is what the command sets), so a
+  whole-map equality check would spin past `SCHEMA_COMMIT_TIMEOUT` the
+  moment a concurrent, unrelated tag mutation on the same table landed in
+  between polls. See `docs/engineering-lessons.md`'s entry on this for the
+  general form. `MetaCommand::TagResource`/`UntagResource` are on the
+  `is_relayable_command` allowlist beside `SetTableTtl` — regression:
+  `tests/dynamo_tags.rs`. `DescribeLimits`/`DescribeEndpoints` need no
+  catalog at all: `dynamo::describe_limits` is a static read (four named
+  constants); `dynamo::describe_endpoints` reads `ctx.admin.dynamo_addr` —
+  the same field `admin.rs::config_view`'s `addrs.dynamo` already reports —
+  for this node's own bound DynamoDB listen address.
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node

@@ -393,11 +393,12 @@ async fn dashboard_role_gating_split_deployment() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
             ),
             "the control role's own tab list now includes Streams too (a control-only \
              node holds the full replicated Metadata, so the stream list + shard-chain \
-             detail render truthfully there; only the live-tail poller degrades): {core_js}"
+             detail render truthfully there; only the live-tail poller degrades), and \
+             now Transactions too (docs/roadmap.md U-01, gated like tablets): {core_js}"
         );
 
         // ---- /admin/config's role differs across the split -----------------
@@ -697,6 +698,181 @@ async fn control_node_streams_read_path_is_ground_truth() {
         for node in control_nodes.iter().chain(data_nodes.iter()) {
             node.shutdown_graceful().await;
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-01 (render-only dashboard fixes, no backend change) —
+/// one assertion group per bullet, all against the served static assets
+/// (this is a render-only change: the JSON they consume is already covered
+/// by `admin_endpoint.rs`). A single-node cluster is enough for every one of
+/// these; nothing here needs a multi-node fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u01_render_only_fixes() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- 1. Transactions tab over /admin/txns (CpTxnView) --------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"data-tab="txns""#) && shell.contains(r#"<section id="txns""#),
+            "the shell carries the Transactions nav link and section: {shell}"
+        );
+        assert!(
+            shell.contains("dashboard_txns.js"),
+            "the shell references the Transactions view's script asset: {shell}"
+        );
+        let (s, _, txns_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_txns.js").await;
+        assert_eq!(s, 200, "dashboard_txns.js is served");
+        assert!(
+            txns_js.contains("function renderTxns") && txns_js.contains("txnViewsByTablet"),
+            "dashboard_txns.js renders the per-hosted-tablet transaction-tracker view: {txns_js}"
+        );
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/txns") && core_js.contains("function txnViewsByTablet"),
+            "dashboard_core.js fans out /admin/txns and merges it cluster-wide: {core_js}"
+        );
+        assert!(
+            core_js.contains(
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+            ) && core_js.contains(
+                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"]"#
+            ),
+            "the Transactions tab is role-gated exactly like Tablets (ROLE_TABS): {core_js}"
+        );
+        let (s, _, txns_body) = raw(admin_addr, "GET", "/admin/txns").await;
+        assert_eq!(s, 200, "GET /admin/txns: {txns_body}");
+        let txns_json: Value = serde_json::from_str(&txns_body).expect("/admin/txns is JSON");
+        assert!(
+            txns_json.get("groups").is_some(),
+            "the CpTxnView list is under \"groups\", the same shape dashboard_txns.js reads: {txns_body}"
+        );
+
+        // ---- 2. Full per-group Raft detail in renderTabletDetail -----------
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        for field in [
+            "commit_index",
+            "durable_index",
+            "snapshot_index",
+            "log_len",
+            "g.voters",
+            "g.learners",
+        ] {
+            assert!(
+                tablets_js.contains(field),
+                "renderTabletDetail renders CpRaftView's own {field}: {tablets_js}"
+            );
+        }
+
+        // ---- 3. believes_alive badge in renderOverview ----------------------
+        let (s, _, overview_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_overview.js").await;
+        assert_eq!(s, 200, "dashboard_overview.js is served");
+        assert!(
+            overview_js.contains("believes_alive") && overview_js.contains("believesAlive"),
+            "renderOverview surfaces the control leader's own believes_alive verdict per member: {overview_js}"
+        );
+
+        // ---- 4. Sparklines from /admin/metrics/history as a shared component,
+        //         charting the six CP read-path counters on Overview --------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("function sparkline"),
+            "dashboard_core.js defines a shared sparkline() component: {core_js}"
+        );
+        assert!(
+            core_js.contains("/admin/metrics/history"),
+            "dashboard_core.js fetches this node's own metrics-history ring: {core_js}"
+        );
+        assert!(
+            overview_js.contains("sparkline("),
+            "renderOverview renders sparklines: {overview_js}"
+        );
+        for counter in [
+            "cp_read_barriers_served",
+            "cp_read_barriers_timed_out",
+            "cp_eventual_reads_local",
+            "cp_eventual_reads_forwarded",
+            "cp_eventual_reads_fell_back",
+            "cp_uncertainty_restarts",
+        ] {
+            assert!(
+                overview_js.contains(counter),
+                "the Overview read-path sparklines chart {counter}: {overview_js}"
+            );
+        }
+        // The route itself already serves real samples the sparklines can
+        // read (`admin_endpoint.rs` covers `/admin/metrics/history`'s own
+        // shape more thoroughly; this just proves the render-only wiring
+        // reaches a real 200).
+        let (s, _, history_body) = raw(admin_addr, "GET", "/admin/metrics/history").await;
+        assert_eq!(s, 200, "GET /admin/metrics/history: {history_body}");
+        assert!(
+            serde_json::from_str::<Value>(&history_body)
+                .expect("metrics history is JSON")
+                .get("samples")
+                .is_some(),
+            "the ring buffer is served under \"samples\": {history_body}"
+        );
+
+        // ---- 5. SYSTEM_TABLE_KINDS extended to all 16 EntityKind variants --
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        // Pin the expected 16 segment strings by constructing every real
+        // `EntityKind` variant and reading its own `as_str()` — this crate
+        // has no `EntityKind::ALL`/iterator to derive the list from
+        // (`syskv.rs`), so a future 17th variant needs both this array and
+        // `SYSTEM_TABLE_KINDS` updated by hand; this at least proves the 16
+        // that exist today are exactly the 16 the dropdown lists, spelled
+        // exactly the way `EntityKind::from_segment` expects them back.
+        use animus_control::syskv::EntityKind;
+        let expected_kinds: [&str; 16] = [
+            EntityKind::Tablet.as_str(),
+            EntityKind::Member.as_str(),
+            EntityKind::Schema.as_str(),
+            EntityKind::Policy.as_str(),
+            EntityKind::NodeAddrs.as_str(),
+            EntityKind::Counter.as_str(),
+            EntityKind::CpMemberAddr.as_str(),
+            EntityKind::StreamShard.as_str(),
+            EntityKind::IndexBackfill.as_str(),
+            EntityKind::SplitLineage.as_str(),
+            EntityKind::SplitPlacing.as_str(),
+            EntityKind::Backup.as_str(),
+            EntityKind::BackupProgress.as_str(),
+            EntityKind::Restore.as_str(),
+            EntityKind::PitrSegment.as_str(),
+            EntityKind::PitrBaseBackup.as_str(),
+        ];
+        for kind in expected_kinds {
+            assert!(
+                storage_js.contains(&format!("[\"{kind}\",")),
+                "SYSTEM_TABLE_KINDS lists the real EntityKind segment {kind:?}: {storage_js}"
+            );
+            // `EntityKind::from_segment` recognizes every one of these, so a
+            // round trip through it is a live cross-check that the pinned
+            // literal actually decodes back to the variant it came from —
+            // not just a string that happens to match.
+            assert!(
+                EntityKind::from_segment(kind.as_bytes()).is_some(),
+                "{kind:?} round-trips through EntityKind::from_segment"
+            );
+        }
+        assert!(
+            !storage_js.contains("[\"keyspace\","),
+            "the stray [\"keyspace\", ...] dropdown entry (never a real EntityKind \
+             segment, always returned zero rows) is dropped, not carried forward: {storage_js}"
+        );
+
+        nodes[0].shutdown_graceful().await;
     })
     .await
     .expect("test timed out");

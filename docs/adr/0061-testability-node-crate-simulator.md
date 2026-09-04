@@ -743,6 +743,91 @@ covered then.
 | E1 | `animus-operator`: a fake-kube-client harness and tests for `controller.rs` — `reconcile`, `apply_children`, `control_nodes_changed`, and the ADR 0032-driven `drain_and_remove_node` scale-down sequencing, which is precisely the stateful, ordering-sensitive logic this codebase otherwise insists gets a fault-injected test |
 | E2 | `animus-cli`: argument/dispatch coverage for its 741 currently-untested lines |
 
+#### 2026-09-04 amendment — E1 landed: a `ClusterApi`/`AdminOps` seam, not `kube`'s own mock service
+
+E1 is done. `controller.rs`'s two live-cluster boundaries — the `kube::Api`
+calls (`ConfigMap`/`Service`/`NetworkPolicy`/`StatefulSet` apply/get,
+`AnimusCluster` status patch) and the admin-port HTTP calls
+(`AdminClient`'s drain/status/remove) — are now two small `#[async_trait]`
+traits, `cluster_api::ClusterApi` and `admin_client::AdminOps`, each with
+exactly the handful of operations `controller.rs` actually performs.
+`RealClusterApi`/`AdminClient` are the production implementors (unchanged
+behavior — `RealClusterApi` issues the identical `kube::Api` calls
+`controller.rs` used to make inline); `fakes::FakeClusterApi`/
+`FakeAdminClient` (`#[cfg(test)]` only) are small in-memory record-and-serve
+stores. `Context`, `reconcile`, `apply_children`, `control_nodes_changed`,
+`drain_and_remove_node`, and `error_policy` are all generic over `C:
+ClusterApi, A: AdminOps` now, monomorphized at `run()`'s call site to the
+real implementors and at each test's call site to the fakes — the same
+`E: Env`-style generic-over-a-trait shape the rest of the workspace uses,
+just with two small leaf traits instead of one big seam, since this crate
+has no `Env` and never will (its own `CLAUDE.md`'s "No `Env` seam here"
+gotcha).
+
+**Trade-off actually taken: a hand-written trait, not `kube`'s own
+`tower_test`-backed mock `Client`.** The brief for this rung offered both;
+a hand-written trait was chosen for three reasons found while scoping, not
+assumed going in:
+
+1. `controller.rs` has **two** live-cluster boundaries, not one — the
+   `kube::Api` calls and a hand-rolled `hyper` client to a pod's admin port
+   (`admin_client.rs`, deliberately not built on `kube::Client` — see that
+   module's own doc for why). A `tower_test` mock `Client` would only ever
+   cover the first; the admin-port drain sequence still needs *some* seam,
+   so the "avoid a trait" saving is partial at best. Having decided E1
+   needs a trait for the drain sequence regardless, giving `ClusterApi` the
+   same shape rather than a `kube`-specific mock keeps both boundaries
+   uniform and both fakes equally cheap to read.
+2. `kube`'s mock service intercepts at the HTTP-request level — a test
+   would have to match on real Kubernetes REST paths/verbs/content-types
+   (`PATCH .../configmaps/{name}?fieldManager=...` with
+   `application/apply-patch+yaml`, `PATCH .../status` as a JSON merge
+   patch, `GET` with 404-vs-empty-body `Option` semantics) and hand-encode
+   canned responses as wire JSON. A `ClusterApi` trait call is already
+   typed at the exact granularity `controller.rs` reasons about ("apply
+   this `ConfigMap`", "get this `StatefulSet` or `None`"), so the fake
+   never needs to reconstruct Kubernetes' own wire conventions to be
+   correct — there is strictly less protocol-shaped test-fixture code to
+   get subtly wrong.
+3. Recording "the fake's recorded applies by kind+name" (what the brief
+   asks test (1) to assert on) falls out of the trait design for free —
+   `FakeClusterApi::applies()` is a `Vec<(AppliedKind, String)>` built by
+   the fake's own `apply_*` methods — where a wire-level mock would need a
+   separate request-parsing step to recover the same information from raw
+   HTTP bodies.
+
+**What this proves.** `reconcile`'s full branch structure — the immutable
+`controlNodes`-change refusal, the below-`controlNodes` scale-down refusal,
+the highest-ordinal-first drain-then-remove sequence with its
+stop-on-first-failure behavior, `AnimusClusterStatus.phase` computation
+from `ready_replicas` vs `desired_replicas`, and `control_nodes_changed`'s
+`ConfigMap`-JSON-round-trip inference — is now exercised by seed-free,
+real-socket-free `#[tokio::test]`s, including the one shape a live cluster
+makes awkward to test at all: a drain that never completes, which
+`crate::controller::tests::drain_and_remove_node_is_bounded_when_drain_never_completes`
+proves terminates in bounded polls (120, not indefinitely) using
+`#[tokio::test(start_paused = true)]`'s auto-advancing virtual clock rather
+than ten minutes of real wall-clock wait. It also pins, as an explicit
+regression test rather than an implicit assumption, that `apply_children`
+unconditionally re-applies all five children on every reconcile — there is
+no diff-against-previous-state anywhere in this controller, so "a reconcile
+of an unchanged cluster" is an idempotent re-apply, never a no-op.
+
+**What this does not prove**, unchanged from the gap `src/controller.rs`'s
+own module doc already named before this rung: real `kube::Api` wire
+behavior (resourceVersion conflicts, admission, watch-driven requeue,
+server-side-apply field-ownership semantics against a real API server), and
+real-thread/real-network liveness of the `Controller::run` watch loop
+itself. `RealClusterApi`'s methods are asserted by inspection to be the
+same `kube::Api` calls `controller.rs` made directly before this rung (the
+refactor commit is behavior-preserving, not tested against a live server
+by this harness) — that gap is still `scripts/e2e-kind.sh`'s to close, and
+still does, unchanged by this rung. E1's harness and the e2e smoke are
+complementary, not overlapping: the harness proves the reconcile *logic*
+deterministically and cheaply; the e2e smoke proves the *real* Kubernetes
+interaction once, expensively, and only where the sandbox allows it to run
+at all.
+
 ## Consequences
 
 **Good.** The node's own logic — routing, forwarding, retry, 2PC

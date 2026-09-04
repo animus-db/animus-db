@@ -21,21 +21,22 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::admin_client::AdminClient;
+use crate::admin_client::{AdminClient, AdminOps};
+use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
     CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 
-/// The field manager name every server-side-apply call uses.
+/// The field manager name every server-side-apply call uses
+/// ([`crate::cluster_api::RealClusterApi`]'s own `PatchParams::apply`).
 pub const FIELD_MANAGER: &str = "animus-operator";
 /// Requeue interval after a clean reconcile.
 const REQUEUE_OK: Duration = Duration::from_secs(30);
@@ -56,71 +57,45 @@ pub enum ReconcileError {
     MissingNamespace,
 }
 
-/// Shared context every reconcile call gets: the API client and the admin
-/// HTTP client used for the scale-down drain sequence.
-pub struct Context {
-    pub client: Client,
-    pub admin: AdminClient,
-}
-
-fn apply_params() -> PatchParams {
-    PatchParams::apply(FIELD_MANAGER).force()
+/// Shared context every reconcile call gets: the Kubernetes API seam and
+/// the admin-port seam used for the scale-down drain sequence. Generic over
+/// both so tests can substitute `crate::fakes::{FakeClusterApi,
+/// FakeAdminClient}` for the real `kube`/HTTP implementors — see
+/// `crate::cluster_api`/`crate::admin_client`'s own docs for why this is
+/// the seam boundary.
+pub struct Context<C: ClusterApi, A: AdminOps> {
+    pub cluster_api: C,
+    pub admin: A,
 }
 
 /// Apply every desired child for `cluster`, in a fixed order (`ConfigMap`
 /// before `StatefulSet`, so a rolling pod never briefly reads a
 /// `StatefulSet`-implied config that its `ConfigMap` doesn't have yet).
-async fn apply_children(
-    client: &Client,
+/// Every child is applied unconditionally on every call — there is no diff
+/// against the previously-applied object, so a reconcile of an otherwise
+/// unchanged cluster still re-applies all five children (an idempotent
+/// re-apply, not a no-op; `crate::controller::tests` pins this).
+async fn apply_children<C: ClusterApi>(
+    cluster_api: &C,
     cluster: &AnimusCluster,
     ns: &str,
 ) -> Result<StatefulSet, ReconcileError> {
     let spec = &cluster.spec;
 
     let cm = desired::configmap::build(cluster, spec);
-    Api::<ConfigMap>::namespaced(client.clone(), ns)
-        .patch(
-            cm.metadata.name.as_deref().unwrap(),
-            &apply_params(),
-            &Patch::Apply(&cm),
-        )
-        .await?;
+    cluster_api.apply_configmap(ns, &cm).await?;
 
     let internal_svc = desired::services::build_internal(cluster, spec);
-    Api::<Service>::namespaced(client.clone(), ns)
-        .patch(
-            internal_svc.metadata.name.as_deref().unwrap(),
-            &apply_params(),
-            &Patch::Apply(&internal_svc),
-        )
-        .await?;
+    cluster_api.apply_service(ns, &internal_svc).await?;
 
     let client_svc = desired::services::build_client(cluster, spec);
-    Api::<Service>::namespaced(client.clone(), ns)
-        .patch(
-            client_svc.metadata.name.as_deref().unwrap(),
-            &apply_params(),
-            &Patch::Apply(&client_svc),
-        )
-        .await?;
+    cluster_api.apply_service(ns, &client_svc).await?;
 
     let netpol = desired::networkpolicy::build(cluster, spec);
-    Api::<NetworkPolicy>::namespaced(client.clone(), ns)
-        .patch(
-            netpol.metadata.name.as_deref().unwrap(),
-            &apply_params(),
-            &Patch::Apply(&netpol),
-        )
-        .await?;
+    cluster_api.apply_networkpolicy(ns, &netpol).await?;
 
     let sts = desired::statefulset::build(cluster, spec);
-    let applied: StatefulSet = Api::<StatefulSet>::namespaced(client.clone(), ns)
-        .patch(
-            sts.metadata.name.as_deref().unwrap(),
-            &apply_params(),
-            &Patch::Apply(&sts),
-        )
-        .await?;
+    let applied = cluster_api.apply_statefulset(ns, &sts).await?;
 
     Ok(applied)
 }
@@ -135,16 +110,14 @@ async fn apply_children(
 /// `ConfigMap`'s own already-applied config, which is cheap to read back
 /// (server-side apply already wrote it) and is the actual source of truth
 /// for which ordinals were minted `Both` vs `Data` last time.
-async fn control_nodes_changed(
-    client: &Client,
+async fn control_nodes_changed<C: ClusterApi>(
+    cluster_api: &C,
     ns: &str,
     cluster: &AnimusCluster,
 ) -> Result<Option<i32>, ReconcileError> {
     let name = cluster.name_any();
     let cm_name = desired::config_map_name(&name);
-    let existing = Api::<ConfigMap>::namespaced(client.clone(), ns)
-        .get_opt(&cm_name)
-        .await?;
+    let existing = cluster_api.get_configmap(ns, &cm_name).await?;
     let Some(existing) = existing else {
         return Ok(None);
     };
@@ -183,8 +156,8 @@ fn admin_base_url(name: &str, ns: &str, ordinal: i32, admin_port: i32) -> String
 /// sequence `crate::CLAUDE.md`/the delivery brief document: `POST
 /// /admin/drain {node}`, poll `GET /admin/member/drain-status?node=` to
 /// completion, then `POST /admin/member/remove {node}`.
-async fn drain_and_remove_node(
-    admin: &AdminClient,
+async fn drain_and_remove_node<A: AdminOps>(
+    admin: &A,
     name: &str,
     ns: &str,
     ordinal: i32,
@@ -194,10 +167,7 @@ async fn drain_and_remove_node(
     let base = admin_base_url(name, ns, ordinal, admin_port);
 
     admin
-        .post_json::<_, serde_json::Value>(
-            &format!("{base}/admin/drain"),
-            &json!({ "node": node_id }),
-        )
+        .post_json(&format!("{base}/admin/drain"), &json!({ "node": node_id }))
         .await
         .map_err(|e| format!("draining {node_id}: {e}"))?;
 
@@ -231,7 +201,7 @@ async fn drain_and_remove_node(
     }
 
     admin
-        .post_json::<_, serde_json::Value>(
+        .post_json(
             &format!("{base}/admin/member/remove"),
             &json!({ "node": node_id }),
         )
@@ -253,9 +223,9 @@ fn set_condition(status: &mut AnimusClusterStatus, type_: &str, message: String)
     });
 }
 
-async fn reconcile(
+async fn reconcile<C: ClusterApi, A: AdminOps>(
     cluster: Arc<AnimusCluster>,
-    ctx: Arc<Context>,
+    ctx: Arc<Context<C, A>>,
 ) -> Result<Action, ReconcileError> {
     let name = cluster.name_any();
     let ns = cluster
@@ -270,7 +240,7 @@ async fn reconcile(
     // going (the rest of the spec — image, resources, scale — still
     // deserves to converge), but never regenerate the config with the new
     // value.
-    if let Some(prior) = control_nodes_changed(&ctx.client, &ns, &cluster).await? {
+    if let Some(prior) = control_nodes_changed(&ctx.cluster_api, &ns, &cluster).await? {
         warn!(
             cluster = %name,
             prior_control_nodes = prior,
@@ -317,8 +287,7 @@ async fn reconcile(
 
     // Scale-down: drain+remove every pod ordinal being dropped, highest
     // first, before the `StatefulSet`'s own replica count goes down.
-    let sts_api = Api::<StatefulSet>::namespaced(ctx.client.clone(), &ns);
-    if let Some(existing) = sts_api.get_opt(&name).await? {
+    if let Some(existing) = ctx.cluster_api.get_statefulset(&ns, &name).await? {
         let current_replicas = existing.spec.and_then(|s| s.replicas).unwrap_or(0);
         let target_replicas = cluster.spec.nodes;
         if target_replicas < current_replicas {
@@ -350,14 +319,14 @@ async fn reconcile(
     finish_reconcile(&cluster, &ctx, &ns, status).await
 }
 
-async fn finish_reconcile(
+async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     cluster: &AnimusCluster,
-    ctx: &Context,
+    ctx: &Context<C, A>,
     ns: &str,
     mut status: AnimusClusterStatus,
 ) -> Result<Action, ReconcileError> {
     let name = cluster.name_any();
-    let applied_sts = apply_children(&ctx.client, cluster, ns).await?;
+    let applied_sts = apply_children(&ctx.cluster_api, cluster, ns).await?;
 
     let desired_replicas = cluster.spec.nodes;
     let ready = applied_sts
@@ -382,19 +351,18 @@ async fn finish_reconcile(
         ClusterPhase::Pending
     });
 
-    let cluster_api = Api::<AnimusCluster>::namespaced(ctx.client.clone(), ns);
-    let patch = json!({ "status": status });
-    // A merge patch, not server-side apply: `PatchParams::force` is only
-    // valid with `Patch::Apply`, and the API client rejects the combination
-    // before the request is even sent.
-    cluster_api
-        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+    ctx.cluster_api
+        .patch_cluster_status(ns, &name, &status)
         .await?;
 
     Ok(Action::requeue(REQUEUE_OK))
 }
 
-fn error_policy(cluster: Arc<AnimusCluster>, err: &ReconcileError, _ctx: Arc<Context>) -> Action {
+fn error_policy<C: ClusterApi, A: AdminOps>(
+    cluster: Arc<AnimusCluster>,
+    err: &ReconcileError,
+    _ctx: Arc<Context<C, A>>,
+) -> Action {
     error!(
         cluster = %cluster.name_any(),
         error = %err,
@@ -411,7 +379,7 @@ fn error_policy(cluster: Arc<AnimusCluster>, err: &ReconcileError, _ctx: Arc<Con
 pub async fn run(client: Client) {
     let clusters = Api::<AnimusCluster>::all(client.clone());
     let ctx = Arc::new(Context {
-        client: client.clone(),
+        cluster_api: RealClusterApi::new(client.clone()),
         admin: AdminClient::new(),
     });
 
@@ -432,7 +400,11 @@ pub async fn run(client: Client) {
             Api::<NetworkPolicy>::all(client),
             watcher::Config::default(),
         )
-        .run(reconcile, error_policy, ctx)
+        .run(
+            reconcile::<RealClusterApi, AdminClient>,
+            error_policy::<RealClusterApi, AdminClient>,
+            ctx,
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj, action)) => {
@@ -444,4 +416,361 @@ pub async fn run(client: Client) {
             }
         })
         .await;
+}
+
+/// ADR 0061 rung E1: `reconcile`/`control_nodes_changed`/
+/// `drain_and_remove_node` exercised via `crate::fakes::{FakeClusterApi,
+/// FakeAdminClient}` — no live API server, no real socket. See that
+/// module's doc and `crates/animus-operator/CLAUDE.md`'s testing section
+/// for what this harness does and does not prove.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use k8s_openapi::api::core::v1::ConfigMap;
+
+    use super::*;
+    use crate::crd::AnimusClusterSpec;
+    use crate::desired::test_support::test_cluster;
+    use crate::fakes::{AppliedKind, FakeAdminClient, FakeClusterApi};
+
+    fn make_ctx(
+        cluster_api: FakeClusterApi,
+        admin: FakeAdminClient,
+    ) -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
+        Arc::new(Context { cluster_api, admin })
+    }
+
+    /// The exact URL `admin_base_url` + a path suffix builds — used to
+    /// assert on `FakeAdminClient::calls()` without duplicating
+    /// `drain_and_remove_node`'s own URL-building logic.
+    fn admin_url(name: &str, ns: &str, ordinal: i32, admin_port: i32, path: &str) -> String {
+        format!("{}{path}", admin_base_url(name, ns, ordinal, admin_port))
+    }
+
+    /// A `ConfigMap` shaped exactly like the one a previous reconcile would
+    /// have applied for `spec`, for seeding `FakeClusterApi::seed_configmap`
+    /// in the `control_nodes_changed`/immutable-field tests.
+    fn prior_cluster_configmap(name: &str, ns: &str, spec: &AnimusClusterSpec) -> ConfigMap {
+        let config = desired::cluster_config::build_cluster_config(name, ns, spec);
+        let mut cm = ConfigMap::default();
+        cm.metadata.name = Some(desired::config_map_name(name));
+        cm.data = Some(BTreeMap::from([(
+            desired::cluster_config::CONFIG_FILE_NAME.to_string(),
+            desired::cluster_config::to_json(&config),
+        )]));
+        cm
+    }
+
+    // --- (1) a fresh cluster reconcile creates the expected children -----
+
+    #[tokio::test]
+    async fn reconcile_fresh_cluster_applies_all_five_children_in_order() {
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert_eq!(
+            ctx.cluster_api.applies(),
+            vec![
+                (AppliedKind::ConfigMap, desired::config_map_name("demo")),
+                (AppliedKind::Service, desired::internal_service_name("demo")),
+                (AppliedKind::Service, desired::client_service_name("demo")),
+                (
+                    AppliedKind::NetworkPolicy,
+                    desired::network_policy_name("demo")
+                ),
+                (AppliedKind::StatefulSet, "demo".to_string()),
+            ]
+        );
+
+        // No `StatefulSet` status was ever reported ready (nothing seeded),
+        // so a fresh cluster's own first reconcile lands in `Pending`.
+        let status = ctx.cluster_api.last_status().expect("status was patched");
+        assert_eq!(status.phase, Some(ClusterPhase::Pending));
+        assert_eq!(status.ready_nodes, Some(0));
+    }
+
+    // --- (2) a reconcile of an unchanged cluster: pin the actual behavior -
+
+    #[tokio::test]
+    async fn reconcile_of_unchanged_cluster_reapplies_every_child_again() {
+        // `apply_children` never diffs against what's already applied —
+        // every reconcile unconditionally re-applies all five children, an
+        // idempotent re-apply rather than a no-op. This test pins that
+        // choice so a future change to the behavior is a deliberate,
+        // visible diff here, not a silent regression.
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let first = ctx.cluster_api.applies();
+        assert_eq!(first.len(), 5);
+
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let second = ctx.cluster_api.applies();
+        assert_eq!(second.len(), 10);
+        assert_eq!(&second[..5], &first[..]);
+        assert_eq!(&second[5..], &first[..]);
+    }
+
+    // --- (3) control_nodes_changed detects a change vs no change ---------
+
+    #[tokio::test]
+    async fn control_nodes_changed_detects_a_real_change() {
+        let fake = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+
+        let cluster = test_cluster("demo", "ns1", 5, Some(5));
+        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
+        assert_eq!(result, Some(3));
+    }
+
+    #[tokio::test]
+    async fn control_nodes_changed_is_none_when_unchanged() {
+        let fake = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+
+        let cluster = test_cluster("demo", "ns1", 5, Some(3));
+        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn control_nodes_changed_is_none_when_no_prior_configmap() {
+        // A fresh cluster (nothing applied yet): nothing to compare
+        // against, so this must never look like an immutable-field change.
+        let fake = FakeClusterApi::new();
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    // --- (4) drain_and_remove_node's sequence, including the bounded ------
+    // --- never-completes failure path -------------------------------------
+
+    #[tokio::test]
+    async fn drain_and_remove_node_succeeds_when_drain_completes_immediately() {
+        // No response queued: FakeAdminClient's default GET response is
+        // "already fully drained", so the sequence completes in one poll.
+        let admin = FakeAdminClient::new();
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        assert_eq!(
+            admin.calls(),
+            vec![
+                (
+                    "POST".to_string(),
+                    admin_url("demo", "ns1", 2, 14003, "/admin/drain")
+                ),
+                (
+                    "GET".to_string(),
+                    admin_url(
+                        "demo",
+                        "ns1",
+                        2,
+                        14003,
+                        &format!("/admin/member/drain-status?node={}", node_id_for_test())
+                    )
+                ),
+                (
+                    "POST".to_string(),
+                    admin_url("demo", "ns1", 2, 14003, "/admin/member/remove")
+                ),
+            ]
+        );
+    }
+
+    /// `node_id("demo", 2)` — a tiny local mirror since `node_id` is
+    /// private to `desired::cluster_config`.
+    fn node_id_for_test() -> String {
+        desired::cluster_config::node_id("demo", 2)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_and_remove_node_is_bounded_when_drain_never_completes() {
+        let admin = FakeAdminClient::new();
+        // Exactly one queued response: it repeats forever (see
+        // `FakeAdminClient`'s own doc), so the drain never satisfies
+        // `drain_and_remove_node`'s completion check.
+        admin.queue_drain_status(3, "Draining");
+
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 4, 14003).await;
+        let err = result.expect_err("a drain that never completes must eventually give up");
+        assert!(
+            err.contains("did not finish draining after 120 polls"),
+            "{err}"
+        );
+
+        let calls = admin.calls();
+        // 1 drain POST + 120 status GETs, never reaching remove — bounded,
+        // not a spin loop.
+        assert_eq!(calls.len(), 1 + 120);
+        assert!(calls.iter().all(|(_, url)| !url.contains("/member/remove")));
+    }
+
+    // --- reconcile-level scale-down sequencing, both the happy path and ---
+    // --- the stop-on-first-failure path ------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_scale_down_drains_removed_ordinals_highest_first() {
+        let fake_cluster = FakeClusterApi::new();
+        // A previous reconcile already scaled this cluster to 5 replicas.
+        fake_cluster.seed_statefulset("demo", 5, 5);
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        // Target: 3 nodes — ordinals 3 and 4 must be drained+removed,
+        // highest first, before anything else.
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let drain_posts: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            drain_posts,
+            vec![
+                admin_url("demo", "ns1", 4, 14003, "/admin/drain"),
+                admin_url("demo", "ns1", 3, 14003, "/admin/drain"),
+            ]
+        );
+        let remove_posts: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/member/remove"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            remove_posts,
+            vec![
+                admin_url("demo", "ns1", 4, 14003, "/admin/member/remove"),
+                admin_url("demo", "ns1", 3, 14003, "/admin/member/remove"),
+            ]
+        );
+
+        // No blocking condition: the drain sequence succeeded.
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_DRAIN_FAILED)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_scale_down_stops_on_first_drain_failure() {
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_statefulset("demo", 5, 5);
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.fail_drain();
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_DRAIN_FAILED)
+        );
+
+        // Only the highest ordinal (4) was ever attempted — the sequence
+        // must stop there, never touching ordinal 3, and never reaching
+        // "remove" for anything.
+        let calls = ctx.admin.calls();
+        let drain_posts: Vec<&String> = calls
+            .iter()
+            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            drain_posts,
+            vec![&admin_url("demo", "ns1", 4, 14003, "/admin/drain")]
+        );
+        assert!(!calls.iter().any(|(_, u)| u.contains("/member/remove")));
+    }
+
+    // --- bonus: the immutable-controlNodes-change path end to end ---------
+
+    #[tokio::test]
+    async fn reconcile_refuses_immutable_control_nodes_change() {
+        let fake_cluster = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        // The spec now asks for controlNodes: 5 — refused, since it
+        // previously applied as 3.
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_IMMUTABLE_FIELD_CHANGED)
+        );
+
+        // The re-applied ConfigMap must still reflect the *prior*
+        // controlNodes value (3 "both" roles), never the refused new one.
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("ConfigMap re-applied");
+        let json = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::CONFIG_FILE_NAME)
+            .unwrap();
+        let parsed: desired::cluster_config::ClusterConfig = serde_json::from_str(json).unwrap();
+        let both_count = parsed
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.role, desired::cluster_config::NodeRole::Both))
+            .count();
+        assert_eq!(both_count, 3);
+    }
 }

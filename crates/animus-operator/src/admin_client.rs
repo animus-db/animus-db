@@ -110,3 +110,44 @@ impl AdminClient {
         self.send(req).await
     }
 }
+
+/// The two admin-port calls `crate::controller::drain_and_remove_node`
+/// performs, factored out so that sequence can be driven by an in-memory
+/// fake in tests (`crate::fakes::FakeAdminClient`, `#[cfg(test)]`) instead
+/// of a real socket to a pod's admin port. Errors collapse to `String`
+/// (matching what `drain_and_remove_node` already did with [`AdminError`]
+/// via `.to_string()` before this seam existed) rather than staying
+/// [`AdminError`] — the fake has no HTTP/URI/JSON errors of its own to
+/// report, only "no response queued" and caller-injected failures, so a
+/// shared string keeps both implementors' error type identical without an
+/// enum neither one fully populates.
+#[async_trait::async_trait]
+pub trait AdminOps: Send + Sync {
+    /// `POST url` with a JSON body, decoding the response as JSON.
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
+    /// `GET url`, decoding the body as JSON.
+    async fn get_json(&self, url: &str) -> Result<serde_json::Value, String>;
+}
+
+#[async_trait::async_trait]
+impl AdminOps for AdminClient {
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        AdminClient::post_json(self, url, body)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
+        AdminClient::get_json(self, url)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}

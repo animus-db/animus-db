@@ -49,11 +49,11 @@
 //! change is rejected up front. `Scan` reads a whole table with `Limit` /
 //! `ExclusiveStartKey` pagination and an optional `FilterExpression` (the
 //! same predicate subset as `ConditionExpression`). GetItem/Query/Scan accept
-//! a `ProjectionExpression` / `AttributesToGet` (top-level attribute names
-//! only). Deferred (rejected with a clear error): document-path projections
-//! (`a.b`), per-index projection lists, `UpdateItem`-only `ReturnValues`
-//! modes, and adding an LSI to an existing table (LSIs are create-time-only
-//! in real DynamoDB).
+//! a `ProjectionExpression` (dotted document paths `a.b.c`, list-index
+//! segments `a[0]`/`a[0][1]`) or the legacy `AttributesToGet` (top-level
+//! attribute names only). Deferred (rejected with a clear error): per-index
+//! projection lists, `UpdateItem`-only `ReturnValues` modes, and adding an
+//! LSI to an existing table (LSIs are create-time-only in real DynamoDB).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -179,67 +179,158 @@ pub enum Select {
     Count,
 }
 
+/// One segment of a projection document path: either a map key (a plain
+/// attribute name, one `.`-separated component) or a list index (one `[n]`
+/// suffix). A dotted path `a.b` is two `Field` segments; a list-index path
+/// `a[0].b` is `Field("a")`, `Index(0)`, `Field("b")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    /// A map (`M`) key.
+    Field(String),
+    /// A list (`L`) index — zero-based, matching DynamoDB.
+    Index(usize),
+}
+
 /// A projection: the document paths a read should return (from a
 /// `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
 /// operation means "all attributes"; `Some(paths)` keeps only the requested
 /// paths (a requested-but-absent path is simply omitted, as in DynamoDB).
 ///
-/// Each element is a **dotted document path** `a.b.c`: a top-level attribute name
-/// optionally followed by `.`-separated map keys, so a projection can reach into
-/// nested `M` (map) attributes. A path that traverses into a non-map value (or an
-/// absent key) yields nothing for that path. List-index paths (`a[0]`) remain
-/// deferred — a `[` is rejected at decode time so the limitation is explicit.
-///
-/// The string form is kept (`Projection(pub Vec<String>)`), so a plain top-level
-/// name is just a one-segment path.
+/// Each element is a **document path**: a top-level attribute name optionally
+/// followed by further `.`-separated map keys and/or `[n]` list-index
+/// suffixes ([`PathSegment`]), so a projection can reach into nested `M`
+/// (map) and `L` (list) attributes — `a.b`, `a[0]`, `a[0].b`, `a[0][1]` are
+/// all valid. A path that traverses into the wrong container type, or names
+/// an absent key / out-of-range index, yields nothing for that path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Projection(pub Vec<String>);
+pub struct Projection(pub Vec<Vec<PathSegment>>);
 
 impl Projection {
     /// Apply the projection to `item`, keeping only the requested document paths,
     /// reconstructing the nested structure each path reaches (so projecting
-    /// `a.b` yields `{a:{b:..}}`). Absent paths are skipped. Multiple paths
-    /// sharing a prefix are merged.
+    /// `a.b` yields `{a:{b:..}}`, and projecting `a[1]`/`a[3]` out of a longer
+    /// list yields `{a:[<elem 1>,<elem 3>]}` — a **compacted** list carrying just
+    /// the selected elements, in ascending index order, exactly as DynamoDB
+    /// documents it). Absent paths are skipped. Multiple paths sharing a prefix
+    /// (including two different indices of the same list) are merged.
     #[must_use]
     pub fn apply(&self, item: &Item) -> Item {
-        let mut out = Item::new();
+        let mut root = Proj::Empty;
         for path in &self.0 {
-            let segments: Vec<&str> = path.split('.').collect();
-            project_path(item, &segments, &mut out);
+            project_into_item(item, path, &mut root);
         }
-        out
+        match finalize(root) {
+            Some(AttributeValue::M(m)) => m,
+            _ => Item::new(),
+        }
     }
 }
 
-/// Project one dotted path's `segments` from `src` into `dst`, reconstructing the
-/// nested map structure. The head names a top-level attribute; each further
-/// segment descends into an `M` value. A path that does not resolve to a present
-/// value (wrong type or absent key) contributes nothing.
-fn project_path(src: &Item, segments: &[&str], dst: &mut Item) {
-    let Some((head, rest)) = segments.split_first() else {
-        return;
-    };
-    let Some(value) = src.get(*head) else {
-        return;
-    };
-    if rest.is_empty() {
-        // Whole sub-tree at this leaf. Merge with anything already projected
-        // under `head` (e.g. a sibling deeper path) by preferring the broader
-        // (whole-value) projection.
-        dst.insert((*head).to_owned(), value.clone());
+/// Intermediate accumulator for a merge of possibly many projected paths that
+/// share structure. Mirrors `AttributeValue`'s two container shapes (`M`/`L`),
+/// keeping a list's projected indices in a sorted map — so overlapping/nested
+/// index projections merge correctly — until [`finalize`] compacts each one
+/// into the DynamoDB-documented "just the selected elements, in order" list.
+#[derive(Default)]
+enum Proj {
+    /// Nothing projected here yet.
+    #[default]
+    Empty,
+    /// A path ended here: the whole subtree at this point is kept verbatim.
+    Whole(AttributeValue),
+    /// At least one path descended through a map key here.
+    Map(BTreeMap<String, Proj>),
+    /// At least one path descended through a list index here.
+    List(BTreeMap<usize, Proj>),
+}
+
+/// Project one path's remaining `segments` out of `value`, merging into `dst`.
+/// A path that does not resolve (wrong container type, absent key, or
+/// out-of-range index) contributes nothing — `dst` is left as whatever earlier
+/// paths already built.
+fn project_into(value: &AttributeValue, segments: &[PathSegment], dst: &mut Proj) {
+    // A path that already selected this whole subtree needs nothing more —
+    // and must not be downgraded back into a partial Map/List by a
+    // differently-shaped path processed afterward.
+    if matches!(dst, Proj::Whole(_)) {
         return;
     }
-    // Descend into a nested map only.
-    let AttributeValue::M(inner) = value else {
+    match segments.split_first() {
+        None => *dst = Proj::Whole(value.clone()),
+        Some((PathSegment::Field(name), rest)) => {
+            let AttributeValue::M(map) = value else {
+                return;
+            };
+            let Some(child) = map.get(name) else {
+                return;
+            };
+            if !matches!(dst, Proj::Map(_)) {
+                *dst = Proj::Map(BTreeMap::new());
+            }
+            let Proj::Map(m) = dst else {
+                unreachable!("just set to Map above")
+            };
+            project_into(child, rest, m.entry(name.clone()).or_default());
+        }
+        Some((PathSegment::Index(i), rest)) => {
+            let AttributeValue::L(list) = value else {
+                return;
+            };
+            let Some(child) = list.get(*i) else {
+                return;
+            };
+            if !matches!(dst, Proj::List(_)) {
+                *dst = Proj::List(BTreeMap::new());
+            }
+            let Proj::List(m) = dst else {
+                unreachable!("just set to List above")
+            };
+            project_into(child, rest, m.entry(*i).or_default());
+        }
+    }
+}
+
+/// [`project_into`]'s top-level entry point: the root of a document path is
+/// always a top-level attribute name, sourced from `item` (an `Item` and an
+/// `AttributeValue::M`'s inner map share the same shape, but the root has no
+/// wrapping `AttributeValue` of its own).
+fn project_into_item(item: &Item, segments: &[PathSegment], dst: &mut Proj) {
+    let Some((PathSegment::Field(name), rest)) = segments.split_first() else {
+        return; // A path always starts with a field segment (the parser guarantees this).
+    };
+    let Some(child) = item.get(name) else {
         return;
     };
-    // Recurse into the nested map, accumulating into the nested entry under
-    // `head` (created/extended as a map).
-    let entry = dst
-        .entry((*head).to_owned())
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-    if let AttributeValue::M(nested_dst) = entry {
-        project_path(inner, rest, nested_dst);
+    if !matches!(dst, Proj::Map(_)) {
+        *dst = Proj::Map(BTreeMap::new());
+    }
+    let Proj::Map(m) = dst else {
+        unreachable!("just set to Map above")
+    };
+    project_into(child, rest, m.entry(name.clone()).or_default());
+}
+
+/// Convert an accumulated [`Proj`] tree into the `AttributeValue` it
+/// represents, compacting each `List` node's sparse index map into a plain,
+/// ascending-order `Vec` — DynamoDB's documented list-projection contract
+/// ("if you project `a[1]` and `a[3]`, the result list has two elements").
+fn finalize(node: Proj) -> Option<AttributeValue> {
+    match node {
+        Proj::Empty => None,
+        Proj::Whole(v) => Some(v),
+        Proj::Map(m) => {
+            let mut out = Item::new();
+            for (k, v) in m {
+                if let Some(val) = finalize(v) {
+                    out.insert(k, val);
+                }
+            }
+            Some(AttributeValue::M(out))
+        }
+        Proj::List(m) => {
+            let out: Vec<AttributeValue> = m.into_values().filter_map(finalize).collect();
+            Some(AttributeValue::L(out))
+        }
     }
 }
 
@@ -543,6 +634,17 @@ pub enum Operation {
         /// The requested secondary-index change, if this call changes an
         /// index rather than the stream (ADR 0045 §6).
         index_update: Option<IndexUpdate>,
+        /// The declared `AttributeType` for each attribute named in this
+        /// call's own `AttributeDefinitions` (issue #319) — the identical
+        /// `(AttributeName, AttributeType)` pairs [`CreateTable`](Self::
+        /// CreateTable)'s own `key_types` field carries. Populated whenever
+        /// `index_update` is `Some(IndexUpdate::Create(..))` (the one
+        /// `UpdateTable` shape that can introduce a brand-new key
+        /// attribute); empty for every other call (a `Delete`, or a stream
+        /// change), since neither needs it. `animusd` threads this into the
+        /// new index's own `IndexDef` so it records a real declared type
+        /// instead of always defaulting to `S`.
+        key_types: Vec<(String, String)>,
     },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
@@ -925,6 +1027,46 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `TagResource` (roadmap W-06): add or overwrite tags on a table,
+    /// addressed by its [`table_arn`] (`ResourceArn` on the wire, decoded
+    /// and validated as a table ARN — malformed shape or a stream/backup
+    /// ARN sharing the `table/<name>` prefix is a decode-time
+    /// `ValidationException`; a well-formed ARN naming a table that does
+    /// not exist is `animusd`'s call, ADR-faithful to `ResourceNotFoundException`).
+    /// A tag key already present is overwritten (last writer wins, AWS's
+    /// own `TagResource` semantics).
+    TagResource {
+        /// The target table, recovered from `ResourceArn` by [`parse_table_arn`].
+        table: String,
+        /// The `(key, value)` pairs to set.
+        tags: BTreeMap<String, String>,
+    },
+    /// `UntagResource` (roadmap W-06): remove tags from a table by key,
+    /// addressed the same way as [`TagResource`](Self::TagResource). A key
+    /// not currently present is silently ignored, matching AWS.
+    UntagResource {
+        /// The target table, recovered from `ResourceArn`.
+        table: String,
+        /// The tag keys to remove.
+        tag_keys: Vec<String>,
+    },
+    /// `ListTagsOfResource` (roadmap W-06): a pure read of a table's current
+    /// tags, addressed the same way as [`TagResource`](Self::TagResource).
+    /// No pagination — AWS's own `NextToken` is only ever needed past 50
+    /// tags in a single response page, and this adapter always returns the
+    /// whole set.
+    ListTagsOfResource {
+        /// The target table, recovered from `ResourceArn`.
+        table: String,
+    },
+    /// `DescribeLimits` (roadmap W-06): a pure, static read of this
+    /// adapter's account/table capacity ceilings. No fields to decode —
+    /// AWS's own request body is `{}`.
+    DescribeLimits,
+    /// `DescribeEndpoints` (roadmap W-06): this node's own DynamoDB
+    /// endpoint address, for SDK client discovery. No fields to decode —
+    /// AWS's own request body is `{}`.
+    DescribeEndpoints,
 }
 
 /// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
@@ -977,7 +1119,10 @@ impl Operation {
             | Operation::DescribeTimeToLive { table, .. }
             | Operation::UpdateContinuousBackups { table, .. }
             | Operation::DescribeContinuousBackups { table, .. }
-            | Operation::CreateBackup { table, .. } => Some(table),
+            | Operation::CreateBackup { table, .. }
+            | Operation::TagResource { table, .. }
+            | Operation::UntagResource { table, .. }
+            | Operation::ListTagsOfResource { table, .. } => Some(table),
             // `RestoreTableFromBackup` targets its brand-new *target* table
             // (mirroring `CreateTable`'s own "the table about to exist" —
             // the target doesn't exist yet either way).
@@ -999,7 +1144,12 @@ impl Operation {
             // own "no single table" shape.
             | Operation::DescribeBackup { .. }
             | Operation::ListBackups { .. }
-            | Operation::DeleteBackup { .. } => None,
+            | Operation::DeleteBackup { .. }
+            // `DescribeLimits`/`DescribeEndpoints` (roadmap W-06) address no
+            // table at all — an account-wide static read and a pure
+            // node-address read, respectively.
+            | Operation::DescribeLimits
+            | Operation::DescribeEndpoints => None,
         }
     }
 }
@@ -1379,8 +1529,81 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }),
         "RestoreTableFromBackup" => decode_restore_table_from_backup(obj),
         "RestoreTableToPointInTime" => decode_restore_table_to_point_in_time(obj),
+        "TagResource" => decode_tag_resource(obj),
+        "UntagResource" => decode_untag_resource(obj),
+        "ListTagsOfResource" => Ok(Operation::ListTagsOfResource {
+            table: resource_arn_table(obj)?,
+        }),
+        "DescribeLimits" => Ok(Operation::DescribeLimits),
+        "DescribeEndpoints" => Ok(Operation::DescribeEndpoints),
         _ => Err(WireError::unknown_operation(target)),
     }
+}
+
+/// Decode the `ResourceArn` field shared by `TagResource`/`UntagResource`/
+/// `ListTagsOfResource`, recovering the target table name via
+/// [`parse_table_arn`]. Missing entirely, not a string, or not a
+/// well-formed **table** ARN (including a well-formed stream/backup ARN,
+/// which names a different resource) is `ValidationException` — the same
+/// class of decode-time structural error every other malformed field in
+/// this module gets; a well-formed ARN naming a table that genuinely
+/// doesn't exist is `animusd`'s call (`ResourceNotFoundException`, since
+/// only it holds the replicated catalog).
+fn resource_arn_table(obj: &Map<String, Value>) -> Result<String, WireError> {
+    let arn = obj
+        .get("ResourceArn")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `ResourceArn`"))?;
+    parse_table_arn(arn)
+        .map(str::to_owned)
+        .ok_or_else(|| WireError::validation(format!("`ResourceArn` is not a table ARN: {arn}")))
+}
+
+/// Decode a `TagResource` body: `ResourceArn` plus `Tags`, an array of
+/// `{"Key": .., "Value": ..}` objects. A later duplicate key in the array
+/// overwrites an earlier one in the decoded map (the same "last one wins"
+/// rule `MetaCommand::TagResource`'s own apply arm applies for a *repeated*
+/// call) — DynamoDB imposes no ordering guarantee on this array either way.
+fn decode_tag_resource(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = resource_arn_table(obj)?;
+    let tags_arr = obj
+        .get("Tags")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `Tags`"))?;
+    let mut tags = BTreeMap::new();
+    for entry in tags_arr {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation("`Tags` entries must be objects"))?;
+        let key = entry
+            .get("Key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`Tags` entry missing string field `Key`"))?;
+        let value = entry
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`Tags` entry missing string field `Value`"))?;
+        tags.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(Operation::TagResource { table, tags })
+}
+
+/// Decode an `UntagResource` body: `ResourceArn` plus `TagKeys`, an array of
+/// strings.
+fn decode_untag_resource(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = resource_arn_table(obj)?;
+    let tag_keys = obj
+        .get("TagKeys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `TagKeys`"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| WireError::validation("`TagKeys` entries must be strings"))
+        })
+        .collect::<Result<Vec<String>, WireError>>()?;
+    Ok(Operation::UntagResource { table, tag_keys })
 }
 
 /// Decode a `CreateBackup` body: `TableName` plus `BackupName` (validated
@@ -2574,6 +2797,51 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
     }
 }
 
+/// `UpdateTable` top-level keys this adapter never implements a change for —
+/// there is no provisioned-capacity model, no encryption-at-rest toggle, and
+/// no global-tables replica set (see `website/compatibility.html`'s "no
+/// billing meter" framing). Present unconditionally, so a body carrying only
+/// one of these is a clear `ValidationException` naming the key rather than
+/// the generic "requires either..." fallback or, worse, a silent no-op.
+const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &[
+    "SSESpecification",
+    "ReplicaUpdates",
+    "ProvisionedThroughput",
+];
+
+/// Reject any `UpdateTable` top-level key this adapter doesn't model, each
+/// with its own named `ValidationException` (mirroring
+/// [`decode_index_updates`]'s per-shape rejections). `BillingMode` is a
+/// deliberate special case, not a blanket rejection: `CreateTable` already
+/// accepts (and never inspects) `BillingMode: "PAY_PER_REQUEST"` — the only
+/// billing mode this adapter has, since there is no provisioned-capacity
+/// model to switch to — so an `UpdateTable` re-asserting that same value is
+/// tolerated the same way (a common SDK/CLI habit, e.g. `aws dynamodb
+/// update-table --billing-mode PAY_PER_REQUEST`), while any other value
+/// (`"PROVISIONED"`, or a non-string) is rejected by name. Tolerating the
+/// key does not by itself satisfy the call — a `BillingMode`-only body still
+/// falls through to the "requires either..." rejection below, since this
+/// adapter models no billing-mode *change*, only the redundant restatement
+/// of the mode it already has.
+fn reject_unsupported_update_table_keys(obj: &Map<String, Value>) -> Result<(), WireError> {
+    for key in UNSUPPORTED_UPDATE_TABLE_KEYS {
+        if obj.contains_key(*key) {
+            return Err(WireError::validation(format!(
+                "UpdateTable: {key} is not supported"
+            )));
+        }
+    }
+    if let Some(mode) = obj.get("BillingMode")
+        && mode.as_str() != Some("PAY_PER_REQUEST")
+    {
+        return Err(WireError::validation(
+            "UpdateTable: BillingMode is not supported (only PAY_PER_REQUEST, \
+             this adapter's only billing mode, may be restated)",
+        ));
+    }
+    Ok(())
+}
+
 /// Decode an `UpdateTable` request: either a `StreamSpecification` change
 /// (ADR 0042 §2) or a single `GlobalSecondaryIndexUpdates` element (ADR 0045
 /// §6) — rejected up front if **both** are present in the same call (Fork
@@ -2581,9 +2849,18 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 /// decodes to [`StreamUpdate::Enable`] (requiring `StreamViewType`),
 /// `StreamEnabled: false` to [`StreamUpdate::Disable`]; index-update decoding
 /// is [`decode_index_updates`]. Any other shape (neither field present) is
-/// rejected — this adapter models no throughput/key/billing-mode change.
+/// rejected — this adapter models no throughput/key/billing-mode change. See
+/// [`reject_unsupported_update_table_keys`] for the explicit per-key
+/// rejections (`SSESpecification`/`ReplicaUpdates`/`ProvisionedThroughput`
+/// always, `BillingMode` unless restating `PAY_PER_REQUEST`) this runs
+/// before either shape is considered.
+/// An index-update call's own `AttributeDefinitions` (issue #319) is decoded
+/// via [`decode_attribute_types`] into [`Operation::UpdateTable`]'s
+/// `key_types` field — empty for a stream change, which never introduces a
+/// new key attribute.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
+    reject_unsupported_update_table_keys(obj)?;
     let has_index_updates = obj.contains_key("GlobalSecondaryIndexUpdates");
     let has_stream_spec = obj.contains_key("StreamSpecification");
     if has_index_updates && has_stream_spec {
@@ -2594,10 +2871,12 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
     }
     if has_index_updates {
         let index_update = decode_index_updates(obj)?;
+        let key_types = decode_attribute_types(obj);
         return Ok(Operation::UpdateTable {
             table,
             stream: None,
             index_update: Some(index_update),
+            key_types,
         });
     }
     let Some(spec) = obj.get("StreamSpecification") else {
@@ -2622,6 +2901,7 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
         table,
         stream: Some(stream),
         index_update: None,
+        key_types: Vec::new(),
     })
 }
 
@@ -2810,41 +3090,45 @@ fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, Wir
         ));
     }
     if let Some(expr) = obj.get("ProjectionExpression").and_then(Value::as_str) {
-        let names = expr
+        let paths = expr
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|raw| resolve_projection_name(obj, raw))
+            .map(|raw| parse_projection_path(obj, raw))
             .collect::<Result<Vec<_>, _>>()?;
-        if names.is_empty() {
+        if paths.is_empty() {
             return Err(WireError::validation("`ProjectionExpression` is empty"));
         }
-        return Ok(Some(Projection(names)));
+        return Ok(Some(Projection(paths)));
     }
     if let Some(arr) = obj.get("AttributesToGet") {
         let arr = arr
             .as_array()
             .ok_or_else(|| WireError::validation("`AttributesToGet` must be an array"))?;
-        let mut names = Vec::with_capacity(arr.len());
+        let mut paths = Vec::with_capacity(arr.len());
         for v in arr {
             let name = v.as_str().ok_or_else(|| {
                 WireError::validation("`AttributesToGet` elements must be strings")
             })?;
-            names.push(reject_path(name)?.to_owned());
+            paths.push(vec![PathSegment::Field(reject_path(name)?.to_owned())]);
         }
-        if names.is_empty() {
+        if paths.is_empty() {
             return Err(WireError::validation("`AttributesToGet` is empty"));
         }
-        return Ok(Some(Projection(names)));
+        return Ok(Some(Projection(paths)));
     }
     Ok(None)
 }
 
-/// Resolve one `ProjectionExpression` element into a **dotted document path**,
-/// resolving a `#alias` on each `.`-separated segment through
-/// `ExpressionAttributeNames`. The result is the path with aliases substituted
-/// (e.g. `#p.#c` → `profile.city`). List-index syntax (`[`) is still rejected.
-fn resolve_projection_name(obj: &Map<String, Value>, raw: &str) -> Result<String, WireError> {
+/// Parse one `ProjectionExpression` element into a document path: a
+/// `.`-separated sequence of segments, each an attribute name (or `#alias`,
+/// resolved through `ExpressionAttributeNames`) optionally followed by one or
+/// more `[n]` list-index suffixes (e.g. `#p.list[0][1]` → `Field("profile")`,
+/// `Field("list")`, `Index(0)`, `Index(1)`, once `#p` resolves to `profile`).
+fn parse_projection_path(
+    obj: &Map<String, Value>,
+    raw: &str,
+) -> Result<Vec<PathSegment>, WireError> {
     let mut segments = Vec::new();
     for seg in raw.split('.') {
         let seg = seg.trim();
@@ -2853,40 +3137,78 @@ fn resolve_projection_name(obj: &Map<String, Value>, raw: &str) -> Result<String
                 "projection path `{raw}` has an empty segment"
             )));
         }
-        let resolved = if let Some(alias) = seg.strip_prefix('#') {
-            let names = obj
-                .get("ExpressionAttributeNames")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    WireError::validation(format!(
-                        "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
-                    ))
-                })?;
-            names
-                .get(&format!("#{alias}"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    WireError::validation(format!("name placeholder `#{alias}` is not defined"))
-                })?
-                .to_owned()
-        } else {
-            seg.to_owned()
-        };
-        reject_list_index(&resolved)?;
-        segments.push(resolved);
+        segments.extend(parse_projection_segment(obj, raw, seg)?);
     }
-    Ok(segments.join("."))
+    Ok(segments)
 }
 
-/// Reject a list-index attribute path (containing `[`): nested-map document
-/// paths (`a.b`) are supported, but list indexing (`a[0]`) is deferred.
-fn reject_list_index(name: &str) -> Result<(), WireError> {
-    if name.contains('[') {
+/// Parse one `.`-separated piece of a projection path (`seg`, e.g. `list[0][1]`
+/// or `#p`) into a field segment plus any trailing index segments. `raw` is
+/// the whole path, kept only for error messages.
+fn parse_projection_segment(
+    obj: &Map<String, Value>,
+    raw: &str,
+    seg: &str,
+) -> Result<Vec<PathSegment>, WireError> {
+    let bracket = seg.find('[');
+    let (name_part, rest) = match bracket {
+        Some(i) => (&seg[..i], &seg[i..]),
+        None => (seg, ""),
+    };
+    if name_part.is_empty() {
         return Err(WireError::validation(format!(
-            "list-index projection `{name}` is not supported (map paths `a.b` only)"
+            "malformed list-index syntax in projection path `{raw}` (no attribute name before `[`)"
         )));
     }
-    Ok(())
+    let name = if let Some(alias) = name_part.strip_prefix('#') {
+        let names = obj
+            .get("ExpressionAttributeNames")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                WireError::validation(format!(
+                    "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
+                ))
+            })?;
+        names
+            .get(&format!("#{alias}"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WireError::validation(format!("name placeholder `#{alias}` is not defined"))
+            })?
+            .to_owned()
+    } else {
+        name_part.to_owned()
+    };
+    let mut out = vec![PathSegment::Field(name)];
+    out.extend(parse_index_chain(rest, raw)?);
+    Ok(out)
+}
+
+/// Parse a chain of `[n]` list-index suffixes (`rest`, e.g. `[0][1]`) into
+/// `PathSegment::Index` entries. `raw` is the whole path, for error messages.
+/// Each index must be a plain non-negative decimal integer — malformed syntax
+/// (`[`, `[x]`, `[-1]`, `[01]`... any non-digit body) is a `ValidationException`,
+/// matching how DynamoDB rejects it rather than DynamoDB's own index type
+/// silently misinterpreting it.
+fn parse_index_chain(mut rest: &str, raw: &str) -> Result<Vec<PathSegment>, WireError> {
+    let malformed = || {
+        WireError::validation(format!(
+            "malformed list-index syntax in projection path `{raw}`"
+        ))
+    };
+    let mut indices = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('[').ok_or_else(malformed)?;
+        let close = rest.find(']').ok_or_else(malformed)?;
+        let digits = &rest[..close];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed());
+        }
+        let index: usize = digits.parse().map_err(|_| malformed())?;
+        indices.push(PathSegment::Index(index));
+        rest = &rest[close + 1..];
+    }
+    Ok(indices)
 }
 
 /// Reject a non-top-level attribute name (containing `.` or `[`), used where only
@@ -4150,6 +4472,33 @@ pub fn backup_arn(table: &str, backup_id: &str) -> String {
     format!("arn:aws:dynamodb:animus:0:table/{table}/backup/{backup_id}")
 }
 
+/// The synthetic ARN this adapter surfaces for a **table itself** (roadmap
+/// W-06 — `TagResource`/`UntagResource`/`ListTagsOfResource`'s
+/// `ResourceArn`, and this adapter's own `TableArn`): `arn:aws:dynamodb:
+/// animus:0:table/<table>` — [`stream_arn`]/[`backup_arn`]'s identical
+/// placeholder region/account convention, with no further suffix (unlike
+/// those two, which append `/stream/<label>`/`/backup/<id>`).
+#[must_use]
+pub fn table_arn(table: &str) -> String {
+    format!("arn:aws:dynamodb:animus:0:table/{table}")
+}
+
+/// The inverse of [`table_arn`]: recovers the bare table name from a
+/// **table** ARN. Rejects (returns `None` for) anything that isn't exactly
+/// `arn:aws:dynamodb:animus:0:table/<name>` with no further `/`-separated
+/// segment — in particular a well-formed stream ARN
+/// (`.../table/<name>/stream/<label>`) or backup ARN
+/// (`.../table/<name>/backup/<id>`), which share this prefix but name a
+/// different resource, not a table.
+#[must_use]
+pub fn parse_table_arn(arn: &str) -> Option<&str> {
+    let rest = arn.strip_prefix("arn:aws:dynamodb:animus:0:table/")?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(rest)
+}
+
 /// Build the shared `TableDescription`/`Table` object both
 /// [`create_table_response`] and [`describe_table_response`] wrap: name, key
 /// schema, `ACTIVE` status, any secondary indexes — each carrying its own
@@ -4183,6 +4532,7 @@ fn table_description_object(
     }
     let mut desc = Map::new();
     desc.insert("TableName".into(), Value::String(table.to_owned()));
+    desc.insert("TableArn".into(), Value::String(table_arn(table)));
     desc.insert("KeySchema".into(), Value::Array(key_schema));
     desc.insert("TableStatus".into(), Value::String(status.to_owned()));
 
@@ -4367,18 +4717,18 @@ pub fn delete_table_response(
 /// **Real DynamoDB's `AttributeDefinitions` covers every key attribute in
 /// the table, base and index alike** — a GSI's hash/sort attribute or an
 /// LSI's alternate sort attribute, not just the base table's own
-/// partition/sort key (issue #319). Neither this crate's `IndexDef`
-/// bridge nor `IndexDef` itself ever records an index key attribute's own
-/// declared type (`animus-dynamo/CLAUDE.md`/`animusd/CLAUDE.md` both trace
-/// why — it holds uniformly for a `CreateTable`-declared index and a later
-/// `UpdateTable`-added one alike), so an index-only key attribute here
-/// always renders as the same `key_types`-absent `"S"` default every other
-/// untyped attribute already gets — an honest "unknown, defaulted" answer
-/// rather than an omission. **This does not restore a genuine per-index
-/// type** (nothing here started persisting one); it only closes the
-/// coverage gap — every declared key attribute now gets *an* entry, the
-/// AWS-faithful shape `DescribeTable` promises, even though today every
-/// index-only one names the same placeholder type.
+/// partition/sort key (issue #319, closed). This function itself is
+/// unchanged by that fix — it has always resolved every name in `names`
+/// through a plain lookup in `key_types`, defaulting to `S` only when a
+/// name genuinely isn't there. What changed is what its caller now passes:
+/// `animusd::dynamo::describe_table`/`delete_table` extend the base table's
+/// own typed key columns with `schema_bridge::index_attribute_types` (each
+/// index's own `IndexDef.hash_attribute_type`/`sort_attribute_type`,
+/// recorded from `CreateTable`/`UpdateTable`'s own `AttributeDefinitions`
+/// when the caller supplied one — see `animus_control::IndexDef`'s own
+/// doc), so an index-only key attribute now renders its **real** declared
+/// type when one was ever recorded, and only falls back to the honest
+/// "unknown, defaulted" `S` when it genuinely wasn't.
 fn attribute_definitions(
     schema: &TableSchema,
     key_types: &[(String, String)],
@@ -4784,6 +5134,99 @@ pub fn describe_time_to_live_response(desc: &TtlDescription) -> String {
     serde_json::to_string(&Value::Object(obj)).expect("describe-ttl response serializes")
 }
 
+/// The JSON body for a successful `TagResource`/`UntagResource` (roadmap
+/// W-06): both are AWS-faithfully a bare `{}` on success — neither op
+/// echoes anything back.
+#[must_use]
+pub fn tag_or_untag_resource_response() -> String {
+    "{}".to_owned()
+}
+
+/// The JSON body for a successful `ListTagsOfResource` (roadmap W-06):
+/// `{"Tags": [{"Key": .., "Value": ..}, ...]}`, sorted by key (`tags`'
+/// `BTreeMap` order) — never a `NextToken`, since this adapter always
+/// returns the whole set (see [`Operation::ListTagsOfResource`]'s own doc).
+#[must_use]
+pub fn list_tags_of_resource_response(tags: &BTreeMap<String, String>) -> String {
+    let entries: Vec<Value> = tags
+        .iter()
+        .map(|(k, v)| {
+            let mut e = Map::new();
+            e.insert("Key".into(), Value::String(k.clone()));
+            e.insert("Value".into(), Value::String(v.clone()));
+            Value::Object(e)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("Tags".into(), Value::Array(entries));
+    serde_json::to_string(&Value::Object(obj)).expect("list-tags response serializes")
+}
+
+/// `DescribeLimits`' static account-wide read capacity ceiling (roadmap
+/// W-06) — real DynamoDB's own documented on-demand default.
+pub const ACCOUNT_MAX_READ_CAPACITY_UNITS: u64 = 80_000;
+/// `DescribeLimits`' static account-wide write capacity ceiling.
+pub const ACCOUNT_MAX_WRITE_CAPACITY_UNITS: u64 = 80_000;
+/// `DescribeLimits`' static per-table read capacity ceiling.
+pub const TABLE_MAX_READ_CAPACITY_UNITS: u64 = 40_000;
+/// `DescribeLimits`' static per-table write capacity ceiling.
+pub const TABLE_MAX_WRITE_CAPACITY_UNITS: u64 = 40_000;
+
+/// The JSON body for a successful `DescribeLimits` (roadmap W-06): AWS's
+/// documented on-demand-default shape, `{AccountMaxReadCapacityUnits,
+/// AccountMaxWriteCapacityUnits, TableMaxReadCapacityUnits,
+/// TableMaxWriteCapacityUnits}`. This adapter has no provisioned-capacity
+/// billing meter at all (root `CLAUDE.md`'s "no RCUs/WCUs to plan
+/// around") — these four constants are reported honestly as a static
+/// ceiling an SDK's own tooling can probe, never derived from anything
+/// this adapter tracks.
+#[must_use]
+pub fn describe_limits_response() -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "AccountMaxReadCapacityUnits".into(),
+        Value::from(ACCOUNT_MAX_READ_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "AccountMaxWriteCapacityUnits".into(),
+        Value::from(ACCOUNT_MAX_WRITE_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "TableMaxReadCapacityUnits".into(),
+        Value::from(TABLE_MAX_READ_CAPACITY_UNITS),
+    );
+    obj.insert(
+        "TableMaxWriteCapacityUnits".into(),
+        Value::from(TABLE_MAX_WRITE_CAPACITY_UNITS),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("describe-limits response serializes")
+}
+
+/// How long an SDK is told it may cache a `DescribeEndpoints` result before
+/// asking again — AWS's own documented default.
+pub const DESCRIBE_ENDPOINTS_CACHE_PERIOD_MINUTES: u64 = 1440;
+
+/// The JSON body for a successful `DescribeEndpoints` (roadmap W-06):
+/// `{"Endpoints":[{"Address": .., "CachePeriodInMinutes": 1440}]}` — a
+/// single entry naming the caller's own node (`animusd::dynamo::
+/// describe_endpoints` supplies its own bound DynamoDB listen address; this
+/// crate has no notion of "the cluster's other nodes").
+#[must_use]
+pub fn describe_endpoints_response(address: &str) -> String {
+    let mut endpoint = Map::new();
+    endpoint.insert("Address".into(), Value::String(address.to_owned()));
+    endpoint.insert(
+        "CachePeriodInMinutes".into(),
+        Value::from(DESCRIBE_ENDPOINTS_CACHE_PERIOD_MINUTES),
+    );
+    let mut obj = Map::new();
+    obj.insert(
+        "Endpoints".into(),
+        Value::Array(vec![Value::Object(endpoint)]),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("describe-endpoints response serializes")
+}
+
 /// A table's point-in-time recovery (PITR) configuration and restorable
 /// window (ADR 0059 §9), as both `UpdateContinuousBackups` and
 /// `DescribeContinuousBackups` render it. `animusd` derives every field
@@ -5086,6 +5529,11 @@ mod tests {
         AttributeValue::S(v.into())
     }
 
+    /// A one-segment field path — the common case in these tests.
+    fn field(name: &str) -> Vec<PathSegment> {
+        vec![PathSegment::Field(name.into())]
+    }
+
     fn n(v: &str) -> AttributeValue {
         AttributeValue::N(v.into())
     }
@@ -5250,7 +5698,7 @@ mod tests {
         item.insert("id".into(), s("u1"));
         item.insert("name".into(), s("Ada"));
         item.insert("secret".into(), s("hidden"));
-        let p = Projection(vec!["id".into(), "name".into(), "absent".into()]);
+        let p = Projection(vec![field("id"), field("name"), field("absent")]);
         let projected = p.apply(&item);
         assert_eq!(projected.len(), 2);
         assert_eq!(projected.get("id"), Some(&s("u1")));
@@ -5270,7 +5718,7 @@ mod tests {
         };
         assert_eq!(
             projection,
-            Some(Projection(vec!["id".into(), "name".into()]))
+            Some(Projection(vec![field("id"), field("name")]))
         );
     }
 
@@ -5285,13 +5733,13 @@ mod tests {
         };
         assert_eq!(
             projection,
-            Some(Projection(vec!["id".into(), "name".into()]))
+            Some(Projection(vec![field("id"), field("name")]))
         );
     }
 
     #[test]
     fn decodes_document_path_projection() {
-        // Document-path projections (`a.b`) are now supported.
+        // Document-path projections (`a.b`) are supported.
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"a.b, c"}"#;
         let Operation::GetItem { projection, .. } =
@@ -5299,16 +5747,77 @@ mod tests {
         else {
             panic!("expected GetItem");
         };
-        assert_eq!(projection, Some(Projection(vec!["a.b".into(), "c".into()])));
+        assert_eq!(
+            projection,
+            Some(Projection(vec![
+                vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Field("b".into())
+                ],
+                field("c"),
+            ]))
+        );
     }
 
     #[test]
-    fn rejects_list_index_projection() {
-        // List-index paths (`a[0]`) remain deferred.
+    fn decodes_list_index_projection() {
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
-            "ProjectionExpression":"a[0]"}"#;
-        let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
+            "ProjectionExpression":"a[0], a[0].b, matrix[1][2]"}"#;
+        let Operation::GetItem { projection, .. } =
+            decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert_eq!(
+            projection,
+            Some(Projection(vec![
+                vec![PathSegment::Field("a".into()), PathSegment::Index(0)],
+                vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Index(0),
+                    PathSegment::Field("b".into()),
+                ],
+                vec![
+                    PathSegment::Field("matrix".into()),
+                    PathSegment::Index(1),
+                    PathSegment::Index(2),
+                ],
+            ]))
+        );
+    }
+
+    #[test]
+    fn decodes_list_index_projection_with_alias() {
+        // `#p[0]` — the alias resolves the name part; the index suffix rides
+        // straight through.
+        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "ProjectionExpression":"#p[0]",
+            "ExpressionAttributeNames":{"#p":"list"}}"##;
+        let Operation::GetItem { projection, .. } =
+            decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert_eq!(
+            projection,
+            Some(Projection(vec![vec![
+                PathSegment::Field("list".into()),
+                PathSegment::Index(0),
+            ]]))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_list_index_syntax() {
+        for expr in ["a[", "a[x]", "a[-1]", "a[0", "a]0[", "[0]"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                    "ProjectionExpression":"{expr}"}}"#
+            );
+            let result = decode_request("DynamoDB_20120810.GetItem", body.as_bytes());
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "ValidationException", "for `{expr}`");
+        }
     }
 
     #[test]
@@ -5320,7 +5829,14 @@ mod tests {
         item.insert("a".into(), AttributeValue::M(inner));
         item.insert("c".into(), s("top"));
         item.insert("d".into(), s("gone"));
-        let projected = Projection(vec!["a.b".into(), "c".into()]).apply(&item);
+        let projected = Projection(vec![
+            vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+            ],
+            field("c"),
+        ])
+        .apply(&item);
         // `a` is reconstructed with only `b`; `c` kept; `d` dropped.
         let AttributeValue::M(a) = projected.get("a").expect("a present") else {
             panic!("a is a map");
@@ -5329,6 +5845,99 @@ mod tests {
         assert!(!a.contains_key("z"));
         assert_eq!(projected.get("c"), Some(&s("top")));
         assert!(!projected.contains_key("d"));
+    }
+
+    #[test]
+    fn list_index_projection_selects_and_compacts() {
+        // Projecting a[1] and a[3] out of a longer list yields a *compacted*
+        // two-element list, per DynamoDB's own documented contract.
+        let mut item = Item::new();
+        item.insert(
+            "a".into(),
+            AttributeValue::L(vec![s("z0"), s("z1"), s("z2"), s("z3"), s("z4")]),
+        );
+        let projected = Projection(vec![
+            vec![PathSegment::Field("a".into()), PathSegment::Index(3)],
+            vec![PathSegment::Field("a".into()), PathSegment::Index(1)],
+        ])
+        .apply(&item);
+        assert_eq!(
+            projected.get("a"),
+            Some(&AttributeValue::L(vec![s("z1"), s("z3")]))
+        );
+    }
+
+    #[test]
+    fn list_index_projection_out_of_range_yields_nothing() {
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::L(vec![s("only")]));
+        let projected = Projection(vec![vec![
+            PathSegment::Field("a".into()),
+            PathSegment::Index(5),
+        ]])
+        .apply(&item);
+        assert!(!projected.contains_key("a"));
+    }
+
+    #[test]
+    fn nested_list_index_projection_descends_into_a_map_element() {
+        // list[0].b — the first list element is a map; only `b` survives.
+        let mut inner = BTreeMap::new();
+        inner.insert("b".into(), s("keep"));
+        inner.insert("z".into(), s("drop"));
+        let mut item = Item::new();
+        item.insert(
+            "list".into(),
+            AttributeValue::L(vec![AttributeValue::M(inner), s("second")]),
+        );
+        let projected = Projection(vec![vec![
+            PathSegment::Field("list".into()),
+            PathSegment::Index(0),
+            PathSegment::Field("b".into()),
+        ]])
+        .apply(&item);
+        let AttributeValue::L(list) = projected.get("list").expect("list present") else {
+            panic!("list is a list");
+        };
+        assert_eq!(list.len(), 1, "only index 0 selected");
+        let AttributeValue::M(m) = &list[0] else {
+            panic!("element is a map");
+        };
+        assert_eq!(m.get("b"), Some(&s("keep")));
+        assert!(!m.contains_key("z"));
+    }
+
+    #[test]
+    fn nested_index_of_a_list_selects_and_compacts() {
+        // matrix[0][2] and matrix[0][0] out of a nested list — a compacted
+        // two-element inner list at index 0; index 1 of the outer list is
+        // never touched.
+        let mut item = Item::new();
+        item.insert(
+            "matrix".into(),
+            AttributeValue::L(vec![
+                AttributeValue::L(vec![s("m00"), s("m01"), s("m02")]),
+                AttributeValue::L(vec![s("m10"), s("m11")]),
+            ]),
+        );
+        let projected = Projection(vec![
+            vec![
+                PathSegment::Field("matrix".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(2),
+            ],
+            vec![
+                PathSegment::Field("matrix".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(0),
+            ],
+        ])
+        .apply(&item);
+        let AttributeValue::L(outer) = projected.get("matrix").expect("matrix present") else {
+            panic!("matrix is a list");
+        };
+        assert_eq!(outer.len(), 1, "only outer index 0 selected");
+        assert_eq!(outer[0], AttributeValue::L(vec![s("m00"), s("m02")]));
     }
 
     #[test]
@@ -5853,13 +6462,19 @@ mod tests {
     /// fidelity gap): before this fix `attribute_definitions` only ever
     /// looked at `schema.partition_key`/`schema.sort_key`, so a composite
     /// GSI's `score` (hash) and `rank` (sort) — neither of them the base
-    /// table's own `id` — never appeared in the response at all. Every
-    /// index-only attribute here has no recorded type anywhere in the
-    /// catalog (a separate, uniform-across-`CreateTable`/`UpdateTable` gap,
-    /// not fixed by this test — see `attribute_definitions`'s own doc), so
-    /// it renders the same `"S"` placeholder every other untyped attribute
-    /// gets; what this test actually pins is that the attribute *appears at
-    /// all*, deduplicated against the base/other index attributes.
+    /// table's own `id` — never appeared in the response at all.
+    ///
+    /// **Flipped (issue #319, closed)**: `key_types` here is no longer just
+    /// the base table's own typed columns — it's what `animusd::dynamo::
+    /// describe_table` actually builds now, extending it with
+    /// `schema_bridge::index_attribute_types` off each index's own
+    /// (control-catalog-recorded) `hash_attribute_type`/
+    /// `sort_attribute_type`. So `score`/`rank`/`alt_sort` each render their
+    /// **real** declared type, not the old blanket `"S"` placeholder — this
+    /// function's own logic (a plain name → type lookup) never changed; only
+    /// what `animusd` now passes into it did. `alt_sort` deliberately has no
+    /// entry in `key_types` at all, proving the untyped fallback still works
+    /// correctly for an attribute nobody declared a type for.
     #[test]
     fn describe_table_response_attribute_definitions_cover_index_key_attributes() {
         let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
@@ -5875,10 +6490,19 @@ mod tests {
             sort_attribute: "alt_sort".into(),
             projection: IndexProjection::All,
         });
+        // The base table's own key type, plus `score`/`rank`'s own declared
+        // types — the shape `animusd::dynamo::describe_table` merges via
+        // `schema_bridge::index_attribute_types`. `alt_sort` is deliberately
+        // absent (untyped).
+        let key_types = [
+            ("id".to_owned(), "S".to_owned()),
+            ("score".to_owned(), "N".to_owned()),
+            ("rank".to_owned(), "B".to_owned()),
+        ];
         let body = describe_table_response(
             "t",
             &TableSchema::simple("id"),
-            &[("id".into(), "S".into())],
+            &key_types,
             &[gsi, lsi],
             &[],
             None,
@@ -5891,10 +6515,20 @@ mod tests {
         let attr_defs_start = body.find("\"AttributeDefinitions\":[").expect("present");
         let attr_defs_end = attr_defs_start + body[attr_defs_start..].find(']').expect("closes");
         let attr_defs = &body[attr_defs_start..=attr_defs_end];
-        for name in ["id", "score", "rank", "alt_sort"] {
+        for (name, ty) in [
+            ("id", "S"),
+            ("score", "N"),
+            ("rank", "B"),
+            // `alt_sort` has no declared type in `key_types` above, so it
+            // must still fall back to the honest "unknown" placeholder.
+            ("alt_sort", "S"),
+        ] {
             assert!(
-                attr_defs.contains(&format!("\"AttributeName\":\"{name}\"")),
-                "missing AttributeDefinitions entry for `{name}`: {attr_defs}"
+                attr_defs.contains(&format!(
+                    "{{\"AttributeName\":\"{name}\",\"AttributeType\":\"{ty}\"}}"
+                )),
+                "missing/wrong AttributeDefinitions entry for `{name}` (want type `{ty}`): \
+                 {attr_defs}"
             );
         }
         assert_eq!(
@@ -6076,6 +6710,7 @@ mod tests {
                 table,
                 stream,
                 index_update,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(stream, Some(StreamUpdate::Enable(StreamViewType::NewImage)));
@@ -6117,6 +6752,7 @@ mod tests {
                 table,
                 stream,
                 index_update,
+                key_types,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(stream, None);
@@ -6124,6 +6760,7 @@ mod tests {
                     index_update,
                     Some(IndexUpdate::Delete("by-email".to_owned()))
                 );
+                assert!(key_types.is_empty(), "a Delete needs no declared type");
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
@@ -6139,6 +6776,7 @@ mod tests {
             Operation::UpdateTable {
                 table,
                 index_update,
+                key_types,
                 ..
             } => {
                 assert_eq!(table, "t");
@@ -6149,6 +6787,31 @@ mod tests {
                     }
                     other => panic!("expected Create(Global(..)), got {other:?}"),
                 }
+                assert!(
+                    key_types.is_empty(),
+                    "no AttributeDefinitions in this request"
+                );
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    /// Issue #319: an `UpdateTable` GSI-`Create` call's own
+    /// `AttributeDefinitions` is decoded into `key_types` (the same shape
+    /// `CreateTable` already carries), so `animusd` can record the new
+    /// index's own declared key attribute type instead of always defaulting
+    /// to `S`.
+    #[test]
+    fn update_table_create_index_decodes_attribute_definitions() {
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"score","AttributeType":"N"}],
+            "GlobalSecondaryIndexUpdates":[
+            {"Create":{"IndexName":"by-score",
+                "KeySchema":[{"AttributeName":"score","KeyType":"HASH"}],
+                "Projection":{"ProjectionType":"ALL"}}}]}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable { key_types, .. } => {
+                assert_eq!(key_types, vec![("score".to_owned(), "N".to_owned())]);
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
@@ -6160,6 +6823,13 @@ mod tests {
             {"Update":{"IndexName":"by-email"}}]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
+        // Pin the exact wording (issue W-04): "no `Update`" plus the reason
+        // (no throughput model), not just the error code.
+        assert_eq!(
+            err.message,
+            "each GlobalSecondaryIndexUpdates element must be exactly one of `Create` or \
+             `Delete` (no `Update` — no throughput model)"
+        );
     }
 
     #[test]
@@ -6174,6 +6844,72 @@ mod tests {
     #[test]
     fn update_table_requires_stream_specification_or_index_updates() {
         let body = br#"{"TableName":"t"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_rejects_sse_specification() {
+        let body = br#"{"TableName":"t","SSESpecification":{"Enabled":true}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(
+            err.message,
+            "UpdateTable: SSESpecification is not supported"
+        );
+    }
+
+    #[test]
+    fn update_table_rejects_replica_updates() {
+        let body = br#"{"TableName":"t","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+    }
+
+    #[test]
+    fn update_table_rejects_provisioned_throughput() {
+        let body = br#"{"TableName":"t",
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(
+            err.message,
+            "UpdateTable: ProvisionedThroughput is not supported"
+        );
+    }
+
+    #[test]
+    fn update_table_rejects_an_unsupported_billing_mode() {
+        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("BillingMode"), "{}", err.message);
+    }
+
+    #[test]
+    fn update_table_tolerates_pay_per_request_billing_mode_alongside_a_real_change() {
+        // BillingMode: PAY_PER_REQUEST is this adapter's only billing mode
+        // (see CreateTable, which accepts and never inspects it); restating
+        // it on UpdateTable is a common SDK/CLI habit and must not block an
+        // otherwise-valid stream/index change.
+        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST",
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable { stream, .. } => {
+                assert_eq!(stream, Some(StreamUpdate::Disable));
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_table_rejects_a_billing_mode_only_body_with_no_modeled_change() {
+        // Tolerating the key isn't the same as modeling a billing-mode
+        // *change*: with no GSI/stream change alongside it, this still
+        // falls through to the generic "requires either..." rejection.
+        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
@@ -7394,6 +8130,157 @@ mod tests {
         assert!(!body.contains("AttributeName"));
     }
 
+    // --- Resource tagging (roadmap W-06) ------------------------------------
+
+    #[test]
+    fn table_arn_round_trips_through_parse_table_arn() {
+        let arn = table_arn("orders");
+        assert_eq!(arn, "arn:aws:dynamodb:animus:0:table/orders");
+        assert_eq!(parse_table_arn(&arn), Some("orders"));
+    }
+
+    #[test]
+    fn parse_table_arn_rejects_a_stream_or_backup_arn() {
+        assert_eq!(
+            parse_table_arn("arn:aws:dynamodb:animus:0:table/orders/stream/L1"),
+            None
+        );
+        assert_eq!(
+            parse_table_arn("arn:aws:dynamodb:animus:0:table/orders/backup/abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_table_arn_rejects_malformed_input() {
+        assert_eq!(parse_table_arn("not-an-arn"), None);
+        assert_eq!(parse_table_arn("arn:aws:dynamodb:animus:0:table/"), None);
+    }
+
+    #[test]
+    fn decodes_tag_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders",
+            "Tags":[{"Key":"env","Value":"prod"},{"Key":"team","Value":"payments"}]}"#;
+        match decode_request("DynamoDB_20120810.TagResource", body).unwrap() {
+            Operation::TagResource { table, tags } => {
+                assert_eq!(table, "orders");
+                assert_eq!(
+                    tags,
+                    BTreeMap::from([
+                        ("env".to_owned(), "prod".to_owned()),
+                        ("team".to_owned(), "payments".to_owned()),
+                    ])
+                );
+            }
+            other => panic!("expected TagResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_tag_resource_rejects_a_malformed_resource_arn() {
+        let body = br#"{"ResourceArn":"not-an-arn","Tags":[{"Key":"env","Value":"prod"}]}"#;
+        let err = decode_request("DynamoDB_20120810.TagResource", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decode_tag_resource_rejects_missing_tags() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders"}"#;
+        let err = decode_request("DynamoDB_20120810.TagResource", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_untag_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders",
+            "TagKeys":["env","team"]}"#;
+        match decode_request("DynamoDB_20120810.UntagResource", body).unwrap() {
+            Operation::UntagResource { table, tag_keys } => {
+                assert_eq!(table, "orders");
+                assert_eq!(tag_keys, vec!["env".to_owned(), "team".to_owned()]);
+            }
+            other => panic!("expected UntagResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tags_of_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders"}"#;
+        match decode_request("DynamoDB_20120810.ListTagsOfResource", body).unwrap() {
+            Operation::ListTagsOfResource { table } => assert_eq!(table, "orders"),
+            other => panic!("expected ListTagsOfResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_tags_of_resource_response_shape() {
+        let tags = BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("team".to_owned(), "payments".to_owned()),
+        ]);
+        let body = list_tags_of_resource_response(&tags);
+        assert!(body.contains("\"Key\":\"env\""));
+        assert!(body.contains("\"Value\":\"prod\""));
+        assert!(body.contains("\"Key\":\"team\""));
+    }
+
+    #[test]
+    fn list_tags_of_resource_response_empty() {
+        let body = list_tags_of_resource_response(&BTreeMap::new());
+        assert_eq!(body, "{\"Tags\":[]}");
+    }
+
+    #[test]
+    fn tag_or_untag_resource_response_is_empty_object() {
+        assert_eq!(tag_or_untag_resource_response(), "{}");
+    }
+
+    #[test]
+    fn describe_table_response_includes_table_arn() {
+        let body = describe_table_response(
+            "orders",
+            &TableSchema::simple("id"),
+            &[],
+            &[],
+            &[],
+            None,
+            "ACTIVE",
+        );
+        assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
+    }
+
+    #[test]
+    fn decodes_describe_limits() {
+        match decode_request("DynamoDB_20120810.DescribeLimits", b"{}").unwrap() {
+            Operation::DescribeLimits => {}
+            other => panic!("expected DescribeLimits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_limits_response_shape() {
+        let body = describe_limits_response();
+        assert!(body.contains("\"AccountMaxReadCapacityUnits\":80000"));
+        assert!(body.contains("\"AccountMaxWriteCapacityUnits\":80000"));
+        assert!(body.contains("\"TableMaxReadCapacityUnits\":40000"));
+        assert!(body.contains("\"TableMaxWriteCapacityUnits\":40000"));
+    }
+
+    #[test]
+    fn decodes_describe_endpoints() {
+        match decode_request("DynamoDB_20120810.DescribeEndpoints", b"{}").unwrap() {
+            Operation::DescribeEndpoints => {}
+            other => panic!("expected DescribeEndpoints, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_endpoints_response_shape() {
+        let body = describe_endpoints_response("127.0.0.1:8000");
+        assert!(body.contains("\"Address\":\"127.0.0.1:8000\""));
+        assert!(body.contains("\"CachePeriodInMinutes\":1440"));
+    }
+
     // --- Backups (ADR 0059, Train 1 PR④) -----------------------------------
 
     #[test]
@@ -8421,7 +9308,7 @@ mod tests {
                 assert_eq!(requests[0].keys.len(), 2);
                 assert_eq!(
                     requests[0].projection,
-                    Some(Projection(vec!["id".into(), "v".into()]))
+                    Some(Projection(vec![field("id"), field("v")]))
                 );
                 assert!(requests[0].consistent_read);
                 assert_eq!(requests[1].table, "t2");

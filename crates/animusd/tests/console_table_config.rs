@@ -273,10 +273,12 @@ async fn add_and_drop_gsi_round_trip() {
         let resp = json(&body);
         assert_eq!(resp["gsi"]["name"], "by-status");
         assert_eq!(resp["gsi"]["hash_attribute"]["name"], "status");
-        // No declared type: `UpdateTable`'s GSI-create decoder drops
-        // `AttributeDefinitions` (issue #319), so nothing in the catalog
-        // records one and the console reports `null` rather than an
-        // invented `"S"`.
+        // No declared type: this request gave no `hash_attribute_type`
+        // (issue #319's fields are optional), so `add_gsi` sent no
+        // `AttributeDefinitions` entry and the console reports `null`
+        // rather than an invented `"S"` — see
+        // `add_gsi_records_a_declared_attribute_type` below for the
+        // positive case, where a type genuinely round-trips.
         assert!(
             resp["gsi"]["hash_attribute"]["attribute_type"].is_null(),
             "an added GSI's key attribute must not claim a type: {body}"
@@ -336,6 +338,116 @@ async fn add_and_drop_gsi_round_trip() {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Issue #319: an Add-GSI call that *does* supply `hash_attribute_type`/
+/// `sort_attribute_type` gets a real declared type recorded — the console
+/// response echoes it back immediately, and it still reads that way off a
+/// fresh `GET /console/api/tables/{name}` afterward (a real replicated-
+/// catalog round trip, not just an echo of the request). Companion to
+/// `add_and_drop_gsi_round_trip`'s own no-type case just above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_gsi_records_a_declared_attribute_type() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"readings",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = console(
+            console_addr,
+            "POST",
+            "/console/api/tables/readings/gsi",
+            r#"{"index_name":"by-score","hash_attribute":"score",
+                "hash_attribute_type":"N","sort_attribute":"rank",
+                "sort_attribute_type":"B"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "add_gsi failed: {body}");
+        let resp = json(&body);
+        assert_eq!(resp["gsi"]["hash_attribute"]["name"], "score");
+        assert_eq!(resp["gsi"]["hash_attribute"]["attribute_type"], "N");
+        assert_eq!(resp["gsi"]["sort_attribute"]["name"], "rank");
+        assert_eq!(resp["gsi"]["sort_attribute"]["attribute_type"], "B");
+        assert_no_cluster_shape(&body);
+
+        // Re-read the table detail fresh — the type is durably in the
+        // replicated catalog, not merely echoed off the request.
+        let (status, body) = console(console_addr, "GET", "/console/api/tables/readings", "").await;
+        assert_eq!(status, 200);
+        let d = json(&body);
+        assert_eq!(d["gsis"][0]["hash_attribute"]["attribute_type"], "N");
+        assert_eq!(d["gsis"][0]["sort_attribute"]["attribute_type"], "B");
+
+        // And `DescribeTable`'s own `AttributeDefinitions` — the original
+        // issue #319 complaint — covers both, for real, not `"S"`.
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.DescribeTable",
+            r#"{"TableName":"readings"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeTable failed: {body}");
+        assert!(
+            body.contains(r#"{"AttributeName":"score","AttributeType":"N"}"#),
+            "score's declared N type missing from AttributeDefinitions: {body}"
+        );
+        assert!(
+            body.contains(r#"{"AttributeName":"rank","AttributeType":"B"}"#),
+            "rank's declared B type missing from AttributeDefinitions: {body}"
+        );
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A malformed `hash_attribute_type`/`sort_attribute_type` (anything but
+/// `S`/`N`/`B`, case-insensitively) is a client error, matching real
+/// DynamoDB's own rejection of an unknown `AttributeType` — never silently
+/// dropped or defaulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_gsi_rejects_an_unknown_attribute_type() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"orders",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = console(
+            console_addr,
+            "POST",
+            "/console/api/tables/orders/gsi",
+            r#"{"index_name":"by-status","hash_attribute":"status","hash_attribute_type":"X"}"#,
+        )
+        .await;
+        assert_eq!(status, 400, "expected a client error: {body}");
 
         node.shutdown_graceful().await;
     })

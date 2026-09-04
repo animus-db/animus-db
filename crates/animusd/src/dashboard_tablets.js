@@ -136,15 +136,36 @@ function renderTabletDetail(tablets, groups) {
   const gs = groups[tbSelectedId] || [];
   const lead = gs.find((x) => x.g.is_leader);
 
+  // Full per-replica Raft detail (docs/roadmap.md U-01): term, commit,
+  // applied, durable, and snapshot indices, plus the log length — every
+  // field `CpRaftView` (admin.rs) carries beyond the leader/role summary the
+  // row itself already shows. `durable_index`/`commit_index` diverging from
+  // `last_applied` is exactly the replication-lag signal ADR 0021 §3's
+  // design calls for surfacing.
   const replicaRows = (t.replicas || []).map((rid) => {
     const g = gs.find((x) => nodeIdOf(x.node) === rid);
     const role = g ? (g.g.is_leader ? "leader" : "follower") : "unreachable";
     const dotCls = g ? (g.g.is_leader ? "ok-dot" : "dim-dot") : "bad-dot";
-    const meta = g ? `t${g.g.term} · i${g.g.last_applied}${g.g.quiesced ? " · quiesced" : ""}` : "—";
+    const meta = g
+      ? `t${g.g.term} · commit ${g.g.commit_index} · applied ${g.g.last_applied} · durable ${g.g.durable_index} · snapshot ${g.g.snapshot_index} · log ${g.g.log_len}${g.g.quiesced ? " · quiesced" : ""}`
+      : "—";
     return `<div class="replica-row">${dot(dotCls)}${idSpan(rid, "node mono")}
       <span class="role" style="color:${role === "leader" ? "var(--accent)" : role === "unreachable" ? "var(--danger)" : "var(--text2)"}">${esc(role)}</span>
       <span class="meta">${esc(meta)}</span></div>`;
   }).join("");
+
+  // This tablet's own live voter/learner sets (ADR 0058 Train 1) — a
+  // converged group's replicas all report the same sets, so the leader's own
+  // view (or, absent a reachable leader, any reachable replica's) is the
+  // representative one. Deliberately NOT derived from `t.replicas`
+  // (`Metadata`'s own tablet-map view of who SHOULD host this tablet) —
+  // `CpRaftView.voters`/`.learners` is this replica's live Raft config, the
+  // ground truth during a mid-reconfigure window where the two can disagree.
+  const repView = lead || gs[0];
+  const votersLearnersHtml = repView ? `<div class="meta" style="margin-top:8px">
+      <div>Voters: ${(repView.g.voters || []).map((v) => idSpan(v, "mono")).join(" ") || `<span class="muted">—</span>`}</div>
+      <div>Learners: ${(repView.g.learners || []).length ? repView.g.learners.map((v) => idSpan(v, "mono")).join(" ") : `<span class="muted">none</span>`}</div>
+    </div>` : "";
 
   let storageHtml;
   if (!lead) {
@@ -173,7 +194,7 @@ function renderTabletDetail(tablets, groups) {
       <button class="link-text" id="tb-detail-close">Close ×</button></div>
     <div class="sub">${tableCellHtml(t.table)} · ${esc(tokenBound(t.range && t.range.start, "AAAAAAAAAAA"))} → ${esc(tokenBound(t.range && t.range.end, "__________8"))}</div>
     <h3>Raft group</h3>
-    <div style="margin-bottom:18px">${replicaRows || `<div class="empty">no replicas</div>`}</div>
+    <div style="margin-bottom:18px">${replicaRows || `<div class="empty">no replicas</div>`}${votersLearnersHtml}</div>
     <h3>Storage engine</h3>
     ${storageHtml}
     <div class="row" style="margin-top:16px">

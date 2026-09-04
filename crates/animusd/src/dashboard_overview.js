@@ -1,13 +1,18 @@
 "use strict";
-// The Overview view: health banner, stat tiles, a nodes list (grouped into
-// "Control plane" / "Data nodes" sections when a split deployment's
+// The Overview view: health banner, stat tiles, a "Read path" card of
+// `sparkline()` tiles reading `/admin/metrics/history`'s ring buffer for the
+// six CP read-path counters (docs/roadmap.md U-01), a nodes list (grouped
+// into "Control plane" / "Data nodes" sections when a split deployment's
 // control-only nodes exist, each reachable row linking to that node's own
-// admin console), a per-table breakdown (real data — the design's "Recent
-// activity" panel is dropped, since there is no backend event log to back
-// it), and a tablets-per-node balance chart. Depends on `dashboard_core.js`
-// having loaded first (STATE, $, esc, pill, dot, idSpan, consoleLink,
-// nodeIdOf, nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
-// statusDotClass, computeHealth, activateTab, splitHiddenTable).
+// admin console and, for a data member, a `believes_alive` badge — the
+// control leader's own real-time failure-detector verdict, ADR 0012,
+// distinct from the committed `Metadata` status the row's main text already
+// shows), a per-table breakdown (real data — the design's "Recent activity"
+// panel is dropped, since there is no backend event log to back it), and a
+// tablets-per-node balance chart. Depends on `dashboard_core.js` having
+// loaded first (STATE, $, esc, pill, dot, idSpan, consoleLink, nodeIdOf,
+// nodeDisplayId, cpGroupsByTablet, tabletStatus, worstTabletStatus,
+// statusDotClass, computeHealth, activateTab, splitHiddenTable, sparkline).
 
 function renderOverview() {
   const status = STATE.status;
@@ -92,6 +97,38 @@ function renderOverview() {
     `<div class="stat-tile"><div class="label">${esc(t.label)}</div><div class="value${t.live ? " live" : ""}">${t.value}</div><div class="sub">${esc(t.sub)}</div></div>`
   ).join("");
 
+  // ---- read-path sparklines (docs/roadmap.md U-01) ----
+  // This node's own `/admin/metrics/history` ring (`SELF.metricsHistory`,
+  // dashboard_core.js) — per-node, not cluster-aggregated (see that field's
+  // own doc: a sum-across-nodes sparkline would hide which node is actually
+  // doing the work). The six CP read-path counters (ADR 0016/0017/0055/0018
+  // — the linearizable ReadIndex path, the eventually-consistent path, and
+  // the clock-uncertainty restart signal): each tile charts the raw,
+  // monotonically non-decreasing counter's shape over the retained ~2h
+  // window (`sparkline()`, dashboard_core.js), not its instantaneous rate —
+  // a flat line means no activity of that kind occurred in the window, a
+  // rising one means it did.
+  const samples = (SELF.metricsHistory && SELF.metricsHistory.samples) || [];
+  const READPATH_COUNTERS = [
+    ["cp_read_barriers_served", "Read barriers served"],
+    ["cp_read_barriers_timed_out", "Read barriers timed out"],
+    ["cp_eventual_reads_local", "Eventual reads (local)"],
+    ["cp_eventual_reads_forwarded", "Eventual reads (forwarded)"],
+    ["cp_eventual_reads_fell_back", "Eventual reads (fell back)"],
+    ["cp_uncertainty_restarts", "Uncertainty restarts"],
+  ];
+  $("ov-readpath").innerHTML = samples.length
+    ? READPATH_COUNTERS.map(([key, label]) => {
+        const series = samples.map((s) => (s.counters && s.counters[key]) || 0);
+        const latest = series.length ? series[series.length - 1] : 0;
+        return `<div class="stat-tile">
+          <div class="label">${esc(label)}</div>
+          <div class="value">${esc(latest.toLocaleString())}</div>
+          <div class="sub">${sparkline(series)}</div>
+        </div>`;
+      }).join("")
+    : `<div class="empty">no metrics history yet (this node's own ring buffer, sampled every 10s)</div>`;
+
   // ---- nodes list ----
   // Every DATA member (tracked in replicated `Metadata`, keyed by raftkv id —
   // covers both a "data"-role and a "combined"-role node) plus every
@@ -123,8 +160,22 @@ function renderOverview() {
       // false`) — called out here, minimally, rather than as a new column,
       // since it's the same "current status" text this row already shows.
       const neverActivated = m && m.status === "Down" && m.has_activated === false;
+      // The control leader's OWN real-time failure-detector verdict for this
+      // member (`/admin/raft`'s `believes_alive`, ADR 0012) — a live signal
+      // distinct from `m.status` above, which is the *committed*, already-
+      // proposed-and-applied transition the leader itself derives FROM this
+      // same verdict. The two usually agree; showing both is the point —
+      // `believesAlive` can briefly disagree with a lagging `status` (a
+      // just-flapped member the leader hasn't proposed a transition for yet)
+      // or simply confirm it. `null` (no control leader known, or this
+      // member has no entry in the leader's own `/admin/raft` view — e.g. a
+      // control-only fan-out gap) renders no badge at all rather than a
+      // misleading guess.
+      const leaderMembers = h.controlLeader && h.controlLeader.raft && h.controlLeader.raft.members;
+      const fdEntry = Array.isArray(leaderMembers) ? leaderMembers.find((mm) => mm.node === id) : null;
+      const believesAlive = fdEntry ? fdEntry.believes_alive : null;
       return {
-        id, role, up,
+        id, role, up, believesAlive,
         base: node && node.ok ? node.base : null,
         detail: `${hostedCount} tablet(s)`,
         statusText: m
@@ -137,6 +188,7 @@ function renderOverview() {
       <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${esc(r.role)}</span>
       <span class="detail">${esc(r.detail)}</span>
       ${consoleLink(r.base, r.id)}
+      ${r.believesAlive == null ? "" : pill(r.believesAlive ? "ok" : "warn", r.believesAlive ? "fd: alive" : "fd: not alive")}
       <span class="status-text" style="color:var(${r.up ? "--ok" : "--danger"})">${esc(r.statusText)}</span>
     </div>`;
   const groupHead = (label) =>
