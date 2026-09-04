@@ -12114,14 +12114,28 @@ mod forward_transport_failure_tests {
             .next()
             .expect("seed put provisioned a tablet")
             .0;
-        let replicas = nodes[0]
-            .metadata()
-            .tablets
-            .get(&tablet)
-            .expect("tablet exists")
-            .replicas
-            .clone();
-        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+        // The tablet's replica set is an eventual property: `provision_tablet`
+        // records a best-effort initial set and `reconcile_placement` grows it
+        // to `MAX_REPLICATION_FACTOR` (see `tests/tablet_rf_self_heals.rs`),
+        // so poll to convergence rather than asserting the first read.
+        let rf_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let replicas = loop {
+            let replicas = nodes[0]
+                .metadata()
+                .tablets
+                .get(&tablet)
+                .expect("tablet exists")
+                .replicas
+                .clone();
+            if replicas.len() == 3 {
+                break replicas;
+            }
+            assert!(
+                tokio::time::Instant::now() < rf_deadline,
+                "RF did not converge to MAX_REPLICATION_FACTOR: {replicas:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let caller = nodes
             .iter()
@@ -12252,6 +12266,7 @@ mod forward_hop_timeout_tests {
         ClusterConfig {
             nodes,
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -12383,14 +12398,28 @@ mod forward_hop_timeout_tests {
             .next()
             .expect("seed put provisioned a tablet")
             .0;
-        let replicas = nodes[0]
-            .metadata()
-            .tablets
-            .get(&tablet)
-            .expect("tablet exists")
-            .replicas
-            .clone();
-        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+        // The tablet's replica set is an eventual property: `provision_tablet`
+        // records a best-effort initial set and `reconcile_placement` grows it
+        // to `MAX_REPLICATION_FACTOR` (see `tests/tablet_rf_self_heals.rs`),
+        // so poll to convergence rather than asserting the first read.
+        let rf_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let replicas = loop {
+            let replicas = nodes[0]
+                .metadata()
+                .tablets
+                .get(&tablet)
+                .expect("tablet exists")
+                .replicas
+                .clone();
+            if replicas.len() == 3 {
+                break replicas;
+            }
+            assert!(
+                tokio::time::Instant::now() < rf_deadline,
+                "RF did not converge to MAX_REPLICATION_FACTOR: {replicas:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let caller = nodes
             .iter()
@@ -12586,14 +12615,28 @@ mod forward_hop_timeout_tests {
             .next()
             .expect("seed put provisioned a tablet")
             .0;
-        let replicas = nodes[0]
-            .metadata()
-            .tablets
-            .get(&tablet)
-            .expect("tablet exists")
-            .replicas
-            .clone();
-        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+        // The tablet's replica set is an eventual property: `provision_tablet`
+        // records a best-effort initial set and `reconcile_placement` grows it
+        // to `MAX_REPLICATION_FACTOR` (see `tests/tablet_rf_self_heals.rs`),
+        // so poll to convergence rather than asserting the first read.
+        let rf_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let replicas = loop {
+            let replicas = nodes[0]
+                .metadata()
+                .tablets
+                .get(&tablet)
+                .expect("tablet exists")
+                .replicas
+                .clone();
+            if replicas.len() == 3 {
+                break replicas;
+            }
+            assert!(
+                tokio::time::Instant::now() < rf_deadline,
+                "RF did not converge to MAX_REPLICATION_FACTOR: {replicas:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let caller = nodes
             .iter()
