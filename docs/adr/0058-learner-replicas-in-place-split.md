@@ -250,7 +250,23 @@ is written assuming them:
   written by the same discipline ADR 0050 established: at the point the
   parent's shard chain becomes complete and immutable, so lineage
   derivation stays race-free by construction. `split_parents` stays
-  deleted.
+  deleted. **(2026-09-04 amendment, issue #588)** Race-free at *write*
+  time was never the gap: `SplitLineage::parents_final_epoch` is
+  legitimately `None` whenever the parent itself never sealed a shard of
+  its own before it split further (ADR 0043 §A3's "never seal an empty
+  segment" — a real, documented outcome of a fast cascade, not a lost
+  race; `docs/engineering-lessons.md`'s #580 entry had already flagged
+  this exact gap as a known-but-unaddressed edge case). The bug was at
+  *read* time: `Metadata::stream_shard_parent_id` used to stop at that
+  `None`, permanently stranding every descendant of a never-sealed
+  intermediate tablet with a null `ParentShardId` even though a real
+  sealed ancestor sits one or more hops further up the very same
+  `split_lineage` chain. Fixed by walking past a never-sealed ancestor to
+  the nearest one that did seal (bounded by `split_lineage.len()`, since
+  it's a tree) — `None` now means only "no ancestor anywhere in this
+  chain, all the way to the root, has ever sealed anything." No change to
+  *when* or *what* `split_lineage` writes — the fix is entirely in the
+  derived read.
 - **The copy-kinds classification** (`KIND_BASE`/`KIND_LSI`/`KIND_FOOTPRINT`
   retained; `KIND_CHANGE`/`KIND_CURSOR` dropped) — unchanged, reused
   verbatim at a different mechanism (see Train 2).
