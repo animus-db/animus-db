@@ -15694,6 +15694,46 @@ does get wired into these tests, which `docs/engineering-lessons.md`'s own
 #572, immediately above) suggests should probably happen — a separate,
 not-yet-scoped follow-up, not fixed here).
 
+**Follow-up, issue #588 (2026-09-04): the "known, undocumented-until-now
+edge case" this entry named above (a doubly-cascaded `(child, parent)`
+pick tripping the downstream `ParentShardId` check) is what actually
+happened next, on `main`, twice.** Not a double-fork of the same parent
+(a hypothesis this issue's own triage text initially favored, going as far
+as naming the branch after it) — `BeginSplitInPlace`/`CutoverSplit`'s
+epoch-CAS + state gate make a second fork of an already-forked-away parent
+structurally impossible, confirmed by direct code reading, not just
+assumed. Reproduced instead in ~1-in-10 real `ProdEnv` runs with a fully
+legitimate, single-fork-per-parent lineage tree: an intermediate tablet
+split again having sealed *nothing of its own* (exactly this entry's own
+"a child... can legitimately reach its own CutoverSplit with nothing ever
+sealed for it" case), so `stream_shard_parent_id` returned `None` for
+every one of its descendants — permanently, since `parents_final_epoch`
+is frozen once, at cutover, and never revisited. Root-caused with a
+diagnostic `eprintln!` of `split_lineage` dropped into a scratch copy of
+this exact test (removed before the real fix landed) — the printed tree
+showed a clean, well-formed cascade with **no** duplicate parent entries,
+which is what closed out the double-fork hypothesis in minutes rather than
+hours of re-reading the CAS logic looking for a hole that wasn't there.
+Fixed at the source of the derivation, not the test: `Metadata::
+stream_shard_parent_id` now walks past a never-sealed intermediate
+ancestor to the nearest one that DID seal (`docs/adr/
+0058-learner-replicas-in-place-split.md`'s Fork F9 entry has the full
+mechanism) — `None` means only "no ancestor anywhere in the chain ever
+sealed," never "the immediate parent happens to be one that didn't." The
+test itself still needed a companion fix (`streams_e2e.rs`): it used to
+assert the child's rendered `ParentShardId` names the *immediate* `parent`
+tablet id the lineage scan happened to land on — after the derivation fix,
+that is no longer always the same tablet, so the assertion now derives its
+own expectation via `meta.stream_shard_parent_id(child, 0)` (the same
+function production code calls) rather than assuming it equals
+`parent.0`. **General form**: when an accessor derives a value by walking
+one hop of a chain and stops the moment that hop has nothing to say, ask
+whether "nothing to say" is actually possible mid-chain (not just at the
+true end) before trusting a one-hop `?`/early-return to mean "there is no
+answer" — a legitimate empty link partway through a chain is a different
+fact than a legitimate empty chain, and conflating them stops a derivation
+that should recurse.
+
 ## The driver arm on a background loop's own error policy must match its sibling routes' (2026-09-03, issue #580, extends #572's lesson)
 
 `inplace_split_driver_tick`'s two exhaustion loops (`crates/animusd/src/
