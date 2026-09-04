@@ -947,6 +947,38 @@ reusing the captured config is the point of the test.
   card; and `dashboard_storage.js`'s `SYSTEM_TABLE_KINDS` extended to all 16
   `EntityKind` variants (`animus-control::syskv`), dropping a stray
   `"keyspace"` entry that never matched any real `EntityKind` segment.
+  **docs/roadmap.md U-02** added a ninth tab, Backups (`dashboard_backups.js`,
+  gated to control + combined exactly like Placement — no per-node fan-out,
+  just replicated `Metadata` a data-only node can't read locally): a render
+  of `/admin/backups`/`/admin/restores` (`admin.rs::backups_view`/
+  `restores_view`) plus a per-table PITR status row derived from
+  `/admin/status`'s own `schemas[*].pitr` (`TableSchema::pitr`,
+  `animus-control::schema`, already fetched — no third route), and four
+  gated actions, each behind `window.confirm` and posted through the
+  existing `/admin/data/dynamo` proxy (ADR 0021) with the real DynamoDB op
+  names/payload shapes: `CreateBackup{TableName,BackupName}`,
+  `DeleteBackup{BackupArn}`, `RestoreTableFromBackup{TargetTableName,
+  BackupArn}`, and `UpdateContinuousBackups{TableName,
+  PointInTimeRecoverySpecification:{PointInTimeRecoveryEnabled}}`. The
+  Create-backup table picker and the PITR table list both reuse
+  `dashboard_browser.js`'s `dynamoTables()` rather than a second table
+  fetch — `dashboard_backups.js` loads after `dashboard_browser.js` for
+  this reason. **No proxy allowlist change was needed**:
+  `admin.rs::action_data_dynamo` has no op allowlist beyond the bare-name
+  Streams-vs-item disambiguation (`STREAMS_OPS`), and none of these four
+  ops are Streams ops, so each resolves to the ordinary
+  `DynamoDB_20120810.<op>` item-API target and reaches
+  `animus_dynamo::wire::decode_request` unchanged — the same path every
+  other Data Browser mutation already takes. `admin.rs`'s own `backup_id`
+  field **is** the backup's DynamoDB ARN, not a bare id (`wire::backup_arn`
+  mints the whole ARN as the catalog's opaque `BackupId` key, `animus-
+  dynamo::wire`'s own doc), so the row's `backup_id` is posted directly as
+  `BackupArn` with no client-side ARN construction. `RestoreTableFromBackup`
+  is the only action needing input beyond confirmation (the new table's
+  name) — taken via `window.prompt`, this tab's one departure from the
+  Data Browser's static-form convention, since a per-row target-table
+  prompt has no natural home in a persistent form the way Create-backup's
+  table+name pair does.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

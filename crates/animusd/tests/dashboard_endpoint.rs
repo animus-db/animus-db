@@ -393,12 +393,13 @@ async fn dashboard_role_gating_split_deployment() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
             ),
             "the control role's own tab list now includes Streams too (a control-only \
              node holds the full replicated Metadata, so the stream list + shard-chain \
-             detail render truthfully there; only the live-tail poller degrades), and \
-             now Transactions too (docs/roadmap.md U-01, gated like tablets): {core_js}"
+             detail render truthfully there; only the live-tail poller degrades), \
+             Transactions too (docs/roadmap.md U-01, gated like tablets), and now \
+             Backups too (docs/roadmap.md U-02, gated like placement): {core_js}"
         );
 
         // ---- /admin/config's role differs across the split -----------------
@@ -780,9 +781,9 @@ async fn dashboard_u01_render_only_fixes() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
             ) && core_js.contains(
-                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"]"#
+                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups", "node"]"#
             ),
             "the Transactions tab is role-gated exactly like Tablets (ROLE_TABS): {core_js}"
         );
@@ -909,6 +910,141 @@ async fn dashboard_u01_render_only_fixes() {
             !storage_js.contains("[\"keyspace\","),
             "the stray [\"keyspace\", ...] dropdown entry (never a real EntityKind \
              segment, always returned zero rows) is dropped, not carried forward: {storage_js}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-02: the Backups tab — a render-only assertion group,
+/// mirroring `dashboard_u01_render_only_fixes`' own structure (this is a
+/// render-only change over already-covered JSON: `/admin/backups`'s and
+/// `/admin/restores`'s own shapes are proven end to end elsewhere —
+/// `admin_endpoint.rs::admin_backups_view_reflects_the_catalog` and
+/// `dynamo_restore.rs`'s own `/admin/restores` assertion — so this file only
+/// proves the dashboard surface: the shell/script markers, the four gated
+/// actions' real DynamoDB op names/payload shapes (`CreateBackup`/
+/// `DeleteBackup`/`RestoreTableFromBackup`/`UpdateContinuousBackups`, each
+/// behind a `window.confirm`), role gating (control/combined, exactly like
+/// Placement — asserted above in `dashboard_role_gating_split_deployment`,
+/// which this PR's own diff to that test's `ROLE_TABS` string already
+/// covers the data-only exclusion for), and that both routes actually 200
+/// from a live node). No proxy-allowlist change was needed for this PR —
+/// `admin.rs::action_data_dynamo` has no op allowlist beyond the bare-name
+/// Streams-vs-item disambiguation (`STREAMS_OPS`), and none of these four
+/// ops are Streams ops, so each resolves to the ordinary
+/// `DynamoDB_20120810.<op>` item-API target and reaches
+/// `animus_dynamo::wire::decode_request` unchanged — already exercised by
+/// `dynamo_backup.rs`/`dynamo_restore.rs`/`dynamo_pitr.rs` over the real
+/// wire edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u02_backups_tab() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the Backups nav link + section --------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"data-tab="backups""#) && shell.contains(r#"<section id="backups""#),
+            "the shell carries the Backups nav link and section: {shell}"
+        );
+        assert!(
+            shell.contains("dashboard_backups.js"),
+            "the shell references the Backups view's script asset: {shell}"
+        );
+        assert!(
+            shell.contains(r#"id="bk-create-table""#)
+                && shell.contains(r#"id="bk-list-body""#)
+                && shell.contains(r#"id="bk-pitr-body""#)
+                && shell.contains(r#"id="bk-restores-body""#),
+            "the shell carries the Create-backup form, the backup list, the \
+             per-table PITR toggle list, and the restores list: {shell}"
+        );
+
+        // ---- dashboard_backups.js renders the catalog + the four gated
+        //      actions with the real DynamoDB op names/payload field names --
+        let (s, _, backups_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_backups.js").await;
+        assert_eq!(s, 200, "dashboard_backups.js is served");
+        assert!(
+            backups_js.contains("function renderBackups"),
+            "dashboard_backups.js renders the backup/restore/PITR catalogs: {backups_js}"
+        );
+        for (op, field) in [
+            ("CreateBackup", "BackupName"),
+            ("DeleteBackup", "BackupArn"),
+            ("RestoreTableFromBackup", "TargetTableName"),
+            ("UpdateContinuousBackups", "PointInTimeRecoveryEnabled"),
+        ] {
+            assert!(
+                backups_js.contains(op) && backups_js.contains(field),
+                "dashboard_backups.js posts {op} with its real payload field \
+                 {field}: {backups_js}"
+            );
+        }
+        assert!(
+            backups_js.contains("PointInTimeRecoverySpecification"),
+            "UpdateContinuousBackups nests PointInTimeRecoveryEnabled under \
+             PointInTimeRecoverySpecification, matching the wire decoder: {backups_js}"
+        );
+        assert_eq!(
+            backups_js.matches("if (!window.confirm(").count(),
+            4,
+            "each of the four actions (create/delete/restore/PITR toggle) is \
+             gated behind its own window.confirm, the crate's one mutation \
+             idiom (the module doc comment's own mention of window.confirm \
+             is deliberately excluded by this narrower pattern): {backups_js}"
+        );
+        assert!(
+            backups_js.contains("/admin/data/dynamo"),
+            "every action posts through the existing dashboard dynamo proxy, \
+             never a new endpoint: {backups_js}"
+        );
+        assert!(
+            backups_js.contains("dynamoTables()"),
+            "the Create-backup table picker and the PITR table list reuse the \
+             Data Browser's own table source rather than a second fetch: {backups_js}"
+        );
+
+        // ---- dashboard_core.js fetches both catalogs alongside /admin/status,
+        //      not a per-node fan-out (unlike /admin/txns) ---------------------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/backups") && core_js.contains("/admin/restores"),
+            "dashboard_core.js fetches both catalogs once against SEED: {core_js}"
+        );
+        assert!(
+            core_js.contains(
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
+            ) && !core_js.contains(r#"data: ["node", "browser", "streams", "backups"]"#),
+            "Backups is role-gated to control + combined exactly like Placement \
+             — absent from the data role's own tab list: {core_js}"
+        );
+
+        // ---- both routes actually serve from a live node --------------------
+        let (s, _, backups_body) = raw(admin_addr, "GET", "/admin/backups").await;
+        assert_eq!(s, 200, "GET /admin/backups: {backups_body}");
+        assert!(
+            serde_json::from_str::<Value>(&backups_body)
+                .expect("backups view is JSON")
+                .get("backups")
+                .is_some(),
+            "the catalog is served under \"backups\", the shape dashboard_backups.js reads: {backups_body}"
+        );
+        let (s, _, restores_body) = raw(admin_addr, "GET", "/admin/restores").await;
+        assert_eq!(s, 200, "GET /admin/restores: {restores_body}");
+        assert!(
+            serde_json::from_str::<Value>(&restores_body)
+                .expect("restores view is JSON")
+                .get("restores")
+                .is_some(),
+            "the catalog is served under \"restores\", the shape dashboard_backups.js reads: {restores_body}"
         );
 
         nodes[0].shutdown_graceful().await;

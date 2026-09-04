@@ -73,6 +73,7 @@
     <button class="navlink" data-tab="browser">Data Browser</button>
     <button class="navlink" data-tab="streams">Streams</button>
     <button class="navlink" data-tab="storage">Storage</button>
+    <button class="navlink" data-tab="backups">Backups</button>
     <button class="navlink" data-tab="node">Node</button>
     <span class="spacer"></span>
     <div class="sidebar-foot" id="sidebar-foot"></div>
@@ -362,6 +363,37 @@
       </div>
     </section>
 
+    <section id="backups" class="view-max">
+      <div class="view-head">
+        <h1>Backups</h1>
+        <span class="muted" id="bk-summary"></span>
+      </div>
+      <div class="card" id="bk-create-card">
+        <div class="row" style="justify-content:space-between">
+          <h2>Create backup</h2>
+        </div>
+        <div class="row" style="margin-bottom:10px">
+          <label>table</label><select id="bk-create-table"></select>
+          <label>name</label><input type="text" id="bk-create-name" placeholder="backup_name">
+          <button class="primary" id="bk-create-submit">Create backup</button>
+          <span class="muted" id="bk-create-msg"></span>
+        </div>
+      </div>
+      <div class="row" style="margin-bottom:6px"><span class="muted" id="bk-action-msg"></span></div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>Backups</h2>
+        <div id="bk-list-body"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card scroll" style="margin-bottom:14px">
+        <h2>Continuous backups (PITR)</h2>
+        <div id="bk-pitr-body"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card scroll">
+        <h2>Restores</h2>
+        <div id="bk-restores-body"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+
     <section id="node" class="view-max">
       <div class="view-head">
         <h1>Node</h1>
@@ -425,6 +457,7 @@
 <script src="/admin/ui/dashboard_streams.js"></script>
 <script src="/admin/ui/dashboard_browser.js"></script>
 <script src="/admin/ui/dashboard_storage.js"></script>
+<script src="/admin/ui/dashboard_backups.js"></script>
 <script src="/admin/ui/dashboard_node.js"></script>
 <script>
 "use strict";
@@ -497,6 +530,13 @@ $("key-load").addEventListener("click", inspectKey);
 $("seed-table").addEventListener("change", () => { seedTable = $("seed-table").value; renderSeedTables(); });
 $("seed-go").addEventListener("click", seedRun);
 $("seed-stop").addEventListener("click", () => { seeding = false; });
+
+// Backups (docs/roadmap.md U-02) — per-row actions (Restore/Delete/PITR
+// toggle) are wired inside renderBackups() itself, mirroring the Data
+// Browser's own per-index Drop buttons (dashboard_browser.js) since those
+// rows are rebuilt on every refresh; only the static Create-backup button
+// is wired here, once.
+$("bk-create-submit").addEventListener("click", createBackup);
 
 // Node (ADR 0035 PR7) — storage debug scoped to this node only, no node dropdown.
 $("nd-load").addEventListener("click", loadNodeStorage);
