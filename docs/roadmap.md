@@ -64,19 +64,8 @@ the still-true paragraph after the table.
   (2) arithmetic operands, `+`/`-` as first-class tokens; (3) nested-path
   SET/REMOVE targets (touches `apply_update`'s data model).
 - **Size:** M + S + L.
-- **Depends:** do W-02 first so PR3 reuses its `Field | Index` path
-  segment type.
-
-### W-02 ProjectionExpression list-index paths
-
-- **Gap:** `a[0]` is rejected (`reject_list_index`, `wire.rs:2883`).
-- **Plan:** change the projection path segment from `String` to
-  `enum { Field(String), Index(usize) }`; extend `Projection::apply`'s
-  reconstruction to build `L` elements at the indexed slot.
-- **Files:** `wire.rs` `resolve_projection_name` ~2847, `reject_list_index`
-  ~2883, `Projection::apply`.
-- **Tests:** `wire.rs` projection unit tests; `dynamo_documents.rs`.
-- **ADR:** none. **PRs:** one. **Size:** S.
+- **Depends:** W-02 landed 2026-09-04; PR3 reuses its `PathSegment::{Field,
+  Index}` type from `wire.rs`.
 
 ### W-03 Order-preserving encoding for `N` sort keys
 
@@ -104,57 +93,24 @@ the still-true paragraph after the table.
   `key_bytes` + `animus-tablet` mirror + `matches_raw`; (4) index, stream,
   backup regressions.
 - **Size:** L (small algorithm, large blast radius).
-- **Depends:** land W-05 first to avoid rebasing `schema.rs`'s bridge.
+- **Depends:** W-05 landed 2026-09-04; `schema.rs`'s bridge now carries
+  index key attribute types, so this can start at any time.
 
-### W-04 UpdateTable strictness
+### W-11 `AttributeDefinitions` must cover every key attribute
 
-- **Gap:** `BillingMode`, `SSESpecification`, `ReplicaUpdates`,
-  `ProvisionedThroughput` are never parsed, so a body carrying only those
-  may be silently ignored instead of rejected; GSI `Update` element
-  rejection wording needs confirming.
-- **Plan:** explicit `ValidationException` for each unsupported top-level
-  key in `decode_update_table` (`wire.rs:2585-2626`), matching the existing
-  GSI-`Update` rejection idiom at `decode_index_updates` ~2670.
-- **Tests:** `wire.rs` UpdateTable cases (~6074-6180).
-- **ADR:** none. **PRs:** one. **Size:** S.
-
-### W-05 Durable index key attribute types (issue #319)
-
-- **Gap:** `IndexDef` carries bare attribute names; `DescribeTable`'s
-  `AttributeDefinitions` defaults every index-only attribute to `"S"`.
-- **Plan:** add `#[serde(default)]` type fields to `IndexDef` and the
-  registry's `GlobalSecondaryIndex`/`LocalSecondaryIndex`, threaded from
-  the `AttributeDefinitions` array `CreateTable`/`UpdateTable` already
-  require; both bridge directions; console Add-GSI type picker.
-- **Files:** `crates/animus-control/src/schema.rs:244-262`;
-  `crates/animus-dynamo/src/registry.rs:67-88`, `schema.rs:146,172`,
-  `wire.rs` `decode_index_entry` ~2462 and `attribute_definitions`
-  ~4382; console `AddGsiRequest` (`crates/animusd/src/lib.rs:2697-2723`).
-- **Tests:** flip
-  `describe_table_response_attribute_definitions_cover_index_key_attributes`
-  (`wire.rs:5864`).
-- **ADR:** none. **PRs:** (1) fields + CreateTable; (2) UpdateTable
-  CreateIndex + console; (3) response fix + test flip. **Size:** M.
-
-### W-06 Cheap missing ops: tags, DescribeLimits, DescribeEndpoints
-
-- **Gap:** all return `UnknownOperationException`. Some SDK tooling probes
-  them.
-- **Plan:** `tags: BTreeMap<String,String>` on `TableSchema`
-  (`#[serde(default)]`, same precedent as `stream`/`ttl`/`pitr`), mutated by
-  new `MetaCommand::{TagResource,UntagResource}` modelled on `SetTableTtl`
-  (`meta.rs:1412`, apply arm ~3082). `DescribeLimits` is static;
-  `DescribeEndpoints` reads `ClusterConfig` listen addresses.
-- **Gotcha:** a new `MetaCommand` variant must be added at every gating
-  match site (`is_relayable_command`, `mirror.rs`, `syskv.rs`) — the
-  "missed allowlist" bimodal flake in root `CLAUDE.md`.
-- **Files:** `crates/animus-control/src/{schema.rs:298-338,meta.rs}`;
-  `wire.rs` decode table ~1287; `crates/animusd/src/dynamo.rs` dispatch
-  ~568.
-- **Tests:** new `crates/animusd/tests/dynamo_tags.rs`; `meta::tests`
-  next to `SetTableTtl`; a follower-connected regression for relay.
-- **ADR:** none. **PRs:** (1) control-plane plumbing; (2) three tag ops;
-  (3) DescribeLimits + DescribeEndpoints (independent). **Size:** M + S.
+- **Gap:** DynamoDB rejects a `CreateTable`/`UpdateTable` whose key schema
+  (table or index) names an attribute absent from `AttributeDefinitions`;
+  this adapter accepts it and falls back to `S`. Found while landing W-05:
+  most of the repo's own test fixtures omit `AttributeDefinitions` even
+  for base keys, so enforcing it is a fixture sweep, not a one-liner.
+- **Plan:** a `ValidationException` in `decode_create_table`/
+  `decode_update_table` when any hash/sort attribute of the table or of a
+  created index has no declared type; sweep the fixtures under
+  `crates/animusd/tests` and the console's create-table path to declare
+  types; update `website/compatibility.html`.
+- **Files:** `crates/animus-dynamo/src/wire.rs`; `crates/animusd/tests/*`.
+- **Tests:** `wire.rs` decode cases; every fixture the sweep touches.
+- **ADR:** none. **PRs:** one. **Size:** S–M (mechanical breadth).
 
 ### W-07 PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`)
 
@@ -387,9 +343,10 @@ the still-true paragraph after the table.
   `SimEnv` setup from `animus-control`/`animus-cp-data` tests and the B1
   seed harness in `animus-test`; then a first cycles/durability corpus.
   Size M. Land before C-01.
-- **E1:** fake-kube-client harness for `controller.rs`'s `reconcile`,
-  `control_nodes_changed`, `drain_and_remove_node`, reusing
-  `desired/test_support.rs::test_cluster`. Size S–M.
+- **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
+  `animus-operator`, fake-driven `controller::tests`; ADR 0061's
+  2026-09-04 amendment). E2 (`animus-cli` coverage) stays folded into
+  U-08's trailing PRs.
 - **ADR:** amendment notes on 0061.
 
 ### C-05 `SharedWal` (built, unwired): keep, wire later
@@ -428,24 +385,12 @@ Conventions (verified): a new admin route needs a match arm in
 `dashboard.html`, a `dashboard_X.js`, an `include_str!` in `dashboard.rs`,
 a `<script>` tag, and a `ROLE_TABS` entry (`dashboard_core.js:538`).
 Dashboard tests: `crates/animusd/tests/dashboard_endpoint.rs`; admin
-tests: `admin_endpoint.rs`. CLI has no dedicated tests. Console widening:
+tests: `admin_endpoint.rs`. CLI arg parsing is unit-tested via `admin_request`
+(`crates/animus-cli/src/main.rs`); nothing opens a socket. Console widening:
 `ConsoleBackend` in `crates/animus-node/src/console.rs` plus the
 `animusd` impl, tests in `tests/console_*.rs`. The dashboard's only
 mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 `window.confirm` guard.
-
-### U-01 Render-only dashboard fixes (no backend change)
-
-- Transactions tab over `/admin/txns` (`CpTxnView`, `admin.rs:141-197`).
-- Full per-group Raft detail (commit, durable, snapshot index, log len,
-  voters, learners) in `renderTabletDetail` (`dashboard_tablets.js:133`).
-- `believes_alive` badge in `renderOverview` (`dashboard_overview.js:12`).
-- Sparklines from `/admin/metrics/history` (720-sample ring,
-  `lib.rs:8264-8325`) as a shared component in `dashboard_core.js`, on
-  Overview stat tiles; chart the six read-path counters there.
-- `SYSTEM_TABLE_KINDS` (`dashboard_storage.js:56-66`) extended to all 16
-  `EntityKind` variants (`syskv.rs:100-198`).
-- **PRs:** one per bullet or one series. **Size:** M total.
 
 ### U-02 Backups tab
 
@@ -515,10 +460,8 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ### U-08 CLI parity
 
-- **(i) Flat GETs:** `backups`, `restores`, `txns`, `peers`,
-  `control-members`, `system-table [--kind]`, `storage-scan`,
-  `storage-control` as new arms in `run_admin` (`main.rs:185-266`) plus
-  `ADMIN_USAGE`. Size S.
+- **(i) landed 2026-09-04** (`admin_request` pure arg parser + eight flat
+  GET arms in `animus-cli`).
 - **(ii) Dynamo-proxy wrappers:** `backup create|delete`, `restore`,
   `pitr enable|disable`, `ttl`, `stream`, each a `run_*` helper posting
   to `/admin/data/dynamo`. Size M.
@@ -528,7 +471,8 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ## 5. Documentation
 
-D-01 (the stale-prose sweep) and S-07a landed 2026-09-02. What remains
+D-01 (the stale-prose sweep) and S-07a landed 2026-09-02; wave 1 landed
+2026-09-04. What remains
 here: `website/index.html`'s "Planned" pills stay until S-01 lands.
 
 ---
@@ -556,13 +500,13 @@ wave are independent and can run in parallel.
 
 | Wave | Items | Why here |
 |---|---|---|
-| 1 | W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1 | Small, ADR-free, no cross-deps |
-| 2 | W-01, W-10, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
+| 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
+| 2 | W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06 | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04; S-07b after S-06 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
 
-Open issues mapped: #375 → W-01, #319 → W-05. The flaky-test issues
+Open issues mapped: #375 → W-01 (#319 closed by W-05). The flaky-test issues
 (#280, #298, #418, #447, #539) are correctness work under the green
 invariant, not roadmap items, and take precedence over any wave.
