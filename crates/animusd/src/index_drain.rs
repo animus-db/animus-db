@@ -2019,7 +2019,7 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
         ctx.env.next_u64(),
     );
 
-    let replicas = match ctx.data().backup_store.put(&seg_id, &bytes).await {
+    let replicas = match ctx.backup_store.put(&seg_id, &bytes).await {
         Ok(r) => r,
         Err(e) => {
             return Err(format!("backup store put of {seg_id:?} failed: {e}"));
@@ -2232,7 +2232,7 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
         ctx.env.next_u64(),
     );
 
-    let replicas = match ctx.data().segment_store.put_sealed(&seg_id, &bytes).await {
+    let replicas = match ctx.segment_store.put_sealed(&seg_id, &bytes).await {
         Ok(r) => r,
         Err(e) => {
             ctx.data()

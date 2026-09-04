@@ -7,7 +7,7 @@
 //! tablet's own hot-log housekeeping (that job is the sealer + hot-trim arm,
 //! `index_drain.rs`).
 //!
-//! ## Who runs this, and the control-only-leader gap
+//! ## Who runs this
 //!
 //! Spawned unconditionally on every node shape that can ever become the
 //! control-plane leader (`BoundNode::start_with_streams` — combined — and
@@ -21,23 +21,22 @@
 //! all, so `leader_handle()` there is permanently `None`; spawning the loop
 //! would be a harmless but pointless extra tick forever.
 //!
-//! **Documented scope gap.** Phases 2/3 below (object deletion, replica
-//! repair) need a [`crate::SegmentStoreHandle`] — which only exists on a
-//! node with a data role (`crate::DataRole`) — while phase 1's own *mark*
-//! step and the drop-table retention-zero rule need only `Metadata`. On a
-//! **combined** node this is moot (every combined node has both roles); on
-//! a **control-only** leader (a genuine split deployment, ADR 0035) phases
-//! 2/3 are skipped for as long as that leadership stint lasts — rows still
-//! get marked (and so stop being newly discoverable via `dynamo_streams.rs`'s
-//! own `expired`-row filtering) but their objects/rows are never physically
-//! reclaimed until a data-role node becomes the control leader instead. A
-//! **pure** split deployment (control-only nodes are the *only* control
-//! voters) therefore never runs phases 2/3 at all today — a real, deliberate
-//! deferral: extending `SegmentStoreHandle` provisioning to a control-only
-//! node is its own follow-up scope, not attempted here. Every end-to-end
-//! test for this module runs against a combined-mode cluster, where the
-//! control leader always also has a data role. See
-//! `docs/engineering-lessons.md` for the full note.
+//! **The control-only-leader scope gap is closed (W-10, 2026-09-04).**
+//! Phases 2/3 below (object deletion, replica repair) need a
+//! [`crate::SegmentStoreHandle`] — which every node shape now provisions
+//! (`ClientCtx::segment_store`), **never** gated on running the data role
+//! (`crate::DataRole`) the way it used to be. On a **control-only** leader
+//! (a genuine split deployment, ADR 0035) every phase now runs exactly as
+//! it would on a combined or data-only leader: this loop's only remaining
+//! dependency is `Metadata` plus this handle, neither of which needs a
+//! hosted tablet. A **pure** split deployment (control-only nodes are the
+//! *only* control voters) therefore reclaims stream segments correctly on
+//! its own, with no data-role node ever needing to take the lead. See
+//! `crate::ClientCtx::segment_store`'s own doc for why the handle lives
+//! outside `DataRole`, and `tests/stream_janitor.rs`'s
+//! `segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+//! for the end-to-end regression against a genuine split topology (a
+//! control-only trio + data-only nodes, no combined-mode node anywhere).
 //!
 //! ## The phases, one snapshot per tick
 //!
@@ -243,11 +242,9 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
             // The single-directory `FsSegmentStore` opt-in's own convention
             // (ADR 0043 §A7b): no per-replica list, but a real object still
             // needs a real (local) delete — never treat "empty list" as
-            // "nothing to delete."
-            let Some(data) = ctx.data_opt() else {
-                continue; // control-only leader — see the module doc's gap
-            };
-            match data.segment_store.delete_sealed(&[], seg_id).await {
+            // "nothing to delete." `ctx.segment_store` is provisioned on
+            // every node shape, including a control-only leader (W-10).
+            match ctx.segment_store.delete_sealed(&[], seg_id).await {
                 Ok(()) if may_remove_row => removed.push((*tablet, *epoch)),
                 Ok(()) => {}
                 Err(e) => tracing::warn!(
@@ -274,10 +271,7 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
             }
             continue;
         }
-        let Some(data) = ctx.data_opt() else {
-            continue; // control-only leader — see the module doc's gap
-        };
-        match data
+        match ctx
             .segment_store
             .delete_sealed(&still_present, seg_id)
             .await
@@ -301,9 +295,6 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
     }
 
     // --- Phase 2: replica repair for every live, cluster-replicated row --
-    let Some(data) = ctx.data_opt() else {
-        return; // control-only leader — nothing further this tick
-    };
     for ((tablet, epoch), row) in meta.stream_shards.iter() {
         if row.expired || row.replicas.is_empty() {
             continue;
@@ -328,7 +319,7 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
         // Ledger-named-object amendment: resolve from the row, never
         // recompute `segment_id`.
         let seg_id = row.object_id.as_str();
-        let bytes = match data.segment_store.get_sealed(&alive, seg_id).await {
+        let bytes = match ctx.segment_store.get_sealed(&alive, seg_id).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 tracing::error!(
@@ -350,7 +341,7 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
             }
         };
         let target_k = row.replicas.len();
-        let new_replicas = match data
+        let new_replicas = match ctx
             .segment_store
             .repair_replicas(seg_id, &bytes, &alive, target_k)
             .await
@@ -394,7 +385,7 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
     }
 
     // --- Phase 3: orphan reap (ledger-named-object amendment) ------------
-    reap_orphans(&data.segment_store, &meta, now_ms).await;
+    reap_orphans(&ctx.segment_store, &meta, now_ms).await;
 }
 
 /// Phase 3: orphan reap (ADR 0042 §10/ADR 0043 §A3 as-built amendment) — a

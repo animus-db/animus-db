@@ -356,7 +356,8 @@ reusing the captured config is the point of the test.
   the DynamoDB wire path or a `SimCluster` reaches them, and they have
   their own real-socket coverage; so did a handful of small,
   genuinely-crate-wide accessors that don't belong to any one cluster
-  (`effective_metadata`, `metadata_fresh`, `data`/`data_opt`,
+  (`effective_metadata`, `metadata_fresh`, `data` — `data_opt` also lived
+  here at the time, since deleted as dead code, W-10 — and
   `not_leader_error`) — moving them into one cluster would only have
   forced the identical `pub(crate)` widening onto them with no locality
   benefit, since `admin.rs`/`dynamo.rs`/`backup_capture.rs`/
@@ -521,10 +522,16 @@ reusing the captured config is the point of the test.
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
   that crate's own `host` module doc for the shape and why three, not
   one). Every method here is a **thin, logic-free delegation** —
-  `self.edge.leader_handle()`, `self.data_opt().map(|d| d.backup_store
-  ...)`, one call into `dynamo::kind_write_item_at_leader` — nothing is
-  decided here that wasn't already decided by an existing `ClientCtx`/
-  `CpGroup`/`BackupStoreHandle` method. This is the seam that let five of
+  `self.edge.leader_handle()`, `self.backup_store.put(..)`, one call into
+  `dynamo::kind_write_item_at_leader` — nothing is decided here that
+  wasn't already decided by an existing `ClientCtx`/`CpGroup`/
+  `BackupStoreHandle` method. **`BackupObjectStore`'s four methods always
+  answer `Some(..)` now (W-10)** — `self.backup_store` is provisioned on
+  every node shape (see `ClientCtx::backup_store`'s own doc), so the
+  `self.data_opt()?` early-return this impl used to open with is gone;
+  the trait itself stays `Option`-returning for a genuinely store-less
+  host (`animus_node::backup_janitor`'s own `ControlOnlyStore` test
+  double). This is the seam that let five of
   the six leaf background loops (`ttl_reaper.rs`, `index_backfill.rs`,
   `backup_completion.rs`, `backup_janitor.rs`, `pitr_janitor.rs` — each
   now a thin wrapper into `animus-node`, see their own entries below) move
@@ -586,8 +593,16 @@ reusing the captured config is the point of the test.
   (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h) are hardcoded production
   defaults — no CLI knob yet, the identical documented gap `ttl_reaper.rs`'s
   own sweep interval has. The module's own doc has the full design
-  including the self-healing-tag residual and the control-only-leader
-  scope gap. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
+  including the self-healing-tag residual. **The retention loop's own
+  control-only-leader scope gap is closed (W-10)**: `pitr_janitor_loop`'s
+  segment-object reclaim now has a real `BackupStoreHandle`
+  (`ClientCtx::backup_store`) on every node shape. `pitr_snapshot_loop`'s
+  own `BeginBackup` **capture** step stays structurally inert on a
+  control-only leader for an unrelated, unfixable reason — capture is
+  per-tablet leader-side (`backup_capture.rs`), and a control-only node
+  never hosts (so never leads) a CP-data tablet; it still correctly
+  proposes `BeginBackup`/tags rows, it just never has a tablet to capture
+  from. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
   lives in `index_drain.rs`, alongside the stream seal arm it mirrors — see
   that module's doc.
 - **`segment_janitor.rs` did NOT move in rung C2** (ADR 0061) — the one of
@@ -602,7 +617,7 @@ reusing the captured config is the point of the test.
 - **`segment_janitor.rs`** (ADR 0043 §A9) — the **segment janitor**: a
   control-plane-**leader**-only background loop (`segment_janitor_loop`)
   doing two-phase retention reclaim + replica repair over the whole
-  `stream_shards` catalog. The module's own 80-line `//!` doc has the full
+  `stream_shards` catalog. The module's own `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
   **Retired-tablet rule (ADR 0050 rung 6)**: a cutover-removed split
@@ -611,6 +626,27 @@ reusing the captured config is the point of the test.
   children), never tablet presence, and the max-epoch pin applies to live
   tablets only (a retired chain can never seal again) — both halves
   red-proven in `tests/stream_janitor.rs::retired_parents_*`.
+  **The control-only-leader scope gap is closed (W-10, 2026-09-04, ADR
+  0043 §A9)**: phases 2/3 (object deletion, replica repair) used to skip
+  unconditionally on a control-only leader (`ClientCtx::data_opt() ==
+  None` there — that accessor no longer exists at all, see below); every
+  node shape now provisions a real `SegmentStoreHandle`
+  (`ClientCtx::segment_store`), never gated on running the data role, so a
+  **pure** split deployment (control-only nodes are the only control
+  voters) reclaims stream segments correctly with no data-role node ever
+  needing to take the lead. `segment_store`/`backup_store` moved off
+  `DataRole` onto `ClientCtx` itself for this — `DataRole` now holds only
+  genuinely data-role-specific fields (`rmw_lock`, `raftkv_metrics`,
+  `base_id`, `stream_seal_knobs`, `change_rates`); `ClientCtx::data()`
+  (panicking) survives for those, but `data_opt()` (the non-panicking
+  accessor this module used to be the sole caller of) was deleted as dead
+  code. Regression: `tests/stream_janitor.rs::
+  segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+  — a genuine split deployment (3 control-only + 2 data-only nodes, no
+  combined-mode node anywhere) whose control leader (necessarily one of
+  the control-only trio) reclaims a sealed stream's segment objects,
+  including the physical on-disk delete at every recorded (data-only)
+  replica.
 - **`index_backfill.rs`'s loop body moved to `animus_node::
   index_backfill`** (ADR 0061 rung C2 — the first loop moved, and the only
   one needing no capability beyond `ControlLeaderHost<E>`: `metadata()`/
@@ -629,9 +665,10 @@ reusing the captured config is the point of the test.
   every tablet **currently** in that table's live tablet map (a fresh read
   every tick, never cached) has a matching row in `Metadata::index_backfill`
   — the per-tablet catalog the backfill seeder (`index_drain.rs`, below)
-  populates. Touches only replicated `Metadata` (no `SegmentStoreHandle`/
-  data role), so unlike the segment janitor it has **no** control-only-leader
-  scope gap: a pure control-only leader drives the flip too. See the
+  populates. Touches only replicated `Metadata` (no `SegmentStoreHandle`
+  needed at all), so it never had a control-only-leader scope gap to begin
+  with — unlike `segment_janitor.rs`'s own (since W-10, closed): a pure
+  control-only leader drives the flip too. See the
   module's own doc for the full design; `tests/index_backfill.rs` proves
   convergence, the no-premature-flip property against a hand-driven
   `MarkIndexBackfilled` sequence (this file's own suite predates the
@@ -2513,14 +2550,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   (`animus_cp_data::backup::backup_manifest_object_id`/
   `backup_data_object_id` vs. `animus_cp_data::segment::segment_id`) are
   already disjoint, the same belt-and-suspenders posture the ADR itself
-  takes for the namespace split. `BackupStoreHandle` (`DataRole::
-  backup_store`, alongside `DataRole::segment_store`) is threaded through
-  combined (`BoundNode::start_with_growth`) and data-only
-  (`BoundDataNode::start_data_with_growth`) node assembly — **never**
-  control-only (`BoundControlNode::start_control_with` takes no such
-  parameter at all), the identical "no data role, no `SegmentStoreHandle`-
-  shaped handle" gap the streams segment janitor already documents for ADR
-  0043 §A9, inherited rather than fixed here. **Consumed since Train 1
+  takes for the namespace split. `BackupStoreHandle` (`ClientCtx::
+  backup_store`, alongside `ClientCtx::segment_store` — **W-10 moved both
+  off `DataRole` onto `ClientCtx` itself**, provisioned on every node
+  shape) is threaded through combined (`BoundNode::start_with_growth`),
+  data-only (`BoundDataNode::start_data_with_growth`), **and now
+  control-only** (`BoundControlNode::start_control_with`, W-10, ADR 0043
+  §A9's control-only-leader gap — closed) node assembly. **Consumed since Train 1
   PR③** (`#[allow(dead_code)]` removed from `BackupStoreHandle`/its impl/
   `DataRole::backup_store`, PR② → PR③'s own promised follow-up): the
   capture driver (`backup_capture.rs`) `put`s chunked data objects and the
@@ -2540,10 +2576,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `#[allow(dead_code)]`-marked — neither gained a caller in Train 2 either
   (`delete`, unlike the janitor's own `delete_local`, still has no recorded
   `replicas` list to call it with; restore never deletes anything).
-  `data --config`/`data --seed`/`control`/`join`/`--cluster-control`+
-  `--cluster-data` all default to `BackupStoreConfig::Cluster` internally —
-  no CLI flag reaches any of them, the identical documented gap
-  `--segment-store` already has on those same entry points.
+  `data --config`/`data --seed`/`join`/`--cluster-control`+`--cluster-data`
+  all default to `BackupStoreConfig::Cluster` internally — no CLI flag
+  reaches any of them, the identical documented gap `--segment-store` has
+  on those same entry points. **`animusd control` is the one exception
+  (W-10)**: `--segment-store`/`--backup-store` now thread through it
+  exactly as they do through `--config`/`--node` and `--cluster N`
+  (`main.rs`'s `run_control` → `run_node_control_with_stores`).
 - **`backup_capture.rs`** (ADR 0059 §4/§5/§6, Train 1 PR③) — the on-demand
   backup **capture driver**: a per-tablet, leader-side, event-driven loop
   (`backup_capture_loop`, the same "run everywhere, self-gate per tablet on
@@ -2592,13 +2631,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   manifest), `put`s it **before** proposing `MetaCommand::CompleteBackup`
   (durable-before-visible, ADR 0059 §4) — or, past a driver-local
   `STUCK_CREATING_TIMEOUT` (10 minutes, no CLI knob yet) with zero observed
-  report-count growth, proposes `MetaCommand::FailBackup`. **Inherits the
-  identical control-only-leader scope gap `segment_janitor.rs` already
-  documents**: failing needs only `Metadata` (a control-only leader can do
-  it); completing needs a `BackupStoreHandle`, which no control-only node
-  provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
-  and control-only nodes (never data-only, which never becomes control
-  leader at all).
+  report-count growth, proposes `MetaCommand::FailBackup`. **The
+  control-only-leader scope gap `segment_janitor.rs` used to document is
+  closed (W-10)**: failing always needed only `Metadata` (a control-only
+  leader could always do it); completing needs a `BackupStoreHandle` to
+  durably `put` the manifest, which every node shape now provisions
+  (`ClientCtx::backup_store`, never gated on data role) — spawned on
+  combined and control-only nodes (never data-only, which never becomes
+  control leader at all).
 - **`backup_janitor.rs`'s loop body moved to `animus_node::backup_janitor`**
   (ADR 0061 rung C2) — this module is now a thin wrapper, same shape as
   `backup_completion.rs`'s own move above. The regression tests that used
@@ -2630,11 +2670,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   first tick, before a node that does hold a copy ever sweeps its own —
   those copies become permanent, uncataloged orphans. See the module's own
   doc, the ADR's 2026-08-27 as-built amendment, and `docs/engineering-
-  lessons.md` for the full note. **Inherits the identical control-only-
-  leader scope gap** `segment_janitor.rs`/`backup_completion.rs` already
-  document (object reclaim needs a `BackupStoreHandle`, which no
-  control-only node provisions) — spawned on combined and control-only
-  nodes, never data-only.
+  lessons.md` for the full note. **The control-only-leader scope gap
+  `segment_janitor.rs`/`backup_completion.rs` used to document is closed
+  (W-10)**: object reclaim needs a `BackupStoreHandle`, which every node
+  shape now provisions (`ClientCtx::backup_store`) — spawned on combined
+  and control-only nodes, never data-only.
 - **`backup_restore.rs`** (ADR 0059 §7, Train 2; §10, Train 3 PR②) — the **restore driver**:
   a per-tablet, leader-side, event-driven loop (`backup_restore_loop`, the
   identical "run everywhere, self-gate per tablet on `group.is_leader()`"
@@ -3165,19 +3205,35 @@ precisely located blockers, neither introduced by this rung:**
   bypassing `ClientCtx` entirely for setup — the identical thing
   `animus-node/tests/index_backfill_sim.rs` already does for the same
   reason.
-- **`DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle`.** Both hardcode
-  `FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>`
-  regardless of the enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s
-  `prod` feature is unconditionally on for this crate, so `FsSegmentStore`
-  genuinely exists here — the blocker isn't C0's feature gate, it's that
-  neither handle type takes an `E` parameter at all). A real `DataRole`
-  therefore cannot be built generically today. Not exercised by this rung:
-  neither `cp_kind_write_raw` nor `cp_get` ever calls
-  `self.data()`/`self.data_opt()` (verified by reading both call chains,
-  not assumed), so `data: None` is sufficient to prove this rung's claim.
-  Any future extension that needs a real `DataRole` under `SimEnv` (the
-  DynamoDB-shaped `cp_kind_write_item` write path, the TTL/backup/stream
-  loops) hits this blocker first.
+- **`ClientCtx::segment_store`/`backup_store`'s `SegmentStoreHandle`/
+  `BackupStoreHandle`.** Both hardcode `FsSegmentStore`/
+  `ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of the
+  enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s `prod` feature is
+  unconditionally on for this crate, so `FsSegmentStore` genuinely exists
+  here — the blocker isn't C0's feature gate, it's that neither handle
+  type takes an `E` parameter at all). **W-10 moved these two fields off
+  `DataRole` onto `ClientCtx` itself** (provisioned on every node shape,
+  including control-only — see `ClientCtx::segment_store`'s own doc), so
+  unlike every other `DataRole` field this harness's fixture can no longer
+  dodge them via `data: None` — every `ClientCtx` construction, generic
+  `E` included, now needs a real value for both. The fixture (below) works
+  around this the same way it already dodges the schema-DDL blocker above:
+  `SegmentStoreHandle::Fs`/`BackupStoreHandle::Fs` are the one variant of
+  each enum that carries no `E`-typed (or any `ProdEnv`-typed) state at
+  all — `FsSegmentStore::new` doesn't touch the filesystem or any `Env`
+  until `put`/`get`/`delete` is actually called — so a placeholder `Fs`
+  value satisfies the field without needing `ProdEnv` or touching disk;
+  `single_node_ctx`'s own doc has the detail. Only the **`Cluster`**
+  variant is the genuine blocker: neither `cp_kind_write_raw` nor `cp_get`
+  ever reads `ctx.segment_store`/`ctx.backup_store` at all (verified by
+  reading both call chains, not assumed), so this rung never needed a real
+  `Cluster`-backed handle to prove its claim. Any future extension that
+  needs a genuinely working (not placeholder) store handle under `SimEnv`
+  (the segment janitor, the backup/PITR capture-and-reclaim loops) hits
+  this blocker first — it would need a `SimSegmentStore`-shaped
+  `SegmentStoreHandle`/`BackupStoreHandle` variant, which doesn't exist in
+  this crate (ADR 0043 §A7b's `SimSegmentStore` is `animus-cp-data`'s own
+  sim-corpus concern, never reached from here).
 
 **Not yet generic, also worth knowing before extending this harness**:
 `handle_request` and `dynamo::marker_batch_write_raw`/
@@ -3185,10 +3241,11 @@ precisely located blockers, neither introduced by this rung:**
 `&ClientCtx` (`E = ProdEnv`) — only the five split modules
 (`schema`/`read_path`/`write_path`/`txn_coordinator`/`forwarding`) and a
 handful of `lib.rs`-resident crate-wide accessors
-(`effective_metadata`/`data`/`data_opt`/…) are `E`-generic today. Driving
+(`effective_metadata`/`data`/…) are `E`-generic today (`data_opt` no
+longer exists, W-10 — see this file's own entry above). Driving
 the DynamoDB wire-shaped write path (`cp_kind_write_item`, which *is*
 already `E`-generic in `write_path.rs`) under `SimEnv` is reachable in a
-follow-on rung once a `SimEnv`-safe `DataRole` exists; driving
+follow-on rung once a `SimEnv`-safe `DataRole`/store-handle pair exists; driving
 `handle_request`/`dynamo.rs`'s handlers themselves is a larger, separate
 genericization this rung did not attempt.
 

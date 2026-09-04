@@ -9,7 +9,7 @@
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
-//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
 //! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--dynamo-auth PATH] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
 //! ```
@@ -123,22 +123,22 @@
 //! same two backends (`cluster`, the default K-replicated
 //! `ClusterSegmentStore`; `fs:PATH`, a bare single-directory
 //! `FsSegmentStore`) but never the same object namespace
-//! (`animus_cp_data::backup`'s `backup/{backup_id}/...` ids). **Plumbing
-//! only as of ADR 0059 Train 1 PR②** — no capture driver, janitor, or wire
-//! surface reads or writes through it yet, so this flag has no observable
-//! effect beyond validating and threading the knob down to where a later
-//! PR's capture driver will read it. Same scope as `--segment-store`
-//! (`--config`/`--node` and `--cluster N` only) and the same documented
-//! `--backup-store`-less gap on `--cluster-control`/`--cluster-data` and the
-//! standalone `control`/`data`/`join` subcommands — **and, unlike
-//! `--segment-store`, this asymmetry additionally means a control-only node
-//! never provisions a backup store at all**, matching the ADR 0043 §A9 gap
-//! the streams segment janitor already has for the identical reason (no
-//! data role, no `SegmentStoreHandle`-shaped handle of any kind).
-//! **Unlike `--segment-store dir:PATH`, `--backup-store` also accepts the
-//! literal keyword `cluster`** (spelled out because ADR 0059 §1 states the
-//! knob as `cluster|fs:PATH` rather than "omit for cluster") — omitting the
-//! flag and passing `--backup-store cluster` are equivalent.
+//! (`animus_cp_data::backup`'s `backup/{backup_id}/...` ids). Consumed by
+//! the per-tablet capture driver (`backup_capture.rs`), the completion
+//! aggregator (`backup_completion.rs`), the backup/PITR janitors, and
+//! restore (ADR 0059 Trains 1–3, all implemented). Threads through
+//! `--config`/`--node`, `--cluster N`, **and (W-10) `animusd control`** —
+//! `--cluster-control`/`--cluster-data` and the standalone `data`/`join`
+//! subcommands remain a documented gap (each always gets the default
+//! `Cluster` store, since neither parses this flag). **A control-only node
+//! now provisions a real backup store just like a combined or data-only
+//! one (W-10, ADR 0043 §A9's control-only-leader gap — closed)** — its
+//! backup/PITR janitors can physically reclaim objects for as long as it
+//! leads, not just mark rows. **Unlike `--segment-store dir:PATH`,
+//! `--backup-store` also accepts the literal keyword `cluster`** (spelled
+//! out because ADR 0059 §1 states the knob as `cluster|fs:PATH` rather than
+//! "omit for cluster") — omitting the flag and passing `--backup-store
+//! cluster` are equivalent.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -207,7 +207,7 @@ const USAGE: &str = "usage:\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS]\n  \
+    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH]\n  \
     animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH]";
 
@@ -741,6 +741,14 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     // See `run`'s own `--orphan-sweep-after` doc (ADR 0040 PR6) — applies
     // identically here since a control-only node runs a local `RaftNode` too.
     let mut orphan_sweep_after: Option<u64> = None;
+    // `--segment-store dir:PATH` / `--backup-store cluster|fs:PATH` (W-10,
+    // ADR 0043 §A9's control-only-leader gap — closed): see `run`'s own doc
+    // for the full knob description. A control-only node can genuinely
+    // become the control-plane leader (ADR 0035) and now provisions these
+    // handles exactly like a combined or data-only node's own `--config`/
+    // `--cluster N` path does.
+    let mut segment_store: Option<String> = None;
+    let mut backup_store: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -752,22 +760,33 @@ async fn run_control(args: &[String]) -> Result<(), String> {
             "--orphan-sweep-after" => {
                 orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
             }
+            "--segment-store" => {
+                segment_store = Some(parse_next(&mut it, "--segment-store")?);
+            }
+            "--backup-store" => {
+                backup_store = Some(parse_next(&mut it, "--backup-store")?);
+            }
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
     let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
+    let segment_store_config = parse_segment_store(segment_store.as_deref())?;
+    let backup_store_config = parse_backup_store(backup_store.as_deref())?;
     let path = config_path.ok_or("control requires --config FILE")?;
     let index = node.ok_or("control requires --node I")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
 
-    let node = animusd::run_node_control_with_orphan_sweep_after(
+    let node = animusd::run_node_control_with_stores(
         &config,
         index,
         &dir,
         backend,
         orphan_sweep_after,
+        segment_store_config,
+        backup_store_config,
+        animusd::DEFAULT_STREAM_RETENTION,
     )
     .await
     .map_err(|e| format!("failed to start control node {index}: {e}"))?;

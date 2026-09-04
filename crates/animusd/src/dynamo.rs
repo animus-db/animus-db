@@ -2215,7 +2215,6 @@ async fn restore_table_to_point_in_time(
 
     let manifest_object_id = backup_codec::backup_manifest_object_id(&base_id);
     let manifest_bytes = ctx
-        .data()
         .backup_store
         .get_any(&manifest_object_id)
         .await

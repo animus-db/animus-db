@@ -3386,6 +3386,8 @@ fn spawn_common_tail(
     control: ControlHandle,
     edge: ClusterEdgeState,
     data: Option<DataRole>,
+    segment_store: SegmentStoreHandle,
+    backup_store: BackupStoreHandle,
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
@@ -3411,6 +3413,8 @@ fn spawn_common_tail(
         edge,
         env,
         data,
+        segment_store,
+        backup_store,
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -3964,8 +3968,6 @@ impl BoundNode {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
-            segment_store,
-            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
         };
@@ -3973,6 +3975,8 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             edge.clone(),
             Some(data_role),
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -4441,6 +4445,7 @@ impl Node {
         Ok(BoundControlNode {
             id,
             env,
+            dir,
             internal_addr,
             client_listener,
             client_addr,
@@ -4771,6 +4776,15 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct BoundControlNode {
     id: NodeId,
     env: ProdEnv,
+    /// This node's own data directory (ADR 0040 PR1's `--dir`) — **not**
+    /// where the dedicated system-keyspace engine lives (that's
+    /// `dir.join("internal")`, via `ProdEnv::bind`); this is the directory
+    /// [`build_segment_store`]/[`build_backup_store`] root their own local
+    /// `FsSegmentStore` building block at (`dir.join("segments")`), mirroring
+    /// [`BoundNode::dir`]/[`BoundDataNode::dir`] (W-10, ADR 0043 §A9 — a
+    /// control-only node now provisions these handles too, see
+    /// [`start_control_with`](Self::start_control_with)'s doc).
+    dir: PathBuf,
     internal_addr: SocketAddr,
     client_listener: TcpListener,
     client_addr: SocketAddr,
@@ -4854,6 +4868,22 @@ impl BoundControlNode {
     /// of the apply task's published cache (`Metadata: DRIVER_APPLIED`)
     /// rather than an optional shadow mirror.
     ///
+    /// `segment_store_config`/`backup_store_config`/`stream_retention` (W-10,
+    /// ADR 0043 §A9's control-only-leader gap — closed): this node's own
+    /// [`SegmentStoreHandle`]/[`BackupStoreHandle`], built exactly the way
+    /// [`BoundNode::start_with_streams`]/[`BoundDataNode::
+    /// start_data_with_streams`] build theirs (`build_segment_store`/
+    /// `build_backup_store`, rooted at `self.dir.join("segments")`) —
+    /// **unlike [`DataRole`], never gated on running the data role**: a
+    /// control-only node can genuinely become the control-plane leader (ADR
+    /// 0035) and needs these handles to physically delete/repair stream
+    /// segment objects and reclaim backup objects for as long as it leads
+    /// (`segment_janitor`/`backup_janitor`/`backup_completion`/
+    /// `pitr_janitor`, all spawned below) — see each module's own doc for
+    /// what a control-only leader used to skip. `stream_retention` threads
+    /// through to the segment janitor exactly as [`BoundNode::
+    /// start_with_streams`]'s own parameter of the same name does.
+    ///
     /// # Errors
     /// Propagates a failure to open the dedicated engine (LSM backend only).
     #[allow(clippy::too_many_arguments)]
@@ -4866,6 +4896,9 @@ impl BoundControlNode {
         cluster_admin_addrs: Vec<SocketAddr>,
         backend: StorageBackend,
         orphan_sweep_after: Duration,
+        segment_store_config: SegmentStoreConfig,
+        backup_store_config: BackupStoreConfig,
+        stream_retention: Duration,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4913,6 +4946,11 @@ impl BoundControlNode {
         let engine_env = self.env.clone();
         // Keep a clone for peer-sync (below) before the env is consumed.
         let sync_env = self.env.clone();
+        // Keep a clone for `segment_store`/`backup_store` (below, built
+        // after `raft` exists — also before `self.env` is consumed by the
+        // `RaftNode::start_with_orphan_sweep_after` call inside the match
+        // just below).
+        let store_env = self.env.clone();
         // Keep a clone of this control-only node's dedicated engine for admin
         // introspection (`/admin/storage/control`, ADR 0038 PR4) — a second,
         // read-only handle onto the same live engine; the apply task's own
@@ -4960,10 +4998,36 @@ impl BoundControlNode {
         let edge = ClusterEdgeState::new();
         edge.register_control(raft.clone());
 
+        // This node's stream-shard segment store (ADR 0043 §A7b) — see
+        // `BoundNode::start_with_streams`'s identical construction; `control`
+        // here is `ControlHandle::Local`, which `ControlPlacementView` reads
+        // through unchanged. **W-10 (ADR 0043 §A9's control-only-leader gap,
+        // closed)**: unlike `DataRole`'s fields, this is provisioned
+        // regardless of data role — see `ClientCtx::segment_store`'s own doc
+        // for why it lives outside `DataRole`.
+        let segment_store = build_segment_store(
+            &store_env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            self.id.clone(),
+            &segment_store_config,
+        );
+        // This node's backup store (ADR 0059 §1) — see `segment_store`'s
+        // doc immediately above for why this is provisioned here too.
+        let backup_store = build_backup_store(
+            &store_env,
+            &self.dir,
+            ControlHandle::Local(raft.clone()),
+            self.id.clone(),
+            &backup_store_config,
+        );
+
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
             edge,
             None,
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -5002,20 +5066,19 @@ impl BoundControlNode {
 
         // The segment janitor (ADR 0043 §A9, round-3 PR7): a control-only
         // node can genuinely become the control-plane leader (ADR 0035
-        // split deployment), so it needs this loop too — retention
-        // *marking* and the drop-table retention-zero rule need only
-        // `Metadata`, which this node has. See `segment_janitor.rs`'s own
-        // doc for the documented gap this leaves (phases 2/3 — object
-        // deletion and replica repair — need a `SegmentStoreHandle`, which
-        // no control-only node provisions; a **pure** split deployment
-        // therefore never runs those two phases today). No CLI/config knob
-        // exists yet for a control-only node's own retention period —
-        // mirroring `StreamSealKnobs`/`SegmentStoreConfig`'s own documented
-        // "the split-deployment CLI path is a named follow-up" precedent —
-        // so this always uses the production default.
+        // split deployment), so it needs this loop too. **W-10 (closed)**:
+        // every phase now runs here, not just retention *marking* and the
+        // drop-table retention-zero rule — phases 2/3 (object deletion,
+        // replica repair) have a real `SegmentStoreHandle` to work with
+        // (`segment_store`, built above), the identical handle a combined
+        // or data-only leader's own leadership stint would use. See
+        // `segment_janitor.rs`'s own module doc for the full design.
+        // `stream_retention` threads through from the caller exactly as
+        // `BoundNode::start_with_streams`'s own parameter of the same name
+        // does — no longer hardcoded to the production default.
         tasks.push(tokio::spawn(segment_janitor::segment_janitor_loop(
             ctx.clone(),
-            DEFAULT_STREAM_RETENTION,
+            stream_retention,
         )));
 
         // The secondary-index backfill-completion aggregator (ADR 0045 §4):
@@ -5029,40 +5092,37 @@ impl BoundControlNode {
 
         // The on-demand backup completion aggregator (ADR 0059 §3/§4, Train
         // 1 PR③): a control-only node can genuinely become the control-plane
-        // leader (ADR 0035 split deployment), so it needs this loop too —
-        // *failing* a stuck backup needs only `Metadata`, but *completing*
-        // one needs a `BackupStoreHandle` to durably `put` the manifest,
-        // which no control-only node provisions — see
-        // `backup_completion.rs`'s own doc for the documented gap this
-        // leaves (a pure split deployment's control-only leader marks a
-        // fully-captured backup ready but cannot itself flip it to
-        // `Available`, until a data-capable node takes the lead instead).
+        // leader (ADR 0035 split deployment), so it needs this loop too.
+        // **W-10 (closed)**: *completing* a backup (durably `put`-ing the
+        // manifest) now works here too — `ctx.backup_store` (built above)
+        // is a real handle regardless of data role. See
+        // `backup_completion.rs`'s own doc for the full design.
         tasks.push(tokio::spawn(backup_completion::backup_completion_loop(
             ctx.clone(),
         )));
 
         // The on-demand backup janitor (ADR 0059 §3, Train 1 PR④): a
         // control-only node can genuinely become the control-plane leader
-        // (ADR 0035 split deployment), so it needs this loop too — the
-        // *mark* half (a wire `DeleteBackup` proposing `MarkBackupDeleted`)
-        // needs only `Metadata`, but the actual object reclaim needs a
-        // `BackupStoreHandle`, which no control-only node provisions — see
-        // `backup_janitor.rs`'s own doc for the documented gap this leaves
-        // (identical shape to the segment janitor's own, above): rows
-        // accumulate marked-but-unreclaimed until a data-capable node takes
-        // the lead instead.
+        // (ADR 0035 split deployment), so it needs this loop too. **W-10
+        // (closed)**: the actual object reclaim now works here too, via the
+        // same `ctx.backup_store` handle every other node shape uses — see
+        // `backup_janitor.rs`'s own doc for the full design.
         tasks.push(tokio::spawn(backup_janitor::backup_janitor_loop(
             ctx.clone(),
         )));
 
         // PITR periodic base snapshots + retention (ADR 0059 §9, Train 3): a
         // control-only node can genuinely become the control-plane leader
-        // (ADR 0035 split deployment), so it needs both loops too — the
-        // identical documented gap as the segment/backup janitors above:
-        // marking needs only `Metadata`, but the snapshot loop's own
-        // `BeginBackup` capture and the retention loop's own segment-object
-        // reclaim both need a data role no control-only node provisions
-        // (see `pitr_janitor.rs`'s own doc).
+        // (ADR 0035 split deployment), so it needs both loops too. **W-10
+        // (closed)**: the retention loop's own segment-object reclaim now
+        // works here too, via `ctx.backup_store`. The snapshot loop's own
+        // `BeginBackup` **capture** step is unaffected by this fix and stays
+        // structurally inert on a control-only leader for an unrelated
+        // reason — capture is per-tablet, leader-side (`backup_capture.rs`),
+        // and a control-only node never hosts (so never leads) a CP-data
+        // tablet; a control-only leader still correctly proposes
+        // `BeginBackup`/tags rows, it just never has a tablet of its own to
+        // capture from — see `pitr_janitor.rs`'s own doc.
         tasks.push(tokio::spawn(pitr_janitor::pitr_snapshot_loop(
             ctx.clone(),
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -5389,8 +5449,6 @@ impl BoundDataNode {
             rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
-            segment_store,
-            backup_store,
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
         };
@@ -5398,6 +5456,8 @@ impl BoundDataNode {
             control,
             edge.clone(),
             Some(data_role),
+            segment_store,
+            backup_store,
             admin_info,
             client_route,
             intra_route,
@@ -6443,16 +6503,6 @@ struct DataRole {
     /// wait for its own group to form" from "this node hosts nothing for the tablet,
     /// so forward."
     pub(crate) base_id: NodeId,
-    /// This node's stream-shard [`SegmentStoreHandle`] (ADR 0043 §A7b) — the
-    /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
-    /// `change_consumer_loop` seal arm's only consumer today.
-    pub(crate) segment_store: SegmentStoreHandle,
-    /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — a
-    /// second, backup-dedicated store handle alongside `segment_store`
-    /// above, built from its own `--backup-store` CLI knob. Consumed by the
-    /// per-tablet capture driver (`backup_capture.rs`) and the completion
-    /// aggregator (`backup_completion.rs`) since ADR 0059 Train 1 PR③.
-    pub(crate) backup_store: BackupStoreHandle,
     /// The DynamoDB Streams sealer's own size/age knobs (ADR 0042 §13).
     pub(crate) stream_seal_knobs: StreamSealKnobs,
     /// Growth PR3 Fork F (ADR 0042 §14): this node's own per-tablet
@@ -6505,6 +6555,28 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// [`DataRole`]'s doc. `None` on a control-only node (ADR 0035 PR3).
     /// Access via [`data`](Self::data), not directly.
     data: Option<DataRole>,
+    /// This node's stream-shard [`SegmentStoreHandle`] (ADR 0043 §A7b) — the
+    /// sealer's `SegmentStore::put` target, `index_drain.rs`'s
+    /// `change_consumer_loop` seal arm's only consumer today. **Provisioned
+    /// on every node shape, including a control-only one (W-10, ADR 0043
+    /// §A9's control-only-leader gap, closed):** unlike [`DataRole`]'s own
+    /// fields, this is never gated on running the data role — a
+    /// control-only node can genuinely become the control-plane leader (ADR
+    /// 0035) and, as the `segment_janitor` loop's own module doc
+    /// describes, its retention-reclaim and replica-repair phases need this
+    /// handle regardless of whether the leader also hosts tablets. Lives at
+    /// the top level of [`ClientCtx`] rather than inside [`DataRole`]
+    /// precisely so it is never behind that `Option`.
+    pub(crate) segment_store: SegmentStoreHandle,
+    /// This node's **backup** [`BackupStoreHandle`] (ADR 0059 §1) — the
+    /// `segment_store` field's twin for the on-demand backup/PITR
+    /// subsystem's own, independently-configured object namespace. Consumed
+    /// by the per-tablet capture driver (`backup_capture.rs`), the
+    /// completion aggregator (`backup_completion.rs`), and the backup/PITR
+    /// janitors. **Provisioned on every node shape, including a
+    /// control-only one (W-10)** — see `segment_store`'s doc above for why
+    /// this lives here rather than inside [`DataRole`].
+    pub(crate) backup_store: BackupStoreHandle,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -6596,18 +6668,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         self.data
             .as_ref()
             .expect("ClientCtx::data called on a control-only node (ADR 0035 PR3)")
-    }
-
-    /// Like [`data`](Self::data), but a non-panicking `Option` — for a path
-    /// that genuinely may run on a control-only node and must degrade
-    /// gracefully instead of asserting a data role exists. The segment
-    /// janitor (`segment_janitor.rs`, ADR 0043 §A9, round-3 PR7) is the one
-    /// caller today: it may run on **any** node that can become the
-    /// control-plane leader, including a control-only one (ADR 0035),
-    /// which has no [`SegmentStoreHandle`] at all — see that module's own
-    /// doc for the documented scope this gates.
-    pub(crate) fn data_opt(&self) -> Option<&DataRole> {
-        self.data.as_ref()
     }
 
     /// This node's best available **cache-tolerant** view of the cluster's
@@ -9816,6 +9876,15 @@ pub async fn start_split_cluster_with_growth(
                 admin_addrs.clone(),
                 backend,
                 orphan_sweep_after,
+                // `--segment-store`/`--backup-store` don't thread through
+                // this dev-only split-cluster path yet (a documented gap
+                // matching `--quiesce-after`'s own, `main.rs`'s module doc) —
+                // this still closes W-10's own gap for this path, since the
+                // default `Cluster` store is a real, working handle, not the
+                // total absence a control-only leader used to have.
+                SegmentStoreConfig::default(),
+                BackupStoreConfig::default(),
+                DEFAULT_STREAM_RETENTION,
             )
             .await?,
         );
@@ -10247,6 +10316,42 @@ pub async fn run_node_control_with_orphan_sweep_after(
     backend: StorageBackend,
     orphan_sweep_after: Duration,
 ) -> std::io::Result<Node> {
+    run_node_control_with_stores(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        SegmentStoreConfig::default(),
+        BackupStoreConfig::default(),
+        DEFAULT_STREAM_RETENTION,
+    )
+    .await
+}
+
+/// Like [`run_node_control_with_orphan_sweep_after`], but also configures
+/// this control-only node's own [`SegmentStoreHandle`]/[`BackupStoreHandle`]/
+/// stream-retention period (W-10, ADR 0043 §A9's control-only-leader gap —
+/// closed) instead of the `Cluster`/`Cluster`/[`DEFAULT_STREAM_RETENTION`]
+/// defaults — the innermost layer, mirroring [`BoundNode::
+/// start_with_streams`]'s own layered-wrapper convention: `animusd control`'s
+/// `--segment-store`/`--backup-store` CLI flags thread through here exactly
+/// as the combined path's own flags of the same name thread through
+/// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`].
+///
+/// # Errors
+/// As [`run_node_control`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_control_with_stores(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    segment_store_config: SegmentStoreConfig,
+    backup_store_config: BackupStoreConfig,
+    stream_retention: Duration,
+) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
     })?;
@@ -10295,6 +10400,9 @@ pub async fn run_node_control_with_orphan_sweep_after(
             admin_addrs,
             backend,
             orphan_sweep_after,
+            segment_store_config,
+            backup_store_config,
+            stream_retention,
         )
         .await
 }
@@ -10327,6 +10435,37 @@ pub async fn run_node_data(
     index: usize,
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
+) -> std::io::Result<Node> {
+    run_node_data_with_streams(
+        config,
+        index,
+        dir,
+        backend,
+        StreamSealKnobs::default(),
+        SegmentStoreConfig::default(),
+    )
+    .await
+}
+
+/// Like [`run_node_data`], but also configures the DynamoDB Streams sealer's
+/// own size/age knobs and segment-store selection — the data-only sibling of
+/// [`BoundNode::start_with_streams`]'s own layered-wrapper convention: every
+/// existing `run_node_data` call site keeps compiling and behaving
+/// identically (production knobs, the default `Cluster` store); a test that
+/// needs tiny seal thresholds (this codebase's own testing discipline —
+/// never wait out a 4-hour age trigger) calls this directly. Pairs with
+/// [`run_node_control_with_stores`]'s own `stream_retention` parameter for a
+/// genuine split-topology segment-janitor test (see `tests/stream_janitor.rs`).
+///
+/// # Errors
+/// As [`run_node_data`].
+pub async fn run_node_data_with_streams(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -10409,8 +10548,8 @@ pub async fn run_node_data(
             intra_route,
             None,
             admin_addrs,
-            StreamSealKnobs::default(),
-            SegmentStoreConfig::default(),
+            stream_seal_knobs,
+            segment_store_config,
             None,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
@@ -12241,7 +12380,7 @@ mod simenv_client_ctx_tests {
     /// `data: None` (no `DataRole`, ADR 0035 PR3's control-only shape) is
     /// deliberate, not a shortcut: neither `cp_kind_write_raw` nor `cp_get`
     /// — the two production methods this harness drives — ever calls
-    /// `self.data()`/`self.data_opt()` (verified by reading both call
+    /// `self.data()` (verified by reading both call
     /// chains, not assumed), so a `DataRole` is not needed to prove this
     /// rung's claim. Building one for real would need `SegmentStoreHandle`/
     /// `BackupStoreHandle`, both of which hardcode `FsSegmentStore`/
@@ -12302,6 +12441,13 @@ mod simenv_client_ctx_tests {
             // node id in one `Simulator` shares one virtual clock).
             env: sim.env(nid(0)),
             data: None,
+            // Neither `cp_kind_write_raw` nor `cp_get` ever reads these (see
+            // this function's own doc) — the `Fs` variant is a placeholder
+            // that never touches the filesystem until `put`/`get`/`delete`
+            // is actually called (`FsSegmentStore::new`'s own doc), so no
+            // real store or `ProdEnv` is needed just to satisfy the field.
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
