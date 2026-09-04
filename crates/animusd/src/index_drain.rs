@@ -2685,6 +2685,8 @@ mod gsi_drain_cursor_tests {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},
+                        {{"AttributeName":"g","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "GlobalSecondaryIndexes":[
                         {{"IndexName":"by-g",
@@ -3574,6 +3576,7 @@ mod stream_sealer_tests {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "StreamSpecification":{{"StreamEnabled":true,
                         "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
@@ -3590,7 +3593,9 @@ mod stream_sealer_tests {
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.CreateTable",
-            &format!(r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#),
+            &format!(
+                r#"{{"TableName":"{table}","AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],"KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+            ),
         )
         .await;
         assert_eq!(status, 200, "CreateTable failed: {body}");
@@ -4164,6 +4169,8 @@ mod stream_sealer_tests {
                 "DynamoDB_20120810.CreateTable",
                 &format!(
                     r#"{{"TableName":"{table}",
+                        "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},
+                            {{"AttributeName":"g","AttributeType":"S"}}],
                         "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                         "GlobalSecondaryIndexes":[
                             {{"IndexName":"by-g",
@@ -4594,6 +4601,7 @@ mod stream_sealer_tests {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
             ),
         )

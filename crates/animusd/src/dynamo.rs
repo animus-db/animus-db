@@ -7220,6 +7220,7 @@ mod stream_write_path_tests {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "StreamSpecification":{{"StreamEnabled":true,
                         "StreamViewType":"KEYS_ONLY"}}}}"#
@@ -7349,6 +7350,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"mb",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -7416,6 +7418,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"benchp",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -7614,6 +7617,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"plain",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
