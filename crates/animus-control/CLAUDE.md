@@ -171,6 +171,17 @@ per-tablet CP data plane (`animus-cp-data`).
   changing the attribute in place (no disable/re-enable round trip) is
   `Applied` — see the variant's own doc before copying `SetTableStream`'s
   shape for a future replicated-config command that also has no label.
+  **`TableSchema::tags: BTreeMap<String, String>`** (roadmap W-06, DynamoDB
+  `TagResource`/`UntagResource`/`ListTagsOfResource`) is a third shape,
+  neither `StreamSpec`'s label-carrying nor `TtlSpec`'s no-label-single-
+  value one: it **merges** rather than replaces, so `MetaCommand::
+  TagResource`/`UntagResource`'s apply arms are per-key set/remove, and
+  (unlike `SetTableTtl`) a caller checking whether its own write committed
+  must compare per-key membership, never the whole map — see
+  `docs/engineering-lessons.md`'s entry on this for the general form.
+  `Metadata::table_tags` mirrors `table_ttl`/`table_pitr`'s read-accessor
+  shape (empty map rather than `None` for a known table with no tags, since
+  a tag set has no "disabled" state to distinguish from "empty").
 
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`). **`Metadata` is

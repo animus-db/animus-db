@@ -49,8 +49,28 @@ comment for its full type/method inventory.
 - `wire` — the DynamoDB JSON translation (`decode_request` →
   `Operation`, covering CreateTable/Put/Get/Delete/Query/Scan/UpdateItem/
   BatchWriteItem/BatchGetItem/TransactWriteItems/TransactGetItems/UpdateTable/
-  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive,
-  plus the response encoders). `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
+  DescribeTable/DeleteTable/ListTables/UpdateTimeToLive/DescribeTimeToLive/
+  TagResource/UntagResource/ListTagsOfResource/DescribeLimits/
+  DescribeEndpoints, plus the response encoders). **Resource tagging
+  (roadmap W-06)**: `table_arn`/`parse_table_arn` are this adapter's own
+  table-ARN codec (`arn:aws:dynamodb:animus:0:table/<table>`, mirroring
+  `stream_arn`/`backup_arn`'s identical placeholder-region/account
+  convention with no further suffix) — `TagResource`/`UntagResource`/
+  `ListTagsOfResource`'s `ResourceArn` decodes through it, and it also now
+  backs `TableArn` in `table_description_object` (`CreateTable`/
+  `DescribeTable`/`UpdateTable`/`DeleteTable`'s shared response builder),
+  which didn't render one before this. A malformed or non-table `ResourceArn`
+  (e.g. a well-formed *stream* ARN) is a decode-time `ValidationException`
+  here; a well-formed table ARN naming a table that doesn't exist is
+  `animusd`'s call (`ResourceNotFoundException`, since only it holds the
+  replicated catalog). `TableSchema::tags: BTreeMap<String, String>`
+  (`animus-control`) is wire metadata only — nothing here or in
+  `animus-control` interprets a tag's key or value. `DescribeLimits`/
+  `DescribeEndpoints` decode to unit-like variants (no request fields, table()
+  → `None`) — `DescribeLimits`' response is four honest static constants
+  (this adapter has no capacity-billing meter at all); `DescribeEndpoints`'
+  is built by `animusd` from its own bound DynamoDB listen address, since
+  this crate has no node identity to report. `Query` and `Scan` share `decode_limit`/`decode_exclusive_start_key`/
   `decode_predicate`/`decode_select` — same `Limit`/`ExclusiveStartKey`/`FilterExpression`/`Select`
   contract, so fixing one fixes both; do not fork them.
   One gotcha: `GetItem`/`Query`/

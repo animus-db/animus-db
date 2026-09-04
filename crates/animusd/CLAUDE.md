@@ -2347,6 +2347,27 @@ route below the edge through the same `ClientCtx` CP primitives.
   `ttl_expired: bool`). `MetaCommand::SetTableTtl` is on the
   `is_relayable_command` allowlist beside `SetTableStream` — regression:
   `tests/schema_ddl_relay.rs`.
+
+  **Resource tagging (roadmap W-06).** `TagResource`/`UntagResource`/
+  `ListTagsOfResource` ride the same replicated-catalog shape (`dynamo::
+  tag_resource`/`untag_resource` commit-wait `MetaCommand::TagResource`/
+  `UntagResource` exactly like `update_time_to_live`; `list_tags_of_resource`
+  is a pure `meta.table_tags(table)` read). **Gotcha, not obvious from the
+  TTL precedent above**: the commit-wait convergence check is **per-key
+  membership**, not whole-map equality — `TagResource`/`UntagResource`
+  *merge* into `TableSchema::tags` rather than replacing it wholesale (unlike
+  `TtlSpec`, which `update_time_to_live` can safely compare for exact
+  equality since the whole `Option<Spec>` is what the command sets), so a
+  whole-map equality check would spin past `SCHEMA_COMMIT_TIMEOUT` the
+  moment a concurrent, unrelated tag mutation on the same table landed in
+  between polls. See `docs/engineering-lessons.md`'s entry on this for the
+  general form. `MetaCommand::TagResource`/`UntagResource` are on the
+  `is_relayable_command` allowlist beside `SetTableTtl` — regression:
+  `tests/dynamo_tags.rs`. `DescribeLimits`/`DescribeEndpoints` need no
+  catalog at all: `dynamo::describe_limits` is a static read (four named
+  constants); `dynamo::describe_endpoints` reads `ctx.admin.dynamo_addr` —
+  the same field `admin.rs::config_view`'s `addrs.dynamo` already reports —
+  for this node's own bound DynamoDB listen address.
 - **Admin / debug** (`admin.rs`, `RoleAddrs.admin`, ADR 0020) — read-only
   `GET` views + gated `POST` actions + data writes; grep `admin.rs`'s route
   table for the full endpoint inventory. Below the edge it only reads node
