@@ -126,6 +126,7 @@ async fn create_table_no_index(addr: SocketAddr, table: &str) {
         "DynamoDB_20120810.CreateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )

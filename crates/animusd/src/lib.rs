@@ -2773,6 +2773,44 @@ impl console::ConsoleBackend for ClientCtx {
                 .collect();
             body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
         }
+        // Roadmap W-11: `AttributeDefinitions` must cover every key
+        // attribute the request's own `KeySchema` names — the base table's
+        // (already declared above) *and* every GSI/LSI's own hash/sort
+        // attribute. This form collects no type for an index-only key
+        // attribute (`CreateGsiRequest`/`CreateLsiRequest` carry key
+        // attribute *names* only — see `console::CreateTableRequest`'s own
+        // doc for why that's a deliberate console-form scope cut, not a
+        // mechanism gap), so default each to `"S"`, the same default
+        // `schema::column_type_for(None)` already applies bridge-side.
+        let declared: std::collections::BTreeSet<String> = body["AttributeDefinitions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d["AttributeName"].as_str().map(str::to_owned))
+            .collect();
+        let mut extra_names: Vec<String> = Vec::new();
+        for g in &req.gsis {
+            if !g.hash_attribute.trim().is_empty() {
+                extra_names.push(g.hash_attribute.clone());
+            }
+            if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
+                extra_names.push(sort.to_owned());
+            }
+        }
+        for l in &req.lsis {
+            if !l.sort_attribute.trim().is_empty() {
+                extra_names.push(l.sort_attribute.clone());
+            }
+        }
+        let mut seen = declared;
+        let defs = body["AttributeDefinitions"].as_array_mut().unwrap();
+        for name in extra_names {
+            if seen.insert(name.clone()) {
+                defs.push(serde_json::json!({
+                    "AttributeName": name, "AttributeType": "S",
+                }));
+            }
+        }
         if req.stream_enabled {
             body["StreamSpecification"] = serde_json::json!({
                 "StreamEnabled": true,
@@ -2844,35 +2882,39 @@ impl console::ConsoleBackend for ClientCtx {
                 "AttributeName": sort_attribute, "KeyType": "RANGE",
             }));
         }
-        // Issue #319: an `AttributeDefinitions` entry for each attribute the
-        // request actually gave a type for — `UpdateTable`'s GSI-create
-        // decoder now reads it (`wire::decode_update_table`), so a type
-        // supplied here really does survive into the catalog. An omitted
-        // type (the common case, and every pre-#319 caller) sends no entry
-        // for that attribute, the identical untyped shape as before.
-        let mut attribute_definitions = Vec::new();
-        if let Some(ty) = console_validate_attribute_type(req.hash_attribute_type.as_deref())? {
+        // Issue #319: an `AttributeDefinitions` entry carries the request's
+        // own declared type when it gave one — `UpdateTable`'s GSI-create
+        // decoder reads it (`wire::decode_update_table`), so a type
+        // supplied here really does survive into the catalog. Roadmap
+        // W-11: unlike before, an entry is now sent even when the request
+        // gave no type — `wire::decode_update_table` now rejects a
+        // `GlobalSecondaryIndexUpdates` `Create` whose own key attribute(s)
+        // have no `AttributeDefinitions` entry at all, so an omitted type
+        // (this form has no picker for it, unlike the Add-GSI form's own
+        // optional fields) defaults to `"S"`, the same default
+        // `schema::column_type_for(None)` already applies bridge-side —
+        // this genuinely widens what gets recorded (`hash_attribute_type`
+        // is `Some(String)` now, not `None`); see
+        // `docs/engineering-lessons.md`'s W-11 entry.
+        let hash_ty =
+            console_validate_attribute_type(req.hash_attribute_type.as_deref())?.unwrap_or("S");
+        let mut attribute_definitions = vec![serde_json::json!({
+            "AttributeName": req.hash_attribute, "AttributeType": hash_ty,
+        })];
+        if let Some(sort_attribute) = sort_attribute {
+            let sort_ty =
+                console_validate_attribute_type(req.sort_attribute_type.as_deref())?.unwrap_or("S");
             attribute_definitions.push(serde_json::json!({
-                "AttributeName": req.hash_attribute, "AttributeType": ty,
+                "AttributeName": sort_attribute, "AttributeType": sort_ty,
             }));
         }
-        if let (Some(sort_attribute), Some(ty)) = (
-            sort_attribute,
-            console_validate_attribute_type(req.sort_attribute_type.as_deref())?,
-        ) {
-            attribute_definitions.push(serde_json::json!({
-                "AttributeName": sort_attribute, "AttributeType": ty,
-            }));
-        }
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "TableName": table,
+            "AttributeDefinitions": attribute_definitions,
             "GlobalSecondaryIndexUpdates": [
                 {"Create": {"IndexName": req.index_name, "KeySchema": key_schema}}
             ],
         });
-        if !attribute_definitions.is_empty() {
-            body["AttributeDefinitions"] = serde_json::Value::Array(attribute_definitions);
-        }
         let payload = serde_json::to_vec(&body).unwrap_or_default();
         let (status, resp_body) =
             crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;

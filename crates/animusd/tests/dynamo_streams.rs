@@ -145,7 +145,7 @@ async fn set_table_stream_enable_propagates_and_survives_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"orders",
+        r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -182,7 +182,7 @@ async fn update_table_stream_enable_and_disable_through_every_node() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -246,7 +246,7 @@ async fn describe_table_returns_stream_spec_and_arn_reenable_mints_new_label() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_IMAGE"}}"#,
@@ -332,7 +332,7 @@ async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"streamed",
+        r#"{"TableName":"streamed","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -346,7 +346,7 @@ async fn transact_write_items_on_a_streamed_table_delivers_correct_events() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"plain",
+        r#"{"TableName":"plain","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -458,7 +458,7 @@ async fn transact_write_items_abort_leaves_no_stream_event() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"streamed",
+        r#"{"TableName":"streamed","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -717,7 +717,7 @@ async fn get_records_walks_the_shard_chain_and_drains_the_open_tail() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -848,7 +848,7 @@ async fn open_shard_iterator_survives_a_seal_and_keeps_working() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -919,7 +919,7 @@ async fn limit_pagination_drains_a_sealed_shard_exactly_once() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -1023,7 +1023,7 @@ async fn get_records_on_a_sealed_shard_works_from_every_node() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -1087,7 +1087,7 @@ async fn get_records_on_an_open_shard_forwards_correctly_from_every_node() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"KEYS_ONLY"}}"#,
@@ -1200,7 +1200,7 @@ async fn disabled_stream_grace_window_lists_and_serves_sealed_reads_with_no_open
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1307,7 +1307,7 @@ async fn pre_enable_marker_records_never_surface_on_the_stream() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"mk",
+        r#"{"TableName":"mk","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -1439,7 +1439,7 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"t",
+            r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,

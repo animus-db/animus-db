@@ -74,6 +74,7 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
 async fn create_table(addr: SocketAddr, name: &str) {
     let body = format!(
         r#"{{"TableName":"{name}",
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}],
             "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}]}}"#
     );
     let (status, resp) = dynamo(addr, "DynamoDB_20120810.CreateTable", &body).await;
@@ -117,7 +118,7 @@ async fn list_tables_sorts_paginates_and_excludes_gsi_hidden_tables() {
     let (status, resp) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"with_gsi",
+        r#"{"TableName":"with_gsi","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"x","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-x",

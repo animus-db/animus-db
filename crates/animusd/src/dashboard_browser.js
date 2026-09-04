@@ -375,7 +375,11 @@ async function submitAddIndexForm() {
   const projType = $("br-dy-ix-proj").value;
   if (!name || !hash) { $("br-dy-ix-msg").textContent = "index name and hash attribute are required"; return; }
   const keySchema = [{ AttributeName: hash, KeyType: "HASH" }];
-  if (sort) keySchema.push({ AttributeName: sort, KeyType: "RANGE" });
+  const attrDefs = [{ AttributeName: hash, AttributeType: "S" }];
+  if (sort) {
+    keySchema.push({ AttributeName: sort, KeyType: "RANGE" });
+    attrDefs.push({ AttributeName: sort, AttributeType: "S" });
+  }
   const create = { IndexName: name, KeySchema: keySchema };
   if (projType === "INCLUDE") {
     const names = $("br-dy-ix-include").value.split(",").map((s) => s.trim()).filter(Boolean);
@@ -388,7 +392,11 @@ async function submitAddIndexForm() {
   try {
     const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
       op: "UpdateTable",
-      payload: { TableName: table, GlobalSecondaryIndexUpdates: [{ Create: create }] },
+      payload: {
+        TableName: table,
+        AttributeDefinitions: attrDefs,
+        GlobalSecondaryIndexUpdates: [{ Create: create }],
+      },
     });
     if (status >= 300) { $("br-dy-ix-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
     closeAddIndexForm();

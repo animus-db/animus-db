@@ -180,6 +180,7 @@ async fn create_index_via_wire(addr: SocketAddr, table: &str, index: &str, hash_
         "DynamoDB_20120810.UpdateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"{hash_attr}","AttributeType":"S"}}],
                 "GlobalSecondaryIndexUpdates":[{{"Create":{{
                     "IndexName":"{index}",
                     "KeySchema":[{{"AttributeName":"{hash_attr}","KeyType":"HASH"}}],
@@ -353,6 +354,7 @@ async fn backfill_seed_markers_never_surface_as_phantom_stream_events() {
         "DynamoDB_20120810.CreateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                 "StreamSpecification":{{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
@@ -458,6 +460,7 @@ async fn backfill_seed_markers_never_surface_from_sealed_shards_either() {
         "DynamoDB_20120810.CreateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                 "StreamSpecification":{{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#

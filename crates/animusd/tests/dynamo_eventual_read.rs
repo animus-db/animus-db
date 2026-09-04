@@ -113,7 +113,7 @@ async fn eventual_reads_converge_on_every_node_while_consistent_reads_are_immedi
     let (status, body) = dynamo(
         addrs[0],
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"reads",
+        r#"{"TableName":"reads","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}]}"#,
     )
@@ -264,7 +264,7 @@ async fn a_delete_converges_to_absence_on_an_eventual_read() {
     let (status, body) = dynamo(
         addrs[0],
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"gone",
+        r#"{"TableName":"gone","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
     )
     .await;

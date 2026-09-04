@@ -60,6 +60,7 @@ async fn create_table_no_index(addr: SocketAddr, table: &str) {
         "DynamoDB_20120810.CreateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )
@@ -93,6 +94,7 @@ async fn create_index_via_wire(
         "DynamoDB_20120810.UpdateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"{hash_attr}","AttributeType":"S"}}],
                 "GlobalSecondaryIndexUpdates":[{{"Create":{{
                     "IndexName":"{index}",
                     "KeySchema":[{{"AttributeName":"{hash_attr}","KeyType":"HASH"}}],
@@ -371,6 +373,8 @@ async fn update_table_create_validation_rejects_bad_index_declarations() {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},
+                                             {{"AttributeName":"x","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "GlobalSecondaryIndexes":[
                         {{"IndexName":"by-x","KeySchema":[{{"AttributeName":"x","KeyType":"HASH"}}],
@@ -455,13 +459,18 @@ async fn update_table_create_rejects_past_the_gsi_cap() {
                 )
             })
             .collect();
+        let gsi_attribute_defs: Vec<String> = (0..MAX_GSI_PER_TABLE)
+            .map(|i| format!(r#"{{"AttributeName":"a{i}","AttributeType":"S"}}"#))
+            .collect();
         let (status, body) = dynamo(
             addr,
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},{}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "GlobalSecondaryIndexes":[{}]}}"#,
+                gsi_attribute_defs.join(","),
                 gsis.join(",")
             ),
         )

@@ -120,7 +120,7 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"withlsi",
+        r#"{"TableName":"withlsi","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"score","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "LocalSecondaryIndexes":[
@@ -135,7 +135,7 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"nolsi",
+        r#"{"TableName":"nolsi","AttributeDefinitions":[{"AttributeName":"cat","AttributeType":"S"},{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[

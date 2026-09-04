@@ -136,7 +136,9 @@ async fn create_base_table(addr: SocketAddr, table: &str) {
         addr,
         "DynamoDB_20120810.CreateTable",
         &format!(
-            r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
+            r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )
     .await;

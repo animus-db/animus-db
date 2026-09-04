@@ -142,7 +142,7 @@ async fn table_detail_projects_full_configuration() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"simple",
+            r#"{"TableName":"simple","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -246,7 +246,7 @@ async fn add_and_drop_gsi_round_trip() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders",
+            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -274,14 +274,16 @@ async fn add_and_drop_gsi_round_trip() {
         assert_eq!(resp["gsi"]["name"], "by-status");
         assert_eq!(resp["gsi"]["hash_attribute"]["name"], "status");
         // No declared type: this request gave no `hash_attribute_type`
-        // (issue #319's fields are optional), so `add_gsi` sent no
-        // `AttributeDefinitions` entry and the console reports `null`
-        // rather than an invented `"S"` — see
-        // `add_gsi_records_a_declared_attribute_type` below for the
-        // positive case, where a type genuinely round-trips.
-        assert!(
-            resp["gsi"]["hash_attribute"]["attribute_type"].is_null(),
-            "an added GSI's key attribute must not claim a type: {body}"
+        // (issue #319's fields are optional). Roadmap W-11: `AttributeDefinitions`
+        // must now cover every key attribute a request's `KeySchema` names, so
+        // `add_gsi` defaults an omitted type to `"S"` rather than sending no
+        // entry at all (`wire::decode_update_table` would otherwise reject the
+        // `GlobalSecondaryIndexUpdates` `Create` outright) — see
+        // `add_gsi_records_a_declared_attribute_type` below for the case where a
+        // genuinely different type round-trips instead of this default.
+        assert_eq!(
+            resp["gsi"]["hash_attribute"]["attribute_type"], "S",
+            "an added GSI's key attribute defaults to a declared S type: {body}"
         );
         assert!(resp["gsi"]["sort_attribute"].is_null());
         assert_eq!(
@@ -363,7 +365,7 @@ async fn add_gsi_records_a_declared_attribute_type() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"readings",
+            r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -434,7 +436,7 @@ async fn add_gsi_rejects_an_unknown_attribute_type() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"orders",
+            r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -468,7 +470,7 @@ async fn stream_toggle_round_trips() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"events",
+            r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -530,7 +532,7 @@ async fn ttl_set_and_clear_round_trips() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"sessions",
+            r#"{"TableName":"sessions","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -592,7 +594,7 @@ async fn delete_table_works() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"scratch",
+            r#"{"TableName":"scratch","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
