@@ -1145,6 +1145,39 @@ reusing the captured config is the point of the test.
   fourth amendment (referenced above) plus that ADR generally for why the
   console does *not* join the replicated `NodeAddrs` book — no other node
   ever needs to resolve it.
+- **`TableDetail` gains `pitr`/`backups` (roadmap U-03, ADR 0059 §3/§4/§9)**
+  — no `ConsoleBackend` widening this time (unlike every PR above): both
+  new fields are read-only projections `console_table_detail`
+  (`lib.rs`) builds alongside the GSI/LSI/stream/TTL fields it already
+  computes, so `table_detail`'s existing one method covers them for free.
+  `pitr: Option<console::PitrStatus>` is `None` when continuous backups are
+  disabled — an `Option` on the *outer* field replacing the `enabled: bool`
+  companion-field shape `StreamSummary`/`TtlSummary` use, since there is
+  nothing else to carry when disabled; `Some` reuses `dynamo::
+  pitr_description` **verbatim** (widened to `pub(crate)`) rather than
+  re-deriving `DescribeContinuousBackups`'s own restore-window computation
+  a second way. `backups: Vec<console::BackupSummary>` (`backup_id`/
+  `status`/`created_wall_ms` only — never a node/tablet/replica/object-path
+  detail, ADR 0052's own rule) is `meta.backups` filtered to this table's
+  own rows, excluding an `Expired`/`Failed` row (the identical filter
+  `visible_backup`/`list_backups` already apply) and a PITR base snapshot
+  (`meta.pitr_base_backups` — internal machinery, never a user's own
+  `CreateBackup`, mirroring `ListBackups`' own default `USER`-only filter);
+  `dynamo::backup_wire_status` (also widened to `pub(crate)`) supplies the
+  same `CREATING`/`AVAILABLE`/`DELETED` label `DescribeBackup`/`ListBackups`
+  use. **Table-scoped, not backup-scoped**: a backup outliving its dropped
+  source table (ADR 0059 §3's own "scar") never appears here — this list is
+  for a live table's own detail page only, reached instead via
+  `DescribeBackup`/`ListBackups` directly. `console.js`'s Config tab gained
+  a fourth jump-nav section, "Backups" (`renderBackupsSection`, between
+  Indexes and Danger zone) — a read-only fact strip for the PITR status
+  plus a plain list for on-demand backups, no new endpoint and no edit
+  affordance (this item adds no way to enable PITR or create a backup from
+  the console — only DynamoDB's own `UpdateContinuousBackups`/
+  `CreateBackup` calls do that today). Tests:
+  `tests/console_table_config.rs`'s
+  `table_detail_with_no_pitr_or_backups_is_null_and_empty`/
+  `table_detail_shows_pitr_status_and_backups`.
 
 ## CLI reference
 

@@ -2463,6 +2463,55 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
     }
 }
 
+/// This table's continuous-backups (PITR) status, console-shaped (U-03,
+/// ADR 0059 §9) — reuses [`dynamo::pitr_description`] verbatim (the exact
+/// computation `DescribeContinuousBackups` already performs) rather than
+/// re-deriving the restore window a second way; `None` when PITR is
+/// disabled (`PitrDescription::enabled == false`), mirroring
+/// [`console::PitrStatus`]'s own doc on why `Option` replaces an inner
+/// `enabled` field here.
+fn console_pitr_status(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Option<console::PitrStatus> {
+    let d = dynamo::pitr_description(ctx, meta, table);
+    d.enabled.then_some(console::PitrStatus {
+        earliest_restorable_ms: d.earliest_restorable_ms,
+        latest_restorable_ms: d.latest_restorable_ms,
+    })
+}
+
+/// This table's own on-demand backups, console-shaped (U-03, ADR 0059
+/// §3/§4) — `meta.backups` filtered to rows naming `table`, excluding a
+/// PITR base snapshot (an internal, `System`-typed backup — see
+/// [`console::BackupSummary`]'s own doc) and any row already `Expired`/
+/// `Failed` (the identical "already gone" filter [`visible_backup`]/
+/// [`list_backups`] apply, generalized here to one table's own rows).
+/// `meta.backups` is a `BTreeMap<BackupId, _>`, so this is already in
+/// ascending backup-id order with no separate sort. **Deliberately never
+/// includes a backup whose *source table* was later dropped** — this is
+/// the live-table detail page (see [`console::TableDetail::backups`]'s own
+/// doc); a backup outliving its source table is reached only via
+/// `DescribeBackup`/`ListBackups` directly, never through here.
+fn console_table_backups(meta: &Metadata, table: &str) -> Vec<console::BackupSummary> {
+    meta.backups
+        .iter()
+        .filter(|(id, row)| row.table == table && !meta.pitr_base_backups.contains(*id))
+        .filter(|(_, row)| {
+            !matches!(
+                row.status,
+                animus_control::BackupStatus::Expired | animus_control::BackupStatus::Failed { .. }
+            )
+        })
+        .map(|(backup_id, row)| console::BackupSummary {
+            backup_id: backup_id.clone(),
+            status: dynamo::backup_wire_status(&row.status).to_string(),
+            created_wall_ms: row.manifest.created_wall_ms,
+        })
+        .collect()
+}
+
 /// Project one table's full configuration for animusd console's table page
 /// Config tab (ADR 0052 PR3, `GET /console/api/tables/{name}`) — the
 /// `TableDetail`-shaped sibling of [`console_table_summaries`]'s per-table
@@ -2475,7 +2524,16 @@ fn console_gsi_detail(schema: &TableSchema, idx: &animus_control::IndexDef) -> c
 /// `is_index_table_name` check here is belt-and-suspenders, matching that
 /// function's own comment on why it keeps the filter despite the invariant
 /// holding elsewhere today).
-fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDetail> {
+///
+/// **U-03**: also projects `pitr`/`backups` (via [`console_pitr_status`]/
+/// [`console_table_backups`] above) — needs `ctx` (not just `meta`) purely
+/// for `dynamo::pitr_description`'s `ctx.env.wall_now()` read (ADR 0051
+/// discipline: the pure catalog carries no clock of its own).
+fn console_table_detail(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Option<console::TableDetail> {
     if animus_dynamo::index::is_index_table_name(table) {
         return None;
     }
@@ -2525,6 +2583,8 @@ fn console_table_detail(meta: &Metadata, table: &str) -> Option<console::TableDe
         lsis,
         stream: console_stream_summary(schema),
         ttl: console_ttl_summary(schema),
+        pitr: console_pitr_status(ctx, meta, table),
+        backups: console_table_backups(meta, table),
     })
 }
 
@@ -2847,13 +2907,13 @@ impl console::ConsoleBackend for ClientCtx {
         }
 
         let meta = self.metadata_fresh().await;
-        console_table_detail(&meta, table_name).ok_or_else(|| {
+        console_table_detail(self, &meta, table_name).ok_or_else(|| {
             console::ConsoleError::new(500, "table created but not found in the catalog")
         })
     }
 
     async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
-        console_table_detail(&self.effective_metadata(), table)
+        console_table_detail(self, &self.effective_metadata(), table)
     }
 
     async fn add_gsi(

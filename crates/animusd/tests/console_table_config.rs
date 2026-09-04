@@ -635,3 +635,124 @@ async fn delete_table_works() {
     .await
     .expect("test timed out");
 }
+
+/// U-03: `GET /console/api/tables/{name}` gains `pitr` and `backups`. A
+/// table with neither enabled/created shows `pitr: null` and an empty
+/// `backups` array — never an omitted field, and never a fabricated
+/// non-empty answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn table_detail_with_no_pitr_or_backups_is_null_and_empty() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"plain",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = console(console_addr, "GET", "/console/api/tables/plain", "").await;
+        assert_eq!(status, 200, "table detail failed: {body}");
+        let d = json(&body);
+        assert!(d["pitr"].is_null(), "no PITR enabled: {body}");
+        assert!(
+            d["backups"].as_array().unwrap().is_empty(),
+            "no backups created: {body}"
+        );
+        assert_no_cluster_shape(&body);
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// U-03's round trip: enable continuous backups (PITR) and create an
+/// on-demand backup, then confirm the table detail page reports both — the
+/// exact fields `DescribeContinuousBackups`/`ListBackups` themselves would
+/// report, sourced from the same catalog reads (`animusd::dynamo::
+/// pitr_description`/`backup_wire_status`), never re-derived — and nothing
+/// cluster-shaped alongside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn table_detail_shows_pitr_status_and_backups() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) =
+            support::start_single_node(dir.path(), animusd::StorageBackend::Memory).await;
+        let dynamo_addr = node.dynamo_addr();
+        let console_addr = node.console_addr();
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"orders",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.UpdateContinuousBackups",
+            r#"{"TableName":"orders",
+                "PointInTimeRecoverySpecification":{"PointInTimeRecoveryEnabled":true}}"#,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "UpdateContinuousBackups(enable) failed: {body}"
+        );
+
+        let (status, body) = dynamo(
+            dynamo_addr,
+            "DynamoDB_20120810.CreateBackup",
+            r#"{"TableName":"orders","BackupName":"snap-1"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateBackup failed: {body}");
+        let backup_arn = json(&body)["BackupDetails"]["BackupArn"]
+            .as_str()
+            .expect("BackupArn")
+            .to_string();
+
+        let (status, body) = console(console_addr, "GET", "/console/api/tables/orders", "").await;
+        assert_eq!(status, 200, "table detail failed: {body}");
+        let d = json(&body);
+
+        let pitr = &d["pitr"];
+        assert!(!pitr.is_null(), "PITR enabled: {body}");
+        assert!(
+            pitr["earliest_restorable_ms"].as_u64().unwrap() > 0,
+            "earliest_restorable_ms: {body}"
+        );
+        assert!(
+            pitr["latest_restorable_ms"].as_u64().unwrap() > 0,
+            "latest_restorable_ms: {body}"
+        );
+
+        let backups = d["backups"].as_array().unwrap();
+        assert_eq!(backups.len(), 1, "exactly one backup: {body}");
+        assert_eq!(backups[0]["backup_id"], backup_arn);
+        let status_label = backups[0]["status"].as_str().unwrap();
+        assert!(
+            status_label == "CREATING" || status_label == "AVAILABLE",
+            "unexpected status {status_label}: {body}"
+        );
+        assert!(
+            backups[0]["created_wall_ms"].as_u64().unwrap() > 0,
+            "created_wall_ms: {body}"
+        );
+        assert_no_cluster_shape(&body);
+
+        node.shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
