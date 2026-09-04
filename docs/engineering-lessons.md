@@ -2362,6 +2362,10 @@ debugging anything that feels like it might have happened before.
   just by symptom" technique that separated harness-vs-production once
   works again one layer deeper. (2026-08-15/2026-08-15, D8 test-harness PR,
   base `1fd1a326`.)
+- **A fourth, distinct D8 test-harness bug — the poll itself asserting an
+  unguaranteed property, not a race in production — see "A converged-or-
+  timeout poll must target a tablet the property actually holds for"
+  below (2026-09-03, issue #580).**
 - **Adjudicating a race in consensus does not order the physical writes
   below it — a shared mutable storage key underneath an agreed decision is
   its own, independent hazard, and the fix is to remove the sharing, not to
@@ -15540,3 +15544,136 @@ default consumer (anything that builds it with no `--target`), the new
 stage goes *before* the existing default in file order, never after —
 check `grep -n '^FROM' Dockerfile` after any such edit and confirm the last
 line is still the stage every no-`--target` caller expects.
+
+## A converged-or-timeout poll must target a tablet the property actually holds for, not "whichever one a lookup happened to return" (2026-09-03, issue #580)
+
+`streams_e2e.rs::auto_split_mid_stream_with_live_consumer_across_every_node`
+(D8) panicked once on `main` — "the parent tablet never sealed at least one
+shard (timed out after 20s)" — then passed in 8s on the very next run, with
+no code change in between. The test picks a `(child, parent)` pair by
+scanning the table's currently-active tablets (`tablets_for`, ascending by
+`TabletId` — ids are minted monotonically and never reused, ADR 0022) for
+the first one that has a `split_lineage` entry, then polls
+`meta.stream_shards` for `parent` to show at least one sealed shard.
+
+That poll assumes every split's parent seals something before cutover. It
+doesn't: `inplace_split_driver_tick`'s own final seal
+(`index_drain::seal_now`, `crates/animusd/src/index_drain.rs`) implements
+ADR 0043 §A3's "never seal an empty segment" rule — `Ok(None)` the instant
+`pending_changes()` is empty — and `CutoverSplit` proposes regardless of
+whether anything got sealed. With a 2048-byte auto-split threshold and 40
+items, a **child** minted by the in-place fork inherits data (bytes) but
+not pending change-log records, and can legitimately exceed the threshold
+and split again (cascade) having received zero *new* writes since its own
+birth — such a tablet reaches its own `CutoverSplit` with nothing ever
+sealed for it. `tablets_for`'s ascending order normally shields the test
+from this (any surviving direct child of the true root sorts below every
+later-minted grandchild, so the scan finds a root-parented pair first) —
+but if *both* of the root's own direct children happen to cascade away
+before the poll runs, every remaining active tablet is a grandchild, and
+the scan's first match resolves to an intermediate parent that never sealed
+anything. Rare, timing-dependent, and exactly reproduces a pass-then-fail
+flip with no code change: whether both children cascade before the lineage
+scan's window is a race against the test's own write loop, not against
+anything the production code guarantees.
+
+The fix (`crates/animusd/tests/streams_e2e.rs`) targets the property at the
+one tablet the test actually knows is safe: the table's original tablet,
+captured (`root`, via `tablets_for`) right after `CreateTable` and before
+any write — the tablet the byte-threshold trigger fires against, and so
+the one tablet in any lineage this run produces that is *guaranteed* to
+have taken real writes (and, under `tiny_seal_knobs()`'s `seal_bytes: 1`,
+to have sealed them almost immediately) before it ever splits. The
+`(child, parent)` scan is untouched — it still picks an arbitrary lineage
+pair for the downstream `ParentShardId`/chain-walk checks, which is a
+narrower, pre-existing assumption (that whichever `parent` it lands on
+happens to have sealed) not the target of this fix; a doubly-cascaded pick
+could in principle still trip *those* checks, and is left as a known,
+undocumented-until-now edge case rather than folded into this fix's scope.
+
+**General form**: a `await_true`/converged-or-timeout poll that asserts
+some property of "a tablet/entity a lookup returned" is only as sound as
+the guarantee that the *specific* thing the lookup can return actually has
+that property in every reachable state — not just the state the lookup's
+author had in mind when writing it. When a selection is itself
+data-dependent (here: which lineage entry a `BTreeMap`/`Vec` scan happens to
+land on, itself downstream of how a cascade played out), prefer asserting
+against a fixed, provably-safe anchor captured before the nondeterminism
+begins, over trusting whichever instance a generic "find the first match"
+scan returns. This is the same shape as the `HashMap`-vs-`BTreeMap`
+determinism rule one level up the stack: an assertion's target must not be
+allowed to vary with timing the test doesn't control, or a fixed-deadline
+wait becomes a coin flip dressed up as a bug report.
+
+Companion fix, `crates/animusd/src/index_drain.rs`: the swallowed
+`tracing::debug!` in this same split-driver arm (`inplace_split_driver_
+tick`'s caller, `change_consumer_loop`) is now `tracing::warn!` carrying
+the tablet's epoch and state alongside the error — a `debug!` there is
+invisible not just at the real `animusd` binary's own default log level
+(`otel::init_tracing`'s `RUST_LOG`-less fallback is `"info"`) but *always*
+in this crate's own `ProdEnv` integration test binaries, which — checked
+for this fix, not assumed — wire up no tracing subscriber at all (only
+`main.rs` calls `otel::init_tracing`; no `tests/*.rs` file or `tests/
+support` does). So today this warning still won't appear in a `cargo test
+-p animusd --test streams_e2e` run's own output either way — `warn!` is
+still the right level (it's the correct signal for a genuinely-anomalous
+condition, and it costs nothing to be already-correct the day a subscriber
+does get wired into these tests, which `docs/engineering-lessons.md`'s own
+"a routed operation's error policy must be identical" precedent (issue
+#572, immediately above) suggests should probably happen — a separate,
+not-yet-scoped follow-up, not fixed here).
+
+## The driver arm on a background loop's own error policy must match its sibling routes' (2026-09-03, issue #580, extends #572's lesson)
+
+`inplace_split_driver_tick`'s two exhaustion loops (`crates/animusd/src/
+index_drain.rs`, the streams and PITR final-seal loops immediately inside
+the `Splitting` arm) called `seal_now`/`pitr_seal_now` in a `while ...?
+.is_some() {}` shape — any `Err`, transient or permanent, propagated
+straight out via `?` and aborted the whole tick, including every veto
+check and the `CutoverSplit` propose after it. But a losing dueling-seal
+race against the ordinary per-tick `seal_tick`/`pitr_tick` arm (same
+`INDEX_DRAIN_INTERVAL` tick, same `(tablet, next_epoch)` slot — the
+identical race issue #572 already named for `force_seal_tablet`/
+`force_pitr_seal_tablet`'s `Local` route) returns a `"; retry"`-suffixed
+transient error (`index_drain::is_retryable_elsewhere`), not a permanent
+one — and this loop had no way to tell the two apart, so a transient loss
+here cost the driver a full extra `INDEX_DRAIN_INTERVAL` (200ms) tick
+before it tried again, on top of whatever this tick's own commit-wait
+budget (`SEAL_COMMIT_TIMEOUT`) had already spent.
+
+Fixed to mirror #572's own resolution exactly: a retryable loss now
+`continue`s the exhaustion loop immediately (re-reading fresh state and
+retrying within the *same* tick, the same treatment the periodic arm's own
+next call already gets structurally for free), and only a non-retryable
+`Err` propagates via `?` as before. Same classifier
+(`index_drain::is_retryable_elsewhere`), reused, not reimplemented — one
+retryability rule for this whole error family, now applied identically on
+every route that can hit it: the periodic per-tick arm, `force_seal_tablet`/
+`force_pitr_seal_tablet`'s local route (#572), and the split driver's own
+endgame loop (this fix). See #572's own lesson entry above for the general
+form ("a routed operation's error policy must be identical on the local
+and forwarded routes") — this is the same shape one route further out: not
+local-vs-forwarded, but ordinary-tick-arm-vs-split-driver-arm, both
+converging on the identical underlying primitive and its identical
+transient-failure mode.
+
+No `SimEnv`-driven regression test was added for this specific change: the
+loop's shape (`while primitive(..)?.is_some() {}` around a fallible
+primitive) is exercised for the ordinary per-tick arm by `index_drain.rs`'s
+own `stream_sealer_tests` unit-test module (per issue #570's precedent,
+referenced from that section) — there is no equivalent PITR-arm unit-test
+module yet — but reproducing
+*this* specific race — the split driver's own exhaustion loop racing the
+periodic arm for the same `(tablet, epoch)` slot inside one real
+`INDEX_DRAIN_INTERVAL` tick, during an actual in-place split — needs two
+real concurrent driver ticks against a live `CpGroup`, which is exactly the
+shape `crates/animusd/CLAUDE.md`'s own `ClientCtx` `SimEnv` harness doesn't
+reach (it drives `ClientCtx` request handling, not this crate's real-thread
+background loops racing each other) and a `ProdEnv` `#[tokio::test(multi_
+thread)]` integration test would be needed to force deterministically —
+timing-dependent by construction, and this repo's own stated policy (see
+"`SimEnv` proves logic and ordering, not real-thread liveness" in
+`CLAUDE.md`) is not to paper over that gap with a test that would itself be
+flaky. Correctness here rests on the change being a direct, minimal mirror
+of #572's already-reviewed fix to the identical predicate on a materially
+identical race, not on a new test proving it.

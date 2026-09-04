@@ -392,7 +392,29 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                 // arms are production-dead pending Layer B2's deletion, so
                 // no live parent can lack `Tablet::inplace_split` here).
                 if let Err(e) = inplace_split_driver_tick(&ctx, &meta, tablet, &group).await {
-                    tracing::debug!(tablet = tablet.0, error = %e, "inplace split: tick failed");
+                    // `warn!`, not `debug!` (issue #580): this arm covers
+                    // the split endgame's own `seal_now`/`pitr_seal_now`
+                    // exhaustion loops and the `CutoverSplit` propose
+                    // itself, and this crate's own tests/CI run with no
+                    // tracing subscriber wired up at all — a `debug!` here
+                    // is invisible at *every* level in that harness, and
+                    // even where a subscriber IS attached (the real
+                    // `animusd` binary's own `otel::init_tracing`, whose
+                    // `RUST_LOG`-less fallback is `"info"`) `debug!` still
+                    // wouldn't clear the bar. A losing dueling-seal retry
+                    // is otherwise silently retried on the next 200ms tick
+                    // with nothing to show for it in a run's logs, which is
+                    // exactly what left this arm's own failure mode
+                    // (`CutoverSplit` proposed against a tablet with zero
+                    // sealed shards) invisible until a fixed-deadline test
+                    // poll timed out with no clue why.
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        epoch = tablet_row.map(|t| t.epoch.0),
+                        state = ?tablet_row.map(|t| t.state),
+                        error = %e,
+                        "inplace split: tick failed"
+                    );
                 }
             }
             // ADR 0044 phase-1 PR6: "quiesced ⇒ nothing new for the
@@ -726,6 +748,21 @@ const FROZEN_ENDGAME_GSI_DRAIN_MAX_PASSES: u32 = 64;
 /// routing refresh").
 const INPLACE_SPLIT_MATERIALIZE_SETTLE_MS: u64 = 250;
 
+/// Retry budget for a losing dueling-seal race inside
+/// [`inplace_split_driver_tick`]'s own final-seal loops (issue #580's
+/// bound on issue #572's retry fix). Unlike `force_seal_tablet`/
+/// `force_pitr_seal_tablet`'s `CpRoute::Local` retry, this loop has no
+/// wall-clock deadline to bound it by (it isn't answering a client
+/// request against `SCHEMA_COMMIT_TIMEOUT`) — so a small attempt count
+/// stands in for one: enough to ride out an ordinary one- or two-loss
+/// race against the periodic `seal_tick`/`pitr_tick` arm without pinning
+/// this tick indefinitely if the race keeps recurring. Exhausting the
+/// budget propagates the retryable error like any other failure here —
+/// this driver is re-invoked every `change_consumer_loop` tick (200ms)
+/// with no local state, so the next tick simply tries again from a fresh
+/// read.
+const SPLIT_DRIVER_SEAL_RETRIES: u32 = 5;
+
 /// One **in-place split** driver tick for a `Splitting` parent (carrying an
 /// [`animus_tablet::InPlaceSplitIntent`]) this node leads (ADR 0058 Train 2
 /// rung 3's residue — the `animusd`-level layer the ADR's own as-built note
@@ -790,14 +827,54 @@ async fn inplace_split_driver_tick(
     // iterator drains the parent shard and walks on to the children via
     // `split_lineage` (fork F9, written identically by `CutoverSplit`'s
     // in-place branch).
+    //
+    // A losing `seal_now` retries in place, up to `SPLIT_DRIVER_SEAL_
+    // RETRIES` times, rather than propagating on the first loss (issue
+    // #580, mirroring #572's identical fix to `force_seal_tablet`'s own
+    // `CpRoute::Local` arm): this call races the periodic per-tick
+    // `seal_tick` arm for the exact same `(tablet, next_epoch)` slot, and a
+    // loss there is `index_drain::is_retryable_elsewhere`'s documented
+    // transient `"; retry"` error, not a permanent one. Propagating it via
+    // `?` on the first loss used to abort this whole tick — including the
+    // GSI-drain veto, the backfill veto, and the `CutoverSplit` propose
+    // below — to be retried only on the *next* 200ms `change_consumer_loop`
+    // tick, after possibly having already burned most of this call's own
+    // `SEAL_COMMIT_TIMEOUT` commit-wait budget losing the race. Bounded
+    // (rather than an unconditional retry loop) because this call site has
+    // no wall-clock deadline of its own to fall back on the way
+    // `force_seal_tablet`'s `SCHEMA_COMMIT_TIMEOUT` does — exhausting the
+    // budget still propagates the retryable error exactly as before, and
+    // the next tick tries again from scratch. Only a non-retryable error
+    // propagates immediately, budget or not.
     if !table.is_empty() && meta.table_stream(&table).is_some() {
-        while seal_now(ctx, &table, tablet, group).await?.is_some() {}
+        let mut retries_left = SPLIT_DRIVER_SEAL_RETRIES;
+        loop {
+            match seal_now(ctx, &table, tablet, group).await {
+                Ok(Some(_)) => {}  // sealed a segment; more may remain
+                Ok(None) => break, // nothing left pending; done
+                Err(e) if retries_left > 0 && is_retryable_elsewhere(&e) => {
+                    retries_left -= 1; // dueling seal; retry
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     // PITR final seal (ADR 0059 §9, Train 3), anchored at the fork position
     // — the identical exhaustion loop, independently, for a currently
-    // PITR-enabled table.
+    // PITR-enabled table, with the identical bounded dueling-seal retry
+    // above.
     if !table.is_empty() && meta.table_pitr(&table).is_some() {
-        while pitr_seal_now(ctx, &table, tablet, group).await?.is_some() {}
+        let mut retries_left = SPLIT_DRIVER_SEAL_RETRIES;
+        loop {
+            match pitr_seal_now(ctx, &table, tablet, group).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) if retries_left > 0 && is_retryable_elsewhere(&e) => {
+                    retries_left -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     // GSI-drain veto, accelerated exactly like the copy-based frozen
