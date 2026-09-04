@@ -76,8 +76,10 @@ pub enum AttributeValue {
 
 impl AttributeValue {
     /// Byte encoding used when an attribute is part of a key. String/number/
-    /// binary sort by these bytes (numbers therefore sort lexicographically — a
-    /// documented simplification of DynamoDB's numeric ordering).
+    /// binary sort by these bytes, and for every one of the three that
+    /// bytewise order equals DynamoDB's own order — including `N`, via the
+    /// order-preserving codec in [`numkey`] (ADR 0063: sign class byte,
+    /// biased exponent, digit run). See that ADR/module for the full design.
     ///
     /// Only scalar types are valid key attributes in DynamoDB; the document
     /// and set types return an empty encoding (the schema/registry layers
@@ -85,7 +87,16 @@ impl AttributeValue {
     pub(crate) fn key_bytes(&self) -> Vec<u8> {
         match self {
             AttributeValue::S(s) => s.clone().into_bytes(),
-            AttributeValue::N(n) => n.clone().into_bytes(),
+            AttributeValue::N(n) => numkey::encode(n).unwrap_or_else(|| {
+                // A key attribute reaching this point has already been
+                // validated as a well-formed DynamoDB `N` by the wire layer
+                // (`numkey::encode` only returns `None` for malformed text or
+                // an exponent outside DynamoDB's own documented range, which
+                // a well-formed `N` never has) — this fallback exists so a
+                // read path never panics on data that somehow got here
+                // anyway, not because it is expected to be hit.
+                n.clone().into_bytes()
+            }),
             AttributeValue::B(b) => b.clone(),
             AttributeValue::Bool(b) => vec![u8::from(*b)],
             AttributeValue::Null

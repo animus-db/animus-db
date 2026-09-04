@@ -171,14 +171,16 @@ comment for its full type/method inventory.
 - This crate's `storage_key` = `escape(partition_key) || sort_key`, using an
   order-preserving, prefix-free escape (no key's encoding prefixes another's).
   So a partition's items are contiguous and sort-ordered, and `query` is one
-  range scan. Numbers (`N`) are carried as text and sort lexicographically in
-  the **byte-ordered scan range** (a documented simplification — it can only
-  widen the range scanned, never narrow it, so it stays correct). But
-  `SortKeyCondition::matches`, the **in-memory filter** applied to the rows
-  that range returns, compares `N` **numerically**, not by those same bytes
-  (issue #373: a byte compare put `sk = 9` outside `sk BETWEEN 5 AND 15`,
-  since `"15" < "9"` lexicographically) — `S`/`B` still compare by key bytes,
-  which already matches DynamoDB for those types. `SortKeyCondition` carries
+  range scan. **Numbers (`N`) are carried through an order-preserving byte
+  encoding (`numkey`, ADR 0063)** — sign class byte, biased exponent, digit
+  run — so the stored/scanned key order equals DynamoDB's own numeric order,
+  the same guarantee `S`/`B` already had (UTF-8 byte order and raw byte order
+  respectively, both already matching DynamoDB for those types).
+  `SortKeyCondition::matches`, the **in-memory filter** applied to the rows a
+  range scan returns, also compares `N` **numerically**, over the decimal
+  text (not the stored bytes — it's handed an already-typed
+  `AttributeValue`), matching what the *scan order* now separately
+  guarantees at the byte level. `SortKeyCondition` carries
   one `Compare(Comparator, AttributeValue)` variant (reusing the same
   `Comparator` `ConditionExpression` does) for all five `KeyConditionExpression`
   comparators DynamoDB supports (`=`, `<`, `<=`, `>`, `>=` — `<>` stays
@@ -192,18 +194,19 @@ comment for its full type/method inventory.
   `SortKeyCondition::matches_raw`, not `matches` directly with the bytes
   wrapped in `AttributeValue::B` — every production call site used to do
   exactly that, which silently defeated the numeric compare above for `N`
-  (the raw bytes are decimal text, and `B`-vs-`N` falls back to a byte
-  compare) even after `matches` itself went numeric; `matches_raw`
-  reinterprets the raw bytes as the condition's own declared type first.
-  **Range/`BETWEEN` filtering is now correct for `N`** end to end (base
-  table, GSI, LSI), including mixed digit counts and negatives — but **result
-  *ordering*** (`ScanIndexForward`) **is not**: it is still the raw
-  byte-ordered scan order, lexicographic-by-text for `N`, so a page ordered
-  by `ScanIndexForward` is unfaithful whenever an `N` partition mixes
-  magnitudes or signs (e.g. `9` sorts after `15` in the returned order even
-  though the *filter* now correctly includes both). An order-preserving
-  numeric key encoding would fix ordering too, but is a real wire-format
-  change and out of scope here — it needs its own ADR. **The stored data-plane
+  (the raw bytes are the `numkey` encoding, not decimal text, and `B`-vs-`N`
+  falls back to a byte compare) even after `matches` itself went numeric;
+  `matches_raw` reinterprets the raw bytes as the condition's own declared
+  type first — decoding them via `numkey::decode` for `N` (not
+  reinterpreting as UTF-8 the way `S` would be).
+  **Range/`BETWEEN` filtering, and result *ordering* (`ScanIndexForward`),
+  are both correct for `N`** end to end (base table, GSI, LSI), including
+  mixed digit counts, negatives, and decimals — a page ordered by
+  `ScanIndexForward` agrees with DynamoDB's own numeric ordering, closing the
+  gap ADR 0063 exists to close (a byte-range scan bound derived from a
+  numeric predicate, e.g. tightening `BETWEEN` past a filter, is the one
+  follow-up that ADR deliberately leaves unscheduled — see its "What this
+  ADR does not do" section). **The stored data-plane
   key adds a prefix at the `animusd` edge** (`dynamo.rs::item_key`, ADR
   0022/0023): `partition_token(escape(pk)) || escape(pk) || sk` — a Murmur3
   token spreads partitions across the table's hash ring, and there is **no

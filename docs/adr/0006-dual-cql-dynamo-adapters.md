@@ -168,19 +168,21 @@ The surface now extends past the original three point ops:
   (`AND`/`OR`/`NOT` with parentheses) is the remaining piece and lands
   separately.
   **One decision worth recording:** filter comparisons order numbers
-  **numerically**, deliberately unlike `AttributeValue::key_bytes`, whose
-  lexicographic number order is a documented simplification of *key*
-  ordering. A key's order must agree with how rows are stored; a filter is
-  evaluated in memory over an item and carries no such constraint, so
-  inheriting the simplification would make `price > :p` quietly wrong
-  (9 would outrank 10). The comparison is done on the decimal text rather
-  than through an `f64`, because DynamoDB permits 38 significant digits and
-  a float round-trip would silently collapse exactly the large numeric
-  identifiers people use as keys. Equality is numeric-aware for the same
-  reason: `1.10`, `1.1` and `-0`/`0` are the same number written
-  differently. A missing attribute, and any ordering across incomparable
-  types, is false for every operator — `<>` included, since DynamoDB has no
-  three-valued logic here.
+  **numerically** — an unconditional property, not merely a workaround for
+  `AttributeValue::key_bytes`'s old lexicographic number order (that
+  encoding's own simplification was closed by [ADR
+  0063](0063-order-preserving-number-keys.md), which made `key_bytes`
+  numerically order-preserving for `N` too; see that ADR for why a *filter*
+  still compares over decimal text rather than through the key encoding —
+  it's handed an already-typed `AttributeValue`, not raw stored bytes, so
+  there's no encode/decode round trip to save). The comparison is done on
+  the decimal text rather than through an `f64`, because DynamoDB permits 38
+  significant digits and a float round-trip would silently collapse exactly
+  the large numeric identifiers people use as keys. Equality is
+  numeric-aware for the same reason: `1.10`, `1.1` and `-0`/`0` are the same
+  number written differently. A missing attribute, and any ordering across
+  incomparable types, is false for every operator — `<>` included, since
+  DynamoDB has no three-valued logic here.
   **Audit note (2026-08-22, seventh — boolean composition):** the predicate
   grammar now composes with `AND`/`OR`/`NOT` and parentheses, completing the
   `FilterExpression`/`ConditionExpression` surface. Precedence is DynamoDB's:

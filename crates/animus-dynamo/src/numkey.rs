@@ -1,13 +1,14 @@
 //! Order-preserving byte encoding for DynamoDB `N` (number) values (roadmap
-//! W-03 step 2, ADR 0063). **Unwired**: nothing in this crate calls
-//! [`encode`]/[`decode`] yet — [`AttributeValue::key_bytes`](crate::AttributeValue::key_bytes)
-//! still carries `N` as raw decimal text (byte-ordered, not numeric — see
-//! that method's own doc and `crates/animus-dynamo/CLAUDE.md`'s "Key
-//! encoding" bullet for the numeric-ordering gap this codec exists to
-//! close). A later step wires `key_bytes()`, `animus-tablet`'s mirror, and
-//! `SortKeyCondition::matches_raw` to this module; until then this is a
-//! free-standing, independently testable codec.
+//! W-03, ADR 0063). **Wired** (W-03 step 3):
+//! [`AttributeValue::key_bytes`](crate::AttributeValue::key_bytes) encodes
+//! `N` through [`encode`], and `SortKeyCondition::matches_raw`
+//! (`condition.rs`) decodes stored bytes through [`decode`] — see both
+//! methods' own docs. `animus-tablet` was found to have no `N`-specific
+//! encoding of its own to mirror (ADR 0063's Scope section) — this codec is
+//! applied entirely inside this crate, before a value is ever handed to
+//! `animus-tablet`'s `escape`/`partition_token`.
 //!
+
 //! ## Design
 //!
 //! Every DynamoDB number canonicalises to a **sign**, a **decimal
