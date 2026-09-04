@@ -1849,6 +1849,69 @@ angle this investigation surfaced (most reproduction attempts under a
 heavily loaded, resource-constrained sandbox fail on unrelated causes —
 FD exhaustion, connection reset/refused — not the mechanism under test).
 
+**The second fix let the chase RETURN to a slow-but-live leader — but every
+hop it's retried at, hinted or not, was still individually capped at
+`FORWARD_HOP_TIMEOUT` (issue #585, a third continuation, fixed).** Fixing
+*which* candidate the chase picks is not the same as fixing *how long* that
+candidate's own attempt is allowed to run. Each retry is a **fresh**
+proposal on the receiving leader, not a resumed wait on the original one, so
+if the leader genuinely needs longer than `FORWARD_HOP_TIMEOUT` to commit on
+*every* attempt (a membership-change storm serializing its proposes ahead of
+this one, not just the first attempt), a capped retry can never outlast the
+leader's own real commit latency no matter how many times the chase
+correctly circles back to it — every attempt restarts the clock and dies at
+the identical wall. Confirmed live in CI:
+`tests/split_placing_two_replica_diff_e2e.rs`'s paced writer failed `put
+failed: Error("no CP group leader reachable")` twice out of two runs with
+the second fix already in place, during the 5-voter → 3-voter trajectory
+where the leader moves n2 → m0 — the chase was demonstrably resolving to
+the *right* candidate (the second fix's own property held) and still never
+succeeding, because every return trip to it was capped exactly like an
+ungrounded first guess.
+
+Fixed by giving the forward-candidate decision a classification, not just
+an address: `decide::ForwardCandidate::Hinted`/`Guessed` (`animus-node`).
+`Hinted` means some live replica named this address as the leader — this
+node's own local replica's `cp_leader_hint` for the very first hop
+(`CpRoute::Forward`'s new second field), or a refusal's own embedded hint
+thereafter, including the `timed_out` last-resort retry once every known
+replica is exhausted (nothing else is left this pass to protect a cap
+from). `Guessed` means a deterministic pick with zero liveness signal — the
+no-local-replica fallback, or an untried replica the chase reaches for on
+its own. `forward_to_tablet_leader` now caps a hop at `FORWARD_HOP_TIMEOUT`
+only when its candidate is `Guessed`; a `Hinted` one gets the full remaining
+`CLIENT_TIMEOUT` budget, exactly like every hop did before the first #585
+fix. This keeps the starvation fix intact — a `Guessed` candidate is always
+tried, capped, before the chase ever falls back to retrying one a second
+time — while finally letting a genuinely slow-but-live leader actually
+finish once the chase is pointed at it with a real vouch behind it, rather
+than being retried at it forever under the same wall every time. See
+`decide::ForwardCandidate`'s own doc (`animus-node`) and
+`forward_to_tablet_leader`'s own doc (`forwarding.rs`) for the full
+per-case reasoning.
+
+Regression: `forward_hop_timeout_tests::
+forward_to_tablet_leader_does_not_cap_a_hinted_retry_of_a_genuinely_slow_leader`
+(`lib.rs`, beside the two sibling tests above, for the identical reason).
+**Why the second fix's own test above didn't already catch this**: its
+stub (`spawn_slow_then_ok_stub`) special-cases only the *first* connection
+to stall — every later connection, retry included, answers instantly — so
+whether that retry's own hop happened to be capped or not never mattered to
+that fixture; it proves candidate *selection* (the chase returns to the
+right address) but nothing about *how long the return trip is allowed to
+run*. This test's own stub (`spawn_always_slow_ok_stub`) instead answers
+**every** connection — first attempt and retry alike — only after a delay
+past `FORWARD_HOP_TIMEOUT`, matching the real production shape (a standing
+commit-latency cost on every attempt, not a one-time slow start), so only a
+genuinely uncapped hinted retry can succeed inside `CLIENT_TIMEOUT`. See
+`docs/engineering-lessons.md`'s matching entry for the general lesson (a
+fixture built to prove one fix in a mechanism can stay green through a
+regression in a different dimension of that same mechanism unless it
+faithfully models that dimension too) and for this investigation's own
+repro-loop findings (two sandbox-only `"Too many open files"` failures out
+of ten post-fix runs of the flaky e2e test above, zero occurrences of the
+actual pre-fix failure signature).
+
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
 formation window, or a crashed leader), one exhausted pass is not a failure.

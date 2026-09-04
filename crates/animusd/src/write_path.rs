@@ -101,7 +101,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     let request = ClientRequest::KindWriteItem {
                         table: table.to_owned(),
                         pk: pk.clone(),
@@ -109,7 +109,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         op: op.clone(),
                         condition: condition.cloned(),
                     };
-                    match self.cp_forward(table, &base_key, addr, request).await {
+                    match self
+                        .cp_forward(table, &base_key, addr, hinted, request)
+                        .await
+                    {
                         ClientResponse::KindWriteOk {
                             old,
                             new,
@@ -248,14 +251,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     let request = ClientRequest::KindWrite {
                         table: table.to_owned(),
                         writes: writes.clone(),
                         change_log: change_log.clone(),
                     };
                     match decide::ok_or_err(
-                        self.cp_forward(table, &first, addr, request).await,
+                        self.cp_forward(table, &first, addr, hinted, request).await,
                         "forwarded CP kind write",
                     ) {
                         Ok(()) => return Ok(()),

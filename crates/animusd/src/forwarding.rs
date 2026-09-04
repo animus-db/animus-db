@@ -174,10 +174,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if let Some(leader) = leader {
             return Some(CpRoute::Local(leader));
         }
-        // Forward only to a concrete leader *hint* a local replica gives us.
+        // Forward only to a concrete leader *hint* a local replica gives us
+        // -- a real, live-vouched-for hint (issue #585's `hinted: true`).
         let forward_hint = self.cp_forward_target(tablet);
         if let Some(addr) = forward_hint {
-            return Some(CpRoute::Forward(addr));
+            return Some(CpRoute::Forward(addr, true));
         }
         // No local leader and no leader hint. Whether this node hosts *any* local
         // handle for the group is cheap (no `Metadata` clone); only fetch the
@@ -237,7 +238,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if let topology::RouteDecision::Forward(addr) =
             topology::decide_cp_route(false, None, has_local_replica, is_replica, fallback_forward)
         {
-            return Some(CpRoute::Forward(addr));
+            // `decide_cp_route`'s `forward_hint` argument is `None` above, so
+            // reaching `Forward` here can only be through its `fallback_forward`
+            // branch -- a deterministic pick among the tablet's replicas with no
+            // liveness signal behind it (issue #585's `hinted: false`).
+            return Some(CpRoute::Forward(addr, false));
         }
         None
     }
@@ -344,15 +349,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// pass, still hard-bounded by the same overall deadline. Gated on the
     /// tablet being resolvable so an op this node can't even map to a tablet
     /// keeps failing fast instead of consuming the whole budget.
+    ///
+    /// `hinted` is [`CpRoute::Forward`]'s own second field, threaded
+    /// straight through from the caller's route resolution — whether `addr`
+    /// was vouched for by a live replica or merely guessed (issue #585, a
+    /// third continuation). See
+    /// [`forward_to_tablet_leader`](Self::forward_to_tablet_leader)'s own
+    /// doc for why this governs the very first hop's timeout.
     pub(crate) async fn cp_forward(
         &self,
         table: &str,
         key: &[u8],
         addr: String,
+        hinted: bool,
         request: ClientRequest,
     ) -> ClientResponse {
         let tablet = self.tablet_for(table, key);
-        self.forward_to_tablet_leader(tablet, addr, request).await
+        self.forward_to_tablet_leader(tablet, addr, hinted, request)
+            .await
     }
 
     /// The tablet-id-addressed core of [`cp_forward`](Self::cp_forward) —
@@ -460,10 +474,55 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// genuinely slow-but-live leader is still waited out within
     /// `CLIENT_TIMEOUT` rather than permanently written off after one
     /// capped hop (the pre-#585 property this second fix restores).
+    ///
+    /// **The second fix let the chase RETURN to a slow-but-live leader —
+    /// but every hop it's retried at, hinted or not, was still individually
+    /// capped at [`FORWARD_HOP_TIMEOUT`] (issue #585, a third
+    /// continuation).** Restoring `timed_out` retry eligibility fixed which
+    /// candidate the chase picks; it did nothing about how long any one
+    /// attempt is allowed to run, since every `relay_request_with_timeout`
+    /// call still used `remaining.min(FORWARD_HOP_TIMEOUT)` regardless of
+    /// *why* this hop's target was chosen. That is fatal for exactly the
+    /// case the second fix exists for: each attempt is a **fresh** proposal
+    /// on the receiving leader, not a resumed wait on the original one, so
+    /// if the leader genuinely needs longer than `FORWARD_HOP_TIMEOUT` to
+    /// commit (a membership-change storm serializing its proposes ahead of
+    /// this one), a capped retry can never outlast the leader's own real
+    /// commit latency no matter how many times the chase circles back —
+    /// each attempt restarts the clock and dies at the same wall. Confirmed
+    /// live: `tests/split_placing_two_replica_diff_e2e.rs`'s paced writer
+    /// failed `put failed: Error("no CP group leader reachable")` twice out
+    /// of two runs even with the second fix in place, during the 5-voter →
+    /// 3-voter trajectory where the leader moves n2 → m0 — the chase was
+    /// demonstrably returning to the right candidate (per the second fix)
+    /// and still never succeeding, because every return trip was capped
+    /// exactly like a first guess.
+    ///
+    /// **Fixed by capping only a candidate nothing has vouched for.** A
+    /// forward candidate is now classified [`Hinted`](decide::ForwardCandidate::Hinted)
+    /// (some live replica named this address as the leader — this node's
+    /// own local replica's `cp_leader_hint` for the very first hop, or a
+    /// refusal's own embedded hint thereafter, including the `timed_out`
+    /// last-resort retry, which by construction has nothing else left to
+    /// protect a cap from) or [`Guessed`](decide::ForwardCandidate::Guessed)
+    /// (a deterministic pick with zero liveness signal — the
+    /// no-local-replica fallback, or an untried replica the chase reaches
+    /// for on its own). Only a `Guessed` hop is capped at
+    /// `FORWARD_HOP_TIMEOUT`; a `Hinted` one gets the full remaining
+    /// `CLIENT_TIMEOUT` budget, exactly like every hop did before the first
+    /// #585 fix — see [`decide::ForwardCandidate`]'s own doc for the full
+    /// per-case reasoning. This preserves the starvation fix (a bad guess
+    /// still can't consume the whole budget — every known replica is always
+    /// tried, capped, before the chase ever falls back to retrying a
+    /// `Guessed` candidate a second time) while finally letting a
+    /// genuinely slow-but-live leader actually finish once the chase is
+    /// pointed at it with a real vouch behind it, rather than merely being
+    /// retried at it forever with the same 2-second wall each time.
     pub(crate) async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
         addr: String,
+        hinted: bool,
         request: ClientRequest,
     ) -> ClientResponse {
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
@@ -475,22 +534,34 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // method's own doc and `decide::resolve_forward_candidate`'s.
         let mut timed_out: BTreeSet<String> = BTreeSet::new();
         let mut next = addr;
+        // Issue #585, a third continuation: whether the *current* `next` was
+        // vouched for by a live replica (`Hinted`) or merely guessed
+        // (`Guessed`) — see this method's own doc. Only a guessed hop's
+        // transport timeout is capped.
+        let mut next_hinted = hinted;
         loop {
             tried.insert(next.clone());
             let remaining = deadline.duration_since(self.env.now());
-            // Issue #585: cap this hop's own transport timeout to
-            // `FORWARD_HOP_TIMEOUT` rather than handing it the whole
-            // `remaining` budget — see `FORWARD_HOP_TIMEOUT`'s own doc and
-            // this method's doc above. The final hop before `deadline`
-            // still gets the smaller of the two, so the overall
-            // `CLIENT_TIMEOUT` ceiling is unchanged.
+            // Issue #585 / #585 third continuation: cap this hop's own
+            // transport timeout to `FORWARD_HOP_TIMEOUT` ONLY when nothing
+            // vouches for `next` (`!next_hinted`) — see `FORWARD_HOP_TIMEOUT`'s
+            // own doc and this method's doc above. A hinted candidate gets
+            // the full `remaining` budget instead. Either way the final hop
+            // before `deadline` still gets whatever (smaller) time is
+            // actually left, so the overall `CLIENT_TIMEOUT` ceiling is
+            // unchanged.
+            let hop_timeout = if next_hinted {
+                remaining
+            } else {
+                remaining.min(FORWARD_HOP_TIMEOUT)
+            };
             let resp = relay_request_with_timeout(
                 next.clone(),
                 &ClientRequest::Forwarded {
                     request: Box::new(request.clone()),
                     traceparent: crate::otel::current_traceparent(),
                 },
-                remaining.min(FORWARD_HOP_TIMEOUT),
+                hop_timeout,
             )
             .await;
             let ClientResponse::Error(e) = &resp else {
@@ -537,7 +608,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // fresh replica, then a last-resort retry of a timed-out one).
             let candidate = decide::resolve_forward_candidate(hint, other, &tried, &timed_out);
             match decide::decide_forward_retry(candidate, tablet.is_some()) {
-                decide::ForwardRetryStep::Retry(a) => next = a,
+                decide::ForwardRetryStep::Retry(c) => {
+                    next_hinted = c.is_hinted();
+                    next = c.into_addr();
+                }
                 decide::ForwardRetryStep::WaitElection => {
                     // Every known candidate refused with no leader to point
                     // at, AND none is merely a timed-out one still worth a

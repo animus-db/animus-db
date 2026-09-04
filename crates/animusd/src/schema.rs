@@ -919,10 +919,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(_) => {} // dueling seal vs. the periodic arm; retry below
                     }
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForceSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -976,10 +976,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(_) => {} // dueling seal vs. the periodic arm; retry below
                     }
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1032,10 +1032,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Some(split_key) => self.trigger_split(tablet, split_key).await,
                     };
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::Error(e)
@@ -1153,13 +1153,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Local(leader)) => {
                     return index_drain::clear_backfill_cursor(&leader, index).await;
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ClearBackfillCursor {
                         tablet: tablet.0,
                         index: index.to_owned(),
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1251,14 +1251,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .map(|(key, _, value)| (key, value))
                         .collect());
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::StreamHotRead {
                         tablet: tablet.0,
                         from_position,
                         limit,
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::Pairs(pairs) => return Ok(pairs),
