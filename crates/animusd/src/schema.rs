@@ -14,11 +14,12 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 
 use crate::ReadConsistency;
 use crate::{
-    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, MAX_REPLICATION_FACTOR,
-    MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult, RegisterOutcome,
-    SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
+    CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_HOP_TIMEOUT,
+    MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus, PlacementPolicy, ProposeResult,
+    RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, SCHEMA_PROPOSE_PATIENCE,
     SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT,
-    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key, topology,
+    WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain, median_split_key,
+    relay_request_with_timeout, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -178,6 +179,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // connects, regardless of what its own `propose_schema` achieves
         // (best-effort, same as every other branch here — the caller confirms
         // via replicated `Metadata`, not this return value).
+        //
+        // Issue #585: this is the identical hinted-retry-chase shape
+        // `forward_to_tablet_leader` has (many known candidates, try each in
+        // turn until one connects), so it gets the same per-candidate
+        // transport-timeout cap (`FORWARD_HOP_TIMEOUT`, via
+        // `relay_request_with_timeout` directly) rather than `self.relay`'s
+        // flat `CLIENT_TIMEOUT` — a reachable-but-slow candidate must not be
+        // able to consume the whole timeout on one hop and starve every
+        // candidate still left in this broadcast.
         for (id, addr) in self.intra_route_snapshot() {
             // Self-skip by id, not by address string: this node's own
             // `intra_route` entry is `advertised_addr(self)`, which a bind
@@ -189,8 +199,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 continue;
             }
             if !matches!(
-                self.relay(addr, ClientRequest::ProposeSchema(command.clone()))
-                    .await,
+                relay_request_with_timeout(
+                    addr,
+                    &ClientRequest::ProposeSchema(command.clone()),
+                    FORWARD_HOP_TIMEOUT,
+                )
+                .await,
                 ClientResponse::Error(_)
             ) {
                 return true;
@@ -905,10 +919,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(_) => {} // dueling seal vs. the periodic arm; retry below
                     }
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForceSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -962,10 +976,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(_) => {} // dueling seal vs. the periodic arm; retry below
                     }
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ForcePitrSeal { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1018,10 +1032,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Some(split_key) => self.trigger_split(tablet, split_key).await,
                     };
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::Error(e)
@@ -1139,13 +1153,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Some(CpRoute::Local(leader)) => {
                     return index_drain::clear_backfill_cursor(&leader, index).await;
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::ClearBackfillCursor {
                         tablet: tablet.0,
                         index: index.to_owned(),
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::PutOk => return Ok(()),
@@ -1237,14 +1251,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .map(|(key, _, value)| (key, value))
                         .collect());
                 }
-                Some(CpRoute::Forward(addr)) => {
+                Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::StreamHotRead {
                         tablet: tablet.0,
                         from_position,
                         limit,
                     };
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, request)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request)
                         .await
                     {
                         ClientResponse::Pairs(pairs) => return Ok(pairs),

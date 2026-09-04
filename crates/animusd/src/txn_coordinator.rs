@@ -181,7 +181,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 )
                 .await
             }
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnPrepare {
                     table: table.to_owned(),
                     anchor,
@@ -190,7 +190,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     participant_spans,
                     pending_kind_writes,
                 };
-                match self.cp_forward(table, &first, addr, request).await {
+                match self.cp_forward(table, &first, addr, hinted, request).await {
                     ClientResponse::TxnPrepared {
                         txn_id,
                         record_key,
@@ -573,7 +573,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     None => Err("CP group leader moved after decide; retry".into()),
                 }
             }
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnDecide {
                     table: table.to_owned(),
                     txn_id,
@@ -582,7 +582,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     min_commit_ts,
                     orphan_created_ts,
                 };
-                match self.cp_forward(table, &record_key, addr, request).await {
+                match self
+                    .cp_forward(table, &record_key, addr, hinted, request)
+                    .await
+                {
                     ClientResponse::TxnDecided { outcome } => Ok(outcome),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(
@@ -705,7 +708,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     None => Err("CP group leader moved during resolve; retry".into()),
                 }
             }
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnResolve {
                     table: table.to_owned(),
                     txn_id,
@@ -713,7 +716,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     keys,
                     outcome,
                 };
-                match self.cp_forward(table, &first, addr, request).await {
+                match self.cp_forward(table, &first, addr, hinted, request).await {
                     ClientResponse::TxnResolved { outcome } => Ok(outcome),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(
@@ -805,13 +808,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 .txn_status_local(record_key)
                 .await
                 .ok_or_else(|| "CP group leader moved, or no record yet; retry".to_string()),
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnStatus {
                     table: record_table.to_owned(),
                     record_key: record_key.to_vec(),
                 };
                 match self
-                    .cp_forward(record_table, record_key, addr, request)
+                    .cp_forward(record_table, record_key, addr, hinted, request)
                     .await
                 {
                     ClientResponse::TxnStatusReply { status } => Ok(status),
@@ -853,13 +856,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 .txn_record_view(record_key)
                 .await
                 .ok_or_else(|| "CP group leader moved during txn record view; retry".to_string()),
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnRecordView {
                     table: record_table.to_owned(),
                     record_key: record_key.to_vec(),
                 };
                 match self
-                    .cp_forward(record_table, record_key, addr, request)
+                    .cp_forward(record_table, record_key, addr, hinted, request)
                     .await
                 {
                     ClientResponse::TxnRecordViewReply { view } => Ok(view),
@@ -888,13 +891,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 .txn_verify_staged(span, txn_id)
                 .await
                 .ok_or_else(|| "CP group leader moved during txn verify; retry".to_string()),
-            CpRoute::Forward(addr) => {
+            CpRoute::Forward(addr, hinted) => {
                 let request = ClientRequest::TxnVerify {
                     table: table.to_owned(),
                     span: span.clone(),
                     txn_id: txn_id.clone(),
                 };
-                match self.cp_forward(table, &span.start, addr, request).await {
+                match self
+                    .cp_forward(table, &span.start, addr, hinted, request)
+                    .await
+                {
                     ClientResponse::TxnVerifyReply { staged } => Ok(staged),
                     ClientResponse::Error(e) => Err(e),
                     other => Err(format!(

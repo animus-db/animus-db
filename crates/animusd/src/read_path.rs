@@ -440,12 +440,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Ok(outcome) => return Ok(outcome),
                     Err(e) => e,
                 },
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     match self
                         .cp_forward(
                             table,
                             &key,
                             addr,
+                            hinted,
                             ClientRequest::GetSnapshot {
                                 key: key.clone(),
                                 table: table.to_owned(),
@@ -539,12 +540,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Ok(v) => return Ok(v),
                     Err(e) => e,
                 },
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     match self
                         .cp_forward(
                             table,
                             &key,
                             addr,
+                            hinted,
                             ClientRequest::Get {
                                 key: key.clone(),
                                 table: table.to_owned(),
@@ -682,7 +684,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     let request = ClientRequest::Scan {
                         start: start.clone(),
                         end: end.clone(),
@@ -691,7 +693,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         table: table.to_owned(),
                         stale: false,
                     };
-                    match self.cp_forward(table, &start, addr, request).await {
+                    match self.cp_forward(table, &start, addr, hinted, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
                         ClientResponse::Error(e) => e,
                         other => {
@@ -879,7 +881,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::Forward(addr) => {
+                CpRoute::Forward(addr, hinted) => {
                     let request = ClientRequest::KindScan {
                         table: table.to_owned(),
                         kind,
@@ -889,7 +891,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         reverse,
                         stale: false,
                     };
-                    match self.cp_forward(table, &start, addr, request).await {
+                    match self.cp_forward(table, &start, addr, hinted, request).await {
                         ClientResponse::Pairs(p) => return Ok(p),
                         ClientResponse::Error(e) => e,
                         other => {

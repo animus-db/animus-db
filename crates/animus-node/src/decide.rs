@@ -193,15 +193,87 @@ pub fn other_tablet_replica_addr(
         .find_map(|id| route.get(id).cloned().filter(|a| !tried.contains(a)))
 }
 
+/// Whether a forward candidate was **vouched for** by some live replica (a
+/// refusal's own embedded leader hint — or, for the very first hop, this
+/// node's own local replica's `cp_leader_hint`) or merely **guessed** (a
+/// deterministic pick among a tablet's other known replicas, or — before
+/// this node has a local replica at all — `resolve_cp_route`'s
+/// no-local-replica fallback), with no liveness signal behind it at all
+/// (issue #585, a third continuation).
+///
+/// This is the caller's (`ClientCtx::forward_to_tablet_leader`, `animusd`)
+/// signal for **which timeout to give the next hop** — see that method's
+/// own doc for why the distinction is load-bearing, not cosmetic: capping
+/// *every* hop at `FORWARD_HOP_TIMEOUT` (the first #585 fix) stops a wrong
+/// guess from starving the chase, but it also caps a hop the chase already
+/// has good reason to trust, so a genuinely slow-but-live leader that
+/// legitimately needs longer than one hop's cap to answer can never
+/// succeed even once the chase correctly circles back to it (the residual
+/// #585 bug this type exists to close) — a `Guessed` candidate stays
+/// capped (something else is always tried first, so nothing is starved by
+/// giving it only a slice); a `Hinted` one gets the full remaining
+/// `CLIENT_TIMEOUT` budget, since it is either vouched for by a live
+/// replica or (see [`resolve_forward_candidate`]'s own doc on its
+/// last-resort case) the sole candidate left this pass, where a cap can
+/// only ever hurt and never protects anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardCandidate {
+    /// Some live replica named this address as the leader — a refusal's
+    /// own embedded hint (untried, or previously timed-out and worth an
+    /// immediate retry per [`resolve_forward_candidate`]'s priority (1)),
+    /// or, for the very first hop, this node's own local replica's leader
+    /// hint (`cp_leader_hint` — see `CpRoute::Forward`'s own `hinted`
+    /// field, `animusd`). Also covers [`resolve_forward_candidate`]'s
+    /// last-resort retry of a `timed_out` candidate once every known
+    /// replica has been exhausted this pass (priority (3)) — no fresh hint
+    /// names it *this* round, but it is the sole candidate left, so
+    /// capping it can only ever hurt and never protects any other
+    /// candidate's budget (there is no other candidate left to protect).
+    Hinted(String),
+    /// A deterministic pick with no liveness signal at all — a tablet's
+    /// other known replicas, tried in `Metadata`-derived order
+    /// ([`other_tablet_replica_addr`]), or `resolve_cp_route`'s own
+    /// no-local-replica fallback for the very first hop. Safe to cap: an
+    /// untried replica is always explored ahead of one already tried
+    /// (priority order below), so a slow guess never consumes budget a
+    /// better candidate needed.
+    Guessed(String),
+}
+
+impl ForwardCandidate {
+    /// The candidate address, regardless of which kind.
+    pub fn addr(&self) -> &str {
+        match self {
+            ForwardCandidate::Hinted(a) | ForwardCandidate::Guessed(a) => a,
+        }
+    }
+
+    /// Consume `self`, keeping only the address.
+    pub fn into_addr(self) -> String {
+        match self {
+            ForwardCandidate::Hinted(a) | ForwardCandidate::Guessed(a) => a,
+        }
+    }
+
+    /// Whether this candidate should get the full remaining `CLIENT_TIMEOUT`
+    /// budget (`true`) rather than a hop capped at `FORWARD_HOP_TIMEOUT`
+    /// (`false`) — see the type's own doc.
+    pub fn is_hinted(&self) -> bool {
+        matches!(self, ForwardCandidate::Hinted(_))
+    }
+}
+
 /// One step of `ClientCtx::forward_to_tablet_leader`'s (`animusd`)
 /// hinted-retry loop — the pure decision behind it, given the
-/// already-resolved `candidate` address (the refusal's own leader hint if
+/// already-resolved `candidate` (the refusal's own leader hint if
 /// untried, else [`other_tablet_replica_addr`]'s fallback, computed by the
-/// caller).
+/// caller and classified [`Hinted`](ForwardCandidate::Hinted)/
+/// [`Guessed`](ForwardCandidate::Guessed) by
+/// [`resolve_forward_candidate`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardRetryStep {
-    /// Retry the forwarded op at this address.
-    Retry(String),
+    /// Retry the forwarded op at this candidate.
+    Retry(ForwardCandidate),
     /// Every known candidate for a **known** tablet refused with no leader
     /// to point at (`leader_hint=none`): the group is mid-election (a
     /// split-child/first-provision formation window, or a crashed leader).
@@ -217,12 +289,94 @@ pub enum ForwardRetryStep {
 /// See [`ForwardRetryStep`]. `tablet_known` is `tablet.is_some()` at the call
 /// site — only a resolvable tablet's group can be "mid-election"; an
 /// unresolvable one has nothing to wait out.
-pub fn decide_forward_retry(candidate: Option<String>, tablet_known: bool) -> ForwardRetryStep {
+pub fn decide_forward_retry(
+    candidate: Option<ForwardCandidate>,
+    tablet_known: bool,
+) -> ForwardRetryStep {
     match candidate {
-        Some(a) => ForwardRetryStep::Retry(a),
+        Some(c) => ForwardRetryStep::Retry(c),
         None if tablet_known => ForwardRetryStep::WaitElection,
         None => ForwardRetryStep::GiveUp,
     }
+}
+
+/// The pure candidate-resolution step behind `ClientCtx::
+/// forward_to_tablet_leader`'s (`animusd`) hop loop, feeding directly into
+/// [`decide_forward_retry`] above (issue #585, continued). Given what the
+/// hop that just completed discovered — a refusal's own parsed leader
+/// `hint` (`None` for a no-hint refusal *or* a confirmed-dead transport
+/// failure — the caller has already folded those together, exactly as
+/// before), the caller's already-computed fallback among the tablet's other
+/// known replicas (`other_untried_replica`, [`other_tablet_replica_addr`]'s
+/// result — plain data, not a closure, since that helper needs live
+/// `Metadata`/route state this module never touches), and the two
+/// bookkeeping sets `tried`/`timed_out` — picks the next address to retry,
+/// or `None` once nothing is left this pass.
+///
+/// **Why `timed_out` is a third input, not folded into `tried`.** A
+/// candidate that gave a definitive answer this pass (a real refusal, or a
+/// **fast** transport failure — the candidate is confirmed unreachable
+/// within its own budget) is exhausted: retrying it teaches the chase
+/// nothing new, so `tried` alone correctly excludes it everywhere below. A
+/// candidate whose hop instead ran out its own capped
+/// `FORWARD_HOP_TIMEOUT` before any answer arrived proves nothing about
+/// whether it's alive — it might be the group's genuine, simply slow-to-
+/// commit leader (a membership-change storm, a loaded sandbox) — so it
+/// stays a *live* candidate, just one the caller (`animusd`) also records in
+/// `tried` for its own separate reason (bounding the loop's revisit rate;
+/// see that caller's own doc). `timed_out` is exactly the override list:
+/// membership here means "this address is still worth trying even though
+/// `tried` also contains it."
+///
+/// **Priority order, matching the pre-#585 behavior wherever it's silent
+/// about the difference**: (1) the refusal's own hint, if untried **or**
+/// merely timed-out — a hint naming exactly the node that just timed out on
+/// this caller is the strongest live-leader signal there is, so it wins
+/// immediately, not after a full round through every other replica; (2) a
+/// never-before-tried replica, so a live-but-quiet candidate is always
+/// explored before a slow one is retried; (3) once every known replica has
+/// been tried, whichever timed-out candidate has been waiting longest
+/// (`timed_out`'s first element — a `BTreeSet<String>`, so this is a stable,
+/// deterministic pick, not a real FIFO, but "some previously-slow candidate"
+/// rather than "give up" is the only property that matters here); (4)
+/// `None` — nothing left, the caller's [`decide_forward_retry`] turns this
+/// into `WaitElection`/`GiveUp`.
+///
+/// This still bounds a single unresponsive candidate to at most one
+/// **capped** hop's worth of budget **per round** through the other known
+/// replicas — it cannot silently re-consume the *whole* remaining deadline
+/// the way the pre-#585 code did, since every other untried replica is
+/// tried first, and priority (2)'s candidate is always [`Guessed`]. Cases
+/// (1) and (3) are [`Hinted`] instead — the caller gives those the full
+/// remaining budget, not another capped hop (a third continuation of
+/// #585): capping *every* retry, including a hint naming the group's own
+/// genuine leader or a last-resort retry with nothing else left to try,
+/// re-introduced a dual of the original bug — a leader that legitimately
+/// needs longer than one hop's cap to commit (a membership-change storm
+/// serializing its proposes) could never succeed even once the chase
+/// correctly circled back to it, since every fresh attempt restarts the
+/// op from scratch and a capped hop can never outlast the leader's own
+/// real commit latency. See [`ForwardCandidate`]'s own doc for the full
+/// reasoning behind which case gets which classification.
+///
+/// [`Hinted`]: ForwardCandidate::Hinted
+/// [`Guessed`]: ForwardCandidate::Guessed
+pub fn resolve_forward_candidate(
+    hint: Option<(NodeId, String)>,
+    other_untried_replica: Option<String>,
+    tried: &BTreeSet<String>,
+    timed_out: &BTreeSet<String>,
+) -> Option<ForwardCandidate> {
+    hint.filter(|(_, a)| !tried.contains(a) || timed_out.contains(a))
+        .map(|(_, a)| ForwardCandidate::Hinted(a))
+        .or_else(|| other_untried_replica.map(ForwardCandidate::Guessed))
+        .or_else(|| {
+            timed_out
+                .iter()
+                .next()
+                .cloned()
+                .map(ForwardCandidate::Hinted)
+        })
 }
 
 #[cfg(test)]
@@ -536,15 +690,30 @@ mod tests {
     #[test]
     fn forward_retry_retries_a_present_candidate() {
         assert_eq!(
-            decide_forward_retry(Some(addr(9)), true),
-            ForwardRetryStep::Retry(addr(9))
+            decide_forward_retry(Some(ForwardCandidate::Hinted(addr(9))), true),
+            ForwardRetryStep::Retry(ForwardCandidate::Hinted(addr(9)))
         );
         // Even for an unresolvable tablet, a candidate (e.g. the refusal's
-        // own hint) still wins over giving up.
+        // own hint) still wins over giving up. The classification rides
+        // through unchanged -- `decide_forward_retry` doesn't inspect it,
+        // only the caller (`forward_to_tablet_leader`) does.
         assert_eq!(
-            decide_forward_retry(Some(addr(9)), false),
-            ForwardRetryStep::Retry(addr(9))
+            decide_forward_retry(Some(ForwardCandidate::Guessed(addr(9))), false),
+            ForwardRetryStep::Retry(ForwardCandidate::Guessed(addr(9)))
         );
+    }
+
+    // --- ForwardCandidate ----------------------------------------------------
+
+    #[test]
+    fn forward_candidate_addr_and_is_hinted_agree_with_the_variant() {
+        let hinted = ForwardCandidate::Hinted(addr(1));
+        let guessed = ForwardCandidate::Guessed(addr(2));
+        assert_eq!(hinted.addr(), addr(1));
+        assert!(hinted.is_hinted());
+        assert_eq!(guessed.addr(), addr(2));
+        assert!(!guessed.is_hinted());
+        assert_eq!(hinted.into_addr(), addr(1));
     }
 
     #[test]
@@ -558,5 +727,121 @@ mod tests {
     #[test]
     fn forward_retry_gives_up_when_the_tablet_itself_is_unresolvable() {
         assert_eq!(decide_forward_retry(None, false), ForwardRetryStep::GiveUp);
+    }
+
+    // --- resolve_forward_candidate (issue #585, continued twice) -----------
+
+    #[test]
+    fn resolve_candidate_prefers_an_untried_hint_over_everything_else() {
+        let tried = BTreeSet::new();
+        let timed_out = BTreeSet::new();
+        assert_eq!(
+            resolve_forward_candidate(Some((nid(9), addr(9))), Some(addr(3)), &tried, &timed_out),
+            Some(ForwardCandidate::Hinted(addr(9))),
+            "an untried hint wins over the fallback replica, and is classified Hinted"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_retries_a_hint_naming_a_timed_out_node_immediately() {
+        // The mechanism this rung exists for: a hop that ran out of its own
+        // FORWARD_HOP_TIMEOUT (no answer at all, not a refusal) is recorded
+        // in `tried` (bounding revisit rate) AND `timed_out` (it's still a
+        // live candidate). The very next replica's own refusal names it as
+        // its leader hint -- that must win immediately, not wait for a full
+        // round through every other known replica first, and it must still
+        // be classified `Hinted` (not `Guessed`) so the caller gives it the
+        // full remaining budget rather than another capped hop -- the exact
+        // property the third #585 continuation exists for.
+        let mut tried = BTreeSet::new();
+        tried.insert(addr(9)); // the node that just timed out
+        let mut timed_out = BTreeSet::new();
+        timed_out.insert(addr(9));
+
+        assert_eq!(
+            resolve_forward_candidate(Some((nid(9), addr(9))), None, &tried, &timed_out),
+            Some(ForwardCandidate::Hinted(addr(9))),
+            "a hint naming a timed-out (not confirmed-dead) node must be retried, \
+             not filtered out just because it's already in `tried`, and must stay \
+             Hinted so the caller doesn't cap it again"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_does_not_retry_a_hint_naming_a_confirmed_dead_node() {
+        // Contrast case: a node already tried and refused (or failed FAST,
+        // a genuine transport failure) -- never added to `timed_out` -- must
+        // stay excluded even if some other replica's hint points at it. This
+        // is issue #316's original property, unaffected by #585's fix.
+        let mut tried = BTreeSet::new();
+        tried.insert(addr(9));
+        let timed_out = BTreeSet::new(); // confirmed dead, not merely slow
+
+        assert_eq!(
+            resolve_forward_candidate(Some((nid(9), addr(9))), None, &tried, &timed_out),
+            None,
+            "a hint naming an already-tried, non-timed-out node must not be retried"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_prefers_a_fresh_replica_over_retrying_a_timed_out_one() {
+        // No hint at all (a no-hint refusal, or nothing has answered yet).
+        // A never-tried replica must be explored before circling back to a
+        // candidate that merely timed out -- so a live-but-quiet replica is
+        // never starved behind a slow one. The fresh replica is `Guessed`
+        // (no live replica vouched for it) -- safe to cap, since nothing
+        // else needs protecting from a slow guess anymore once it's the one
+        // being tried.
+        let mut tried = BTreeSet::new();
+        tried.insert(addr(9));
+        let mut timed_out = BTreeSet::new();
+        timed_out.insert(addr(9));
+
+        assert_eq!(
+            resolve_forward_candidate(None, Some(addr(3)), &tried, &timed_out),
+            Some(ForwardCandidate::Guessed(addr(3))),
+            "an untried replica must win over retrying a timed-out one, and is Guessed"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_falls_back_to_a_timed_out_node_once_every_replica_is_tried() {
+        // Every known replica has been tried this pass (no hint, no fresh
+        // fallback left) -- but one of them only timed out, not confirmed
+        // dead. That's still worth another shot with whatever budget is
+        // left, rather than declaring WaitElection/GiveUp -- and it must be
+        // `Hinted`, not `Guessed`: this is the sole candidate left this
+        // pass, so capping it protects nothing and can only prevent a
+        // genuinely slow-but-live leader from ever finishing.
+        let mut tried = BTreeSet::new();
+        tried.insert(addr(1));
+        tried.insert(addr(9));
+        let mut timed_out = BTreeSet::new();
+        timed_out.insert(addr(9));
+
+        assert_eq!(
+            resolve_forward_candidate(None, None, &tried, &timed_out),
+            Some(ForwardCandidate::Hinted(addr(9))),
+            "once every known replica is tried, a merely-timed-out one is retried \
+             rather than giving up, uncapped (classified Hinted)"
+        );
+    }
+
+    #[test]
+    fn resolve_candidate_is_none_once_every_replica_is_confirmed_dead_or_refused() {
+        // Nothing left at all: no hint, no fresh replica, and `timed_out` is
+        // empty (every tried candidate gave a definitive answer). This is
+        // the signal the caller's `decide_forward_retry` turns into
+        // WaitElection/GiveUp.
+        let mut tried = BTreeSet::new();
+        tried.insert(addr(1));
+        tried.insert(addr(2));
+        let timed_out = BTreeSet::new();
+
+        assert_eq!(
+            resolve_forward_candidate(None, None, &tried, &timed_out),
+            None
+        );
     }
 }

@@ -1723,6 +1723,195 @@ test's own 30s victim-detection poll) yet the fix was still provable
 red-before/green-after via a fully deterministic isolation of the exact
 mechanism.
 
+**A reachable-but-slow candidate can starve the chase too, not just a dead
+one (issue #585, fixed).** Issue #316's fix above only helps once a
+transport failure has actually happened; each hop's own transport timeout
+used to be `remaining = deadline.duration_since(self.env.now())` — the
+*entire* time left before the chase's own overall deadline — handed whole
+to a single `relay_request_with_timeout` call. A candidate that accepts the
+TCP connection but is merely slow (a loaded sandbox, a starved disk) or
+simply never answers isn't a transport failure at all until its own
+timeout fires, so it could consume the *whole* remaining `CLIENT_TIMEOUT`
+budget on that one hop — the loop would then find `now >= deadline`
+immediately after and give up having tried exactly **one** replica, even
+with two other live replicas (one the tablet's real leader) reachable in
+well under a second the whole time. Observed as a bimodal `admin_endpoint`
+failure in a loaded sandbox — a different test each time, always
+`RELAY_TRANSPORT_FAILURE` — never reproduced on CI. Fixed by capping every
+hop's own transport timeout to `FORWARD_HOP_TIMEOUT` (2s,
+`remaining.min(FORWARD_HOP_TIMEOUT)`, `lib.rs`) instead of the whole
+remaining budget — see that constant's own doc for the sizing rationale
+(comfortably above a healthy hop's real round trip, while still leaving
+room for several more hops inside `CLIENT_TIMEOUT`). **The identical
+per-candidate-gets-the-whole-timeout shape also existed in
+`ClientCtx::propose_schema`'s own broadcast-to-every-known-address chase**
+(the ADR 0030 growth-node fallback, `schema.rs`) — fixed the same way,
+calling `relay_request_with_timeout` directly with `FORWARD_HOP_TIMEOUT`
+instead of `self.relay`'s flat `CLIENT_TIMEOUT`. `remote_metadata_watch_
+loop`'s long-poll (`WATCH_METADATA_CLIENT_TIMEOUT`, deliberately *longer*
+than `CLIENT_TIMEOUT` since it must outlive the serving node's own
+`WATCH_METADATA_SERVER_TIMEOUT` park) is the one call site that
+legitimately needs its own long single timeout and was left unchanged —
+see that constant's own doc. Regression:
+`forward_hop_timeout_tests::forward_to_tablet_leader_bounds_each_hop_so_a_
+slow_candidate_cannot_starve_the_chase` (`lib.rs`, beside
+`forward_transport_failure_tests` above and for the identical reason — a
+real-socket `ProdEnv` test, since `forwarding.rs` carries the same hard
+`#[deny(clippy::disallowed_methods)]`): a real raw `TcpListener` stub
+rebinds the deterministic first-guess replica's own former intra address
+and accepts every connection but never writes a reply, proving the fixed
+chase recovers via a live replica in a few seconds rather than dead-ending
+near the full `CLIENT_TIMEOUT`. See `docs/engineering-lessons.md`'s
+matching Testing entry for the general lesson (a hint-chasing forward's
+per-candidate timeout must be a bounded slice of the overall deadline,
+never the whole remaining budget) and why no `SimEnv` shape can reach this
+mechanism today (the cross-node relay is a free function hardcoded to a
+real `TcpStream`, not routed through `E: Env`'s `Network` seam or the `R:
+RelayClient` capability trait).
+
+**The hop cap above regressed the property it was supposed to leave
+intact — a genuinely slow-but-LIVE leader must still be waited out (issue
+#585, continued, fixed).** Capping every hop closes the starvation hole,
+but the fix's own `RELAY_TRANSPORT_FAILURE` sentinel folded two different
+causes together: a candidate confirmed dead *within* budget (a fast
+connect/write/read failure) and a candidate whose hop merely *ran out* of
+its own `FORWARD_HOP_TIMEOUT` before any answer arrived — reachable, just
+slow. `tried` treats both identically: permanently excluded from the rest
+of the pass, including from ever being the target of another replica's own
+hint. Under a real membership-change storm (five voters, some being
+added/removed), the group's actual leader can legitimately take **several
+seconds** to commit — comfortably inside `CLIENT_TIMEOUT`, past one
+`FORWARD_HOP_TIMEOUT`. The first hop to that leader times out and marks it
+`tried`; every other replica's own "not the leader here" refusal then
+names that *same* address as its hint — filtered out every time by
+`!tried.contains(a)` — so the chase falls through to the tablet's other
+(non-leader) replicas over and over, burning a full round's worth of
+`FORWARD_HOP_TIMEOUT`s before `ForwardRetryStep::WaitElection`'s
+`tried.clear()` ever lets it circle back, routinely enough to blow the
+whole `CLIENT_TIMEOUT` budget on a leader that would have answered in a
+few seconds. Observed live in CI as a transient ~3s leaderless window
+during a real 5-voter placing reconfiguration
+(`tests/split_placing_two_replica_diff_e2e.rs`), surfacing as a
+`RELAY_TRANSPORT_FAILURE` put error — the write simply ran out of
+retries, having spent the whole time on real (if temporarily
+non-leading) candidates.
+
+Fixed by telling "confirmed dead" and "timed out" apart **at the
+source**: `relay_request_with_timeout` (`lib.rs`) now returns one of two
+distinct sentinels depending on which half of `tokio::time::timeout`'s own
+result fires — `RELAY_TRANSPORT_FAILURE` when the inner connect/write/read
+genuinely fails *within* budget (`Ok(None)`, fast, confirmed dead), or the
+new `RELAY_HOP_TIMEOUT` when the whole attempt merely outlives `timeout`
+(`Err(_)`, `tokio::time::error::Elapsed` — nothing failed, there just
+wasn't an answer *yet*). `forward_to_tablet_leader` tracks
+`RELAY_HOP_TIMEOUT` addresses in a second set, `timed_out`, alongside
+`tried`. The actual candidate-resolution decision moved to a new pure,
+unit-tested function, `decide::resolve_forward_candidate` (ADR 0061 A6,
+`animus-node`): a hint naming an address in `timed_out` is retried
+immediately, even though that address is also in `tried` — the strongest
+possible signal that node is the live leader — ahead of exploring any
+fresh replica; once every known replica is genuinely exhausted with no
+hint left, the chase falls back to retrying a `timed_out` candidate
+directly (its own doc has the full priority order and rationale for why
+`timed_out` must be a separate set rather than folded into `tried`). This
+keeps BOTH properties at once: a reachable-but-silent candidate still
+cannot consume the whole budget (every other known replica is always tried
+first, the original #585 property), and a genuinely slow-but-live leader
+is still waited out within `CLIENT_TIMEOUT` rather than permanently
+written off after one capped hop (the pre-#585 property this continuation
+restores).
+
+Regression: `forward_hop_timeout_tests::
+forward_to_tablet_leader_waits_out_a_slow_but_live_leader_instead_of_giving_up`
+(`lib.rs`, beside the sibling test above, for the identical reason —
+`forwarding.rs` carries the hard `#[deny(clippy::disallowed_methods)]`).
+**All three** of the tablet's replicas are replaced with stubs (not just
+the first guess): the first-guess stub stalls its first connection past
+`FORWARD_HOP_TIMEOUT` (a `RELAY_HOP_TIMEOUT`) but answers a later
+connection immediately; the other two each answer — after a real ~1.8s
+delay of their own, modeling a busy cluster where *every* hop costs real
+time — with a refusal hinting at the first guess. A version of this test
+with the other two replicas answering *instantly* still passes against
+the reverted (pre-this-fix) candidate logic too, since PR #106's
+pre-existing `WaitElection` backoff already self-heals a fully-exhausted
+pass and an instant self-heal round costs only `FORWARD_ELECTION_BACKOFF`
+(100ms) — the real ~1.8s-per-hop delay is load-bearing for making a full
+extra round genuinely expensive, matching the real production failure
+shape. Confirmed red-before/green-after by temporarily reverting
+`forward_to_tablet_leader`'s candidate resolution to the pre-fix
+`hint.filter(|(_, a)| !tried.contains(a)).map(..).or(other)` shape: the
+test then fails the elapsed-time assertion deterministically, every run
+(a plain unit test of the same decision — timeout vs. refusal vs. a hint
+naming a timed-out node — lives in `animus-node`'s own
+`decide::tests::resolve_candidate_*`, no sockets involved). See
+`docs/engineering-lessons.md`'s matching entry for the sandbox-flakiness
+angle this investigation surfaced (most reproduction attempts under a
+heavily loaded, resource-constrained sandbox fail on unrelated causes —
+FD exhaustion, connection reset/refused — not the mechanism under test).
+
+**The second fix let the chase RETURN to a slow-but-live leader — but every
+hop it's retried at, hinted or not, was still individually capped at
+`FORWARD_HOP_TIMEOUT` (issue #585, a third continuation, fixed).** Fixing
+*which* candidate the chase picks is not the same as fixing *how long* that
+candidate's own attempt is allowed to run. Each retry is a **fresh**
+proposal on the receiving leader, not a resumed wait on the original one, so
+if the leader genuinely needs longer than `FORWARD_HOP_TIMEOUT` to commit on
+*every* attempt (a membership-change storm serializing its proposes ahead of
+this one, not just the first attempt), a capped retry can never outlast the
+leader's own real commit latency no matter how many times the chase
+correctly circles back to it — every attempt restarts the clock and dies at
+the identical wall. Confirmed live in CI:
+`tests/split_placing_two_replica_diff_e2e.rs`'s paced writer failed `put
+failed: Error("no CP group leader reachable")` twice out of two runs with
+the second fix already in place, during the 5-voter → 3-voter trajectory
+where the leader moves n2 → m0 — the chase was demonstrably resolving to
+the *right* candidate (the second fix's own property held) and still never
+succeeding, because every return trip to it was capped exactly like an
+ungrounded first guess.
+
+Fixed by giving the forward-candidate decision a classification, not just
+an address: `decide::ForwardCandidate::Hinted`/`Guessed` (`animus-node`).
+`Hinted` means some live replica named this address as the leader — this
+node's own local replica's `cp_leader_hint` for the very first hop
+(`CpRoute::Forward`'s new second field), or a refusal's own embedded hint
+thereafter, including the `timed_out` last-resort retry once every known
+replica is exhausted (nothing else is left this pass to protect a cap
+from). `Guessed` means a deterministic pick with zero liveness signal — the
+no-local-replica fallback, or an untried replica the chase reaches for on
+its own. `forward_to_tablet_leader` now caps a hop at `FORWARD_HOP_TIMEOUT`
+only when its candidate is `Guessed`; a `Hinted` one gets the full remaining
+`CLIENT_TIMEOUT` budget, exactly like every hop did before the first #585
+fix. This keeps the starvation fix intact — a `Guessed` candidate is always
+tried, capped, before the chase ever falls back to retrying one a second
+time — while finally letting a genuinely slow-but-live leader actually
+finish once the chase is pointed at it with a real vouch behind it, rather
+than being retried at it forever under the same wall every time. See
+`decide::ForwardCandidate`'s own doc (`animus-node`) and
+`forward_to_tablet_leader`'s own doc (`forwarding.rs`) for the full
+per-case reasoning.
+
+Regression: `forward_hop_timeout_tests::
+forward_to_tablet_leader_does_not_cap_a_hinted_retry_of_a_genuinely_slow_leader`
+(`lib.rs`, beside the two sibling tests above, for the identical reason).
+**Why the second fix's own test above didn't already catch this**: its
+stub (`spawn_slow_then_ok_stub`) special-cases only the *first* connection
+to stall — every later connection, retry included, answers instantly — so
+whether that retry's own hop happened to be capped or not never mattered to
+that fixture; it proves candidate *selection* (the chase returns to the
+right address) but nothing about *how long the return trip is allowed to
+run*. This test's own stub (`spawn_always_slow_ok_stub`) instead answers
+**every** connection — first attempt and retry alike — only after a delay
+past `FORWARD_HOP_TIMEOUT`, matching the real production shape (a standing
+commit-latency cost on every attempt, not a one-time slow start), so only a
+genuinely uncapped hinted retry can succeed inside `CLIENT_TIMEOUT`. See
+`docs/engineering-lessons.md`'s matching entry for the general lesson (a
+fixture built to prove one fix in a mechanism can stay green through a
+regression in a different dimension of that same mechanism unless it
+faithfully models that dimension too) and for this investigation's own
+repro-loop findings (two sandbox-only `"Too many open files"` failures out
+of ten post-fix runs of the flaky e2e test above, zero occurrences of the
+actual pre-fix failure signature).
+
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
 formation window, or a crashed leader), one exhausted pass is not a failure.
