@@ -15815,3 +15815,28 @@ own validation gate never reaches, for a behavior change far larger than
 the "M"-sized item described. Left unenforced, documented here and in the
 session report, rather than either silently expanding the diff's blast
 radius or silently skipping the question asked.
+
+- **Repurposing a private parser across two features must re-audit its
+  error text, not just its logic** (2026-09-04, issue #375/W-01's PR3,
+  nested-path `UpdateExpression` targets). `parse_projection_path`/
+  `parse_projection_segment`/`parse_index_chain` (`animus-dynamo/src/
+  wire.rs`) already implemented the exact document-path grammar
+  (`a.b[0]`, `#alias`, list indices) `UpdateExpression`'s new nested `SET`/
+  `REMOVE`/`ADD`/`DELETE` targets needed — reusing it verbatim (rather than
+  a second hand-rolled path parser) was the right call and cost nothing in
+  logic. What it *did* cost, and would have shipped silently wrong without a
+  second look: every one of that parser's error messages said "projection
+  path" by name (`"malformed list-index syntax in projection path
+  `{raw}`"`, `"projection uses name placeholder ..."`), because it was
+  written when `ProjectionExpression` was its only caller. Left unchanged, a
+  malformed `UpdateExpression` path (`SET a[ = :v`) would have reported a
+  `ValidationException` blaming "projection path" — correct code, actively
+  misleading diagnostic, on a request that has no `ProjectionExpression` in
+  it at all. Fixed by generalizing the wording to "document path" (the name
+  both features' grammar actually describes) before wiring the second
+  caller through. General form: when a private helper built for feature A
+  gains a second caller (feature B), grep its own error/log strings for
+  feature A's name — a reused *helper* is usually safe to share verbatim,
+  but a reused helper's *messages* silently keep pointing at whichever
+  feature was there first unless someone explicitly generalizes them, and
+  nothing type-checks that omission.

@@ -183,7 +183,12 @@ pub enum Select {
 /// attribute name, one `.`-separated component) or a list index (one `[n]`
 /// suffix). A dotted path `a.b` is two `Field` segments; a list-index path
 /// `a[0].b` is `Field("a")`, `Index(0)`, `Field("b")`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (issue #375 PR3): an `UpdateAction`'s own
+/// target/operand paths ride the wire the same way `UpdateAction` itself
+/// does (see that type's doc) — `Projection` itself is never sent that way,
+/// so this is purely for `UpdateOperand`/`UpdateAction`'s sake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathSegment {
     /// A map (`M`) key.
     Field(String),
@@ -377,40 +382,39 @@ pub enum UpdateReturnValues {
 }
 
 /// One operand of a `SET` clause's right-hand side (an [`UpdateExpr`]): a
-/// `:value` placeholder already resolved at decode time, a top-level
-/// attribute name read from the item being updated, or a function call.
-/// Nested document paths (`a.b`, `a[0]`) are a documented gap here — this
-/// operand always names a **top-level** attribute (issue #375 PR1/PR2); see
-/// [`UpdateAction::Set`]'s own doc.
+/// `:value` placeholder already resolved at decode time, a document path
+/// read from the item being updated, or a function call. A `Path` may be
+/// nested (`a.b`, `a[0]`, `#n.b[1]` — issue #375 PR3, the same [`PathSegment`]
+/// grammar `ProjectionExpression` already uses, via [`parse_update_path`]).
 ///
 /// A `Path` operand's read happens at **apply time** ([`eval_update_operand`]),
 /// against whatever the fold has built so far — not necessarily the item's
 /// original pre-update image — since [`apply_update`] evaluates each SET
 /// action's expression against its own in-progress `item`. This mirrors
-/// `ADD`'s existing `item.get(attr)` read exactly; it is a documented
-/// simplification (DynamoDB's own within-expression ordering semantics are
-/// stricter) rather than a modeled property.
+/// `ADD`'s existing read exactly; it is a documented simplification
+/// (DynamoDB's own within-expression ordering semantics are stricter) rather
+/// than a modeled property.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateOperand {
     /// An already-resolved `:value`.
     Value(AttributeValue),
-    /// A top-level attribute name, read from the item at apply time.
-    Path(String),
+    /// A document path, read from the item at apply time.
+    Path(Vec<PathSegment>),
     /// `if_not_exists(path, default)` — `path`'s current value if present,
     /// else `default` (itself evaluated, so it may be another function call
     /// or a `:value`). Evaluating to nothing (a `default` that is itself an
     /// absent path) is a `ValidationException` — `SET` can never assign
     /// "no value".
-    IfNotExists(String, Box<UpdateOperand>),
+    IfNotExists(Vec<PathSegment>, Box<UpdateOperand>),
     /// `list_append(a, b)` — the concatenation `a ++ b`; both operands must
     /// evaluate to a list (`L`). A missing operand, or a present one that
     /// isn't a list, is a `ValidationException`.
     ListAppend(Box<UpdateOperand>, Box<UpdateOperand>),
 }
 
-/// A `SET` clause's right-hand side: one [`UpdateOperand`], or (issue #375
-/// PR2) `operand + operand` / `operand - operand` — DynamoDB allows at most
-/// one arithmetic operator per `SET` value, both sides numeric (`N`).
+/// A `SET` clause's right-hand side: one [`UpdateOperand`], or `operand +
+/// operand` / `operand - operand` — DynamoDB allows at most one arithmetic
+/// operator per `SET` value, both sides numeric (`N`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateExpr {
     /// A single operand, no arithmetic.
@@ -432,9 +436,13 @@ impl UpdateExpr {
     }
 }
 
-/// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
-/// top-level attribute to a value/path/function-call/arithmetic expression, or
-/// remove one.
+/// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set
+/// a document path to a value/path/function-call/arithmetic expression, remove
+/// one, or apply `ADD`/`DELETE`'s typed operation to one. Every target is a
+/// **document path** (`Vec<`[`PathSegment`]`>`, issue #375 PR3) — `a`, `a.b`,
+/// `a[0]`, `#n.b[1]` — the same grammar `ProjectionExpression` uses
+/// ([`parse_update_path`]), so `SET`/`REMOVE`/`ADD`/`DELETE` can all target a
+/// nested map/list element, not only a top-level attribute.
 ///
 /// **`Serialize`/`Deserialize` (ADR 0046 U3)**: rides the wire inside
 /// `ClientRequest::KindWriteItem`'s `KindWriteOp::Update` — the leader-side
@@ -443,23 +451,25 @@ impl UpdateExpr {
 /// (possibly stale, possibly racing) edge that received the request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateAction {
-    /// `SET attr = expr` — set (or overwrite) a top-level attribute to the
-    /// result of evaluating `expr` ([`UpdateExpr`]: a value, a path,
+    /// `SET path = expr` — set (or overwrite) a document path to the result
+    /// of evaluating `expr` ([`UpdateExpr`]: a value, a path,
     /// `if_not_exists(..)`/`list_append(..)`, or `operand +/- operand`)
-    /// against the item at apply time (issue #375 PR1/PR2). Nested document
-    /// paths as the *target* (`SET a.b = :v`) are a documented gap — the
-    /// target is always a top-level attribute name.
-    Set(String, UpdateExpr),
-    /// `REMOVE attr` — drop a top-level attribute if present.
-    Remove(String),
-    /// `ADD attr :v` — numeric addition when both sides are `N`, set union
-    /// when both are the same set type. On an absent attribute it seeds the
-    /// value, which is what makes `ADD` the idiomatic counter increment.
-    Add(String, AttributeValue),
-    /// `DELETE attr :v` — remove `:v`'s members from a set attribute. Only
+    /// against the item at apply time. `path`'s parent must already exist
+    /// (`SET a.b = :v` on an absent `a` is a `ValidationException`) — only
+    /// the final segment may be new.
+    Set(Vec<PathSegment>, UpdateExpr),
+    /// `REMOVE path` — drop a document path if present; a no-op if any part
+    /// of it is absent. `REMOVE a[i]` compacts the list.
+    Remove(Vec<PathSegment>),
+    /// `ADD path :v` — numeric addition when both sides are `N`, set union
+    /// when both are the same set type. On an absent path it seeds the
+    /// value (the same parent-must-exist rule as `SET`), which is what makes
+    /// `ADD` the idiomatic counter increment.
+    Add(Vec<PathSegment>, AttributeValue),
+    /// `DELETE path :v` — remove `:v`'s members from a set-typed path. Only
     /// the set types; an empty result removes the attribute entirely, as
     /// DynamoDB does not store empty sets.
-    Delete(String, AttributeValue),
+    Delete(Vec<PathSegment>, AttributeValue),
 }
 
 /// One sub-request of a `BatchWriteItem` (within a single table's request list):
@@ -1973,8 +1983,8 @@ impl UpdateToken<'_> {
 /// `parse_update_func_call`'s recursive-descent consumption of a call's own
 /// matching parens is what actually keeps a clause keyword or `,` inside a
 /// call from ever reaching `continues_update_clause`, so `depth` itself is
-/// informational once the grammar is genuinely recursive (issue #375 PR1)
-/// rather than load-bearing for that.
+/// informational once the grammar is genuinely recursive (issue #375
+/// PR1) rather than load-bearing for that.
 fn tokenize_update_expression(expr: &str) -> Vec<(UpdateToken<'_>, u32)> {
     let mut tokens = Vec::new();
     let mut depth: u32 = 0;
@@ -2148,6 +2158,16 @@ fn decode_update_expression(
     }
 }
 
+/// Parse an `UpdateExpression` document-path target/operand — the same
+/// grammar `ProjectionExpression`'s own path elements use
+/// ([`parse_projection_path`]), reused verbatim: `a`, `a.b`, `a[0]`,
+/// `#n.b[1]` (issue #375 PR3). A thin, distinctly-named wrapper so update
+/// call sites read as parsing an update path, not incidentally borrowing a
+/// projection helper.
+fn parse_update_path(obj: &Map<String, Value>, raw: &str) -> Result<Vec<PathSegment>, WireError> {
+    parse_projection_path(obj, raw)
+}
+
 /// Parse the clause sequence of an already-tokenized `UpdateExpression`,
 /// given `tokens[0]` is confirmed to be a clause keyword (checked by
 /// [`decode_update_expression`] before calling this).
@@ -2180,7 +2200,7 @@ fn parse_update_clauses(
                         return Err(WireError::validation("SET clause must be `attr = :value`"));
                     }
                 }
-                let attr = resolve_attr_name(obj, path)?;
+                let attr = parse_update_path(obj, path)?;
                 let value_expr = parse_update_set_expr(obj, tokens, &mut i, expr)?;
                 actions.push(UpdateAction::Set(attr, value_expr));
                 if !continues_update_clause(tokens, &mut i, expr)? {
@@ -2189,7 +2209,7 @@ fn parse_update_clauses(
             },
             "remove" => loop {
                 let path = expect_update_word(tokens, &mut i, expr, "an attribute name")?;
-                let attr = resolve_attr_name(obj, path)?;
+                let attr = parse_update_path(obj, path)?;
                 actions.push(UpdateAction::Remove(attr));
                 if !continues_update_clause(tokens, &mut i, expr)? {
                     break;
@@ -2206,7 +2226,7 @@ fn parse_update_clauses(
                             kw.to_uppercase()
                         ))
                     })?;
-                let attr = resolve_attr_name(obj, name)?;
+                let attr = parse_update_path(obj, name)?;
                 let value = resolve_placeholder(obj, value_tok)?;
                 if kw == "add" {
                     // A numeric ADD is the one non-idempotent write this
@@ -2267,7 +2287,59 @@ fn parse_update_clauses(
             _ => unreachable!("update_clause_keyword only returns the four matched arms"),
         }
     }
+    validate_no_overlapping_targets(&actions)?;
     Ok(actions)
+}
+
+/// Reject an `UpdateExpression` whose actions target overlapping document
+/// paths — `SET a = :x, a.b = :y` (one path is a prefix of, or equal to,
+/// another), matching DynamoDB's own "Two document paths overlap" rejection.
+/// `O(n^2)` in the action count, which is always small (a single request
+/// body).
+fn validate_no_overlapping_targets(actions: &[UpdateAction]) -> Result<(), WireError> {
+    fn target(a: &UpdateAction) -> &[PathSegment] {
+        match a {
+            UpdateAction::Set(p, _) => p,
+            UpdateAction::Remove(p) => p,
+            UpdateAction::Add(p, _) => p,
+            UpdateAction::Delete(p, _) => p,
+        }
+    }
+    let paths: Vec<&[PathSegment]> = actions.iter().map(target).collect();
+    for (i, a) in paths.iter().enumerate() {
+        for b in &paths[i + 1..] {
+            if a.iter().zip(b.iter()).all(|(x, y)| x == y) {
+                return Err(WireError::validation(format!(
+                    "Two document paths overlap with each other; must remove or rewrite \
+                     one of these paths; path one: [{}], path two: [{}]",
+                    format_update_path(a),
+                    format_update_path(b),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render a document path back to `a.b[0]`-style text for an error message.
+fn format_update_path(path: &[PathSegment]) -> String {
+    let mut out = String::new();
+    for (i, seg) in path.iter().enumerate() {
+        match seg {
+            PathSegment::Field(name) => {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(name);
+            }
+            PathSegment::Index(n) => {
+                out.push('[');
+                out.push_str(&n.to_string());
+                out.push(']');
+            }
+        }
+    }
+    out
 }
 
 /// Consume one exact punctuation token (`Comma`/`RParen`/…), or fail with a
@@ -2340,7 +2412,7 @@ fn parse_update_operand(
     if word.starts_with(':') {
         return Ok(UpdateOperand::Value(resolve_placeholder(obj, word)?));
     }
-    Ok(UpdateOperand::Path(resolve_attr_name(obj, word)?))
+    Ok(UpdateOperand::Path(parse_update_path(obj, word)?))
 }
 
 /// Parse a function call's argument list — `tokens[*i]` is the `(` right
@@ -2358,7 +2430,7 @@ fn parse_update_func_call(
     match name {
         "if_not_exists" => {
             let path_word = expect_update_word(tokens, i, expr, "a path")?;
-            let path = resolve_attr_name(obj, path_word)?;
+            let path = parse_update_path(obj, path_word)?;
             expect_update_punct(tokens, i, expr, UpdateToken::Comma, "`,`")?;
             let default = parse_update_operand(obj, tokens, i, expr)?;
             expect_update_punct(tokens, i, expr, UpdateToken::RParen, "`)`")?;
@@ -2428,19 +2500,40 @@ fn eval_update_arithmetic(
     Ok(AttributeValue::N(sum))
 }
 
+/// Read a document path out of `item`, returning `None` at the first
+/// missing key/out-of-range index or wrong-container-type step (no error —
+/// the caller decides whether an absent path is legal). Mirrors
+/// `condition::resolve_path`-shaped readers elsewhere in this crate, but
+/// returns a *reference* (no clone until the caller actually needs one).
+fn get_document_path<'a>(item: &'a Item, path: &[PathSegment]) -> Option<&'a AttributeValue> {
+    let mut segments = path.iter();
+    let PathSegment::Field(first) = segments.next()? else {
+        return None; // The parser never emits an Index as a path's first segment.
+    };
+    let mut cur = item.get(first)?;
+    for seg in segments {
+        cur = match (seg, cur) {
+            (PathSegment::Field(name), AttributeValue::M(m)) => m.get(name)?,
+            (PathSegment::Index(idx), AttributeValue::L(l)) => l.get(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 /// Evaluate one [`UpdateOperand`] against `item`. `Ok(None)` means the
-/// operand names an attribute that does not currently exist — a legal
+/// operand names a document path that does not currently exist — a legal
 /// intermediate result (`if_not_exists`'s first argument), but never a
-/// legal *final* `SET` value; the caller decides whether `None` is an
-/// error.
+/// legal *final* `SET`/arithmetic value; the caller decides whether `None`
+/// is an error.
 fn eval_update_operand(
     item: &Item,
     operand: &UpdateOperand,
 ) -> Result<Option<AttributeValue>, WireError> {
     match operand {
         UpdateOperand::Value(v) => Ok(Some(v.clone())),
-        UpdateOperand::Path(name) => Ok(item.get(name).cloned()),
-        UpdateOperand::IfNotExists(name, default) => match item.get(name) {
+        UpdateOperand::Path(path) => Ok(get_document_path(item, path).cloned()),
+        UpdateOperand::IfNotExists(path, default) => match get_document_path(item, path) {
             Some(v) => Ok(Some(v.clone())),
             None => eval_update_operand(item, default),
         },
@@ -2460,9 +2553,131 @@ fn eval_update_operand(
     }
 }
 
-/// Resolve a single top-level attribute name in an update clause, following a
-/// `#alias` through `ExpressionAttributeNames`. Document paths are rejected here
-/// (updates target a top-level attribute in this subset).
+/// Set a document path in `item` to `value` — the target [`PathSegment`]
+/// chain's parent must already exist (every segment but the last), matching
+/// DynamoDB's own "The document path provided in the update expression is
+/// invalid for update" rejection; only the final segment may be new. An
+/// `Index` past the end of its list **appends** rather than padding
+/// (DynamoDB's own documented behavior for `SET list[n]` beyond the current
+/// length); an `Index` within bounds overwrites that element.
+fn set_document_path(item: &mut Item, path: &[PathSegment], value: AttributeValue) {
+    match path.split_first() {
+        Some((PathSegment::Field(name), [])) => {
+            item.insert(name.clone(), value);
+        }
+        Some((PathSegment::Field(name), rest)) => {
+            if let Some(parent) = item.get_mut(name) {
+                set_into_container(parent, rest, value);
+            }
+        }
+        _ => {} // A top-level Index is nonsensical; the caller's own guard rejects it first.
+    }
+}
+
+/// [`set_document_path`]'s recursive step once already inside a container —
+/// `path` is never empty here (the caller only recurses with a non-empty
+/// `rest`). A missing/wrong-shaped parent is silently a no-op: the caller
+/// (`apply_update`) has already validated every intermediate segment exists
+/// via [`document_path_parent_exists`] before calling this, so reaching a
+/// dead end here would mean that check and this walk disagree — which
+/// should never happen, not something to paper over with a second error
+/// path.
+fn set_into_container(container: &mut AttributeValue, path: &[PathSegment], value: AttributeValue) {
+    match path.split_first() {
+        None => {}
+        Some((PathSegment::Field(name), rest)) => {
+            let AttributeValue::M(m) = container else {
+                return;
+            };
+            if rest.is_empty() {
+                m.insert(name.clone(), value);
+            } else if let Some(parent) = m.get_mut(name) {
+                set_into_container(parent, rest, value);
+            }
+        }
+        Some((PathSegment::Index(idx), rest)) => {
+            let AttributeValue::L(l) = container else {
+                return;
+            };
+            if rest.is_empty() {
+                if *idx < l.len() {
+                    l[*idx] = value;
+                } else {
+                    l.push(value);
+                }
+            } else if let Some(parent) = l.get_mut(*idx) {
+                set_into_container(parent, rest, value);
+            }
+        }
+    }
+}
+
+/// Whether `path`'s parent (every segment but the last) already exists in
+/// `item` — the pre-flight `SET`/`ADD` guard: DynamoDB requires every
+/// intermediate container to pre-exist, only the final segment may be new.
+/// A bare top-level path (`path.len() == 1`) has no parent to check and is
+/// always legal here.
+fn document_path_parent_exists(item: &Item, path: &[PathSegment]) -> bool {
+    match path.split_last() {
+        None => true, // never reached: the parser never emits an empty path.
+        Some((_, [])) => true,
+        Some((_, parent)) => get_document_path(item, parent).is_some(),
+    }
+}
+
+/// Remove a document path from `item` if present; a no-op if any part of it
+/// is absent. `REMOVE a[i]` compacts the list (`Vec::remove`), matching
+/// DynamoDB.
+fn remove_document_path(item: &mut Item, path: &[PathSegment]) {
+    match path.split_first() {
+        Some((PathSegment::Field(name), [])) => {
+            item.remove(name);
+        }
+        Some((PathSegment::Field(name), rest)) => {
+            if let Some(parent) = item.get_mut(name) {
+                remove_from_container(parent, rest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`remove_document_path`]'s recursive step once already inside a
+/// container.
+fn remove_from_container(container: &mut AttributeValue, path: &[PathSegment]) {
+    match path.split_first() {
+        None => {}
+        Some((PathSegment::Field(name), rest)) => {
+            let AttributeValue::M(m) = container else {
+                return;
+            };
+            if rest.is_empty() {
+                m.remove(name);
+            } else if let Some(parent) = m.get_mut(name) {
+                remove_from_container(parent, rest);
+            }
+        }
+        Some((PathSegment::Index(idx), rest)) => {
+            let AttributeValue::L(l) = container else {
+                return;
+            };
+            if rest.is_empty() {
+                if *idx < l.len() {
+                    l.remove(*idx);
+                }
+            } else if let Some(parent) = l.get_mut(*idx) {
+                remove_from_container(parent, rest);
+            }
+        }
+    }
+}
+
+/// Resolve a single top-level attribute name in a `ConditionExpression`
+/// (`attribute_exists`/comparators/`KeyConditionExpression`, …), following a
+/// `#alias` through `ExpressionAttributeNames`. Document paths are rejected
+/// here — unlike `UpdateExpression`'s own targets/operands
+/// ([`parse_update_path`], issue #375 PR3), a condition's attribute
+/// reference stays top-level-only in this subset.
 fn resolve_attr_name(obj: &Map<String, Value>, raw: &str) -> Result<String, WireError> {
     let name = if let Some(alias) = raw.strip_prefix('#') {
         obj.get("ExpressionAttributeNames")
@@ -3390,11 +3605,15 @@ fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, Wir
     Ok(None)
 }
 
-/// Parse one `ProjectionExpression` element into a document path: a
-/// `.`-separated sequence of segments, each an attribute name (or `#alias`,
-/// resolved through `ExpressionAttributeNames`) optionally followed by one or
-/// more `[n]` list-index suffixes (e.g. `#p.list[0][1]` → `Field("profile")`,
-/// `Field("list")`, `Index(0)`, `Index(1)`, once `#p` resolves to `profile`).
+/// Parse one document path — a `.`-separated sequence of segments, each an
+/// attribute name (or `#alias`, resolved through `ExpressionAttributeNames`)
+/// optionally followed by one or more `[n]` list-index suffixes (e.g.
+/// `#p.list[0][1]` → `Field("profile")`, `Field("list")`, `Index(0)`,
+/// `Index(1)`, once `#p` resolves to `profile`). Originally one
+/// `ProjectionExpression` element's own grammar; reused verbatim (issue #375
+/// PR3) by `UpdateExpression`'s `SET`/`REMOVE`/`ADD`/`DELETE` targets and a
+/// `SET` expression's path operands via [`parse_update_path`] — the two
+/// surfaces share one document-path grammar, so fixing one fixes both.
 fn parse_projection_path(
     obj: &Map<String, Value>,
     raw: &str,
@@ -3404,7 +3623,7 @@ fn parse_projection_path(
         let seg = seg.trim();
         if seg.is_empty() {
             return Err(WireError::validation(format!(
-                "projection path `{raw}` has an empty segment"
+                "document path `{raw}` has an empty segment"
             )));
         }
         segments.extend(parse_projection_segment(obj, raw, seg)?);
@@ -3412,7 +3631,7 @@ fn parse_projection_path(
     Ok(segments)
 }
 
-/// Parse one `.`-separated piece of a projection path (`seg`, e.g. `list[0][1]`
+/// Parse one `.`-separated piece of a document path (`seg`, e.g. `list[0][1]`
 /// or `#p`) into a field segment plus any trailing index segments. `raw` is
 /// the whole path, kept only for error messages.
 fn parse_projection_segment(
@@ -3427,7 +3646,7 @@ fn parse_projection_segment(
     };
     if name_part.is_empty() {
         return Err(WireError::validation(format!(
-            "malformed list-index syntax in projection path `{raw}` (no attribute name before `[`)"
+            "malformed list-index syntax in document path `{raw}` (no attribute name before `[`)"
         )));
     }
     let name = if let Some(alias) = name_part.strip_prefix('#') {
@@ -3436,7 +3655,7 @@ fn parse_projection_segment(
             .and_then(Value::as_object)
             .ok_or_else(|| {
                 WireError::validation(format!(
-                    "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
+                    "document path uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
                 ))
             })?;
         names
@@ -3463,7 +3682,7 @@ fn parse_projection_segment(
 fn parse_index_chain(mut rest: &str, raw: &str) -> Result<Vec<PathSegment>, WireError> {
     let malformed = || {
         WireError::validation(format!(
-            "malformed list-index syntax in projection path `{raw}`"
+            "malformed list-index syntax in document path `{raw}`"
         ))
     };
     let mut indices = Vec::new();
@@ -4555,17 +4774,28 @@ pub fn batch_write_response() -> String {
 /// This is the single choke point that covers both `UpdateItem` and
 /// `TransactWriteItems`'s `Update` action, since both call this function.
 pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, WireError> {
+    let invalid_path = || {
+        WireError::validation(
+            "The document path provided in the update expression is invalid for update",
+        )
+    };
     for action in actions {
         match action {
-            UpdateAction::Set(attr, value_expr) => {
+            UpdateAction::Set(path, value_expr) => {
+                if !document_path_parent_exists(&item, path) {
+                    return Err(invalid_path());
+                }
                 let value = eval_update_expr(&item, value_expr)?;
-                item.insert(attr.clone(), value);
+                set_document_path(&mut item, path, value);
             }
-            UpdateAction::Remove(attr) => {
-                item.remove(attr);
+            UpdateAction::Remove(path) => {
+                remove_document_path(&mut item, path);
             }
-            UpdateAction::Add(attr, operand) => {
-                let updated = match (item.get(attr), operand) {
+            UpdateAction::Add(path, operand) => {
+                if !document_path_parent_exists(&item, path) {
+                    return Err(invalid_path());
+                }
+                let updated = match (get_document_path(&item, path), operand) {
                     // Absent: seed with the operand. This is what makes
                     // `ADD #c :one` the idiomatic counter increment on a row
                     // that does not exist yet.
@@ -4573,7 +4803,8 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, Wi
                     (Some(AttributeValue::N(cur)), AttributeValue::N(delta)) => AttributeValue::N(
                         crate::condition::add_numeric(cur, delta).ok_or_else(|| {
                             WireError::validation(format!(
-                                "ADD on `{attr}`: `{cur}` and `{delta}` are not both numbers"
+                                "ADD on `{}`: `{cur}` and `{delta}` are not both numbers",
+                                format_update_path(path)
                             ))
                         })?,
                     ),
@@ -4588,18 +4819,19 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, Wi
                     }
                     (Some(existing), operand) => {
                         return Err(WireError::validation(format!(
-                            "ADD on `{attr}` needs a number or a matching set type, \
+                            "ADD on `{}` needs a number or a matching set type, \
                              got {} += {}",
+                            format_update_path(path),
                             type_name(existing),
                             type_name(operand)
                         )));
                     }
                 };
-                item.insert(attr.clone(), updated);
+                set_document_path(&mut item, path, updated);
             }
-            UpdateAction::Delete(attr, operand) => {
-                let Some(existing) = item.get(attr) else {
-                    // Deleting from an absent attribute is a no-op, as in
+            UpdateAction::Delete(path, operand) => {
+                let Some(existing) = get_document_path(&item, path) else {
+                    // Deleting from an absent path is a no-op, as in
                     // DynamoDB — not an error.
                     continue;
                 };
@@ -4615,7 +4847,8 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, Wi
                     }
                     (existing, operand) => {
                         return Err(WireError::validation(format!(
-                            "DELETE on `{attr}` needs matching set types, got {} -= {}",
+                            "DELETE on `{}` needs matching set types, got {} -= {}",
+                            format_update_path(path),
                             type_name(existing),
                             type_name(operand)
                         )));
@@ -4624,9 +4857,9 @@ pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, Wi
                 // DynamoDB does not store empty sets: emptying one removes the
                 // attribute rather than leaving `SS: []` behind.
                 if set_is_empty(&remaining) {
-                    item.remove(attr);
+                    remove_document_path(&mut item, path);
                 } else {
-                    item.insert(attr.clone(), remaining);
+                    set_document_path(&mut item, path, remaining);
                 }
             }
         }
@@ -7399,9 +7632,9 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("a".into(), UpdateExpr::value(s("x"))),
-                UpdateAction::Set("b".into(), UpdateExpr::value(AttributeValue::N("3".into()))),
-                UpdateAction::Remove("c".into()),
+                UpdateAction::Set(field("a"), UpdateExpr::value(s("x"))),
+                UpdateAction::Set(field("b"), UpdateExpr::value(AttributeValue::N("3".into()))),
+                UpdateAction::Remove(field("c")),
             ]
         );
         assert_eq!(return_values, UpdateReturnValues::AllNew);
@@ -7421,7 +7654,7 @@ mod tests {
         };
         assert_eq!(
             actions,
-            vec![UpdateAction::Set("x".into(), UpdateExpr::value(s("y")))]
+            vec![UpdateAction::Set(field("x"), UpdateExpr::value(s("y")))]
         );
     }
 
@@ -7453,7 +7686,7 @@ mod tests {
         };
         assert_eq!(
             actions,
-            vec![UpdateAction::Set("set".into(), UpdateExpr::value(s("x")))]
+            vec![UpdateAction::Set(field("set"), UpdateExpr::value(s("x")))]
         );
     }
 
@@ -7472,8 +7705,8 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("add".into(), UpdateExpr::value(s("x"))),
-                UpdateAction::Set("remove".into(), UpdateExpr::value(s("y"))),
+                UpdateAction::Set(field("add"), UpdateExpr::value(s("x"))),
+                UpdateAction::Set(field("remove"), UpdateExpr::value(s("y"))),
             ]
         );
     }
@@ -7488,7 +7721,7 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Remove("set".into())]);
+        assert_eq!(actions, vec![UpdateAction::Remove(field("set"))]);
     }
 
     /// Two reserved words in one `REMOVE` action list.
@@ -7504,8 +7737,8 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Remove("remove".into()),
-                UpdateAction::Remove("delete".into()),
+                UpdateAction::Remove(field("remove")),
+                UpdateAction::Remove(field("delete")),
             ]
         );
     }
@@ -7524,7 +7757,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![UpdateAction::Add(
-                "add".into(),
+                field("add"),
                 AttributeValue::N("1".into())
             )]
         );
@@ -7544,7 +7777,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![UpdateAction::Delete(
-                "delete".into(),
+                field("delete"),
                 AttributeValue::SS(vec!["a".into()])
             )]
         );
@@ -7568,10 +7801,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("set".into(), UpdateExpr::value(s("x"))),
-                UpdateAction::Remove("remove".into()),
-                UpdateAction::Add("add".into(), AttributeValue::N("1".into())),
-                UpdateAction::Delete("delete".into(), AttributeValue::SS(vec!["a".into()])),
+                UpdateAction::Set(field("set"), UpdateExpr::value(s("x"))),
+                UpdateAction::Remove(field("remove")),
+                UpdateAction::Add(field("add"), AttributeValue::N("1".into())),
+                UpdateAction::Delete(field("delete"), AttributeValue::SS(vec!["a".into()])),
             ]
         );
     }
@@ -7591,7 +7824,7 @@ mod tests {
         };
         assert_eq!(
             actions,
-            vec![UpdateAction::Set("size".into(), UpdateExpr::value(s("x")))]
+            vec![UpdateAction::Set(field("size"), UpdateExpr::value(s("x")))]
         );
     }
 
@@ -7610,7 +7843,7 @@ mod tests {
         };
         assert_eq!(
             actions,
-            vec![UpdateAction::Set("set".into(), UpdateExpr::value(s("x")))]
+            vec![UpdateAction::Set(field("set"), UpdateExpr::value(s("x")))]
         );
     }
 
@@ -7632,7 +7865,7 @@ mod tests {
         };
         assert_eq!(
             actions,
-            vec![UpdateAction::Set("a".into(), UpdateExpr::value(s("x")))]
+            vec![UpdateAction::Set(field("a"), UpdateExpr::value(s("x")))]
         );
     }
 
@@ -7656,8 +7889,8 @@ mod tests {
         let new = apply_update(
             item,
             &[
-                UpdateAction::Set("a".into(), UpdateExpr::value(s("x"))),
-                UpdateAction::Remove("c".into()),
+                UpdateAction::Set(field("a"), UpdateExpr::value(s("x"))),
+                UpdateAction::Remove(field("c")),
             ],
         )
         .expect("SET/REMOVE are infallible");
@@ -7681,9 +7914,9 @@ mod tests {
         assert_eq!(
             actions,
             vec![UpdateAction::Set(
-                "a".into(),
+                field("a"),
                 UpdateExpr::Operand(UpdateOperand::IfNotExists(
-                    "a".into(),
+                    field("a"),
                     Box::new(UpdateOperand::Value(AttributeValue::N("0".into())))
                 ))
             )]
@@ -7693,9 +7926,9 @@ mod tests {
     #[test]
     fn if_not_exists_seeds_an_absent_attribute_and_leaves_a_present_one_alone() {
         let action = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Operand(UpdateOperand::IfNotExists(
-                "a".into(),
+                field("a"),
                 Box::new(UpdateOperand::Value(AttributeValue::N("0".into()))),
             )),
         );
@@ -7716,10 +7949,10 @@ mod tests {
     #[test]
     fn if_not_exists_with_no_default_value_is_a_validation_error() {
         let action = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Operand(UpdateOperand::IfNotExists(
-                "a".into(),
-                Box::new(UpdateOperand::Path("also_absent".into())),
+                field("a"),
+                Box::new(UpdateOperand::Path(field("also_absent"))),
             )),
         );
         let err = apply_update(Item::new(), &[action]).expect_err("nothing to assign");
@@ -7747,9 +7980,9 @@ mod tests {
             AttributeValue::L(vec![AttributeValue::N("1".into())]),
         );
         let action = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Operand(UpdateOperand::ListAppend(
-                Box::new(UpdateOperand::Path("a".into())),
+                Box::new(UpdateOperand::Path(field("a"))),
                 Box::new(UpdateOperand::Value(AttributeValue::L(vec![
                     AttributeValue::N("2".into()),
                 ]))),
@@ -7770,9 +8003,9 @@ mod tests {
         let mut item = Item::new();
         item.insert("a".into(), AttributeValue::N("1".into()));
         let action = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Operand(UpdateOperand::ListAppend(
-                Box::new(UpdateOperand::Path("a".into())),
+                Box::new(UpdateOperand::Path(field("a"))),
                 Box::new(UpdateOperand::Value(AttributeValue::L(vec![]))),
             )),
         );
@@ -7783,9 +8016,9 @@ mod tests {
     #[test]
     fn list_append_on_a_missing_operand_is_a_validation_error() {
         let action = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Operand(UpdateOperand::ListAppend(
-                Box::new(UpdateOperand::Path("missing".into())),
+                Box::new(UpdateOperand::Path(field("missing"))),
                 Box::new(UpdateOperand::Value(AttributeValue::L(vec![]))),
             )),
         );
@@ -7818,16 +8051,16 @@ mod tests {
             actions,
             vec![
                 UpdateAction::Set(
-                    "a".into(),
+                    field("a"),
                     UpdateExpr::Add(
-                        UpdateOperand::Path("a".into()),
+                        UpdateOperand::Path(field("a")),
                         UpdateOperand::Value(AttributeValue::N("1".into()))
                     )
                 ),
                 UpdateAction::Set(
-                    "b".into(),
+                    field("b"),
                     UpdateExpr::Sub(
-                        UpdateOperand::Path("b".into()),
+                        UpdateOperand::Path(field("b")),
                         UpdateOperand::Value(AttributeValue::N("2".into()))
                     )
                 ),
@@ -7840,9 +8073,9 @@ mod tests {
         let mut item = Item::new();
         item.insert("a".into(), AttributeValue::N("1.10".into()));
         let add = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Add(
-                UpdateOperand::Path("a".into()),
+                UpdateOperand::Path(field("a")),
                 UpdateOperand::Value(AttributeValue::N("0.90".into())),
             ),
         );
@@ -7852,9 +8085,9 @@ mod tests {
         let mut item = Item::new();
         item.insert("a".into(), AttributeValue::N("5".into()));
         let sub = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Sub(
-                UpdateOperand::Path("a".into()),
+                UpdateOperand::Path(field("a")),
                 UpdateOperand::Value(AttributeValue::N("8".into())),
             ),
         );
@@ -7868,9 +8101,9 @@ mod tests {
         let mut item = Item::new();
         item.insert("a".into(), AttributeValue::S("nope".into()));
         let add = UpdateAction::Set(
-            "a".into(),
+            field("a"),
             UpdateExpr::Add(
-                UpdateOperand::Path("a".into()),
+                UpdateOperand::Path(field("a")),
                 UpdateOperand::Value(AttributeValue::N("1".into())),
             ),
         );
@@ -7903,6 +8136,267 @@ mod tests {
             "ExpressionAttributeValues":{":x":{"N":"1"},":y":{"N":"2"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- Nested-path SET/REMOVE/ADD/DELETE targets (issue #375 PR3) --------
+
+    #[test]
+    fn decodes_nested_set_and_remove_paths() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a.b = :v, c[0] = :w REMOVE d.e, f[1]",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"N":"1"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Set(
+                    vec![
+                        PathSegment::Field("a".into()),
+                        PathSegment::Field("b".into())
+                    ],
+                    UpdateExpr::value(s("x")),
+                ),
+                UpdateAction::Set(
+                    vec![PathSegment::Field("c".into()), PathSegment::Index(0)],
+                    UpdateExpr::value(AttributeValue::N("1".into())),
+                ),
+                UpdateAction::Remove(vec![
+                    PathSegment::Field("d".into()),
+                    PathSegment::Field("e".into())
+                ]),
+                UpdateAction::Remove(vec![PathSegment::Field("f".into()), PathSegment::Index(1)]),
+            ]
+        );
+    }
+
+    /// `#alias.b[1]` — an alias on the leading segment, plain dotted/index
+    /// syntax on the rest, exactly like a `ProjectionExpression` path.
+    #[test]
+    fn decodes_an_aliased_nested_set_path() {
+        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET #n.b[1] = :v",
+            "ExpressionAttributeNames":{"#n":"a"},
+            "ExpressionAttributeValues":{":v":{"S":"x"}}}"##;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set(
+                vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Field("b".into()),
+                    PathSegment::Index(1)
+                ],
+                UpdateExpr::value(s("x")),
+            )]
+        );
+    }
+
+    #[test]
+    fn apply_update_sets_a_nested_field_when_the_parent_exists() {
+        let mut nested = BTreeMap::new();
+        nested.insert("b".into(), AttributeValue::N("1".into()));
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::M(nested));
+        let action = UpdateAction::Set(
+            vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("c".into()),
+            ],
+            UpdateExpr::value(s("new")),
+        );
+        let out = apply_update(item, &[action]).expect("a already exists");
+        let AttributeValue::M(m) = out.get("a").expect("a present") else {
+            panic!("a is not a map");
+        };
+        assert_eq!(
+            m.get("b"),
+            Some(&AttributeValue::N("1".into())),
+            "sibling untouched"
+        );
+        assert_eq!(m.get("c"), Some(&s("new")), "new key added");
+    }
+
+    /// `SET a.b = :v` on a completely absent `a` is a `ValidationException`
+    /// — only the *final* path segment may be new.
+    #[test]
+    fn apply_update_rejects_set_on_a_nested_path_whose_parent_is_missing() {
+        let action = UpdateAction::Set(
+            vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+            ],
+            UpdateExpr::value(s("x")),
+        );
+        let err = apply_update(Item::new(), &[action]).expect_err("a does not exist");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn apply_update_sets_a_list_index_in_bounds_and_appends_out_of_bounds() {
+        let mut item = Item::new();
+        item.insert(
+            "l".into(),
+            AttributeValue::L(vec![
+                AttributeValue::N("0".into()),
+                AttributeValue::N("1".into()),
+            ]),
+        );
+        // In-bounds: overwrite index 0.
+        let out = apply_update(
+            item,
+            &[UpdateAction::Set(
+                vec![PathSegment::Field("l".into()), PathSegment::Index(0)],
+                UpdateExpr::value(AttributeValue::N("99".into())),
+            )],
+        )
+        .expect("index 0 is in bounds");
+        assert_eq!(
+            out.get("l"),
+            Some(&AttributeValue::L(vec![
+                AttributeValue::N("99".into()),
+                AttributeValue::N("1".into()),
+            ]))
+        );
+
+        // Out-of-bounds: appends rather than padding or erroring (AWS's own
+        // documented `SET list[n]` behavior beyond the current length).
+        let out = apply_update(
+            out,
+            &[UpdateAction::Set(
+                vec![PathSegment::Field("l".into()), PathSegment::Index(10)],
+                UpdateExpr::value(AttributeValue::N("2".into())),
+            )],
+        )
+        .expect("out-of-bounds SET appends");
+        assert_eq!(
+            out.get("l"),
+            Some(&AttributeValue::L(vec![
+                AttributeValue::N("99".into()),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("2".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn apply_update_removes_a_nested_field_and_compacts_a_list_index() {
+        let mut nested = BTreeMap::new();
+        nested.insert("b".into(), AttributeValue::N("1".into()));
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::M(nested));
+        item.insert(
+            "l".into(),
+            AttributeValue::L(vec![
+                AttributeValue::N("0".into()),
+                AttributeValue::N("1".into()),
+                AttributeValue::N("2".into()),
+            ]),
+        );
+        let out = apply_update(
+            item,
+            &[
+                UpdateAction::Remove(vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Field("b".into()),
+                ]),
+                UpdateAction::Remove(vec![PathSegment::Field("l".into()), PathSegment::Index(1)]),
+            ],
+        )
+        .expect("REMOVE is infallible");
+        let AttributeValue::M(m) = out.get("a").expect("a present") else {
+            panic!("a is not a map");
+        };
+        assert!(!m.contains_key("b"), "b removed");
+        // Removing index 1 compacts the list — no hole left behind.
+        assert_eq!(
+            out.get("l"),
+            Some(&AttributeValue::L(vec![
+                AttributeValue::N("0".into()),
+                AttributeValue::N("2".into()),
+            ]))
+        );
+    }
+
+    /// `REMOVE` on a path that does not exist (missing key, missing parent,
+    /// or an out-of-range index) is a no-op, not an error.
+    #[test]
+    fn apply_update_removes_a_missing_nested_path_as_a_no_op() {
+        let out = apply_update(
+            Item::new(),
+            &[UpdateAction::Remove(vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+            ])],
+        )
+        .expect("no-op, not an error");
+        assert!(out.is_empty());
+    }
+
+    /// `ADD`/`DELETE` also target nested paths — "if trivial" per the
+    /// roadmap item, and it is: the same get/set-document-path primitives
+    /// `SET`/`REMOVE` use.
+    #[test]
+    fn add_and_delete_target_a_nested_path() {
+        let mut nested = BTreeMap::new();
+        nested.insert("count".into(), AttributeValue::N("41".into()));
+        let mut item = Item::new();
+        item.insert("stats".into(), AttributeValue::M(nested));
+        let out = apply_update(
+            item,
+            &[UpdateAction::Add(
+                vec![
+                    PathSegment::Field("stats".into()),
+                    PathSegment::Field("count".into()),
+                ],
+                AttributeValue::N("1".into()),
+            )],
+        )
+        .expect("ADD on a nested N");
+        let AttributeValue::M(m) = out.get("stats").expect("stats present") else {
+            panic!("stats is not a map");
+        };
+        assert_eq!(m.get("count"), Some(&AttributeValue::N("42".into())));
+    }
+
+    /// Assigning to overlapping document paths in one `UpdateExpression`
+    /// (`SET a = :x, a.b = :y`) is a `ValidationException` — matching
+    /// DynamoDB's own "document paths overlap" rejection.
+    #[test]
+    fn rejects_overlapping_set_targets_in_one_expression() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = :x, a.b = :y",
+            "ExpressionAttributeValues":{":x":{"M":{}},":y":{"S":"z"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// The identical-path case (`SET a = :x, a = :y`) is the degenerate form
+    /// of the same overlap rule.
+    #[test]
+    fn rejects_the_exact_same_target_set_twice() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = :x REMOVE a"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A `REMOVE`/`SET` pair on genuinely disjoint paths — including two
+    /// different indices of the same list — is unaffected by the overlap
+    /// check.
+    #[test]
+    fn disjoint_paths_do_not_trigger_the_overlap_check() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a.b = :v, a.c = :w REMOVE d[0], d[1]",
+            "ExpressionAttributeValues":{":v":{"S":"x"},":w":{"S":"y"}}}"#;
+        decode_request("DynamoDB_20120810.UpdateItem", body).expect("disjoint targets");
     }
 
     #[test]
@@ -8354,7 +8848,7 @@ mod tests {
         let out = apply_update(
             Item::new(),
             &[UpdateAction::Set(
-                "a".into(),
+                field("a"),
                 UpdateExpr::value(at_cap_value),
             )],
         )
@@ -8365,7 +8859,7 @@ mod tests {
         let err = apply_update(
             Item::new(),
             &[UpdateAction::Set(
-                "a".into(),
+                field("a"),
                 UpdateExpr::value(over_cap_value),
             )],
         )
@@ -8391,8 +8885,8 @@ mod tests {
         let out = apply_update(
             item,
             &[
-                UpdateAction::Set("temp".into(), UpdateExpr::value(huge)),
-                UpdateAction::Remove("temp".into()),
+                UpdateAction::Set(field("temp"), UpdateExpr::value(huge)),
+                UpdateAction::Remove(field("temp")),
             ],
         )
         .expect("nets back under the cap after the REMOVE, so it must succeed");
@@ -8415,7 +8909,7 @@ mod tests {
         let err = apply_update(
             item,
             &[UpdateAction::Set(
-                "b".into(),
+                field("b"),
                 UpdateExpr::value(AttributeValue::S("y".repeat(20))),
             )],
         )
@@ -9669,20 +10163,20 @@ mod tests {
 
         // Absent -> seeded. This is the counter-on-a-new-row case.
         let out =
-            apply_update(Item::new(), &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+            apply_update(Item::new(), &[UpdateAction::Add(field("c"), n("1"))]).expect("applies");
         assert_eq!(out.get("c"), Some(&n("1")));
 
         // Present -> incremented, exactly.
         let mut item = Item::new();
         item.insert("c".into(), n("41"));
-        let out = apply_update(item, &[UpdateAction::Add("c".into(), n("1"))]).expect("applies");
+        let out = apply_update(item, &[UpdateAction::Add(field("c"), n("1"))]).expect("applies");
         assert_eq!(out.get("c"), Some(&n("42")));
 
         // Sets union and stay sorted/deduplicated.
         let mut item = Item::new();
         item.insert("t".into(), ss(&["a", "b"]));
         let out =
-            apply_update(item, &[UpdateAction::Add("t".into(), ss(&["b", "c"]))]).expect("applies");
+            apply_update(item, &[UpdateAction::Add(field("t"), ss(&["b", "c"]))]).expect("applies");
         assert_eq!(
             out.get("t"),
             Some(&ss(&["a", "b", "c"])),
@@ -9699,20 +10193,20 @@ mod tests {
         let mut item = Item::new();
         item.insert("t".into(), ss(&["a", "b", "c"]));
         let out =
-            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["b"]))]).expect("applies");
+            apply_update(item, &[UpdateAction::Delete(field("t"), ss(&["b"]))]).expect("applies");
         assert_eq!(out.get("t"), Some(&ss(&["a", "c"])));
 
         let mut item = Item::new();
         item.insert("t".into(), ss(&["a"]));
         let out =
-            apply_update(item, &[UpdateAction::Delete("t".into(), ss(&["a"]))]).expect("applies");
+            apply_update(item, &[UpdateAction::Delete(field("t"), ss(&["a"]))]).expect("applies");
         assert!(
             !out.contains_key("t"),
             "an emptied set is removed, not stored as an empty set: {out:?}"
         );
 
         // Deleting from an absent attribute is a no-op, not an error.
-        let out = apply_update(Item::new(), &[UpdateAction::Delete("t".into(), ss(&["a"]))])
+        let out = apply_update(Item::new(), &[UpdateAction::Delete(field("t"), ss(&["a"]))])
             .expect("no-op");
         assert!(out.is_empty());
     }
@@ -9726,7 +10220,7 @@ mod tests {
         assert!(
             apply_update(
                 item.clone(),
-                &[UpdateAction::Add("s".into(), AttributeValue::N("1".into()))]
+                &[UpdateAction::Add(field("s"), AttributeValue::N("1".into()))]
             )
             .is_err(),
             "ADD a number to a string must be rejected"
@@ -9735,7 +10229,7 @@ mod tests {
             apply_update(
                 item,
                 &[UpdateAction::Delete(
-                    "s".into(),
+                    field("s"),
                     AttributeValue::SS(vec!["a".into()])
                 )]
             )
@@ -9759,11 +10253,11 @@ mod tests {
                     actions,
                     vec![
                         UpdateAction::Set(
-                            "name".into(),
+                            field("name"),
                             UpdateExpr::value(AttributeValue::S("x".into()))
                         ),
-                        UpdateAction::Add("tags2".into(), AttributeValue::SS(vec!["a".into()])),
-                        UpdateAction::Delete("tags".into(), AttributeValue::SS(vec!["old".into()])),
+                        UpdateAction::Add(field("tags2"), AttributeValue::SS(vec!["a".into()])),
+                        UpdateAction::Delete(field("tags"), AttributeValue::SS(vec!["old".into()])),
                     ],
                     "all three clause shapes, with aliases resolved"
                 );
@@ -9800,7 +10294,7 @@ mod tests {
         match decode_request("DynamoDB_20120810.UpdateItem", body).expect("decodes") {
             Operation::UpdateItem { actions, .. } => assert_eq!(
                 actions,
-                vec![UpdateAction::Add("c".into(), AttributeValue::N("1".into()))]
+                vec![UpdateAction::Add(field("c"), AttributeValue::N("1".into()))]
             ),
             other => panic!("expected UpdateItem, got {other:?}"),
         }
