@@ -1162,3 +1162,136 @@ async fn dashboard_u04_ttl_row() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-04 (PR 2): the create-table form declares GSIs/LSIs/a
+/// stream/TTL in one place. Same structure as `dashboard_u04_ttl_row` above:
+/// shell/script markers proving the new fields and their client-side
+/// validation exist, then a live round trip posting the exact
+/// `CreateTable` + follow-up `UpdateTimeToLive` request sequence the
+/// extended `submitTableForm` builds (mirroring `console::ConsoleBackend::
+/// create_table`'s own sequence, `crates/animusd/src/lib.rs`) and checking
+/// the real catalog reflects every declared piece.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u04_create_table_form() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new form fields --------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        for id in [
+            "br-dy-ct-lsi-table",
+            "br-dy-ct-lsi-add",
+            "br-dy-ct-gsi-table",
+            "br-dy-ct-gsi-add",
+            "br-dy-ct-stream",
+            "br-dy-ct-stream-vt",
+            "br-dy-ct-ttl",
+            "br-dy-ct-ttl-attr",
+        ] {
+            assert!(
+                shell.contains(&format!(r#"id="{id}""#)),
+                "the create-table form carries #{id}: {shell}"
+            );
+        }
+
+        // ---- dashboard_browser.js builds the real request sequence ----------
+        let (s, _, browser_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_browser.js").await;
+        assert_eq!(s, 200, "dashboard_browser.js is served");
+        assert!(
+            browser_js.contains("function addCtLsiRow") && browser_js.contains("function addCtGsiRow"),
+            "the form's GSI/LSI row editors exist: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("GlobalSecondaryIndexes")
+                && browser_js.contains("LocalSecondaryIndexes")
+                && browser_js.contains("StreamSpecification"),
+            "submitTableForm sends GSIs, LSIs, and a stream spec on CreateTable: {browser_js}"
+        );
+        // Client-side validation, mirroring ConsoleBackend::create_table's own
+        // checks (lib.rs) so a mistake bounces here, not off the wire.
+        for marker in [
+            "needs a hash attribute",
+            "needs a sort key attribute",
+            "requires the table to have its own sort key",
+            "INCLUDE projection needs at least one attribute",
+        ] {
+            assert!(
+                browser_js.contains(marker),
+                "submitTableForm validates {marker:?} client-side: {browser_js}"
+            );
+        }
+        // Every key attribute (base + every declared index) ends up in
+        // AttributeDefinitions before the request is ever sent.
+        assert!(
+            browser_js.contains("AttributeDefinitions") && browser_js.contains("declareDefault"),
+            "the form declares AttributeDefinitions for every base and index key: {browser_js}"
+        );
+
+        // ---- the exact request sequence a filled-in form would send --------
+        let (s, ct_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"CreateTable","payload":{
+                "TableName":"orders",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"created_at","KeyType":"RANGE"}],
+                "GlobalSecondaryIndexes":[{"IndexName":"by-status","KeySchema":[{"AttributeName":"status","KeyType":"HASH"}]}],
+                "LocalSecondaryIndexes":[{"IndexName":"by-score","KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"score","KeyType":"RANGE"}]}],
+                "AttributeDefinitions":[
+                    {"AttributeName":"id","AttributeType":"S"},
+                    {"AttributeName":"created_at","AttributeType":"N"},
+                    {"AttributeName":"status","AttributeType":"S"},
+                    {"AttributeName":"score","AttributeType":"S"}
+                ],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}
+            }}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable orders: {ct_body}");
+
+        let (s, ttl_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"orders","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "enable TTL on orders: {ttl_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        let schema = &status["schemas"]["tables"]["orders"];
+        let indexes = schema["indexes"].as_array().expect("indexes array");
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i["name"] == "by-status" && i["kind"] == "Global" && i["hash_attribute"] == "status"),
+            "the GSI is declared: {schema}"
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i["name"] == "by-score" && i["kind"] == "Local" && i["sort_attribute"] == "score"),
+            "the LSI is declared: {schema}"
+        );
+        assert_eq!(
+            schema["stream"]["view_type"].as_str(),
+            Some("NewAndOldImages"),
+            "the stream is declared: {schema}"
+        );
+        assert_eq!(
+            schema["ttl"]["attribute_name"].as_str(),
+            Some("expiresAt"),
+            "TTL is declared via the follow-up call: {schema}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}

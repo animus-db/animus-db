@@ -1019,12 +1019,38 @@ reusing the captured config is the point of the test.
   TimeToLiveSpecification:{Enabled,AttributeName}}` shape — `AttributeName`
   is sent on **both** calls (AWS requires it even to disable, to name the
   attribute being disabled), so `disableTtl` reads it back off `schema.ttl`
-  rather than asking the user to retype it. Tests:
-  `tests/dashboard_endpoint.rs::dashboard_u04_ttl_row` (the same
-  render-markers-plus-live-round-trip structure as U-01/U-02's own tests
-  above) — the actual `UpdateTimeToLive`/`DescribeTimeToLive` wire
-  mechanics keep their full end-to-end coverage in `tests/dynamo_ttl.rs`,
-  unchanged by this item.
+  rather than asking the user to retype it. **`#br-dy-table-form`
+  (`submitTableForm`) now declares GSIs, LSIs, a stream, and TTL in one
+  place**, mirroring `console::ConsoleBackend::create_table`'s own request
+  sequence (`lib.rs`, above): a real `CreateTable` call whose
+  `AttributeDefinitions` covers every base **and** index key attribute —
+  the base key's own type picker, every index-only key attribute defaulted
+  to `"S"` (`declareDefault`, the same default `schema::column_type_for
+  (None)` applies bridge-side — this form collects no type for an
+  index-only key attribute, a deliberate scope cut inherited from the
+  console's own precedent, not a mechanism gap) — followed by a
+  `UpdateTimeToLive` call once the table exists, since `CreateTable`'s own
+  wire shape carries no TTL field. `addCtLsiRow`/`addCtGsiRow` are dynamic
+  attribute-row editors (`+ LSI`/`+ GSI`, a remove button per row), the same
+  shape `addItemAttrRow` above already uses; unlike the "Add index (GSI)"
+  form's own LSI-less scope (ADR 0045 §7 — an LSI can't be added to a
+  populated table), this form's LSI rows **do** get a real
+  `ALL`/`KEYS_ONLY`/`INCLUDE` projection control, since `wire::
+  decode_index_entry` parses `Projection` identically for a `CreateTable`-
+  declared GSI or LSI (`animus-dynamo/CLAUDE.md`'s own module doc) — a
+  wire-supported field the console's own create-table form deliberately
+  omits for LSIs (its own `CreateLsiRequest` doc), but nothing stops this
+  form from offering it. Client-side validation mirrors
+  `ConsoleBackend::create_table`'s own checks verbatim (every GSI/LSI needs
+  a name and hash/sort attribute, an LSI needs the table's own sort key,
+  an `INCLUDE` projection needs at least one non-key attribute, TTL needs
+  an attribute name to enable) so a mistake is caught here rather than
+  bouncing off the wire as a decode error. Tests:
+  `tests/dashboard_endpoint.rs::dashboard_u04_ttl_row`/
+  `dashboard_u04_create_table_form` (the same render-markers-plus-live-
+  round-trip structure as U-01/U-02's own tests above) — the actual
+  `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics keep their full
+  end-to-end coverage in `tests/dynamo_ttl.rs`, unchanged by this item.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

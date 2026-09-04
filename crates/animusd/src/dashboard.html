@@ -191,6 +191,26 @@
             <div class="form-field" id="br-dy-ct-sk-wrap" style="display:none"><label>Sort key</label><input type="text" id="br-dy-ct-sk" placeholder="sort_key"></div>
             <div class="form-field" id="br-dy-ct-skt-wrap" style="display:none"><label>Type</label><select id="br-dy-ct-skt"><option value="S">String</option><option value="N">Number</option></select></div>
           </div>
+
+          <div class="row" style="justify-content:space-between;margin-top:14px">
+            <label style="font-size:11.5px;color:var(--text2)">Local secondary indexes <span class="muted">(needs a sort key)</span></label>
+            <button type="button" id="br-dy-ct-lsi-add">+ LSI</button>
+          </div>
+          <table id="br-dy-ct-lsi-table"><thead><tr><th>Name</th><th>Sort attribute</th><th>Projection</th><th>Non-key attrs</th><th></th></tr></thead><tbody></tbody></table>
+
+          <div class="row" style="justify-content:space-between;margin-top:14px">
+            <label style="font-size:11.5px;color:var(--text2)">Global secondary indexes</label>
+            <button type="button" id="br-dy-ct-gsi-add">+ GSI</button>
+          </div>
+          <table id="br-dy-ct-gsi-table"><thead><tr><th>Name</th><th>Hash attribute</th><th>Sort attribute</th><th>Projection</th><th>Non-key attrs</th><th></th></tr></thead><tbody></tbody></table>
+
+          <div class="row" style="gap:24px;margin-top:14px;flex-wrap:wrap">
+            <label class="row" style="font-size:11.5px;color:var(--text2)"><input type="checkbox" id="br-dy-ct-stream"> Enable stream</label>
+            <div class="form-field" id="br-dy-ct-stream-vt-wrap" style="display:none"><label>View type</label><select id="br-dy-ct-stream-vt"></select></div>
+            <label class="row" style="font-size:11.5px;color:var(--text2)"><input type="checkbox" id="br-dy-ct-ttl"> Enable TTL</label>
+            <div class="form-field" id="br-dy-ct-ttl-attr-wrap" style="display:none"><label>TTL attribute</label><input type="text" id="br-dy-ct-ttl-attr" placeholder="expiresAt"></div>
+          </div>
+
           <div class="row" style="justify-content:flex-end;margin-top:12px">
             <span class="muted" id="br-dy-ct-msg"></span>
             <button id="br-dy-ct-cancel">Cancel</button>
@@ -496,6 +516,14 @@ $("br-dy-ct-has-sk").addEventListener("change", () => {
 });
 $("br-dy-ct-cancel").addEventListener("click", closeTableForm);
 $("br-dy-ct-submit").addEventListener("click", submitTableForm);
+$("br-dy-ct-lsi-add").addEventListener("click", () => addCtLsiRow());
+$("br-dy-ct-gsi-add").addEventListener("click", () => addCtGsiRow());
+$("br-dy-ct-stream").addEventListener("change", () => {
+  $("br-dy-ct-stream-vt-wrap").style.display = $("br-dy-ct-stream").checked ? "" : "none";
+});
+$("br-dy-ct-ttl").addEventListener("change", () => {
+  $("br-dy-ct-ttl-attr-wrap").style.display = $("br-dy-ct-ttl").checked ? "" : "none";
+});
 $("br-dy-op-scan").addEventListener("click", () => setDynamoOp("scan"));
 $("br-dy-op-query").addEventListener("click", () => setDynamoOp("query"));
 $("br-dy-index").addEventListener("change", onDyIndexChange);
