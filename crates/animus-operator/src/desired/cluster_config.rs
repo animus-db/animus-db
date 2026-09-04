@@ -234,12 +234,17 @@ pub const DYNAMO_AUTH_FILE_NAME: &str = "credentials.json";
 /// not just its usage-string doc comment — see this crate's `CLAUDE.md` for
 /// the full support table):
 /// - combined role (`animusd --config FILE --node I`, ordinals
-///   `< control_nodes`): `--dir`, `--ephemeral`, `--split-mode`,
-///   `--dynamo-auth`.
+///   `< control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth`.
 /// - data role (`animusd data --config FILE --node I`, ordinals
-///   `>= control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth` only —
-///   **not** `--split-mode` (rejected as an unknown argument by that
-///   subcommand today).
+///   `>= control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth`.
+///
+/// **No `--split-mode` flag is emitted on either branch**: the flag and the
+/// copy-based split workflow it selected were deleted outright
+/// (2026-09-01, ADR 0058's rung 4 layer) — `animusd`'s CLI parser no longer
+/// accepts it on any subcommand at all. `AnimusClusterSpec.split_mode` (and
+/// this function's matching emission) was removed for the same reason
+/// (#590): it used to be emitted unconditionally on the combined branch,
+/// which made any spec setting `splitMode` a live pod-startup failure.
 ///
 /// **`spec.quiesceAfterSecs`/`spec.autoSplitBytes` are never emitted as
 /// flags here on either branch (S-06)** — both now reach `animusd` through
@@ -266,9 +271,6 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     if ephemeral {
         both_flags.push_str(" --ephemeral");
         data_flags.push_str(" --ephemeral");
-    }
-    if let Some(mode) = &spec.split_mode {
-        both_flags.push_str(&format!(" --split-mode {mode}"));
     }
     if spec.dynamo_auth_secret_name.is_some() {
         let flag = format!(" --dynamo-auth {DYNAMO_AUTH_MOUNT_DIR}/{DYNAMO_AUTH_FILE_NAME}");
@@ -529,15 +531,92 @@ mod tests {
     }
 
     #[test]
-    fn entrypoint_omits_split_mode_on_data_branch_only() {
+    fn entrypoint_never_emits_split_mode() {
+        // #590: `--split-mode` and the copy-based split workflow it
+        // selected were deleted from `animusd` outright (2026-09-01, ADR
+        // 0058's rung 4 layer) — `animusd`'s CLI parser rejects the flag
+        // as unknown on every subcommand now. `AnimusClusterSpec` no
+        // longer has a `split_mode` field at all, so there is nothing for
+        // this test to set on `spec` — it just pins that the token can
+        // never resurface in either branch of the generated script.
         let mut s = spec(4);
         s.control_nodes = Some(2);
-        s.split_mode = Some("inplace".to_string());
         let script = entrypoint_script(&s);
-        // Split the script at the `else` to inspect each branch in isolation.
-        let (both_branch, data_branch) = script.split_once("else").unwrap();
-        assert!(both_branch.contains("--split-mode inplace"));
-        assert!(!data_branch.contains("--split-mode"));
+        assert!(!script.contains("--split-mode"));
+        assert!(!script.contains("split-mode"));
+    }
+
+    /// The exhaustive set of `--flag` tokens `animusd`'s hand-rolled CLI
+    /// parser accepts on the two subcommands `entrypoint_script` can ever
+    /// exec (`crates/animusd/src/main.rs`, no `clap` derive — flags are
+    /// matched as literal strings in each subcommand's own `while let
+    /// Some(arg) = it.next()` loop):
+    /// - combined role (`run`, the bare `animusd --config FILE --node I`
+    ///   form, ~L369-413 as of this writing): `--config`, `--node`,
+    ///   `--cluster`, `--cluster-control`, `--cluster-data`, `--dir`,
+    ///   `--ip`, `--ephemeral`, `--auto-split-bytes`,
+    ///   `--auto-split-change-rate`, `--orphan-sweep-after`,
+    ///   `--stream-seal-bytes`, `--stream-seal-age`, `--stream-retention`,
+    ///   `--segment-store`, `--backup-store`, `--quiesce-after`,
+    ///   `--dynamo-auth`, `--advertise-host`.
+    /// - data role (`run_data`, `animusd data ...`, ~L961-994): `--config`,
+    ///   `--node`, `--dir`, `--ephemeral`, `--seed`, `--id`, `--ip`,
+    ///   `--base-port`, `--dynamo-auth`, `--advertise-host`.
+    ///
+    /// `--split-mode` is deliberately absent from both — see main.rs's own
+    /// module doc: it and the copy-based split workflow it selected were
+    /// deleted outright (2026-09-01, ADR 0058's rung 4 layer). See also
+    /// `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table.
+    const ANIMUSD_ACCEPTED_FLAGS: &[&str] = &[
+        "--config",
+        "--node",
+        "--cluster",
+        "--cluster-control",
+        "--cluster-data",
+        "--dir",
+        "--ip",
+        "--ephemeral",
+        "--auto-split-bytes",
+        "--auto-split-change-rate",
+        "--orphan-sweep-after",
+        "--stream-seal-bytes",
+        "--stream-seal-age",
+        "--stream-retention",
+        "--segment-store",
+        "--backup-store",
+        "--quiesce-after",
+        "--dynamo-auth",
+        "--advertise-host",
+        "--seed",
+        "--id",
+        "--base-port",
+    ];
+
+    #[test]
+    fn entrypoint_flags_are_all_accepted_by_animusd() {
+        // A representative spec with every optional flag-affecting field
+        // set, on both the combined and data branches.
+        let mut s = spec(4);
+        s.control_nodes = Some(2);
+        s.storage.ephemeral = Some(true);
+        s.dynamo_auth_secret_name = Some("my-dynamo-creds".to_string());
+        s.quiesce_after_secs = Some(7);
+        s.auto_split_bytes = Some(1_000_000);
+        let script = entrypoint_script(&s);
+
+        let mut unknown = Vec::new();
+        for line in script.lines() {
+            for token in line.split_whitespace() {
+                if token.starts_with("--") && !ANIMUSD_ACCEPTED_FLAGS.contains(&token) {
+                    unknown.push(token.to_string());
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
+             script:\n{script}"
+        );
     }
 
     #[test]

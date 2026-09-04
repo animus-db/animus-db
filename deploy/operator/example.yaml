@@ -17,5 +17,4 @@ spec:
   clientService:
     type: ClusterIP
   quiesceAfterSecs: 5
-  splitMode: inplace
   # dynamoAuthSecretName: example-dynamo-credentials

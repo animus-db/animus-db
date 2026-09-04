@@ -22,12 +22,14 @@ spec:
             properties:
               autoSplitBytes:
                 description: |-
-                  **Not currently wired into `entrypoint.sh`** — `animusd`'s
-                  `--config FILE --node I` invocation (what every pod in this
-                  deployment shape runs) does not accept `--auto-split-bytes` today;
-                  that flag exists only on the dev-only `--cluster N` in-process mode.
-                  Kept on the spec for forward compatibility and documented loudly
-                  here and in the crate guide rather than silently dropped.
+                  The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
+                  **S-06**: like `quiesce_after_secs` above, now emitted into the
+                  generated `cluster.json`'s `cluster_settings.auto_split_bytes`
+                  section rather than a CLI flag — `--auto-split-bytes` itself only
+                  ever existed on the dev-only `--cluster N` in-process mode, so this
+                  field went from **never wired into `entrypoint.sh` at all** to
+                  reaching every pod (combined and data-role) through the config file
+                  instead.
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -84,8 +86,14 @@ spec:
                 type: integer
               quiesceAfterSecs:
                 description: |-
-                  `--quiesce-after SECS` (combined-role pods only — see
-                  `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table).
+                  The idle-before-quiescing grace period for a data-plane CP group
+                  (ADR 0044 phase-1 / ADR 0048). **S-06**: emitted into the generated
+                  `cluster.json`'s `cluster_settings.quiesce_after_secs` section
+                  (`desired::cluster_config::build_cluster_config`), not a CLI flag —
+                  this now applies to **every** pod, combined and data-role alike (an
+                  `animusd` data-only node had no route to quiescence at all before
+                  S-06 closed that gap; see `crates/animus-operator/CLAUDE.md`'s
+                  CLI-flag-support table for the full before/after picture).
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -127,10 +135,6 @@ spec:
                     description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
-              splitMode:
-                description: '`--split-mode {copy,inplace}` (combined-role pods only).'
-                nullable: true
-                type: string
               storage:
                 default: {}
                 description: Data volume configuration.

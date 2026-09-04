@@ -132,7 +132,6 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   |---|---|---|
   | `--dir` | yes | yes |
   | `--ephemeral` | yes | yes |
-  | `--split-mode` | yes | **no** |
   | `--dynamo-auth` | yes | yes |
 
   **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
@@ -152,16 +151,20 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   reconciled (`resolve_cluster_settings` in `animusd`'s own `main.rs`); do
   not reintroduce it as a flag without removing it from the emitted
   section, or vice versa.
-  **`--split-mode` is a separate, pre-existing concern this table does not
-  resolve**: `crates/animusd/src/main.rs`'s own module doc states the flag
-  and the copy-based split workflow it selected were deleted outright
-  (2026-09-01, ADR 0058's rung 4 layer) — `main.rs`'s real CLI parser no
-  longer appears to accept `--split-mode` at all, on *any* subcommand, which
-  would make `entrypoint_script`'s still-conditional emission of it a live
-  pod-startup failure for any `AnimusClusterSpec.splitMode` value. This was
-  not fixed here (out of scope for S-06, and a pre-existing bug gets its own
-  PR with its own regression test per the root `CLAUDE.md`'s conventions) —
-  re-verify against `main.rs` before relying on the "yes" in this table.
+  **`--split-mode` no longer exists (fixed, #590)**: `crates/animusd/src/
+  main.rs`'s own module doc states the flag and the copy-based split
+  workflow it selected were deleted outright (2026-09-01, ADR 0058's rung 4
+  layer) — `main.rs`'s CLI parser rejects `--split-mode` as unknown on
+  every subcommand. `entrypoint_script` used to emit it unconditionally on
+  the combined branch whenever `AnimusClusterSpec.split_mode` was set,
+  which made any cluster spec setting `splitMode` fail at pod startup;
+  `split_mode` has been removed from `AnimusClusterSpec` entirely (there is
+  no back-compat promise in this repo, ADR 0060/root `CLAUDE.md`), so
+  there is no flag left to conditionally emit. See
+  `entrypoint_flags_are_all_accepted_by_animusd` in `desired::
+  cluster_config`'s tests for the regression coverage (every `--flag`
+  token the script emits is checked against an explicit allowlist of what
+  `main.rs` actually accepts).
 - **`control_nodes_changed` reads the *previous* `ConfigMap`'s own applied
   `cluster.json` back to detect an immutable-field change**, rather than a
   status annotation the controller would have to remember to write and keep
