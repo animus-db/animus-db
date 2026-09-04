@@ -363,6 +363,27 @@ pub(crate) fn add_numeric(x: &str, y: &str) -> Option<String> {
     })
 }
 
+/// Negate a DynamoDB number given as text — flips its sign and re-validates/
+/// re-normalizes through [`add_numeric`] (`add_numeric("0", flipped)`, so
+/// `"5"` and `"-0"` both come back exactly as `add_numeric` would render
+/// them, never a hand-rolled second normalization path). This is
+/// `UpdateExpression`'s `SET a = a - :x` (issue #375 PR2): DynamoDB has no
+/// separate subtraction primitive, only addition of a negated operand — the
+/// same shape this module's own differential-test `negate` helper already
+/// exercises `add_numeric` with, now exposed for production use. `None` if
+/// `x` is not a number.
+#[must_use]
+pub(crate) fn negate_numeric(x: &str) -> Option<String> {
+    let (neg, int, frac) = decimal_parts(x)?;
+    let sign = if neg { "" } else { "-" };
+    let flipped = if frac.is_empty() {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    };
+    add_numeric("0", &flipped)
+}
+
 /// `(negative, integer digits, fractional digits)` for a decimal string.
 #[must_use]
 fn decimal_parts(v: &str) -> Option<(bool, String, String)> {

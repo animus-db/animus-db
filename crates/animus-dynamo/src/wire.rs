@@ -380,7 +380,7 @@ pub enum UpdateReturnValues {
 /// `:value` placeholder already resolved at decode time, a top-level
 /// attribute name read from the item being updated, or a function call.
 /// Nested document paths (`a.b`, `a[0]`) are a documented gap here — this
-/// operand always names a **top-level** attribute (issue #375 PR1); see
+/// operand always names a **top-level** attribute (issue #375 PR1/PR2); see
 /// [`UpdateAction::Set`]'s own doc.
 ///
 /// A `Path` operand's read happens at **apply time** ([`eval_update_operand`]),
@@ -408,20 +408,24 @@ pub enum UpdateOperand {
     ListAppend(Box<UpdateOperand>, Box<UpdateOperand>),
 }
 
-/// A `SET` clause's right-hand side: currently always a single
-/// [`UpdateOperand`] (issue #375 PR1) — arithmetic (`operand +/- operand`)
-/// lands in a follow-up.
+/// A `SET` clause's right-hand side: one [`UpdateOperand`], or (issue #375
+/// PR2) `operand + operand` / `operand - operand` — DynamoDB allows at most
+/// one arithmetic operator per `SET` value, both sides numeric (`N`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateExpr {
     /// A single operand, no arithmetic.
     Operand(UpdateOperand),
+    /// `lhs + rhs`, both operands numeric.
+    Add(UpdateOperand, UpdateOperand),
+    /// `lhs - rhs`, both operands numeric.
+    Sub(UpdateOperand, UpdateOperand),
 }
 
 impl UpdateExpr {
-    /// A plain `:value`/path/function-call `SET` expression — convenience
-    /// wrapper around [`UpdateOperand::Value`]/`Self::Operand` used by every
-    /// caller that just needs "SET this literal value" (the pre-arithmetic
-    /// common case).
+    /// A plain `:value`/path/function-call `SET` expression, no arithmetic —
+    /// convenience wrapper around [`UpdateOperand::Value`]/`Self::Operand`
+    /// used by every caller that just needs "SET this literal value" (the
+    /// pre-arithmetic common case).
     #[must_use]
     pub fn value(v: AttributeValue) -> Self {
         UpdateExpr::Operand(UpdateOperand::Value(v))
@@ -429,7 +433,8 @@ impl UpdateExpr {
 }
 
 /// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
-/// top-level attribute to a value/path/function-call expression, or remove one.
+/// top-level attribute to a value/path/function-call/arithmetic expression, or
+/// remove one.
 ///
 /// **`Serialize`/`Deserialize` (ADR 0046 U3)**: rides the wire inside
 /// `ClientRequest::KindWriteItem`'s `KindWriteOp::Update` — the leader-side
@@ -439,11 +444,11 @@ impl UpdateExpr {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateAction {
     /// `SET attr = expr` — set (or overwrite) a top-level attribute to the
-    /// result of evaluating `expr` ([`UpdateExpr`]: a value, a path, or
-    /// `if_not_exists(..)`/`list_append(..)`) against the item at apply time
-    /// (issue #375 PR1). Nested document paths as the *target* (`SET a.b =
-    /// :v`) are a documented gap — the target is always a top-level
-    /// attribute name.
+    /// result of evaluating `expr` ([`UpdateExpr`]: a value, a path,
+    /// `if_not_exists(..)`/`list_append(..)`, or `operand +/- operand`)
+    /// against the item at apply time (issue #375 PR1/PR2). Nested document
+    /// paths as the *target* (`SET a.b = :v`) are a documented gap — the
+    /// target is always a top-level attribute name.
     Set(String, UpdateExpr),
     /// `REMOVE attr` — drop a top-level attribute if present.
     Remove(String),
@@ -1924,13 +1929,19 @@ fn decode_update_item(obj: &Map<String, Value>) -> Result<Operation, WireError> 
 /// A lexical token of an `UpdateExpression`, paired (by [`tokenize_update_expression`])
 /// with the paren-nesting depth it sits at. `Word` keeps the exact source
 /// slice — an attribute name/path (`a`, `a.b`), a `#alias`, a `:placeholder`,
-/// or a clause-keyword spelling (`SET`/`set`/...); which of those it *means*
-/// depends on where it sits in the token stream, never on its spelling alone.
+/// a function name, or a clause-keyword spelling (`SET`/`set`/...); which of
+/// those it *means* depends on where it sits in the token stream, never on
+/// its spelling alone. `Plus`/`Minus` (issue #375 PR2) are real tokens, not
+/// part of a `Word` — an unaliased attribute name containing a literal `+`
+/// or `-` cannot be referenced directly in an expression and needs a
+/// `#alias`, the identical rule this grammar already has for `.`/`[`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateToken<'a> {
     Word(&'a str),
     Comma,
     Equals,
+    Plus,
+    Minus,
     LParen,
     RParen,
 }
@@ -1942,6 +1953,8 @@ impl UpdateToken<'_> {
             UpdateToken::Word(w) => Cow::Borrowed(w),
             UpdateToken::Comma => Cow::Borrowed(","),
             UpdateToken::Equals => Cow::Borrowed("="),
+            UpdateToken::Plus => Cow::Borrowed("+"),
+            UpdateToken::Minus => Cow::Borrowed("-"),
             UpdateToken::LParen => Cow::Borrowed("("),
             UpdateToken::RParen => Cow::Borrowed(")"),
         }
@@ -1950,17 +1963,18 @@ impl UpdateToken<'_> {
 
 /// Tokenize an `UpdateExpression` into words and punctuation, each paired with
 /// the paren-nesting depth (0 = top level) it appears at. A "word" is a
-/// maximal run of characters that is none of whitespace, `,`, `=`, `(`, `)` —
-/// so an attribute path (`a.b`), a `#alias`, and a `:placeholder` each come
-/// out as one token, exactly like the substring scan this replaces treated
-/// them, but a clause keyword is now just another word: whether it *starts a
-/// clause* is a property of its position in the grammar, decided by the
-/// caller, never of its spelling. Depth-tracking exists so a keyword spelled
-/// inside function-call parens is never mistaken for a clause start — this
-/// grammar has no function calls yet ([`resolve_placeholder`] only accepts a
-/// bare `:placeholder`), so depth never actually exceeds 0 in an expression
-/// that goes on to parse successfully, but the tracking is the foundation a
-/// future document-path/function-call grammar needs.
+/// maximal run of characters that is none of whitespace, `,`, `=`, `+`, `-`,
+/// `(`, `)` — so an attribute path (`a.b`), a `#alias`, and a `:placeholder`
+/// each come out as one token, exactly like the substring scan this replaces
+/// treated them, but a clause keyword is now just another word: whether it
+/// *starts a clause* is a property of its position in the grammar, decided by
+/// the caller, never of its spelling. Depth-tracking exists so a keyword
+/// spelled inside function-call parens is never mistaken for a clause start —
+/// `parse_update_func_call`'s recursive-descent consumption of a call's own
+/// matching parens is what actually keeps a clause keyword or `,` inside a
+/// call from ever reaching `continues_update_clause`, so `depth` itself is
+/// informational once the grammar is genuinely recursive (issue #375 PR1)
+/// rather than load-bearing for that.
 fn tokenize_update_expression(expr: &str) -> Vec<(UpdateToken<'_>, u32)> {
     let mut tokens = Vec::new();
     let mut depth: u32 = 0;
@@ -1979,6 +1993,14 @@ fn tokenize_update_expression(expr: &str) -> Vec<(UpdateToken<'_>, u32)> {
                 tokens.push((UpdateToken::Equals, depth));
                 chars.next();
             }
+            '+' => {
+                tokens.push((UpdateToken::Plus, depth));
+                chars.next();
+            }
+            '-' => {
+                tokens.push((UpdateToken::Minus, depth));
+                chars.next();
+            }
             '(' => {
                 tokens.push((UpdateToken::LParen, depth));
                 depth += 1;
@@ -1992,7 +2014,7 @@ fn tokenize_update_expression(expr: &str) -> Vec<(UpdateToken<'_>, u32)> {
             _ => {
                 let mut end = start;
                 while let Some(&(idx, ch)) = chars.peek() {
-                    if ch.is_whitespace() || matches!(ch, ',' | '=' | '(' | ')') {
+                    if ch.is_whitespace() || matches!(ch, ',' | '=' | '+' | '-' | '(' | ')') {
                         break;
                     }
                     end = idx + ch.len_utf8();
@@ -2082,12 +2104,13 @@ fn continues_update_clause(
 /// clauses are `SET a = expr, b = expr`, `REMOVE c, d`, `ADD e :v`, and
 /// `DELETE f :v`, in any order; the attribute names may use `#alias`
 /// placeholders and the values `:placeholder`s. A `SET` right-hand side
-/// (issue #375 PR1) is one [`UpdateExpr`]: a bare `:value`/path, or a
-/// `if_not_exists(path, default)`/`list_append(a, b)` function call — see
-/// [`parse_update_set_expr`]. Non-whitespace text before the first
-/// recognized clause keyword is rejected too — e.g. `"foo SET x = :v"` —
-/// rather than silently dropped, which would otherwise apply only the `SET`
-/// and never surface the leading garbage.
+/// (issue #375 PR1/PR2) is one [`UpdateExpr`]: a bare `:value`/path, a
+/// `if_not_exists(path, default)`/`list_append(a, b)` function call, or
+/// `operand +/- operand` numeric arithmetic — see [`parse_update_set_expr`].
+/// Non-whitespace text before the first recognized clause keyword is
+/// rejected too — e.g. `"foo SET x = :v"` — rather than silently dropped,
+/// which would otherwise apply only the `SET` and never surface the leading
+/// garbage.
 ///
 /// This is a real clause tokenizer ([`tokenize_update_expression`]), not a
 /// substring keyword scan: `SET`/`REMOVE`/`ADD`/`DELETE` are recognized as
@@ -2272,16 +2295,31 @@ fn expect_update_punct(
     }
 }
 
-/// Parse a `SET` clause's right-hand side: currently always a single
-/// [`UpdateOperand`] (issue #375 PR1) — a follow-up teaches this arithmetic.
+/// Parse a `SET` clause's right-hand side: one [`UpdateOperand`] (issue #375
+/// PR1), or (PR2) `operand + operand` / `operand - operand` — DynamoDB
+/// allows at most one arithmetic operator, so a second `+`/`-` is left for
+/// the caller (`continues_update_clause`) to reject as "expected `,` or a
+/// clause keyword".
 fn parse_update_set_expr(
     obj: &Map<String, Value>,
     tokens: &[(UpdateToken<'_>, u32)],
     i: &mut usize,
     expr: &str,
 ) -> Result<UpdateExpr, WireError> {
-    let operand = parse_update_operand(obj, tokens, i, expr)?;
-    Ok(UpdateExpr::Operand(operand))
+    let lhs = parse_update_operand(obj, tokens, i, expr)?;
+    match tokens.get(*i) {
+        Some((UpdateToken::Plus, _)) => {
+            *i += 1;
+            let rhs = parse_update_operand(obj, tokens, i, expr)?;
+            Ok(UpdateExpr::Add(lhs, rhs))
+        }
+        Some((UpdateToken::Minus, _)) => {
+            *i += 1;
+            let rhs = parse_update_operand(obj, tokens, i, expr)?;
+            Ok(UpdateExpr::Sub(lhs, rhs))
+        }
+        _ => Ok(UpdateExpr::Operand(lhs)),
+    }
 }
 
 /// Parse one [`UpdateOperand`]: a `:value` placeholder, a top-level
@@ -2355,7 +2393,39 @@ fn eval_update_expr(item: &Item, expr: &UpdateExpr) -> Result<AttributeValue, Wi
     };
     match expr {
         UpdateExpr::Operand(op) => eval_update_operand(item, op)?.ok_or_else(missing),
+        UpdateExpr::Add(a, b) => eval_update_arithmetic(item, a, b, "+"),
+        UpdateExpr::Sub(a, b) => eval_update_arithmetic(item, a, b, "-"),
     }
+}
+
+/// The `+`/`-` arithmetic core shared by [`eval_update_expr`]'s two operator
+/// arms: both operands must evaluate to `N`, added via
+/// [`crate::condition::add_numeric`] (`-` first negates the right side via
+/// [`crate::condition::negate_numeric`] — DynamoDB's only subtraction path,
+/// mirrored from `condition.rs`'s own `ADD`-with-a-negated-delta precedent).
+fn eval_update_arithmetic(
+    item: &Item,
+    a: &UpdateOperand,
+    b: &UpdateOperand,
+    op: &str,
+) -> Result<AttributeValue, WireError> {
+    let operand_error = || {
+        WireError::validation(format!(
+            "SET arithmetic (`{op}`) requires two number (N) operands"
+        ))
+    };
+    let av = eval_update_operand(item, a)?.ok_or_else(operand_error)?;
+    let bv = eval_update_operand(item, b)?.ok_or_else(operand_error)?;
+    let (AttributeValue::N(an), AttributeValue::N(bn)) = (&av, &bv) else {
+        return Err(operand_error());
+    };
+    let rhs = if op == "-" {
+        crate::condition::negate_numeric(bn).ok_or_else(operand_error)?
+    } else {
+        bn.clone()
+    };
+    let sum = crate::condition::add_numeric(an, &rhs).ok_or_else(operand_error)?;
+    Ok(AttributeValue::N(sum))
 }
 
 /// Evaluate one [`UpdateOperand`] against `item`. `Ok(None)` means the
@@ -4463,13 +4533,14 @@ pub fn batch_write_response() -> String {
 /// item. Pure.
 ///
 /// `REMOVE` drops a top-level attribute and is infallible. `SET` (issue #375
-/// PR1) evaluates its right-hand-side [`UpdateExpr`] against the item — a
-/// bare `:value` never fails, but `if_not_exists`/`list_append` can (a
-/// missing operand, a non-list `list_append`). `ADD` and `DELETE` are typed
-/// operations too, and DynamoDB rejects a mismatch (`ADD`ing a number to a
-/// string set) rather than ignoring it. Hence the `Result` — silently
-/// skipping a mismatched action would leave the caller believing an update
-/// applied when it did not, which is the one outcome worse than an error.
+/// PR1/PR2) evaluates its right-hand-side [`UpdateExpr`] against the item —
+/// a bare `:value` never fails, but `if_not_exists`/`list_append`/`+`/`-`
+/// can (a missing operand, a non-list `list_append`, non-numeric
+/// arithmetic). `ADD` and `DELETE` are typed operations too, and DynamoDB
+/// rejects a mismatch (`ADD`ing a number to a string set) rather than
+/// ignoring it. Hence the `Result` — silently skipping a mismatched action
+/// would leave the caller believing an update applied when it did not, which
+/// is the one outcome worse than an error.
 ///
 /// This runs on the **leader** that owns the row (ADR 0046 U3), against the old
 /// image the leader itself read, so `ADD`'s read-modify-write is evaluated
@@ -7727,6 +7798,109 @@ mod tests {
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
             "UpdateExpression":"SET a = nope(a, :v)",
             "ExpressionAttributeValues":{":v":{"N":"0"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- SET arithmetic, `+`/`-` (issue #375 PR2) ---------------------------
+
+    #[test]
+    fn decodes_set_arithmetic_add_and_subtract() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = a + :x, b = b - :y",
+            "ExpressionAttributeValues":{":x":{"N":"1"},":y":{"N":"2"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![
+                UpdateAction::Set(
+                    "a".into(),
+                    UpdateExpr::Add(
+                        UpdateOperand::Path("a".into()),
+                        UpdateOperand::Value(AttributeValue::N("1".into()))
+                    )
+                ),
+                UpdateAction::Set(
+                    "b".into(),
+                    UpdateExpr::Sub(
+                        UpdateOperand::Path("b".into()),
+                        UpdateOperand::Value(AttributeValue::N("2".into()))
+                    )
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_arithmetic_adds_and_subtracts_with_decimal_precision() {
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::N("1.10".into()));
+        let add = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Add(
+                UpdateOperand::Path("a".into()),
+                UpdateOperand::Value(AttributeValue::N("0.90".into())),
+            ),
+        );
+        let out = apply_update(item, &[add]).expect("both sides numeric");
+        assert_eq!(out.get("a"), Some(&AttributeValue::N("2".into())));
+
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::N("5".into()));
+        let sub = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Sub(
+                UpdateOperand::Path("a".into()),
+                UpdateOperand::Value(AttributeValue::N("8".into())),
+            ),
+        );
+        let out = apply_update(item, &[sub]).expect("both sides numeric");
+        assert_eq!(out.get("a"), Some(&AttributeValue::N("-3".into())));
+    }
+
+    /// A non-`N` operand on either side of `+`/`-` is a `ValidationException`.
+    #[test]
+    fn set_arithmetic_rejects_a_non_numeric_operand() {
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::S("nope".into()));
+        let add = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Add(
+                UpdateOperand::Path("a".into()),
+                UpdateOperand::Value(AttributeValue::N("1".into())),
+            ),
+        );
+        let err = apply_update(item, &[add]).expect_err("a is an S, not N");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// Function results can be operands: `SET a = if_not_exists(a, :zero) +
+    /// :one` — a counter that starts at zero when the item is new.
+    #[test]
+    fn if_not_exists_result_used_as_an_arithmetic_operand() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = if_not_exists(a, :zero) + :one",
+            "ExpressionAttributeValues":{":zero":{"N":"0"},":one":{"N":"1"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        let out = apply_update(Item::new(), &actions).expect("if_not_exists seeds 0, then +1");
+        assert_eq!(out.get("a"), Some(&AttributeValue::N("1".into())));
+    }
+
+    /// DynamoDB allows at most one operator per `SET` value — `a + :x + :y`
+    /// is rejected, not silently left-associated.
+    #[test]
+    fn set_arithmetic_rejects_a_second_operator() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = a + :x + :y",
+            "ExpressionAttributeValues":{":x":{"N":"1"},":y":{"N":"2"}}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
