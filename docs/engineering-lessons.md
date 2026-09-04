@@ -15840,3 +15840,69 @@ radius or silently skipping the question asked.
   but a reused helper's *messages* silently keep pointing at whichever
   feature was there first unless someone explicitly generalizes them, and
   nothing type-checks that omission.
+## Enforcing a decode-time invariant surfaces every JSON-body-building call site, not just the ones under `crates/*/tests` (roadmap W-11)
+
+Landing the rejection W-05's own lesson above deliberately deferred —
+`CreateTable`/`UpdateTable` must reject a key attribute (base or index)
+with no `AttributeDefinitions` entry, and reject an entry that names no
+key attribute at all — found that "the fixtures" is a wider set than the
+obvious `crates/animusd/tests/*.rs` grep suggests. Two call sites outside
+that tree built genuinely incomplete bodies and would have started
+`400`-ing in production the moment the strict decoder shipped:
+
+- **`animusd::lib.rs`'s `ConsoleBackend::add_gsi`/`create_table`** (the
+  console's own Add-GSI and create-table forms) send an
+  `AttributeDefinitions` entry only for the base table's partition/sort key
+  — an index-only key attribute's type was left **deliberately absent**
+  pre-W-11 (`console::CreateTableRequest`'s own doc explains why: neither
+  `CreateGsiRequest`/`CreateLsiRequest` nor the create-table form collects
+  one). That was a legitimate design choice against the *lenient* decoder;
+  against the *strict* one it is simply broken — every console-added index
+  needs a `"S"`-defaulted `AttributeDefinitions` entry now, so the type
+  these two request builders record for an index key attribute changes
+  from `None` to `Some("S")`, a real, observable behavior change (fixed in
+  `console_table_config.rs::add_and_drop_gsi_round_trip` and
+  `console_create_table.rs::create_full_table_declares_everything_exactly`,
+  whose whole point had been to pin the *old*, `None`-recording behavior).
+- **`animusd::src::dashboard_browser.js`'s `submitAddIndexForm`** (the
+  *operator* dashboard's own "Add index" form — a different surface from
+  the console app above, ADR 0052's "Naming, deliberately addressed") sent
+  no `AttributeDefinitions` at all for its GSI's key(s). No Rust test
+  exercises this path (it POSTs JSON built entirely client-side), so
+  nothing in the crate's own test suite would ever have caught the break —
+  it was found only by grepping every `KeySchema`/`GlobalSecondaryIndexUpdates`
+  occurrence across `crates/animusd/src/*.js` too, not just `*.rs`.
+
+The general form: a decode-time invariant enforced for the first time
+doesn't just need every *test* fixture swept — it needs every **caller**
+that builds the wire JSON by hand, including a same-crate but
+non-`tests/`-tree admin surface and any client-side JS that talks straight
+to the wire without a Rust test in between. `grep`ping only `crates/*/tests`
+(the obvious first pass, and literally what W-05's own residual note
+above named as done) would have shipped two silent regressions.
+
+## `UpdateTable`'s own `AttributeDefinitions` requirement is scoped to the new index's keys only, because the decoder never sees the table's existing ones (roadmap W-11)
+
+`decode_create_table` has the whole picture in one JSON body — the base
+table's `KeySchema` plus every declared GSI/LSI's own — so its
+`AttributeDefinitions` check can legitimately be "exactly the union of
+every key attribute this request's own key schema names, nothing more,
+nothing less." `decode_update_table`'s `GlobalSecondaryIndexUpdates`
+`Create` arm cannot use the same rule: this crate is deliberately pure (no
+I/O, no replicated catalog, `animus-dynamo/CLAUDE.md`'s own charter), so it
+has no way to know the base table's *existing* partition/sort key or any
+*other* index's keys — only the one new index's own `KeySchema` is ever in
+the request body. So the required set for `UpdateTable` is scoped to
+**just the new index's own key attribute(s)** — not because DynamoDB's
+real rule is narrower there (it isn't: AWS's own `AttributeDefinitions`
+rule spans a table's whole key schema, existing keys included, and
+tolerates a caller re-declaring one), but because that is the largest set
+this decoder can actually verify without a capability it deliberately
+doesn't have. A caller that also re-sends the base table's own key
+definitions on an `UpdateTable` call — a real, AWS-legal pattern some
+SDKs/IaC tools use — would be rejected here as "unused," a known,
+narrower-than-AWS gap; nothing in this repo's own test fixtures does that
+today, so it wasn't hit, but it is the direct consequence of the pure-crate
+boundary above and worth knowing before "fixing" it by loosening the
+unused-side check instead of giving the decoder catalog access (which
+`animus-dynamo/CLAUDE.md`'s charter rules out).

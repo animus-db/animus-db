@@ -56,7 +56,7 @@
 //! LSI to an existing table (LSIs are create-time-only in real DynamoDB).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_control::{IndexStatus, StreamViewType};
 use serde::{Deserialize, Serialize};
@@ -1511,6 +1511,10 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
             let schema = decode_key_schema(obj)?;
             let key_types = decode_attribute_types(obj);
             let indexes = decode_indexes(obj)?;
+            check_attribute_definitions(
+                &create_table_required_key_attributes(&schema, &indexes),
+                &key_types,
+            )?;
             let stream_view_type = decode_create_table_stream_spec(obj)?;
             Ok(Operation::CreateTable {
                 table,
@@ -3064,7 +3068,15 @@ fn decode_key_schema(obj: &Map<String, Value>) -> Result<TableSchema, WireError>
 
 /// Decode `AttributeDefinitions` into `(AttributeName, AttributeType)` pairs (the
 /// declared `S`/`N`/`B` for each key attribute). Absent or malformed entries are
-/// skipped — the schema bridge defaults a missing type to `String`.
+/// skipped. `CreateTable` and `UpdateTable`'s `GlobalSecondaryIndexUpdates`
+/// `Create` (roadmap W-11) both check the decoded pairs against their own
+/// required key attributes right after calling this
+/// ([`check_attribute_definitions`]), so by the time either operation reaches
+/// `to_control`/`index_to_control` (`schema.rs`) every key attribute has a
+/// real declared type — that bridge's own "a missing entry defaults to
+/// `String`" fallback is now unreachable from the wire path and stays live
+/// only for `create_table_legacy`'s pre-`CreateTable` convention, which never
+/// declares `AttributeDefinitions` at all.
 fn decode_attribute_types(obj: &Map<String, Value>) -> Vec<(String, String)> {
     obj.get("AttributeDefinitions")
         .and_then(Value::as_array)
@@ -3079,6 +3091,94 @@ fn decode_attribute_types(obj: &Map<String, Value>) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The key attribute names `CreateTable` requires a declared
+/// `AttributeType` for: the base table's own partition/sort key plus every
+/// declared index's own hash/sort key (GSI and LSI alike — an LSI's hash is
+/// always the base partition key, already covered by `schema`, but its own
+/// alternate sort attribute is index-only and must be declared too). Real
+/// DynamoDB's `AttributeDefinitions` rule spans the table's *entire* key
+/// schema at once, not per-index, so this is the complete required set for
+/// one `CreateTable` call — see [`check_attribute_definitions`].
+fn create_table_required_key_attributes(
+    schema: &TableSchema,
+    indexes: &[SecondaryIndex],
+) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    required.insert(schema.partition_key.clone());
+    if let Some(sk) = &schema.sort_key {
+        required.insert(sk.clone());
+    }
+    for index in indexes {
+        required.extend(index_key_attributes(index));
+    }
+    required
+}
+
+/// One index's own declared key attribute name(s) — a GSI's hash (+ optional
+/// sort), or an LSI's own alternate sort attribute alone (its hash is
+/// always the base table's partition key, tracked separately by
+/// [`create_table_required_key_attributes`], not part of the index's own
+/// declaration). Used both for `CreateTable`'s whole-table required set and
+/// for `UpdateTable`'s `GlobalSecondaryIndexUpdates` `Create`, which needs
+/// definitions for exactly the new index's own keys and nothing else (ADR
+/// none — roadmap W-11).
+fn index_key_attributes(index: &SecondaryIndex) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    match index {
+        SecondaryIndex::Global(g) => {
+            required.insert(g.key_attribute.clone());
+            if let Some(sk) = &g.sort_attribute {
+                required.insert(sk.clone());
+            }
+        }
+        SecondaryIndex::Local(l) => {
+            required.insert(l.sort_attribute.clone());
+        }
+    }
+    required
+}
+
+/// DynamoDB's own two-sided `AttributeDefinitions` contract (real AWS
+/// rejects both directions of mismatch): `required` — the key attribute
+/// name(s) a table's/index's key schema names — must have a matching
+/// `AttributeDefinitions` entry, and conversely every declared
+/// `AttributeDefinitions` entry must name a key attribute somewhere in
+/// `required` (an unused definition is rejected too, matching AWS's own
+/// "Some AttributeDefinitions are not used" wording). Missing is checked,
+/// and reported, before unused — matching the order AWS's own validator
+/// surfaces them in.
+fn check_attribute_definitions(
+    required: &BTreeSet<String>,
+    key_types: &[(String, String)],
+) -> Result<(), WireError> {
+    let declared: BTreeSet<String> = key_types.iter().map(|(name, _)| name.clone()).collect();
+    let missing: Vec<&String> = required.difference(&declared).collect();
+    if !missing.is_empty() {
+        let names = missing
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: Some index key attributes are not \
+             defined in AttributeDefinitions. Keys: [{names}]"
+        )));
+    }
+    let unused: Vec<&String> = declared.difference(required).collect();
+    if !unused.is_empty() {
+        let names = unused
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(WireError::validation(format!(
+            "One or more parameter values were invalid: Some AttributeDefinitions are not used. \
+             Unused: [{names}]"
+        )));
+    }
+    Ok(())
 }
 
 /// AWS's cap on a table's `GlobalSecondaryIndexes`, declared at `CreateTable`
@@ -3357,6 +3457,9 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
     if has_index_updates {
         let index_update = decode_index_updates(obj)?;
         let key_types = decode_attribute_types(obj);
+        if let IndexUpdate::Create(ref index) = index_update {
+            check_attribute_definitions(&index_key_attributes(index), &key_types)?;
+        }
         return Ok(Operation::UpdateTable {
             table,
             stream: None,
@@ -6569,6 +6672,7 @@ mod tests {
     #[test]
     fn create_table_simple_key() {
         let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
             Operation::CreateTable { schema, .. } => {
@@ -7275,7 +7379,9 @@ mod tests {
 
     #[test]
     fn update_table_decodes_a_create_index_update() {
-        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"}],
+            "GlobalSecondaryIndexUpdates":[
             {"Create":{"IndexName":"by-email",
                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
                 "Projection":{"ProjectionType":"ALL"}}}]}"#;
@@ -7294,10 +7400,10 @@ mod tests {
                     }
                     other => panic!("expected Create(Global(..)), got {other:?}"),
                 }
-                assert!(
-                    key_types.is_empty(),
-                    "no AttributeDefinitions in this request"
-                );
+                // Roadmap W-11: `AttributeDefinitions` now must cover the new
+                // index's own key, so it rides through onto `key_types`
+                // rather than staying empty.
+                assert_eq!(key_types, vec![("email".to_owned(), "S".to_owned())]);
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
@@ -7424,6 +7530,7 @@ mod tests {
     #[test]
     fn decodes_create_table_with_stream_enabled() {
         let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"OLD_IMAGE"}}"#;
         match decode_request("DynamoDB_20120810.CreateTable", body).unwrap() {
@@ -7439,6 +7546,7 @@ mod tests {
     #[test]
     fn decodes_create_table_with_stream_disabled_or_absent() {
         let disabled = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":false}}"#;
         match decode_request("DynamoDB_20120810.CreateTable", disabled).unwrap() {
@@ -7449,6 +7557,7 @@ mod tests {
         }
 
         let absent = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
         match decode_request("DynamoDB_20120810.CreateTable", absent).unwrap() {
             Operation::CreateTable {
@@ -7461,6 +7570,8 @@ mod tests {
     #[test]
     fn decodes_create_table_with_gsi() {
         let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                     {"AttributeName":"email","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -7485,6 +7596,11 @@ mod tests {
     #[test]
     fn decodes_composite_gsi_and_lsi() {
         let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                                     {"AttributeName":"sk","AttributeType":"S"},
+                                     {"AttributeName":"a","AttributeType":"S"},
+                                     {"AttributeName":"b","AttributeType":"S"},
+                                     {"AttributeName":"alt","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}],
             "GlobalSecondaryIndexes":[
@@ -8934,6 +9050,9 @@ mod tests {
     #[test]
     fn decodes_index_projection_types() {
         let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                     {"AttributeName":"e","AttributeType":"S"},
+                                     {"AttributeName":"o","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"k","KeySchema":[{"AttributeName":"e","KeyType":"HASH"}],
@@ -8968,7 +9087,10 @@ mod tests {
             })
             .collect();
         format!(
-            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+            r#"{{"TableName":"t",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}},
+                                         {{"AttributeName":"e","AttributeType":"S"}}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                 "GlobalSecondaryIndexes":[{}]}}"#,
             gsis.join(",")
         )
@@ -8999,9 +9121,16 @@ mod tests {
                 )
             })
             .collect();
+        let mut attr_defs: Vec<String> =
+            vec![r#"{"AttributeName":"id","AttributeType":"S"}"#.to_owned()];
+        attr_defs
+            .extend((0..n).map(|i| format!(r#"{{"AttributeName":"r{i}","AttributeType":"S"}}"#)));
         format!(
-            r#"{{"TableName":"t","KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+            r#"{{"TableName":"t",
+                "AttributeDefinitions":[{}],
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                 "LocalSecondaryIndexes":[{}]}}"#,
+            attr_defs.join(","),
             lsis.join(",")
         )
     }
@@ -9016,6 +9145,150 @@ mod tests {
         let err = decode_request("DynamoDB_20120810.CreateTable", over_cap.as_bytes())
             .expect_err("6 LSIs is rejected");
         assert_eq!(err.code, "ValidationException");
+    }
+
+    // --- AttributeDefinitions must cover exactly the key schema (roadmap
+    // W-11) -------------------------------------------------------------
+
+    #[test]
+    fn create_table_rejects_a_key_attribute_missing_from_attribute_definitions() {
+        let body = br#"{"TableName":"t",
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
+        let err = decode_request("DynamoDB_20120810.CreateTable", body)
+            .expect_err("no AttributeDefinitions at all for a declared key");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("not defined in AttributeDefinitions"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("id"),
+            "message should name the missing attribute: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn create_table_rejects_a_missing_index_key_attribute_definition() {
+        // The base key is declared, but the GSI's own hash attribute isn't —
+        // real DynamoDB's `AttributeDefinitions` rule spans the whole key
+        // schema (table + every index) at once, not just the base table.
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.CreateTable", body)
+            .expect_err("the GSI's own hash attribute has no declared type");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("email"),
+            "message should name the missing index attribute: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn create_table_rejects_an_unused_attribute_definition() {
+        // `extra` is declared but never appears in any key schema (table or
+        // index) — the mirror-image DynamoDB rejection ("Some
+        // AttributeDefinitions are not used").
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                     {"AttributeName":"extra","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
+        let err = decode_request("DynamoDB_20120810.CreateTable", body)
+            .expect_err("`extra` names no key attribute anywhere in this request");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("AttributeDefinitions are not used"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("extra"),
+            "message should name the unused attribute: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn create_table_with_exact_attribute_definitions_is_accepted() {
+        // The positive case every rejection test above is a negative
+        // mutation of: base key + every index key, nothing more, nothing
+        // less, decodes cleanly.
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                     {"AttributeName":"email","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-email",
+                 "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#;
+        decode_request("DynamoDB_20120810.CreateTable", body)
+            .expect("exact AttributeDefinitions coverage is accepted");
+    }
+
+    #[test]
+    fn update_table_create_index_rejects_a_missing_attribute_definition() {
+        let body = br#"{"TableName":"t","GlobalSecondaryIndexUpdates":[
+            {"Create":{"IndexName":"by-email",
+                "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                "Projection":{"ProjectionType":"ALL"}}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body)
+            .expect_err("no AttributeDefinitions at all for the new index's own key");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("not defined in AttributeDefinitions"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("email"),
+            "message should name the missing attribute: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn update_table_create_index_rejects_an_unused_attribute_definition() {
+        // `UpdateTable`'s `GlobalSecondaryIndexUpdates` `Create` needs
+        // definitions for exactly the new index's own key(s) — an extra
+        // entry (even one that happens to look like a real attribute name)
+        // is rejected the same way `CreateTable`'s own extras are.
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},
+                                     {"AttributeName":"unrelated","AttributeType":"S"}],
+            "GlobalSecondaryIndexUpdates":[
+            {"Create":{"IndexName":"by-email",
+                "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+                "Projection":{"ProjectionType":"ALL"}}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body)
+            .expect_err("`unrelated` is not part of the new index's own key");
+        assert_eq!(err.code, "ValidationException");
+        assert!(
+            err.message.contains("AttributeDefinitions are not used"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("unrelated"),
+            "message should name the unused attribute: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn update_table_delete_index_needs_no_attribute_definitions() {
+        // Dropping a GSI needs no key-type information at all — real
+        // DynamoDB never asks for one either.
+        let body = br#"{"TableName":"t",
+            "GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"by-email"}}]}"#;
+        decode_request("DynamoDB_20120810.UpdateTable", body)
+            .expect("Delete needs no AttributeDefinitions");
     }
 
     // --- UpdateTimeToLive / DescribeTimeToLive (ADR 0051) -----------------
