@@ -303,7 +303,10 @@ async fn a_descending_limit_keeps_the_highest_rows() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
             "ScanIndexForward":false,"Limit":2}"#,
     )
@@ -437,7 +440,10 @@ async fn descending_composes_with_a_filter() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}},
             "ScanIndexForward":false,"Limit":2}"#,

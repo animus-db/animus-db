@@ -187,7 +187,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI row.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"mid"}}}"#,
     )
@@ -223,7 +225,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI move.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"mid"}}}"#,
     )
@@ -236,7 +240,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI move.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"high"}}}"#,
     )
@@ -275,7 +281,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written batch.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p2"},":a":{"S":"1"}}}"#,
     )
@@ -285,7 +293,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written batch.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p3"},":a":{"S":"2"}}}"#,
     )
@@ -295,7 +305,9 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written batch delete.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i",
             "ExpressionAttributeValues":{":i":{"S":"p1"}}}"#,
     )
@@ -325,10 +337,12 @@ async fn update_item_and_batch_write_item_maintain_secondary_indexes() {
     .await;
 
     // The base table itself reflects the batch too (unaffected sanity check).
+    // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+    // just-written batch delete.
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.GetItem",
-        r#"{"TableName":"items","Key":{"id":{"S":"p1"},"sk":{"S":"a"}}}"#,
+        r#"{"TableName":"items","Key":{"id":{"S":"p1"},"sk":{"S":"a"}},"ConsistentRead":true}"#,
     )
     .await;
     assert_eq!(status, 200);
@@ -636,7 +650,9 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI row.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"A"}}}"#,
     )
@@ -666,7 +682,9 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI move.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"A"}}}"#,
     )
@@ -679,7 +697,9 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written LSI move.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i AND alt = :a",
             "ExpressionAttributeValues":{":i":{"S":"p1"},":a":{"S":"B"}}}"#,
     )
@@ -704,7 +724,10 @@ async fn unconditional_put_and_delete_maintain_lsi_without_a_condition_or_all_ol
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"items","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): the stale alt=B row could
+        // otherwise still be visible on a replica that hasn't applied the
+        // delete yet.
+        r#"{"TableName":"items","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i",
             "ExpressionAttributeValues":{":i":{"S":"p1"}}}"#,
     )
@@ -1025,7 +1048,10 @@ async fn cross_node_racing_unconditional_puts_never_orphan_an_lsi_row() {
     let (status, body) = dynamo(
         addr_c,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"race","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): the orphan-detector count
+        // must see this node's own latest applied state, not a
+        // possibly-still-catching-up replica-local snapshot.
+        r#"{"TableName":"race","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i",
             "ExpressionAttributeValues":{":i":{"S":"shared"}}}"#,
     )
@@ -1210,7 +1236,10 @@ async fn cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row(
     let (status, body) = dynamo(
         addr_c,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"race_txn","IndexName":"by-alt",
+        // ConsistentRead: true (ADR 0055, #604): the orphan-detector count
+        // must see this node's own latest applied state, not a
+        // possibly-still-catching-up replica-local snapshot.
+        r#"{"TableName":"race_txn","IndexName":"by-alt","ConsistentRead":true,
             "KeyConditionExpression":"id = :i",
             "ExpressionAttributeValues":{":i":{"S":"shared"}}}"#,
     )

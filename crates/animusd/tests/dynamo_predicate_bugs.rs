@@ -165,7 +165,10 @@ async fn an_aliased_filter_actually_filters() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r##"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r##"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"#par = :v",
             "ExpressionAttributeNames":{"#par":"parity"},
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}}}"##,
@@ -195,7 +198,10 @@ async fn comparisons_filter_rather_than_matching_nothing() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"sk >= :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"a3"}}}"#,
     )
@@ -234,7 +240,10 @@ async fn a_sort_key_range_is_served_rather_than_narrowed() {
     let (status, ge) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk >= :s",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND sk >= :s",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":s":{"S":"a3"}}}"#,
     )
     .await;
@@ -249,7 +258,10 @@ async fn a_sort_key_range_is_served_rather_than_narrowed() {
     let (status, ok) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":lo":{"S":"a1"},":hi":{"S":"a3"}}}"#,
     )
     .await;
@@ -302,10 +314,14 @@ async fn a_key_condition_naming_a_non_key_attribute_is_rejected() {
 async fn aliased_and_plain_key_conditions_both_still_serve() {
     let (_dir, nodes, addrs) = setup().await;
 
+    // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+    // just-written rows.
     for body in [
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
-        r##"{"TableName":"events","KeyConditionExpression":"#k = :p",
+        r##"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"#k = :p",
             "ExpressionAttributeNames":{"#k":"pk"},
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"##,
     ] {
