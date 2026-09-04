@@ -49,11 +49,11 @@
 //! change is rejected up front. `Scan` reads a whole table with `Limit` /
 //! `ExclusiveStartKey` pagination and an optional `FilterExpression` (the
 //! same predicate subset as `ConditionExpression`). GetItem/Query/Scan accept
-//! a `ProjectionExpression` / `AttributesToGet` (top-level attribute names
-//! only). Deferred (rejected with a clear error): document-path projections
-//! (`a.b`), per-index projection lists, `UpdateItem`-only `ReturnValues`
-//! modes, and adding an LSI to an existing table (LSIs are create-time-only
-//! in real DynamoDB).
+//! a `ProjectionExpression` (dotted document paths `a.b.c`, list-index
+//! segments `a[0]`/`a[0][1]`) or the legacy `AttributesToGet` (top-level
+//! attribute names only). Deferred (rejected with a clear error): per-index
+//! projection lists, `UpdateItem`-only `ReturnValues` modes, and adding an
+//! LSI to an existing table (LSIs are create-time-only in real DynamoDB).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -179,67 +179,158 @@ pub enum Select {
     Count,
 }
 
+/// One segment of a projection document path: either a map key (a plain
+/// attribute name, one `.`-separated component) or a list index (one `[n]`
+/// suffix). A dotted path `a.b` is two `Field` segments; a list-index path
+/// `a[0].b` is `Field("a")`, `Index(0)`, `Field("b")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    /// A map (`M`) key.
+    Field(String),
+    /// A list (`L`) index — zero-based, matching DynamoDB.
+    Index(usize),
+}
+
 /// A projection: the document paths a read should return (from a
 /// `ProjectionExpression` or the legacy `AttributesToGet`). `None` on an
 /// operation means "all attributes"; `Some(paths)` keeps only the requested
 /// paths (a requested-but-absent path is simply omitted, as in DynamoDB).
 ///
-/// Each element is a **dotted document path** `a.b.c`: a top-level attribute name
-/// optionally followed by `.`-separated map keys, so a projection can reach into
-/// nested `M` (map) attributes. A path that traverses into a non-map value (or an
-/// absent key) yields nothing for that path. List-index paths (`a[0]`) remain
-/// deferred — a `[` is rejected at decode time so the limitation is explicit.
-///
-/// The string form is kept (`Projection(pub Vec<String>)`), so a plain top-level
-/// name is just a one-segment path.
+/// Each element is a **document path**: a top-level attribute name optionally
+/// followed by further `.`-separated map keys and/or `[n]` list-index
+/// suffixes ([`PathSegment`]), so a projection can reach into nested `M`
+/// (map) and `L` (list) attributes — `a.b`, `a[0]`, `a[0].b`, `a[0][1]` are
+/// all valid. A path that traverses into the wrong container type, or names
+/// an absent key / out-of-range index, yields nothing for that path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Projection(pub Vec<String>);
+pub struct Projection(pub Vec<Vec<PathSegment>>);
 
 impl Projection {
     /// Apply the projection to `item`, keeping only the requested document paths,
     /// reconstructing the nested structure each path reaches (so projecting
-    /// `a.b` yields `{a:{b:..}}`). Absent paths are skipped. Multiple paths
-    /// sharing a prefix are merged.
+    /// `a.b` yields `{a:{b:..}}`, and projecting `a[1]`/`a[3]` out of a longer
+    /// list yields `{a:[<elem 1>,<elem 3>]}` — a **compacted** list carrying just
+    /// the selected elements, in ascending index order, exactly as DynamoDB
+    /// documents it). Absent paths are skipped. Multiple paths sharing a prefix
+    /// (including two different indices of the same list) are merged.
     #[must_use]
     pub fn apply(&self, item: &Item) -> Item {
-        let mut out = Item::new();
+        let mut root = Proj::Empty;
         for path in &self.0 {
-            let segments: Vec<&str> = path.split('.').collect();
-            project_path(item, &segments, &mut out);
+            project_into_item(item, path, &mut root);
         }
-        out
+        match finalize(root) {
+            Some(AttributeValue::M(m)) => m,
+            _ => Item::new(),
+        }
     }
 }
 
-/// Project one dotted path's `segments` from `src` into `dst`, reconstructing the
-/// nested map structure. The head names a top-level attribute; each further
-/// segment descends into an `M` value. A path that does not resolve to a present
-/// value (wrong type or absent key) contributes nothing.
-fn project_path(src: &Item, segments: &[&str], dst: &mut Item) {
-    let Some((head, rest)) = segments.split_first() else {
-        return;
-    };
-    let Some(value) = src.get(*head) else {
-        return;
-    };
-    if rest.is_empty() {
-        // Whole sub-tree at this leaf. Merge with anything already projected
-        // under `head` (e.g. a sibling deeper path) by preferring the broader
-        // (whole-value) projection.
-        dst.insert((*head).to_owned(), value.clone());
+/// Intermediate accumulator for a merge of possibly many projected paths that
+/// share structure. Mirrors `AttributeValue`'s two container shapes (`M`/`L`),
+/// keeping a list's projected indices in a sorted map — so overlapping/nested
+/// index projections merge correctly — until [`finalize`] compacts each one
+/// into the DynamoDB-documented "just the selected elements, in order" list.
+#[derive(Default)]
+enum Proj {
+    /// Nothing projected here yet.
+    #[default]
+    Empty,
+    /// A path ended here: the whole subtree at this point is kept verbatim.
+    Whole(AttributeValue),
+    /// At least one path descended through a map key here.
+    Map(BTreeMap<String, Proj>),
+    /// At least one path descended through a list index here.
+    List(BTreeMap<usize, Proj>),
+}
+
+/// Project one path's remaining `segments` out of `value`, merging into `dst`.
+/// A path that does not resolve (wrong container type, absent key, or
+/// out-of-range index) contributes nothing — `dst` is left as whatever earlier
+/// paths already built.
+fn project_into(value: &AttributeValue, segments: &[PathSegment], dst: &mut Proj) {
+    // A path that already selected this whole subtree needs nothing more —
+    // and must not be downgraded back into a partial Map/List by a
+    // differently-shaped path processed afterward.
+    if matches!(dst, Proj::Whole(_)) {
         return;
     }
-    // Descend into a nested map only.
-    let AttributeValue::M(inner) = value else {
+    match segments.split_first() {
+        None => *dst = Proj::Whole(value.clone()),
+        Some((PathSegment::Field(name), rest)) => {
+            let AttributeValue::M(map) = value else {
+                return;
+            };
+            let Some(child) = map.get(name) else {
+                return;
+            };
+            if !matches!(dst, Proj::Map(_)) {
+                *dst = Proj::Map(BTreeMap::new());
+            }
+            let Proj::Map(m) = dst else {
+                unreachable!("just set to Map above")
+            };
+            project_into(child, rest, m.entry(name.clone()).or_default());
+        }
+        Some((PathSegment::Index(i), rest)) => {
+            let AttributeValue::L(list) = value else {
+                return;
+            };
+            let Some(child) = list.get(*i) else {
+                return;
+            };
+            if !matches!(dst, Proj::List(_)) {
+                *dst = Proj::List(BTreeMap::new());
+            }
+            let Proj::List(m) = dst else {
+                unreachable!("just set to List above")
+            };
+            project_into(child, rest, m.entry(*i).or_default());
+        }
+    }
+}
+
+/// [`project_into`]'s top-level entry point: the root of a document path is
+/// always a top-level attribute name, sourced from `item` (an `Item` and an
+/// `AttributeValue::M`'s inner map share the same shape, but the root has no
+/// wrapping `AttributeValue` of its own).
+fn project_into_item(item: &Item, segments: &[PathSegment], dst: &mut Proj) {
+    let Some((PathSegment::Field(name), rest)) = segments.split_first() else {
+        return; // A path always starts with a field segment (the parser guarantees this).
+    };
+    let Some(child) = item.get(name) else {
         return;
     };
-    // Recurse into the nested map, accumulating into the nested entry under
-    // `head` (created/extended as a map).
-    let entry = dst
-        .entry((*head).to_owned())
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-    if let AttributeValue::M(nested_dst) = entry {
-        project_path(inner, rest, nested_dst);
+    if !matches!(dst, Proj::Map(_)) {
+        *dst = Proj::Map(BTreeMap::new());
+    }
+    let Proj::Map(m) = dst else {
+        unreachable!("just set to Map above")
+    };
+    project_into(child, rest, m.entry(name.clone()).or_default());
+}
+
+/// Convert an accumulated [`Proj`] tree into the `AttributeValue` it
+/// represents, compacting each `List` node's sparse index map into a plain,
+/// ascending-order `Vec` — DynamoDB's documented list-projection contract
+/// ("if you project `a[1]` and `a[3]`, the result list has two elements").
+fn finalize(node: Proj) -> Option<AttributeValue> {
+    match node {
+        Proj::Empty => None,
+        Proj::Whole(v) => Some(v),
+        Proj::Map(m) => {
+            let mut out = Item::new();
+            for (k, v) in m {
+                if let Some(val) = finalize(v) {
+                    out.insert(k, val);
+                }
+            }
+            Some(AttributeValue::M(out))
+        }
+        Proj::List(m) => {
+            let out: Vec<AttributeValue> = m.into_values().filter_map(finalize).collect();
+            Some(AttributeValue::L(out))
+        }
     }
 }
 
@@ -2860,41 +2951,45 @@ fn decode_projection(obj: &Map<String, Value>) -> Result<Option<Projection>, Wir
         ));
     }
     if let Some(expr) = obj.get("ProjectionExpression").and_then(Value::as_str) {
-        let names = expr
+        let paths = expr
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|raw| resolve_projection_name(obj, raw))
+            .map(|raw| parse_projection_path(obj, raw))
             .collect::<Result<Vec<_>, _>>()?;
-        if names.is_empty() {
+        if paths.is_empty() {
             return Err(WireError::validation("`ProjectionExpression` is empty"));
         }
-        return Ok(Some(Projection(names)));
+        return Ok(Some(Projection(paths)));
     }
     if let Some(arr) = obj.get("AttributesToGet") {
         let arr = arr
             .as_array()
             .ok_or_else(|| WireError::validation("`AttributesToGet` must be an array"))?;
-        let mut names = Vec::with_capacity(arr.len());
+        let mut paths = Vec::with_capacity(arr.len());
         for v in arr {
             let name = v.as_str().ok_or_else(|| {
                 WireError::validation("`AttributesToGet` elements must be strings")
             })?;
-            names.push(reject_path(name)?.to_owned());
+            paths.push(vec![PathSegment::Field(reject_path(name)?.to_owned())]);
         }
-        if names.is_empty() {
+        if paths.is_empty() {
             return Err(WireError::validation("`AttributesToGet` is empty"));
         }
-        return Ok(Some(Projection(names)));
+        return Ok(Some(Projection(paths)));
     }
     Ok(None)
 }
 
-/// Resolve one `ProjectionExpression` element into a **dotted document path**,
-/// resolving a `#alias` on each `.`-separated segment through
-/// `ExpressionAttributeNames`. The result is the path with aliases substituted
-/// (e.g. `#p.#c` → `profile.city`). List-index syntax (`[`) is still rejected.
-fn resolve_projection_name(obj: &Map<String, Value>, raw: &str) -> Result<String, WireError> {
+/// Parse one `ProjectionExpression` element into a document path: a
+/// `.`-separated sequence of segments, each an attribute name (or `#alias`,
+/// resolved through `ExpressionAttributeNames`) optionally followed by one or
+/// more `[n]` list-index suffixes (e.g. `#p.list[0][1]` → `Field("profile")`,
+/// `Field("list")`, `Index(0)`, `Index(1)`, once `#p` resolves to `profile`).
+fn parse_projection_path(
+    obj: &Map<String, Value>,
+    raw: &str,
+) -> Result<Vec<PathSegment>, WireError> {
     let mut segments = Vec::new();
     for seg in raw.split('.') {
         let seg = seg.trim();
@@ -2903,40 +2998,78 @@ fn resolve_projection_name(obj: &Map<String, Value>, raw: &str) -> Result<String
                 "projection path `{raw}` has an empty segment"
             )));
         }
-        let resolved = if let Some(alias) = seg.strip_prefix('#') {
-            let names = obj
-                .get("ExpressionAttributeNames")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    WireError::validation(format!(
-                        "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
-                    ))
-                })?;
-            names
-                .get(&format!("#{alias}"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    WireError::validation(format!("name placeholder `#{alias}` is not defined"))
-                })?
-                .to_owned()
-        } else {
-            seg.to_owned()
-        };
-        reject_list_index(&resolved)?;
-        segments.push(resolved);
+        segments.extend(parse_projection_segment(obj, raw, seg)?);
     }
-    Ok(segments.join("."))
+    Ok(segments)
 }
 
-/// Reject a list-index attribute path (containing `[`): nested-map document
-/// paths (`a.b`) are supported, but list indexing (`a[0]`) is deferred.
-fn reject_list_index(name: &str) -> Result<(), WireError> {
-    if name.contains('[') {
+/// Parse one `.`-separated piece of a projection path (`seg`, e.g. `list[0][1]`
+/// or `#p`) into a field segment plus any trailing index segments. `raw` is
+/// the whole path, kept only for error messages.
+fn parse_projection_segment(
+    obj: &Map<String, Value>,
+    raw: &str,
+    seg: &str,
+) -> Result<Vec<PathSegment>, WireError> {
+    let bracket = seg.find('[');
+    let (name_part, rest) = match bracket {
+        Some(i) => (&seg[..i], &seg[i..]),
+        None => (seg, ""),
+    };
+    if name_part.is_empty() {
         return Err(WireError::validation(format!(
-            "list-index projection `{name}` is not supported (map paths `a.b` only)"
+            "malformed list-index syntax in projection path `{raw}` (no attribute name before `[`)"
         )));
     }
-    Ok(())
+    let name = if let Some(alias) = name_part.strip_prefix('#') {
+        let names = obj
+            .get("ExpressionAttributeNames")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                WireError::validation(format!(
+                    "projection uses name placeholder `#{alias}` but `ExpressionAttributeNames` is absent"
+                ))
+            })?;
+        names
+            .get(&format!("#{alias}"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WireError::validation(format!("name placeholder `#{alias}` is not defined"))
+            })?
+            .to_owned()
+    } else {
+        name_part.to_owned()
+    };
+    let mut out = vec![PathSegment::Field(name)];
+    out.extend(parse_index_chain(rest, raw)?);
+    Ok(out)
+}
+
+/// Parse a chain of `[n]` list-index suffixes (`rest`, e.g. `[0][1]`) into
+/// `PathSegment::Index` entries. `raw` is the whole path, for error messages.
+/// Each index must be a plain non-negative decimal integer — malformed syntax
+/// (`[`, `[x]`, `[-1]`, `[01]`... any non-digit body) is a `ValidationException`,
+/// matching how DynamoDB rejects it rather than DynamoDB's own index type
+/// silently misinterpreting it.
+fn parse_index_chain(mut rest: &str, raw: &str) -> Result<Vec<PathSegment>, WireError> {
+    let malformed = || {
+        WireError::validation(format!(
+            "malformed list-index syntax in projection path `{raw}`"
+        ))
+    };
+    let mut indices = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix('[').ok_or_else(malformed)?;
+        let close = rest.find(']').ok_or_else(malformed)?;
+        let digits = &rest[..close];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed());
+        }
+        let index: usize = digits.parse().map_err(|_| malformed())?;
+        indices.push(PathSegment::Index(index));
+        rest = &rest[close + 1..];
+    }
+    Ok(indices)
 }
 
 /// Reject a non-top-level attribute name (containing `.` or `[`), used where only
@@ -5136,6 +5269,11 @@ mod tests {
         AttributeValue::S(v.into())
     }
 
+    /// A one-segment field path — the common case in these tests.
+    fn field(name: &str) -> Vec<PathSegment> {
+        vec![PathSegment::Field(name.into())]
+    }
+
     fn n(v: &str) -> AttributeValue {
         AttributeValue::N(v.into())
     }
@@ -5300,7 +5438,7 @@ mod tests {
         item.insert("id".into(), s("u1"));
         item.insert("name".into(), s("Ada"));
         item.insert("secret".into(), s("hidden"));
-        let p = Projection(vec!["id".into(), "name".into(), "absent".into()]);
+        let p = Projection(vec![field("id"), field("name"), field("absent")]);
         let projected = p.apply(&item);
         assert_eq!(projected.len(), 2);
         assert_eq!(projected.get("id"), Some(&s("u1")));
@@ -5320,7 +5458,7 @@ mod tests {
         };
         assert_eq!(
             projection,
-            Some(Projection(vec!["id".into(), "name".into()]))
+            Some(Projection(vec![field("id"), field("name")]))
         );
     }
 
@@ -5335,13 +5473,13 @@ mod tests {
         };
         assert_eq!(
             projection,
-            Some(Projection(vec!["id".into(), "name".into()]))
+            Some(Projection(vec![field("id"), field("name")]))
         );
     }
 
     #[test]
     fn decodes_document_path_projection() {
-        // Document-path projections (`a.b`) are now supported.
+        // Document-path projections (`a.b`) are supported.
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
             "ProjectionExpression":"a.b, c"}"#;
         let Operation::GetItem { projection, .. } =
@@ -5349,16 +5487,77 @@ mod tests {
         else {
             panic!("expected GetItem");
         };
-        assert_eq!(projection, Some(Projection(vec!["a.b".into(), "c".into()])));
+        assert_eq!(
+            projection,
+            Some(Projection(vec![
+                vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Field("b".into())
+                ],
+                field("c"),
+            ]))
+        );
     }
 
     #[test]
-    fn rejects_list_index_projection() {
-        // List-index paths (`a[0]`) remain deferred.
+    fn decodes_list_index_projection() {
         let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
-            "ProjectionExpression":"a[0]"}"#;
-        let err = decode_request("DynamoDB_20120810.GetItem", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
+            "ProjectionExpression":"a[0], a[0].b, matrix[1][2]"}"#;
+        let Operation::GetItem { projection, .. } =
+            decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert_eq!(
+            projection,
+            Some(Projection(vec![
+                vec![PathSegment::Field("a".into()), PathSegment::Index(0)],
+                vec![
+                    PathSegment::Field("a".into()),
+                    PathSegment::Index(0),
+                    PathSegment::Field("b".into()),
+                ],
+                vec![
+                    PathSegment::Field("matrix".into()),
+                    PathSegment::Index(1),
+                    PathSegment::Index(2),
+                ],
+            ]))
+        );
+    }
+
+    #[test]
+    fn decodes_list_index_projection_with_alias() {
+        // `#p[0]` — the alias resolves the name part; the index suffix rides
+        // straight through.
+        let body = br##"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "ProjectionExpression":"#p[0]",
+            "ExpressionAttributeNames":{"#p":"list"}}"##;
+        let Operation::GetItem { projection, .. } =
+            decode_request("DynamoDB_20120810.GetItem", body).unwrap()
+        else {
+            panic!("expected GetItem");
+        };
+        assert_eq!(
+            projection,
+            Some(Projection(vec![vec![
+                PathSegment::Field("list".into()),
+                PathSegment::Index(0),
+            ]]))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_list_index_syntax() {
+        for expr in ["a[", "a[x]", "a[-1]", "a[0", "a]0[", "[0]"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                    "ProjectionExpression":"{expr}"}}"#
+            );
+            let result = decode_request("DynamoDB_20120810.GetItem", body.as_bytes());
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "ValidationException", "for `{expr}`");
+        }
     }
 
     #[test]
@@ -5370,7 +5569,14 @@ mod tests {
         item.insert("a".into(), AttributeValue::M(inner));
         item.insert("c".into(), s("top"));
         item.insert("d".into(), s("gone"));
-        let projected = Projection(vec!["a.b".into(), "c".into()]).apply(&item);
+        let projected = Projection(vec![
+            vec![
+                PathSegment::Field("a".into()),
+                PathSegment::Field("b".into()),
+            ],
+            field("c"),
+        ])
+        .apply(&item);
         // `a` is reconstructed with only `b`; `c` kept; `d` dropped.
         let AttributeValue::M(a) = projected.get("a").expect("a present") else {
             panic!("a is a map");
@@ -5379,6 +5585,99 @@ mod tests {
         assert!(!a.contains_key("z"));
         assert_eq!(projected.get("c"), Some(&s("top")));
         assert!(!projected.contains_key("d"));
+    }
+
+    #[test]
+    fn list_index_projection_selects_and_compacts() {
+        // Projecting a[1] and a[3] out of a longer list yields a *compacted*
+        // two-element list, per DynamoDB's own documented contract.
+        let mut item = Item::new();
+        item.insert(
+            "a".into(),
+            AttributeValue::L(vec![s("z0"), s("z1"), s("z2"), s("z3"), s("z4")]),
+        );
+        let projected = Projection(vec![
+            vec![PathSegment::Field("a".into()), PathSegment::Index(3)],
+            vec![PathSegment::Field("a".into()), PathSegment::Index(1)],
+        ])
+        .apply(&item);
+        assert_eq!(
+            projected.get("a"),
+            Some(&AttributeValue::L(vec![s("z1"), s("z3")]))
+        );
+    }
+
+    #[test]
+    fn list_index_projection_out_of_range_yields_nothing() {
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::L(vec![s("only")]));
+        let projected = Projection(vec![vec![
+            PathSegment::Field("a".into()),
+            PathSegment::Index(5),
+        ]])
+        .apply(&item);
+        assert!(!projected.contains_key("a"));
+    }
+
+    #[test]
+    fn nested_list_index_projection_descends_into_a_map_element() {
+        // list[0].b — the first list element is a map; only `b` survives.
+        let mut inner = BTreeMap::new();
+        inner.insert("b".into(), s("keep"));
+        inner.insert("z".into(), s("drop"));
+        let mut item = Item::new();
+        item.insert(
+            "list".into(),
+            AttributeValue::L(vec![AttributeValue::M(inner), s("second")]),
+        );
+        let projected = Projection(vec![vec![
+            PathSegment::Field("list".into()),
+            PathSegment::Index(0),
+            PathSegment::Field("b".into()),
+        ]])
+        .apply(&item);
+        let AttributeValue::L(list) = projected.get("list").expect("list present") else {
+            panic!("list is a list");
+        };
+        assert_eq!(list.len(), 1, "only index 0 selected");
+        let AttributeValue::M(m) = &list[0] else {
+            panic!("element is a map");
+        };
+        assert_eq!(m.get("b"), Some(&s("keep")));
+        assert!(!m.contains_key("z"));
+    }
+
+    #[test]
+    fn nested_index_of_a_list_selects_and_compacts() {
+        // matrix[0][2] and matrix[0][0] out of a nested list — a compacted
+        // two-element inner list at index 0; index 1 of the outer list is
+        // never touched.
+        let mut item = Item::new();
+        item.insert(
+            "matrix".into(),
+            AttributeValue::L(vec![
+                AttributeValue::L(vec![s("m00"), s("m01"), s("m02")]),
+                AttributeValue::L(vec![s("m10"), s("m11")]),
+            ]),
+        );
+        let projected = Projection(vec![
+            vec![
+                PathSegment::Field("matrix".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(2),
+            ],
+            vec![
+                PathSegment::Field("matrix".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(0),
+            ],
+        ])
+        .apply(&item);
+        let AttributeValue::L(outer) = projected.get("matrix").expect("matrix present") else {
+            panic!("matrix is a list");
+        };
+        assert_eq!(outer.len(), 1, "only outer index 0 selected");
+        assert_eq!(outer[0], AttributeValue::L(vec![s("m00"), s("m02")]));
     }
 
     #[test]
@@ -8544,7 +8843,7 @@ mod tests {
                 assert_eq!(requests[0].keys.len(), 2);
                 assert_eq!(
                     requests[0].projection,
-                    Some(Projection(vec!["id".into(), "v".into()]))
+                    Some(Projection(vec![field("id"), field("v")]))
                 );
                 assert!(requests[0].consistent_read);
                 assert_eq!(requests[1].table, "t2");

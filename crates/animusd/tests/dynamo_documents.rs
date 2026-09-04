@@ -167,6 +167,33 @@ async fn document_set_types_projection_and_return_values() {
     assert!(!body.contains("address"), "address projected out: {body}");
     assert!(!body.contains("tags"), "tags projected out: {body}");
 
+    // GetItem with a list-index ProjectionExpression: scores[0] and scores[2]
+    // out of the 3-element list yield a *compacted* 2-element list (W-02).
+    let (status, body) = dynamo(
+        addr1,
+        "DynamoDB_20120810.GetItem",
+        r#"{"ConsistentRead":true,"TableName":"profiles","Key":{"id":{"S":"u1"}},
+            "ProjectionExpression":"scores[0], scores[2]"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "list-index projected GetItem failed: {body}");
+    assert!(
+        body.contains(r#""scores":{"L":[{"N":"1"},{"S":"x"}]}"#),
+        "compacted list projection: {body}"
+    );
+    assert!(!body.contains("\"name\""), "name projected out: {body}");
+
+    // A malformed list-index projection is a ValidationException, not a 500.
+    let (status, body) = dynamo(
+        addr1,
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"profiles","Key":{"id":{"S":"u1"}},
+            "ProjectionExpression":"scores[x]"}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "malformed list index: {body}");
+    assert!(body.contains("ValidationException"), "got: {body}");
+
     // ReturnValues: ALL_OLD on an overwrite echoes the prior item.
     let (status, body) = dynamo(
         addr0,

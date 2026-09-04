@@ -237,15 +237,32 @@ comment for its full type/method inventory.
   base64url** pair (`base64url_encode`/`base64url_decode`, strict/canonical
   decode) — the display encoding for `animusd`'s admin/dashboard surfaces, not
   used by the DynamoDB wire itself.
-- **Projection** supports **dotted document paths**: `ProjectionExpression` is a
-  comma-separated list of paths `a.b.c` (with `#alias` placeholders per segment via
-  `ExpressionAttributeNames`), or the legacy `AttributesToGet` array (top-level
-  names). `Projection::apply` reconstructs the nested map structure a path reaches
-  (`a.b` ⇒ `{a:{b:..}}`). A list-index path (`a[0]`, any `[`) is still rejected.
-  Projection is applied at the edge (`animusd`) after the read; for `Scan` the
-  `FilterExpression` sees the whole item *before* projection trims it. An index
-  `Query` with no explicit projection falls back to the index's declared
-  `IndexProjection`.
+- **Projection** supports **dotted document paths and list-index segments**
+  (W-02): `ProjectionExpression` is a comma-separated list of paths `a.b.c`/
+  `a[0]`/`a[0].b`/`matrix[1][2]` (with `#alias` placeholders per `.`-separated
+  segment, resolved via `ExpressionAttributeNames` — the index suffix rides
+  straight through an alias unchanged), or the legacy `AttributesToGet` array
+  (top-level names only, no `.`/`[` — unchanged). Each path decodes to
+  `Vec<PathSegment>` (`Field(String)`/`Index(usize)`, `wire::parse_projection_path`),
+  not a plain string, so `Projection::apply` never re-parses at apply time.
+  `Projection::apply` reconstructs the nested structure a path reaches: a
+  `Field` chain rebuilds nested `M`s (`a.b` ⇒ `{a:{b:..}}`); an `Index`
+  reconstructs the parent `L` **compacted** to just the selected elements, in
+  ascending index order — DynamoDB's own documented contract ("project `a[1]`
+  and `a[3]`" yields a two-element list, not a sparse one). Implemented via an
+  intermediate `Proj` accumulator tree (`Empty`/`Whole`/`Map`/`List`, the
+  `List` variant keeping a sorted `BTreeMap<usize, Proj>` until a final
+  `finalize` pass compacts it) rather than mutating `Item`/`AttributeValue`
+  directly — needed because a list projection must merge overlapping/nested
+  index selections (`a[1]` and `a[1].b`) before it knows how many elements the
+  final compacted list has. An out-of-range index, or an index applied to a
+  non-`L` value, yields nothing for that path, exactly like a `Field` into a
+  non-`M`/absent key. Malformed index syntax (`a[`, `a[x]`, `a[-1]`, unbalanced
+  brackets) is a decode-time `ValidationException` (`parse_index_chain`) — the
+  digits-only check is what rejects a negative index. Projection is applied at
+  the edge (`animusd`) after the read; for `Scan` the `FilterExpression` sees
+  the whole item *before* projection trims it. An index `Query` with no
+  explicit projection falls back to the index's declared `IndexProjection`.
 - **`ReturnValues`** supports `NONE` (default) and `ALL_OLD` on Put/Delete; the
   edge reads the prior item once (reusing it for any `ConditionExpression` check,
   so there is no double read) and `write_response` echoes it under `Attributes`.
@@ -345,8 +362,7 @@ comment for its full type/method inventory.
   so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
   reached by the raw client protocol's plain writes, not ordinary
   `TransactWriteItems` contention).
-- **Still deferred** (don't represent as a full adapter): list-index document
-  paths (`a[0]`). `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
+- `BatchGetItem` and `ADD`/`DELETE` `UpdateExpression`
   arithmetic are both implemented (`decode_batch_get`/`decode_update_expression`
   in `wire.rs`) — see the `wire` entry point above and this crate's own unit
   tests. **`Query` now paginates exactly like `Scan`**
