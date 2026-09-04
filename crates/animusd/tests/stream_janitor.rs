@@ -1217,6 +1217,7 @@ async fn start_split_streamed_cluster(
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
 
         let mut control_nodes = Vec::new();

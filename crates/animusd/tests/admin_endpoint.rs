@@ -1431,6 +1431,7 @@ async fn bring_up_with_auth(
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),
             }),
+            cluster_settings: None,
         };
         match animusd::run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
             Ok(node) => return (node, config),
