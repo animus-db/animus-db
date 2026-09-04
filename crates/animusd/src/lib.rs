@@ -133,7 +133,7 @@ use animus_storage::{
 use animus_tablet::{KeyRange, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 // Pure CP-topology decision logic (routing predicates), extracted into
@@ -9045,7 +9045,7 @@ async fn handle_connection(
     ctx: ClientCtx,
     listener: ListenerKind,
 ) -> std::io::Result<()> {
-    while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
+    while let Some(request) = read_frame::<ClientRequest, _>(&mut stream).await? {
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
         // handling ends up forwarding to another node (`cp_forward`), and what
@@ -10928,7 +10928,7 @@ async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<Clien
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
             write_frame(&mut stream, request).await.ok()?;
-            read_frame::<ClientResponse>(&mut stream).await.ok()?
+            read_frame::<ClientResponse, _>(&mut stream).await.ok()?
         })
         .await;
         if let Ok(Some(resp)) = reply
@@ -11442,7 +11442,7 @@ async fn relay_request_with_timeout(
     match tokio::time::timeout(timeout, async {
         let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
         write_frame(&mut stream, request).await.ok()?;
-        read_frame::<ClientResponse>(&mut stream).await.ok()?
+        read_frame::<ClientResponse, _>(&mut stream).await.ok()?
     })
     .await
     {
@@ -11514,7 +11514,16 @@ const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
 /// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
 /// receiver would drop the connection anyway — failing at the sender names the
 /// culprit instead of surfacing as a mysterious peer hang-up).
-pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
+///
+/// **Generic over `AsyncWrite + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. This is what lets
+/// [`handle_connection`] write the reply on a socket's split
+/// `OwnedWriteHalf` after racing the read half against peer-close.
+pub async fn write_frame<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &T,
+) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
     stream.write_all(&framed).await?;
     stream.flush().await?;
@@ -11534,7 +11543,13 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::
 /// Propagates read failures and decode errors; a declared length over
 /// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
 /// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
-pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
+///
+/// **Generic over `AsyncRead + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. See [`write_frame`]'s matching note.
+pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
