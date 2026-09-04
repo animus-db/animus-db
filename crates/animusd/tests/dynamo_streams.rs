@@ -1549,3 +1549,104 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         .await
         .expect("did not converge in time");
 }
+
+/// **Stream records carry the ADR 0063 `N` key encoding correctly**:
+/// `ChangeRecord.base_sk` is captured in the new order-preserving `numkey`
+/// layout the moment `key_bytes()` changed, with no code of its own to
+/// update (the ADR's own Scope section) — this proves the wire's `Keys` for
+/// a table with an `N` sort key still reports the exact DynamoDB numeric
+/// text each item was written with, across mixed digit counts and a
+/// negative value, and that every record for the same partition arrives
+/// carrying the value it was written with, in write order.
+///
+/// **Note**: a record's `Keys` is derived from its own `NewImage`/`OldImage`
+/// (`streams_wire::keys_from_images`), never re-decoded from `base_sk`
+/// itself — so this pins that the write path's stored `N` text still
+/// reaches the stream correctly end to end, not `numkey::decode` directly
+/// (`SortKeyCondition::matches_raw`'s own coverage in `animus-dynamo`
+/// exercises that). It still exercises the encoding change indirectly: the
+/// change-log record's own storage key is `partition_prefix || base_sk ||
+/// hlc`, and `base_sk` is now the `numkey` bytes (which can contain
+/// arbitrary byte values, including ones a raw-text encoding never would),
+/// so a break in shard/record positioning from those bytes would surface
+/// here as a missing or misordered record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs() {
+    let dir = support::panic_safe_tempdir();
+    let nodes = start_streamed_cluster(1, dir.path(), never_seals_knobs()).await;
+    await_bootstrap(&nodes).await;
+    let addr = nodes[0].dynamo_addr();
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "StreamSpecification":{"StreamEnabled":true,
+                "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+    let label = field(&body, "LatestStreamLabel");
+    let stream_arn = format!("arn:aws:dynamodb:animus:0:table/readings/stream/{label}");
+
+    // Mixed digit counts and a negative — the exact shape a raw byte-text
+    // encoding would have gotten wrong for ordering, and (per this test's
+    // own doc) a real risk for record *positioning* now that `base_sk`
+    // carries the `numkey` bytes instead of decimal text.
+    let sks = ["-12", "0", "5", "9", "100"];
+    for sk in sks {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"readings","Item":{{"pk":{{"S":"p1"}},"sk":{{"N":"{sk}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem(sk={sk}) failed: {body}");
+    }
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDBStreams_20120810.DescribeStream",
+        &format!(r#"{{"StreamArn":"{stream_arn}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeStream failed: {body}");
+    let v = json(&body);
+    let shards = v["StreamDescription"]["Shards"].as_array().unwrap();
+    assert_eq!(
+        shards.len(),
+        1,
+        "never_seals_knobs must keep everything in the one open epoch-0 shard: {body}"
+    );
+    let shard_id = shards[0]["ShardId"].as_str().unwrap().to_owned();
+
+    let records = await_records(addr, &stream_arn, &shard_id, sks.len()).await;
+    assert_eq!(
+        records.len(),
+        sks.len(),
+        "expected exactly one record per write: {records:?}"
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    for record in &records {
+        assert_eq!(
+            record["dynamodb"]["Keys"]["pk"]["S"], "p1",
+            "wrong partition in Keys: {record:?}"
+        );
+        let sk = record["dynamodb"]["Keys"]["sk"]["N"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no N-typed sk in Keys: {record:?}"))
+            .to_owned();
+        seen.push(sk);
+    }
+    assert_eq!(
+        seen,
+        sks.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "records for partition p1 must carry the exact N values they were \
+         written with, in write order: {records:?}"
+    );
+}

@@ -38,35 +38,6 @@ the still-true paragraph after the table.
 
 ## 1. Wire surface (DynamoDB API)
 
-### W-03 Order-preserving encoding for `N` sort keys
-
-- **Gap:** `AttributeValue::key_bytes()` writes `N` as raw decimal text, so
-  Query ordering across magnitudes and signs is bytewise, not numeric.
-  Range predicates are correct; `ScanIndexForward` order is not.
-- **Plan:** canonical sign + exponent + digit-run encoding with inversion
-  for negatives, applied at the single choke point `key_bytes()` and
-  mirrored byte-for-byte in `animus-tablet`'s escape/token primitives;
-  `matches_raw` must decode the new encoding instead of UTF-8 text.
-- **Reuse:** `condition.rs`'s `decimal_parts`/`add_digits`/`sub_digits`
-  for canonicalisation.
-- **Files:** `crates/animus-dynamo/src/lib.rs:84-97`;
-  `crates/animus-tablet/src/lib.rs:44,134`; `index.rs:140-249` (GSI/LSI
-  row keys); `condition.rs:118-131`.
-- **Tests:** new differential proptest against `bigdecimal` next to
-  `condition.rs`'s `decimal_differential_tests`; rewrite
-  `matches_raw_reinterprets_bytes_by_the_conditions_own_declared_type`
-  (`condition.rs:870`); explicit regressions for GSI, LSI, streams, and
-  backup/restore reading the same bytes.
-- **ADR:** **yes, 0063** — amends ADR 0022/0023's key layout, which those
-  ADRs mark "do not change without a data migration". No back-compat is
-  owed (root `CLAUDE.md`), but the decision is recorded.
-- **PRs:** (1) ADR; (2) encode/decode + proptest, unwired; (3) wire
-  `key_bytes` + `animus-tablet` mirror + `matches_raw`; (4) index, stream,
-  backup regressions.
-- **Size:** L (small algorithm, large blast radius).
-- **Depends:** W-05 landed 2026-09-04; `schema.rs`'s bridge now carries
-  index key attribute types, so this can start at any time.
-
 ### W-07 PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`)
 
 - **Gap:** absent. Deliberately sized honestly: a new parser, a new error
@@ -392,7 +363,7 @@ wave are independent and can run in parallel.
 |---|---|---|
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
-| 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
+| 3 | W-09, U-05, U-07, U-08(ii), C-04 D1 | U-05 after its members panel; D1 before C-01 |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
