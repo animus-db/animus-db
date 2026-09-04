@@ -19,7 +19,7 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0063**.
+The next free ADR number at the time of writing is **0064**.
 
 ---
 
