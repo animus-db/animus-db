@@ -5372,6 +5372,7 @@ impl BoundDataNode {
             stream_seal_knobs,
             segment_store_config,
             None,
+            Duration::ZERO,
             None,
             BackupStoreConfig::default(),
         )
@@ -5394,6 +5395,13 @@ impl BoundDataNode {
     /// backup store handle too (ADR 0059's own asymmetry is that a
     /// *control-only* node gets none — see [`BoundControlNode::
     /// start_control_with`], which takes no such parameter at all).
+    ///
+    /// `quiesce_after` (ADR 0044 phase-1 / ADR 0048, S-06): closes the
+    /// documented gap this method used to have (see `animusd/CLAUDE.md`'s
+    /// Quiescence section, pre-S-06) — a data-only node's own tablet-host
+    /// reconciler now enables quiescence exactly like [`BoundNode::
+    /// start_with_growth`]'s combined-mode reconciler does, same
+    /// `Duration::ZERO`-disables/`MIN_QUIESCE_AFTER`-floor contract.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5409,6 +5417,7 @@ impl BoundDataNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
+        quiesce_after: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
     ) -> std::io::Result<Node> {
@@ -5544,7 +5553,7 @@ impl BoundDataNode {
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
         // shape to `BoundNode::start_with`'s.
-        let reconciler = {
+        let mut reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
             let base_id = my_id.clone();
@@ -5576,6 +5585,20 @@ impl BoundDataNode {
                 )),
             }
         };
+        // ADR 0044 phase-1 / ADR 0048 (S-06 closes the documented gap this
+        // path used to have): identical contract to `BoundNode::
+        // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
+        // (every pre-S-06 call site) disables it entirely, zero behavior
+        // change.
+        if !quiesce_after.is_zero() {
+            debug_assert!(
+                quiesce_after >= MIN_QUIESCE_AFTER,
+                "quiesce_after ({quiesce_after:?}) must be at least \
+                 MIN_QUIESCE_AFTER ({MIN_QUIESCE_AFTER:?}) or 0 to disable \
+                 quiescence — see that constant's own doc"
+            );
+            reconciler.enable_quiescence(quiesce_after);
+        }
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
         // to register members against; that is entirely the control
@@ -5637,9 +5660,8 @@ impl BoundDataNode {
 
         // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
         // just above. No test-tunable interval knob on this data-only path
-        // yet (mirrors `quiesce_after`'s own documented gap for
-        // `start_data_with_growth`, `animusd/CLAUDE.md`'s Quiescence
-        // section) — always the production default.
+        // yet (unlike `quiesce_after`, which closed its own equivalent gap
+        // here — S-06) — always the production default.
         tasks.push(tokio::spawn(ttl_reaper::ttl_reaper_loop(
             ctx.clone(),
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
@@ -9966,6 +9988,11 @@ pub async fn start_split_cluster_with_growth(
                 StreamSealKnobs::default(),
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
+                // `--quiesce-after` doesn't thread through the
+                // `--cluster-control`/`--cluster-data` dev path yet — the
+                // same documented gap `run`'s own module doc names (S-06
+                // scoped only the three real deployment paths).
+                Duration::ZERO,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
             )
@@ -10097,6 +10124,8 @@ pub async fn run_node_with_streams_and_quiesce_after(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10138,6 +10167,8 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
@@ -10180,6 +10211,56 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        None,
+        None,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+    )
+    .await
+}
+
+/// Like [`run_node_with_streams_quiesce_and_backup_store`], but also exposes
+/// **auto-split** (ADR 0034 / ADR 0042 §14, S-06) instead of pinning both
+/// triggers at `None` — `--config FILE --node I`'s only route to auto-split
+/// at all before S-06 (previously reachable solely via `--cluster N`'s
+/// dev-only in-process mode). `main.rs`'s `run_single` is this function's
+/// one real caller; every other existing call site above keeps compiling
+/// and behaving identically at `None`/`None` (no auto-split, unchanged).
+/// TTL sweep interval and PITR snapshot cadence stay pinned at their own
+/// production defaults, same as [`run_node_with_streams_quiesce_and_backup_
+/// store`] — a caller needing those tunable too calls [`run_node_with_
+/// streams_quiesce_and_ttl_sweep_interval`] directly.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_with_cluster_settings(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
+    run_node_with_streams_quiesce_and_ttl_sweep_interval(
+        config,
+        index,
+        dir,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        auto_split_bytes,
+        auto_split_change_rate,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10197,6 +10278,18 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// discipline — never wait out a real minute) calls this directly, or its
 /// single-knob convenience sibling [`run_node_with_ttl_sweep_interval`].
 ///
+/// `auto_split_bytes`/`auto_split_change_rate` (ADR 0034 / ADR 0042 §14,
+/// S-06): threaded straight to [`BoundNode::start_with_growth`]'s own knobs
+/// of the same name — `None` (every existing call site below) is
+/// byte-identical to before this pair of parameters existed. `--config
+/// FILE --node I`'s only path to auto-split before S-06 was none at all
+/// (only `--cluster N`'s dev in-process mode had the CLI flags); `main.rs`'s
+/// `run_single` is this pair's one real caller, reached by calling this
+/// innermost layer directly rather than growing every wrapper above by two
+/// more parameters — the same "call the innermost layer directly for a
+/// knob its wrappers don't expose" convention `dynamo_auth`
+/// (`run_node_data`'s doc) already established.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -10210,6 +10303,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
     ttl_sweep_interval: Duration,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
@@ -10271,13 +10366,13 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
+            auto_split_bytes,
             admin_addrs,
             orphan_sweep_after,
             stream_seal_knobs,
             segment_store_config,
             stream_retention,
-            None,
+            auto_split_change_rate,
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
@@ -10314,6 +10409,8 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        None,
+        None,
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10496,11 +10593,14 @@ pub async fn run_node_data(
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
 ) -> std::io::Result<Node> {
-    run_node_data_with_streams(
+    run_node_data_with_cluster_settings(
         config,
         index,
         dir,
         backend,
+        None,
+        None,
+        Duration::ZERO,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
     )
@@ -10516,6 +10616,8 @@ pub async fn run_node_data(
 /// never wait out a 4-hour age trigger) calls this directly. Pairs with
 /// [`run_node_control_with_stores`]'s own `stream_retention` parameter for a
 /// genuine split-topology segment-janitor test (see `tests/stream_janitor.rs`).
+/// A thin wrapper over [`run_node_data_with_cluster_settings`] with every
+/// S-06 cluster-settings knob at its pre-S-06 default.
 ///
 /// # Errors
 /// As [`run_node_data`].
@@ -10524,6 +10626,51 @@ pub async fn run_node_data_with_streams(
     index: usize,
     dir: impl Into<PathBuf>,
     backend: StorageBackend,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+) -> std::io::Result<Node> {
+    run_node_data_with_cluster_settings(
+        config,
+        index,
+        dir,
+        backend,
+        None,
+        None,
+        Duration::ZERO,
+        stream_seal_knobs,
+        segment_store_config,
+    )
+    .await
+}
+
+/// Like [`run_node_data`], but also exposes the knobs `animusd data
+/// --config`'s own `cluster_settings`-carrying [`ClusterConfig`] can now
+/// reach (S-06): auto-split (ADR 0034 / ADR 0042 §14), quiescence (ADR 0044
+/// phase-1 / ADR 0048), and the Streams sealer's size/age triggers (ADR
+/// 0042 §13) — every one of these applies to a data-hosting node exactly as
+/// it does on the combined-mode path (`run_node_with_streams_quiesce_and_
+/// ttl_sweep_interval`'s own doc), unlike `orphan_sweep_after`/
+/// `stream_retention`, which stay unreachable here since a data-only node
+/// runs no local control `RaftNode` and is never a control-plane leader —
+/// see [`config::ClusterSettings`]'s own doc for the full per-field
+/// applicability breakdown. Every default
+/// below (`None`/`Duration::ZERO`/[`StreamSealKnobs::default`]/
+/// [`SegmentStoreConfig::default`]) is byte-identical to [`run_node_data`]'s
+/// own pre-S-06 behavior. `segment_store_config` is W-10's own knob (the
+/// same one [`run_node_data_with_streams`] exposes); `animusd data --config`
+/// has no flag for it yet, so `main.rs` passes the default.
+///
+/// # Errors
+/// As [`run_node_data`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_node_data_with_cluster_settings(
+    config: &ClusterConfig,
+    index: usize,
+    dir: impl Into<PathBuf>,
+    backend: StorageBackend,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    quiesce_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
 ) -> std::io::Result<Node> {
@@ -10606,11 +10753,12 @@ pub async fn run_node_data_with_streams(
             ClusterEdgeState::new(),
             client_route,
             intra_route,
-            None,
+            auto_split_bytes,
             admin_addrs,
             stream_seal_knobs,
             segment_store_config,
-            None,
+            auto_split_change_rate,
+            quiesce_after,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
             // CLI flag reaches `animusd data --config` yet, so this always
@@ -11182,6 +11330,11 @@ async fn finish_data_join(
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
             None,
+            // `--quiesce-after` doesn't reach a seed/join startup yet — the
+            // same documented gap `animusd`'s own module doc names for
+            // `join`/`data --seed` (S-06 scoped only the three real
+            // `--config`/`--node`-shaped deployment paths).
+            Duration::ZERO,
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
@@ -11357,6 +11510,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -11757,6 +11911,7 @@ mod forward_transport_failure_tests {
         ClusterConfig {
             nodes,
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -11983,6 +12138,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -12198,6 +12354,7 @@ mod issue_412_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -12749,6 +12906,7 @@ mod issue_298_conflict_tests {
                 console: addrs[5],
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 

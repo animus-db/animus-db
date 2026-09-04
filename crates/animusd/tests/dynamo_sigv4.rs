@@ -65,6 +65,7 @@ async fn start_single_node_with_auth(
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),
             }),
+            cluster_settings: None,
         };
         match animusd::run_node_with(&config, 0, dir, StorageBackend::default()).await {
             Ok(node) => return (node, config),

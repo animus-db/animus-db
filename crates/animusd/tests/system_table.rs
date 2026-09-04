@@ -60,6 +60,7 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
     let config = animusd::ClusterConfig {
         nodes: vec![node_cfg],
         dynamo_auth: None,
+        cluster_settings: None,
     };
     animusd::run_node(&config, 0, dir.join("node-0"))
         .await

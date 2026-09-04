@@ -7132,6 +7132,7 @@ mod stream_write_path_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 

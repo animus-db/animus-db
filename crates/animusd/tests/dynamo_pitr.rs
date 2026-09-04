@@ -61,6 +61,7 @@ async fn start_single_node_with_knobs(dir: &Path, knobs: StreamSealKnobs) -> (No
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         };
         match animusd::run_node_with_streams(
             &config,

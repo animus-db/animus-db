@@ -83,6 +83,7 @@ async fn bring_up_named(
         let config = ClusterConfig {
             nodes: (0..n).map(|i| named_role_addrs(name, i, &addrs)).collect(),
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;

@@ -2610,6 +2610,7 @@ mod gsi_drain_cursor_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -3405,6 +3406,7 @@ mod stream_sealer_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 

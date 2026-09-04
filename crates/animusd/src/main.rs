@@ -81,17 +81,36 @@
 //! the reconciler's proactive wake (a replica set member marked `Down`)
 //! touches it again. **Defaults ON at `main::DEFAULT_QUIESCE_AFTER_SECS`
 //! (5s)** — see that constant's own doc for the evidence behind this default
-//! and how to override it; `0` disables the feature entirely. Threads
-//! through `--config`/`--node` and `--cluster N` today; a documented gap for
-//! a follow-up on two other shapes: passed to `--cluster-control`/
-//! `--cluster-data` it parses but is silently unused (that path has no
-//! growth-combination wrapper to receive it yet); passed to the standalone
-//! `control`/`data`/`join` subcommands it is rejected outright as an unknown
-//! argument (each parses its own flag set independently of `run`'s).
+//! and how to override it; `0` disables the feature entirely. The CLI flag
+//! itself threads through `--config`/`--node` and `--cluster N` only; a
+//! documented gap for a follow-up remains on two other shapes: passed to
+//! `--cluster-control`/`--cluster-data` it parses but is silently unused
+//! (that path has no growth-combination wrapper to receive it yet); the
+//! standalone `control`/`join` subcommands reject it outright as an unknown
+//! argument (each parses its own flag set independently of `run`'s), and
+//! neither runs a data-plane role that would use it anyway. **`animusd data
+//! --config FILE`, however, now reaches this knob too (S-06)** — not via a
+//! CLI flag of its own, but through the same `cluster_settings.
+//! quiesce_after_secs` config-file section `--config`/`--node` reads (see
+//! that flag's `run_single`/`run_data_config` doc and `animusd::config::
+//! ClusterSettings`'s own doc for the full per-field applicability
+//! breakdown, since a control-only node ignores this field entirely).
 //! **A nonzero value below `animusd::MIN_QUIESCE_AFTER` (200ms, the
 //! change-consumer sweep interval — issue #302 fix) is rejected at parse
 //! time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
+//!
+//! **`cluster_settings` (S-06)**: a `ClusterConfig` file (`--config FILE`)
+//! may also carry a `cluster_settings` section — the same auto-split/
+//! quiesce/orphan-sweep/stream-seal knobs the CLI flags above express,
+//! reachable now on every real deployment shape (`--config`/`--node`,
+//! `animusd control`, `animusd data --config`), not just `--cluster N`'s
+//! dev-only in-process mode. A CLI flag **and** the config file's own
+//! section setting the identical field is a hard startup error (the same
+//! "specify it one way, not both" contract `--dynamo-auth` already uses),
+//! checked field by field — see `animusd::config::ClusterSettings`'s own
+//! doc for the full field list, units, and which fields apply to which
+//! role.
 //!
 //! `ClientCtx::trigger_split` always proposes the ADR 0058 single-entry
 //! atomic in-place fork now — the original ADR 0050 copy-based
@@ -277,7 +296,10 @@ async fn run(args: &[String]) -> Result<(), String> {
     // threshold. **The former `--auto-split K` key-count trigger was
     // removed** (bytes and, for streamed tables, `--auto-split-change-rate`
     // below cover its use cases — see the root `CLAUDE.md`'s auto-split
-    // entry).
+    // entry). This CLI flag is `--cluster N`'s only route to the knob;
+    // `--config`/`--node` (real deployments) reaches it via a config file's
+    // `cluster_settings.auto_split_bytes` section instead (S-06) — see this
+    // file's own module doc.
     let mut auto_split_bytes: Option<u64> = None;
     // `--auto-split-change-rate RATE` (ADR 0042 §14, growth PR3 Fork F):
     // opt-in — a **streamed** led tablet whose own smoothed change-append
@@ -393,25 +415,36 @@ async fn run(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
-    let stream_seal_knobs = stream_seal_knobs(stream_seal_bytes, stream_seal_age_secs);
-    let stream_retention =
-        stream_retention_secs.map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
+    // S-06: the raw (un-defaulted) CLI values for every knob
+    // `animusd::config::ClusterSettings` can also carry in a config file's
+    // own `cluster_settings` section — `--config`/`--node`'s dispatch below
+    // merges this against the loaded config's section (`resolve_cluster_
+    // settings`, a hard error if both sides set the identical field); the
+    // CLI-only dispatch branches (`--cluster N`/`--cluster-control`/
+    // `--cluster-data`, no config file to merge against) apply it directly,
+    // unchanged from before this section existed.
+    let cli_cluster_settings = animusd::config::ClusterSettings {
+        auto_split_bytes,
+        auto_split_change_rate,
+        orphan_sweep_after_secs: orphan_sweep_after,
+        quiesce_after_secs: quiesce_after,
+        stream_seal_bytes,
+        stream_seal_age_secs,
+        stream_retention_secs,
+    };
+    let orphan_sweep_after =
+        orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
+    let stream_seal_knobs = stream_seal_knobs(
+        cli_cluster_settings.stream_seal_bytes,
+        cli_cluster_settings.stream_seal_age_secs,
+    );
+    let stream_retention = cli_cluster_settings
+        .stream_retention_secs
+        .map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
     let segment_store_config = parse_segment_store(segment_store.as_deref())?;
     let backup_store_config = parse_backup_store(backup_store.as_deref())?;
-    let quiesce_after = quiesce_after_duration(quiesce_after);
-    // See `animusd::MIN_QUIESCE_AFTER`'s own doc (issue #302 fix): a nonzero
-    // `--quiesce-after` shorter than `change_consumer_loop`'s own sweep
-    // interval can reopen the stale-veto quiescence race the fix closes.
-    // `0` (disable quiescence entirely) is exempt.
-    if !quiesce_after.is_zero() && quiesce_after < animusd::MIN_QUIESCE_AFTER {
-        return Err(format!(
-            "--quiesce-after must be at least {} ms (animusd's change-consumer \
-             sweep interval) or 0 to disable quiescence entirely; got {} ms",
-            animusd::MIN_QUIESCE_AFTER.as_millis(),
-            quiesce_after.as_millis()
-        ));
-    }
+    let quiesce_after = quiesce_after_duration(cli_cluster_settings.quiesce_after_secs);
+    validate_quiesce_after(quiesce_after)?;
     let dynamo_auth_flag = dynamo_auth_path
         .as_deref()
         .map(load_dynamo_auth_file)
@@ -453,11 +486,8 @@ async fn run(args: &[String]) -> Result<(), String> {
                 index,
                 dir,
                 backend,
-                orphan_sweep_after,
-                stream_seal_knobs,
+                cli_cluster_settings,
                 segment_store_config,
-                stream_retention,
-                quiesce_after,
                 dynamo_auth_flag,
                 backup_store_config,
                 advertise_host,
@@ -671,6 +701,75 @@ fn apply_advertise_host_flag(
     }
 }
 
+/// Merge a config file's `cluster_settings` section (S-06) with whatever
+/// subset of the same knobs a CLI flag also supplied on this invocation —
+/// the field-by-field version of [`apply_dynamo_auth_flag`]'s "specify it
+/// one way, not both" contract: a CLI flag **and** the config's own section
+/// setting the identical field is a hard startup error, but an operator may
+/// still set *different* fields on each side (e.g. `--orphan-sweep-after`
+/// on the CLI with `auto_split_bytes` only in the config file) — see
+/// [`animusd::config::ClusterSettings`]'s own doc for the full field list
+/// and per-role applicability.
+///
+/// `cli` carries only the fields this invocation's own CLI flags actually
+/// set (every field this subcommand has no flag for stays `None`, so it can
+/// never conflict) — every field not present in either source resolves to
+/// `None`, exactly as omitting both the flag and the config section already
+/// does.
+///
+/// # Errors
+/// A message naming the conflicting field if both sources set it.
+fn resolve_cluster_settings(
+    config_settings: Option<&animusd::config::ClusterSettings>,
+    cli: &animusd::config::ClusterSettings,
+) -> Result<animusd::config::ClusterSettings, String> {
+    let config_settings = config_settings.cloned().unwrap_or_default();
+    let mut effective = config_settings.clone();
+    macro_rules! merge_field {
+        ($field:ident, $flag_name:literal) => {
+            if let Some(v) = cli.$field {
+                if config_settings.$field.is_some() {
+                    return Err(format!(
+                        "cluster_settings.{} is set both in the config file and via {} — \
+                         specify it one way, not both",
+                        stringify!($field),
+                        $flag_name
+                    ));
+                }
+                effective.$field = Some(v);
+            }
+        };
+    }
+    merge_field!(auto_split_bytes, "--auto-split-bytes");
+    merge_field!(auto_split_change_rate, "--auto-split-change-rate");
+    merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
+    merge_field!(quiesce_after_secs, "--quiesce-after");
+    merge_field!(stream_seal_bytes, "--stream-seal-bytes");
+    merge_field!(stream_seal_age_secs, "--stream-seal-age");
+    merge_field!(stream_retention_secs, "--stream-retention");
+    Ok(effective)
+}
+
+/// `--quiesce-after`'s floor check (issue #302), factored out so both
+/// [`run`]'s CLI-only dispatch branches and [`run_single`]'s
+/// config-file-merged value (S-06 — a config-supplied `quiesce_after_secs`
+/// never passed through the CLI-only check below it) get the identical
+/// validation.
+///
+/// # Errors
+/// As documented on the message itself.
+fn validate_quiesce_after(quiesce_after: Duration) -> Result<(), String> {
+    if !quiesce_after.is_zero() && quiesce_after < animusd::MIN_QUIESCE_AFTER {
+        return Err(format!(
+            "--quiesce-after must be at least {} ms (animusd's change-consumer \
+             sweep interval) or 0 to disable quiescence entirely; got {} ms",
+            animusd::MIN_QUIESCE_AFTER.as_millis(),
+            quiesce_after.as_millis()
+        ));
+    }
+    Ok(())
+}
+
 /// Per-process: run node `index` from the config file.
 ///
 /// `dynamo_auth_flag` (ADR 0057) is `--dynamo-auth PATH`, already loaded —
@@ -680,17 +779,25 @@ fn apply_advertise_host_flag(
 ///
 /// `backup_store_config` (ADR 0059 §1) is `--backup-store cluster|fs:PATH`,
 /// already parsed. Plumbing only (ADR 0059 Train 1 PR②).
+///
+/// `cli_settings` (S-06) is the raw `--auto-split-bytes`/`--auto-split-
+/// change-rate`/`--orphan-sweep-after`/`--quiesce-after`/`--stream-seal-
+/// bytes`/`--stream-seal-age`/`--stream-retention` values this invocation's
+/// CLI flags actually set — merged here against the loaded config's own
+/// `cluster_settings` section (a hard error, field by field, if both sides
+/// set the same one — [`resolve_cluster_settings`]) before being converted
+/// to the durations/knobs [`animusd::run_node_with_cluster_settings`]
+/// takes. This is `--config`/`--node`'s only route to auto-split at all
+/// (previously reachable solely via `--cluster N`'s dev-only in-process
+/// mode).
 #[allow(clippy::too_many_arguments)]
 async fn run_single(
     path: &str,
     index: usize,
     dir: Option<std::path::PathBuf>,
     backend: animusd::StorageBackend,
-    orphan_sweep_after: Duration,
-    stream_seal_knobs: animusd::StreamSealKnobs,
+    cli_settings: animusd::config::ClusterSettings,
     segment_store_config: animusd::SegmentStoreConfig,
-    stream_retention: Duration,
-    quiesce_after: Duration,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
@@ -701,16 +808,28 @@ async fn run_single(
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
-    let node = animusd::run_node_with_streams_quiesce_and_backup_store(
+    let settings = resolve_cluster_settings(config.cluster_settings.as_ref(), &cli_settings)?;
+    let orphan_sweep_after = orphan_sweep_after_duration(settings.orphan_sweep_after_secs);
+    let stream_seal_knobs_val =
+        stream_seal_knobs(settings.stream_seal_bytes, settings.stream_seal_age_secs);
+    let stream_retention = settings
+        .stream_retention_secs
+        .map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
+    let quiesce_after = quiesce_after_duration(settings.quiesce_after_secs);
+    validate_quiesce_after(quiesce_after)?;
+
+    let node = animusd::run_node_with_cluster_settings(
         &config,
         index,
         &dir,
         backend,
         orphan_sweep_after,
-        stream_seal_knobs,
+        stream_seal_knobs_val,
         segment_store_config,
         stream_retention,
         quiesce_after,
+        settings.auto_split_bytes,
+        settings.auto_split_change_rate,
         backup_store_config,
     )
     .await
@@ -723,6 +842,14 @@ async fn run_single(
         node.admin_addr(),
         node.console_addr(),
     );
+    if let Some(b) = settings.auto_split_bytes {
+        println!("animusd: node {index} auto-split at {b} bytes/tablet");
+    }
+    if let Some(rate) = settings.auto_split_change_rate {
+        println!(
+            "animusd: node {index} streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
+        );
+    }
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
     node.shutdown_graceful().await;
@@ -769,13 +896,24 @@ async fn run_control(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
-    let orphan_sweep_after = orphan_sweep_after_duration(orphan_sweep_after);
     let segment_store_config = parse_segment_store(segment_store.as_deref())?;
     let backup_store_config = parse_backup_store(backup_store.as_deref())?;
     let path = config_path.ok_or("control requires --config FILE")?;
     let index = node.ok_or("control requires --node I")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    // S-06: `cluster_settings.orphan_sweep_after_secs` reaches a control-only
+    // node too — the only field of that section a control-only node can act
+    // on (no data role, so every other field is silently ignored — see
+    // `animusd::config::ClusterSettings`'s own doc). A conflict with
+    // `--orphan-sweep-after` is a hard startup error, same shape as every
+    // other cluster-settings field.
+    let cli_settings = animusd::config::ClusterSettings {
+        orphan_sweep_after_secs: orphan_sweep_after,
+        ..Default::default()
+    };
+    let settings = resolve_cluster_settings(config.cluster_settings.as_ref(), &cli_settings)?;
+    let orphan_sweep_after = orphan_sweep_after_duration(settings.orphan_sweep_after_secs);
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
 
     let node = animusd::run_node_control_with_stores(
@@ -897,6 +1035,15 @@ async fn run_data(args: &[String]) -> Result<(), String> {
 /// `dynamo_auth_flag` — see [`run_single`]'s identical doc: specifying
 /// credentials both in the config file's own `dynamo_auth` section and via
 /// the flag is a hard startup error.
+///
+/// **S-06**: `data --config` has no CLI flags of its own for any
+/// `cluster_settings` field yet, so there is nothing to conflict-check here
+/// — the config file's section (auto-split, quiesce, stream-seal; a
+/// data-only node has no local control `RaftNode` and is never a
+/// control-plane leader, so `orphan_sweep_after_secs`/`stream_retention_
+/// secs` are ignored — see [`animusd::config::ClusterSettings`]'s own doc)
+/// is applied straight through [`animusd::run_node_data_with_cluster_
+/// settings`].
 async fn run_data_config(
     path: &str,
     index: usize,
@@ -911,9 +1058,27 @@ async fn run_data_config(
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
 
-    let node = animusd::run_node_data(&config, index, &dir, backend)
-        .await
-        .map_err(|e| format!("failed to start data node {index}: {e}"))?;
+    let settings = config.cluster_settings.clone().unwrap_or_default();
+    let quiesce_after = quiesce_after_duration(settings.quiesce_after_secs);
+    validate_quiesce_after(quiesce_after)?;
+    let stream_seal_knobs_val =
+        stream_seal_knobs(settings.stream_seal_bytes, settings.stream_seal_age_secs);
+
+    let node = animusd::run_node_data_with_cluster_settings(
+        &config,
+        index,
+        &dir,
+        backend,
+        settings.auto_split_bytes,
+        settings.auto_split_change_rate,
+        quiesce_after,
+        stream_seal_knobs_val,
+        // Same documented gap as `--backup-store` (ADR 0059 §1): no
+        // `--segment-store` flag reaches `animusd data --config` yet.
+        animusd::SegmentStoreConfig::default(),
+    )
+    .await
+    .map_err(|e| format!("failed to start data node {index}: {e}"))?;
     println!(
         "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
         config.len(),
@@ -922,6 +1087,9 @@ async fn run_data_config(
         node.admin_addr(),
         node.console_addr(),
     );
+    if let Some(b) = settings.auto_split_bytes {
+        println!("animusd: data node {index} auto-split at {b} bytes/tablet");
+    }
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
     node.shutdown_graceful().await;
@@ -1398,5 +1566,89 @@ mod tests {
         let err = parse_segment_store(Some("cluster"))
             .expect_err("`--segment-store` has no `cluster` keyword");
         assert!(err.contains("--segment-store"), "{err}");
+    }
+
+    // --- `resolve_cluster_settings` (S-06) --------------------------------
+
+    #[test]
+    fn cluster_settings_absent_on_both_sides_resolves_to_default() {
+        let cli = animusd::config::ClusterSettings::default();
+        let effective = resolve_cluster_settings(None, &cli).expect("no conflict possible");
+        assert_eq!(effective, animusd::config::ClusterSettings::default());
+    }
+
+    #[test]
+    fn cluster_settings_cli_only_field_is_adopted() {
+        let cli = animusd::config::ClusterSettings {
+            auto_split_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        let effective = resolve_cluster_settings(None, &cli).expect("no conflict");
+        assert_eq!(effective.auto_split_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn cluster_settings_config_only_field_is_kept() {
+        let config = animusd::config::ClusterSettings {
+            quiesce_after_secs: Some(30),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings::default();
+        let effective = resolve_cluster_settings(Some(&config), &cli).expect("no conflict");
+        assert_eq!(effective.quiesce_after_secs, Some(30));
+    }
+
+    #[test]
+    fn cluster_settings_disjoint_fields_on_each_side_both_apply() {
+        // An operator may set different knobs on the CLI vs. the config
+        // file — only the *same* field on both sides is a conflict.
+        let config = animusd::config::ClusterSettings {
+            auto_split_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            orphan_sweep_after_secs: Some(60),
+            ..Default::default()
+        };
+        let effective =
+            resolve_cluster_settings(Some(&config), &cli).expect("disjoint, no conflict");
+        assert_eq!(effective.auto_split_bytes, Some(1_000_000));
+        assert_eq!(effective.orphan_sweep_after_secs, Some(60));
+    }
+
+    #[test]
+    fn cluster_settings_same_field_on_both_sides_is_a_hard_error() {
+        let config = animusd::config::ClusterSettings {
+            quiesce_after_secs: Some(30),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            quiesce_after_secs: Some(5),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("quiesce_after_secs"), "{err}");
+        assert!(err.contains("--quiesce-after"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_conflict_check_is_per_field_not_whole_section() {
+        // A conflict on one field must not be masked or triggered by an
+        // unrelated field also being set on one side only.
+        let config = animusd::config::ClusterSettings {
+            auto_split_bytes: Some(1_000_000),
+            quiesce_after_secs: Some(30),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            quiesce_after_secs: Some(5),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("quiesce_after_secs conflicts even though auto_split_bytes doesn't");
+        assert!(err.contains("quiesce_after_secs"), "{err}");
+        assert!(!err.contains("auto_split_bytes"), "{err}");
     }
 }

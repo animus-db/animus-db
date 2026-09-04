@@ -57,6 +57,7 @@ async fn start_single_node_fast_pitr(dir: &Path) -> (Node, ClusterConfig) {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         };
         match animusd::run_node_with_streams_and_pitr_snapshot_cadence(
             &config,

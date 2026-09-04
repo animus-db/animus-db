@@ -81,6 +81,7 @@ async fn bring_up_inplace(
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;

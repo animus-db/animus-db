@@ -102,6 +102,7 @@ async fn start(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
     let config = animusd::ClusterConfig {
         nodes: vec![addrs],
         dynamo_auth: None,
+        cluster_settings: None,
     };
     // Bounded rebind retry against the documented port-TOCTOU: another test
     // binary's `free_addrs` probe can hold a just-freed port for microseconds,
