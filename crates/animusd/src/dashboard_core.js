@@ -1,10 +1,10 @@
 "use strict";
 // Shared state, fetch helpers, formatting utilities, theme, and tab routing
 // for animusd admin (ADR 0021's "AnimusDB Console"). `dashboard_overview.js`, `dashboard_placement.js`,
-// `dashboard_tablets.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
+// `dashboard_tablets.js`, `dashboard_txns.js`, `dashboard_streams.js`, `dashboard_browser.js`, and
 // `dashboard_storage.js` load after this file and call into it (STATE, $, esc, getJSON, postJSON,
 // pill, consoleLink, bytes, humanBytes, tokenBound, b64url, nodeIdOf, cpGroupsByTablet,
-// autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
+// txnViewsByTablet, autoSplitThresholds, tabletStatus, worstTabletStatus, statusDotClass, computeHealth,
 // activateTab, gotoStorage, splitHiddenTable);
 // nothing here calls into them except `render()`, the single per-refresh
 // entry point every view's render function hangs off of.
@@ -251,6 +251,29 @@ function cpGroupsByTablet() {
   return map;
 }
 
+// Collect every hosted CP group's transaction-tracker view (ADR 0018 §2/PR7,
+// docs/roadmap.md U-01) across reachable nodes, indexed by tablet id — the
+// identical fan-out/dedupe shape `cpGroupsByTablet` uses just above (`/admin/
+// txns` iterates the same `ctx.edge.hosted_groups()` `/admin/raftkv` does, so
+// under `--cluster N` dev mode every node's response lists every replica
+// cluster-wide too, and a group must be counted once regardless of how many
+// admin ports reported it).
+function txnViewsByTablet() {
+  const map = {};
+  const seen = new Set();
+  for (const n of STATE.nodes) {
+    if (!n.ok || !n.txns || !n.txns.groups) continue;
+    for (const tv of n.txns.groups) {
+      const key = tv.tablet + ":" + tv.node;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const node = nodeById(tv.node) || { config: { node_id: tv.node }, ok: false };
+      (map[tv.tablet] = map[tv.tablet] || []).push({ node, tv });
+    }
+  }
+  return map;
+}
+
 // The `--auto-split-bytes B` (bytes, ADR 0034) threshold, from any
 // reachable node's `/admin/config` — a single flag set, so every node
 // agrees. `null` if the trigger isn't enabled for this run. (The former
@@ -469,14 +492,19 @@ async function loadAll() {
       // here — `.catch(() => null)` like `raft`/`raftkv`/`health`, so one
       // unreachable/older node degrades to "no metrics for this node" rather
       // than failing the whole fan-out.
-      const [config, raft, raftkv, health, metrics] = await Promise.all([
+      // `txns` (ADR 0018 §2/PR7, docs/roadmap.md U-01) fans out alongside
+      // `raftkv` the same way `metrics` does — `.catch(() => null)` so one
+      // unreachable/older node degrades to "no txn view for this node"
+      // rather than failing the whole fan-out.
+      const [config, raft, raftkv, txns, health, metrics] = await Promise.all([
         getJSON(base, "/admin/config"),
         getJSON(base, "/admin/raft").catch(() => null),
         getJSON(base, "/admin/raftkv").catch(() => null),
+        getJSON(base, "/admin/txns").catch(() => null),
         getJSON(base, "/admin/health").catch(() => null),
         getJSON(base, "/admin/metrics").catch(() => null),
       ]);
-      Object.assign(node, { config, raft, raftkv, health, metrics, ok: true });
+      Object.assign(node, { config, raft, raftkv, txns, health, metrics, ok: true });
     } catch (e) {
       node.error = String(e);
     }
@@ -495,6 +523,7 @@ function render() {
   renderOverview();
   renderPlacement();
   renderTablets();
+  renderTxns();
   renderStreams();
   renderStorageSelectors();
   renderBrowserTables();
@@ -535,9 +564,16 @@ function render() {
 // live-tail poller (`GetShardIterator`/`GetRecords`'s open-shard path, and
 // `GetRecords`' sealed path) needs a genuine local CP data plane to serve —
 // `dashboard_streams.js`'s own doc covers exactly what degrades and why.
+// "txns" (ADR 0018 §2/PR7, docs/roadmap.md U-01) is gated exactly like
+// "tablets": both are cluster-wide views built from a per-node fan-out
+// (`/admin/txns`, mirroring `/admin/raftkv`) cross-referenced against the
+// full tablet map in replicated `Metadata` — a data-only node has no local
+// control-plane Raft state to derive that map from, so it gets neither tab,
+// the same reasoning `tablets`' own placement in this table already
+// documents.
 const ROLE_TABS = {
-  control: ["overview", "placement", "tablets", "browser", "streams", "storage"],
-  combined: ["overview", "placement", "tablets", "browser", "streams", "storage", "node"],
+  control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"],
+  combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"],
   data: ["node", "browser", "streams"],
 };
 // The currently-visible tab set — starts as the superset (`combined`) until

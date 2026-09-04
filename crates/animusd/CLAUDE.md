@@ -860,7 +860,10 @@ reusing the captured config is the point of the test.
   `console.rs`** (below) despite the naming overlap — this is the
   **operator** surface (cluster health/placement/Raft/storage) on the
   admin port; see `console.rs`'s own entry and ADR 0052's "Naming,
-  deliberately addressed" for the full disambiguation.
+  deliberately addressed" for the full disambiguation. **docs/roadmap.md
+  U-01 (render-only, no backend change)** added a Transactions tab
+  (`dashboard_txns.js`, read-only `/admin/txns`, gated like Tablets in
+  `ROLE_TABS`).
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

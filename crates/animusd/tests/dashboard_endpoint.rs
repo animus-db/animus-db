@@ -393,11 +393,12 @@ async fn dashboard_role_gating_split_deployment() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
             ),
             "the control role's own tab list now includes Streams too (a control-only \
              node holds the full replicated Metadata, so the stream list + shard-chain \
-             detail render truthfully there; only the live-tail poller degrades): {core_js}"
+             detail render truthfully there; only the live-tail poller degrades), and \
+             now Transactions too (docs/roadmap.md U-01, gated like tablets): {core_js}"
         );
 
         // ---- /admin/config's role differs across the split -----------------
@@ -697,6 +698,64 @@ async fn control_node_streams_read_path_is_ground_truth() {
         for node in control_nodes.iter().chain(data_nodes.iter()) {
             node.shutdown_graceful().await;
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-01 (render-only dashboard fixes, no backend change) —
+/// one assertion group per bullet, all against the served static assets
+/// (this is a render-only change: the JSON they consume is already covered
+/// by `admin_endpoint.rs`). A single-node cluster is enough for every one of
+/// these; nothing here needs a multi-node fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u01_render_only_fixes() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- 1. Transactions tab over /admin/txns (CpTxnView) --------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"data-tab="txns""#) && shell.contains(r#"<section id="txns""#),
+            "the shell carries the Transactions nav link and section: {shell}"
+        );
+        assert!(
+            shell.contains("dashboard_txns.js"),
+            "the shell references the Transactions view's script asset: {shell}"
+        );
+        let (s, _, txns_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_txns.js").await;
+        assert_eq!(s, 200, "dashboard_txns.js is served");
+        assert!(
+            txns_js.contains("function renderTxns") && txns_js.contains("txnViewsByTablet"),
+            "dashboard_txns.js renders the per-hosted-tablet transaction-tracker view: {txns_js}"
+        );
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/txns") && core_js.contains("function txnViewsByTablet"),
+            "dashboard_core.js fans out /admin/txns and merges it cluster-wide: {core_js}"
+        );
+        assert!(
+            core_js.contains(
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+            ) && core_js.contains(
+                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"]"#
+            ),
+            "the Transactions tab is role-gated exactly like Tablets (ROLE_TABS): {core_js}"
+        );
+        let (s, _, txns_body) = raw(admin_addr, "GET", "/admin/txns").await;
+        assert_eq!(s, 200, "GET /admin/txns: {txns_body}");
+        let txns_json: Value = serde_json::from_str(&txns_body).expect("/admin/txns is JSON");
+        assert!(
+            txns_json.get("groups").is_some(),
+            "the CpTxnView list is under \"groups\", the same shape dashboard_txns.js reads: {txns_body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
     })
     .await
     .expect("test timed out");
