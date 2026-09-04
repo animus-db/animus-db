@@ -1413,6 +1413,31 @@ pub enum MetaCommand {
         table: TableName,
         spec: Option<TtlSpec>,
     },
+    /// Add or overwrite tags on a table (ADR-less, roadmap W-06): the
+    /// `TagResource` wire operation's own catalog mutation. Rejected if the
+    /// table has no schema. Modelled on [`MetaCommand::SetTableTtl`]'s own
+    /// simplicity rather than [`MetaCommand::SetTableStream`]'s label
+    /// discipline — a tag set has no identity to go stale, so there is
+    /// nothing to reject: an existing key's value is overwritten (last
+    /// writer wins, matching DynamoDB's own `TagResource` semantics), a new
+    /// key is inserted, and the whole command is a **no-op** only when every
+    /// given `(key, value)` pair already matches what is recorded (so a
+    /// caller's retry of an already-applied `TagResource` is idempotent, the
+    /// same shape `SetTableTtl`'s identical-spec case gets).
+    TagResource {
+        table: TableName,
+        tags: BTreeMap<String, String>,
+    },
+    /// Remove tags from a table by key (the `UntagResource` wire
+    /// operation's own catalog mutation). Rejected if the table has no
+    /// schema. A no-op if none of the named keys are currently present
+    /// (mirroring `TagResource`'s own idempotent-retry shape); a key not
+    /// present is silently ignored rather than treated as an error, matching
+    /// DynamoDB's own `UntagResource` behavior.
+    UntagResource {
+        table: TableName,
+        tag_keys: Vec<String>,
+    },
     /// Enable or disable a table's **point-in-time recovery (PITR)**
     /// configuration (ADR 0059 §9) — the `UpdateContinuousBackups` wire
     /// operation's own catalog toggle. Rejected if the table has no schema.
@@ -3092,6 +3117,39 @@ impl Metadata {
                 }
                 schema.ttl = spec.clone();
                 ApplyOutcome::Applied
+            }
+            MetaCommand::TagResource { table, tags } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let mut changed = false;
+                for (key, value) in tags {
+                    if schema.tags.get(key) != Some(value) {
+                        schema.tags.insert(key.clone(), value.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
+            MetaCommand::UntagResource { table, tag_keys } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let mut changed = false;
+                for key in tag_keys {
+                    if schema.tags.remove(key).is_some() {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
             }
             MetaCommand::UpdateContinuousBackups {
                 table,
@@ -8342,6 +8400,180 @@ mod tests {
             m.apply(&MetaCommand::SetTableTtl {
                 table: "no-such-table".to_owned(),
                 spec: Some(ttl_spec("expiresAt")),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+    }
+
+    // --- W-06: resource tagging -----------------------------------------
+
+    /// `TagResource` on a table with a schema records the tags, `Applied`.
+    #[test]
+    fn tag_resource_adds_tags() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([
+                    ("env".to_owned(), "prod".to_owned()),
+                    ("team".to_owned(), "payments".to_owned()),
+                ]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().tags,
+            BTreeMap::from([
+                ("env".to_owned(), "prod".to_owned()),
+                ("team".to_owned(), "payments".to_owned()),
+            ])
+        );
+    }
+
+    /// An existing key is overwritten (last writer wins), matching
+    /// DynamoDB's own `TagResource` semantics.
+    #[test]
+    fn tag_resource_overwrites_an_existing_key() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([("env".to_owned(), "prod".to_owned())]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([("env".to_owned(), "staging".to_owned())]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().tags,
+            BTreeMap::from([("env".to_owned(), "staging".to_owned())])
+        );
+    }
+
+    /// Re-`TagResource`-ing with exactly the already-recorded `(key, value)`
+    /// pairs is a no-op — the same idempotent-retry shape `SetTableTtl`'s
+    /// identical-spec case gets.
+    #[test]
+    fn tag_resource_identical_repeat_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([("env".to_owned(), "prod".to_owned())]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([("env".to_owned(), "prod".to_owned())]),
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// `TagResource` against a table with no schema is `Rejected`.
+    #[test]
+    fn tag_resource_rejects_unknown_table() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "no-such-table".to_owned(),
+                tags: BTreeMap::from([("env".to_owned(), "prod".to_owned())]),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+    }
+
+    /// `UntagResource` removes the named keys, leaving the rest.
+    #[test]
+    fn untag_resource_removes_named_keys() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::TagResource {
+                table: "orders".to_owned(),
+                tags: BTreeMap::from([
+                    ("env".to_owned(), "prod".to_owned()),
+                    ("team".to_owned(), "payments".to_owned()),
+                ]),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UntagResource {
+                table: "orders".to_owned(),
+                tag_keys: vec!["env".to_owned()],
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().tags,
+            BTreeMap::from([("team".to_owned(), "payments".to_owned())])
+        );
+    }
+
+    /// `UntagResource` naming a key that isn't present is a no-op — a
+    /// missing key is silently ignored, not an error, matching DynamoDB.
+    #[test]
+    fn untag_resource_missing_key_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::UntagResource {
+                table: "orders".to_owned(),
+                tag_keys: vec!["env".to_owned()],
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// `UntagResource` against a table with no schema is `Rejected`.
+    #[test]
+    fn untag_resource_rejects_unknown_table() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::UntagResource {
+                table: "no-such-table".to_owned(),
+                tag_keys: vec!["env".to_owned()],
             }),
             ApplyOutcome::Rejected("no such table schema")
         );

@@ -335,6 +335,21 @@ pub struct TableSchema {
     /// through `MetaCommand::UpdateContinuousBackups` (so it replicates).
     #[serde(default)]
     pub pitr: Option<PitrSpec>,
+    /// This table's **resource tags** (`TagResource`/`UntagResource`/
+    /// `ListTagsOfResource`, DynamoDB's own generic key-value tagging), if
+    /// any. Empty (never `None`) for a table with no tags — unlike
+    /// `stream`/`ttl`/`pitr`, a tag set has no notion of "disabled" to
+    /// distinguish from "empty," so a plain `BTreeMap` is the natural
+    /// representation. `#[serde(default)]` for the same additive-field
+    /// reason as `indexes`/`stream`/`ttl`/`pitr`. **Wire metadata only**:
+    /// nothing in this crate or `animus-dynamo` interprets a tag's key or
+    /// value — they are recorded verbatim and echoed back by
+    /// `ListTagsOfResource`, never consumed by placement, billing, or any
+    /// other mechanism. Mutated only through `MetaCommand::{TagResource,
+    /// UntagResource}` (so they replicate); a tag key is unique within a
+    /// table (`TagResource` overwrites an existing key's value).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -372,6 +387,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -397,6 +413,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
@@ -418,6 +435,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            tags: BTreeMap::new(),
         }
     }
 
