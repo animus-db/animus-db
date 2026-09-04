@@ -46,35 +46,19 @@ pub struct KeySummary {
 }
 
 /// One *index* key attribute's shape. Unlike [`KeySummary`] the type is
-/// `Option`: an index's key attribute has no declared type of its own
-/// anywhere in the catalog — `animus_control::IndexDef` has no type field
-/// at all, only the attribute *name*. A type is therefore knowable only
-/// when that same attribute also happens to be a declared column of the
-/// base table, and **the base table's own two key columns are the only
-/// columns there are**: `animus_dynamo::schema::to_control` builds a
-/// `ColumnDef` for `partition_key`/`sort_key` and nothing else, while
-/// `index_to_control` never receives `key_types` in the first place.
-///
-/// This holds on **both** declaration paths, which an earlier revision of
-/// this doc got wrong: it claimed a `CreateTable`-declared index kept its
-/// type because its attributes arrive in `AttributeDefinitions`. They do
-/// arrive — and then only the base table's own keys are looked up in them.
-/// So a `CreateTable` GSI's own hash key and an LSI's own sort attribute
-/// are just as untyped as a GSI added later through `UpdateTable`, whose
-/// `GlobalSecondaryIndexUpdates` decoder ignores `AttributeDefinitions`
-/// outright. Issue #319 covers both paths.
-///
-/// **Only the wire-level `DescribeTable` echo half of #319 has since been
-/// fixed** (`animus_dynamo::wire::attribute_definitions` now lists every
-/// index key attribute, not just the base table's own — real DynamoDB's
-/// own `AttributeDefinitions` contract) — but it does so by rendering the
-/// same `key_types`-absent `"S"` placeholder every other untyped attribute
-/// already got, **not** by recording a genuine type anywhere; nothing
-/// upstream of that response builder changed. `IndexDef` still has no type
-/// field, so this struct's `Option` is unaffected and still correctly
-/// `None` for every index-only key attribute — restoring a real picker
-/// here still needs the type actually made durable first, exactly as this
-/// doc already said.
+/// `Option`: an index's key attribute may or may not have a declared type on
+/// file, depending on how it was declared (issue #319, closed).
+/// `animus_control::IndexDef` now carries its own `hash_attribute_type`/
+/// `sort_attribute_type` — resolved from the declaring `CreateTable`/
+/// `UpdateTable` call's own `AttributeDefinitions` when that call gave one
+/// (`animus_dynamo::schema::index_to_control`) — so a `Some` here is a real,
+/// durably recorded type, not the base table's own columns leaking through
+/// coincidentally (an LSI's hash, which *is* the base partition key, is the
+/// one case where both sources happen to agree). `None` means exactly what
+/// it always did: nobody ever told the catalog this attribute's type, most
+/// commonly because the declaring call's `AttributeDefinitions` never
+/// mentioned it (this adapter, unlike real DynamoDB, does not require every
+/// key attribute to appear there).
 ///
 /// `None` renders as a bare attribute name rather than a fabricated `(S)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -194,19 +178,24 @@ pub struct TableDetail {
 /// `sort_attribute` are free text (an attribute name is per-item, never a
 /// closed set — see the module doc on why the UI must not offer a picker).
 ///
-/// **No attribute type.** DynamoDB's own `UpdateTable` carries one in
-/// `AttributeDefinitions`, but this adapter's decoder for
-/// `GlobalSecondaryIndexUpdates` never reads it (issue #319), so a type sent
-/// here would be silently discarded and the index would still read back
-/// untyped. Rather than offer a control whose value cannot survive the round
-/// trip, the console asks for the name alone; restore the type here (and the
-/// picker in `console.js`) once #319 makes it durable.
+/// **`hash_attribute_type`/`sort_attribute_type` are optional** (issue #319,
+/// closed): DynamoDB's own `AttributeType` (`S`/`N`/`B`) — a genuinely
+/// closed set, so `console.js` offers a real picker for these two, unlike a
+/// free-text attribute name. `#[serde(default)]` so an omitted type (or an
+/// older `console.js`) still decodes — `animusd`'s backend then sends no
+/// `AttributeDefinitions` entry for that attribute, and the index reads back
+/// untyped exactly as it always has. `sort_attribute_type` is meaningless
+/// without a `sort_attribute` and is simply ignored when one isn't given.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AddGsiRequest {
     pub index_name: String,
     pub hash_attribute: String,
     #[serde(default)]
+    pub hash_attribute_type: Option<String>,
+    #[serde(default)]
     pub sort_attribute: Option<String>,
+    #[serde(default)]
+    pub sort_attribute_type: Option<String>,
 }
 
 /// A request to enable/disable a table's stream (`POST .../stream`).
@@ -246,9 +235,8 @@ pub struct CreateKeyAttribute {
 /// /console/api/tables`) — **the only place in this whole console an LSI can
 /// ever be declared**: DynamoDB LSIs are create-time-only, so there is no
 /// `add_lsi`/`drop_lsi` endpoint anywhere else (see [`LsiDetail`]'s own doc).
-/// No attribute type on `sort_attribute` — see [`CreateTableRequest`]'s own
-/// doc for why an index's key attribute type is never recorded, not even at
-/// `CreateTable` time.
+/// No attribute type on `sort_attribute` — a deliberate console-form scope
+/// cut, not a mechanism limitation; see [`CreateTableRequest`]'s own doc.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateLsiRequest {
     pub index_name: String,
@@ -286,28 +274,18 @@ fn default_projection_type() -> String {
 /// create-table form's request body, and the one endpoint on this listener
 /// that can declare an LSI (see [`CreateLsiRequest`]'s own doc for why).
 ///
-/// **What this form does *not* offer, and why**: an index (GSI or LSI) key
-/// attribute's own type. It would be natural to assume `CreateTable`
-/// behaves like the base table's own key (which genuinely does get a typed
-/// `AttributeDefinitions` entry, [`CreateKeyAttribute`]) — but tracing
-/// `animus_dynamo::wire::decode_key_schema`/`decode_attribute_types` and the
-/// `animus_dynamo::schema` bridge (`to_control`/`index_to_control`) shows
-/// otherwise: `to_control` builds a `ColumnDef` **only** for the base
-/// table's own `partition_key`/`sort_key`, and `index_to_control` (the one
-/// function that turns a decoded `SecondaryIndex` into the replicated
-/// `IndexDef`, called identically for every index `CreateTable` declares)
-/// never receives `key_types` at all — `IndexDef` itself has no type field
-/// to put one in regardless. So an index's key attribute has no recorded
-/// type **even when the index is declared at `CreateTable` time** — the
-/// same gap issue #319 already documented for `UpdateTable`'s
-/// `GlobalSecondaryIndexUpdates` path, just not previously traced for this
-/// one. `console_index_key_summary`'s `Option` therefore resolves to `Some`
-/// for an index key attribute only in the one structural coincidence where
-/// that attribute name is *also* the base table's own declared partition or
-/// sort key (true of every LSI's shared hash attribute, never true of its
-/// own alternate sort attribute or of an ordinary GSI's own hash/sort). This
-/// form asks for index key attribute *names* only, same as [`AddGsiRequest`]
-/// — never a control whose value cannot survive its own round trip.
+/// **What this form does *not* offer**: an index (GSI or LSI) key
+/// attribute's own type — [`CreateGsiRequest`]/[`CreateLsiRequest`] carry
+/// key attribute *names* only, same as [`AddGsiRequest`] before issue #319
+/// added its own two optional type fields. Unlike `AddGsiRequest`, this is a
+/// deliberate **console-form** scope cut, not a mechanism limitation:
+/// `animus_dynamo::schema::index_to_control` (the bridge `create_table`
+/// calls for every `CreateTable`-declared index) has resolved a real
+/// `hash_attribute_type`/`sort_attribute_type` from the request's own
+/// `AttributeDefinitions` since #319 closed, so a real DynamoDB client's
+/// `CreateTable` call already gets this for free — restoring the picker
+/// here (mirroring `AddGsiRequest`'s) is a natural console-side follow-up,
+/// not attempted in this PR.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateTableRequest {
     pub table_name: String,
@@ -1246,8 +1224,10 @@ mod tests {
                 name: "by-status".into(),
                 hash_attribute: IndexKeySummary {
                     name: "status".into(),
-                    // `None` on purpose: this is the shape a GSI added
-                    // through `UpdateTable` really has (issue #319).
+                    // `None` on purpose: an index key attribute the
+                    // declaring call's own `AttributeDefinitions` never
+                    // covered (issue #319) — still a common, legitimate
+                    // shape even after that issue's fix.
                     attribute_type: None,
                 },
                 sort_attribute: None,

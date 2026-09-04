@@ -634,6 +634,17 @@ pub enum Operation {
         /// The requested secondary-index change, if this call changes an
         /// index rather than the stream (ADR 0045 §6).
         index_update: Option<IndexUpdate>,
+        /// The declared `AttributeType` for each attribute named in this
+        /// call's own `AttributeDefinitions` (issue #319) — the identical
+        /// `(AttributeName, AttributeType)` pairs [`CreateTable`](Self::
+        /// CreateTable)'s own `key_types` field carries. Populated whenever
+        /// `index_update` is `Some(IndexUpdate::Create(..))` (the one
+        /// `UpdateTable` shape that can introduce a brand-new key
+        /// attribute); empty for every other call (a `Delete`, or a stream
+        /// change), since neither needs it. `animusd` threads this into the
+        /// new index's own `IndexDef` so it records a real declared type
+        /// instead of always defaulting to `S`.
+        key_types: Vec<(String, String)>,
     },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
@@ -2843,6 +2854,10 @@ fn reject_unsupported_update_table_keys(obj: &Map<String, Value>) -> Result<(), 
 /// rejections (`SSESpecification`/`ReplicaUpdates`/`ProvisionedThroughput`
 /// always, `BillingMode` unless restating `PAY_PER_REQUEST`) this runs
 /// before either shape is considered.
+/// An index-update call's own `AttributeDefinitions` (issue #319) is decoded
+/// via [`decode_attribute_types`] into [`Operation::UpdateTable`]'s
+/// `key_types` field — empty for a stream change, which never introduces a
+/// new key attribute.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
     reject_unsupported_update_table_keys(obj)?;
@@ -2856,10 +2871,12 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
     }
     if has_index_updates {
         let index_update = decode_index_updates(obj)?;
+        let key_types = decode_attribute_types(obj);
         return Ok(Operation::UpdateTable {
             table,
             stream: None,
             index_update: Some(index_update),
+            key_types,
         });
     }
     let Some(spec) = obj.get("StreamSpecification") else {
@@ -2884,6 +2901,7 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
         table,
         stream: Some(stream),
         index_update: None,
+        key_types: Vec::new(),
     })
 }
 
@@ -6667,6 +6685,7 @@ mod tests {
                 table,
                 stream,
                 index_update,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(stream, Some(StreamUpdate::Enable(StreamViewType::NewImage)));
@@ -6708,6 +6727,7 @@ mod tests {
                 table,
                 stream,
                 index_update,
+                key_types,
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(stream, None);
@@ -6715,6 +6735,7 @@ mod tests {
                     index_update,
                     Some(IndexUpdate::Delete("by-email".to_owned()))
                 );
+                assert!(key_types.is_empty(), "a Delete needs no declared type");
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }
@@ -6730,6 +6751,7 @@ mod tests {
             Operation::UpdateTable {
                 table,
                 index_update,
+                key_types,
                 ..
             } => {
                 assert_eq!(table, "t");
@@ -6740,6 +6762,31 @@ mod tests {
                     }
                     other => panic!("expected Create(Global(..)), got {other:?}"),
                 }
+                assert!(
+                    key_types.is_empty(),
+                    "no AttributeDefinitions in this request"
+                );
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    /// Issue #319: an `UpdateTable` GSI-`Create` call's own
+    /// `AttributeDefinitions` is decoded into `key_types` (the same shape
+    /// `CreateTable` already carries), so `animusd` can record the new
+    /// index's own declared key attribute type instead of always defaulting
+    /// to `S`.
+    #[test]
+    fn update_table_create_index_decodes_attribute_definitions() {
+        let body = br#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"score","AttributeType":"N"}],
+            "GlobalSecondaryIndexUpdates":[
+            {"Create":{"IndexName":"by-score",
+                "KeySchema":[{"AttributeName":"score","KeyType":"HASH"}],
+                "Projection":{"ProjectionType":"ALL"}}}]}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable { key_types, .. } => {
+                assert_eq!(key_types, vec![("score".to_owned(), "N".to_owned())]);
             }
             other => panic!("expected UpdateTable, got {other:?}"),
         }

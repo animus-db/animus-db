@@ -583,7 +583,8 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             table,
             stream,
             index_update,
-        } => update_table(ctx, &table, stream, index_update).await,
+            key_types,
+        } => update_table(ctx, &table, stream, index_update, &key_types).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
         Operation::ListTables {
@@ -2509,6 +2510,7 @@ async fn update_table(
     table: &str,
     stream: Option<wire::StreamUpdate>,
     index_update: Option<wire::IndexUpdate>,
+    key_types: &[(String, String)],
 ) -> Result<String, WireError> {
     if !metadata_fresh(ctx).await.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
@@ -2529,7 +2531,7 @@ async fn update_table(
             wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
         },
         (None, Some(update)) => match update {
-            wire::IndexUpdate::Create(index) => create_index(ctx, table, &index).await?,
+            wire::IndexUpdate::Create(index) => create_index(ctx, table, &index, key_types).await?,
             wire::IndexUpdate::Delete(index) => drop_index(ctx, table, &index).await?,
         },
         // Unreachable via the wire decoder (it always sets exactly one), but
@@ -2577,7 +2579,10 @@ async fn update_table(
 ///   total.
 ///
 /// Bridges the validated declaration to the control-plane `IndexDef` via
-/// [`schema_bridge::index_to_control`], **overriding its status to
+/// [`schema_bridge::index_to_control`] (`key_types` is this call's own
+/// decoded `AttributeDefinitions`, ADR 0045 §6's issue #319 fix — resolves
+/// the new index's own key attribute type(s) instead of leaving them
+/// `None`), **overriding its status to
 /// `Creating`** — that function's own doc: its default `Active` is correct
 /// only for `create_table`'s always-empty-by-construction caller, and this is
 /// the caller its doc names as needing the override. Proposes
@@ -2599,6 +2604,7 @@ async fn create_index(
     ctx: &ClientCtx,
     table: &str,
     index: &animus_dynamo::SecondaryIndex,
+    key_types: &[(String, String)],
 ) -> Result<(), WireError> {
     let animus_dynamo::SecondaryIndex::Global(gsi) = index else {
         return Err(WireError::validation(
@@ -2638,11 +2644,7 @@ async fn create_index(
              {MAX_GSI_PER_TABLE} allowed per table"
         )));
     }
-    // UpdateTable's own `AttributeDefinitions` isn't threaded to this caller
-    // yet (issue #319/W-05's UpdateTable half — a follow-up PR in this
-    // series) — `&[]` leaves every resolved type `None`, the same untyped
-    // shape `UpdateTable`-added indexes have always had.
-    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key, &[]);
+    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key, key_types);
     def.status = IndexStatus::Creating;
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {

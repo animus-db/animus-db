@@ -929,7 +929,18 @@ reusing the captured config is the point of the test.
   `add_gsi`/`drop_gsi`/`set_stream`/`set_ttl` build the same JSON body a
   real DynamoDB client would and call `crate::dynamo::execute_routed` (the
   identical function the real edge and `POST /admin/data/dynamo` already
-  call) rather than re-deriving `MetaCommand` proposals directly, while
+  call) rather than re-deriving `MetaCommand` proposals directly — **since
+  issue #319/W-05, `add_gsi` also builds an `AttributeDefinitions` entry
+  for each of `AddGsiRequest`'s new optional `hash_attribute_type`/
+  `sort_attribute_type` fields** (validated case-insensitively against
+  `S`/`N`/`B` by `console_validate_attribute_type`, a `400` on anything
+  else) so a type the console form's picker declares survives into the
+  replicated catalog exactly like a real DynamoDB `UpdateTable` call's own
+  `AttributeDefinitions` would — `console.js`'s Add-GSI form (`saveGsi`)
+  is the only console screen with this control; the create-table form's
+  `CreateGsiRequest`/`CreateLsiRequest` remain deliberately type-less (a
+  console-form scope cut, not a mechanism gap — see `console.rs`'s own
+  `CreateTableRequest` doc), while
   `delete_table` — not a DynamoDB wire operation at all — calls the same
   `ClientCtx::drop_table` `admin.rs::action_drop_table` does. A GSI and an
   LSI render from two distinct types/templates (`GsiDetail`/`gsiRowHtml` vs.
