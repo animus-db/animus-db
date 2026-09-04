@@ -22,13 +22,15 @@ use animus_tablet::{Epoch, KeyRange, TabletId};
 use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
 };
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    // `support::connect_retry` rides out the port-TOCTOU/listener-not-yet-
+    // accepting window a plain `TcpStream::connect` can lose the instant
+    // `bring_up` returns (issue #592) — see that helper's own doc.
+    let mut stream = support::connect_retry(addr).await;
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await
