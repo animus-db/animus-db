@@ -47,7 +47,11 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 - `src/admin_client.rs` — a minimal plain-HTTP JSON client (`hyper`/
   `hyper-util`, reusing `kube`'s own already-pulled HTTP stack rather than
   adding `reqwest`) for `animusd`'s admin/debug interface (ADR 0020) — used
-  only by the scale-down drain sequence below.
+  only by the scale-down drain sequence below. Also carries `AdminOps`, the
+  test seam over that client's two calls (ADR 0061 rung E1 — see Tests).
+- `src/cluster_api.rs` — `ClusterApi`, the test seam over the `kube::Api`
+  calls `controller.rs` performs, plus `RealClusterApi`, its production
+  implementor (ADR 0061 rung E1 — see Tests).
 - `src/controller.rs` — the thin imperative shell: `reconcile` builds every
   desired child via `desired::*`, server-side-applies each
   (`PatchParams::apply(FIELD_MANAGER).force()`, field manager
@@ -177,7 +181,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (40 tests total as of this crate's initial
+own `#[cfg(test)] mod tests` (51 tests total as of ADR 0061 rung E1's
 landing): golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
 `ConfigMap` contents (including the no-port-striding invariant and a
 scale-up byte-for-byte-preserves-existing-entries regression), `Service`
@@ -185,9 +189,42 @@ port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable storage
 shape, and `NetworkPolicy` selector/rule structure. **No cluster is
 needed** — every test constructs an `AnimusCluster` via `test_support::
 test_cluster` and asserts on the returned typed object or its JSON, never
-against a live API server. `src/controller.rs` itself is *not* unit-tested
-this way (it needs a fake/real API server to exercise meaningfully) — that
-is exactly what the e2e smoke below covers instead.
+against a live API server.
+
+- **`src/controller.rs` has its own fake-kube-client harness now** (ADR
+  0061 rung E1, `crate::fakes`, `#[cfg(test)]` only). `controller.rs`'s two
+  live-cluster boundaries — the `kube::Api` calls and the `AdminClient`
+  admin-port HTTP calls — are each behind a small `#[async_trait]` trait
+  (`cluster_api::ClusterApi`, `admin_client::AdminOps`); `Context`,
+  `reconcile`, `apply_children`, `control_nodes_changed`, and
+  `drain_and_remove_node` are all generic over both. Production (`run()`)
+  wires the real implementors (`RealClusterApi`, `AdminClient`); tests wire
+  `fakes::{FakeClusterApi, FakeAdminClient}`, small in-memory
+  record-and-serve stores (see their own doc for exactly what they do and
+  do not model — no resourceVersion/admission/watch semantics, a
+  same-process store rather than `kube`'s own wire protocol). This is a
+  hand-written trait rather than `kube`'s own `tower_test`-backed mock
+  `Client` — see ADR 0061's 2026-09-04 amendment note for the trade-off
+  (in short: there are *two* live-cluster boundaries here, not one, since
+  the admin-port client is deliberately not built on `kube::Client`, so a
+  `kube`-specific mock would only ever cover half of it).
+  `controller::tests` (in `src/controller.rs`) covers: a fresh cluster's
+  reconcile applying all five children in the right order; that an
+  unchanged cluster's reconcile still re-applies every child (pinned as the
+  actual, deliberate behavior — `apply_children` never diffs against
+  previously-applied state, so this is an idempotent re-apply, not a
+  no-op); `control_nodes_changed` detecting a real change, no change, and
+  "no prior `ConfigMap` yet"; `drain_and_remove_node`'s sequence on both
+  the immediate-success path and the **bounded** never-completes path
+  (`#[tokio::test(start_paused = true)]`'s virtual clock resolves the 120
+  x 5s poll budget without real wall-clock wait); reconcile-level
+  scale-down sequencing, both the highest-ordinal-first happy path and
+  stop-on-first-drain-failure; and the immutable-`controlNodes`-change
+  refusal end to end. **What this harness does not prove**: real
+  `kube::Api` wire behavior against an actual API server (conflicts,
+  admission, watch-driven requeue, real server-side-apply field-ownership
+  semantics) or real-thread liveness of the `Controller::run` watch loop —
+  that gap is still the e2e smoke's to close, unchanged by this harness.
 
 ## e2e
 
