@@ -159,6 +159,47 @@ pub struct LsiDetail {
     pub sort_attribute: IndexKeySummary,
 }
 
+/// A table's continuous-backups (PITR, ADR 0059 §9) status, console-shaped:
+/// `None` when PITR is disabled — DynamoDB itself reports no restore window
+/// for a disabled table, so there is nothing else to carry (mirrors
+/// [`StreamSummary`]/[`TtlSummary`]'s own "`enabled` gates a companion
+/// field" shape, just expressed as `Option<Self>` on the embedding field
+/// instead of an inner `enabled: bool`, since every field here is
+/// meaningless without it). `Some` carries exactly the restore window
+/// `DescribeContinuousBackups` already computes (`animusd::dynamo::
+/// pitr_description`) — this console never re-derives it. **Never a segment/
+/// tablet/node-shaped detail** — only wall-clock timestamps, same discipline
+/// as the rest of this module.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PitrStatus {
+    /// The earliest wall-clock instant (epoch milliseconds) this table can
+    /// currently be restored to.
+    pub earliest_restorable_ms: Option<u64>,
+    /// The latest wall-clock instant (epoch milliseconds) this table can
+    /// currently be restored to.
+    pub latest_restorable_ms: Option<u64>,
+}
+
+/// One on-demand backup of this table (ADR 0059 §3/§4, U-03), console-shaped
+/// down to just what identifies it and where it stands: **never** which
+/// node/replica captured it, its manifest object path, or any other
+/// storage-internal detail (the exact cluster-shaped state this whole
+/// console must never surface — see the module doc). `status` is the same
+/// plain wire-label string (`"CREATING"`/`"AVAILABLE"`/`"DELETED"`)
+/// [`GsiDetail::status`] already uses for the identical reason: this module
+/// never imports `animus_control::BackupStatus` itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BackupSummary {
+    /// The backup's own opaque identity (an ARN-shaped string, the same one
+    /// `DescribeBackup`/`DeleteBackup` take on the DynamoDB wire) — not a
+    /// cluster-internal id, DynamoDB's own public identifier for this
+    /// resource.
+    pub backup_id: String,
+    pub status: String,
+    /// Wall-clock creation time, epoch milliseconds.
+    pub created_wall_ms: u64,
+}
+
 /// One table's full configuration, for the table page's Config tab
 /// (`GET /console/api/tables/{name}`). Everything [`TableSummary`] carries as
 /// a count instead carries its full declaration here (every GSI, every LSI).
@@ -171,6 +212,16 @@ pub struct TableDetail {
     pub lsis: Vec<LsiDetail>,
     pub stream: StreamSummary,
     pub ttl: TtlSummary,
+    /// This table's continuous-backups (PITR) status — `None` when disabled.
+    pub pitr: Option<PitrStatus>,
+    /// This table's own on-demand backups (table-scoped: a backup outliving
+    /// its source table, ADR 0059 §3's "scar", never shows up here — this
+    /// list is for a live table's detail page only), in ascending
+    /// backup-id order (`ListBackups`' own catalog iteration order).
+    /// Excludes an internal PITR base snapshot (`BackupTypeFilter::System`
+    /// on the wire) — this list mirrors the wire's own default `USER`
+    /// filter, never surfacing PITR's own periodic base-snapshot mechanism.
+    pub backups: Vec<BackupSummary>,
 }
 
 /// A request to add a global secondary index (`POST
@@ -1252,6 +1303,15 @@ mod tests {
                 enabled: false,
                 attribute_name: None,
             },
+            pitr: Some(PitrStatus {
+                earliest_restorable_ms: Some(1_000),
+                latest_restorable_ms: Some(2_000),
+            }),
+            backups: vec![BackupSummary {
+                backup_id: "arn:animus:backup:orders/01".into(),
+                status: "AVAILABLE".into(),
+                created_wall_ms: 1_500,
+            }],
         }
     }
 
@@ -1276,6 +1336,14 @@ mod tests {
             json["lsis"][0].get("status").is_none(),
             "an LSI row carries no lifecycle status field at all"
         );
+        assert_eq!(json["pitr"]["earliest_restorable_ms"], 1_000);
+        assert_eq!(json["pitr"]["latest_restorable_ms"], 2_000);
+        assert_eq!(
+            json["backups"][0]["backup_id"],
+            "arn:animus:backup:orders/01"
+        );
+        assert_eq!(json["backups"][0]["status"], "AVAILABLE");
+        assert_eq!(json["backups"][0]["created_wall_ms"], 1_500);
 
         let text = json.to_string().to_ascii_lowercase();
         for forbidden in [
@@ -1301,6 +1369,20 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["name"], "orders");
         assert!(value.get("table").is_none(), "no extra wrapping key");
+    }
+
+    /// A table with PITR disabled and no on-demand backups serializes
+    /// `pitr` as `null` and `backups` as an empty array — never an omitted
+    /// field (U-03: the caller must always be able to distinguish "no
+    /// backups" from "field not sent").
+    #[test]
+    fn table_detail_with_no_pitr_or_backups_is_null_and_empty() {
+        let mut detail = sample_detail();
+        detail.pitr = None;
+        detail.backups = vec![];
+        let json = serde_json::to_value(&detail).unwrap();
+        assert!(json["pitr"].is_null());
+        assert_eq!(json["backups"].as_array().unwrap().len(), 0);
     }
 
     #[test]

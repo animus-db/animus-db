@@ -230,21 +230,31 @@ date/time crate dependency for one cosmetic label format.
   `start_cluster_with_streams`/`run_node_with_streams`/`start_cluster_inner`
   each gained one more trailing `Duration` parameter (defaulting to
   `DEFAULT_STREAM_RETENTION`, 24h, at every non-`_streams` call site,
-  including every `start_cluster_with_auto_split*` wrapper), while
-  `BoundControlNode::start_control_with` (control-only) hardcodes the
-  default inline with no override yet — the same "split-deployment CLI
-  path is a named follow-up" precedent this bullet's own opening sentence
-  already established for the seal knobs/segment-store config. `main.rs`
-  parses it identically to `--stream-seal-age`. `SegmentStoreHandle`
-  (`Cluster(ClusterSegmentStore<ProdEnv,
-  FsSegmentStore>)` or a bare opt-in `Fs(FsSegmentStore)`) and
-  `StreamSealKnobs` live on `DataRole` (`ClientCtx.data()`), built by
-  `build_segment_store` at node-assembly time — the **default** cluster
+  including every `start_cluster_with_auto_split*` wrapper). **`animusd
+  control` gained the identical `--segment-store`/`--backup-store` flags
+  and a real `stream_retention` parameter too (W-10, 2026-09-04)** —
+  `BoundControlNode::start_control_with` no longer hardcodes either the
+  store config or the retention default inline; `run_node_control_with_
+  stores` is the new innermost layer (`run_node_control`/`run_node_control_
+  with_orphan_sweep_after` still default to `SegmentStoreConfig::default()`/
+  `BackupStoreConfig::default()`/`DEFAULT_STREAM_RETENTION`, mirroring the
+  combined path's own layered-wrapper convention). The `--cluster-control`/
+  `--cluster-data` dev path and the standalone `data`/`join` subcommands
+  remain the documented gap (no CLI flag reaches them; each always gets the
+  default `Cluster` store). `main.rs` parses `animusd control`'s new flags
+  identically to `--stream-seal-age`. **`SegmentStoreHandle`/
+  `BackupStoreHandle` moved off `DataRole` onto `ClientCtx` itself (W-10)**
+  — `ClientCtx::segment_store`/`backup_store`, provisioned on every node
+  shape including control-only, never gated on `ClientCtx.data()` any
+  more; `StreamSealKnobs` stays on `DataRole` (genuinely data-role-only —
+  a control-only node never runs the sealer, since it hosts no tablet).
+  Both handles are built by `build_segment_store`/`build_backup_store` at
+  node-assembly time — the **default** cluster
   variant roots its own per-node local `FsSegmentStore` at
   `<node dir>/segments` (a sibling of the `internal/` subdirectory
-  `ProdEnv::bind` already owns; `BoundNode`/`BoundDataNode` gained a `dir`
-  field to carry that path forward, since neither previously kept it past
-  bind time) and is backed by a `ControlPlacementView` over this node's own
+  `ProdEnv::bind` already owns; `BoundNode`/`BoundDataNode`, and now (W-10)
+  `BoundControlNode` too, each carry a `dir` field forward from bind time
+  for exactly this) and is backed by a `ControlPlacementView` over this node's own
   control handle (live `Active` members; label-blind, matching
   `cluster_segment_store.rs`'s own current policy — a later PR that wants
   failure-domain-aware segment placement would extend this view).

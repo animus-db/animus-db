@@ -44,6 +44,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -393,12 +394,13 @@ async fn dashboard_role_gating_split_deployment() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
             ),
             "the control role's own tab list now includes Streams too (a control-only \
              node holds the full replicated Metadata, so the stream list + shard-chain \
-             detail render truthfully there; only the live-tail poller degrades), and \
-             now Transactions too (docs/roadmap.md U-01, gated like tablets): {core_js}"
+             detail render truthfully there; only the live-tail poller degrades), \
+             Transactions too (docs/roadmap.md U-01, gated like tablets), and now \
+             Backups too (docs/roadmap.md U-02, gated like placement): {core_js}"
         );
 
         // ---- /admin/config's role differs across the split -----------------
@@ -406,11 +408,50 @@ async fn dashboard_role_gating_split_deployment() {
         assert_eq!(s, 200);
         let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
         assert_eq!(cfg["role"].as_str(), Some("control"));
+        // U-06 (docs/roadmap.md): a control-only node provisions neither
+        // store, never runs the reconciler quiescence knob, and never binds
+        // the dynamo listener — every one of these fields is `null`, never
+        // omitted, so the shape stays stable across roles.
+        assert!(
+            cfg["backup_store"].is_null()
+                && cfg["segment_store"].is_null()
+                && cfg["quiesce_after_ms"].is_null()
+                && cfg["auth_enabled"].is_null()
+                && cfg["auth_access_key_ids"].is_null(),
+            "a control-only node's /admin/config has no store/quiesce/auth fields: {cfg}"
+        );
 
         let (s, _, body) = raw(data_admin, "GET", "/admin/config").await;
         assert_eq!(s, 200);
         let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
         assert_eq!(cfg["role"].as_str(), Some("data"));
+        // A data-only node gets its own real, independently-configured
+        // backup/segment store (ADR 0059 §1's asymmetry with control-only),
+        // and binds the dynamo listener (so `auth_enabled` is `Some(false)`
+        // — this deployment has no `dynamo_auth` section — never `null`).
+        // `quiesce_after_ms` is `null` here because this fixture's config
+        // carries no `cluster_settings.quiesce_after_secs` (S-06's only
+        // route to the knob on a data-only node), so quiescence is off.
+        assert_eq!(
+            cfg["backup_store"]["kind"].as_str(),
+            Some("cluster"),
+            "a data-only node's own backup store: {cfg}"
+        );
+        assert_eq!(
+            cfg["segment_store"]["kind"].as_str(),
+            Some("cluster"),
+            "a data-only node's own segment store: {cfg}"
+        );
+        assert!(
+            cfg["quiesce_after_ms"].is_null(),
+            "data-only quiescence is off without cluster_settings: {cfg}"
+        );
+        assert_eq!(
+            cfg["auth_enabled"].as_bool(),
+            Some(false),
+            "no dynamo_auth section in this deployment: {cfg}"
+        );
+        assert!(cfg["auth_access_key_ids"].is_null(), "auth is off: {cfg}");
 
         // ---- the data-only node's control-plane mirror actually syncs -----
         // (ADR 0035 PR7's one backend addition: `/admin/raft`'s
@@ -741,9 +782,9 @@ async fn dashboard_u01_render_only_fixes() {
         );
         assert!(
             core_js.contains(
-                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage"]"#
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
             ) && core_js.contains(
-                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "node"]"#
+                r#"combined: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups", "node"]"#
             ),
             "the Transactions tab is role-gated exactly like Tablets (ROLE_TABS): {core_js}"
         );
@@ -870,6 +911,383 @@ async fn dashboard_u01_render_only_fixes() {
             !storage_js.contains("[\"keyspace\","),
             "the stray [\"keyspace\", ...] dropdown entry (never a real EntityKind \
              segment, always returned zero rows) is dropped, not carried forward: {storage_js}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-02: the Backups tab — a render-only assertion group,
+/// mirroring `dashboard_u01_render_only_fixes`' own structure (this is a
+/// render-only change over already-covered JSON: `/admin/backups`'s and
+/// `/admin/restores`'s own shapes are proven end to end elsewhere —
+/// `admin_endpoint.rs::admin_backups_view_reflects_the_catalog` and
+/// `dynamo_restore.rs`'s own `/admin/restores` assertion — so this file only
+/// proves the dashboard surface: the shell/script markers, the four gated
+/// actions' real DynamoDB op names/payload shapes (`CreateBackup`/
+/// `DeleteBackup`/`RestoreTableFromBackup`/`UpdateContinuousBackups`, each
+/// behind a `window.confirm`), role gating (control/combined, exactly like
+/// Placement — asserted above in `dashboard_role_gating_split_deployment`,
+/// which this PR's own diff to that test's `ROLE_TABS` string already
+/// covers the data-only exclusion for), and that both routes actually 200
+/// from a live node). No proxy-allowlist change was needed for this PR —
+/// `admin.rs::action_data_dynamo` has no op allowlist beyond the bare-name
+/// Streams-vs-item disambiguation (`STREAMS_OPS`), and none of these four
+/// ops are Streams ops, so each resolves to the ordinary
+/// `DynamoDB_20120810.<op>` item-API target and reaches
+/// `animus_dynamo::wire::decode_request` unchanged — already exercised by
+/// `dynamo_backup.rs`/`dynamo_restore.rs`/`dynamo_pitr.rs` over the real
+/// wire edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u02_backups_tab() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the Backups nav link + section --------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"data-tab="backups""#) && shell.contains(r#"<section id="backups""#),
+            "the shell carries the Backups nav link and section: {shell}"
+        );
+        assert!(
+            shell.contains("dashboard_backups.js"),
+            "the shell references the Backups view's script asset: {shell}"
+        );
+        assert!(
+            shell.contains(r#"id="bk-create-table""#)
+                && shell.contains(r#"id="bk-list-body""#)
+                && shell.contains(r#"id="bk-pitr-body""#)
+                && shell.contains(r#"id="bk-restores-body""#),
+            "the shell carries the Create-backup form, the backup list, the \
+             per-table PITR toggle list, and the restores list: {shell}"
+        );
+
+        // ---- dashboard_backups.js renders the catalog + the four gated
+        //      actions with the real DynamoDB op names/payload field names --
+        let (s, _, backups_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_backups.js").await;
+        assert_eq!(s, 200, "dashboard_backups.js is served");
+        assert!(
+            backups_js.contains("function renderBackups"),
+            "dashboard_backups.js renders the backup/restore/PITR catalogs: {backups_js}"
+        );
+        for (op, field) in [
+            ("CreateBackup", "BackupName"),
+            ("DeleteBackup", "BackupArn"),
+            ("RestoreTableFromBackup", "TargetTableName"),
+            ("UpdateContinuousBackups", "PointInTimeRecoveryEnabled"),
+        ] {
+            assert!(
+                backups_js.contains(op) && backups_js.contains(field),
+                "dashboard_backups.js posts {op} with its real payload field \
+                 {field}: {backups_js}"
+            );
+        }
+        assert!(
+            backups_js.contains("PointInTimeRecoverySpecification"),
+            "UpdateContinuousBackups nests PointInTimeRecoveryEnabled under \
+             PointInTimeRecoverySpecification, matching the wire decoder: {backups_js}"
+        );
+        assert_eq!(
+            backups_js.matches("if (!window.confirm(").count(),
+            4,
+            "each of the four actions (create/delete/restore/PITR toggle) is \
+             gated behind its own window.confirm, the crate's one mutation \
+             idiom (the module doc comment's own mention of window.confirm \
+             is deliberately excluded by this narrower pattern): {backups_js}"
+        );
+        assert!(
+            backups_js.contains("/admin/data/dynamo"),
+            "every action posts through the existing dashboard dynamo proxy, \
+             never a new endpoint: {backups_js}"
+        );
+        assert!(
+            backups_js.contains("dynamoTables()"),
+            "the Create-backup table picker and the PITR table list reuse the \
+             Data Browser's own table source rather than a second fetch: {backups_js}"
+        );
+
+        // ---- dashboard_core.js fetches both catalogs alongside /admin/status,
+        //      not a per-node fan-out (unlike /admin/txns) ---------------------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/backups") && core_js.contains("/admin/restores"),
+            "dashboard_core.js fetches both catalogs once against SEED: {core_js}"
+        );
+        assert!(
+            core_js.contains(
+                r#"control: ["overview", "placement", "tablets", "txns", "browser", "streams", "storage", "backups"]"#
+            ) && !core_js.contains(r#"data: ["node", "browser", "streams", "backups"]"#),
+            "Backups is role-gated to control + combined exactly like Placement \
+             — absent from the data role's own tab list: {core_js}"
+        );
+
+        // ---- both routes actually serve from a live node --------------------
+        let (s, _, backups_body) = raw(admin_addr, "GET", "/admin/backups").await;
+        assert_eq!(s, 200, "GET /admin/backups: {backups_body}");
+        assert!(
+            serde_json::from_str::<Value>(&backups_body)
+                .expect("backups view is JSON")
+                .get("backups")
+                .is_some(),
+            "the catalog is served under \"backups\", the shape dashboard_backups.js reads: {backups_body}"
+        );
+        let (s, _, restores_body) = raw(admin_addr, "GET", "/admin/restores").await;
+        assert_eq!(s, 200, "GET /admin/restores: {restores_body}");
+        assert!(
+            serde_json::from_str::<Value>(&restores_body)
+                .expect("restores view is JSON")
+                .get("restores")
+                .is_some(),
+            "the catalog is served under \"restores\", the shape dashboard_backups.js reads: {restores_body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
+/// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
+/// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The
+/// actual `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics already have
+/// their own full end-to-end coverage (`tests/dynamo_ttl.rs`), so this test
+/// only proves: the shell carries the new row beside the Stream row,
+/// `dashboard_browser.js` renders it from `schema.ttl` (the same
+/// already-fetched `/admin/status` fact `dynamo::describe_time_to_live`
+/// itself reads) and posts the real `UpdateTimeToLive` op/payload shape
+/// behind `window.confirm`, and that exact shape — enable, then disable
+/// with the same `AttributeName` AWS requires on both calls — is accepted
+/// by the real wire through the admin proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u04_ttl_row() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #br-dy-ttl beside #br-dy-stream -------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let stream_pos = shell
+            .find(r#"id="br-dy-stream""#)
+            .expect("shell carries #br-dy-stream");
+        let ttl_pos = shell
+            .find(r#"id="br-dy-ttl""#)
+            .expect("shell carries #br-dy-ttl");
+        assert!(
+            ttl_pos > stream_pos && ttl_pos - stream_pos < 200,
+            "#br-dy-ttl sits immediately beside #br-dy-stream: {shell}"
+        );
+
+        // ---- dashboard_browser.js renders it and posts the real op ---------
+        let (s, _, browser_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_browser.js").await;
+        assert_eq!(s, 200, "dashboard_browser.js is served");
+        assert!(
+            browser_js.contains("function renderTtlRow")
+                && browser_js.contains("function enableTtl")
+                && browser_js.contains("function disableTtl"),
+            "dashboard_browser.js defines the TTL row's render + enable/disable handlers: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("schema.ttl"),
+            "renderTtlRow reads the already-fetched schema.ttl, no extra DescribeTimeToLive round trip: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("UpdateTimeToLive")
+                && browser_js.contains("TimeToLiveSpecification")
+                && browser_js.contains("AttributeName"),
+            "the TTL row posts the real UpdateTimeToLive op with its real payload shape: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("Enable TTL on") && browser_js.contains("Disable TTL on"),
+            "both enable and disable are gated behind their own window.confirm: {browser_js}"
+        );
+
+        // ---- the exact payload shape round-trips through the real wire -----
+        let (s, ct_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable widgets: {ct_body}");
+
+        let (s, en_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "enable TTL: {en_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        assert_eq!(
+            status["schemas"]["tables"]["widgets"]["ttl"]["attribute_name"].as_str(),
+            Some("expiresAt"),
+            "TTL is enabled with the declared attribute: {status_body}"
+        );
+
+        let (s, dis_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":false,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "disable TTL: {dis_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        assert!(
+            status["schemas"]["tables"]["widgets"]["ttl"].is_null(),
+            "TTL is disabled: {status_body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-04 (PR 2): the create-table form declares GSIs/LSIs/a
+/// stream/TTL in one place. Same structure as `dashboard_u04_ttl_row` above:
+/// shell/script markers proving the new fields and their client-side
+/// validation exist, then a live round trip posting the exact
+/// `CreateTable` + follow-up `UpdateTimeToLive` request sequence the
+/// extended `submitTableForm` builds (mirroring `console::ConsoleBackend::
+/// create_table`'s own sequence, `crates/animusd/src/lib.rs`) and checking
+/// the real catalog reflects every declared piece.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u04_create_table_form() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new form fields --------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        for id in [
+            "br-dy-ct-lsi-table",
+            "br-dy-ct-lsi-add",
+            "br-dy-ct-gsi-table",
+            "br-dy-ct-gsi-add",
+            "br-dy-ct-stream",
+            "br-dy-ct-stream-vt",
+            "br-dy-ct-ttl",
+            "br-dy-ct-ttl-attr",
+        ] {
+            assert!(
+                shell.contains(&format!(r#"id="{id}""#)),
+                "the create-table form carries #{id}: {shell}"
+            );
+        }
+
+        // ---- dashboard_browser.js builds the real request sequence ----------
+        let (s, _, browser_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_browser.js").await;
+        assert_eq!(s, 200, "dashboard_browser.js is served");
+        assert!(
+            browser_js.contains("function addCtLsiRow") && browser_js.contains("function addCtGsiRow"),
+            "the form's GSI/LSI row editors exist: {browser_js}"
+        );
+        assert!(
+            browser_js.contains("GlobalSecondaryIndexes")
+                && browser_js.contains("LocalSecondaryIndexes")
+                && browser_js.contains("StreamSpecification"),
+            "submitTableForm sends GSIs, LSIs, and a stream spec on CreateTable: {browser_js}"
+        );
+        // Client-side validation, mirroring ConsoleBackend::create_table's own
+        // checks (lib.rs) so a mistake bounces here, not off the wire.
+        for marker in [
+            "needs a hash attribute",
+            "needs a sort key attribute",
+            "requires the table to have its own sort key",
+            "INCLUDE projection needs at least one attribute",
+        ] {
+            assert!(
+                browser_js.contains(marker),
+                "submitTableForm validates {marker:?} client-side: {browser_js}"
+            );
+        }
+        // Every key attribute (base + every declared index) ends up in
+        // AttributeDefinitions before the request is ever sent.
+        assert!(
+            browser_js.contains("AttributeDefinitions") && browser_js.contains("declareDefault"),
+            "the form declares AttributeDefinitions for every base and index key: {browser_js}"
+        );
+
+        // ---- the exact request sequence a filled-in form would send --------
+        let (s, ct_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"CreateTable","payload":{
+                "TableName":"orders",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"created_at","KeyType":"RANGE"}],
+                "GlobalSecondaryIndexes":[{"IndexName":"by-status","KeySchema":[{"AttributeName":"status","KeyType":"HASH"}]}],
+                "LocalSecondaryIndexes":[{"IndexName":"by-score","KeySchema":[{"AttributeName":"id","KeyType":"HASH"},{"AttributeName":"score","KeyType":"RANGE"}]}],
+                "AttributeDefinitions":[
+                    {"AttributeName":"id","AttributeType":"S"},
+                    {"AttributeName":"created_at","AttributeType":"N"},
+                    {"AttributeName":"status","AttributeType":"S"},
+                    {"AttributeName":"score","AttributeType":"S"}
+                ],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}
+            }}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable orders: {ct_body}");
+
+        let (s, ttl_body) = raw_post(
+            admin_addr,
+            "/admin/data/dynamo",
+            "",
+            r#"{"op":"UpdateTimeToLive","payload":{"TableName":"orders","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+        )
+        .await;
+        assert_eq!(s, 200, "enable TTL on orders: {ttl_body}");
+
+        let (s, _, status_body) = raw(admin_addr, "GET", "/admin/status").await;
+        assert_eq!(s, 200);
+        let status: Value = serde_json::from_str(&status_body).expect("status is JSON");
+        let schema = &status["schemas"]["tables"]["orders"];
+        let indexes = schema["indexes"].as_array().expect("indexes array");
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i["name"] == "by-status" && i["kind"] == "Global" && i["hash_attribute"] == "status"),
+            "the GSI is declared: {schema}"
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|i| i["name"] == "by-score" && i["kind"] == "Local" && i["sort_attribute"] == "score"),
+            "the LSI is declared: {schema}"
+        );
+        assert_eq!(
+            schema["stream"]["view_type"].as_str(),
+            Some("NewAndOldImages"),
+            "the stream is declared: {schema}"
+        );
+        assert_eq!(
+            schema["ttl"]["attribute_name"].as_str(),
+            Some("expiresAt"),
+            "TTL is declared via the follow-up call: {schema}"
         );
 
         nodes[0].shutdown_graceful().await;

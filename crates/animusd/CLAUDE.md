@@ -175,6 +175,32 @@ reusing the captured config is the point of the test.
   `BoundControlNode::start_control_with` hardcodes `None` at its own
   `spawn_common_tail` call — a control-only node never binds the dynamo
   listener, so nothing there would ever read the field.
+- **`cluster_settings: Option<ClusterSettings>` (S-06)** — cluster-wide
+  operational knobs (auto-split, quiesce, orphan-sweep, stream-seal)
+  reachable from a config file on every real deployment shape
+  (`--config`/`--node`, `animusd control`, `animusd data --config`), not
+  just `--cluster N`'s dev-only in-process CLI flags — the gap the root
+  `CLAUDE.md`'s auto-split entry and ADR 0034/0040/0048's amendment notes
+  describe. `ClusterSettings`'s seven fields mirror their CLI flags
+  field-for-field (a `_secs` field is the flag's raw seconds value, never a
+  `Duration`), each independently `#[serde(default)]`, and its own doc
+  comment has the full per-field applicability table (a data-only node
+  ignores `orphan_sweep_after_secs`/`stream_retention_secs`; a control-only
+  node acts on `orphan_sweep_after_secs` alone). `main.rs`'s
+  `resolve_cluster_settings` merges this section against whatever CLI flags
+  the invocation actually gave, field by field — the same "specify it one
+  way, not both" hard-error contract `apply_dynamo_auth_flag` uses for
+  `dynamo_auth`, not a silent precedence rule; the merge is per-field, so an
+  operator may still set *different* knobs on each side. This is
+  `--config`/`--node`'s and `animusd data --config`'s only route to
+  auto-split at all (previously reachable solely via `--cluster N`), and
+  the config-file route that finally lets `animusd data --config` reach
+  quiescence too (see the Quiescence section below, and `start_data_with_
+  growth`'s own new `quiesce_after` parameter). Adding this field hit the
+  identical `error[E0063]` fan-out `dynamo_auth` describes just above —
+  ~55 `ClusterConfig { .. }` literals across `src/`+`tests/` needed a
+  `cluster_settings: None,` line, again compiler-enumerated rather than
+  grepped.
 - **`control_handle.rs`** — the `ControlHandle` seam (ADR 0035 PR1):
   `Local(RaftNode<ProdEnv>)` for a node with real control Raft, vs.
   `Remote(RemoteControlClient)` for a data-only node reaching a separate control
@@ -356,7 +382,8 @@ reusing the captured config is the point of the test.
   the DynamoDB wire path or a `SimCluster` reaches them, and they have
   their own real-socket coverage; so did a handful of small,
   genuinely-crate-wide accessors that don't belong to any one cluster
-  (`effective_metadata`, `metadata_fresh`, `data`/`data_opt`,
+  (`effective_metadata`, `metadata_fresh`, `data` — `data_opt` also lived
+  here at the time, since deleted as dead code, W-10 — and
   `not_leader_error`) — moving them into one cluster would only have
   forced the identical `pub(crate)` widening onto them with no locality
   benefit, since `admin.rs`/`dynamo.rs`/`backup_capture.rs`/
@@ -521,10 +548,16 @@ reusing the captured config is the point of the test.
   (`ControlLeaderHost<ProdEnv>`/`BackupObjectStore`/`TtlScanHost` — see
   that crate's own `host` module doc for the shape and why three, not
   one). Every method here is a **thin, logic-free delegation** —
-  `self.edge.leader_handle()`, `self.data_opt().map(|d| d.backup_store
-  ...)`, one call into `dynamo::kind_write_item_at_leader` — nothing is
-  decided here that wasn't already decided by an existing `ClientCtx`/
-  `CpGroup`/`BackupStoreHandle` method. This is the seam that let five of
+  `self.edge.leader_handle()`, `self.backup_store.put(..)`, one call into
+  `dynamo::kind_write_item_at_leader` — nothing is decided here that
+  wasn't already decided by an existing `ClientCtx`/`CpGroup`/
+  `BackupStoreHandle` method. **`BackupObjectStore`'s four methods always
+  answer `Some(..)` now (W-10)** — `self.backup_store` is provisioned on
+  every node shape (see `ClientCtx::backup_store`'s own doc), so the
+  `self.data_opt()?` early-return this impl used to open with is gone;
+  the trait itself stays `Option`-returning for a genuinely store-less
+  host (`animus_node::backup_janitor`'s own `ControlOnlyStore` test
+  double). This is the seam that let five of
   the six leaf background loops (`ttl_reaper.rs`, `index_backfill.rs`,
   `backup_completion.rs`, `backup_janitor.rs`, `pitr_janitor.rs` — each
   now a thin wrapper into `animus-node`, see their own entries below) move
@@ -586,8 +619,16 @@ reusing the captured config is the point of the test.
   (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h) are hardcoded production
   defaults — no CLI knob yet, the identical documented gap `ttl_reaper.rs`'s
   own sweep interval has. The module's own doc has the full design
-  including the self-healing-tag residual and the control-only-leader
-  scope gap. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
+  including the self-healing-tag residual. **The retention loop's own
+  control-only-leader scope gap is closed (W-10)**: `pitr_janitor_loop`'s
+  segment-object reclaim now has a real `BackupStoreHandle`
+  (`ClientCtx::backup_store`) on every node shape. `pitr_snapshot_loop`'s
+  own `BeginBackup` **capture** step stays structurally inert on a
+  control-only leader for an unrelated, unfixable reason — capture is
+  per-tablet leader-side (`backup_capture.rs`), and a control-only node
+  never hosts (so never leads) a CP-data tablet; it still correctly
+  proposes `BeginBackup`/tags rows, it just never has a tablet to capture
+  from. The fifth **consumer arm** itself (`pitr_tick`/`pitr_seal_now`)
   lives in `index_drain.rs`, alongside the stream seal arm it mirrors — see
   that module's doc.
 - **`segment_janitor.rs` did NOT move in rung C2** (ADR 0061) — the one of
@@ -602,7 +643,7 @@ reusing the captured config is the point of the test.
 - **`segment_janitor.rs`** (ADR 0043 §A9) — the **segment janitor**: a
   control-plane-**leader**-only background loop (`segment_janitor_loop`)
   doing two-phase retention reclaim + replica repair over the whole
-  `stream_shards` catalog. The module's own 80-line `//!` doc has the full
+  `stream_shards` catalog. The module's own `//!` doc has the full
   design (including the load-bearing epoch-derivation guard and the
   convergent drop-table cascade); see also `docs/streams-notes.md`.
   **Retired-tablet rule (ADR 0050 rung 6)**: a cutover-removed split
@@ -611,6 +652,27 @@ reusing the captured config is the point of the test.
   children), never tablet presence, and the max-epoch pin applies to live
   tablets only (a retired chain can never seal again) — both halves
   red-proven in `tests/stream_janitor.rs::retired_parents_*`.
+  **The control-only-leader scope gap is closed (W-10, 2026-09-04, ADR
+  0043 §A9)**: phases 2/3 (object deletion, replica repair) used to skip
+  unconditionally on a control-only leader (`ClientCtx::data_opt() ==
+  None` there — that accessor no longer exists at all, see below); every
+  node shape now provisions a real `SegmentStoreHandle`
+  (`ClientCtx::segment_store`), never gated on running the data role, so a
+  **pure** split deployment (control-only nodes are the only control
+  voters) reclaims stream segments correctly with no data-role node ever
+  needing to take the lead. `segment_store`/`backup_store` moved off
+  `DataRole` onto `ClientCtx` itself for this — `DataRole` now holds only
+  genuinely data-role-specific fields (`rmw_lock`, `raftkv_metrics`,
+  `base_id`, `stream_seal_knobs`, `change_rates`); `ClientCtx::data()`
+  (panicking) survives for those, but `data_opt()` (the non-panicking
+  accessor this module used to be the sole caller of) was deleted as dead
+  code. Regression: `tests/stream_janitor.rs::
+  segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader`
+  — a genuine split deployment (3 control-only + 2 data-only nodes, no
+  combined-mode node anywhere) whose control leader (necessarily one of
+  the control-only trio) reclaims a sealed stream's segment objects,
+  including the physical on-disk delete at every recorded (data-only)
+  replica.
 - **`index_backfill.rs`'s loop body moved to `animus_node::
   index_backfill`** (ADR 0061 rung C2 — the first loop moved, and the only
   one needing no capability beyond `ControlLeaderHost<E>`: `metadata()`/
@@ -629,9 +691,10 @@ reusing the captured config is the point of the test.
   every tablet **currently** in that table's live tablet map (a fresh read
   every tick, never cached) has a matching row in `Metadata::index_backfill`
   — the per-tablet catalog the backfill seeder (`index_drain.rs`, below)
-  populates. Touches only replicated `Metadata` (no `SegmentStoreHandle`/
-  data role), so unlike the segment janitor it has **no** control-only-leader
-  scope gap: a pure control-only leader drives the flip too. See the
+  populates. Touches only replicated `Metadata` (no `SegmentStoreHandle`
+  needed at all), so it never had a control-only-leader scope gap to begin
+  with — unlike `segment_janitor.rs`'s own (since W-10, closed): a pure
+  control-only leader drives the flip too. See the
   module's own doc for the full design; `tests/index_backfill.rs` proves
   convergence, the no-premature-flip property against a hand-driven
   `MarkIndexBackfilled` sequence (this file's own suite predates the
@@ -823,6 +886,38 @@ reusing the captured config is the point of the test.
   method has a reason to carry. See `animus-node/CLAUDE.md`'s own rung C4d
   entry for the full design and the finding behind the wider-than-expected
   surface.
+  **`config_view` (ADR 0020, roadmap U-06)** carries, alongside the
+  identity/address/`auto_split_bytes_threshold` fields `AdminInfo` already
+  had: `backup_store`/`segment_store` (this node's own configured store,
+  redacted to `{kind, path}` via the `StoreView` type in `lib.rs` — never a
+  credential; `null` on a control-only node, which provisions neither),
+  `quiesce_after_ms` (the ADR 0048 threshold this node's reconciler was
+  actually started with, `null` when quiescence is off **or**
+  structurally inapplicable — control-only always; a data-only node
+  reports it since S-06 wired `cluster_settings.quiesce_after_secs`
+  through `start_data_with_growth`, see the Quiescence section below),
+  `auth_enabled`/`auth_access_key_ids` (ADR
+  0057's SigV4 gate — the access key **ids** only, never the secret; both
+  `null` on a control-only node, which never binds the dynamo listener,
+  `Some(false)`/`null` when the role has the listener but no `dynamo_auth`
+  section), and `otlp_endpoint` (`otel::resolved_endpoint()`, ADR 0027 —
+  `null` when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset/empty). Every field is
+  computed once at each `AdminInfo` construction site (`lib.rs`'s
+  `start_with_growth`/`start_control_with`/`start_data_with_growth`, plus
+  the in-crate `SimEnv` test harness), the same precedent
+  `auto_split_bytes_threshold` set — adding one means a compiler-driven
+  fan-out across all four `AdminInfo { .. }` literals, not a config_view-only
+  change. The dashboard's Node view (`dashboard_node.js::
+  renderNodeIdentity`) renders all six as extra `list-row`s below the
+  existing address list, skipping (not blanking) whichever ones are `null`
+  for this role — the same idiom `addrRows` already uses.
+  `tests/admin_endpoint.rs::admin_config_reports_auth_state_and_never_
+  serves_the_secret` is the secret-never-served regression: it asserts
+  against the raw serialized response body, not just the parsed
+  `auth_access_key_ids` field, so a secret leaking through some other key
+  would still be caught. `tests/dashboard_endpoint.rs::
+  dashboard_role_gating_split_deployment` covers the control-vs-data
+  null/present split.
 - **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
   0061 rung C4a): `read_http_request` does only `stream.read()`, handing
   every parsing decision (header-block framing, `Content-Length`
@@ -847,6 +942,10 @@ reusing the captured config is the point of the test.
   are still the regression net for the two thin wrappers themselves.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
+  **`resolved_endpoint()`** (roadmap U-06) factors `init_tracing`'s own env
+  lookup out into a standalone function so `AdminInfo::otlp_endpoint`
+  (`config_view`, above) can report the same resolved value without
+  duplicating the read.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
   animusd admin (ADR 0021's "AnimusDB Console") SPA: `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
@@ -875,6 +974,83 @@ reusing the captured config is the point of the test.
   card; and `dashboard_storage.js`'s `SYSTEM_TABLE_KINDS` extended to all 16
   `EntityKind` variants (`animus-control::syskv`), dropping a stray
   `"keyspace"` entry that never matched any real `EntityKind` segment.
+  **docs/roadmap.md U-02** added a ninth tab, Backups (`dashboard_backups.js`,
+  gated to control + combined exactly like Placement — no per-node fan-out,
+  just replicated `Metadata` a data-only node can't read locally): a render
+  of `/admin/backups`/`/admin/restores` (`admin.rs::backups_view`/
+  `restores_view`) plus a per-table PITR status row derived from
+  `/admin/status`'s own `schemas[*].pitr` (`TableSchema::pitr`,
+  `animus-control::schema`, already fetched — no third route), and four
+  gated actions, each behind `window.confirm` and posted through the
+  existing `/admin/data/dynamo` proxy (ADR 0021) with the real DynamoDB op
+  names/payload shapes: `CreateBackup{TableName,BackupName}`,
+  `DeleteBackup{BackupArn}`, `RestoreTableFromBackup{TargetTableName,
+  BackupArn}`, and `UpdateContinuousBackups{TableName,
+  PointInTimeRecoverySpecification:{PointInTimeRecoveryEnabled}}`. The
+  Create-backup table picker and the PITR table list both reuse
+  `dashboard_browser.js`'s `dynamoTables()` rather than a second table
+  fetch — `dashboard_backups.js` loads after `dashboard_browser.js` for
+  this reason. **No proxy allowlist change was needed**:
+  `admin.rs::action_data_dynamo` has no op allowlist beyond the bare-name
+  Streams-vs-item disambiguation (`STREAMS_OPS`), and none of these four
+  ops are Streams ops, so each resolves to the ordinary
+  `DynamoDB_20120810.<op>` item-API target and reaches
+  `animus_dynamo::wire::decode_request` unchanged — the same path every
+  other Data Browser mutation already takes. `admin.rs`'s own `backup_id`
+  field **is** the backup's DynamoDB ARN, not a bare id (`wire::backup_arn`
+  mints the whole ARN as the catalog's opaque `BackupId` key, `animus-
+  dynamo::wire`'s own doc), so the row's `backup_id` is posted directly as
+  `BackupArn` with no client-side ARN construction. `RestoreTableFromBackup`
+  is the only action needing input beyond confirmation (the new table's
+  name) — taken via `window.prompt`, this tab's one departure from the
+  Data Browser's static-form convention, since a per-row target-table
+  prompt has no natural home in a persistent form the way Create-backup's
+  table+name pair does.
+
+  **docs/roadmap.md U-04** (`dashboard_browser.js`) added a `#br-dy-ttl`
+  row beside `#br-dy-stream` (`renderTtlRow`, called from
+  `renderDynamoFields` alongside `renderStreamRow`) — same shape as the
+  Stream row: current state read straight off the already-fetched
+  `schema.ttl` (`/admin/status`, the identical replicated-catalog fact
+  `dynamo::describe_time_to_live`'s own `meta.table_ttl(table)` read
+  answers, so no extra `DescribeTimeToLive` round trip), enable/disable
+  posted through the existing `/admin/data/dynamo` proxy behind
+  `window.confirm` with the real `UpdateTimeToLive{TableName,
+  TimeToLiveSpecification:{Enabled,AttributeName}}` shape — `AttributeName`
+  is sent on **both** calls (AWS requires it even to disable, to name the
+  attribute being disabled), so `disableTtl` reads it back off `schema.ttl`
+  rather than asking the user to retype it. **`#br-dy-table-form`
+  (`submitTableForm`) now declares GSIs, LSIs, a stream, and TTL in one
+  place**, mirroring `console::ConsoleBackend::create_table`'s own request
+  sequence (`lib.rs`, above): a real `CreateTable` call whose
+  `AttributeDefinitions` covers every base **and** index key attribute —
+  the base key's own type picker, every index-only key attribute defaulted
+  to `"S"` (`declareDefault`, the same default `schema::column_type_for
+  (None)` applies bridge-side — this form collects no type for an
+  index-only key attribute, a deliberate scope cut inherited from the
+  console's own precedent, not a mechanism gap) — followed by a
+  `UpdateTimeToLive` call once the table exists, since `CreateTable`'s own
+  wire shape carries no TTL field. `addCtLsiRow`/`addCtGsiRow` are dynamic
+  attribute-row editors (`+ LSI`/`+ GSI`, a remove button per row), the same
+  shape `addItemAttrRow` above already uses; unlike the "Add index (GSI)"
+  form's own LSI-less scope (ADR 0045 §7 — an LSI can't be added to a
+  populated table), this form's LSI rows **do** get a real
+  `ALL`/`KEYS_ONLY`/`INCLUDE` projection control, since `wire::
+  decode_index_entry` parses `Projection` identically for a `CreateTable`-
+  declared GSI or LSI (`animus-dynamo/CLAUDE.md`'s own module doc) — a
+  wire-supported field the console's own create-table form deliberately
+  omits for LSIs (its own `CreateLsiRequest` doc), but nothing stops this
+  form from offering it. Client-side validation mirrors
+  `ConsoleBackend::create_table`'s own checks verbatim (every GSI/LSI needs
+  a name and hash/sort attribute, an LSI needs the table's own sort key,
+  an `INCLUDE` projection needs at least one non-key attribute, TTL needs
+  an attribute name to enable) so a mistake is caught here rather than
+  bouncing off the wire as a decode error. Tests:
+  `tests/dashboard_endpoint.rs::dashboard_u04_ttl_row`/
+  `dashboard_u04_create_table_form` (the same render-markers-plus-live-
+  round-trip structure as U-01/U-02's own tests above) — the actual
+  `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics keep their full
+  end-to-end coverage in `tests/dynamo_ttl.rs`, unchanged by this item.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
@@ -1073,6 +1249,39 @@ reusing the captured config is the point of the test.
   fourth amendment (referenced above) plus that ADR generally for why the
   console does *not* join the replicated `NodeAddrs` book — no other node
   ever needs to resolve it.
+- **`TableDetail` gains `pitr`/`backups` (roadmap U-03, ADR 0059 §3/§4/§9)**
+  — no `ConsoleBackend` widening this time (unlike every PR above): both
+  new fields are read-only projections `console_table_detail`
+  (`lib.rs`) builds alongside the GSI/LSI/stream/TTL fields it already
+  computes, so `table_detail`'s existing one method covers them for free.
+  `pitr: Option<console::PitrStatus>` is `None` when continuous backups are
+  disabled — an `Option` on the *outer* field replacing the `enabled: bool`
+  companion-field shape `StreamSummary`/`TtlSummary` use, since there is
+  nothing else to carry when disabled; `Some` reuses `dynamo::
+  pitr_description` **verbatim** (widened to `pub(crate)`) rather than
+  re-deriving `DescribeContinuousBackups`'s own restore-window computation
+  a second way. `backups: Vec<console::BackupSummary>` (`backup_id`/
+  `status`/`created_wall_ms` only — never a node/tablet/replica/object-path
+  detail, ADR 0052's own rule) is `meta.backups` filtered to this table's
+  own rows, excluding an `Expired`/`Failed` row (the identical filter
+  `visible_backup`/`list_backups` already apply) and a PITR base snapshot
+  (`meta.pitr_base_backups` — internal machinery, never a user's own
+  `CreateBackup`, mirroring `ListBackups`' own default `USER`-only filter);
+  `dynamo::backup_wire_status` (also widened to `pub(crate)`) supplies the
+  same `CREATING`/`AVAILABLE`/`DELETED` label `DescribeBackup`/`ListBackups`
+  use. **Table-scoped, not backup-scoped**: a backup outliving its dropped
+  source table (ADR 0059 §3's own "scar") never appears here — this list is
+  for a live table's own detail page only, reached instead via
+  `DescribeBackup`/`ListBackups` directly. `console.js`'s Config tab gained
+  a fourth jump-nav section, "Backups" (`renderBackupsSection`, between
+  Indexes and Danger zone) — a read-only fact strip for the PITR status
+  plus a plain list for on-demand backups, no new endpoint and no edit
+  affordance (this item adds no way to enable PITR or create a backup from
+  the console — only DynamoDB's own `UpdateContinuousBackups`/
+  `CreateBackup` calls do that today). Tests:
+  `tests/console_table_config.rs`'s
+  `table_detail_with_no_pitr_or_backups_is_null_and_empty`/
+  `table_detail_shows_pitr_status_and_backups`.
 
 ## CLI reference
 
@@ -2224,7 +2433,8 @@ crate's `CLAUDE.md`. This crate's own contribution:
   `CpGroup::is_quiesced()`/`RaftKvNode::is_quiesced()` are pure frozen
   accessors, so an open dashboard tab cannot un-quiesce a fleet.
 - **Production wiring**: `--quiesce-after SECS` (`main.rs`) threads through
-  `--config`/`--node` (`run_node_with_streams_and_quiesce_after` →
+  `--config`/`--node` (`run_single` → `run_node_with_cluster_settings` →
+  `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
   `BoundNode::start_with_growth`) and `--cluster N`
   (`start_cluster_with_growth_and_quiesce_after`) — **defaults ON at 5s**
   (`main::DEFAULT_QUIESCE_AFTER_SECS`; `0` disables). See that constant's
@@ -2233,8 +2443,27 @@ crate's `CLAUDE.md`. This crate's own contribution:
   sustained mixed load with real inter-process latency) — a
   maintainer-reviewable call, not a settled fact. Not yet wired for the
   `--cluster-control`/`--cluster-data` split-deployment dev path or the
-  standalone `control`/`data`/`join` subcommands (documented gaps in
-  `main.rs`'s own module doc).
+  standalone `control`/`join` subcommands (documented gaps in `main.rs`'s
+  own module doc). **`animusd data --config` also reaches it now (S-06)** —
+  `BoundDataNode::start_data_with_growth` gained its own `quiesce_after`
+  parameter and `enable_quiescence` call (mirroring the combined-mode
+  reconciler's), closing what used to be a hardcoded `Duration::ZERO` on
+  every data-only node; not via a CLI flag of its own, but through the same
+  `ClusterConfig::cluster_settings.quiesce_after_secs` config-file section
+  `--config`/`--node` also reads (`ClusterSettings`'s own doc in
+  `config.rs` has the field-by-field applicability breakdown, and the root
+  `CLAUDE.md`'s auto-split entry / ADR 0034/0040/0048's amendment notes
+  cover the section as a whole). A CLI flag and the config section setting
+  the *same* field is a hard startup error (`resolve_cluster_settings` in
+  `main.rs`), the identical "one way, not both" contract `--dynamo-auth`
+  already uses.
+- **`/admin/config`'s `quiesce_after_ms`** (roadmap U-06) reports the actual
+  threshold this node's own reconciler was started with — `null` when it's
+  `0`/disabled (on a data-only node that means no
+  `cluster_settings.quiesce_after_secs` in its config, since S-06 is the
+  only route to the knob there — there is still no `data --config` CLI
+  flag) and on a control-only node (structurally inapplicable — no CP-data
+  tablet to quiesce). See `admin.rs::config_view`, above.
 
 Tests: `index_drain.rs`'s own `stream_sealer_tests` module (in-crate, needs
 private `CpGroup` access) covers the veto end to end
@@ -2597,14 +2826,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   (`animus_cp_data::backup::backup_manifest_object_id`/
   `backup_data_object_id` vs. `animus_cp_data::segment::segment_id`) are
   already disjoint, the same belt-and-suspenders posture the ADR itself
-  takes for the namespace split. `BackupStoreHandle` (`DataRole::
-  backup_store`, alongside `DataRole::segment_store`) is threaded through
-  combined (`BoundNode::start_with_growth`) and data-only
-  (`BoundDataNode::start_data_with_growth`) node assembly — **never**
-  control-only (`BoundControlNode::start_control_with` takes no such
-  parameter at all), the identical "no data role, no `SegmentStoreHandle`-
-  shaped handle" gap the streams segment janitor already documents for ADR
-  0043 §A9, inherited rather than fixed here. **Consumed since Train 1
+  takes for the namespace split. `BackupStoreHandle` (`ClientCtx::
+  backup_store`, alongside `ClientCtx::segment_store` — **W-10 moved both
+  off `DataRole` onto `ClientCtx` itself**, provisioned on every node
+  shape) is threaded through combined (`BoundNode::start_with_growth`),
+  data-only (`BoundDataNode::start_data_with_growth`), **and now
+  control-only** (`BoundControlNode::start_control_with`, W-10, ADR 0043
+  §A9's control-only-leader gap — closed) node assembly. **Consumed since Train 1
   PR③** (`#[allow(dead_code)]` removed from `BackupStoreHandle`/its impl/
   `DataRole::backup_store`, PR② → PR③'s own promised follow-up): the
   capture driver (`backup_capture.rs`) `put`s chunked data objects and the
@@ -2624,10 +2852,13 @@ route below the edge through the same `ClientCtx` CP primitives.
   `#[allow(dead_code)]`-marked — neither gained a caller in Train 2 either
   (`delete`, unlike the janitor's own `delete_local`, still has no recorded
   `replicas` list to call it with; restore never deletes anything).
-  `data --config`/`data --seed`/`control`/`join`/`--cluster-control`+
-  `--cluster-data` all default to `BackupStoreConfig::Cluster` internally —
-  no CLI flag reaches any of them, the identical documented gap
-  `--segment-store` already has on those same entry points.
+  `data --config`/`data --seed`/`join`/`--cluster-control`+`--cluster-data`
+  all default to `BackupStoreConfig::Cluster` internally — no CLI flag
+  reaches any of them, the identical documented gap `--segment-store` has
+  on those same entry points. **`animusd control` is the one exception
+  (W-10)**: `--segment-store`/`--backup-store` now thread through it
+  exactly as they do through `--config`/`--node` and `--cluster N`
+  (`main.rs`'s `run_control` → `run_node_control_with_stores`).
 - **`backup_capture.rs`** (ADR 0059 §4/§5/§6, Train 1 PR③) — the on-demand
   backup **capture driver**: a per-tablet, leader-side, event-driven loop
   (`backup_capture_loop`, the same "run everywhere, self-gate per tablet on
@@ -2676,13 +2907,14 @@ route below the edge through the same `ClientCtx` CP primitives.
   manifest), `put`s it **before** proposing `MetaCommand::CompleteBackup`
   (durable-before-visible, ADR 0059 §4) — or, past a driver-local
   `STUCK_CREATING_TIMEOUT` (10 minutes, no CLI knob yet) with zero observed
-  report-count growth, proposes `MetaCommand::FailBackup`. **Inherits the
-  identical control-only-leader scope gap `segment_janitor.rs` already
-  documents**: failing needs only `Metadata` (a control-only leader can do
-  it); completing needs a `BackupStoreHandle`, which no control-only node
-  provisions (`ClientCtx::data_opt() == None` there) — spawned on combined
-  and control-only nodes (never data-only, which never becomes control
-  leader at all).
+  report-count growth, proposes `MetaCommand::FailBackup`. **The
+  control-only-leader scope gap `segment_janitor.rs` used to document is
+  closed (W-10)**: failing always needed only `Metadata` (a control-only
+  leader could always do it); completing needs a `BackupStoreHandle` to
+  durably `put` the manifest, which every node shape now provisions
+  (`ClientCtx::backup_store`, never gated on data role) — spawned on
+  combined and control-only nodes (never data-only, which never becomes
+  control leader at all).
 - **`backup_janitor.rs`'s loop body moved to `animus_node::backup_janitor`**
   (ADR 0061 rung C2) — this module is now a thin wrapper, same shape as
   `backup_completion.rs`'s own move above. The regression tests that used
@@ -2714,11 +2946,11 @@ route below the edge through the same `ClientCtx` CP primitives.
   first tick, before a node that does hold a copy ever sweeps its own —
   those copies become permanent, uncataloged orphans. See the module's own
   doc, the ADR's 2026-08-27 as-built amendment, and `docs/engineering-
-  lessons.md` for the full note. **Inherits the identical control-only-
-  leader scope gap** `segment_janitor.rs`/`backup_completion.rs` already
-  document (object reclaim needs a `BackupStoreHandle`, which no
-  control-only node provisions) — spawned on combined and control-only
-  nodes, never data-only.
+  lessons.md` for the full note. **The control-only-leader scope gap
+  `segment_janitor.rs`/`backup_completion.rs` used to document is closed
+  (W-10)**: object reclaim needs a `BackupStoreHandle`, which every node
+  shape now provisions (`ClientCtx::backup_store`) — spawned on combined
+  and control-only nodes, never data-only.
 - **`backup_restore.rs`** (ADR 0059 §7, Train 2; §10, Train 3 PR②) — the **restore driver**:
   a per-tablet, leader-side, event-driven loop (`backup_restore_loop`, the
   identical "run everywhere, self-gate per tablet on `group.is_leader()`"
@@ -3249,19 +3481,35 @@ precisely located blockers, neither introduced by this rung:**
   bypassing `ClientCtx` entirely for setup — the identical thing
   `animus-node/tests/index_backfill_sim.rs` already does for the same
   reason.
-- **`DataRole`'s `SegmentStoreHandle`/`BackupStoreHandle`.** Both hardcode
-  `FsSegmentStore`/`ClusterSegmentStore<ProdEnv, FsSegmentStore>`
-  regardless of the enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s
-  `prod` feature is unconditionally on for this crate, so `FsSegmentStore`
-  genuinely exists here — the blocker isn't C0's feature gate, it's that
-  neither handle type takes an `E` parameter at all). A real `DataRole`
-  therefore cannot be built generically today. Not exercised by this rung:
-  neither `cp_kind_write_raw` nor `cp_get` ever calls
-  `self.data()`/`self.data_opt()` (verified by reading both call chains,
-  not assumed), so `data: None` is sufficient to prove this rung's claim.
-  Any future extension that needs a real `DataRole` under `SimEnv` (the
-  DynamoDB-shaped `cp_kind_write_item` write path, the TTL/backup/stream
-  loops) hits this blocker first.
+- **`ClientCtx::segment_store`/`backup_store`'s `SegmentStoreHandle`/
+  `BackupStoreHandle`.** Both hardcode `FsSegmentStore`/
+  `ClusterSegmentStore<ProdEnv, FsSegmentStore>` regardless of the
+  enclosing `ClientCtx<E, R>`'s `E` (`animus-env`'s `prod` feature is
+  unconditionally on for this crate, so `FsSegmentStore` genuinely exists
+  here — the blocker isn't C0's feature gate, it's that neither handle
+  type takes an `E` parameter at all). **W-10 moved these two fields off
+  `DataRole` onto `ClientCtx` itself** (provisioned on every node shape,
+  including control-only — see `ClientCtx::segment_store`'s own doc), so
+  unlike every other `DataRole` field this harness's fixture can no longer
+  dodge them via `data: None` — every `ClientCtx` construction, generic
+  `E` included, now needs a real value for both. The fixture (below) works
+  around this the same way it already dodges the schema-DDL blocker above:
+  `SegmentStoreHandle::Fs`/`BackupStoreHandle::Fs` are the one variant of
+  each enum that carries no `E`-typed (or any `ProdEnv`-typed) state at
+  all — `FsSegmentStore::new` doesn't touch the filesystem or any `Env`
+  until `put`/`get`/`delete` is actually called — so a placeholder `Fs`
+  value satisfies the field without needing `ProdEnv` or touching disk;
+  `single_node_ctx`'s own doc has the detail. Only the **`Cluster`**
+  variant is the genuine blocker: neither `cp_kind_write_raw` nor `cp_get`
+  ever reads `ctx.segment_store`/`ctx.backup_store` at all (verified by
+  reading both call chains, not assumed), so this rung never needed a real
+  `Cluster`-backed handle to prove its claim. Any future extension that
+  needs a genuinely working (not placeholder) store handle under `SimEnv`
+  (the segment janitor, the backup/PITR capture-and-reclaim loops) hits
+  this blocker first — it would need a `SimSegmentStore`-shaped
+  `SegmentStoreHandle`/`BackupStoreHandle` variant, which doesn't exist in
+  this crate (ADR 0043 §A7b's `SimSegmentStore` is `animus-cp-data`'s own
+  sim-corpus concern, never reached from here).
 
 **Not yet generic, also worth knowing before extending this harness**:
 `handle_request` and `dynamo::marker_batch_write_raw`/
@@ -3269,10 +3517,11 @@ precisely located blockers, neither introduced by this rung:**
 `&ClientCtx` (`E = ProdEnv`) — only the five split modules
 (`schema`/`read_path`/`write_path`/`txn_coordinator`/`forwarding`) and a
 handful of `lib.rs`-resident crate-wide accessors
-(`effective_metadata`/`data`/`data_opt`/…) are `E`-generic today. Driving
+(`effective_metadata`/`data`/…) are `E`-generic today (`data_opt` no
+longer exists, W-10 — see this file's own entry above). Driving
 the DynamoDB wire-shaped write path (`cp_kind_write_item`, which *is*
 already `E`-generic in `write_path.rs`) under `SimEnv` is reachable in a
-follow-on rung once a `SimEnv`-safe `DataRole` exists; driving
+follow-on rung once a `SimEnv`-safe `DataRole`/store-handle pair exists; driving
 `handle_request`/`dynamo.rs`'s handlers themselves is a larger, separate
 genericization this rung did not attempt.
 

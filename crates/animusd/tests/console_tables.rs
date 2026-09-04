@@ -133,7 +133,7 @@ async fn tables_endpoint_projects_the_schema_catalog_correctly() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"without_sort_key",
+            r#"{"TableName":"without_sort_key","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -170,7 +170,7 @@ async fn tables_endpoint_projects_the_schema_catalog_correctly() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"with_stream",
+            r#"{"TableName":"with_stream","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}}"#,
         )
@@ -181,7 +181,7 @@ async fn tables_endpoint_projects_the_schema_catalog_correctly() {
         let (status, body) = dynamo(
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
-            r#"{"TableName":"with_ttl",
+            r#"{"TableName":"with_ttl","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;

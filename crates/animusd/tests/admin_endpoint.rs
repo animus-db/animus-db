@@ -10,10 +10,11 @@
 //! written key out to an SSTable observed via `storage/lsm`). Real time + sockets,
 //! so it polls with generous timeouts.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, Node, read_frame};
+use animusd::{ClientRequest, ClientResponse, DynamoAuthConfig, Node, read_frame};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -45,6 +46,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -99,6 +101,7 @@ async fn bring_up_with_streams_quiesce(
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         let mut failed = false;
@@ -274,6 +277,46 @@ async fn admin_interface_surfaces_state_and_actions() {
             config_view["addrs"]["admin"].as_str(),
             Some(admin_addr.to_string().as_str()),
             "config echoes the admin address: {config_view}"
+        );
+        // U-06 (docs/roadmap.md): a combined-mode node started through plain
+        // `run_node` gets the production-default `Cluster` stores, no
+        // quiescence (disabled by default), and no `dynamo_auth` section —
+        // `auth_enabled` is `Some(false)`, never `null` (combined nodes bind
+        // the dynamo listener, so the field applies), and no key ids.
+        assert_eq!(
+            config_view["backup_store"]["kind"].as_str(),
+            Some("cluster"),
+            "default backup store: {config_view}"
+        );
+        assert_eq!(
+            config_view["segment_store"]["kind"].as_str(),
+            Some("cluster"),
+            "default segment store: {config_view}"
+        );
+        assert!(
+            config_view["quiesce_after_ms"].is_null(),
+            "quiescence is off by default: {config_view}"
+        );
+        assert_eq!(
+            config_view["auth_enabled"].as_bool(),
+            Some(false),
+            "no dynamo_auth section: {config_view}"
+        );
+        assert!(
+            config_view["auth_access_key_ids"].is_null(),
+            "auth is off: {config_view}"
+        );
+        // The resolved OTLP endpoint mirrors `animusd::otel::resolved_endpoint`'s
+        // own env-var read exactly — asserted against the live process
+        // environment rather than hardcoded to `null`, so this doesn't go
+        // flaky under a CI runner that happens to export the var.
+        let expected_otlp = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .filter(|e| !e.is_empty());
+        assert_eq!(
+            config_view["otlp_endpoint"].as_str().map(str::to_owned),
+            expected_otlp,
+            "resolved OTLP endpoint mirrors the process env: {config_view}"
         );
 
         // ---- /admin/status -------------------------------------------------
@@ -1357,6 +1400,88 @@ async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
         for node in &nodes {
             node.shutdown_graceful().await;
         }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Bring up a single node with a `dynamo_auth` section (ADR 0057), retrying
+/// the port-TOCTOU race exactly like [`bring_up`] does — this file's own
+/// copy since `bring_up` always builds a config with `dynamo_auth: None`,
+/// the same "sibling test modules keep their own fixtures independent"
+/// convention `dynamo_sigv4.rs::start_single_node_with_auth` already uses.
+async fn bring_up_with_auth(
+    dir: &std::path::Path,
+    credentials: BTreeMap<String, String>,
+) -> (Node, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(6);
+        let config = animusd::ClusterConfig {
+            nodes: vec![animusd::RoleAddrs {
+                id: animusd::config::node_id(0),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[0],
+                client: addrs[1],
+                dynamo: addrs[2],
+                admin: addrs[3],
+                intra: addrs[4],
+                console: addrs[5],
+                advertise_host: None,
+            }],
+            dynamo_auth: Some(DynamoAuthConfig {
+                credentials: credentials.clone(),
+            }),
+            cluster_settings: None,
+        };
+        match animusd::run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
+            Ok(node) => return (node, config),
+            Err(_) => sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("single node (dynamo_auth) failed to start after retries (ports kept getting stolen)");
+}
+
+/// U-06 (docs/roadmap.md): `/admin/config` reports `auth_enabled: true` and
+/// the configured access key **ids** once a `dynamo_auth` section is
+/// present — and, load-bearing, the configured *secret* never appears
+/// anywhere in the served JSON, however it's rendered. Asserted against the
+/// raw response body text, not just the parsed `auth_access_key_ids` field,
+/// so this would catch the secret leaking through some other field too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_config_reports_auth_state_and_never_serves_the_secret() {
+    timeout(Duration::from_secs(30), async {
+        const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+        const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let mut credentials = BTreeMap::new();
+        credentials.insert(ACCESS_KEY_ID.to_string(), SECRET.to_string());
+
+        let dir = support::panic_safe_tempdir();
+        let (node, _config) = bring_up_with_auth(dir.path(), credentials).await;
+        let admin_addr = node.admin_addr();
+
+        let (status, config_view) = admin_get(admin_addr, "/admin/config").await;
+        assert_eq!(status, 200, "config_view: {config_view}");
+
+        assert_eq!(
+            config_view["auth_enabled"].as_bool(),
+            Some(true),
+            "a dynamo_auth section is configured: {config_view}"
+        );
+        assert_eq!(
+            config_view["auth_access_key_ids"].as_array(),
+            Some(&vec![Value::String(ACCESS_KEY_ID.to_string())]),
+            "the access key id (never the secret) is reported: {config_view}"
+        );
+
+        // The load-bearing assertion: the secret never leaves this node's
+        // admin surface, in this field or any other.
+        let raw = serde_json::to_string(&config_view).expect("config_view serializes");
+        assert!(
+            !raw.contains(SECRET),
+            "the SigV4 secret access key must never appear in /admin/config: {raw}"
+        );
+
+        node.shutdown_graceful().await;
     })
     .await
     .expect("test timed out");

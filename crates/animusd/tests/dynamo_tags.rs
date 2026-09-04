@@ -77,6 +77,7 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
 async fn create_table(addr: SocketAddr, name: &str) {
     let body = format!(
         r#"{{"TableName":"{name}",
+            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}],
             "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}]}}"#
     );
     let (status, resp) = dynamo(addr, "DynamoDB_20120810.CreateTable", &body).await;

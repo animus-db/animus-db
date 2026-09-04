@@ -677,13 +677,16 @@
       <nav class="jump-nav">
         <a href="#settings">Settings</a>
         <a href="#indexes">Indexes</a>
+        <a href="#backups">Backups</a>
         <a href="#danger">Danger zone</a>
       </nav>
       <section id="settings" class="config-section"></section>
       <section id="indexes" class="config-section"></section>
+      <section id="backups" class="config-section"></section>
       <section id="danger" class="config-section"></section>`;
     renderSettingsSection();
     renderIndexesSection();
+    renderBackupsSection();
     renderDangerSection();
   }
 
@@ -953,6 +956,60 @@
       btn.disabled = false;
       window.alert(`Couldn't drop index “${name}”: ${e.message || e}`);
     }
+  }
+
+  // -- Backups: continuous backups (PITR) status + on-demand backups list --
+  // (U-03) — read-only: this screen only surfaces what `CreateBackup`/
+  // `UpdateContinuousBackups` on a real DynamoDB client already produced,
+  // never a place to kick either off. Every field here is table-scoped —
+  // no node/tablet/replica/placement detail, per ADR 0052's own rule.
+
+  function backupStatusPill(status) {
+    const cls = status === "AVAILABLE" ? "pill-active" : status === "CREATING" ? "pill-creating" : "pill-deleting";
+    return `<span class="status-pill ${cls}">${esc(status)}</span>`;
+  }
+
+  function fmtWallMs(ms) {
+    return ms == null ? '<span class="dash">—</span>' : esc(new Date(ms).toLocaleString());
+  }
+
+  function renderBackupsSection() {
+    const d = TABLE_DETAIL;
+    const el = document.getElementById("backups");
+    const p = d.pitr;
+    el.innerHTML = `
+      <h2>Backups</h2>
+      <h3 class="subhead">Continuous backups (point-in-time recovery)</h3>
+      <div class="fact-strip">
+        <div class="fact"><span class="fact-label">Status</span><span class="fact-value">${
+          p ? '<span class="bool-yes">Enabled</span>' : '<span class="bool-no">Disabled</span>'
+        }</span></div>
+        <div class="fact"><span class="fact-label">Earliest restorable</span><span class="fact-value">${
+          p ? fmtWallMs(p.earliest_restorable_ms) : '<span class="dash">—</span>'
+        }</span></div>
+        <div class="fact"><span class="fact-label">Latest restorable</span><span class="fact-value">${
+          p ? fmtWallMs(p.latest_restorable_ms) : '<span class="dash">—</span>'
+        }</span></div>
+      </div>
+      <h3 class="subhead">On-demand backups</h3>
+      <div class="index-card">
+        <div class="index-list">${
+          d.backups.length
+            ? d.backups
+                .map(
+                  (b) => `
+          <div class="index-row">
+            <div class="index-row-main">
+              <span class="index-name mono">${esc(b.backup_id)}</span>
+              ${backupStatusPill(b.status)}
+            </div>
+            <div class="index-row-keys">Created ${fmtWallMs(b.created_wall_ms)}</div>
+          </div>`
+                )
+                .join("")
+            : '<div class="empty-state">No on-demand backups.</div>'
+        }</div>
+      </div>`;
   }
 
   // -- Danger zone: delete the table, with a typed-name confirm step -------

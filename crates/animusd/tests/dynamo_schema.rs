@@ -217,7 +217,7 @@ async fn create_table_survives_node_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
                          {"AttributeName":"sk","KeyType":"RANGE"}]}"#,
     )
@@ -425,7 +425,7 @@ async fn create_table_index_replicates_to_second_node() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -517,7 +517,7 @@ async fn create_table_index_survives_node_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -579,7 +579,7 @@ async fn create_table_index_survives_node_restart() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -623,7 +623,7 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -731,7 +731,7 @@ async fn extended_surface() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"notes","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"notes","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
     assert_eq!(status, 200, "CreateTable(notes) failed: {body}");

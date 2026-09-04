@@ -195,6 +195,9 @@ async fn join_control_nonvoter(
                 admin_addrs,
                 StorageBackend::Memory,
                 animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::SegmentStoreConfig::default(),
+                animusd::BackupStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
             )
             .await
             .expect("open the growth control-only node's system-keyspace engine");

@@ -202,15 +202,21 @@ async fn create_minimal_table_appears_in_tables_list() {
 /// caught issue #319 on the *create* path: tracing `CreateTable`'s decoder
 /// (`animus_dynamo::wire::decode_key_schema`/`decode_attribute_types`, the
 /// `schema` bridge's `to_control`/`index_to_control`) found that an index's
-/// own key attribute gets **no** recorded type even when the index is
-/// declared at `CreateTable` time — `to_control` only ever builds a
+/// own key attribute used to get **no** recorded type even when the index
+/// was declared at `CreateTable` time — `to_control` only ever built a
 /// `ColumnDef` for the base table's own partition/sort key, and
-/// `index_to_control` never receives `key_types` at all. So both the GSI's
-/// hash/sort attributes and the LSI's own alternate sort attribute (all
-/// three chosen here to be distinct from the base table's own key names,
-/// so nothing resolves a type by pure name coincidence) must read back with
-/// `attribute_type: null` — the console honestly reporting an absence, not
-/// a fabricated `"S"`.
+/// `index_to_control` never received `key_types` at all. **Roadmap W-11**
+/// changed this: `AttributeDefinitions` must now cover every key attribute
+/// a request's key schema names (base *and* every index), and this
+/// console form has no picker for an index-only key attribute's type
+/// (`CreateGsiRequest`/`CreateLsiRequest` carry key attribute *names*
+/// only — a deliberate console-form scope cut, `console::
+/// CreateTableRequest`'s own doc), so `create_table` now declares `"S"`
+/// for each one rather than omitting the entry — both the GSI's hash/sort
+/// attributes and the LSI's own alternate sort attribute (all three chosen
+/// here to be distinct from the base table's own key names, so nothing
+/// resolves a type by pure name coincidence) read back with
+/// `attribute_type: "S"`, not `null`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_full_table_declares_everything_exactly() {
     timeout(Duration::from_secs(30), async {
@@ -258,10 +264,10 @@ async fn create_full_table_declares_everything_exactly() {
         assert_eq!(lsis.len(), 1);
         assert_eq!(lsis[0]["name"], "by-score");
         assert_eq!(lsis[0]["sort_attribute"]["name"], "score");
-        assert!(
-            lsis[0]["sort_attribute"]["attribute_type"].is_null(),
-            "an LSI's own alternate sort attribute has no recorded type, even \
-             declared at CreateTable time: {body}"
+        assert_eq!(
+            lsis[0]["sort_attribute"]["attribute_type"], "S",
+            "an LSI's own alternate sort attribute defaults to a declared S \
+             type when declared at CreateTable time: {body}"
         );
         assert!(
             lsis[0].get("status").is_none(),
@@ -272,13 +278,13 @@ async fn create_full_table_declares_everything_exactly() {
         assert_eq!(gsis.len(), 1);
         assert_eq!(gsis[0]["name"], "by-region");
         assert_eq!(gsis[0]["hash_attribute"]["name"], "region");
-        assert!(
-            gsis[0]["hash_attribute"]["attribute_type"].is_null(),
-            "a GSI's hash attribute has no recorded type, even declared at \
-             CreateTable time: {body}"
+        assert_eq!(
+            gsis[0]["hash_attribute"]["attribute_type"], "S",
+            "a GSI's hash attribute defaults to a declared S type when \
+             declared at CreateTable time: {body}"
         );
         assert_eq!(gsis[0]["sort_attribute"]["name"], "priority");
-        assert!(gsis[0]["sort_attribute"]["attribute_type"].is_null());
+        assert_eq!(gsis[0]["sort_attribute"]["attribute_type"], "S");
         assert_eq!(
             gsis[0]["status"], "ACTIVE",
             "a CreateTable-declared index is Active immediately (ADR 0041 §5, \

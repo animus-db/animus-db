@@ -76,6 +76,7 @@ async fn start_control(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node
     let config = animusd::ClusterConfig {
         nodes: vec![addrs],
         dynamo_auth: None,
+        cluster_settings: None,
     };
     animusd::run_node_control(&config, 0, dir, StorageBackend::Memory)
         .await

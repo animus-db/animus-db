@@ -180,6 +180,7 @@ async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name(
                 role_addrs_at(1, addrs, None),
             ],
             dynamo_auth: None,
+            cluster_settings: None,
         },
         2,
         dir.path(),
@@ -252,6 +253,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
                 role_addrs_at(1, addrs, Some(HOST)),
             ],
             dynamo_auth: None,
+            cluster_settings: None,
         },
         2,
         dir.path(),
@@ -383,6 +385,7 @@ async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
                 .map(|i| role_addrs_at(i, addrs, Some("localhost")))
                 .collect(),
             dynamo_auth: None,
+            cluster_settings: None,
         },
         n,
         dir.path(),

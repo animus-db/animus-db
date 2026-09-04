@@ -12,6 +12,11 @@
 // `tabletsForTable`, reused below for the Indexes card's backfill-progress
 // count — a stream shard count and an index backfill count both need "every
 // tablet currently mapped to this table", the same live-topology lookup).
+// docs/roadmap.md U-04 added the TTL row (beside the Stream row, same
+// enable/disable-via-`/admin/data/dynamo` shape) and extended the
+// create-table form to declare GSIs/LSIs/a stream/TTL in one `CreateTable`
+// call plus a TTL follow-up, mirroring `console::ConsoleBackend::
+// create_table`'s own request sequence (`crates/animusd/src/lib.rs`).
 
 // ---- DynamoDB: schema helpers (shared by Scan/Query/item forms) ----
 // Excludes a GSI's own hidden `<base>$<index>` materialization table
@@ -167,6 +172,7 @@ function renderDynamoFields() {
   renderIndexSelector(schema);
   renderIndexesSection(schema);
   renderStreamRow(schema);
+  renderTtlRow(schema);
 }
 
 // ---- DynamoDB Streams: enable/disable (ADR 0042/0043) ----
@@ -231,6 +237,82 @@ async function disableStream() {
   });
   if (status >= 300) {
     const msg = $("br-dy-stream-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+// ---- DynamoDB TTL: enable/disable (ADR 0051) ----
+// A table's TTL toggle lives here, right beside the Stream row above and for
+// the identical reason (a per-table action, not a cluster-wide view). Status
+// is read straight off `schema.ttl` — already part of the /admin/status
+// payload this view polls, the same replicated-catalog fact
+// `dynamo::describe_time_to_live`'s own `meta.table_ttl(table)` read would
+// answer — so no extra `DescribeTimeToLive` round trip is needed to render
+// current state; enable/disable post the real `UpdateTimeToLive` op through
+// the same `/admin/data/dynamo` proxy every other Data Browser mutation
+// uses, behind `window.confirm`. AWS requires `AttributeName` on every call,
+// including a disable, so the disable path always echoes the currently
+// enabled attribute back.
+function renderTtlRow(schema) {
+  const el = $("br-dy-ttl");
+  if (!schema) { el.innerHTML = ""; return; }
+  const ttl = schema.ttl;
+  if (ttl) {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>TTL</h2>
+      <div class="row" style="justify-content:space-between">
+        <div class="row">${pill("ok", "ENABLED")}<span class="mono">${esc(ttl.attribute_name)}</span></div>
+        <div class="row"><span class="muted" id="br-dy-ttl-msg"></span><button class="danger-text" id="br-dy-ttl-disable">Disable</button></div>
+      </div>
+    </div>`;
+    $("br-dy-ttl-disable").addEventListener("click", disableTtl);
+  } else {
+    el.innerHTML = `<div class="card scroll" style="margin-top:2px">
+      <h2>TTL</h2>
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">no TTL enabled</span>
+        <div class="row">
+          <span class="muted" id="br-dy-ttl-msg"></span>
+          <input type="text" id="br-dy-ttl-attr" placeholder="attribute" style="width:130px">
+          <button id="br-dy-ttl-enable">Enable</button>
+        </div>
+      </div>
+    </div>`;
+    $("br-dy-ttl-enable").addEventListener("click", enableTtl);
+  }
+}
+
+async function enableTtl() {
+  const table = dyTable;
+  const attr = $("br-dy-ttl-attr").value.trim();
+  if (!attr) { $("br-dy-ttl-msg").textContent = "attribute name is required"; return; }
+  if (!window.confirm(`Enable TTL on “${table}” using attribute “${attr}”? An item whose “${attr}” attribute holds a past epoch second becomes eligible for background deletion.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTimeToLive",
+    payload: { TableName: table, TimeToLiveSpecification: { Enabled: true, AttributeName: attr } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-ttl-msg");
+    if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
+    return;
+  }
+  await loadAll();
+}
+
+async function disableTtl() {
+  const table = dyTable;
+  const schema = dynamoTables()[table];
+  const attr = schema && schema.ttl && schema.ttl.attribute_name;
+  if (!attr) return;
+  if (!window.confirm(`Disable TTL on “${table}”? Items already past expiry are not deleted immediately — only future expiry stops being enforced.`)) return;
+  const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
+    op: "UpdateTimeToLive",
+    payload: { TableName: table, TimeToLiveSpecification: { Enabled: false, AttributeName: attr } },
+  });
+  if (status >= 300) {
+    const msg = $("br-dy-ttl-msg");
     if (msg) msg.innerHTML = `<span class="err-line">${esc((body && body.message) || `HTTP ${status}`)}</span>`;
     return;
   }
@@ -375,7 +457,11 @@ async function submitAddIndexForm() {
   const projType = $("br-dy-ix-proj").value;
   if (!name || !hash) { $("br-dy-ix-msg").textContent = "index name and hash attribute are required"; return; }
   const keySchema = [{ AttributeName: hash, KeyType: "HASH" }];
-  if (sort) keySchema.push({ AttributeName: sort, KeyType: "RANGE" });
+  const attrDefs = [{ AttributeName: hash, AttributeType: "S" }];
+  if (sort) {
+    keySchema.push({ AttributeName: sort, KeyType: "RANGE" });
+    attrDefs.push({ AttributeName: sort, AttributeType: "S" });
+  }
   const create = { IndexName: name, KeySchema: keySchema };
   if (projType === "INCLUDE") {
     const names = $("br-dy-ix-include").value.split(",").map((s) => s.trim()).filter(Boolean);
@@ -388,7 +474,11 @@ async function submitAddIndexForm() {
   try {
     const { status, body } = await postJSON(SEED, "/admin/data/dynamo", {
       op: "UpdateTable",
-      payload: { TableName: table, GlobalSecondaryIndexUpdates: [{ Create: create }] },
+      payload: {
+        TableName: table,
+        AttributeDefinitions: attrDefs,
+        GlobalSecondaryIndexUpdates: [{ Create: create }],
+      },
     });
     if (status >= 300) { $("br-dy-ix-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
     closeAddIndexForm();
@@ -619,31 +709,206 @@ async function deleteItem(idx) {
 }
 
 // ---- create/drop table ----
+// The create-table form's own GSI/LSI row editors (roadmap U-04) — a
+// dynamic attribute-row list, the same `addRow`/`collectRows`/remove-button
+// shape `addItemAttrRow`/`itemAttrRows` above already use for an item's own
+// attributes. `IndexProjection` is a real closed set for both kinds here
+// (unlike the "Add index (GSI)" form's LSI-less scope: `wire::
+// decode_index_entry` parses `Projection` identically for a `CreateTable`-
+// declared GSI *or* LSI — `animus-dynamo/CLAUDE.md`'s own module doc), so
+// every row gets the same projection-type select + non-key-attrs input.
+const CT_PROJECTION_TYPES = ["ALL", "KEYS_ONLY", "INCLUDE"];
+function ctProjectionSelectHtml(cls, selected) {
+  return `<select class="${cls}">${CT_PROJECTION_TYPES
+    .map((p) => `<option value="${p}"${p === selected ? " selected" : ""}>${p}</option>`)
+    .join("")}</select>`;
+}
+function addCtLsiRow(name = "", sortAttr = "", projType = "ALL", include = "") {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><input type="text" class="lsi-name" value="${esc(name)}" placeholder="index_name"></td>
+    <td><input type="text" class="lsi-sort" value="${esc(sortAttr)}" placeholder="attribute"></td>
+    <td>${ctProjectionSelectHtml("lsi-proj", projType)}</td>
+    <td><input type="text" class="lsi-include" value="${esc(include)}" placeholder="a,b,c"></td>
+    <td><button type="button" class="danger-text lsi-del">✕</button></td>`;
+  tr.querySelector(".lsi-del").addEventListener("click", () => tr.remove());
+  $("br-dy-ct-lsi-table").querySelector("tbody").appendChild(tr);
+}
+function ctLsiRows() {
+  return [...$("br-dy-ct-lsi-table").querySelectorAll("tbody tr")].map((tr) => ({
+    index_name: tr.querySelector(".lsi-name").value.trim(),
+    sort_attribute: tr.querySelector(".lsi-sort").value.trim(),
+    projection_type: tr.querySelector(".lsi-proj").value,
+    include: tr.querySelector(".lsi-include").value.split(",").map((s) => s.trim()).filter(Boolean),
+  })).filter((r) => r.index_name || r.sort_attribute);
+}
+function addCtGsiRow(name = "", hash = "", sort = "", projType = "ALL", include = "") {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td><input type="text" class="gsi-name" value="${esc(name)}" placeholder="index_name"></td>
+    <td><input type="text" class="gsi-hash" value="${esc(hash)}" placeholder="attribute"></td>
+    <td><input type="text" class="gsi-sort" value="${esc(sort)}" placeholder="attribute (optional)"></td>
+    <td>${ctProjectionSelectHtml("gsi-proj", projType)}</td>
+    <td><input type="text" class="gsi-include" value="${esc(include)}" placeholder="a,b,c"></td>
+    <td><button type="button" class="danger-text gsi-del">✕</button></td>`;
+  tr.querySelector(".gsi-del").addEventListener("click", () => tr.remove());
+  $("br-dy-ct-gsi-table").querySelector("tbody").appendChild(tr);
+}
+function ctGsiRows() {
+  return [...$("br-dy-ct-gsi-table").querySelectorAll("tbody tr")].map((tr) => ({
+    index_name: tr.querySelector(".gsi-name").value.trim(),
+    hash_attribute: tr.querySelector(".gsi-hash").value.trim(),
+    sort_attribute: tr.querySelector(".gsi-sort").value.trim(),
+    projection_type: tr.querySelector(".gsi-proj").value,
+    include: tr.querySelector(".gsi-include").value.split(",").map((s) => s.trim()).filter(Boolean),
+  })).filter((r) => r.index_name || r.hash_attribute);
+}
+
 function openTableForm() {
   dyTableFormOpen = true;
   $("br-dy-ct-name").value = ""; $("br-dy-ct-pk").value = "id"; $("br-dy-ct-pkt").value = "S";
   $("br-dy-ct-has-sk").checked = false; $("br-dy-ct-sk").value = ""; $("br-dy-ct-skt").value = "S";
   $("br-dy-ct-sk-wrap").style.display = "none"; $("br-dy-ct-skt-wrap").style.display = "none";
+  $("br-dy-ct-lsi-table").querySelector("tbody").innerHTML = "";
+  $("br-dy-ct-gsi-table").querySelector("tbody").innerHTML = "";
+  $("br-dy-ct-stream").checked = false;
+  $("br-dy-ct-stream-vt").innerHTML = STREAM_VIEW_TYPES.map((v) => `<option value="${v}">${v}</option>`).join("");
+  $("br-dy-ct-stream-vt-wrap").style.display = "none";
+  $("br-dy-ct-ttl").checked = false; $("br-dy-ct-ttl-attr").value = "";
+  $("br-dy-ct-ttl-attr-wrap").style.display = "none";
   $("br-dy-ct-msg").textContent = "";
   $("br-dy-table-form").style.display = "";
 }
 function closeTableForm() { dyTableFormOpen = false; $("br-dy-table-form").style.display = "none"; }
+
+// Builds `Projection` the same way `submitAddIndexForm` already does for a
+// GSI (omit entirely for ALL, the wire decoder's own default) — shared by
+// both the GSI and LSI branches below since `decode_index_entry` treats the
+// two identically.
+function ctProjection(row) {
+  if (row.projection_type === "INCLUDE") return { ProjectionType: "INCLUDE", NonKeyAttributes: row.include };
+  if (row.projection_type === "KEYS_ONLY") return { ProjectionType: "KEYS_ONLY" };
+  return null;
+}
+
+// Mirrors `console::ConsoleBackend::create_table`'s own request sequence
+// (`crates/animusd/src/lib.rs`) — a real `CreateTable` call whose
+// `AttributeDefinitions` covers every base **and** index key attribute (an
+// index-only key attribute defaults to `"S"`, the same default
+// `schema::column_type_for(None)` applies bridge-side, since neither the
+// GSI nor the LSI row editors above collect a type — a deliberate,
+// documented console-form scope cut this form inherits, not a mechanism
+// gap: the type genuinely can't be recovered once declared this way), then
+// — only once the table exists — a follow-up `UpdateTimeToLive` call, since
+// `CreateTable`'s own wire shape carries no TTL field at all.
 async function submitTableForm() {
   const name = $("br-dy-ct-name").value.trim();
   const pk = $("br-dy-ct-pk").value.trim();
-  const sk = $("br-dy-ct-has-sk").checked ? $("br-dy-ct-sk").value.trim() : "";
+  const pkType = $("br-dy-ct-pkt").value;
+  const hasSk = $("br-dy-ct-has-sk").checked;
+  const sk = hasSk ? $("br-dy-ct-sk").value.trim() : "";
+  const skType = $("br-dy-ct-skt").value;
   if (!name || !pk) { $("br-dy-ct-msg").textContent = "name and partition key are required"; return; }
+
+  const lsis = ctLsiRows();
+  const gsis = ctGsiRows();
+
+  // -- client-side validation, mirroring `ConsoleBackend::create_table`'s
+  // own checks so a mistake is caught here rather than bouncing off the
+  // wire as a decode error. --
+  for (const l of lsis) {
+    if (!l.index_name) { $("br-dy-ct-msg").textContent = "every LSI needs an index name"; return; }
+    if (!l.sort_attribute) { $("br-dy-ct-msg").textContent = `LSI "${l.index_name}" needs a sort key attribute`; return; }
+    if (!sk) { $("br-dy-ct-msg").textContent = "declaring an LSI requires the table to have its own sort key"; return; }
+    if (l.projection_type === "INCLUDE" && !l.include.length) {
+      $("br-dy-ct-msg").textContent = `LSI "${l.index_name}"'s INCLUDE projection needs at least one attribute`;
+      return;
+    }
+  }
+  for (const g of gsis) {
+    if (!g.index_name) { $("br-dy-ct-msg").textContent = "every GSI needs an index name"; return; }
+    if (!g.hash_attribute) { $("br-dy-ct-msg").textContent = `GSI "${g.index_name}" needs a hash attribute`; return; }
+    if (g.projection_type === "INCLUDE" && !g.include.length) {
+      $("br-dy-ct-msg").textContent = `GSI "${g.index_name}"'s INCLUDE projection needs at least one attribute`;
+      return;
+    }
+  }
+  const streamEnabled = $("br-dy-ct-stream").checked;
+  const streamViewType = $("br-dy-ct-stream-vt").value;
+  if (streamEnabled && !streamViewType) { $("br-dy-ct-msg").textContent = "stream view type is required to enable a stream"; return; }
+  const ttlEnabled = $("br-dy-ct-ttl").checked;
+  const ttlAttr = $("br-dy-ct-ttl-attr").value.trim();
+  if (ttlEnabled && !ttlAttr) { $("br-dy-ct-msg").textContent = "TTL attribute is required to enable TTL"; return; }
+
+  // -- build CreateTable's body: KeySchema/AttributeDefinitions for the base
+  // table, then GlobalSecondaryIndexes/LocalSecondaryIndexes, growing
+  // AttributeDefinitions with a defaulted "S" entry for every index-only key
+  // attribute not already declared (roadmap W-11: every key attribute,
+  // table and index alike, needs one). --
   const keySchema = [{ AttributeName: pk, KeyType: "HASH" }];
-  const attrDefs = [{ AttributeName: pk, AttributeType: $("br-dy-ct-pkt").value }];
+  const attrDefs = [{ AttributeName: pk, AttributeType: pkType }];
+  const declared = new Set([pk]);
   if (sk) {
     keySchema.push({ AttributeName: sk, KeyType: "RANGE" });
-    attrDefs.push({ AttributeName: sk, AttributeType: $("br-dy-ct-skt").value });
+    attrDefs.push({ AttributeName: sk, AttributeType: skType });
+    declared.add(sk);
   }
+  const declareDefault = (attrName) => {
+    if (attrName && !declared.has(attrName)) {
+      declared.add(attrName);
+      attrDefs.push({ AttributeName: attrName, AttributeType: "S" });
+    }
+  };
+
+  const payload = { TableName: name, KeySchema: keySchema };
+  if (gsis.length) {
+    payload.GlobalSecondaryIndexes = gsis.map((g) => {
+      declareDefault(g.hash_attribute);
+      declareDefault(g.sort_attribute);
+      const gsiKeySchema = [{ AttributeName: g.hash_attribute, KeyType: "HASH" }];
+      if (g.sort_attribute) gsiKeySchema.push({ AttributeName: g.sort_attribute, KeyType: "RANGE" });
+      const entry = { IndexName: g.index_name, KeySchema: gsiKeySchema };
+      const projection = ctProjection(g);
+      if (projection) entry.Projection = projection;
+      return entry;
+    });
+  }
+  if (lsis.length) {
+    payload.LocalSecondaryIndexes = lsis.map((l) => {
+      declareDefault(l.sort_attribute);
+      const entry = {
+        IndexName: l.index_name,
+        KeySchema: [
+          { AttributeName: pk, KeyType: "HASH" },
+          { AttributeName: l.sort_attribute, KeyType: "RANGE" },
+        ],
+      };
+      const projection = ctProjection(l);
+      if (projection) entry.Projection = projection;
+      return entry;
+    });
+  }
+  payload.AttributeDefinitions = attrDefs;
+  if (streamEnabled) payload.StreamSpecification = { StreamEnabled: true, StreamViewType: streamViewType };
+
   $("br-dy-ct-msg").textContent = "creating…";
   try {
-    const { status, body } = await postJSON(SEED, "/admin/data/dynamo",
-      { op: "CreateTable", payload: { TableName: name, KeySchema: keySchema, AttributeDefinitions: attrDefs } });
+    const { status, body } = await postJSON(SEED, "/admin/data/dynamo", { op: "CreateTable", payload });
     if (status >= 300) { $("br-dy-ct-msg").textContent = (body && body.message) || ("HTTP " + status); return; }
+    // The table now exists; TTL is a separate follow-up call (`CreateTable`
+    // carries no TTL field at all) — a failure here still leaves a real,
+    // usable table, so this doesn't roll back or re-throw, it just says so.
+    if (ttlEnabled) {
+      const { status: ttlStatus, body: ttlBody } = await postJSON(SEED, "/admin/data/dynamo", {
+        op: "UpdateTimeToLive",
+        payload: { TableName: name, TimeToLiveSpecification: { Enabled: true, AttributeName: ttlAttr } },
+      });
+      if (ttlStatus >= 300) {
+        $("br-dy-ct-msg").textContent =
+          `table created, but enabling TTL failed: ${(ttlBody && ttlBody.message) || ("HTTP " + ttlStatus)}`;
+        dyTable = name;
+        await loadAll();
+        return;
+      }
+    }
     dyTable = name;
     closeTableForm();
     await loadAll();

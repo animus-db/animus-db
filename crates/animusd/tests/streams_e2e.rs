@@ -770,7 +770,7 @@ async fn gsi_and_stream_coexist_and_both_converge() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"users",
+        r#"{"TableName":"users","AttributeDefinitions":[{"AttributeName":"email","AttributeType":"S"},{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "GlobalSecondaryIndexes":[
                 {"IndexName":"by-email",
@@ -865,7 +865,7 @@ async fn lsm_restart_preserves_streams_and_walk_completes() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"orders",
+        r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -973,7 +973,7 @@ async fn fs_segment_store_opt_in_smoke() {
     let (status, body) = dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1091,7 +1091,7 @@ async fn auto_split_mid_stream_with_live_consumer_across_every_node() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1380,7 +1380,7 @@ async fn manual_split_with_unsealed_backlog_under_production_seal_knobs() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"orders",
+        r#"{"TableName":"orders","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1514,7 +1514,7 @@ async fn admin_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1587,7 +1587,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     let (status, body) = dynamo(
         dynamo_addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"t",
+        r#"{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -1661,6 +1661,7 @@ async fn admin_data_dynamo_proxy_reaches_streams_read_api() {
         "/admin/data/dynamo",
         Some(
             r#"{"op":"CreateTable","payload":{"TableName":"t",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "StreamSpecification":{"StreamEnabled":true,
                     "StreamViewType":"NEW_AND_OLD_IMAGES"}}}"#,
@@ -1848,7 +1849,7 @@ async fn admin_stream_grow_doubles_a_multi_tablet_table_with_exactly_once_delive
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets",
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -2070,7 +2071,7 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"hot_stream",
+        r#"{"TableName":"hot_stream","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
@@ -2082,7 +2083,7 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"plain_table",
+        r#"{"TableName":"plain_table","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
@@ -2191,7 +2192,7 @@ async fn cascade_split_walks_the_grandparent_chain_with_closed_shard_shape() {
     let (status, body) = dynamo(
         nodes[0].dynamo_addr(),
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"casc",
+        r#"{"TableName":"casc","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,

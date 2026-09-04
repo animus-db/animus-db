@@ -33,11 +33,12 @@ use tokio::net::{TcpListener, TcpStream};
 // `CreateGsiRequest`/`CreateLsiRequest`/`CreateKeyAttribute`), which never
 // need a name here.
 pub(crate) use animus_node::console::{
-    AddGsiRequest, ConsoleBackend, ConsoleError, CreateTableRequest, GetShardIteratorRequest,
-    GetStreamRecordsRequest, GsiDetail, IndexKeySummary, ItemsPage, KeySummary, LsiDetail,
-    ProjectionSummary, QueryItemsRequest, ScanItemsRequest, SetStreamRequest, SetTtlRequest,
-    ShardSummary, SortKeyQuery, StreamRecordsPage, StreamShardsPage, StreamShardsRequest,
-    StreamSummary, TableDetail, TableSnapshotFn, TableSummary, TtlSummary, WireItem,
+    AddGsiRequest, BackupSummary, ConsoleBackend, ConsoleError, CreateTableRequest,
+    GetShardIteratorRequest, GetStreamRecordsRequest, GsiDetail, IndexKeySummary, ItemsPage,
+    KeySummary, LsiDetail, PitrStatus, ProjectionSummary, QueryItemsRequest, ScanItemsRequest,
+    SetStreamRequest, SetTtlRequest, ShardSummary, SortKeyQuery, StreamRecordsPage,
+    StreamShardsPage, StreamShardsRequest, StreamSummary, TableDetail, TableSnapshotFn,
+    TableSummary, TtlSummary, WireItem,
 };
 
 use crate::http;

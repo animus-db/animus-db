@@ -517,3 +517,44 @@ knob (1.5× the sweep interval), which is sound rather than merely lucky
 under this fix: `MIN_QUIESCE_AFTER` = 200ms is the floor, so 300ms carries
 real (if modest) headroom, and the invariant no longer depends on timing
 luck to hold.
+
+## Amendment (2026-09-04, S-06): reaches `animusd data --config` too, and
+gains a config-file source
+
+Two gaps this ADR's own PR7 section left implicit are closed:
+
+1. **`BoundDataNode::start_data_with_growth` never called
+   `enable_quiescence` at all.** Every combined-mode wrapper above threads
+   `quiesce_after` down to `BoundNode::start_with_growth`'s reconciler, but
+   the data-only assembly (`animusd data --config`/`--seed`) had no
+   parameter for it whatsoever — a data-only node's tablet-host reconciler
+   was structurally incapable of quiescing, independent of any CLI flag.
+   `start_data_with_growth` now takes the identical `quiesce_after:
+   Duration` parameter, with the identical `Duration::ZERO`-disables /
+   `MIN_QUIESCE_AFTER`-floor `debug_assert!` contract PR7's own combined-mode
+   call site uses.
+2. **`--quiesce-after SECS` was, and remains, a CLI flag on `--config`/
+   `--node` and `--cluster N` only** — `animusd data --config`/`animusd
+   control`/`animusd join`/`data --seed` still have no such flag, and
+   `--cluster-control`/`--cluster-data` still parses-but-ignores it,
+   exactly as this ADR's PR7 section and `main.rs`'s own module doc already
+   described. What changed is that `ClusterConfig` now carries a
+   `cluster_settings.quiesce_after_secs` **config-file** section
+   (`crates/animusd/src/config.rs`) as a second source for the same
+   `enable_quiescence` knob — read by `run_single` (`--config`/`--node`)
+   and, thanks to fix 1 above, genuinely actionable by `run_data_config`
+   (`animusd data --config`) too. A CLI flag and the config section setting
+   the same field on the same invocation is a hard startup error
+   (`main.rs`'s `resolve_cluster_settings`), not a silent precedence rule —
+   the same contract `--dynamo-auth` already established. See ADR 0034's
+   own S-06 amendment for the auto-split half of the same section, and ADR
+   0040's for the orphan-sweep half; `crates/animusd/src/config.rs`'s
+   `ClusterSettings` doc has the full field-by-field per-role applicability
+   table.
+
+The Kubernetes operator (`animus-operator`) picks this up in the same
+change: `AnimusClusterSpec.quiesceAfterSecs` now emits into the generated
+`cluster.json`'s `cluster_settings` section instead of a `--quiesce-after`
+CLI flag on the combined branch only — closing the exact data-role gap fix
+1 above describes, for every `AnimusCluster`-managed deployment. See
+`crates/animus-operator/CLAUDE.md`'s CLI-flag-support table.

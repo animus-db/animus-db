@@ -1334,7 +1334,15 @@ fn describe_endpoints(ctx: &ClientCtx) -> Result<String, WireError> {
 /// across every tablet: reporting a later time than the *slowest* tablet's
 /// own coverage would silently promise a restore this adapter cannot
 /// actually reconstruct for that tablet's own range.
-fn pitr_description(ctx: &ClientCtx, meta: &Metadata, table: &str) -> wire::PitrDescription {
+///
+/// `pub(crate)`: `console_table_detail` (U-03, `lib.rs`) calls this same
+/// function for the table detail page's `pitr` field rather than
+/// re-deriving the restore window a second way.
+pub(crate) fn pitr_description(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> wire::PitrDescription {
     let Some(spec) = meta.table_pitr(table) else {
         return wire::PitrDescription {
             enabled: false,
@@ -1524,7 +1532,10 @@ async fn create_backup(
 /// janitor, `animusd::backup_janitor`, is physically reclaiming either
 /// asynchronously). No wildcard arm: a future `BackupStatus` variant fails
 /// to compile here until this mapping is a deliberate decision.
-fn backup_wire_status(status: &animus_control::BackupStatus) -> &'static str {
+///
+/// `pub(crate)`: `console_table_backups` (U-03, `lib.rs`) reuses this same
+/// label mapping for the table detail page's `backups` list.
+pub(crate) fn backup_wire_status(status: &animus_control::BackupStatus) -> &'static str {
     match status {
         animus_control::BackupStatus::Creating => "CREATING",
         animus_control::BackupStatus::Available => "AVAILABLE",
@@ -2215,7 +2226,6 @@ async fn restore_table_to_point_in_time(
 
     let manifest_object_id = backup_codec::backup_manifest_object_id(&base_id);
     let manifest_bytes = ctx
-        .data()
         .backup_store
         .get_any(&manifest_object_id)
         .await
@@ -7122,6 +7132,7 @@ mod stream_write_path_tests {
                 advertise_host: None,
             }],
             dynamo_auth: None,
+            cluster_settings: None,
         }
     }
 
@@ -7209,6 +7220,7 @@ mod stream_write_path_tests {
             "DynamoDB_20120810.CreateTable",
             &format!(
                 r#"{{"TableName":"{table}",
+                    "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                     "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
                     "StreamSpecification":{{"StreamEnabled":true,
                         "StreamViewType":"KEYS_ONLY"}}}}"#
@@ -7338,6 +7350,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"mb",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -7405,6 +7418,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"benchp",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -7603,6 +7617,7 @@ mod stream_write_path_tests {
             node.dynamo_addr(),
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"plain",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;

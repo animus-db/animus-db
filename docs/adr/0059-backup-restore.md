@@ -250,17 +250,18 @@ store's listing consistency is weaker than a replicated Raft log's, and a
 manifest living only in the store would make an ordinary `DescribeBackup`
 pay a store round trip for something `Metadata` already answers for free.
 
-**This janitor inherits ADR 0043 §A9's own open control-only-leader scope
-gap, named rather than silently re-created.** Retention *marking* needs
-only `Metadata`, cheap on any control-plane leader; object deletion needs
-a `SegmentStoreHandle`, which today exists only on a node with a data
-role. A control-only leader (a genuine ADR 0035 split deployment) marks
-backups expired and reacts to a stuck `Creating` correctly, but cannot
-physically reclaim objects for as long as it leads — rows accumulate,
-marked but un-reclaimed, until a data-role node takes the lead instead.
-Exactly the same deferred, documented residual as the stream janitor's;
-extending `SegmentStoreHandle` provisioning to a control-only node would
-close both gaps at once, and remains its own follow-up either way.
+**This janitor used to inherit ADR 0043 §A9's own control-only-leader scope
+gap — closed, along with that gap, by W-10 (2026-09-04; see this doc's own
+As-built amendment below).** Retention *marking* needs only `Metadata`,
+cheap on any control-plane leader; object deletion needs a
+`SegmentStoreHandle`, which — as originally shipped — existed only on a
+node with a data role, so a control-only leader (a genuine ADR 0035 split
+deployment) marked backups expired and reacted to a stuck `Creating`
+correctly but could not physically reclaim objects for as long as it led.
+Both this janitor's and the stream janitor's gaps closed at once, exactly
+as this paragraph originally anticipated: `SegmentStoreHandle`/
+`BackupStoreHandle` provisioning was extended to the control-only assembly
+path (`animusd::BoundControlNode::start_control_with`).
 
 ### 4. Capture (on-demand): per-tablet, leader-side, event-driven
 
@@ -1173,3 +1174,70 @@ backup/restore/PITR train.
   window, and the `TableNotFoundException`/
   `PointInTimeRecoveryUnavailableException`/`InvalidRestoreTimeException`
   error shapes.
+
+## As-built amendment (2026-09-04, W-10 — the control-only-leader scope gap)
+
+Closes the control-only-leader scope gap §3's own "This janitor inherits
+ADR 0043 §A9's own open control-only-leader scope gap" paragraph named
+(above) and §9's own PITR-janitor twin — the roadmap item this amendment
+documents (`docs/roadmap.md` W-10, filed against ADR 0043 §A9 since that's
+where the gap was first named; this ADR inherited it identically for its
+own backup/PITR janitors).
+
+- **The fix: `SegmentStoreHandle`/`BackupStoreHandle` provisioning extended
+  to the control-only assembly path.** `animusd::BoundControlNode::
+  start_control_with` now builds both handles (`build_segment_store`/
+  `build_backup_store`, the identical functions the combined and data-only
+  paths already used) and threads `--segment-store`/`--backup-store`
+  through `animusd control`'s own CLI parsing (`main.rs::run_control` →
+  a new `animusd::run_node_control_with_stores`), exactly as those flags
+  already thread through `--config`/`--node` and `--cluster N`.
+- **The handles moved off `DataRole` onto `ClientCtx` itself** —
+  `ClientCtx::segment_store`/`backup_store`, no longer `Option`-wrapped
+  behind a data role at all, since every node shape now provisions a real
+  value (the `Fs` variant costs nothing to construct where it's never
+  chosen as a placement candidate — see below). `DataRole` now holds only
+  genuinely data-role-specific fields (`rmw_lock`, `raftkv_metrics`,
+  `base_id`, `stream_seal_knobs`, `change_rates`). Every existing call
+  site that read `ctx.data().segment_store`/`ctx.data().backup_store`
+  (`backup_capture.rs`, `backup_restore.rs`, `dynamo.rs`,
+  `dynamo_streams.rs`, `index_drain.rs`, `segment_janitor.rs`) now reads
+  `ctx.segment_store`/`ctx.backup_store` directly; `client_ctx_host.rs`'s
+  `BackupObjectStore` impl for `ClientCtx` now always answers `Some(..)`
+  (the trait itself stays `Option`-returning for a genuinely store-less
+  host — `animus_node::backup_janitor`'s own `ControlOnlyStore` test
+  double). `ClientCtx::data_opt()` — the non-panicking accessor
+  `segment_janitor.rs` was the sole caller of — is deleted as dead code;
+  `ClientCtx::data()` (panicking) is unchanged and still gates the
+  genuinely data-role-only fields.
+- **A control-only node is never chosen as a segment/backup-store replica
+  target**, so this fix changes nothing about *what* gets replicated where
+  — only *who can drive reclaim*. `MetaCommand::RegisterNode`'s own apply
+  arm (`animus-control::meta.rs`) has always excluded a `role == "control"`
+  registration from claiming `Metadata::members` (the placement
+  candidate pool `ClusterSegmentStore`'s `ControlPlacementView` reads);
+  this predates and is unaffected by this fix.
+- **Effect on each consumer**: the segment janitor's phases 2/3 (object
+  deletion, replica repair) and phase 1b's physical delete now run
+  identically on a control-only leader; the backup completion aggregator
+  can now durably `put` a completed backup's manifest object there too;
+  the backup janitor can now physically reclaim a marked-deleted or failed
+  backup's objects there too; the PITR janitor's retention loop can now
+  reclaim PITR segment objects there too. **Unaffected, for a structural
+  reason this fix cannot address**: `pitr_snapshot_loop`'s own `BeginBackup`
+  *capture* step, and the on-demand capture driver (`backup_capture.rs`)
+  generally — capture is per-tablet, leader-side, and a control-only node
+  never hosts (so never leads) a CP-data tablet at all; a control-only
+  leader still correctly proposes `BeginBackup`/tags rows, it simply never
+  has a tablet of its own to capture from. This is not a residual of this
+  fix — it was never in scope, since no `SegmentStoreHandle`-shaped
+  provisioning gap was ever the reason capture couldn't run there.
+- **Regression**: `crates/animusd/tests/stream_janitor.rs::
+  segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader` —
+  a genuine split deployment (3 control-only + 2 data-only nodes, no
+  combined-mode node anywhere) whose control leader (necessarily one of
+  the control-only trio, since a data-only node never registers a local
+  control `RaftNode`) reclaims a sealed stream's segment objects on its
+  own, including the physical on-disk delete at every recorded (data-only)
+  replica. See `crates/animusd/CLAUDE.md`'s matching entries for the full
+  per-module account.

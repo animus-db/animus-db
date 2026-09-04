@@ -62,6 +62,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
         let config = animusd::ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
         let mut nodes = Vec::new();
         for i in 0..n {
@@ -126,6 +127,7 @@ async fn create_table_no_index(addr: SocketAddr, table: &str) {
         "DynamoDB_20120810.CreateTable",
         &format!(
             r#"{{"TableName":"{table}",
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}],
                 "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}]}}"#
         ),
     )
@@ -572,6 +574,7 @@ async fn a_crash_and_restart_mid_backfill_still_converges() {
             }
         }],
         dynamo_auth: None,
+        cluster_settings: None,
     };
     let node = animusd::run_node(&config, 0, &node_dir)
         .await

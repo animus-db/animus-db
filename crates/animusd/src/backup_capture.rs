@@ -348,7 +348,7 @@ async fn backup_capture_tick(ctx: &ClientCtx, group: &CpGroup, tablet: TabletId,
     // the ack didn't) is tolerated by simply not advancing the cursor: the
     // NEXT tick re-derives the identical bytes from the same durable
     // cursor state and retries the identical `put`.
-    if let Err(err) = ctx.data().backup_store.put(&object_id, &object_bytes).await {
+    if let Err(err) = ctx.backup_store.put(&object_id, &object_bytes).await {
         tracing::debug!(
             backup_id,
             tablet = tablet.0,

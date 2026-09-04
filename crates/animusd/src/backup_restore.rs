@@ -202,7 +202,7 @@ async fn restore_tick(
 ) -> RestoreTickOutcome {
     let backup_id = row.backup_id.as_str();
     let manifest_id = backup_codec::backup_manifest_object_id(backup_id);
-    let manifest_bytes = match ctx.data().backup_store.get_any(&manifest_id).await {
+    let manifest_bytes = match ctx.backup_store.get_any(&manifest_id).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             tracing::debug!(
@@ -240,7 +240,7 @@ async fn restore_tick(
         let mut chunk = 0u64;
         loop {
             let object_id = backup_codec::backup_data_object_id(backup_id, entry.tablet.0, chunk);
-            let bytes = match ctx.data().backup_store.get_any(&object_id).await {
+            let bytes = match ctx.backup_store.get_any(&object_id).await {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break, // this reporting tablet's own chunks are exhausted
                 Err(err) => {
@@ -389,7 +389,7 @@ async fn replay_pitr_segments(
 ) -> ReplayOutcome {
     let mut progressed = false;
     for seg in &plan.segments {
-        let bytes = match ctx.data().backup_store.get_any(&seg.object_id).await {
+        let bytes = match ctx.backup_store.get_any(&seg.object_id).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 tracing::debug!(

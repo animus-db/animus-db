@@ -9505,6 +9505,45 @@ debugging anything that feels like it might have happened before.
   the session's opening env block) and say so plainly in the final report;
   do not claim the shared checkout was cleaned up when the tooling itself
   prevented it.
+- **The task prompt's claimed base ("branched from X plus Y") is not
+  guaranteed true of the assigned worktree — verify it against `git log`
+  before doing any research, and recover with a fast-forward merge, not by
+  reading a different checkout (U-04, 2026-09-04).** A task described its
+  worktree as "origin/main plus wave-2 items already integrated," including
+  a specific dashboard tab and a wire-decoder hardening the new work
+  depended on. `git log --oneline -5` on the actual worktree showed plain
+  wave-1 `origin/main` — no wave-2 commits at all — yet several `Read`/
+  `Bash` calls against a *bare*, non-worktree-prefixed path (the shared
+  checkout root the "never hardcode the main checkout's path" entries above
+  warn about) returned content that *did* match the prompt's claim, because
+  that sibling checkout happened to have a different, more-advanced branch
+  checked out. Trusting those reads produced a design built against code
+  that did not exist on this worktree's branch and never would without
+  intervention — a different failure than the documented "silently
+  edited/read the wrong tree" pattern above: here the *assigned* worktree
+  itself was genuinely behind the prompt's stated base, and the bare-path
+  reads were actively misleading rather than merely off-target. Caught by
+  running `pwd` after an unrelated tool refusal, then diffing what a
+  worktree-prefixed `ls`/`grep` showed against the bare-path reads for the
+  same nominal file. **Fix, safely**: `git log --oneline --all | grep
+  <a distinctive commit subject from the missing work>` found the wave-2
+  commits reachable via a local branch ref (`git branch -a` showed it
+  checked out elsewhere, marked `+`) even though they weren't on this
+  worktree's `HEAD` ancestry; `git merge-base --is-ancestor HEAD
+  <that-branch>` confirmed the assigned branch was a strict ancestor (a
+  clean fast-forward, not a real merge — no divergent history to reconcile);
+  stashed the in-progress uncommitted edit (`git stash push -u`), ran `git
+  merge --ff-only <that-branch>`, then `git stash pop` (auto-merged cleanly
+  since the stashed edit touched a region the fast-forward hadn't). Re-ran
+  every earlier research step against the now-correct, worktree-scoped
+  files before continuing — a design built on stale premises needs
+  re-verification, not just a rebase. **Never** substitute "read it from the
+  bare checkout since it has the content I need" for actually getting the
+  assigned worktree to the right state — that checkout's commits may never
+  reach the worktree's branch at all (a sibling agent's unrelated,
+  never-to-be-merged work), and even when they coincidentally do, nothing
+  in that path's history is provably reachable from `HEAD` without checking
+  first.
 - **A worktree-isolated subagent must push its branch before reporting the
   work done or mergeable.** An orchestrator (or the user) cannot verify,
   review, or recover work that exists only in the agent's local worktree, and
@@ -16028,3 +16067,184 @@ proportion the production failure mode would — an all-instant fixture can
 accidentally exercise a *different*, cheaper self-healing path that both
 the buggy and fixed code share, proving nothing about the specific
 difference under test.
+- **Repurposing a private parser across two features must re-audit its
+  error text, not just its logic** (2026-09-04, issue #375/W-01's PR3,
+  nested-path `UpdateExpression` targets). `parse_projection_path`/
+  `parse_projection_segment`/`parse_index_chain` (`animus-dynamo/src/
+  wire.rs`) already implemented the exact document-path grammar
+  (`a.b[0]`, `#alias`, list indices) `UpdateExpression`'s new nested `SET`/
+  `REMOVE`/`ADD`/`DELETE` targets needed — reusing it verbatim (rather than
+  a second hand-rolled path parser) was the right call and cost nothing in
+  logic. What it *did* cost, and would have shipped silently wrong without a
+  second look: every one of that parser's error messages said "projection
+  path" by name (`"malformed list-index syntax in projection path
+  `{raw}`"`, `"projection uses name placeholder ..."`), because it was
+  written when `ProjectionExpression` was its only caller. Left unchanged, a
+  malformed `UpdateExpression` path (`SET a[ = :v`) would have reported a
+  `ValidationException` blaming "projection path" — correct code, actively
+  misleading diagnostic, on a request that has no `ProjectionExpression` in
+  it at all. Fixed by generalizing the wording to "document path" (the name
+  both features' grammar actually describes) before wiring the second
+  caller through. General form: when a private helper built for feature A
+  gains a second caller (feature B), grep its own error/log strings for
+  feature A's name — a reused *helper* is usually safe to share verbatim,
+  but a reused helper's *messages* silently keep pointing at whichever
+  feature was there first unless someone explicitly generalizes them, and
+  nothing type-checks that omission.
+## Enforcing a decode-time invariant surfaces every JSON-body-building call site, not just the ones under `crates/*/tests` (roadmap W-11)
+
+Landing the rejection W-05's own lesson above deliberately deferred —
+`CreateTable`/`UpdateTable` must reject a key attribute (base or index)
+with no `AttributeDefinitions` entry, and reject an entry that names no
+key attribute at all — found that "the fixtures" is a wider set than the
+obvious `crates/animusd/tests/*.rs` grep suggests. Two call sites outside
+that tree built genuinely incomplete bodies and would have started
+`400`-ing in production the moment the strict decoder shipped:
+
+- **`animusd::lib.rs`'s `ConsoleBackend::add_gsi`/`create_table`** (the
+  console's own Add-GSI and create-table forms) send an
+  `AttributeDefinitions` entry only for the base table's partition/sort key
+  — an index-only key attribute's type was left **deliberately absent**
+  pre-W-11 (`console::CreateTableRequest`'s own doc explains why: neither
+  `CreateGsiRequest`/`CreateLsiRequest` nor the create-table form collects
+  one). That was a legitimate design choice against the *lenient* decoder;
+  against the *strict* one it is simply broken — every console-added index
+  needs a `"S"`-defaulted `AttributeDefinitions` entry now, so the type
+  these two request builders record for an index key attribute changes
+  from `None` to `Some("S")`, a real, observable behavior change (fixed in
+  `console_table_config.rs::add_and_drop_gsi_round_trip` and
+  `console_create_table.rs::create_full_table_declares_everything_exactly`,
+  whose whole point had been to pin the *old*, `None`-recording behavior).
+- **`animusd::src::dashboard_browser.js`'s `submitAddIndexForm`** (the
+  *operator* dashboard's own "Add index" form — a different surface from
+  the console app above, ADR 0052's "Naming, deliberately addressed") sent
+  no `AttributeDefinitions` at all for its GSI's key(s). No Rust test
+  exercises this path (it POSTs JSON built entirely client-side), so
+  nothing in the crate's own test suite would ever have caught the break —
+  it was found only by grepping every `KeySchema`/`GlobalSecondaryIndexUpdates`
+  occurrence across `crates/animusd/src/*.js` too, not just `*.rs`.
+
+The general form: a decode-time invariant enforced for the first time
+doesn't just need every *test* fixture swept — it needs every **caller**
+that builds the wire JSON by hand, including a same-crate but
+non-`tests/`-tree admin surface and any client-side JS that talks straight
+to the wire without a Rust test in between. `grep`ping only `crates/*/tests`
+(the obvious first pass, and literally what W-05's own residual note
+above named as done) would have shipped two silent regressions.
+
+## `UpdateTable`'s own `AttributeDefinitions` requirement is scoped to the new index's keys only, because the decoder never sees the table's existing ones (roadmap W-11)
+
+`decode_create_table` has the whole picture in one JSON body — the base
+table's `KeySchema` plus every declared GSI/LSI's own — so its
+`AttributeDefinitions` check can legitimately be "exactly the union of
+every key attribute this request's own key schema names, nothing more,
+nothing less." `decode_update_table`'s `GlobalSecondaryIndexUpdates`
+`Create` arm cannot use the same rule: this crate is deliberately pure (no
+I/O, no replicated catalog, `animus-dynamo/CLAUDE.md`'s own charter), so it
+has no way to know the base table's *existing* partition/sort key or any
+*other* index's keys — only the one new index's own `KeySchema` is ever in
+the request body. So the required set for `UpdateTable` is scoped to
+**just the new index's own key attribute(s)** — not because DynamoDB's
+real rule is narrower there (it isn't: AWS's own `AttributeDefinitions`
+rule spans a table's whole key schema, existing keys included, and
+tolerates a caller re-declaring one), but because that is the largest set
+this decoder can actually verify without a capability it deliberately
+doesn't have. A caller that also re-sends the base table's own key
+definitions on an `UpdateTable` call — a real, AWS-legal pattern some
+SDKs/IaC tools use — would be rejected here as "unused," a known,
+narrower-than-AWS gap; nothing in this repo's own test fixtures does that
+today, so it wasn't hit, but it is the direct consequence of the pure-crate
+boundary above and worth knowing before "fixing" it by loosening the
+unused-side check instead of giving the decoder catalog access (which
+`animus-dynamo/CLAUDE.md`'s charter rules out).
+## A role-gated `Option<Role>` struct can smuggle a field that was never actually role-specific — check each field's own real dependency before believing the "no role, no handle" framing (W-10, ADR 0043 §A9)
+
+`animusd::DataRole` bundled `segment_store: SegmentStoreHandle`/
+`backup_store: BackupStoreHandle` alongside genuinely data-role-specific
+fields (`rmw_lock`, `raftkv_metrics`, `base_id`, `stream_seal_knobs`) —
+reasonable at the time (ADR 0043's sealer PR built the store handle
+alongside the rest of the data-plane assembly a combined/data-only node
+already needed), but it meant every downstream doc, and the segment
+janitor / backup janitor / backup completion / PITR janitor loops
+themselves, inherited a blanket "control-only leader has no data role, so
+no `SegmentStoreHandle`" framing that was never actually true at the
+*handle*'s own level. Tracing what each handle really needs found nothing
+tablet-shaped at all: `SegmentStoreHandle`/`BackupStoreHandle` need only
+`ProdEnv` (for the K-replicated `Cluster` variant's own network I/O) and a
+`ControlHandle` (to read `Metadata` for placement candidates) — both of
+which a control-only node already has. The actual reason a control-only
+node was never chosen as a replica *target* is a completely separate,
+already-correct mechanism (`animus-control::meta.rs`'s `RegisterNode` apply
+arm never claims `Metadata::members` for a `role == "control"`
+registration) — nothing about *hosting* the handle depends on *being
+hosted at* by anyone else's handle.
+
+The fix was mechanical once the real dependency was traced: promote
+`segment_store`/`backup_store` out of the role-gated `Option<DataRole>`
+onto `ClientCtx` itself (always provisioned, on every node shape), leaving
+`DataRole` holding only the fields that genuinely need a hosted tablet or
+the dynamo listener. Four separate background loops' own "control-only
+leader can only mark, never reclaim" scope-gap paragraphs — independently
+documented in `animusd/CLAUDE.md`, ADR 0043 §A9, and ADR 0059 §3/§9 — all
+closed from this one change, because they'd all inherited the same
+mis-scoped blocker rather than each having a genuinely independent
+dependency on hosting a tablet.
+
+**General form**: when a background loop's own doc says "X can't run
+because this node has no data role," check whether X's actual dependency
+(an `Env`, a `ControlHandle`, a piece of `Metadata`) is really gated by
+that role, or whether it only *lives inside* a role-gated struct for
+assembly-time convenience. A field that needs nothing tablet-shaped can
+usually be promoted to the top level and provisioned everywhere, closing
+every downstream consumer's inherited gap at once — cheaper and more
+honest than fixing each consumer's own symptom independently, and a strong
+signal to look for whenever more than one unrelated background loop cites
+the identical "no data role" reason for a gap.
+
+## A fixture sweep scoped to `tests/*.rs` misses `src/`'s own `#[cfg(test)]` modules (W-11 follow-up)
+
+Roadmap W-11 (commit `7031145`) made `animus_dynamo::wire::
+check_attribute_definitions` reject a `CreateTable`/`UpdateTable` whose key
+schema names an attribute absent from `AttributeDefinitions`. The
+groundwork commit (`c5a6a03`) swept every JSON body under
+`crates/animusd/tests/*.rs` (plus the two production call sites the ADR
+0061-era `CLAUDE.md` module map explicitly enumerates:
+`ConsoleBackend::create_table`/`add_gsi` in `lib.rs`,
+`dashboard_browser.js`'s Add-index form) to declare a real type for every
+key attribute — deliberately reviewable on its own, still green against
+the pre-strict decoder. But `crates/animusd/src/*.rs` also carries several
+in-crate `#[cfg(test)] mod`s that build their own `CreateTable` JSON bodies
+directly, for the ordinary reason this crate's own `CLAUDE.md` names
+(they need private handles — a raw `CpGroup`, `pending_changes`,
+`local_scan_kind_bounded` — that no external `tests/*.rs` file can reach):
+`dynamo.rs::stream_write_path_tests` and `index_drain.rs::
+{gsi_drain_cursor_tests, stream_sealer_tests}`. None of these were touched
+by the sweep, so the strict-check commit (`7031145`) landed with 28
+latent failures in `cargo test -p animusd --lib` that neither commit's own
+gate run caught — the sweep was validated against the specific
+`--test <binary>` targets it touched (this crate's `cargo test -p animusd`
+is too heavy to run per change), and nobody ran `--lib` alongside them.
+
+**Fixed** by extending the identical convention (declare exactly the key
+attributes used, typed to match what the test actually writes — `S` unless
+a test asserts `N`/`B`, no unused declarations) across all eight fixture
+functions in those three modules: `dynamo.rs`'s `create_streamed_table`
+plus three inline bodies (`mb`/`benchp`/`plain`), `index_drain.rs`'s
+`create_table_with_gsi`, `create_streamed_table`, `create_base_table`,
+`create_plain_table`, and one inline GSI+stream body in
+`hot_trim_min_rule_gsi_and_stream_together`. 28 failures → 0; `cargo test
+-p animusd --lib` now green (111 passed), alongside `cargo fmt --all
+--check` and `cargo clippy -p animusd --lib --tests -- -D warnings`.
+
+**General form**: a fixture sweep motivated by a wire-decoder change (or
+any change to what a JSON/RPC body must contain) must grep `src/`'s own
+`#[cfg(test)] mod`s for the same shape, not just the crate's `tests/`
+directory — a crate with private-handle test fixtures living in-tree (this
+one has at least eight such modules across `lib.rs`/`dynamo.rs`/
+`index_drain.rs`/`admin.rs`/`segment_janitor.rs`, per that `CLAUDE.md`'s
+own Tests section) has two disjoint test surfaces. A full `cargo test -p
+<crate>` covers both, but a per-change gate that names its `--test
+<binary>` targets (the usual shape here, since the whole crate is
+expensive) must add `--lib` explicitly — and both must be run (and
+reported) before a fixture sweep — or the check it's preparing for — can
+be called complete.

@@ -128,7 +128,7 @@ async fn create_table_ack_implies_tablet_group_serves() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"ready_t",
+        r#"{"TableName":"ready_t","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
     )
     .await;

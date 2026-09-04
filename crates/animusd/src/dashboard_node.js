@@ -34,6 +34,27 @@ function renderNodeIdentity() {
     .filter(([, v]) => v != null)
     .map(([k, v]) => `<div class="list-row"><span class="detail mono">${esc(k)}</span><span class="status-text mono">${esc(v)}</span></div>`)
     .join("");
+  // U-06 (docs/roadmap.md): backup/segment store (redacted kind + root
+  // path — `admin.rs::config_view`'s `StoreView`), the ADR 0048 quiescence
+  // threshold, ADR 0057 auth state (access key ids only, never the
+  // secret), and the resolved OTLP endpoint (ADR 0027). Same idiom as
+  // `addrRows` above: a field this role/config doesn't have is `null` on
+  // the wire and simply omitted from the list, not rendered as an empty row.
+  const storeLabel = (store) => store == null
+    ? null
+    : store.path ? `${esc(store.kind)} · ${esc(store.path)}` : esc(store.kind);
+  const configRows = [
+    ["backup store", storeLabel(c.backup_store)],
+    ["segment store", storeLabel(c.segment_store)],
+    ["quiesce after", c.quiesce_after_ms != null ? `${esc(c.quiesce_after_ms)} ms` : null],
+    ["SigV4 auth", c.auth_enabled == null ? null : c.auth_enabled
+      ? `enabled (${(c.auth_access_key_ids || []).map(esc).join(", ") || "—"})`
+      : "disabled"],
+    ["OTLP endpoint", c.otlp_endpoint ? esc(c.otlp_endpoint) : null],
+  ]
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `<div class="list-row"><span class="detail mono">${esc(k)}</span><span class="status-text mono">${v}</span></div>`)
+    .join("");
   $("nd-identity").innerHTML = `
     <div class="section-head"><span class="title">This node</span>
       <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.03em">${esc(c.role)}</span></div>
@@ -41,7 +62,8 @@ function renderNodeIdentity() {
       <div class="stat-tile"><div class="label">Node id</div><div class="value">${idSpan(id)}</div></div>
       <div class="stat-tile"><div class="label">Role</div><div class="value" style="font-size:16px;text-transform:capitalize">${esc(c.role)}</div></div>
     </div>
-    ${addrRows}`;
+    ${addrRows}
+    ${configRows}`;
 }
 
 function renderNodeHealth() {

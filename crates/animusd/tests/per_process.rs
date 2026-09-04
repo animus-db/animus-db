@@ -98,6 +98,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
         let config = ClusterConfig {
             nodes: nodes_cfg,
             dynamo_auth: None,
+            cluster_settings: None,
         };
 
         // The config round-trips through JSON exactly as it would on disk between

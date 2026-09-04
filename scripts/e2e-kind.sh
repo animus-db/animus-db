@@ -271,7 +271,7 @@ wait_for "port-forward listening" 30 1 -- port_forward_ready
 
 phase "exercise DynamoDB wire: CreateTable"
 RESULT="$(dynamo_call "DynamoDB_20120810.CreateTable" \
-    '{"TableName":"E2EItems","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}')"
+    '{"TableName":"E2EItems","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}')"
 STATUS="$(dynamo_status "$RESULT")"
 BODY="$(dynamo_body "$RESULT")"
 [ "$STATUS" = "200" ] || fail "CreateTable failed: status=${STATUS} body=${BODY}"

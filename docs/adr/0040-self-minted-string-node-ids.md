@@ -355,3 +355,23 @@ This is a 6-PR stack, each independently reviewable, stacked in this order:
    `RemoveMember` claim-without-member extension, the leader-side volatile
    `orphan_sweep_loop` (`animus-control`), and the `orphan_sweep_after`
    config-file/CLI knob (`animusd`).
+
+## Amendment (2026-09-04, S-06): `orphan_sweep_after` genuinely gains a
+config-file source
+
+PR6's bullet above calls `orphan_sweep_after` a "config-file/CLI knob," but
+until S-06 it was CLI-only (`--orphan-sweep-after SECS`, parsed
+independently by `run`/`run_control` in `main.rs`) — a `ClusterConfig` file
+had no section carrying it at all. S-06 makes that phrase literally true:
+`ClusterConfig::cluster_settings.orphan_sweep_after_secs`
+(`crates/animusd/src/config.rs`) is now a real config-file source for the
+same knob, read by both `run_single` (`--config`/`--node`) and `run_control`
+(`animusd control`) — the two shapes that actually run a local control
+`RaftNode` and so can act on it; `animusd data --config` reads the same
+section but ignores this particular field, since a data-only node runs no
+local control Raft to sweep. Setting the same field via `--orphan-sweep-
+after` **and** the config section on the same invocation is a hard startup
+error (`main.rs`'s `resolve_cluster_settings`), the identical contract
+`--dynamo-auth` already established for `dynamo_auth`. See ADR 0034's own
+S-06 amendment for the auto-split half of the same config-file section, and
+ADR 0048's for the quiescence half.

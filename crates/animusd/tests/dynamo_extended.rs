@@ -96,7 +96,7 @@ async fn create_table_query_and_conditional_writes() {
     let (status, body) = dynamo(
         addr0,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"events",
+        r#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}"#,
     )
     .await;

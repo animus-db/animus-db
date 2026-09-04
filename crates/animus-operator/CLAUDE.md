@@ -132,15 +132,36 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   |---|---|---|
   | `--dir` | yes | yes |
   | `--ephemeral` | yes | yes |
-  | `--quiesce-after` | yes | **no** |
   | `--split-mode` | yes | **no** |
   | `--dynamo-auth` | yes | yes |
-  | `--auto-split-bytes` | **no** | **no** |
 
-  `spec.autoSplitBytes` is kept on the CRD (forward compatibility — a
-  `--config`/`--node`-mode `--auto-split-bytes` flag may land later) but
-  **never** emitted into `entrypoint.sh` on either branch; do not "fix" this
-  without first re-checking `main.rs`'s `run`/`run_data` argument parsers.
+  **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
+  flags on either branch (S-06)** — both now reach `animusd` through
+  `build_cluster_config`'s own `cluster_settings` section of the generated
+  `cluster.json` instead (`desired::cluster_config::ClusterSettings`, a
+  mirror of `animusd::config::ClusterSettings`), which every pod reads
+  regardless of which `animusd` subcommand it execs. This is strictly
+  better than a CLI flag for both fields: `quiesceAfterSecs` used to reach
+  only the combined branch (data-role pods had no route to quiescence at
+  all, pre-S-06 on the `animusd` side); `autoSplitBytes` never reached
+  either branch as a flag (only `--cluster N`'s dev-only in-process mode
+  ever accepted `--auto-split-bytes`). Emitting `--quiesce-after` here
+  **on top of** the config section would in fact be a hard `animusd`
+  startup error on the combined branch — its CLI flag and the config
+  file's own section setting the same field is refused, not silently
+  reconciled (`resolve_cluster_settings` in `animusd`'s own `main.rs`); do
+  not reintroduce it as a flag without removing it from the emitted
+  section, or vice versa.
+  **`--split-mode` is a separate, pre-existing concern this table does not
+  resolve**: `crates/animusd/src/main.rs`'s own module doc states the flag
+  and the copy-based split workflow it selected were deleted outright
+  (2026-09-01, ADR 0058's rung 4 layer) — `main.rs`'s real CLI parser no
+  longer appears to accept `--split-mode` at all, on *any* subcommand, which
+  would make `entrypoint_script`'s still-conditional emission of it a live
+  pod-startup failure for any `AnimusClusterSpec.splitMode` value. This was
+  not fixed here (out of scope for S-06, and a pre-existing bug gets its own
+  PR with its own regression test per the root `CLAUDE.md`'s conventions) —
+  re-verify against `main.rs` before relying on the "yes" in this table.
 - **`control_nodes_changed` reads the *previous* `ConfigMap`'s own applied
   `cluster.json` back to detect an immutable-field change**, rather than a
   status annotation the controller would have to remember to write and keep

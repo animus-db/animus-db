@@ -65,6 +65,7 @@ async fn start_single_node_with_auth(
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),
             }),
+            cluster_settings: None,
         };
         match animusd::run_node_with(&config, 0, dir, StorageBackend::default()).await {
             Ok(node) => return (node, config),
@@ -258,7 +259,7 @@ async fn correctly_signed_request_round_trips_create_table_and_put_get() {
     let (status, body) = signed_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         TEST_ACCESS_KEY,
         TEST_SECRET,
         &amz_date,
@@ -304,7 +305,7 @@ async fn unsigned_request_is_rejected_with_missing_authentication_token() {
     let (status, body) = unsigned_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
     assert_eq!(status, 400, "body: {body}");
@@ -327,7 +328,7 @@ async fn wrong_secret_is_rejected_with_invalid_signature() {
     let (status, body) = signed_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         TEST_ACCESS_KEY,
         "not-the-configured-secret",
         &amz_date,
@@ -353,7 +354,7 @@ async fn unknown_access_key_is_rejected_with_unrecognized_client() {
     let (status, body) = signed_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         "AKIDNOTCONFIGURED",
         TEST_SECRET,
         &amz_date,
@@ -380,7 +381,7 @@ async fn stale_x_amz_date_is_rejected_with_expired_signature() {
     let (status, body) = signed_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         TEST_ACCESS_KEY,
         TEST_SECRET,
         &stale_date,
@@ -427,7 +428,7 @@ async fn cluster_without_dynamo_auth_accepts_unsigned_requests_as_before() {
     let (status, body) = unsigned_dynamo(
         addr,
         "DynamoDB_20120810.CreateTable",
-        r#"{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        r#"{"TableName":"widgets","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
     )
     .await;
     assert_eq!(
