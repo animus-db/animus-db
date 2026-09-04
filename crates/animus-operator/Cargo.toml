@@ -27,6 +27,14 @@ futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The `ClusterApi`/`AdminOps` test seams (ADR 0061 rung E1) are `#[async_trait]`
+# rather than native RPITIT: this crate's traits are consumed generically
+# (never as `dyn`), but `kube::runtime::Controller::run` drives the
+# reconciler on a multi-threaded runtime, so every future crossing the seam
+# must be `Send` — `async_trait` boxes it and gets that for free, matching
+# the pattern already used for `animus-env`'s `Env`/`StorageEngine` seams
+# elsewhere in the workspace (see `crates/animus-operator/CLAUDE.md`).
+async-trait.workspace = true
 kube = { version = "4.2.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
 # kube's `rustls-tls` leaves the rustls CryptoProvider choice to the
 # application (rustls 0.23 panics at client build without exactly one
@@ -42,3 +50,10 @@ bytes = "1.12.1"
 http = "1.5.0"
 
 [dev-dependencies]
+# `tokio::time::pause`/`start_paused = true`, for the `drain_and_remove_node`
+# never-completes test: `tokio::time::sleep`'s real-clock use in the drain
+# poll loop is the correct call outside the `Env` seam (ADR 0061 Decision 4,
+# see `controller.rs`'s `#[allow(clippy::disallowed_methods, ...)]` there),
+# but a test still needs its 120 polls x 5s to resolve without 10 minutes of
+# real wall-clock wait.
+tokio = { workspace = true, features = ["test-util"] }
