@@ -4717,18 +4717,18 @@ pub fn delete_table_response(
 /// **Real DynamoDB's `AttributeDefinitions` covers every key attribute in
 /// the table, base and index alike** — a GSI's hash/sort attribute or an
 /// LSI's alternate sort attribute, not just the base table's own
-/// partition/sort key (issue #319). Neither this crate's `IndexDef`
-/// bridge nor `IndexDef` itself ever records an index key attribute's own
-/// declared type (`animus-dynamo/CLAUDE.md`/`animusd/CLAUDE.md` both trace
-/// why — it holds uniformly for a `CreateTable`-declared index and a later
-/// `UpdateTable`-added one alike), so an index-only key attribute here
-/// always renders as the same `key_types`-absent `"S"` default every other
-/// untyped attribute already gets — an honest "unknown, defaulted" answer
-/// rather than an omission. **This does not restore a genuine per-index
-/// type** (nothing here started persisting one); it only closes the
-/// coverage gap — every declared key attribute now gets *an* entry, the
-/// AWS-faithful shape `DescribeTable` promises, even though today every
-/// index-only one names the same placeholder type.
+/// partition/sort key (issue #319, closed). This function itself is
+/// unchanged by that fix — it has always resolved every name in `names`
+/// through a plain lookup in `key_types`, defaulting to `S` only when a
+/// name genuinely isn't there. What changed is what its caller now passes:
+/// `animusd::dynamo::describe_table`/`delete_table` extend the base table's
+/// own typed key columns with `schema_bridge::index_attribute_types` (each
+/// index's own `IndexDef.hash_attribute_type`/`sort_attribute_type`,
+/// recorded from `CreateTable`/`UpdateTable`'s own `AttributeDefinitions`
+/// when the caller supplied one — see `animus_control::IndexDef`'s own
+/// doc), so an index-only key attribute now renders its **real** declared
+/// type when one was ever recorded, and only falls back to the honest
+/// "unknown, defaulted" `S` when it genuinely wasn't.
 fn attribute_definitions(
     schema: &TableSchema,
     key_types: &[(String, String)],
@@ -6462,13 +6462,19 @@ mod tests {
     /// fidelity gap): before this fix `attribute_definitions` only ever
     /// looked at `schema.partition_key`/`schema.sort_key`, so a composite
     /// GSI's `score` (hash) and `rank` (sort) — neither of them the base
-    /// table's own `id` — never appeared in the response at all. Every
-    /// index-only attribute here has no recorded type anywhere in the
-    /// catalog (a separate, uniform-across-`CreateTable`/`UpdateTable` gap,
-    /// not fixed by this test — see `attribute_definitions`'s own doc), so
-    /// it renders the same `"S"` placeholder every other untyped attribute
-    /// gets; what this test actually pins is that the attribute *appears at
-    /// all*, deduplicated against the base/other index attributes.
+    /// table's own `id` — never appeared in the response at all.
+    ///
+    /// **Flipped (issue #319, closed)**: `key_types` here is no longer just
+    /// the base table's own typed columns — it's what `animusd::dynamo::
+    /// describe_table` actually builds now, extending it with
+    /// `schema_bridge::index_attribute_types` off each index's own
+    /// (control-catalog-recorded) `hash_attribute_type`/
+    /// `sort_attribute_type`. So `score`/`rank`/`alt_sort` each render their
+    /// **real** declared type, not the old blanket `"S"` placeholder — this
+    /// function's own logic (a plain name → type lookup) never changed; only
+    /// what `animusd` now passes into it did. `alt_sort` deliberately has no
+    /// entry in `key_types` at all, proving the untyped fallback still works
+    /// correctly for an attribute nobody declared a type for.
     #[test]
     fn describe_table_response_attribute_definitions_cover_index_key_attributes() {
         let gsi = SecondaryIndex::Global(GlobalSecondaryIndex {
@@ -6484,10 +6490,19 @@ mod tests {
             sort_attribute: "alt_sort".into(),
             projection: IndexProjection::All,
         });
+        // The base table's own key type, plus `score`/`rank`'s own declared
+        // types — the shape `animusd::dynamo::describe_table` merges via
+        // `schema_bridge::index_attribute_types`. `alt_sort` is deliberately
+        // absent (untyped).
+        let key_types = [
+            ("id".to_owned(), "S".to_owned()),
+            ("score".to_owned(), "N".to_owned()),
+            ("rank".to_owned(), "B".to_owned()),
+        ];
         let body = describe_table_response(
             "t",
             &TableSchema::simple("id"),
-            &[("id".into(), "S".into())],
+            &key_types,
             &[gsi, lsi],
             &[],
             None,
@@ -6500,10 +6515,20 @@ mod tests {
         let attr_defs_start = body.find("\"AttributeDefinitions\":[").expect("present");
         let attr_defs_end = attr_defs_start + body[attr_defs_start..].find(']').expect("closes");
         let attr_defs = &body[attr_defs_start..=attr_defs_end];
-        for name in ["id", "score", "rank", "alt_sort"] {
+        for (name, ty) in [
+            ("id", "S"),
+            ("score", "N"),
+            ("rank", "B"),
+            // `alt_sort` has no declared type in `key_types` above, so it
+            // must still fall back to the honest "unknown" placeholder.
+            ("alt_sort", "S"),
+        ] {
             assert!(
-                attr_defs.contains(&format!("\"AttributeName\":\"{name}\"")),
-                "missing AttributeDefinitions entry for `{name}`: {attr_defs}"
+                attr_defs.contains(&format!(
+                    "{{\"AttributeName\":\"{name}\",\"AttributeType\":\"{ty}\"}}"
+                )),
+                "missing/wrong AttributeDefinitions entry for `{name}` (want type `{ty}`): \
+                 {attr_defs}"
             );
         }
         assert_eq!(

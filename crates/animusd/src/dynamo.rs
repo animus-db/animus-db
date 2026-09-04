@@ -2871,8 +2871,13 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         )));
     };
     let dynamo_schema = schema_bridge::to_dynamo(control_schema);
-    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let mut key_types = schema_bridge::key_attribute_types(control_schema);
     let index_defs = meta.table_indexes(table);
+    // Issue #319: extend the base table's own typed key columns with every
+    // index's own declared hash/sort attribute type, so `AttributeDefinitions`
+    // reports a real type for an index-only key attribute instead of always
+    // defaulting to `S` — see `schema_bridge::index_attribute_types`'s doc.
+    key_types.extend(schema_bridge::index_attribute_types(index_defs));
     let indexes = schema_bridge::indexes_to_dynamo(index_defs);
     // The Fork-D side channel (`wire::describe_table_response`'s doc): each
     // index's real replicated-catalog status, kept separate from
@@ -2920,8 +2925,10 @@ async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError>
         )));
     };
     let dynamo_schema = schema_bridge::to_dynamo(control_schema);
-    let key_types = schema_bridge::key_attribute_types(control_schema);
+    let mut key_types = schema_bridge::key_attribute_types(control_schema);
     let index_defs = meta.table_indexes(table);
+    // Issue #319 — see `describe_table`'s identical merge for why.
+    key_types.extend(schema_bridge::index_attribute_types(index_defs));
     let indexes = schema_bridge::indexes_to_dynamo(index_defs);
     let index_statuses: Vec<(String, IndexStatus)> = index_defs
         .iter()

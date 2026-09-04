@@ -189,6 +189,36 @@ pub fn index_to_control(
     }
 }
 
+/// The reverse of [`index_to_control`]'s new type resolution: the
+/// `(AttributeName, AttributeType)` pairs for every one of `indexes`'
+/// own declared key attributes that actually has a recorded type (issue
+/// #319) — `None` entries (a pre-existing definition, or one whose
+/// `AttributeDefinitions` never covered it) are simply omitted, so a
+/// caller merging this into a base [`key_attribute_types`] map never
+/// overwrites a real entry with a placeholder. Used by `DescribeTable`/
+/// `DeleteTable`'s response building (`animusd::dynamo`) to extend the
+/// base table's own typed key columns with each index's own typed ones
+/// before handing the merged map to `wire::describe_table_response`/
+/// `delete_table_response` — the AWS-faithful `AttributeDefinitions`
+/// coverage those two already build from a plain `key_types` map that,
+/// until now, only ever contained the base table's own key column types.
+#[must_use]
+pub fn index_attribute_types(indexes: &[IndexDef]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for idx in indexes {
+        if let Some(ty) = idx.hash_attribute_type {
+            out.push((
+                idx.hash_attribute.clone(),
+                attribute_type_for(ty).to_owned(),
+            ));
+        }
+        if let (Some(name), Some(ty)) = (idx.sort_attribute.as_deref(), idx.sort_attribute_type) {
+            out.push((name.to_owned(), attribute_type_for(ty).to_owned()));
+        }
+    }
+    out
+}
+
 /// Recover the DynamoDB [`SecondaryIndex`] declaration from a control-plane
 /// [`IndexDef`] read out of the replicated catalog, so the wire edge can rebuild
 /// its index-maintenance machinery from cluster-agreed definitions (not local
@@ -292,6 +322,57 @@ mod tests {
         );
         assert_eq!(def.sort_attribute_type, None);
         assert_eq!(index_to_dynamo(&def), dynamo);
+    }
+
+    /// Issue #319: a GSI's own hash/sort attribute type, declared in
+    /// `AttributeDefinitions`, is resolved onto the returned [`IndexDef`] —
+    /// and [`index_attribute_types`] recovers exactly those two entries back
+    /// out, the shape `DescribeTable`'s response building merges into its
+    /// base `key_types` map.
+    #[test]
+    fn gsi_key_types_resolve_from_attribute_definitions_and_back() {
+        let dynamo = SecondaryIndex::Global(GlobalSecondaryIndex {
+            name: "by-score".into(),
+            key_attribute: "score".into(),
+            sort_attribute: Some("rank".into()),
+            projection: IndexProjection::All,
+        });
+        let key_types = [
+            ("id".to_owned(), "S".to_owned()),
+            ("score".to_owned(), "N".to_owned()),
+            ("rank".to_owned(), "B".to_owned()),
+        ];
+        let def = index_to_control(&dynamo, "id", &key_types);
+        assert_eq!(def.hash_attribute_type, Some(ColumnType::Number));
+        assert_eq!(def.sort_attribute_type, Some(ColumnType::Binary));
+
+        let recovered = index_attribute_types(std::slice::from_ref(&def));
+        assert_eq!(
+            recovered,
+            vec![
+                ("score".to_owned(), "N".to_owned()),
+                ("rank".to_owned(), "B".to_owned()),
+            ]
+        );
+    }
+
+    /// A pre-existing (or `AttributeDefinitions`-less) [`IndexDef`] — both
+    /// type fields `None` — contributes nothing to
+    /// [`index_attribute_types`]'s output, so merging it into a base
+    /// `key_types` map can never clobber a real entry with a placeholder.
+    #[test]
+    fn index_attribute_types_omits_untyped_fields() {
+        let def = index_to_control(
+            &SecondaryIndex::Global(GlobalSecondaryIndex {
+                name: "by-email".into(),
+                key_attribute: "email".into(),
+                sort_attribute: None,
+                projection: IndexProjection::All,
+            }),
+            "id",
+            &[],
+        );
+        assert!(index_attribute_types(std::slice::from_ref(&def)).is_empty());
     }
 
     #[test]

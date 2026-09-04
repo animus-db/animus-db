@@ -31,6 +31,21 @@ comment for its full type/method inventory.
   replicated catalog (ADR 0013).
 - `schema` — the pure bridge between this crate's DynamoDB `TableSchema` and
   `animus_control`'s replicated `TableSchema`/`IndexDef`, both directions.
+  **`index_to_control` resolves an index's own `hash_attribute_type`/
+  `sort_attribute_type` (issue #319/W-05) from its `key_types` parameter**
+  — the same decoded `AttributeDefinitions` pairs `to_control` already
+  resolves the base table's key columns from — so a `CreateTable`/
+  `UpdateTable` caller that declares an index-only key attribute's type
+  gets it durably recorded on `IndexDef`, not just the base table's own
+  keys. `index_attribute_types(&[IndexDef]) -> Vec<(String, String)>` is
+  the reverse direction: the `(name, type)` pairs `animusd::dynamo::
+  describe_table`/`delete_table` `.extend()` onto their own base
+  `key_types` map before calling `wire::describe_table_response`/
+  `delete_table_response` — see that pair's own doc, and
+  `docs/engineering-lessons.md`'s "threading a per-attribute type through a
+  bridge" entry for why this is a name-keyed edge merge rather than a
+  field threaded through `SecondaryIndex`/`GlobalSecondaryIndex`/
+  `LocalSecondaryIndex` (registry.rs), which never needed to carry it.
 - `storage_key(pk, sk)` — the data-plane key for an item.
 - `index` (**ADR 0041 — the codec every layer of materialized secondary
   indexes is built on**: the write path, the GSI drain, and the native index
