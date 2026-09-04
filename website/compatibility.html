@@ -119,7 +119,7 @@
         <tbody>
           <tr><td><code>CreateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Partition and sort keys, GSIs and LSIs at creation</td></tr>
           <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Includes index status and stream configuration</td></tr>
-          <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Add or drop a GSI on a populated table, with online backfill</td></tr>
+          <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Add or drop a GSI on a populated table, with online backfill, or toggle streams. <code>SSESpecification</code>, <code>ReplicaUpdates</code> and <code>ProvisionedThroughput</code> are rejected with a named <code>ValidationException</code> rather than silently ignored; <code>BillingMode</code> is tolerated only when restating <code>PAY_PER_REQUEST</code>, this adapter's only mode</td></tr>
           <tr><td><code>PutItem</code> · <code>GetItem</code> · <code>DeleteItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Condition expressions, projections, all attribute types</td></tr>
           <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Supported</span></td><td class="d">Update expressions with conditions</td></tr>
           <tr><td><code>Query</code></td><td><span class="pill yes">Supported</span></td><td class="d">Key conditions, filters, index queries, pagination</td></tr>

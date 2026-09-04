@@ -2574,6 +2574,51 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
     }
 }
 
+/// `UpdateTable` top-level keys this adapter never implements a change for —
+/// there is no provisioned-capacity model, no encryption-at-rest toggle, and
+/// no global-tables replica set (see `website/compatibility.html`'s "no
+/// billing meter" framing). Present unconditionally, so a body carrying only
+/// one of these is a clear `ValidationException` naming the key rather than
+/// the generic "requires either..." fallback or, worse, a silent no-op.
+const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &[
+    "SSESpecification",
+    "ReplicaUpdates",
+    "ProvisionedThroughput",
+];
+
+/// Reject any `UpdateTable` top-level key this adapter doesn't model, each
+/// with its own named `ValidationException` (mirroring
+/// [`decode_index_updates`]'s per-shape rejections). `BillingMode` is a
+/// deliberate special case, not a blanket rejection: `CreateTable` already
+/// accepts (and never inspects) `BillingMode: "PAY_PER_REQUEST"` — the only
+/// billing mode this adapter has, since there is no provisioned-capacity
+/// model to switch to — so an `UpdateTable` re-asserting that same value is
+/// tolerated the same way (a common SDK/CLI habit, e.g. `aws dynamodb
+/// update-table --billing-mode PAY_PER_REQUEST`), while any other value
+/// (`"PROVISIONED"`, or a non-string) is rejected by name. Tolerating the
+/// key does not by itself satisfy the call — a `BillingMode`-only body still
+/// falls through to the "requires either..." rejection below, since this
+/// adapter models no billing-mode *change*, only the redundant restatement
+/// of the mode it already has.
+fn reject_unsupported_update_table_keys(obj: &Map<String, Value>) -> Result<(), WireError> {
+    for key in UNSUPPORTED_UPDATE_TABLE_KEYS {
+        if obj.contains_key(*key) {
+            return Err(WireError::validation(format!(
+                "UpdateTable: {key} is not supported"
+            )));
+        }
+    }
+    if let Some(mode) = obj.get("BillingMode")
+        && mode.as_str() != Some("PAY_PER_REQUEST")
+    {
+        return Err(WireError::validation(
+            "UpdateTable: BillingMode is not supported (only PAY_PER_REQUEST, \
+             this adapter's only billing mode, may be restated)",
+        ));
+    }
+    Ok(())
+}
+
 /// Decode an `UpdateTable` request: either a `StreamSpecification` change
 /// (ADR 0042 §2) or a single `GlobalSecondaryIndexUpdates` element (ADR 0045
 /// §6) — rejected up front if **both** are present in the same call (Fork
@@ -2581,9 +2626,14 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 /// decodes to [`StreamUpdate::Enable`] (requiring `StreamViewType`),
 /// `StreamEnabled: false` to [`StreamUpdate::Disable`]; index-update decoding
 /// is [`decode_index_updates`]. Any other shape (neither field present) is
-/// rejected — this adapter models no throughput/key/billing-mode change.
+/// rejected — this adapter models no throughput/key/billing-mode change. See
+/// [`reject_unsupported_update_table_keys`] for the explicit per-key
+/// rejections (`SSESpecification`/`ReplicaUpdates`/`ProvisionedThroughput`
+/// always, `BillingMode` unless restating `PAY_PER_REQUEST`) this runs
+/// before either shape is considered.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
+    reject_unsupported_update_table_keys(obj)?;
     let has_index_updates = obj.contains_key("GlobalSecondaryIndexUpdates");
     let has_stream_spec = obj.contains_key("StreamSpecification");
     if has_index_updates && has_stream_spec {
@@ -6160,6 +6210,13 @@ mod tests {
             {"Update":{"IndexName":"by-email"}}]}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
+        // Pin the exact wording (issue W-04): "no `Update`" plus the reason
+        // (no throughput model), not just the error code.
+        assert_eq!(
+            err.message,
+            "each GlobalSecondaryIndexUpdates element must be exactly one of `Create` or \
+             `Delete` (no `Update` — no throughput model)"
+        );
     }
 
     #[test]
@@ -6174,6 +6231,72 @@ mod tests {
     #[test]
     fn update_table_requires_stream_specification_or_index_updates() {
         let body = br#"{"TableName":"t"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn update_table_rejects_sse_specification() {
+        let body = br#"{"TableName":"t","SSESpecification":{"Enabled":true}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(
+            err.message,
+            "UpdateTable: SSESpecification is not supported"
+        );
+    }
+
+    #[test]
+    fn update_table_rejects_replica_updates() {
+        let body = br#"{"TableName":"t","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+    }
+
+    #[test]
+    fn update_table_rejects_provisioned_throughput() {
+        let body = br#"{"TableName":"t",
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert_eq!(
+            err.message,
+            "UpdateTable: ProvisionedThroughput is not supported"
+        );
+    }
+
+    #[test]
+    fn update_table_rejects_an_unsupported_billing_mode() {
+        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("BillingMode"), "{}", err.message);
+    }
+
+    #[test]
+    fn update_table_tolerates_pay_per_request_billing_mode_alongside_a_real_change() {
+        // BillingMode: PAY_PER_REQUEST is this adapter's only billing mode
+        // (see CreateTable, which accepts and never inspects it); restating
+        // it on UpdateTable is a common SDK/CLI habit and must not block an
+        // otherwise-valid stream/index change.
+        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST",
+            "StreamSpecification":{"StreamEnabled":false}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable { stream, .. } => {
+                assert_eq!(stream, Some(StreamUpdate::Disable));
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_table_rejects_a_billing_mode_only_body_with_no_modeled_change() {
+        // Tolerating the key isn't the same as modeling a billing-mode
+        // *change*: with no GSI/stream change alongside it, this still
+        // falls through to the generic "requires either..." rejection.
+        let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST"}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
         assert_eq!(err.code, "ValidationException");
     }
