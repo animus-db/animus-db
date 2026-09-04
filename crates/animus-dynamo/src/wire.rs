@@ -376,9 +376,60 @@ pub enum UpdateReturnValues {
     UpdatedNew,
 }
 
+/// One operand of a `SET` clause's right-hand side (an [`UpdateExpr`]): a
+/// `:value` placeholder already resolved at decode time, a top-level
+/// attribute name read from the item being updated, or a function call.
+/// Nested document paths (`a.b`, `a[0]`) are a documented gap here — this
+/// operand always names a **top-level** attribute (issue #375 PR1); see
+/// [`UpdateAction::Set`]'s own doc.
+///
+/// A `Path` operand's read happens at **apply time** ([`eval_update_operand`]),
+/// against whatever the fold has built so far — not necessarily the item's
+/// original pre-update image — since [`apply_update`] evaluates each SET
+/// action's expression against its own in-progress `item`. This mirrors
+/// `ADD`'s existing `item.get(attr)` read exactly; it is a documented
+/// simplification (DynamoDB's own within-expression ordering semantics are
+/// stricter) rather than a modeled property.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateOperand {
+    /// An already-resolved `:value`.
+    Value(AttributeValue),
+    /// A top-level attribute name, read from the item at apply time.
+    Path(String),
+    /// `if_not_exists(path, default)` — `path`'s current value if present,
+    /// else `default` (itself evaluated, so it may be another function call
+    /// or a `:value`). Evaluating to nothing (a `default` that is itself an
+    /// absent path) is a `ValidationException` — `SET` can never assign
+    /// "no value".
+    IfNotExists(String, Box<UpdateOperand>),
+    /// `list_append(a, b)` — the concatenation `a ++ b`; both operands must
+    /// evaluate to a list (`L`). A missing operand, or a present one that
+    /// isn't a list, is a `ValidationException`.
+    ListAppend(Box<UpdateOperand>, Box<UpdateOperand>),
+}
+
+/// A `SET` clause's right-hand side: currently always a single
+/// [`UpdateOperand`] (issue #375 PR1) — arithmetic (`operand +/- operand`)
+/// lands in a follow-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateExpr {
+    /// A single operand, no arithmetic.
+    Operand(UpdateOperand),
+}
+
+impl UpdateExpr {
+    /// A plain `:value`/path/function-call `SET` expression — convenience
+    /// wrapper around [`UpdateOperand::Value`]/`Self::Operand` used by every
+    /// caller that just needs "SET this literal value" (the pre-arithmetic
+    /// common case).
+    #[must_use]
+    pub fn value(v: AttributeValue) -> Self {
+        UpdateExpr::Operand(UpdateOperand::Value(v))
+    }
+}
+
 /// One action of an `UpdateItem` `UpdateExpression` (the supported subset): set a
-/// top-level attribute to a value, or remove one. `ADD`/`DELETE` (set/number
-/// arithmetic) are deferred.
+/// top-level attribute to a value/path/function-call expression, or remove one.
 ///
 /// **`Serialize`/`Deserialize` (ADR 0046 U3)**: rides the wire inside
 /// `ClientRequest::KindWriteItem`'s `KindWriteOp::Update` — the leader-side
@@ -387,8 +438,13 @@ pub enum UpdateReturnValues {
 /// (possibly stale, possibly racing) edge that received the request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateAction {
-    /// `SET attr = :v` — set (or overwrite) a top-level attribute.
-    Set(String, AttributeValue),
+    /// `SET attr = expr` — set (or overwrite) a top-level attribute to the
+    /// result of evaluating `expr` ([`UpdateExpr`]: a value, a path, or
+    /// `if_not_exists(..)`/`list_append(..)`) against the item at apply time
+    /// (issue #375 PR1). Nested document paths as the *target* (`SET a.b =
+    /// :v`) are a documented gap — the target is always a top-level
+    /// attribute name.
+    Set(String, UpdateExpr),
     /// `REMOVE attr` — drop a top-level attribute if present.
     Remove(String),
     /// `ADD attr :v` — numeric addition when both sides are `N`, set union
@@ -2023,12 +2079,15 @@ fn continues_update_clause(
 }
 
 /// Decode a DynamoDB `UpdateExpression` (the supported subset). Recognized
-/// clauses are `SET a = :v, b = :w`, `REMOVE c, d`, `ADD e :v`, and
+/// clauses are `SET a = expr, b = expr`, `REMOVE c, d`, `ADD e :v`, and
 /// `DELETE f :v`, in any order; the attribute names may use `#alias`
-/// placeholders and the values `:placeholder`s. Non-whitespace text before
-/// the first recognized clause keyword is rejected too — e.g. `"foo SET x =
-/// :v"` — rather than silently dropped, which would otherwise apply only the
-/// `SET` and never surface the leading garbage.
+/// placeholders and the values `:placeholder`s. A `SET` right-hand side
+/// (issue #375 PR1) is one [`UpdateExpr`]: a bare `:value`/path, or a
+/// `if_not_exists(path, default)`/`list_append(a, b)` function call — see
+/// [`parse_update_set_expr`]. Non-whitespace text before the first
+/// recognized clause keyword is rejected too — e.g. `"foo SET x = :v"` —
+/// rather than silently dropped, which would otherwise apply only the `SET`
+/// and never surface the leading garbage.
 ///
 /// This is a real clause tokenizer ([`tokenize_update_expression`]), not a
 /// substring keyword scan: `SET`/`REMOVE`/`ADD`/`DELETE` are recognized as
@@ -2098,11 +2157,9 @@ fn parse_update_clauses(
                         return Err(WireError::validation("SET clause must be `attr = :value`"));
                     }
                 }
-                let value_tok = expect_update_word(tokens, &mut i, expr, "a `:value` placeholder")
-                    .map_err(|_| WireError::validation("SET clause must be `attr = :value`"))?;
                 let attr = resolve_attr_name(obj, path)?;
-                let value = resolve_placeholder(obj, value_tok)?;
-                actions.push(UpdateAction::Set(attr, value));
+                let value_expr = parse_update_set_expr(obj, tokens, &mut i, expr)?;
+                actions.push(UpdateAction::Set(attr, value_expr));
                 if !continues_update_clause(tokens, &mut i, expr)? {
                     break;
                 }
@@ -2188,6 +2245,149 @@ fn parse_update_clauses(
         }
     }
     Ok(actions)
+}
+
+/// Consume one exact punctuation token (`Comma`/`RParen`/…), or fail with a
+/// message naming what was expected. Compares by variant only — the two
+/// payload-carrying variants (`Word`) are never passed as `want` here.
+fn expect_update_punct(
+    tokens: &[(UpdateToken<'_>, u32)],
+    i: &mut usize,
+    expr: &str,
+    want: UpdateToken<'_>,
+    what: &str,
+) -> Result<(), WireError> {
+    match tokens.get(*i) {
+        Some((tok, _)) if *tok == want => {
+            *i += 1;
+            Ok(())
+        }
+        Some((tok, _)) => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` expected {what}, found `{}`",
+            tok.text()
+        ))),
+        None => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` expected {what}, found end of expression"
+        ))),
+    }
+}
+
+/// Parse a `SET` clause's right-hand side: currently always a single
+/// [`UpdateOperand`] (issue #375 PR1) — a follow-up teaches this arithmetic.
+fn parse_update_set_expr(
+    obj: &Map<String, Value>,
+    tokens: &[(UpdateToken<'_>, u32)],
+    i: &mut usize,
+    expr: &str,
+) -> Result<UpdateExpr, WireError> {
+    let operand = parse_update_operand(obj, tokens, i, expr)?;
+    Ok(UpdateExpr::Operand(operand))
+}
+
+/// Parse one [`UpdateOperand`]: a `:value` placeholder, a top-level
+/// attribute name, or `name(...)` — a function call, recognized purely by a
+/// `(` immediately following the name (never by the name's own spelling, the
+/// same "grammar position decides, not spelling" discipline
+/// [`decode_update_expression`]'s own doc establishes for clause keywords).
+fn parse_update_operand(
+    obj: &Map<String, Value>,
+    tokens: &[(UpdateToken<'_>, u32)],
+    i: &mut usize,
+    expr: &str,
+) -> Result<UpdateOperand, WireError> {
+    let word = expect_update_word(tokens, i, expr, "a value, path, or function call")?;
+    if matches!(tokens.get(*i), Some((UpdateToken::LParen, _))) {
+        return parse_update_func_call(obj, tokens, i, expr, word);
+    }
+    if word.starts_with(':') {
+        return Ok(UpdateOperand::Value(resolve_placeholder(obj, word)?));
+    }
+    Ok(UpdateOperand::Path(resolve_attr_name(obj, word)?))
+}
+
+/// Parse a function call's argument list — `tokens[*i]` is the `(` right
+/// after `name`, not yet consumed. Only `if_not_exists`/`list_append` are
+/// recognized (DynamoDB's names, case-sensitive — unlike the clause
+/// keywords, these are never matched case-insensitively).
+fn parse_update_func_call(
+    obj: &Map<String, Value>,
+    tokens: &[(UpdateToken<'_>, u32)],
+    i: &mut usize,
+    expr: &str,
+    name: &str,
+) -> Result<UpdateOperand, WireError> {
+    *i += 1; // consume '('
+    match name {
+        "if_not_exists" => {
+            let path_word = expect_update_word(tokens, i, expr, "a path")?;
+            let path = resolve_attr_name(obj, path_word)?;
+            expect_update_punct(tokens, i, expr, UpdateToken::Comma, "`,`")?;
+            let default = parse_update_operand(obj, tokens, i, expr)?;
+            expect_update_punct(tokens, i, expr, UpdateToken::RParen, "`)`")?;
+            Ok(UpdateOperand::IfNotExists(path, Box::new(default)))
+        }
+        "list_append" => {
+            let a = parse_update_operand(obj, tokens, i, expr)?;
+            expect_update_punct(tokens, i, expr, UpdateToken::Comma, "`,`")?;
+            let b = parse_update_operand(obj, tokens, i, expr)?;
+            expect_update_punct(tokens, i, expr, UpdateToken::RParen, "`)`")?;
+            Ok(UpdateOperand::ListAppend(Box::new(a), Box::new(b)))
+        }
+        other => Err(WireError::validation(format!(
+            "`UpdateExpression` `{expr}` calls unsupported function `{other}` \
+             (supported: if_not_exists, list_append)"
+        ))),
+    }
+}
+
+/// Evaluate a `SET` clause's right-hand side against `item` — the same
+/// in-progress item [`apply_update`]'s own fold is building, so a `Path`
+/// operand naming an attribute a prior action in the same expression
+/// already set sees that action's result (see [`UpdateOperand`]'s own doc
+/// on this simplification). `None` (an operand that evaluates to "no
+/// value" — a bare absent path, never wrapped in `if_not_exists`) is a
+/// `ValidationException`, since `SET` can never assign nothing.
+fn eval_update_expr(item: &Item, expr: &UpdateExpr) -> Result<AttributeValue, WireError> {
+    let missing = || {
+        WireError::validation(
+            "The provided expression refers to an attribute that does not exist in the item",
+        )
+    };
+    match expr {
+        UpdateExpr::Operand(op) => eval_update_operand(item, op)?.ok_or_else(missing),
+    }
+}
+
+/// Evaluate one [`UpdateOperand`] against `item`. `Ok(None)` means the
+/// operand names an attribute that does not currently exist — a legal
+/// intermediate result (`if_not_exists`'s first argument), but never a
+/// legal *final* `SET` value; the caller decides whether `None` is an
+/// error.
+fn eval_update_operand(
+    item: &Item,
+    operand: &UpdateOperand,
+) -> Result<Option<AttributeValue>, WireError> {
+    match operand {
+        UpdateOperand::Value(v) => Ok(Some(v.clone())),
+        UpdateOperand::Path(name) => Ok(item.get(name).cloned()),
+        UpdateOperand::IfNotExists(name, default) => match item.get(name) {
+            Some(v) => Ok(Some(v.clone())),
+            None => eval_update_operand(item, default),
+        },
+        UpdateOperand::ListAppend(a, b) => {
+            let missing =
+                || WireError::validation("list_append operand does not exist in the item");
+            let a = eval_update_operand(item, a)?.ok_or_else(missing)?;
+            let b = eval_update_operand(item, b)?.ok_or_else(missing)?;
+            let (AttributeValue::L(mut av), AttributeValue::L(bv)) = (a, b) else {
+                return Err(WireError::validation(
+                    "list_append operands must both be lists (L)",
+                ));
+            };
+            av.extend(bv);
+            Ok(Some(AttributeValue::L(av)))
+        }
+    }
 }
 
 /// Resolve a single top-level attribute name in an update clause, following a
@@ -4262,12 +4462,14 @@ pub fn batch_write_response() -> String {
 /// item is built from the key by the caller before this), returning the new
 /// item. Pure.
 ///
-/// `SET` sets/overwrites a top-level attribute and `REMOVE` drops one; both are
-/// infallible. `ADD` and `DELETE` are **not**: they are typed operations, and
-/// DynamoDB rejects a mismatch (`ADD`ing a number to a string set) rather than
-/// ignoring it. Hence the `Result` — silently skipping a mismatched action
-/// would leave the caller believing an update applied when it did not, which
-/// is the one outcome worse than an error.
+/// `REMOVE` drops a top-level attribute and is infallible. `SET` (issue #375
+/// PR1) evaluates its right-hand-side [`UpdateExpr`] against the item — a
+/// bare `:value` never fails, but `if_not_exists`/`list_append` can (a
+/// missing operand, a non-list `list_append`). `ADD` and `DELETE` are typed
+/// operations too, and DynamoDB rejects a mismatch (`ADD`ing a number to a
+/// string set) rather than ignoring it. Hence the `Result` — silently
+/// skipping a mismatched action would leave the caller believing an update
+/// applied when it did not, which is the one outcome worse than an error.
 ///
 /// This runs on the **leader** that owns the row (ADR 0046 U3), against the old
 /// image the leader itself read, so `ADD`'s read-modify-write is evaluated
@@ -4284,8 +4486,9 @@ pub fn batch_write_response() -> String {
 pub fn apply_update(mut item: Item, actions: &[UpdateAction]) -> Result<Item, WireError> {
     for action in actions {
         match action {
-            UpdateAction::Set(attr, value) => {
-                item.insert(attr.clone(), value.clone());
+            UpdateAction::Set(attr, value_expr) => {
+                let value = eval_update_expr(&item, value_expr)?;
+                item.insert(attr.clone(), value);
             }
             UpdateAction::Remove(attr) => {
                 item.remove(attr);
@@ -7125,8 +7328,8 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("a".into(), s("x")),
-                UpdateAction::Set("b".into(), AttributeValue::N("3".into())),
+                UpdateAction::Set("a".into(), UpdateExpr::value(s("x"))),
+                UpdateAction::Set("b".into(), UpdateExpr::value(AttributeValue::N("3".into()))),
                 UpdateAction::Remove("c".into()),
             ]
         );
@@ -7145,7 +7348,10 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Set("x".into(), s("y"))]);
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set("x".into(), UpdateExpr::value(s("y")))]
+        );
     }
 
     /// Regression: unrecognized leading text before the first clause keyword
@@ -7174,7 +7380,10 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Set("set".into(), s("x"))]);
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set("set".into(), UpdateExpr::value(s("x")))]
+        );
     }
 
     /// A reserved word used as the attribute name on *both* sides of a SET
@@ -7192,8 +7401,8 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("add".into(), s("x")),
-                UpdateAction::Set("remove".into(), s("y")),
+                UpdateAction::Set("add".into(), UpdateExpr::value(s("x"))),
+                UpdateAction::Set("remove".into(), UpdateExpr::value(s("y"))),
             ]
         );
     }
@@ -7288,7 +7497,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                UpdateAction::Set("set".into(), s("x")),
+                UpdateAction::Set("set".into(), UpdateExpr::value(s("x"))),
                 UpdateAction::Remove("remove".into()),
                 UpdateAction::Add("add".into(), AttributeValue::N("1".into())),
                 UpdateAction::Delete("delete".into(), AttributeValue::SS(vec!["a".into()])),
@@ -7309,7 +7518,10 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Set("size".into(), s("x"))]);
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set("size".into(), UpdateExpr::value(s("x")))]
+        );
     }
 
     /// A reserved word aliased via `#alias` (the AWS-recommended way to name
@@ -7325,7 +7537,10 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Set("set".into(), s("x"))]);
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set("set".into(), UpdateExpr::value(s("x")))]
+        );
     }
 
     /// Clause keywords stay case-insensitive at a genuine clause-start
@@ -7344,7 +7559,10 @@ mod tests {
         else {
             panic!("expected UpdateItem");
         };
-        assert_eq!(actions, vec![UpdateAction::Set("a".into(), s("x"))]);
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set("a".into(), UpdateExpr::value(s("x")))]
+        );
     }
 
     /// A malformed sequence — a second `path = value` action missing its
@@ -7367,7 +7585,7 @@ mod tests {
         let new = apply_update(
             item,
             &[
-                UpdateAction::Set("a".into(), s("x")),
+                UpdateAction::Set("a".into(), UpdateExpr::value(s("x"))),
                 UpdateAction::Remove("c".into()),
             ],
         )
@@ -7375,6 +7593,142 @@ mod tests {
         assert_eq!(new.get("a"), Some(&s("x")));
         assert!(!new.contains_key("c"));
         assert_eq!(new.get("id"), Some(&s("k")));
+    }
+
+    // --- `if_not_exists`/`list_append` (issue #375 PR1) --------------------
+
+    #[test]
+    fn decodes_if_not_exists_in_set() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = if_not_exists(a, :v)",
+            "ExpressionAttributeValues":{":v":{"N":"0"}}}"#;
+        let Operation::UpdateItem { actions, .. } =
+            decode_request("DynamoDB_20120810.UpdateItem", body).unwrap()
+        else {
+            panic!("expected UpdateItem");
+        };
+        assert_eq!(
+            actions,
+            vec![UpdateAction::Set(
+                "a".into(),
+                UpdateExpr::Operand(UpdateOperand::IfNotExists(
+                    "a".into(),
+                    Box::new(UpdateOperand::Value(AttributeValue::N("0".into())))
+                ))
+            )]
+        );
+    }
+
+    #[test]
+    fn if_not_exists_seeds_an_absent_attribute_and_leaves_a_present_one_alone() {
+        let action = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Operand(UpdateOperand::IfNotExists(
+                "a".into(),
+                Box::new(UpdateOperand::Value(AttributeValue::N("0".into()))),
+            )),
+        );
+        let out =
+            apply_update(Item::new(), std::slice::from_ref(&action)).expect("seeds the default");
+        assert_eq!(out.get("a"), Some(&AttributeValue::N("0".into())));
+
+        let mut present = Item::new();
+        present.insert("a".into(), AttributeValue::N("7".into()));
+        let out = apply_update(present, &[action]).expect("leaves the existing value alone");
+        assert_eq!(out.get("a"), Some(&AttributeValue::N("7".into())));
+    }
+
+    /// `if_not_exists(a, :v)` where `a` is absent and `:v` is itself an
+    /// absent-path default (never wrapped in another `if_not_exists`) has no
+    /// value to assign — a `ValidationException`, not a silently-applied
+    /// no-op.
+    #[test]
+    fn if_not_exists_with_no_default_value_is_a_validation_error() {
+        let action = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Operand(UpdateOperand::IfNotExists(
+                "a".into(),
+                Box::new(UpdateOperand::Path("also_absent".into())),
+            )),
+        );
+        let err = apply_update(Item::new(), &[action]).expect_err("nothing to assign");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_list_append_both_operand_orders() {
+        for expr in ["SET a = list_append(a, :l)", "SET a = list_append(:l, a)"] {
+            let body = format!(
+                r#"{{"TableName":"t","Key":{{"id":{{"S":"k"}}}},
+                "UpdateExpression":"{expr}",
+                "ExpressionAttributeValues":{{":l":{{"L":[{{"N":"3"}}]}}}}}}"#
+            );
+            decode_request("DynamoDB_20120810.UpdateItem", body.as_bytes())
+                .unwrap_or_else(|e| panic!("`{expr}` should decode: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn list_append_concatenates_in_order() {
+        let mut item = Item::new();
+        item.insert(
+            "a".into(),
+            AttributeValue::L(vec![AttributeValue::N("1".into())]),
+        );
+        let action = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Operand(UpdateOperand::ListAppend(
+                Box::new(UpdateOperand::Path("a".into())),
+                Box::new(UpdateOperand::Value(AttributeValue::L(vec![
+                    AttributeValue::N("2".into()),
+                ]))),
+            )),
+        );
+        let out = apply_update(item, &[action]).expect("both operands are lists");
+        assert_eq!(
+            out.get("a"),
+            Some(&AttributeValue::L(vec![
+                AttributeValue::N("1".into()),
+                AttributeValue::N("2".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn list_append_on_a_non_list_operand_is_a_validation_error() {
+        let mut item = Item::new();
+        item.insert("a".into(), AttributeValue::N("1".into()));
+        let action = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Operand(UpdateOperand::ListAppend(
+                Box::new(UpdateOperand::Path("a".into())),
+                Box::new(UpdateOperand::Value(AttributeValue::L(vec![]))),
+            )),
+        );
+        let err = apply_update(item, &[action]).expect_err("a is a number, not a list");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn list_append_on_a_missing_operand_is_a_validation_error() {
+        let action = UpdateAction::Set(
+            "a".into(),
+            UpdateExpr::Operand(UpdateOperand::ListAppend(
+                Box::new(UpdateOperand::Path("missing".into())),
+                Box::new(UpdateOperand::Value(AttributeValue::L(vec![]))),
+            )),
+        );
+        let err = apply_update(Item::new(), &[action]).expect_err("`missing` does not exist");
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn unsupported_function_name_is_rejected() {
+        let body = br#"{"TableName":"t","Key":{"id":{"S":"k"}},
+            "UpdateExpression":"SET a = nope(a, :v)",
+            "ExpressionAttributeValues":{":v":{"N":"0"}}}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateItem", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
     }
 
     #[test]
@@ -7823,14 +8177,23 @@ mod tests {
         // "a" is a 1-byte attribute name, so a value of `MAX_ITEM_SIZE_BYTES -
         // 1` bytes makes the post-update item land exactly on the cap.
         let at_cap_value = AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES - 1));
-        let out = apply_update(Item::new(), &[UpdateAction::Set("a".into(), at_cap_value)])
-            .expect("exactly the cap is accepted");
+        let out = apply_update(
+            Item::new(),
+            &[UpdateAction::Set(
+                "a".into(),
+                UpdateExpr::value(at_cap_value),
+            )],
+        )
+        .expect("exactly the cap is accepted");
         assert_eq!(item_size(&out), MAX_ITEM_SIZE_BYTES);
 
         let over_cap_value = AttributeValue::S("x".repeat(MAX_ITEM_SIZE_BYTES));
         let err = apply_update(
             Item::new(),
-            &[UpdateAction::Set("a".into(), over_cap_value)],
+            &[UpdateAction::Set(
+                "a".into(),
+                UpdateExpr::value(over_cap_value),
+            )],
         )
         .expect_err("one byte over the cap is rejected");
         assert_eq!(err.code, "ValidationException");
@@ -7854,7 +8217,7 @@ mod tests {
         let out = apply_update(
             item,
             &[
-                UpdateAction::Set("temp".into(), huge),
+                UpdateAction::Set("temp".into(), UpdateExpr::value(huge)),
                 UpdateAction::Remove("temp".into()),
             ],
         )
@@ -7879,7 +8242,7 @@ mod tests {
             item,
             &[UpdateAction::Set(
                 "b".into(),
-                AttributeValue::S("y".repeat(20)),
+                UpdateExpr::value(AttributeValue::S("y".repeat(20))),
             )],
         )
         // adds 1 ("b") + 20 = 21 bytes -> MAX_ITEM_SIZE_BYTES + 12, over the cap.
@@ -9221,7 +9584,10 @@ mod tests {
                 assert_eq!(
                     actions,
                     vec![
-                        UpdateAction::Set("name".into(), AttributeValue::S("x".into())),
+                        UpdateAction::Set(
+                            "name".into(),
+                            UpdateExpr::value(AttributeValue::S("x".into()))
+                        ),
                         UpdateAction::Add("tags2".into(), AttributeValue::SS(vec!["a".into()])),
                         UpdateAction::Delete("tags".into(), AttributeValue::SS(vec!["old".into()])),
                     ],
