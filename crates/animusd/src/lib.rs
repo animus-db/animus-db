@@ -10902,6 +10902,17 @@ pub(crate) async fn relay_request(addr: String, request: &ClientRequest) -> Clie
 /// [`WATCH_METADATA_CLIENT_TIMEOUT`] must exceed the serving node's
 /// [`WATCH_METADATA_SERVER_TIMEOUT`] bound by a comfortable margin; reusing
 /// the generic [`CLIENT_TIMEOUT`] here would race the server's own reply.
+///
+/// **Two distinct sentinels since issue #585's continuation, not one** — see
+/// [`RELAY_TRANSPORT_FAILURE`] and [`RELAY_HOP_TIMEOUT`]'s own docs for why
+/// `forwarding::ClientCtx::forward_to_tablet_leader`'s hinted-retry chase
+/// needs to tell them apart. The distinction falls straight out of which
+/// half of `tokio::time::timeout`'s own result fires: the inner async block
+/// completing with `None` (`Ok(None)` below) means a connect/write/read
+/// genuinely failed *within* budget — fast, confirmed, dead; the whole
+/// attempt outliving `timeout` (`Err(_)`, `tokio::time::error::Elapsed`)
+/// means nothing failed, there just wasn't an answer *yet* — the candidate
+/// may still be alive and simply slow.
 async fn relay_request_with_timeout(
     addr: String,
     request: &ClientRequest,
@@ -10915,40 +10926,59 @@ async fn relay_request_with_timeout(
     .await
     {
         Ok(Some(resp)) => resp,
-        _ => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
+        Ok(None) => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
+        Err(_) => ClientResponse::Error(RELAY_HOP_TIMEOUT.into()),
     }
 }
 
-/// The plain-text sentinel [`relay_request_with_timeout`] returns for any
-/// **transport**-level failure — connect refused/timed out, the write/read
-/// itself failing, or the whole attempt outliving its budget — as opposed to
-/// a reply a live peer actually sent. Named so `forwarding::ClientCtx::
-/// forward_to_tablet_leader`'s hinted-retry chase can tell the two apart
-/// (issue #316): unlike a parsed "not the leader here" refusal (a candidate
-/// that IS reachable, just not the leader), this means the candidate could
-/// not be USED at all within its allotted budget — which the chase must
-/// treat as "try the next known replica," exactly like a refusal carrying no
-/// hint, rather than as a terminal error. Before that fix, a forward whose
-/// first-guess or hint-chased candidate happened to be a node that had just
-/// crashed/been killed gave up on the very first unreachable hop and never
-/// tried the tablet's other live replicas — see that function's own doc for
-/// the full mechanism.
+/// The plain-text sentinel [`relay_request_with_timeout`] returns for a
+/// **fast, confirmed** transport-level failure — connect refused, or the
+/// write/read itself failing — all resolved well *within* the hop's own
+/// budget, as opposed to a reply a live peer actually sent. Named so
+/// `forwarding::ClientCtx::forward_to_tablet_leader`'s hinted-retry chase
+/// can tell it apart from a genuine refusal (issue #316): unlike a parsed
+/// "not the leader here" refusal (a candidate that IS reachable, just not
+/// the leader), this means the candidate could not be reached at all —
+/// which the chase must treat as "try the next known replica," exactly like
+/// a refusal carrying no hint, rather than as a terminal error. Before that
+/// fix, a forward whose first-guess or hint-chased candidate happened to be
+/// a node that had just crashed/been killed gave up on the very first
+/// unreachable hop and never tried the tablet's other live replicas — see
+/// that function's own doc for the full mechanism.
 ///
-/// **Two different causes now collapse into this one sentinel — a
-/// distinction that matters for issue #585, not #316.** "Outliving its
-/// budget" was originally read as synonymous with "unreachable" (a crashed
-/// node's connect fails near-instantly, well inside any timeout, so in
-/// practice this sentinel meant genuine unreachability). Since
-/// [`FORWARD_HOP_TIMEOUT`] caps each hop's own timeout well below what a
-/// candidate might legitimately take to answer, this sentinel now also
-/// covers a candidate that IS reachable — connects fine — but is simply
-/// slow or hung and doesn't reply within that hop's own bounded window. The
-/// chase's treatment is correctly identical either way ("try the next known
-/// replica"), so nothing downstream needed to change; this note exists so a
-/// future reader doesn't reintroduce the old "this sentinel means dead"
-/// assumption — see `forward_to_tablet_leader`'s own doc and
-/// `FORWARD_HOP_TIMEOUT`'s for the full account.
+/// **Since issue #585's continuation, this sentinel means confirmed-dead
+/// specifically, never "ran out of time."** The two used to collapse into
+/// this one string (see that fix's own now-superseded note, still visible
+/// in git history) — a crashed node's connect fails near-instantly, well
+/// inside any timeout, so in practice this sentinel meant genuine
+/// unreachability, but nothing distinguished that from a hop that was
+/// merely capped by [`FORWARD_HOP_TIMEOUT`] before a *reachable*, simply
+/// slow candidate could answer. That conflation is exactly what let a
+/// hint naming a slow-but-live leader get filtered out by `forward_to_
+/// tablet_leader`'s own `tried` set forever (see that function's doc for
+/// the regression this caused under a real membership-change storm). The
+/// two causes are now told apart at the source — see [`RELAY_HOP_TIMEOUT`]
+/// for the sibling sentinel and `relay_request_with_timeout`'s own doc for
+/// exactly how the split is made.
 const RELAY_TRANSPORT_FAILURE: &str = "relay to peer node failed";
+
+/// The plain-text sentinel [`relay_request_with_timeout`] returns when a
+/// hop's own capped timeout ([`FORWARD_HOP_TIMEOUT`], or whatever `timeout`
+/// its caller passed) elapses before any answer arrives — as opposed to
+/// [`RELAY_TRANSPORT_FAILURE`], a fast, confirmed failure resolved well
+/// *within* budget. **This does not mean the candidate is dead** — it
+/// means only that nothing was learned about it in the time allotted; it
+/// may be a perfectly live leader still mid-commit (a membership-change
+/// storm, a loaded sandbox, a starved disk). `forwarding::ClientCtx::
+/// forward_to_tablet_leader`'s hinted-retry chase relies on this
+/// distinction (issue #585's continuation, `decide::
+/// resolve_forward_candidate`, `animus-node`): a node that merely timed out
+/// stays eligible for a hint naming it back, and for a final retry once
+/// every other known replica has been exhausted, rather than being
+/// permanently excluded the way a confirmed-dead candidate correctly is.
+/// See `forward_to_tablet_leader`'s own doc for the full mechanism this
+/// sentinel exists to support.
+const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
@@ -11906,6 +11936,246 @@ mod forward_hop_timeout_tests {
                 node.shutdown_graceful().await;
             }
         }
+    }
+
+    /// A raw TCP stub playing "a genuinely live leader whose first commit
+    /// attempt is slow, but who does eventually answer" — stalls its FIRST
+    /// connection forever, exactly like [`spawn_never_answers_stub`] (so
+    /// that hop runs out its own `FORWARD_HOP_TIMEOUT` and the caller sees
+    /// `RELAY_HOP_TIMEOUT`, not a confirmed transport failure), but answers
+    /// every LATER connection immediately with `ClientResponse::PutOk` —
+    /// modeling a leader whose first commit attempt is genuinely slow (a
+    /// real membership-change storm, say) yet which does eventually finish,
+    /// comfortably inside `CLIENT_TIMEOUT`. Deterministic: nothing here is
+    /// time-based except the caller's own timeout under test.
+    async fn spawn_slow_then_ok_stub(addr: SocketAddr) {
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("rebind the first guess's own former intra address");
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let first = first.clone();
+                tokio::spawn(async move {
+                    if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        // The stalled first hop: drain whatever the caller
+                        // sends and hold the connection open with no reply
+                        // — only the caller's own FORWARD_HOP_TIMEOUT ends
+                        // this side of things.
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                    // A later connection: answer immediately, as the real
+                    // leader would once its slow commit finally finishes.
+                    let _ = crate::write_frame(&mut stream, &ClientResponse::PutOk).await;
+                });
+            }
+        });
+    }
+
+    /// A raw TCP stub that answers every connection with the same canned
+    /// "not the leader here" refusal, after `delay` — stands in for a live
+    /// replica whose own refusal names the tablet's real (currently slow)
+    /// leader, exactly what a real cluster's own replicas would say once
+    /// they agree on who leads. `delay` models a busy/reconfiguring
+    /// replica's own real round-trip cost — kept comfortably under
+    /// `FORWARD_HOP_TIMEOUT` so the caller's hop to *this* stub always
+    /// completes with a real refusal, never a further `RELAY_HOP_TIMEOUT`
+    /// of its own.
+    async fn spawn_hint_stub(addr: SocketAddr, hint_msg: String, delay: Duration) {
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("rebind a replica's own former intra address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let hint_msg = hint_msg.clone();
+                tokio::spawn(async move {
+                    let _req: Option<ClientRequest> =
+                        crate::read_frame(&mut stream).await.ok().flatten();
+                    sleep(delay).await;
+                    let _ = crate::write_frame(&mut stream, &ClientResponse::Error(hint_msg)).await;
+                });
+            }
+        });
+    }
+
+    /// Issue #585, continued: the hop cap above closes the starvation hole
+    /// but, on its own, regressed the property it was meant to leave
+    /// intact — a genuinely slow-but-**live** leader must still be waited
+    /// out within `CLIENT_TIMEOUT`, not permanently written off because its
+    /// first hop happened to outlive `FORWARD_HOP_TIMEOUT`. See
+    /// `forward_to_tablet_leader`'s own doc (the "continued" section,
+    /// `forwarding.rs`) for the full mechanism this proves end to end, and
+    /// `decide::resolve_forward_candidate`'s own unit tests (`animus-node`)
+    /// for the pure decision under test here, minus the sockets.
+    ///
+    /// **Setup**, mirroring the module doc's own "why not `SimEnv`"
+    /// reasoning above, and **all three** of the tablet's replicas replaced
+    /// with stubs — not just the first guess — so nothing about this test's
+    /// timing depends on a real Raft group's own incidental election
+    /// state. `replicas[0]` (the deterministic first guess) is replaced by
+    /// [`spawn_slow_then_ok_stub`]: its first hop stalls past
+    /// `FORWARD_HOP_TIMEOUT` (a `RELAY_HOP_TIMEOUT`, not a confirmed-dead
+    /// transport failure), but a later connection to the *same* address
+    /// succeeds immediately — modeling a leader that is genuinely still
+    /// there, just slow on this one attempt (a real membership-change
+    /// storm). `replicas[1]` and `replicas[2]` are both replaced by
+    /// [`spawn_hint_stub`], each answering — after a real ~1.8s delay of
+    /// its own, comfortably under `FORWARD_HOP_TIMEOUT` but modeling a
+    /// busy cluster where *every* hop costs real time, not just the first —
+    /// with a "not the leader here" refusal whose hint names `replicas[0]`:
+    /// exactly what a real live cluster's other members would say once they
+    /// agree on who leads.
+    ///
+    /// **Why every replica needs a real delay, not just the first guess.**
+    /// A version of this test with `replicas[1]`/`replicas[2]` answering
+    /// *instantly* still passes even against the reverted (pre-this-fix)
+    /// candidate logic — PR #106's pre-existing `WaitElection` backoff
+    /// already self-heals a fully-exhausted pass by clearing `tried` and
+    /// re-probing, and when every "other" hop is instant that self-heal
+    /// costs only [`FORWARD_ELECTION_BACKOFF`] (100ms), nowhere near
+    /// enough to distinguish the two behaviors. Giving `replicas[1]`/
+    /// `replicas[2]` a real, near-`FORWARD_HOP_TIMEOUT` delay each
+    /// (matching a real reconfiguring cluster, where a busy peer's own
+    /// refusal isn't free either) makes a **full extra round** through
+    /// every known replica genuinely expensive — which is exactly the
+    /// pre-fix failure mode `forward_to_tablet_leader`'s own doc describes
+    /// (a full round burned before ever circling back to the timed-out
+    /// leader) — while the fixed candidate logic still resolves in one
+    /// stalled hop plus one delayed hint, regardless of how slow the other
+    /// replicas are. Confirmed red-before/green-after by temporarily
+    /// reverting `forward_to_tablet_leader`'s candidate resolution to the
+    /// pre-fix `hint.filter(|(_, a)| !tried.contains(a)).map(..).or(other)`
+    /// shape: this test then fails the elapsed-time assertion below
+    /// deterministically, every run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_to_tablet_leader_waits_out_a_slow_but_live_leader_instead_of_giving_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4 nodes vs RF 3: exactly one node hosts no replica of the seeded
+        // tablet, forcing the no-local-replica fallback path every time.
+        let nodes = bring_up(4, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        put_until_ok(nodes[0].client_addr(), "fwd585b", b"seed", b"v").await;
+        let tablet = *nodes[0]
+            .metadata()
+            .tablets_for_table("fwd585b")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+        let replicas = nodes[0]
+            .metadata()
+            .tablets
+            .get(&tablet)
+            .expect("tablet exists")
+            .replicas
+            .clone();
+        assert_eq!(replicas.len(), 3, "RF should be MAX_REPLICATION_FACTOR");
+
+        let caller = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !replicas.contains(&crate::config::node_id(*i)))
+            .map(|(i, _)| i)
+            .expect("a 4-node cluster at RF 3 has exactly one non-replica node");
+
+        // The deterministic first guess: replicas[0], every time (same
+        // property `forward_transport_failure_tests`/the sibling test
+        // above rely on). replicas[1]/replicas[2] are this tablet's other
+        // two replicas, in the same deterministic `Metadata` order
+        // `other_tablet_replica_addr` itself walks.
+        let replica_node = |id: &animus_env::NodeId| {
+            (0..nodes.len())
+                .find(|i| crate::config::node_id(*i) == *id)
+                .expect("replica id is one of this cluster's nodes")
+        };
+        let first_guess_id = replicas[0].clone();
+        let first_guess = replica_node(&first_guess_id);
+        let second_id = replicas[1].clone();
+        let second = replica_node(&second_id);
+        let third_id = replicas[2].clone();
+        let third = replica_node(&third_id);
+        assert_ne!(
+            first_guess, caller,
+            "the caller must not be its own first guess"
+        );
+        assert_ne!(
+            second, caller,
+            "the caller must not be the second replica either"
+        );
+        assert_ne!(
+            third, caller,
+            "the caller must not be the third replica either"
+        );
+        assert_ne!(first_guess, second);
+        assert_ne!(first_guess, third);
+        assert_ne!(second, third);
+
+        // Capture every victim's own intra address BEFORE tearing it down
+        // (forwarding dials the intra port, ADR 0047), then free the ports
+        // (`shutdown_and_wait`, not the fire-and-forget `shutdown`) so the
+        // stubs below can deterministically rebind the exact same
+        // addresses.
+        let first_guess_intra = nodes[first_guess].intra_addr();
+        let second_intra = nodes[second].intra_addr();
+        let third_intra = nodes[third].intra_addr();
+        nodes[first_guess].shutdown_and_wait().await;
+        nodes[second].shutdown_and_wait().await;
+        nodes[third].shutdown_and_wait().await;
+
+        spawn_slow_then_ok_stub(first_guess_intra).await;
+        // No `advertise_host` in this fixture (`RoleAddrs::advertise_host:
+        // None`), so a node's own intra route entry is its bind address's
+        // plain `to_string()` — see `advertised_addr`'s own doc.
+        let hint_msg = crate::topology::format_not_leader_refusal(Some((
+            first_guess_id,
+            first_guess_intra.to_string(),
+        )));
+        let other_hop_delay = Duration::from_millis(1800); // < FORWARD_HOP_TIMEOUT (2s)
+        spawn_hint_stub(second_intra, hint_msg.clone(), other_hop_delay).await;
+        spawn_hint_stub(third_intra, hint_msg, other_hop_delay).await;
+
+        let ctx = nodes[caller].ctx_for_test();
+        let started = Instant::now();
+        // 9s outer bound: safely below CLIENT_TIMEOUT/SCHEMA_COMMIT_TIMEOUT
+        // (10s each) so this can never fire first and be mistaken for the
+        // thing under test -- the elapsed-time assertion below is the real
+        // teeth.
+        let result = timeout(
+            Duration::from_secs(9),
+            ctx.clear_backfill_cursor_for_table("fwd585b", "nonexistent-index"),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "forwarding must wait out a slow-but-live leader and return its eventual answer, \
+             not give up on it once it's timed out one hop: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a fixed forward wastes at most one FORWARD_HOP_TIMEOUT (2s) on the slow first \
+             guess plus one ~1.8s delayed hint before retrying it straight away -- roughly \
+             3.8s, well under 6s. A forward that has regressed back to treating a timed-out \
+             hop as permanently excluded must instead burn a FULL round through every other \
+             known replica (2s + 1.8s + 1.8s ~= 5.6s) before WaitElection's own backoff even \
+             lets it circle back, then repeat much of that again to rediscover the hint --\
+             comfortably over 6s, often over the 9s outer bound: took {elapsed:?}"
+        );
+
+        nodes[caller].shutdown_graceful().await;
     }
 }
 

@@ -15,9 +15,9 @@ use animus_tablet::{KeyRange, TabletId};
 
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
-    FORWARD_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL,
-    STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo, index_drain,
-    median_split_key, relay_request, relay_request_with_timeout, topology,
+    FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL,
+    STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo,
+    index_drain, median_split_key, relay_request, relay_request_with_timeout, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -414,6 +414,52 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// whole chase's; the overall [`CLIENT_TIMEOUT`] ceiling on the whole
     /// sequence is unchanged, since the final hop before `deadline` still
     /// gets whatever (smaller) time is actually left.
+    ///
+    /// **The cap above regressed the case it was supposed to leave intact:
+    /// a genuinely slow-but-LIVE leader (issue #585, continued).** Capping
+    /// every hop closes the starvation hole, but the first cut also folded
+    /// "ran out of time" into the *same* [`RELAY_TRANSPORT_FAILURE`]
+    /// sentinel a confirmed-dead candidate returns — and `tried` treats
+    /// both identically: permanently excluded from this pass, including
+    /// from ever being the target of another replica's own hint. Under a
+    /// real membership-change storm (a group carrying five voters, some
+    /// being added or removed), the group's actual leader can legitimately
+    /// take **several seconds** to commit — well past one
+    /// [`FORWARD_HOP_TIMEOUT`], comfortably inside [`CLIENT_TIMEOUT`]. The
+    /// first hop to that leader times out, marks it `tried`, and every
+    /// other replica's own "not the leader here" refusal then names that
+    /// *same* address as its hint — filtered out every time by `!tried.
+    /// contains(a)`, so the chase falls through to the tablet's other
+    /// (non-leader) replicas over and over, burning a full round's worth of
+    /// [`FORWARD_HOP_TIMEOUT`]s before [`ForwardRetryStep::WaitElection`]'s
+    /// `tried.clear()` ever lets it circle back — routinely enough to blow
+    /// the whole [`CLIENT_TIMEOUT`] budget on a leader that would have
+    /// answered in three. Observed live in CI as a transient ~3s
+    /// leaderless window during a real 5-voter placing reconfiguration
+    /// (`tests/split_placing_two_replica_diff_e2e.rs`) surfacing as a
+    /// `RELAY_TRANSPORT_FAILURE` put error, not a timeout — the write
+    /// simply ran out of retries, having tried real candidates the whole
+    /// time.
+    ///
+    /// **Fixed by telling "confirmed dead" and "timed out" apart at the
+    /// source** ([`RELAY_HOP_TIMEOUT`] vs. [`RELAY_TRANSPORT_FAILURE`],
+    /// `relay_request_with_timeout`'s own doc) and tracking the latter in a
+    /// second set, `timed_out`, alongside `tried`. A hint naming an address
+    /// in `timed_out` is now retried immediately — the exact signal that
+    /// timed-out node is the live leader — rather than filtered out just
+    /// because it's also in `tried`; once every other known replica is
+    /// exhausted with nothing else to try, the chase falls back to
+    /// retrying a `timed_out` candidate directly instead of giving up. The
+    /// actual candidate-selection logic is the pure, unit-tested
+    /// [`decide::resolve_forward_candidate`] (ADR 0061 A6) — see its own
+    /// doc for the full priority order and why `timed_out` has to be a
+    /// separate set rather than folded into `tried`. This preserves BOTH
+    /// properties at once: a reachable-but-silent candidate still can't
+    /// consume the whole budget (every other known replica is always tried
+    /// first, exactly as the first #585 fix established), and a
+    /// genuinely slow-but-live leader is still waited out within
+    /// `CLIENT_TIMEOUT` rather than permanently written off after one
+    /// capped hop (the pre-#585 property this second fix restores).
     pub(crate) async fn forward_to_tablet_leader(
         &self,
         tablet: Option<TabletId>,
@@ -422,6 +468,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ) -> ClientResponse {
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         let mut tried: BTreeSet<String> = BTreeSet::new();
+        // Issue #585, continued: addresses whose hop merely ran out of its
+        // own capped timeout (RELAY_HOP_TIMEOUT) — not confirmed dead, so
+        // still eligible for a hint naming them back, or a last-resort
+        // retry once every other known replica is exhausted. See this
+        // method's own doc and `decide::resolve_forward_candidate`'s.
+        let mut timed_out: BTreeSet<String> = BTreeSet::new();
         let mut next = addr;
         loop {
             tried.insert(next.clone());
@@ -446,18 +498,31 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             };
             // A genuine "not the leader here" refusal carries a hint (or
             // `None` if the refusing replica is itself mid-election) —
-            // chase it below exactly as before. A **transport** failure
-            // (issue #316: the candidate itself is unreachable — e.g. it
-            // was just killed) gets the identical no-hint treatment: `next`
-            // was a live guess that turned out wrong in a different way,
-            // but the fix is the same either way, "try another known
-            // replica" — never a terminal `return resp` for either. Any
-            // OTHER error is a genuine application-level failure from a
-            // live, leading peer (e.g. a rejected propose) and stays
-            // terminal, unchanged.
-            let hint = if e.as_str() == RELAY_TRANSPORT_FAILURE {
+            // chase it below exactly as before. A **confirmed-dead**
+            // transport failure (issue #316: the candidate itself is
+            // unreachable — e.g. it was just killed) gets the identical
+            // no-hint treatment: `next` was a live guess that turned out
+            // wrong in a different way, but the fix is the same either
+            // way, "try another known replica" — never a terminal `return
+            // resp` for either. A hop that merely **timed out** (issue
+            // #585 continued: reachable, just slow — see
+            // `RELAY_HOP_TIMEOUT`'s own doc) gets the same no-hint
+            // treatment too, but additionally stays in `timed_out` so it
+            // remains eligible for an immediate retry if some other
+            // replica's own hint names it back. Any OTHER error is a
+            // genuine application-level failure from a live, leading peer
+            // (e.g. a rejected propose) and stays terminal, unchanged.
+            let hint = if e.as_str() == RELAY_HOP_TIMEOUT {
+                timed_out.insert(next.clone());
+                None
+            } else if e.as_str() == RELAY_TRANSPORT_FAILURE {
                 None
             } else if let Some(hint) = topology::parse_not_leader_refusal(e) {
+                // A definitive answer (however unhelpful) resolves this
+                // candidate for real — drop any earlier timeout record for
+                // it so `timed_out` stays precise (it answered; it is no
+                // longer merely "ran out of time").
+                timed_out.remove(&next);
                 hint
             } else {
                 return resp;
@@ -465,17 +530,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if self.env.now() >= deadline {
                 return resp;
             }
-            let candidate = hint
-                .filter(|(_, a)| !tried.contains(a))
-                .map(|(_, a)| a)
-                .or_else(|| tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried)));
+            let other = tablet.and_then(|t| self.other_tablet_replica_addr(t, &tried));
             // The pure decision (ADR 0061 A6) over the already-gathered
-            // candidate — see `decide::ForwardRetryStep`'s own doc.
+            // facts — see `decide::resolve_forward_candidate`'s own doc for
+            // the priority order (an untried-or-timed-out hint, then a
+            // fresh replica, then a last-resort retry of a timed-out one).
+            let candidate = decide::resolve_forward_candidate(hint, other, &tried, &timed_out);
             match decide::decide_forward_retry(candidate, tablet.is_some()) {
                 decide::ForwardRetryStep::Retry(a) => next = a,
                 decide::ForwardRetryStep::WaitElection => {
                     // Every known candidate refused with no leader to point
-                    // at: the group is mid-election (formation window after a
+                    // at, AND none is merely a timed-out one still worth a
+                    // retry (`resolve_forward_candidate` already checked):
+                    // the group is mid-election (formation window after a
                     // split/provision, or a crashed leader). Wait it out and
                     // re-run the pass — bounded by the same overall deadline.
                     let remaining = deadline.duration_since(self.env.now());
@@ -486,6 +553,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         .sleep(FORWARD_ELECTION_BACKOFF.min(remaining))
                         .await;
                     tried.clear();
+                    // `timed_out` is already empty here by construction
+                    // (see `resolve_forward_candidate`'s own doc — a
+                    // non-empty `timed_out` always yields a candidate,
+                    // which would have taken the `Retry` arm instead of
+                    // `WaitElection`); cleared anyway as a cheap invariant,
+                    // not a load-bearing reset.
+                    timed_out.clear();
                     // `next` unchanged: re-probe the same replica first — once
                     // the election completes it either serves or hints.
                 }

@@ -1560,6 +1560,86 @@ mechanism today (the cross-node relay is a free function hardcoded to a
 real `TcpStream`, not routed through `E: Env`'s `Network` seam or the `R:
 RelayClient` capability trait).
 
+**The hop cap above regressed the property it was supposed to leave
+intact — a genuinely slow-but-LIVE leader must still be waited out (issue
+#585, continued, fixed).** Capping every hop closes the starvation hole,
+but the fix's own `RELAY_TRANSPORT_FAILURE` sentinel folded two different
+causes together: a candidate confirmed dead *within* budget (a fast
+connect/write/read failure) and a candidate whose hop merely *ran out* of
+its own `FORWARD_HOP_TIMEOUT` before any answer arrived — reachable, just
+slow. `tried` treats both identically: permanently excluded from the rest
+of the pass, including from ever being the target of another replica's own
+hint. Under a real membership-change storm (five voters, some being
+added/removed), the group's actual leader can legitimately take **several
+seconds** to commit — comfortably inside `CLIENT_TIMEOUT`, past one
+`FORWARD_HOP_TIMEOUT`. The first hop to that leader times out and marks it
+`tried`; every other replica's own "not the leader here" refusal then
+names that *same* address as its hint — filtered out every time by
+`!tried.contains(a)` — so the chase falls through to the tablet's other
+(non-leader) replicas over and over, burning a full round's worth of
+`FORWARD_HOP_TIMEOUT`s before `ForwardRetryStep::WaitElection`'s
+`tried.clear()` ever lets it circle back, routinely enough to blow the
+whole `CLIENT_TIMEOUT` budget on a leader that would have answered in a
+few seconds. Observed live in CI as a transient ~3s leaderless window
+during a real 5-voter placing reconfiguration
+(`tests/split_placing_two_replica_diff_e2e.rs`), surfacing as a
+`RELAY_TRANSPORT_FAILURE` put error — the write simply ran out of
+retries, having spent the whole time on real (if temporarily
+non-leading) candidates.
+
+Fixed by telling "confirmed dead" and "timed out" apart **at the
+source**: `relay_request_with_timeout` (`lib.rs`) now returns one of two
+distinct sentinels depending on which half of `tokio::time::timeout`'s own
+result fires — `RELAY_TRANSPORT_FAILURE` when the inner connect/write/read
+genuinely fails *within* budget (`Ok(None)`, fast, confirmed dead), or the
+new `RELAY_HOP_TIMEOUT` when the whole attempt merely outlives `timeout`
+(`Err(_)`, `tokio::time::error::Elapsed` — nothing failed, there just
+wasn't an answer *yet*). `forward_to_tablet_leader` tracks
+`RELAY_HOP_TIMEOUT` addresses in a second set, `timed_out`, alongside
+`tried`. The actual candidate-resolution decision moved to a new pure,
+unit-tested function, `decide::resolve_forward_candidate` (ADR 0061 A6,
+`animus-node`): a hint naming an address in `timed_out` is retried
+immediately, even though that address is also in `tried` — the strongest
+possible signal that node is the live leader — ahead of exploring any
+fresh replica; once every known replica is genuinely exhausted with no
+hint left, the chase falls back to retrying a `timed_out` candidate
+directly (its own doc has the full priority order and rationale for why
+`timed_out` must be a separate set rather than folded into `tried`). This
+keeps BOTH properties at once: a reachable-but-silent candidate still
+cannot consume the whole budget (every other known replica is always tried
+first, the original #585 property), and a genuinely slow-but-live leader
+is still waited out within `CLIENT_TIMEOUT` rather than permanently
+written off after one capped hop (the pre-#585 property this continuation
+restores).
+
+Regression: `forward_hop_timeout_tests::
+forward_to_tablet_leader_waits_out_a_slow_but_live_leader_instead_of_giving_up`
+(`lib.rs`, beside the sibling test above, for the identical reason —
+`forwarding.rs` carries the hard `#[deny(clippy::disallowed_methods)]`).
+**All three** of the tablet's replicas are replaced with stubs (not just
+the first guess): the first-guess stub stalls its first connection past
+`FORWARD_HOP_TIMEOUT` (a `RELAY_HOP_TIMEOUT`) but answers a later
+connection immediately; the other two each answer — after a real ~1.8s
+delay of their own, modeling a busy cluster where *every* hop costs real
+time — with a refusal hinting at the first guess. A version of this test
+with the other two replicas answering *instantly* still passes against
+the reverted (pre-this-fix) candidate logic too, since PR #106's
+pre-existing `WaitElection` backoff already self-heals a fully-exhausted
+pass and an instant self-heal round costs only `FORWARD_ELECTION_BACKOFF`
+(100ms) — the real ~1.8s-per-hop delay is load-bearing for making a full
+extra round genuinely expensive, matching the real production failure
+shape. Confirmed red-before/green-after by temporarily reverting
+`forward_to_tablet_leader`'s candidate resolution to the pre-fix
+`hint.filter(|(_, a)| !tried.contains(a)).map(..).or(other)` shape: the
+test then fails the elapsed-time assertion deterministically, every run
+(a plain unit test of the same decision — timeout vs. refusal vs. a hint
+naming a timed-out node — lives in `animus-node`'s own
+`decide::tests::resolve_candidate_*`, no sockets involved). See
+`docs/engineering-lessons.md`'s matching entry for the sandbox-flakiness
+angle this investigation surfaced (most reproduction attempts under a
+heavily loaded, resource-constrained sandbox fail on unrelated causes —
+FD exhaustion, connection reset/refused — not the mechanism under test).
+
 **Election-wait backoff (PR #106)**: when *every* candidate refuses with
 `leader_hint=none` (the group is mid-election — a split-child/first-provision
 formation window, or a crashed leader), one exhausted pass is not a failure.
