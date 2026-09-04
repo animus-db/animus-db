@@ -25,6 +25,7 @@ pub mod capacity;
 pub mod condition;
 pub mod index;
 pub mod internal_tables;
+pub mod numkey;
 pub mod registry;
 pub mod schema;
 pub mod sigv4;
