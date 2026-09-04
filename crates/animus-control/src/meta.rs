@@ -9957,4 +9957,105 @@ mod tests {
             "the split child's epoch-0 parent is retired tablet 1's final shard"
         );
     }
+
+    /// Issue #588: a cascading split can legitimately produce an
+    /// intermediate tablet that takes zero direct writes of its own before
+    /// splitting further (ADR 0043 §A3's "never seal an empty segment" —
+    /// not a race, the documented case `docs/engineering-lessons.md`'s
+    /// #580 entry names as a known-but-unaddressed edge case). Its own
+    /// `SplitLineage::parents_final_epoch` is legitimately `None` forever,
+    /// but its grandchildren must still resolve a real `ParentShardId` —
+    /// the nearest ancestor's own final sealed shard, walking past however
+    /// many never-sealed intermediate hops lie in between (ADR 0043's
+    /// 2026-09-04 amendment).
+    ///
+    /// Tree built here: 1 seals once, then splits into {2, 3}. 2 splits
+    /// again into {4, 5} **without ever sealing anything of its own** —
+    /// `split_lineage[2].parents_final_epoch == Some(_)` (tablet 1's real
+    /// final epoch), but tablet 2's OWN chain in `stream_shards` stays
+    /// empty. 4 and 5 must still resolve back to tablet 1's final shard,
+    /// not `None`. 3 (which DOES seal before its own further split into
+    /// {6, 7}) proves the ordinary one-hop case is unaffected by the walk.
+    #[test]
+    fn stream_shard_parent_id_walks_past_an_ancestor_that_never_sealed() {
+        let mut m = Metadata::default();
+        enable_stream(&mut m, "events", "L1");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(1),
+                table: Some("events".to_owned()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(1), nid(2), nid(3)],
+            }),
+            ApplyOutcome::Applied
+        );
+        // Tablet 1's own real, final sealed shard.
+        m.apply(&seal(&m, "events", "L1", 1, 0, 100));
+
+        // 1 -> {2, 3}: ordinary first-generation split.
+        split_tablet(
+            &mut m,
+            TabletId(1),
+            0x4000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(2),
+        );
+        assert_eq!(
+            m.split_lineage[&TabletId(2)].parents_final_epoch,
+            Some(0),
+            "test setup: tablet 2's own lineage names tablet 1's real final epoch"
+        );
+
+        // 2 -> {4, 5}: tablet 2 splits again having sealed NOTHING of its
+        // own (no `seal()` call for tablet 2 anywhere in this test) — the
+        // exact issue #588 shape.
+        split_tablet(
+            &mut m,
+            TabletId(2),
+            0x2000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(4),
+        );
+        assert_eq!(
+            m.split_lineage[&TabletId(4)].parents_final_epoch,
+            None,
+            "test setup: tablet 4's immediate parent (2) never sealed anything"
+        );
+        assert!(
+            m.stream_shard_chain("events", "L1", TabletId(2))
+                .next()
+                .is_none(),
+            "test setup: tablet 2 truly has zero sealed shards of its own"
+        );
+
+        // 3 seals once before ITS OWN further split into {6, 7} — the
+        // ordinary, unaffected one-hop case, proven alongside the walked
+        // case so a regression that broke the common path would show up
+        // here too.
+        m.apply(&seal(&m, "events", "L1", 3, 0, 150));
+        split_tablet(
+            &mut m,
+            TabletId(3),
+            0x6000_0000_0000_0000u64.to_be_bytes().to_vec(),
+            TabletId(6),
+        );
+
+        // The walked case: 4 and 5's epoch-0 `ParentShardId` must name
+        // tablet 1's real final shard (shardId-1-0), NOT `None` — walking
+        // straight past tablet 2's own empty chain.
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(4), 0),
+            Some("shardId-1-0".to_owned()),
+            "must walk past tablet 2's never-sealed lineage to tablet 1's real final shard"
+        );
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(5), 0),
+            Some("shardId-1-0".to_owned())
+        );
+
+        // The unaffected one-hop case: 6's parent link stays exactly
+        // tablet 3's own final shard.
+        assert_eq!(
+            m.stream_shard_parent_id(TabletId(6), 0),
+            Some("shardId-3-0".to_owned())
+        );
+    }
 }
