@@ -443,19 +443,26 @@ pub fn apply_and_derive_mirror(
                 }
             }
         }
-        MetaCommand::MarkBackupPitrBase { backup_id } => {
-            // The value is always empty (presence alone is the fact) — the
-            // identical convention `MarkIndexBackfilled` uses.
-            writes.push(KeyWrite::Put(
-                syskv::pitr_base_backup_key(backup_id),
-                Vec::new(),
-            ));
-        }
-        MetaCommand::BeginBackup { backup_id, .. } => {
+        MetaCommand::BeginBackup {
+            backup_id,
+            pitr_base,
+            ..
+        } => {
             writes.push(put_json(
                 syskv::backup_key(backup_id),
                 &meta.backups[backup_id],
             ));
+            if *pitr_base {
+                // Atomic with the mint (issue #593) — the value is always
+                // empty (presence alone is the fact), the identical
+                // convention `MarkIndexBackfilled` uses. This replaces the
+                // now-deleted separate `MetaCommand::MarkBackupPitrBase`
+                // mirror write, which used to land in its own, later apply.
+                writes.push(KeyWrite::Put(
+                    syskv::pitr_base_backup_key(backup_id),
+                    Vec::new(),
+                ));
+            }
         }
         MetaCommand::RecordBackupTabletComplete {
             backup_id, tablet, ..
@@ -1722,10 +1729,13 @@ mod tests {
         assert!(!meta.pitr_segments.contains_key(&(TabletId(1), 0)));
     }
 
-    /// `MarkBackupPitrBase` mirrors as one presence `Put`; `DeleteBackup`
-    /// mirrors it away again alongside the row it tags.
+    /// `BeginBackup { pitr_base: true }` mirrors BOTH the row and the
+    /// presence `Put` in the SAME write batch (issue #593 — replacing the
+    /// old two-command `BeginBackup`-then-`MarkBackupPitrBase` mirror
+    /// sequence); `DeleteBackup` mirrors the tag away again alongside the
+    /// row it tags.
     #[test]
-    fn mark_backup_pitr_base_writes_presence_and_delete_backup_prunes_it() {
+    fn begin_backup_pitr_base_writes_row_and_presence_atomically_and_delete_backup_prunes_it() {
         let mut meta = Metadata::default();
         let _ = apply_and_derive_mirror(
             &mut meta,
@@ -1743,25 +1753,23 @@ mod tests {
                 replicas: Vec::new(),
             },
         );
-        let _ = apply_and_derive_mirror(
+        let (outcome, writes) = apply_and_derive_mirror(
             &mut meta,
             &MetaCommand::BeginBackup {
                 backup_id: "b1".to_string(),
                 table: "orders".to_string(),
                 created_wall_ms: 1_000,
                 backup_name: "pitr-base".to_string(),
-            },
-        );
-        let (outcome, writes) = apply_and_derive_mirror(
-            &mut meta,
-            &MetaCommand::MarkBackupPitrBase {
-                backup_id: "b1".to_string(),
+                pitr_base: true,
             },
         );
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(
             writes,
-            vec![KeyWrite::Put(syskv::pitr_base_backup_key("b1"), Vec::new())]
+            vec![
+                put_json(syskv::backup_key("b1"), &meta.backups["b1"]),
+                KeyWrite::Put(syskv::pitr_base_backup_key("b1"), Vec::new()),
+            ]
         );
 
         let (outcome, writes) = apply_and_derive_mirror(
@@ -1772,6 +1780,35 @@ mod tests {
         );
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert!(writes.contains(&KeyWrite::Delete(syskv::pitr_base_backup_key("b1"))));
+    }
+
+    /// An ordinary on-demand `BeginBackup` (`pitr_base: false`) mirrors only
+    /// the row — never the presence tag.
+    #[test]
+    fn begin_backup_without_pitr_base_mirrors_only_the_row() {
+        let mut meta = Metadata::default();
+        let _ = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::CreateTableSchema {
+                table: "orders".to_string(),
+                schema: schema("id"),
+            },
+        );
+        let (outcome, writes) = apply_and_derive_mirror(
+            &mut meta,
+            &MetaCommand::BeginBackup {
+                backup_id: "b1".to_string(),
+                table: "orders".to_string(),
+                created_wall_ms: 1_000,
+                backup_name: "my-backup".to_string(),
+                pitr_base: false,
+            },
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(
+            writes,
+            vec![put_json(syskv::backup_key("b1"), &meta.backups["b1"])]
+        );
     }
 
     /// A round trip through `apply_key_write`'s put/delete halves (the
@@ -1855,6 +1892,7 @@ mod tests {
             table: "orders".to_string(),
             created_wall_ms: 1000,
             backup_name: "backup".to_string(),
+            pitr_base: false,
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -1901,6 +1939,7 @@ mod tests {
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
         );
 
@@ -1953,6 +1992,7 @@ mod tests {
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
         );
         let _ = apply_and_derive_mirror(
@@ -2004,6 +2044,7 @@ mod tests {
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
         );
         let (outcome, writes) = apply_and_derive_mirror(
@@ -2051,6 +2092,7 @@ mod tests {
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
         );
         let _ = apply_and_derive_mirror(
@@ -2118,6 +2160,7 @@ mod tests {
                 table: "orders".to_string(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
         );
         let _ = apply_and_derive_mirror(
@@ -2346,6 +2389,7 @@ mod tests {
             table: "orders".to_string(),
             created_wall_ms: 1000,
             backup_name: "backup".to_string(),
+            pitr_base: false,
         });
         base.apply(&MetaCommand::RecordBackupTabletComplete {
             backup_id: "backup-1".to_string(),
@@ -2422,6 +2466,7 @@ mod tests {
                 table: "t".to_string(),
                 created_wall_ms: 1_000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             },
             MetaCommand::RecordBackupTabletComplete {
                 backup_id: "backup-1".to_string(),

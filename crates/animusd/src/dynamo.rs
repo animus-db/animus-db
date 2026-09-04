@@ -1496,6 +1496,7 @@ async fn create_backup(
             table: table.to_owned(),
             created_wall_ms,
             backup_name: backup_name.to_owned(),
+            pitr_base: false,
         })
         .await;
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
@@ -7959,6 +7960,7 @@ mod list_backups_tests {
                 table: table.to_owned(),
                 created_wall_ms,
                 backup_name: "b".to_owned(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );

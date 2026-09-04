@@ -540,6 +540,7 @@ fn begin_backup(meta: &mut Metadata, backup_id: &str, wall_ms: u64) {
             table: TABLE.into(),
             created_wall_ms: wall_ms,
             backup_name: "backup".to_string(),
+            pitr_base: false,
         }),
         ApplyOutcome::Applied
     );

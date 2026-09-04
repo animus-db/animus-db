@@ -237,6 +237,7 @@ mod tests {
             table: "orders".to_owned(),
             created_wall_ms: 1_000,
             backup_name: "nightly".to_owned(),
+            pitr_base: false,
         })));
         assert!(accepted(node.propose(
             MetaCommand::RecordBackupTabletComplete {

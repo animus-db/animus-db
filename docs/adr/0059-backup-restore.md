@@ -924,7 +924,12 @@ diffing prose against code.
   accepted residual (a vanishingly brief window where an internal snapshot
   looks like an ordinary on-demand one), not a defended two-phase-commit
   property. `DeleteBackup`'s existing apply arm prunes the tag alongside
-  the row it tags.
+  the row it tags. **Superseded 2026-09-04 (issue #593) — see this ADR's
+  own amendment of that date**: the "vanishingly brief window" above turned
+  out to be a real, observable product gap (a `ListBackups` default `USER`
+  filter, or the console's per-table backups projection, could show the
+  untagged row), so `MarkBackupPitrBase` was deleted outright in favor of a
+  `BeginBackup.pitr_base: bool` field applied atomically with the mint.
 - **A PITR base snapshot is a `SYSTEM`-type backup for `ListBackups`
   purposes**, realizing `wire::BackupTypeFilter::System`'s own doc comment
   from Train 1 PR④ ("PITR base snapshots — never produced yet") literally:
@@ -1241,3 +1246,85 @@ own backup/PITR janitors).
   own, including the physical on-disk delete at every recorded (data-only)
   replica. See `crates/animusd/CLAUDE.md`'s matching entries for the full
   per-module account.
+
+## As-built amendment (2026-09-04, issue #593 — atomic PITR base tag)
+
+Closes the "vanishingly brief window" §9's own Train 3 PR① amendment
+(2026-08-27) named as an accepted residual for `MetaCommand::
+MarkBackupPitrBase`. It was not vanishing in practice: right after
+`UpdateContinuousBackups(Enabled: true)`, `pitr_snapshot_loop` proposes its
+first base snapshot via `BeginBackup` and only afterwards proposes
+`MarkBackupPitrBase` once it observes that row exist. Between the two
+commits — a real committed window, not merely a scheduling artifact — the
+row is an ordinary `Creating` `BackupRow` with no PITR tag, so any consumer
+that hides PITR base snapshots by consulting `Metadata::pitr_base_backups`
+(`ListBackups`'s default `USER` filter, `animusd`'s console per-table
+backups projection) briefly showed it as a user backup.
+`console_table_config::table_detail_shows_pitr_status_and_backups`
+reproduced it end to end (previously tolerated with a converged-or-timeout
+poll; now a strict poll that fails on the very first sighting of a second
+row — see its own updated doc).
+
+- **The fix: fold the tag into the mint.** `MetaCommand::BeginBackup` gained
+  a `pitr_base: bool` field (`false` for every existing proposer — an
+  explicit `CreateBackup`, the admin seeder, every pre-existing test
+  fixture — `true` only for `pitr_janitor::pitr_snapshot_loop`'s own
+  internally-triggered proposal). `Metadata::apply`'s `BeginBackup` arm
+  inserts `backup_id` into `Metadata::pitr_base_backups` in the SAME apply
+  that mints the row, whenever `pitr_base` is set — so every replica that
+  ever observes the row observes it already tagged. There is no longer a
+  committed state in which a PITR base snapshot exists untagged, by
+  construction rather than by convergence.
+- **`MetaCommand::MarkBackupPitrBase` is deleted outright** — its own apply
+  arm, mirror arm, `is_relayable_command` classification
+  (`animus-node::wire`), and every construction site (across
+  `animus-control`'s own tests, `animus-node::backup_janitor`'s test
+  fixture) are gone. It was never wire-visible and had exactly one
+  legitimate proposer (`pitr_snapshot_loop`), so nothing else needed a
+  migration path — this repo makes no back-compat promise across
+  revisions anyway (root `CLAUDE.md`).
+- **The self-healing sweep is gone too, not just narrowed** — it existed
+  solely to close the gap a dropped `MarkBackupPitrBase` ack could leave;
+  with the tag riding the same command as the mint, `BeginBackup` either
+  commits fully tagged or doesn't commit at all, so there is nothing left
+  for a sweep to heal. `pitr_snapshot_tick` (`animus-node::pitr_janitor`)
+  no longer scans `Metadata::backups` at all on its periodic-snapshot path.
+- **`BackupRow.backup_name`'s internal-marker prefix
+  (`__pitr_base__{table}`) survives as a purely cosmetic label** — it was
+  never the source of truth even before this fix (`Metadata::
+  pitr_base_backups` always was), and now has no self-healing-sweep
+  consumer at all; it remains solely for a human reading `DescribeBackup`/
+  `ListBackups`/the console.
+- **Every one of `MetaCommand::BeginBackup`'s ~30-plus existing
+  construction sites needed the new field** — the exact compiler-enumerated
+  fan-out class root `CLAUDE.md`'s engineering-practices log already
+  documents for `backup_name`'s own addition (Train 1 PR④'s as-built
+  amendment, above): `cargo build`'s `error[E0063]` enumerated every site
+  across `animus-control`, `animus-test`, and `animusd`, rather than
+  trusting a grep pass to have found them all.
+- **Regression**: `animus-control::meta::tests::
+  begin_backup_pitr_base_tags_atomically_with_the_mint` (a PITR-enabled
+  table's `BeginBackup { pitr_base: true, .. }` is tagged immediately, in
+  every reachable `BackupStatus` — `Creating` at mint, then `Available`
+  after `CompleteBackup`) and `begin_backup_without_pitr_base_is_never_
+  tagged` (an ordinary on-demand backup is never tagged); the mirror-level
+  twins in `animus-control::mirror::tests` prove the row and the tag
+  mirror to the system keyspace in the same write batch. At the wire
+  layer, `animusd::tests::console_table_config::
+  table_detail_shows_pitr_status_and_backups` now polls the console's own
+  per-table backups projection repeatedly through several of
+  `pitr_snapshot_loop`'s own 200ms tick intervals and fails on the first
+  sighting of more than the user's own one backup, rather than tolerating
+  eventual convergence to it.
+- **Generalizable lesson** (recorded in `docs/engineering-lessons.md`): a
+  piece of state that must never be observable in an intermediate,
+  half-formed shape has to be minted by ONE replicated command, not a
+  mint-then-tag pair — even when the gap between the two commits is
+  expected to be small in practice, "small" is not "never," and a
+  consumer polling fast enough (or simply unlucky) will eventually observe
+  it. Prefer widening the minting command's own signature (a bool/enum
+  field, `error[E0063]`-enumerated across every construction site) over a
+  second side-tag command, even when the side-tag avoids touching more
+  call sites — the atomicity is the point, and a "self-healing sweep" is a
+  tell that the two-command design's own gap was already known to be real,
+  not merely theoretical.

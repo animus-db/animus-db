@@ -651,13 +651,13 @@ per-tablet CP data plane (`animus-cp-data`).
   terminal).
 
 - **PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups`/
-  `SealPitrSegment`/`ExpirePitrSegments`/`MarkBackupPitrBase`.** A fifth
-  consumer's own catalog, deliberately mirroring the backup/stream ones'
-  conventions rather than inventing new shapes: `TableSchema.pitr:
-  Option<PitrSpec>` (generation + enable wall-clock, the `SetTableStream`/
-  `SetTableTtl` schema-catalog class) toggled by `UpdateContinuousBackups`,
-  which mints a fresh `generation` from `Metadata::pitr_generation`'s own
-  never-rewound per-table counter (reusing `EntityKind::Counter` with a
+  `SealPitrSegment`/`ExpirePitrSegments`.** A fifth consumer's own catalog,
+  deliberately mirroring the backup/stream ones' conventions rather than
+  inventing new shapes: `TableSchema.pitr: Option<PitrSpec>` (generation +
+  enable wall-clock, the `SetTableStream`/`SetTableTtl` schema-catalog
+  class) toggled by `UpdateContinuousBackups`, which mints a fresh
+  `generation` from `Metadata::pitr_generation`'s own never-rewound
+  per-table counter (reusing `EntityKind::Counter` with a
   `"pitr_gen:{table}"`-prefixed name rather than a new entity kind).
   `Metadata::pitr_segments: BTreeMap<(TabletId, u64), PitrSegmentRow>`
   mirrors `stream_shards` exactly (same tuple-key JSON codec workaround,
@@ -665,17 +665,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `ExpirePitrSegments` shape, same epoch-derivation-guard obligation on the
   caller) but is a fully separate collection — a table's stream and its
   PITR coverage never share a row or gate each other. **`Metadata::
-  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow`/`BeginBackup`
-  field**: tags an already-`BeginBackup`'d row as a PITR base snapshot
-  without widening `MetaCommand::BeginBackup`'s own signature (which would
-  have touched every one of its ~30 existing construction sites) — see
-  `MetaCommand::MarkBackupPitrBase`'s own doc and the ADR's Train 3 PR①
-  as-built amendment for the self-healing-tag residual this trades for.
-  PITR segments/generation floor deliberately **survive**
-  `DropTableSchema`/`DropTableTablets`, the identical ADR 0024 carve-out
-  `backups` already gets — never gated on the source table's schema still
-  existing, an explicit override of the streams drop-table retention-zero
-  rule (ADR 0059 §9/§10).
+  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow` field**: tags a
+  `BeginBackup`'d row as a PITR base snapshot via that same command's own
+  `pitr_base: bool` flag, applied **atomically with the mint, in the same
+  apply** (issue #593, fixed 2026-09-04) — `Metadata::apply`'s `BeginBackup`
+  arm inserts into `pitr_base_backups` itself when the flag is set, so
+  there is no committed state in which a PITR base snapshot exists
+  untagged. **This was originally a separate side-tag command,
+  `MetaCommand::MarkBackupPitrBase`, proposed only once `pitr_janitor::
+  pitr_snapshot_loop` (`animusd`) observed its own `BeginBackup` row exist**
+  — a real committed window (not merely theoretical) in which the row was
+  an ordinary untagged `Creating` backup, closed by folding the tag into
+  `BeginBackup` itself and deleting `MarkBackupPitrBase` outright (no
+  self-healing sweep needed either, since there is nothing left for one to
+  heal). See the ADR's 2026-09-04 as-built amendment for the full incident
+  and `meta::tests::begin_backup_pitr_base_tags_atomically_with_the_mint`
+  for the regression. PITR segments/generation floor deliberately
+  **survive** `DropTableSchema`/`DropTableTablets`, the identical ADR 0024
+  carve-out `backups` already gets — never gated on the source table's
+  schema still existing, an explicit override of the streams drop-table
+  retention-zero rule (ADR 0059 §9/§10).
 
   **`RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②) reuses the
   restore catalog above rather than inventing a second one**:
