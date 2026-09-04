@@ -17,15 +17,15 @@ use animusd::{
     ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    // `support::connect_retry` rides out the port-TOCTOU/listener-not-yet-
-    // accepting window a plain `TcpStream::connect` can lose the instant
-    // `bring_up` returns (issue #592) — see that helper's own doc.
-    let mut stream = support::connect_retry(addr).await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to {addr} failed: {e}"));
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await
@@ -382,7 +382,9 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
 /// for the one TTL regression below, so it isn't worth sharing via
 /// `support`).
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = support::connect_retry(addr).await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to dynamo at {addr} failed: {e}"));
     let request = format!(
         "POST / HTTP/1.1\r\n\
          Host: animus\r\n\

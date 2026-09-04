@@ -197,33 +197,6 @@ pub async fn restart_same_addrs(
     }
 }
 
-/// Connect to `addr`, riding out the same port-TOCTOU/listener-not-yet-
-/// accepting window [`restart_same_addrs`] already rides out for a rebind —
-/// a freshly bound listener can (rarely, under heavy scheduler contention on
-/// a small/loaded CI runner) refuse the very first connect a test fixture
-/// makes against it the instant `bring_up`/`run_node` returns (issue #592).
-/// Retries **only** on `ErrorKind::ConnectionRefused`, on a bounded 5s
-/// wall-clock deadline exactly like `restart_same_addrs`'s own rebind retry
-/// — any other connect error (a malformed/unreachable address, a genuinely
-/// dead node) fails immediately rather than burning the deadline on an error
-/// this retry can never fix.
-pub async fn connect_retry(addr: SocketAddr) -> TcpStream {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return stream,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "connect to {addr} kept getting refused (listener never came up): {e}"
-                );
-                sleep(Duration::from_millis(20)).await;
-            }
-            Err(e) => panic!("connect to {addr} failed: {e}"),
-        }
-    }
-}
-
 /// Bring up a combined-mode `n`-node core, one process per node, retrying the
 /// (allocate-fresh-ports + start-all) as a unit against a wall-clock
 /// `deadline` rather than a fixed attempt count — same shape as

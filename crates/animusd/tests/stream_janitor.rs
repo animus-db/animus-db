@@ -17,6 +17,7 @@ use animus_tablet::TabletId;
 use animusd::{Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs, bind_cluster};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
@@ -117,12 +118,11 @@ where
     }
 }
 
-/// One DynamoDB JSON request over a fresh HTTP/1.1 connection. Uses
-/// `support::connect_retry` (issue #592) rather than a bare
-/// `TcpStream::connect` — the very first call against a freshly brought-up
-/// node can otherwise lose the port-TOCTOU/listener-not-yet-accepting race.
+/// One DynamoDB JSON request over a fresh HTTP/1.1 connection.
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = support::connect_retry(addr).await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to dynamo at {addr} failed: {e}"));
     let request = format!(
         "POST / HTTP/1.1\r\n\
          Host: animus\r\n\
@@ -155,10 +155,11 @@ async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
     (status, payload.to_string())
 }
 
-/// One HTTP/1.0 request to the admin endpoint. See `dynamo`'s own doc above
-/// for why this dials via `support::connect_retry` (issue #592).
+/// One HTTP/1.0 request to the admin endpoint.
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = support::connect_retry(addr).await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to admin at {addr} failed: {e}"));
     let body = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -271,10 +272,10 @@ fn segment_path(node_dir: &Path, object_id: &str) -> PathBuf {
     node_dir.join("segments").join(object_id)
 }
 
-/// See `dynamo`'s own doc above for why this dials via
-/// `support::connect_retry` (issue #592).
 async fn get_metrics_text(addr: SocketAddr) -> String {
-    let mut stream = support::connect_retry(addr).await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to metrics at {addr} failed: {e}"));
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: animus\r\nConnection: close\r\n\r\n")
         .await
