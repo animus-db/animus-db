@@ -653,6 +653,7 @@ async fn table_detail_with_no_pitr_or_backups_is_null_and_empty() {
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"plain",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -693,6 +694,7 @@ async fn table_detail_shows_pitr_status_and_backups() {
             dynamo_addr,
             "DynamoDB_20120810.CreateTable",
             r#"{"TableName":"orders",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
         )
         .await;
@@ -722,9 +724,30 @@ async fn table_detail_shows_pitr_status_and_backups() {
             .expect("BackupArn")
             .to_string();
 
-        let (status, body) = console(console_addr, "GET", "/console/api/tables/orders", "").await;
-        assert_eq!(status, 200, "table detail failed: {body}");
-        let d = json(&body);
+        // The `backups` list is an eventual property, not a one-shot one:
+        // enabling PITR makes `pitr_snapshot_loop` propose its first base
+        // snapshot (`BeginBackup`) and only THEN tag it
+        // (`MarkBackupPitrBase`, a second commit), so for a few ms that
+        // internal row is indistinguishable from a user's own `CreateBackup`
+        // and the projection transiently shows two rows. Poll until the tag
+        // lands rather than asserting the first read (converged-or-timeout,
+        // per `docs/engineering-lessons.md`); the transient wire-level
+        // visibility itself is tracked as its own issue.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let (d, body) = loop {
+            let (status, body) =
+                console(console_addr, "GET", "/console/api/tables/orders", "").await;
+            assert_eq!(status, 200, "table detail failed: {body}");
+            let d = json(&body);
+            if d["backups"].as_array().map(Vec::len) == Some(1) {
+                break (d, body);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "backups did not converge to exactly the user's one: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         let pitr = &d["pitr"];
         assert!(!pitr.is_null(), "PITR enabled: {body}");

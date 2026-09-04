@@ -1307,6 +1307,7 @@ async fn segment_janitor_reclaims_objects_from_a_genuinely_control_only_leader()
         addr,
         "DynamoDB_20120810.CreateTable",
         r#"{"TableName":"t",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
             "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
             "StreamSpecification":{"StreamEnabled":true,
                 "StreamViewType":"NEW_AND_OLD_IMAGES"}}"#,
