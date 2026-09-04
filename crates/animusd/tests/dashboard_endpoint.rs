@@ -772,6 +772,14 @@ async fn dashboard_u01_render_only_fixes() {
             );
         }
 
+        // ---- 3. believes_alive badge in renderOverview ----------------------
+        let (s, _, overview_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_overview.js").await;
+        assert_eq!(s, 200, "dashboard_overview.js is served");
+        assert!(
+            overview_js.contains("believes_alive") && overview_js.contains("believesAlive"),
+            "renderOverview surfaces the control leader's own believes_alive verdict per member: {overview_js}"
+        );
+
         nodes[0].shutdown_graceful().await;
     })
     .await

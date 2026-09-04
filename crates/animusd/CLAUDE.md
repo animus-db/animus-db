@@ -863,9 +863,11 @@ reusing the captured config is the point of the test.
   deliberately addressed" for the full disambiguation. **docs/roadmap.md
   U-01 (render-only, no backend change)** added a Transactions tab
   (`dashboard_txns.js`, read-only `/admin/txns`, gated like Tablets in
-  `ROLE_TABS`), and full per-replica Raft detail (commit/durable/snapshot
+  `ROLE_TABS`), full per-replica Raft detail (commit/durable/snapshot
   index/log length, plus the group's live voters/learners) in the Tablets
-  tab's `renderTabletDetail`.
+  tab's `renderTabletDetail`, and a `believes_alive` badge (the control
+  leader's own real-time failure-detector verdict, ADR 0012) next to each
+  data member row in Overview.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
