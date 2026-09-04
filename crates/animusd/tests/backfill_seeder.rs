@@ -164,6 +164,8 @@ fn creating_index(name: &str, hash_attribute: &str) -> IndexDef {
         sort_attribute: None,
         projection: IndexProjection::All,
         status: IndexStatus::Creating,
+        hash_attribute_type: None,
+        sort_attribute_type: None,
     }
 }
 

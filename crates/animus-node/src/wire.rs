@@ -1212,6 +1212,8 @@ mod tests {
             sort_attribute: Some("x".to_string()),
             projection: IndexProjection::All,
             status: IndexStatus::active(),
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         };
         let addrs = NodeAddrs {
             internal: String::new(),

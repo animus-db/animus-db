@@ -1031,6 +1031,8 @@ mod tests {
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
             status: crate::schema::IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         });
         let command = MetaCommand::ReplaceTableSchema {
             table: "orders".to_string(),
@@ -1103,6 +1105,8 @@ mod tests {
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
             status: crate::schema::IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         };
         let create = MetaCommand::CreateTableIndex {
             table: "orders".to_string(),
@@ -1162,6 +1166,8 @@ mod tests {
                     sort_attribute: None,
                     projection: crate::schema::IndexProjection::All,
                     status: crate::schema::IndexStatus::Creating,
+                    hash_attribute_type: None,
+                    sort_attribute_type: None,
                 },
             },
         );

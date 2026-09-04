@@ -72,7 +72,11 @@ fn users_schema() -> TableSchema {
     TableSchema::simple("id", ColumnType::String)
 }
 
-/// A global secondary index keyed by `email`.
+/// A global secondary index keyed by `email`. Declares a real
+/// `hash_attribute_type` (issue #319) rather than leaving it `None`, so this
+/// suite's own restart/replication assertions below double as proof the type
+/// survives real Raft replication and WAL recovery, not just a bare `serde`
+/// round trip.
 fn email_index() -> IndexDef {
     IndexDef {
         name: "by-email".into(),
@@ -81,6 +85,8 @@ fn email_index() -> IndexDef {
         sort_attribute: None,
         projection: IndexProjection::All,
         status: IndexStatus::Active,
+        hash_attribute_type: Some(ColumnType::String),
+        sort_attribute_type: None,
     }
 }
 
@@ -144,6 +150,8 @@ fn run(seed: u64) {
             sort_attribute: None, // an LSI must have a sort attribute
             projection: IndexProjection::All,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         },
     });
     sim.run_for(Duration::from_secs(1));

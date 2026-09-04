@@ -259,6 +259,27 @@ pub struct IndexDef {
     /// `MetaCommand::SetIndexStatus` (so it replicates); see [`IndexStatus`].
     #[serde(default = "IndexStatus::active")]
     pub status: IndexStatus,
+    /// The DynamoDB `AttributeType` (`S`/`N`/`B`) [`hash_attribute`](Self::hash_attribute)
+    /// was declared with in `AttributeDefinitions` (issue #319). `CreateTable`/
+    /// `UpdateTable`'s `AttributeDefinitions` array covers every key attribute
+    /// in the table, base **and** index alike, but before this field nothing
+    /// recorded an index-only attribute's own declared type — `DescribeTable`'s
+    /// `AttributeDefinitions` had to default every one of them to `S`
+    /// regardless of what the client actually declared. `None` when the
+    /// caller's `AttributeDefinitions` didn't cover this attribute, or for an
+    /// index definition minted before this field existed
+    /// (`#[serde(default)]` — an implementation convenience per root
+    /// `CLAUDE.md`'s no-back-compat stance, not a migration guarantee); either
+    /// way the response falls back to the same `S` placeholder as before.
+    #[serde(default)]
+    pub hash_attribute_type: Option<ColumnType>,
+    /// The declared type of [`sort_attribute`](Self::sort_attribute), when the
+    /// index has one — `None` whenever `sort_attribute` is `None`, and also
+    /// (like [`hash_attribute_type`](Self::hash_attribute_type)) when the
+    /// caller's `AttributeDefinitions` didn't cover it or the definition
+    /// predates this field.
+    #[serde(default)]
+    pub sort_attribute_type: Option<ColumnType>,
 }
 
 /// One column's declared name and type. The name is stored as written
@@ -722,6 +743,8 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         }
     }
 
@@ -806,6 +829,8 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         }];
         assert_eq!(s.validate(), Err(SchemaError::LocalIndexMissingSort));
     }
@@ -821,6 +846,8 @@ mod tests {
             sort_attribute: Some("ts".into()),
             projection: IndexProjection::KeysOnly,
             status: IndexStatus::Active,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         });
         assert!(s.validate().is_ok());
     }

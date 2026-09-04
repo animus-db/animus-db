@@ -466,6 +466,8 @@ fn create_index(meta: &mut Metadata, table: &str, name: &str, hash_attr: &str) {
             sort_attribute: None,
             projection: IndexProjection::All,
             status: IndexStatus::Creating,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         },
     });
     assert_eq!(

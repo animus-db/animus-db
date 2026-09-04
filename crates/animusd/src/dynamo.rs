@@ -1926,7 +1926,12 @@ async fn provision_restore_target(
                         idx.name()
                     )));
                 }
-                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key);
+                // `RestoreTableFromBackup`'s `GlobalSecondaryIndexOverride` carries
+                // no `AttributeDefinitions` on the wire (issue #319's residual for
+                // this path only, see `index_to_control`'s own doc) — `&[]` leaves
+                // every resolved type `None`, matching this bridge's pre-existing
+                // behavior for this caller exactly.
+                let mut def = schema_bridge::index_to_control(idx, &base_schema.partition_key, &[]);
                 def.status = IndexStatus::Creating;
                 out.push(def);
             }
@@ -2325,7 +2330,7 @@ async fn create_table(
     // it). We compare against the replicated `table_indexes` set by name to know it
     // committed.
     for index in indexes {
-        let def = schema_bridge::index_to_control(index, &schema.partition_key);
+        let def = schema_bridge::index_to_control(index, &schema.partition_key, key_types);
         let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
         loop {
             ctx.propose_schema(&MetaCommand::CreateTableIndex {
@@ -2633,7 +2638,11 @@ async fn create_index(
              {MAX_GSI_PER_TABLE} allowed per table"
         )));
     }
-    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key);
+    // UpdateTable's own `AttributeDefinitions` isn't threaded to this caller
+    // yet (issue #319/W-05's UpdateTable half — a follow-up PR in this
+    // series) — `&[]` leaves every resolved type `None`, the same untyped
+    // shape `UpdateTable`-added indexes have always had.
+    let mut def = schema_bridge::index_to_control(index, &control_schema.partition_key, &[]);
     def.status = IndexStatus::Creating;
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {

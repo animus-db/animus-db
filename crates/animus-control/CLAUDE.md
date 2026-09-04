@@ -183,6 +183,19 @@ per-tablet CP data plane (`animus-cp-data`).
   shape (empty map rather than `None` for a known table with no tags, since
   a tag set has no "disabled" state to distinguish from "empty").
 
+  **`IndexDef` carries `hash_attribute_type`/`sort_attribute_type: Option<
+  ColumnType>` (issue #319/W-05)** — the DynamoDB `AttributeType` an
+  index's own hash/sort key attribute was declared with, resolved by
+  `animus_dynamo::schema::index_to_control` from a `CreateTable`/
+  `UpdateTable` call's own `AttributeDefinitions` when the caller supplied
+  one; `#[serde(default)]`, `None` for a pre-existing definition or an
+  attribute nobody ever declared a type for (still renders `DescribeTable`'s
+  honest `S` placeholder, never a fabricated type). Every one of this
+  struct's ~24 existing construction sites across this crate, `animus-node`,
+  `animus-test`, and `animusd`'s tests needed both new fields added —
+  compiler-enumerated via `error[E0063]`, the same fan-out pattern root
+  `CLAUDE.md`'s "a future 8th port" entry describes for `RoleAddrs`.
+
 - **`persist.rs`** — `WalRecord`, `PersistedState` (durability/recovery; the
   write/compact/recover flow is diagrammed in `docs/wal.md`). **`Metadata` is
   `DRIVER_APPLIED` (ADR 0038), so its WAL `Snapshot` record's `metadata` field

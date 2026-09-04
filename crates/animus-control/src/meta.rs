@@ -4484,6 +4484,8 @@ mod tests {
             sort_attribute: None,
             projection: crate::schema::IndexProjection::All,
             status: IndexStatus::Creating,
+            hash_attribute_type: None,
+            sort_attribute_type: None,
         };
         assert_eq!(
             m.apply(&MetaCommand::CreateTableIndex {
@@ -4544,6 +4546,8 @@ mod tests {
                     sort_attribute: None,
                     projection: crate::schema::IndexProjection::All,
                     status: IndexStatus::Creating,
+                    hash_attribute_type: None,
+                    sort_attribute_type: None,
                 },
             }),
             ApplyOutcome::Applied
@@ -4609,6 +4613,8 @@ mod tests {
                     sort_attribute: None,
                     projection: crate::schema::IndexProjection::All,
                     status: IndexStatus::Creating,
+                    hash_attribute_type: None,
+                    sort_attribute_type: None,
                 },
             }),
             ApplyOutcome::Applied
@@ -5844,6 +5850,8 @@ mod tests {
                     sort_attribute: None,
                     projection: crate::schema::IndexProjection::All,
                     status: IndexStatus::Creating,
+                    hash_attribute_type: None,
+                    sort_attribute_type: None,
                 }],
                 pitr: None,
             }),
@@ -7908,6 +7916,14 @@ mod tests {
                 sort_attribute: None,
                 projection: crate::schema::IndexProjection::All,
                 status: IndexStatus::Creating,
+                // A populated `Some` here (rather than the usual `None`
+                // fixture value) is deliberate: an empty/`None` field can't
+                // prove a JSON round trip actually preserves it (the same
+                // "an empty collection can't prove a map-key encoding rule"
+                // lesson this module's own doc already names for
+                // `stream_shards`) — see the round-trip assertion below.
+                hash_attribute_type: Some(ColumnType::String),
+                sort_attribute_type: None,
             },
         });
         m.apply(&MetaCommand::CreateTablet {
