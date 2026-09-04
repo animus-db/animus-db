@@ -376,7 +376,7 @@ async fn force_active(nodes: &[Node], id: animus_env::NodeId) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
-    timeout(Duration::from_secs(90), async {
+    timeout(Duration::from_secs(150), async {
         let dir = support::panic_safe_tempdir();
 
         // A control-only trio (indices 0..3) plus one combined-mode data
@@ -535,7 +535,32 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             table: "mixed_ddl_t".into(),
             schema: TableSchema::simple("id", ColumnType::String),
         };
-        timeout(Duration::from_secs(20), async {
+        // 60s, not 20 — a budget-ARITHMETIC alignment with the #281/#301
+        // sibling fix (`data_only.rs`'s `schema_ddl_via_a_data_node_relays_
+        // and_commits`), not a widening to paper over an unexplained
+        // failure (issue #591). The data node has no control leader hint of
+        // its own (`run_node_growth`'s local `RaftCore` is a permanent
+        // non-voter, so it never learns one), so `propose_schema` falls to
+        // its ADR 0030 broadcast fallback — one hop to each other known
+        // intra address in turn, each capped at `FORWARD_HOP_TIMEOUT` (2s)
+        // since issue #585. With 3 control nodes to try, one *whole*
+        // `call()` here can legitimately cost up to 3 * FORWARD_HOP_TIMEOUT
+        // = 6s before the loop's `metadata()` check even runs again, so the
+        // old 20s budget covered only ~3 worst-case attempts (3 candidates
+        // x FORWARD_HOP_TIMEOUT each) — the exact same "barely 2-3x, not a
+        // real margin" shape issue #281 diagnosed in the sibling test (see
+        // docs/engineering-lessons.md's issue #281 entry) before PR #301
+        // gave it 60s there. Same runner-aware multiplier, applied here
+        // because it was never propagated to this file: size the budget
+        // against the attempt's own worst-case bound, not against how long
+        // the relay takes when nothing is contended.
+        //
+        // The structural fix that would remove the N x FORWARD_HOP_TIMEOUT
+        // dependence entirely — a concurrent, first-success-wins broadcast
+        // (race all known candidates at once instead of trying them in
+        // series) so the worst case is one hop, not N — is the follow-up if
+        // this budget shape needs revisiting again; see the lessons entry.
+        timeout(Duration::from_secs(60), async {
             loop {
                 let _ = call(
                     // ADR 0047: `ProposeSchema` is intra-only.
@@ -553,7 +578,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
             }
         })
         .await
-        .expect("data-node-issued schema did not relay to the control leader in 20s");
+        .expect("data-node-issued schema did not relay to the control leader in 60s");
 
         for n in &control_nodes {
             n.shutdown_graceful().await;
