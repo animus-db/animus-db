@@ -52,10 +52,27 @@ the canonical list. Read-only views:
 
 ```
 config|status|raft|raftkv|metrics|health <admin-addr>
+peers|txns|backups|restores|control-members|storage-control <admin-addr>
 lsm|wal <admin-addr> [tablet]
 wal-segment <admin-addr> <seg> [tablet]
 key <admin-addr> <key> [tablet]
+storage-scan <admin-addr> [--tablet <id>] [--start <key>] [--limit <n>]
+system-table <admin-addr> [--kind <kind>] [--limit <n>] [--after <cursor>]
 ```
+
+- `peers`/`txns`/`backups`/`restores`/`control-members`/`storage-control`/
+  `storage-scan`/`system-table` (U-08(i)) are flat one-shot GETs, same shape
+  as `config`/`status`/`metrics` — no orchestration, just `GET` + print. Their
+  `(method, path, body)` construction lives in `admin_request`, a pure
+  function `run_admin` calls into (pulled out specifically so this parsing is
+  unit-testable without a socket — see the `#[cfg(test)]` module at the
+  bottom of `main.rs`). `storage-scan`'s `--tablet`/`--start`/`--limit` and
+  `system-table`'s `--kind`/`--limit`/`--after` are looked up by
+  `flag_value` (an order-independent `--name value` scan over the whole arg
+  list) rather than the positional `[tablet]` idiom the single-param storage
+  routes use — there's no one mandatory leading arg to anchor a trailing
+  positional on when every param is optional and there's more than one of
+  them.
 
 Mutating actions:
 
@@ -142,6 +159,10 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
 
 ## Tests
 
-No tests of its own; the client path is covered end-to-end by `animusd`'s
-`tests/cluster.rs`, and the admin surface by `animusd`'s admin/decommission
-tests (`tests/decommission.rs` among others).
+The client path (`status`/`put`/`get`) and the admin surface's actual HTTP
+behavior have no tests of their own here; they're covered end-to-end by
+`animusd`'s `tests/cluster.rs`, and by `animusd`'s admin/decommission tests
+(`tests/decommission.rs` among others). `main.rs` does carry a `#[cfg(test)]`
+module (`cargo test -p animus-cli`) for `admin_request` — the pure
+`(subcommand, args) -> (method, path, body)` step of `run_admin`'s flat GET
+dispatch — and its `flag_value` helper; it opens no sockets.

@@ -53,9 +53,12 @@ async fn main() -> ExitCode {
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
+    peers|txns|backups|restores|control-members|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
+    storage-scan <admin-addr> [--tablet <id>] [--start <key>] [--limit <n>]\n    \
+    system-table <admin-addr> [--kind <kind>] [--limit <n>] [--after <cursor>]\n    \
     split <admin-addr> <tablet> <split-key>\n    \
     stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
@@ -132,8 +135,6 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
         .ok_or("admin needs a subcommand")?;
     let addr = args.get(1).ok_or("admin needs <admin-addr>")?;
     let arg = |i: usize| args.get(i).map(String::as_str);
-    // The optional trailing `tablet` for the storage GET routes.
-    let tablet_q = |i: usize| arg(i).map_or(String::new(), |t| format!("?tablet={t}"));
 
     // `decommission` is a multi-step composite (drain → poll drain-status →
     // remove), not a single request/response — handled separately from the
@@ -182,13 +183,44 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
         return run_control_grow(addr, pairs).await;
     }
 
-    let (method, path, body): (&str, String, Option<String>) = match sub {
+    let (method, path, body) = admin_request(sub, args)?;
+
+    let (status, response) = http_call(addr, method, &path, body).await?;
+    println!("{response}");
+    if !(200..300).contains(&status) {
+        return Err(format!("admin request failed (HTTP {status})"));
+    }
+    Ok(())
+}
+
+/// Build the `(method, path, body)` for the flat one-shot admin routes —
+/// pulled out of [`run_admin`] as a pure function (no socket I/O) so the
+/// argument parsing is unit-testable. `args` is the full admin-subcommand
+/// argument list (`args[0]` the subcommand, `args[1]` the admin address, as
+/// in [`run_admin`]) — `decommission`/`control-add`/`control-remove`/
+/// `control-grow` are multi-step orchestration handled by [`run_admin`]
+/// itself before this is ever called, so they never reach here.
+fn admin_request(
+    sub: &str,
+    args: &[String],
+) -> Result<(&'static str, String, Option<String>), String> {
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    // The optional trailing `tablet` for the storage GET routes.
+    let tablet_q = |i: usize| arg(i).map_or(String::new(), |t| format!("?tablet={t}"));
+
+    Ok(match sub {
         "config" => ("GET", "/admin/config".into(), None),
         "status" => ("GET", "/admin/status".into(), None),
         "raft" => ("GET", "/admin/raft".into(), None),
         "raftkv" => ("GET", "/admin/raftkv".into(), None),
         "metrics" => ("GET", "/admin/metrics".into(), None),
         "health" => ("GET", "/admin/health".into(), None),
+        "peers" => ("GET", "/admin/peers".into(), None),
+        "txns" => ("GET", "/admin/txns".into(), None),
+        "backups" => ("GET", "/admin/backups".into(), None),
+        "restores" => ("GET", "/admin/restores".into(), None),
+        "control-members" => ("GET", "/admin/control/members".into(), None),
+        "storage-control" => ("GET", "/admin/storage/control".into(), None),
         "lsm" => ("GET", format!("/admin/storage/lsm{}", tablet_q(2)), None),
         "wal" => ("GET", format!("/admin/storage/wal{}", tablet_q(2)), None),
         "wal-segment" => {
@@ -206,6 +238,48 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             (
                 "GET",
                 format!("/admin/storage/key?key={key}&tablet={tablet}"),
+                None,
+            )
+        }
+        // All three params are optional server-side (`tablet` defaults to 1,
+        // `start` to the beginning of the tablet, `limit` to 50) — `--flag`
+        // form rather than positional, since there is no single mandatory
+        // leading arg to anchor trailing positionals on the way the
+        // `lsm`/`wal`/`key` routes' single optional `[tablet]` does.
+        "storage-scan" => {
+            let mut q = Vec::new();
+            if let Some(v) = flag_value(args, "--tablet") {
+                q.push(format!("tablet={v}"));
+            }
+            if let Some(v) = flag_value(args, "--start") {
+                q.push(format!("start={v}"));
+            }
+            if let Some(v) = flag_value(args, "--limit") {
+                q.push(format!("limit={v}"));
+            }
+            (
+                "GET",
+                format!("/admin/storage/scan{}", join_query(&q)),
+                None,
+            )
+        }
+        // `kind`/`limit`/`after` are all optional server-side too (ADR 0038
+        // addendum's `system_table` handler) — same `--flag` shape as
+        // `storage-scan` above.
+        "system-table" => {
+            let mut q = Vec::new();
+            if let Some(v) = flag_value(args, "--kind") {
+                q.push(format!("kind={v}"));
+            }
+            if let Some(v) = flag_value(args, "--limit") {
+                q.push(format!("limit={v}"));
+            }
+            if let Some(v) = flag_value(args, "--after") {
+                q.push(format!("after={v}"));
+            }
+            (
+                "GET",
+                format!("/admin/system-table{}", join_query(&q)),
                 None,
             )
         }
@@ -263,14 +337,30 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
             ("POST", "/admin/member/remove".into(), Some(body))
         }
         other => return Err(format!("unknown admin subcommand `{other}`")),
-    };
+    })
+}
 
-    let (status, response) = http_call(addr, method, &path, body).await?;
-    println!("{response}");
-    if !(200..300).contains(&status) {
-        return Err(format!("admin request failed (HTTP {status})"));
+/// Look up a `--name value` pair anywhere in `args` (order-independent,
+/// unlike the positional `arg`/`tablet_q` closures above — `storage-scan`
+/// and `system-table` have several independent optional params with no
+/// natural positional order to anchor on). Returns the value verbatim
+/// (un-percent-encoded, matching every other query value this file already
+/// builds by hand — e.g. `key`'s `key={key}` — since the admin server's own
+/// `query_param` percent-decodes on the way in).
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Join `k=v` pieces into a `?`-prefixed query string, or `""` if there are none.
+fn join_query(pieces: &[String]) -> String {
+    if pieces.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", pieces.join("&"))
     }
-    Ok(())
 }
 
 /// The operator's whole decommission flow (ADR 0032 PR3, extended by ADR 0037
@@ -754,4 +844,125 @@ fn print_response(response: &ClientResponse) {
 /// Render bytes as UTF-8 if possible, else as a debug string.
 fn show(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| format!("{bytes:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `admin_request`'s `args` mirrors `run_admin`'s: `[0]` is the
+    /// subcommand, `[1]` the admin address — both unused by `admin_request`
+    /// itself (routing happens in `run_admin`; `arg(2)`/`flag_value` never
+    /// look at index 0 or 1) but kept as placeholders so `arg(2)` lines up
+    /// with `rest[0]`, matching real call sites.
+    fn args(rest: &[&str]) -> Vec<String> {
+        ["sub", "addr"]
+            .into_iter()
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn flat_gets_with_no_params_route_to_their_fixed_path() {
+        let cases = [
+            ("peers", "/admin/peers"),
+            ("txns", "/admin/txns"),
+            ("backups", "/admin/backups"),
+            ("restores", "/admin/restores"),
+            ("control-members", "/admin/control/members"),
+            ("storage-control", "/admin/storage/control"),
+        ];
+        for (sub, expected_path) in cases {
+            let (method, path, body) = admin_request(sub, &args(&[])).unwrap();
+            assert_eq!(method, "GET", "sub={sub}");
+            assert_eq!(path, expected_path, "sub={sub}");
+            assert_eq!(body, None, "sub={sub}");
+        }
+    }
+
+    #[test]
+    fn storage_scan_with_no_flags_has_no_query_string() {
+        let (method, path, body) = admin_request("storage-scan", &args(&[])).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/admin/storage/scan");
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn storage_scan_passes_through_its_flags_regardless_of_order() {
+        let (_, path, _) = admin_request(
+            "storage-scan",
+            &args(&["--limit", "10", "--tablet", "3", "--start", "abc"]),
+        )
+        .unwrap();
+        assert_eq!(path, "/admin/storage/scan?tablet=3&start=abc&limit=10");
+    }
+
+    #[test]
+    fn storage_scan_supports_a_single_flag_alone() {
+        let (_, path, _) = admin_request("storage-scan", &args(&["--start", "k1"])).unwrap();
+        assert_eq!(path, "/admin/storage/scan?start=k1");
+    }
+
+    #[test]
+    fn system_table_with_no_flags_has_no_query_string() {
+        let (method, path, body) = admin_request("system-table", &args(&[])).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/admin/system-table");
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn system_table_passes_through_kind_limit_after() {
+        let (_, path, _) = admin_request(
+            "system-table",
+            &args(&["--kind", "Tablet", "--limit", "25", "--after", "cursor1"]),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            "/admin/system-table?kind=Tablet&limit=25&after=cursor1"
+        );
+    }
+
+    #[test]
+    fn system_table_supports_kind_alone() {
+        let (_, path, _) = admin_request("system-table", &args(&["--kind", "Policy"])).unwrap();
+        assert_eq!(path, "/admin/system-table?kind=Policy");
+    }
+
+    #[test]
+    fn preexisting_arms_are_unchanged_by_the_refactor() {
+        let (method, path, body) = admin_request("lsm", &args(&[])).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/admin/storage/lsm");
+        assert_eq!(body, None);
+
+        let (_, path, _) = admin_request("lsm", &args(&["7"])).unwrap();
+        assert_eq!(path, "/admin/storage/lsm?tablet=7");
+
+        let (_, path, _) = admin_request("key", &args(&["mykey"])).unwrap();
+        assert_eq!(path, "/admin/storage/key?key=mykey&tablet=1");
+
+        let (method, path, body) = admin_request("split", &args(&["5", "somekey"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/tablet/split");
+        assert_eq!(
+            body,
+            Some(r#"{"split_key":"somekey","tablet":5}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_is_an_error() {
+        assert!(admin_request("no-such-thing", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn flag_value_finds_the_value_following_its_name_anywhere_in_args() {
+        let a = args(&["--a", "1", "--b", "2"]);
+        assert_eq!(flag_value(&a, "--b"), Some("2"));
+        assert_eq!(flag_value(&a, "--missing"), None);
+    }
 }

@@ -436,8 +436,11 @@
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">animus admin</span></div>
 <pre><span class="c"># observe</span>
 <span class="p">$</span> <span class="k">animus admin status|config|health|raft|raftkv|metrics &lt;admin-addr&gt;</span>
+<span class="p">$</span> <span class="k">animus admin peers|txns|backups|restores|control-members|storage-control &lt;admin-addr&gt;</span>
 <span class="p">$</span> <span class="k">animus admin lsm|wal &lt;admin-addr&gt; [tablet]</span>
 <span class="p">$</span> <span class="k">animus admin key &lt;admin-addr&gt; &lt;key&gt; [tablet]</span>
+<span class="p">$</span> <span class="k">animus admin storage-scan &lt;admin-addr&gt; [--tablet &lt;id&gt;] [--start &lt;key&gt;] [--limit &lt;n&gt;]</span>
+<span class="p">$</span> <span class="k">animus admin system-table &lt;admin-addr&gt; [--kind &lt;kind&gt;] [--limit &lt;n&gt;] [--after &lt;cursor&gt;]</span>
 
 <span class="c"># act</span>
 <span class="p">$</span> <span class="k">animus admin split &lt;admin-addr&gt; &lt;tablet&gt; &lt;split-key&gt;</span>
