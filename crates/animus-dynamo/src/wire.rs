@@ -1016,6 +1016,38 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `TagResource` (roadmap W-06): add or overwrite tags on a table,
+    /// addressed by its [`table_arn`] (`ResourceArn` on the wire, decoded
+    /// and validated as a table ARN — malformed shape or a stream/backup
+    /// ARN sharing the `table/<name>` prefix is a decode-time
+    /// `ValidationException`; a well-formed ARN naming a table that does
+    /// not exist is `animusd`'s call, ADR-faithful to `ResourceNotFoundException`).
+    /// A tag key already present is overwritten (last writer wins, AWS's
+    /// own `TagResource` semantics).
+    TagResource {
+        /// The target table, recovered from `ResourceArn` by [`parse_table_arn`].
+        table: String,
+        /// The `(key, value)` pairs to set.
+        tags: BTreeMap<String, String>,
+    },
+    /// `UntagResource` (roadmap W-06): remove tags from a table by key,
+    /// addressed the same way as [`TagResource`](Self::TagResource). A key
+    /// not currently present is silently ignored, matching AWS.
+    UntagResource {
+        /// The target table, recovered from `ResourceArn`.
+        table: String,
+        /// The tag keys to remove.
+        tag_keys: Vec<String>,
+    },
+    /// `ListTagsOfResource` (roadmap W-06): a pure read of a table's current
+    /// tags, addressed the same way as [`TagResource`](Self::TagResource).
+    /// No pagination — AWS's own `NextToken` is only ever needed past 50
+    /// tags in a single response page, and this adapter always returns the
+    /// whole set.
+    ListTagsOfResource {
+        /// The target table, recovered from `ResourceArn`.
+        table: String,
+    },
 }
 
 /// `ListBackups`'s `BackupType` filter — AWS's own `USER`/`SYSTEM`/
@@ -1068,7 +1100,10 @@ impl Operation {
             | Operation::DescribeTimeToLive { table, .. }
             | Operation::UpdateContinuousBackups { table, .. }
             | Operation::DescribeContinuousBackups { table, .. }
-            | Operation::CreateBackup { table, .. } => Some(table),
+            | Operation::CreateBackup { table, .. }
+            | Operation::TagResource { table, .. }
+            | Operation::UntagResource { table, .. }
+            | Operation::ListTagsOfResource { table, .. } => Some(table),
             // `RestoreTableFromBackup` targets its brand-new *target* table
             // (mirroring `CreateTable`'s own "the table about to exist" —
             // the target doesn't exist yet either way).
@@ -1470,8 +1505,79 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }),
         "RestoreTableFromBackup" => decode_restore_table_from_backup(obj),
         "RestoreTableToPointInTime" => decode_restore_table_to_point_in_time(obj),
+        "TagResource" => decode_tag_resource(obj),
+        "UntagResource" => decode_untag_resource(obj),
+        "ListTagsOfResource" => Ok(Operation::ListTagsOfResource {
+            table: resource_arn_table(obj)?,
+        }),
         _ => Err(WireError::unknown_operation(target)),
     }
+}
+
+/// Decode the `ResourceArn` field shared by `TagResource`/`UntagResource`/
+/// `ListTagsOfResource`, recovering the target table name via
+/// [`parse_table_arn`]. Missing entirely, not a string, or not a
+/// well-formed **table** ARN (including a well-formed stream/backup ARN,
+/// which names a different resource) is `ValidationException` — the same
+/// class of decode-time structural error every other malformed field in
+/// this module gets; a well-formed ARN naming a table that genuinely
+/// doesn't exist is `animusd`'s call (`ResourceNotFoundException`, since
+/// only it holds the replicated catalog).
+fn resource_arn_table(obj: &Map<String, Value>) -> Result<String, WireError> {
+    let arn = obj
+        .get("ResourceArn")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `ResourceArn`"))?;
+    parse_table_arn(arn)
+        .map(str::to_owned)
+        .ok_or_else(|| WireError::validation(format!("`ResourceArn` is not a table ARN: {arn}")))
+}
+
+/// Decode a `TagResource` body: `ResourceArn` plus `Tags`, an array of
+/// `{"Key": .., "Value": ..}` objects. A later duplicate key in the array
+/// overwrites an earlier one in the decoded map (the same "last one wins"
+/// rule `MetaCommand::TagResource`'s own apply arm applies for a *repeated*
+/// call) — DynamoDB imposes no ordering guarantee on this array either way.
+fn decode_tag_resource(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = resource_arn_table(obj)?;
+    let tags_arr = obj
+        .get("Tags")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `Tags`"))?;
+    let mut tags = BTreeMap::new();
+    for entry in tags_arr {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| WireError::validation("`Tags` entries must be objects"))?;
+        let key = entry
+            .get("Key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`Tags` entry missing string field `Key`"))?;
+        let value = entry
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WireError::validation("`Tags` entry missing string field `Value`"))?;
+        tags.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(Operation::TagResource { table, tags })
+}
+
+/// Decode an `UntagResource` body: `ResourceArn` plus `TagKeys`, an array of
+/// strings.
+fn decode_untag_resource(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table = resource_arn_table(obj)?;
+    let tag_keys = obj
+        .get("TagKeys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WireError::validation("missing array field `TagKeys`"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| WireError::validation("`TagKeys` entries must be strings"))
+        })
+        .collect::<Result<Vec<String>, WireError>>()?;
+    Ok(Operation::UntagResource { table, tag_keys })
 }
 
 /// Decode a `CreateBackup` body: `TableName` plus `BackupName` (validated
@@ -4333,6 +4439,33 @@ pub fn backup_arn(table: &str, backup_id: &str) -> String {
     format!("arn:aws:dynamodb:animus:0:table/{table}/backup/{backup_id}")
 }
 
+/// The synthetic ARN this adapter surfaces for a **table itself** (roadmap
+/// W-06 — `TagResource`/`UntagResource`/`ListTagsOfResource`'s
+/// `ResourceArn`, and this adapter's own `TableArn`): `arn:aws:dynamodb:
+/// animus:0:table/<table>` — [`stream_arn`]/[`backup_arn`]'s identical
+/// placeholder region/account convention, with no further suffix (unlike
+/// those two, which append `/stream/<label>`/`/backup/<id>`).
+#[must_use]
+pub fn table_arn(table: &str) -> String {
+    format!("arn:aws:dynamodb:animus:0:table/{table}")
+}
+
+/// The inverse of [`table_arn`]: recovers the bare table name from a
+/// **table** ARN. Rejects (returns `None` for) anything that isn't exactly
+/// `arn:aws:dynamodb:animus:0:table/<name>` with no further `/`-separated
+/// segment — in particular a well-formed stream ARN
+/// (`.../table/<name>/stream/<label>`) or backup ARN
+/// (`.../table/<name>/backup/<id>`), which share this prefix but name a
+/// different resource, not a table.
+#[must_use]
+pub fn parse_table_arn(arn: &str) -> Option<&str> {
+    let rest = arn.strip_prefix("arn:aws:dynamodb:animus:0:table/")?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(rest)
+}
+
 /// Build the shared `TableDescription`/`Table` object both
 /// [`create_table_response`] and [`describe_table_response`] wrap: name, key
 /// schema, `ACTIVE` status, any secondary indexes — each carrying its own
@@ -4366,6 +4499,7 @@ fn table_description_object(
     }
     let mut desc = Map::new();
     desc.insert("TableName".into(), Value::String(table.to_owned()));
+    desc.insert("TableArn".into(), Value::String(table_arn(table)));
     desc.insert("KeySchema".into(), Value::Array(key_schema));
     desc.insert("TableStatus".into(), Value::String(status.to_owned()));
 
@@ -4965,6 +5099,34 @@ pub fn describe_time_to_live_response(desc: &TtlDescription) -> String {
     let mut obj = Map::new();
     obj.insert("TimeToLiveDescription".into(), Value::Object(inner));
     serde_json::to_string(&Value::Object(obj)).expect("describe-ttl response serializes")
+}
+
+/// The JSON body for a successful `TagResource`/`UntagResource` (roadmap
+/// W-06): both are AWS-faithfully a bare `{}` on success — neither op
+/// echoes anything back.
+#[must_use]
+pub fn tag_or_untag_resource_response() -> String {
+    "{}".to_owned()
+}
+
+/// The JSON body for a successful `ListTagsOfResource` (roadmap W-06):
+/// `{"Tags": [{"Key": .., "Value": ..}, ...]}`, sorted by key (`tags`'
+/// `BTreeMap` order) — never a `NextToken`, since this adapter always
+/// returns the whole set (see [`Operation::ListTagsOfResource`]'s own doc).
+#[must_use]
+pub fn list_tags_of_resource_response(tags: &BTreeMap<String, String>) -> String {
+    let entries: Vec<Value> = tags
+        .iter()
+        .map(|(k, v)| {
+            let mut e = Map::new();
+            e.insert("Key".into(), Value::String(k.clone()));
+            e.insert("Value".into(), Value::String(v.clone()));
+            Value::Object(e)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("Tags".into(), Value::Array(entries));
+    serde_json::to_string(&Value::Object(obj)).expect("list-tags response serializes")
 }
 
 /// A table's point-in-time recovery (PITR) configuration and restorable
@@ -7814,6 +7976,125 @@ mod tests {
         let body = describe_time_to_live_response(&desc);
         assert!(body.contains("\"TimeToLiveStatus\":\"DISABLED\""));
         assert!(!body.contains("AttributeName"));
+    }
+
+    // --- Resource tagging (roadmap W-06) ------------------------------------
+
+    #[test]
+    fn table_arn_round_trips_through_parse_table_arn() {
+        let arn = table_arn("orders");
+        assert_eq!(arn, "arn:aws:dynamodb:animus:0:table/orders");
+        assert_eq!(parse_table_arn(&arn), Some("orders"));
+    }
+
+    #[test]
+    fn parse_table_arn_rejects_a_stream_or_backup_arn() {
+        assert_eq!(
+            parse_table_arn("arn:aws:dynamodb:animus:0:table/orders/stream/L1"),
+            None
+        );
+        assert_eq!(
+            parse_table_arn("arn:aws:dynamodb:animus:0:table/orders/backup/abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_table_arn_rejects_malformed_input() {
+        assert_eq!(parse_table_arn("not-an-arn"), None);
+        assert_eq!(parse_table_arn("arn:aws:dynamodb:animus:0:table/"), None);
+    }
+
+    #[test]
+    fn decodes_tag_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders",
+            "Tags":[{"Key":"env","Value":"prod"},{"Key":"team","Value":"payments"}]}"#;
+        match decode_request("DynamoDB_20120810.TagResource", body).unwrap() {
+            Operation::TagResource { table, tags } => {
+                assert_eq!(table, "orders");
+                assert_eq!(
+                    tags,
+                    BTreeMap::from([
+                        ("env".to_owned(), "prod".to_owned()),
+                        ("team".to_owned(), "payments".to_owned()),
+                    ])
+                );
+            }
+            other => panic!("expected TagResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_tag_resource_rejects_a_malformed_resource_arn() {
+        let body = br#"{"ResourceArn":"not-an-arn","Tags":[{"Key":"env","Value":"prod"}]}"#;
+        let err = decode_request("DynamoDB_20120810.TagResource", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decode_tag_resource_rejects_missing_tags() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders"}"#;
+        let err = decode_request("DynamoDB_20120810.TagResource", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decodes_untag_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders",
+            "TagKeys":["env","team"]}"#;
+        match decode_request("DynamoDB_20120810.UntagResource", body).unwrap() {
+            Operation::UntagResource { table, tag_keys } => {
+                assert_eq!(table, "orders");
+                assert_eq!(tag_keys, vec!["env".to_owned(), "team".to_owned()]);
+            }
+            other => panic!("expected UntagResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_list_tags_of_resource() {
+        let body = br#"{"ResourceArn":"arn:aws:dynamodb:animus:0:table/orders"}"#;
+        match decode_request("DynamoDB_20120810.ListTagsOfResource", body).unwrap() {
+            Operation::ListTagsOfResource { table } => assert_eq!(table, "orders"),
+            other => panic!("expected ListTagsOfResource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_tags_of_resource_response_shape() {
+        let tags = BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("team".to_owned(), "payments".to_owned()),
+        ]);
+        let body = list_tags_of_resource_response(&tags);
+        assert!(body.contains("\"Key\":\"env\""));
+        assert!(body.contains("\"Value\":\"prod\""));
+        assert!(body.contains("\"Key\":\"team\""));
+    }
+
+    #[test]
+    fn list_tags_of_resource_response_empty() {
+        let body = list_tags_of_resource_response(&BTreeMap::new());
+        assert_eq!(body, "{\"Tags\":[]}");
+    }
+
+    #[test]
+    fn tag_or_untag_resource_response_is_empty_object() {
+        assert_eq!(tag_or_untag_resource_response(), "{}");
+    }
+
+    #[test]
+    fn describe_table_response_includes_table_arn() {
+        let body = describe_table_response(
+            "orders",
+            &TableSchema::simple("id"),
+            &[],
+            &[],
+            &[],
+            None,
+            "ACTIVE",
+        );
+        assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
     }
 
     // --- Backups (ADR 0059, Train 1 PR④) -----------------------------------

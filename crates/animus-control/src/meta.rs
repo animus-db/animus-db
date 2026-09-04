@@ -3662,6 +3662,19 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.pitr.as_ref())
     }
 
+    /// This table's **resource tags** (roadmap W-06), if any. `None` for an
+    /// unknown table; an empty map (never `None`) for a known table with no
+    /// tags — mirroring [`TableSchema::tags`]'s own "always present, may be
+    /// empty" shape rather than [`table_stream`](Self::table_stream)/
+    /// [`table_ttl`](Self::table_ttl)/[`table_pitr`](Self::table_pitr)'s
+    /// "absent means disabled" one, since a tag set has no such notion. A
+    /// read accessor for the wire adapters that consume the replicated
+    /// catalog.
+    #[must_use]
+    pub fn table_tags(&self, table: &str) -> Option<&BTreeMap<String, String>> {
+        self.schemas.get(table).map(|s| &s.tags)
+    }
+
     /// `tablet`'s own catalog rows for `(table, label)`, in ascending epoch
     /// order (ADR 0042 §2/§3) — the chain a `DescribeStream`/lineage-walk
     /// consumer needs for one tablet. `BTreeMap<(TabletId, u64), _>`'s own

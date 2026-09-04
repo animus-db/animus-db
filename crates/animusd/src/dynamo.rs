@@ -162,7 +162,7 @@
 //! nothing to backfill. `UpdateTable` (adding an index to a populated table)
 //! will need a real backfill when it lands (ADR 0041 §5).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_control::schema::{IndexDef, IndexKind, IndexProjection as CtlProjection, IndexStatus};
@@ -494,7 +494,11 @@ fn error_status(err: &WireError) -> u16 {
 
 /// Whether `op` is a DDL mutation that names a table by identity
 /// (`CreateTable`/`UpdateTable`/`DeleteTable`/`UpdateTimeToLive`) — see
-/// [`reject_internal_table`]'s `ddl` parameter.
+/// [`reject_internal_table`]'s `ddl` parameter. `TagResource`/
+/// `UntagResource` join this set for the same reason `UpdateTimeToLive`/
+/// `UpdateContinuousBackups` do (a mutation of the table's own catalog
+/// entry, not a data op) — `ListTagsOfResource`, a pure read, does not,
+/// exactly like `DescribeTimeToLive`/`DescribeContinuousBackups`.
 fn is_ddl_mutation(op: &Operation) -> bool {
     matches!(
         op,
@@ -503,6 +507,8 @@ fn is_ddl_mutation(op: &Operation) -> bool {
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
             | Operation::UpdateContinuousBackups { .. }
+            | Operation::TagResource { .. }
+            | Operation::UntagResource { .. }
     )
 }
 
@@ -1084,6 +1090,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             )
             .await
         }
+        Operation::TagResource { table, tags } => tag_resource(ctx, &table, &tags).await,
+        Operation::UntagResource { table, tag_keys } => {
+            untag_resource(ctx, &table, &tag_keys).await
+        }
+        Operation::ListTagsOfResource { table } => list_tags_of_resource(ctx, meta, &table),
     }
 }
 
@@ -1168,6 +1179,105 @@ fn describe_time_to_live(
         attribute_name: ttl.map(|t| t.attribute_name.clone()),
     };
     Ok(wire::describe_time_to_live_response(&desc))
+}
+
+// --- Resource tagging (roadmap W-06) ---------------------------------------
+
+/// `TagResource`: add or overwrite tags on a table — the same commit-wait
+/// shape [`update_time_to_live`] already uses, just against
+/// `MetaCommand::TagResource`.
+///
+/// The convergence check waits for **each requested `(key, value)` pair
+/// specifically**, not exact map equality against a snapshot taken before
+/// proposing — a concurrent, unrelated `TagResource`/`UntagResource` on the
+/// same table (a different key entirely) must not make this call spin past
+/// its deadline just because the *whole* map no longer matches what it
+/// computed before proposing.
+async fn tag_resource(
+    ctx: &ClientCtx,
+    table: &str,
+    tags: &BTreeMap<String, String>,
+) -> Result<String, WireError> {
+    if !metadata_fresh(ctx).await.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::TagResource {
+            table: table.to_owned(),
+            tags: tags.clone(),
+        })
+        .await;
+        if let Some(current) = metadata_fresh(ctx).await.table_tags(table)
+            && tags.iter().all(|(k, v)| current.get(k) == Some(v))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "TagResource did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    Ok(wire::tag_or_untag_resource_response())
+}
+
+/// `UntagResource`: remove tags from a table by key — [`tag_resource`]'s
+/// mirror, with the identical per-key (rather than whole-map) convergence
+/// check.
+async fn untag_resource(
+    ctx: &ClientCtx,
+    table: &str,
+    tag_keys: &[String],
+) -> Result<String, WireError> {
+    if !metadata_fresh(ctx).await.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::UntagResource {
+            table: table.to_owned(),
+            tag_keys: tag_keys.to_vec(),
+        })
+        .await;
+        if let Some(current) = metadata_fresh(ctx).await.table_tags(table)
+            && tag_keys.iter().all(|k| !current.contains_key(k))
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UntagResource did not commit to the control plane in time \
+                 (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+    Ok(wire::tag_or_untag_resource_response())
+}
+
+/// `ListTagsOfResource`: a pure read of the replicated catalog, mirroring
+/// [`describe_time_to_live`]'s shape exactly.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn list_tags_of_resource(
+    _ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+) -> Result<String, WireError> {
+    if !meta.has_table_schema(table) {
+        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+            table.to_owned(),
+        )));
+    }
+    let empty = BTreeMap::new();
+    let tags = meta.table_tags(table).unwrap_or(&empty);
+    Ok(wire::list_tags_of_resource_response(tags))
 }
 
 // --- PITR (ADR 0059 §9, Train 3) -------------------------------------------
