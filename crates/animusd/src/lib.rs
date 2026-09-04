@@ -2182,6 +2182,92 @@ pub(crate) struct AdminInfo {
     /// tablet as "over threshold, about to split" without hardcoding the
     /// value.
     pub(crate) auto_split_bytes_threshold: Option<u64>,
+    /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
+    /// root path — see [`StoreView`]. `None` on a control-only node: it
+    /// never provisions one ([`BoundControlNode::start_control_with`] takes
+    /// no `backup_store_config` at all — the capture driver only ever runs
+    /// on a node hosting the tablet it captures).
+    pub(crate) backup_store: Option<StoreView>,
+    /// This node's own **streams** segment store (ADR 0043 §A7b), same
+    /// redaction and the same control-only-node absence as
+    /// [`backup_store`](Self::backup_store) — the sealer only ever runs on a
+    /// node hosting the tablet it seals.
+    pub(crate) segment_store: Option<StoreView>,
+    /// This node's own tablet-host reconciler quiescence threshold (ADR
+    /// 0048), in milliseconds, iff quiescence is actually enabled for it —
+    /// `None` when disabled (`--quiesce-after 0`/the default at every entry
+    /// point except `--cluster N --quiesce-after SECS`) **or** structurally
+    /// inapplicable: a control-only node hosts no CP-data tablet to
+    /// quiesce, and a data-only node has no quiescence knob wired at all
+    /// yet (`start_data_with_growth`'s own documented gap — see
+    /// `crates/animusd/CLAUDE.md`'s Quiescence section).
+    pub(crate) quiesce_after_ms: Option<u64>,
+    /// Whether this node's client DynamoDB port enforces SigV4 (ADR 0057) —
+    /// `Some(true)`/`Some(false)` on a role that binds the dynamo listener
+    /// (combined/data), `None` on a control-only node (the listener is
+    /// never bound there, so "enabled" doesn't apply — mirrors
+    /// [`dynamo_addr`](Self::dynamo_addr)'s own `None`).
+    pub(crate) auth_enabled: Option<bool>,
+    /// The configured SigV4 credential store's access key **ids** — never
+    /// the secret keys, which never leave [`ClientCtx::dynamo_auth`].
+    /// `Some` only when [`auth_enabled`](Self::auth_enabled) is
+    /// `Some(true)`; `None` whenever it is or `Some(false)` (nothing
+    /// configured — a validated `dynamo_auth` section can't be empty) or
+    /// `None` (not applicable to this role).
+    pub(crate) auth_access_key_ids: Option<Vec<String>>,
+    /// The OTLP endpoint tracing export currently resolves to
+    /// (`otel::resolved_endpoint`, ADR 0027) — `None` when
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is unset/empty, i.e. export is off.
+    /// Process-wide, not per-role, but captured here alongside every other
+    /// admin-view fact rather than re-read from the environment on every
+    /// `/admin/config` request.
+    pub(crate) otlp_endpoint: Option<String>,
+}
+
+/// A redacted description of one of this node's configured
+/// [`SegmentStoreHandle`]/[`BackupStoreHandle`] instances, for the admin
+/// `/admin/config` view (ADR 0020) — kind (`"cluster"`/`"fs"`) plus, for the
+/// `fs` opt-in, its configured root path. **Never** a credential: neither
+/// variant carries one today (`Cluster` dials cluster peers over the same
+/// internal `Env` network every other intra-cluster RPC already uses;
+/// `Fs`/`FsSegmentStore` is a bare local/shared directory with no
+/// authentication of its own) — an S3-backed variant, when one lands, is
+/// the thing to extend this type for, not something to bolt onto the view
+/// function.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StoreView {
+    pub(crate) kind: &'static str,
+    pub(crate) path: Option<String>,
+}
+
+impl From<&SegmentStoreConfig> for StoreView {
+    fn from(config: &SegmentStoreConfig) -> Self {
+        match config {
+            SegmentStoreConfig::Cluster => StoreView {
+                kind: "cluster",
+                path: None,
+            },
+            SegmentStoreConfig::Fs(path) => StoreView {
+                kind: "fs",
+                path: Some(path.display().to_string()),
+            },
+        }
+    }
+}
+
+impl From<&BackupStoreConfig> for StoreView {
+    fn from(config: &BackupStoreConfig) -> Self {
+        match config {
+            BackupStoreConfig::Cluster => StoreView {
+                kind: "cluster",
+                path: None,
+            },
+            BackupStoreConfig::Fs(path) => StoreView {
+                kind: "fs",
+                path: Some(path.display().to_string()),
+            },
+        }
+    }
 }
 
 /// Project the replicated schema catalog into animusd console's own
@@ -3685,6 +3771,15 @@ impl BoundNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            backup_store: Some((&backup_store_config).into()),
+            segment_store: Some((&segment_store_config).into()),
+            quiesce_after_ms: (!quiesce_after.is_zero())
+                .then_some(quiesce_after.as_millis() as u64),
+            auth_enabled: Some(dynamo_auth.is_some()),
+            auth_access_key_ids: dynamo_auth
+                .as_ref()
+                .map(|creds| creds.keys().cloned().collect()),
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         // Keep a clone of the one internal env so [`Node::shutdown`] can abort
@@ -4757,6 +4852,16 @@ impl BoundControlNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold: None,
+            // A control-only node never provisions a backup/segment store,
+            // never runs the tablet-host reconciler (nothing to quiesce),
+            // and never binds the dynamo listener (so SigV4 enforcement
+            // doesn't apply) — see each field's own doc on `AdminInfo`.
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         let control_metrics = self.env.metrics();
@@ -5186,6 +5291,17 @@ impl BoundDataNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            backup_store: Some((&backup_store_config).into()),
+            segment_store: Some((&segment_store_config).into()),
+            // No quiescence knob on this data-only path yet (documented gap
+            // — see `AdminInfo::quiesce_after_ms`'s own doc and
+            // `crates/animusd/CLAUDE.md`'s Quiescence section).
+            quiesce_after_ms: None,
+            auth_enabled: Some(dynamo_auth.is_some()),
+            auth_access_key_ids: dynamo_auth
+                .as_ref()
+                .map(|creds| creds.keys().cloned().collect()),
+            otlp_endpoint: otel::resolved_endpoint(),
         });
 
         let envs = vec![self.env.clone()];
@@ -12124,6 +12240,14 @@ mod simenv_client_ctx_tests {
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],
             auto_split_bytes_threshold: None,
+            // This harness never builds a real `DataRole`/dynamo listener
+            // (`data: None` below) — see `AdminInfo`'s own field docs.
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
         });
 
         let ctx: SimClientCtx = ClientCtx {

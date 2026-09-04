@@ -20,7 +20,7 @@
 //! Routes (`GET` read-only, `POST` actions):
 //!
 //! - `GET  /`                          — the web dashboard SPA (also `/admin/ui`)
-//! - `GET  /admin/config`              — this node's ids, addresses, peers
+//! - `GET  /admin/config`              — this node's ids, addresses, peers, configured backup/segment store (redacted), quiescence threshold, SigV4 auth state (access key ids only, never secrets), resolved OTLP endpoint (roadmap U-06)
 //! - `GET  /admin/peers`              — every node's admin address (fan-out seed)
 //! - `GET  /admin/status`              — the full replicated `Metadata`
 //! - `GET  /admin/raft`                — control-plane Raft state
@@ -511,6 +511,18 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
+        // U-06 (docs/roadmap.md): backup/segment store (redacted to kind +
+        // root path, never credentials — see `StoreView`), the ADR 0048
+        // quiescence threshold, ADR 0057 auth state (never the secret —
+        // only the access key ids), and the resolved OTLP endpoint (ADR
+        // 0027). `null` on a role/harness for which the field doesn't
+        // apply — see each `AdminInfo` field's own doc.
+        "backup_store": a.backup_store,
+        "segment_store": a.segment_store,
+        "quiesce_after_ms": a.quiesce_after_ms,
+        "auth_enabled": a.auth_enabled,
+        "auth_access_key_ids": a.auth_access_key_ids,
+        "otlp_endpoint": a.otlp_endpoint,
     })
 }
 

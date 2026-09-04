@@ -406,11 +406,50 @@ async fn dashboard_role_gating_split_deployment() {
         assert_eq!(s, 200);
         let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
         assert_eq!(cfg["role"].as_str(), Some("control"));
+        // U-06 (docs/roadmap.md): a control-only node provisions neither
+        // store, never runs the reconciler quiescence knob, and never binds
+        // the dynamo listener — every one of these fields is `null`, never
+        // omitted, so the shape stays stable across roles.
+        assert!(
+            cfg["backup_store"].is_null()
+                && cfg["segment_store"].is_null()
+                && cfg["quiesce_after_ms"].is_null()
+                && cfg["auth_enabled"].is_null()
+                && cfg["auth_access_key_ids"].is_null(),
+            "a control-only node's /admin/config has no store/quiesce/auth fields: {cfg}"
+        );
 
         let (s, _, body) = raw(data_admin, "GET", "/admin/config").await;
         assert_eq!(s, 200);
         let cfg: Value = serde_json::from_str(&body).expect("config is JSON");
         assert_eq!(cfg["role"].as_str(), Some("data"));
+        // A data-only node gets its own real, independently-configured
+        // backup/segment store (ADR 0059 §1's asymmetry with control-only),
+        // and binds the dynamo listener (so `auth_enabled` is `Some(false)`
+        // — this deployment has no `dynamo_auth` section — never `null`).
+        // `quiesce_after_ms` stays `null`: the data-only path has no
+        // quiescence knob wired yet (documented gap,
+        // `crates/animusd/CLAUDE.md`'s Quiescence section).
+        assert_eq!(
+            cfg["backup_store"]["kind"].as_str(),
+            Some("cluster"),
+            "a data-only node's own backup store: {cfg}"
+        );
+        assert_eq!(
+            cfg["segment_store"]["kind"].as_str(),
+            Some("cluster"),
+            "a data-only node's own segment store: {cfg}"
+        );
+        assert!(
+            cfg["quiesce_after_ms"].is_null(),
+            "data-only quiescence is a documented gap: {cfg}"
+        );
+        assert_eq!(
+            cfg["auth_enabled"].as_bool(),
+            Some(false),
+            "no dynamo_auth section in this deployment: {cfg}"
+        );
+        assert!(cfg["auth_access_key_ids"].is_null(), "auth is off: {cfg}");
 
         // ---- the data-only node's control-plane mirror actually syncs -----
         // (ADR 0035 PR7's one backend addition: `/admin/raft`'s

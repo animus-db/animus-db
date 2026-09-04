@@ -823,6 +823,37 @@ reusing the captured config is the point of the test.
   method has a reason to carry. See `animus-node/CLAUDE.md`'s own rung C4d
   entry for the full design and the finding behind the wider-than-expected
   surface.
+  **`config_view` (ADR 0020, roadmap U-06)** carries, alongside the
+  identity/address/`auto_split_bytes_threshold` fields `AdminInfo` already
+  had: `backup_store`/`segment_store` (this node's own configured store,
+  redacted to `{kind, path}` via the `StoreView` type in `lib.rs` — never a
+  credential; `null` on a control-only node, which provisions neither),
+  `quiesce_after_ms` (the ADR 0048 threshold this node's reconciler was
+  actually started with, `null` when quiescence is off **or**
+  structurally inapplicable — control-only always, and data-only today,
+  since `start_data_with_growth` has no quiescence knob wired yet, see the
+  Quiescence section below), `auth_enabled`/`auth_access_key_ids` (ADR
+  0057's SigV4 gate — the access key **ids** only, never the secret; both
+  `null` on a control-only node, which never binds the dynamo listener,
+  `Some(false)`/`null` when the role has the listener but no `dynamo_auth`
+  section), and `otlp_endpoint` (`otel::resolved_endpoint()`, ADR 0027 —
+  `null` when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset/empty). Every field is
+  computed once at each `AdminInfo` construction site (`lib.rs`'s
+  `start_with_growth`/`start_control_with`/`start_data_with_growth`, plus
+  the in-crate `SimEnv` test harness), the same precedent
+  `auto_split_bytes_threshold` set — adding one means a compiler-driven
+  fan-out across all four `AdminInfo { .. }` literals, not a config_view-only
+  change. The dashboard's Node view (`dashboard_node.js::
+  renderNodeIdentity`) renders all six as extra `list-row`s below the
+  existing address list, skipping (not blanking) whichever ones are `null`
+  for this role — the same idiom `addrRows` already uses.
+  `tests/admin_endpoint.rs::admin_config_reports_auth_state_and_never_
+  serves_the_secret` is the secret-never-served regression: it asserts
+  against the raw serialized response body, not just the parsed
+  `auth_access_key_ids` field, so a secret leaking through some other key
+  would still be caught. `tests/dashboard_endpoint.rs::
+  dashboard_role_gating_split_deployment` covers the control-vs-data
+  null/present split.
 - **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
   0061 rung C4a): `read_http_request` does only `stream.read()`, handing
   every parsing decision (header-block framing, `Content-Length`
@@ -847,6 +878,10 @@ reusing the captured config is the point of the test.
   are still the regression net for the two thin wrappers themselves.
 - **`otel.rs`** — OTLP/HTTP distributed-tracing seam (ADR 0027); opt-in, no-op
   unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Scoped to this crate only.
+  **`resolved_endpoint()`** (roadmap U-06) factors `init_tracing`'s own env
+  lookup out into a standalone function so `AdminInfo::otlp_endpoint`
+  (`config_view`, above) can report the same resolved value without
+  duplicating the read.
 - **`dashboard.rs`** + **`dashboard.{html,css}`** + **`dashboard_*.js`** —
   animusd admin (ADR 0021's "AnimusDB Console") SPA: `include_str!`'d and served as
   distinct static assets, vanilla JS, no bundler/CDN/build step — edit,
@@ -2109,6 +2144,13 @@ crate's `CLAUDE.md`. This crate's own contribution:
   `--cluster-control`/`--cluster-data` split-deployment dev path or the
   standalone `control`/`data`/`join` subcommands (documented gaps in
   `main.rs`'s own module doc).
+- **`/admin/config`'s `quiesce_after_ms`** (roadmap U-06) reports the actual
+  threshold this node's own reconciler was started with — `null` when it's
+  `0`/disabled, and also `null` on a data-only node today (the "not yet
+  wired" gap just above means `start_data_with_growth` has no
+  `quiesce_after` parameter to report at all, not merely a `0` value) and
+  on a control-only node (structurally inapplicable — no CP-data tablet to
+  quiesce). See `admin.rs::config_view`, above.
 
 Tests: `index_drain.rs`'s own `stream_sealer_tests` module (in-crate, needs
 private `CpGroup` access) covers the veto end to end
