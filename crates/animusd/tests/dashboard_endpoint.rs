@@ -755,6 +755,23 @@ async fn dashboard_u01_render_only_fixes() {
             "the CpTxnView list is under \"groups\", the same shape dashboard_txns.js reads: {txns_body}"
         );
 
+        // ---- 2. Full per-group Raft detail in renderTabletDetail -----------
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        for field in [
+            "commit_index",
+            "durable_index",
+            "snapshot_index",
+            "log_len",
+            "g.voters",
+            "g.learners",
+        ] {
+            assert!(
+                tablets_js.contains(field),
+                "renderTabletDetail renders CpRaftView's own {field}: {tablets_js}"
+            );
+        }
+
         nodes[0].shutdown_graceful().await;
     })
     .await
