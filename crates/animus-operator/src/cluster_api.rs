@@ -15,14 +15,16 @@
 //! seam.
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Patch, PatchParams};
+use kube::core::DynamicObject;
 use kube::{Api, Client};
 use serde_json::json;
 
 use crate::controller::{FIELD_MANAGER, ReconcileError};
 use crate::crd::{AnimusCluster, AnimusClusterStatus};
+use crate::desired::certificate;
 
 fn apply_params() -> PatchParams {
     PatchParams::apply(FIELD_MANAGER).force()
@@ -73,6 +75,18 @@ pub trait ClusterApi: Send + Sync {
         name: &str,
         status: &AnimusClusterStatus,
     ) -> Result<(), ReconcileError>;
+    /// Server-side-apply `cert` — a cert-manager `Certificate` (ADR 0064
+    /// commit 3), only ever called when `spec.tls.certManager` is set
+    /// (`crate::desired::certificate::build` returns `None` otherwise, so
+    /// `crate::controller::apply_children` never calls this for a
+    /// `secretName`/no-TLS cluster).
+    async fn apply_certificate(&self, ns: &str, cert: &DynamicObject)
+    -> Result<(), ReconcileError>;
+    /// `GET` the `Secret` named `name`, or `None` if it does not exist —
+    /// used to read the cluster CA (`ca.crt`) out of `spec.tls`'s resolved
+    /// `Secret` for the admin client's TLS connector (`crate::controller`'s
+    /// scale-down drain sequence).
+    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError>;
 }
 
 /// The production [`ClusterApi`]: every method is exactly the `kube::Api`
@@ -177,5 +191,27 @@ impl ClusterApi for RealClusterApi {
             .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         Ok(())
+    }
+
+    async fn apply_certificate(
+        &self,
+        ns: &str,
+        cert: &DynamicObject,
+    ) -> Result<(), ReconcileError> {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), ns, &certificate::api_resource());
+        api.patch(
+            cert.metadata.name.as_deref().unwrap(),
+            &apply_params(),
+            &Patch::Apply(cert),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
+        Ok(Api::<Secret>::namespaced(self.client.clone(), ns)
+            .get_opt(name)
+            .await?)
     }
 }

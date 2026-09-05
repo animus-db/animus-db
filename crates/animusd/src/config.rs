@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use animus_env::NodeId;
 #[cfg(test)]
@@ -135,6 +136,59 @@ impl DynamoAuthConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// This node's TLS material (ADR 0064, S-01 commit 2) — a per-node
+/// [`RoleAddrs`] field (unlike [`DynamoAuthConfig`], which is a single
+/// cluster-wide credential map) because the cert/key files it names are
+/// always this node's own, never shared across the cluster; only `ca_path`
+/// is (conventionally) the same file on every node. `#[serde(default)]` on
+/// [`RoleAddrs::tls`] so an absent section (every pre-ADR-0064 config)
+/// deserializes as `None` — plain TCP on every port, byte-for-byte today's
+/// behavior.
+///
+/// Same three-file shape as `animus_env::TlsConfig` (`cert_path`,
+/// `key_path`, `ca_path`) but declared independently here rather than
+/// reusing that type directly: this section also has to exist, and
+/// round-trip through `serde_json`, in builds of `animusd` that don't
+/// enable `animus-env`'s `prod` feature (`animus-env`'s TLS types live
+/// behind that feature, ADR 0061 rung C0) — `animusd`'s own binary always
+/// enables `prod`, but the config *type* shouldn't have to assume that.
+/// `TlsSection::ca_path` is `Option`, matching `animus_env::TlsConfig`'s
+/// own shape (mutual TLS on `internal`/`intra` requires it; server-only
+/// TLS on `client`/`dynamo`/`admin`/`console` never reads it) —
+/// `ClusterConfig::validate_tls` is what actually enforces "every node has
+/// TLS or none does" across a whole config; per-port `ca_path` presence is
+/// enforced port-by-port in `Node::bind*` (mutual ports error without one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsSection {
+    /// PEM file: this node's own certificate (leaf, optionally followed by
+    /// intermediates).
+    pub cert_path: PathBuf,
+    /// PEM file: this node's private key.
+    pub key_path: PathBuf,
+    /// PEM file: the cluster CA certificate(s) — required for the mutual
+    /// `internal`/`intra` ports; unused for the server-only `client`/
+    /// `dynamo`/`admin`/`console` ports.
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+}
+
+impl TlsSection {
+    /// Build the `animus-env` [`animus_env::TlsConfig`] this section
+    /// describes (a plain field-for-field copy — the two types exist
+    /// independently only so this crate's own config type doesn't have to
+    /// assume `animus-env`'s `prod` feature is on just to round-trip
+    /// through `serde_json`, see this type's own doc; `animusd` itself
+    /// always enables that feature).
+    #[must_use]
+    pub fn to_tls_config(&self) -> animus_env::TlsConfig {
+        animus_env::TlsConfig {
+            cert_path: self.cert_path.clone(),
+            key_path: self.key_path.clone(),
+            ca_path: self.ca_path.clone(),
+        }
     }
 }
 
@@ -258,6 +312,7 @@ impl ClusterConfig {
                     intra: p(4),
                     console: p(5),
                     advertise_host: None,
+                    tls: None,
                 }
             })
             .collect();
@@ -294,6 +349,7 @@ impl ClusterConfig {
                     intra: p(4),
                     console: p(5),
                     advertise_host: None,
+                    tls: None,
                 }
             })
             .collect();
@@ -398,9 +454,10 @@ impl ClusterConfig {
     /// Returns a `serde_json` error if the text is not a valid config, if
     /// two entries claim the same [`RoleAddrs::id`] (ADR 0040 PR3: ids are
     /// now explicit and must be unique — a duplicate is a hard load-time
-    /// error, not a silently-shadowed entry), or if a present `dynamo_auth`
+    /// error, not a silently-shadowed entry), if a present `dynamo_auth`
     /// section has an empty credentials map (ADR 0057 — see
-    /// [`DynamoAuthConfig::validate`]).
+    /// [`DynamoAuthConfig::validate`]), or if only some nodes carry a `tls`
+    /// section (ADR 0064 — see [`Self::validate_tls`]).
     pub fn from_json(text: &str) -> serde_json::Result<Self> {
         let cfg: Self = serde_json::from_str(text)?;
         let mut seen = std::collections::BTreeSet::new();
@@ -415,7 +472,45 @@ impl ClusterConfig {
         if let Some(auth) = &cfg.dynamo_auth {
             auth.validate().map_err(serde_json::Error::custom)?;
         }
+        cfg.validate_tls().map_err(serde_json::Error::custom)?;
         Ok(cfg)
+    }
+
+    /// ADR 0064's "a cluster is either all-TLS or all-plain on the internal
+    /// wire" rule: every node's `tls` section is present, or none is.
+    /// `internal`/`intra` are mutual-TLS-only ports shared by a Raft
+    /// group's own peers (the control group, and every per-tablet group) —
+    /// a group with some members dialing in plaintext and others requiring
+    /// a handshake would either silently drop half its peers or accept
+    /// unauthenticated connections from the other half, neither of which is
+    /// a coherent security posture (see ADR 0064 Decision 3). The
+    /// client/admin/console ports have no such constraint (each is
+    /// independently server-only TLS, checked instead at bind time per
+    /// node) — only this cross-node internal-wire rule needs a whole-config
+    /// check.
+    ///
+    /// # Errors
+    /// Returns a message naming the first node whose `tls` presence
+    /// disagrees with the first node in the list, unless every node agrees.
+    pub fn validate_tls(&self) -> Result<(), String> {
+        let mut nodes = self.nodes.iter();
+        let Some(first) = nodes.next() else {
+            return Ok(());
+        };
+        let first_has_tls = first.tls.is_some();
+        for n in nodes {
+            if n.tls.is_some() != first_has_tls {
+                return Err(format!(
+                    "mixed TLS configuration: node {:?} {} a tls section but node {:?} {} \
+                     one — a cluster must be all-TLS or all-plain on the internal wire (ADR 0064)",
+                    n.id,
+                    if n.tls.is_some() { "has" } else { "has no" },
+                    first.id,
+                    if first_has_tls { "has" } else { "has no" },
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -649,5 +744,94 @@ mod tests {
         assert_eq!(settings.stream_retention_secs, None);
         assert_eq!(settings.auto_split_change_rate, None);
         assert_eq!(settings.auto_split_ops_rate, None);
+    }
+
+    // --- `tls` (ADR 0064, S-01 commit 2) ----------------------------------
+
+    fn tls_section(tag: &str) -> TlsSection {
+        TlsSection {
+            cert_path: format!("/etc/animusd/tls/{tag}.cert.pem").into(),
+            key_path: format!("/etc/animusd/tls/{tag}.key.pem").into(),
+            ca_path: Some("/etc/animusd/tls/ca.pem".into()),
+        }
+    }
+
+    #[test]
+    fn tls_defaults_to_none_and_round_trips_absent() {
+        // A generated config carries no `tls` section on any node, and it
+        // survives a JSON round trip as `None` — byte-identical to
+        // pre-ADR-0064 behavior.
+        let cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(cfg.nodes.iter().all(|n| n.tls.is_none()));
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(parsed.nodes.iter().all(|n| n.tls.is_none()));
+
+        // An old-shaped node JSON object with no `tls` key at all must
+        // still parse (`#[serde(default)]`, never a breaking requirement).
+        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let parsed = ClusterConfig::from_json(&bare).unwrap();
+        assert!(parsed.nodes.iter().all(|n| n.tls.is_none()));
+    }
+
+    #[test]
+    fn tls_section_round_trips_with_and_without_ca_path() {
+        let mut cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.nodes[0].tls = Some(tls_section("n0"));
+        // `ca_path` is `Option` on the type itself (server-only TLS on the
+        // client/dynamo/admin/console ports never reads it) — a section
+        // with no CA must still round-trip even though this whole-config
+        // path never validates per-port ca_path presence.
+        cfg.nodes[1].tls = Some(TlsSection {
+            cert_path: "/etc/animusd/tls/n1.cert.pem".into(),
+            key_path: "/etc/animusd/tls/n1.key.pem".into(),
+            ca_path: None,
+        });
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert_eq!(parsed.nodes[0].tls, cfg.nodes[0].tls);
+        assert_eq!(parsed.nodes[1].tls, cfg.nodes[1].tls);
+        assert!(parsed.nodes[1].tls.as_ref().unwrap().ca_path.is_none());
+    }
+
+    #[test]
+    fn validate_tls_accepts_all_nodes_plain_or_all_nodes_tls() {
+        let plain = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
+        plain.validate_tls().expect("all-plain must validate");
+
+        let mut all_tls = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
+        for (i, node) in all_tls.nodes.iter_mut().enumerate() {
+            node.tls = Some(tls_section(&format!("n{i}")));
+        }
+        all_tls.validate_tls().expect("all-tls must validate");
+        // Also reachable through `from_json`, which calls `validate_tls`
+        // itself (this is what makes a mixed config a *load-time* error,
+        // not something discovered only at the first failed handshake).
+        ClusterConfig::from_json(&all_tls.to_json()).expect("all-tls config file must load");
+    }
+
+    #[test]
+    fn validate_tls_rejects_a_mixed_config() {
+        let mut cfg = ClusterConfig::generate(3, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.nodes[1].tls = Some(tls_section("n1"));
+        let err = cfg
+            .validate_tls()
+            .expect_err("one node with tls and two without must be rejected");
+        assert!(err.contains("mixed TLS configuration"), "{err}");
+
+        // And the same rejection happens automatically at `from_json` load
+        // time — an operator never gets past parsing a mixed config file.
+        let load_err = ClusterConfig::from_json(&cfg.to_json())
+            .expect_err("from_json must reject a mixed-tls config file");
+        assert!(load_err.to_string().contains("mixed TLS configuration"));
+    }
+
+    #[test]
+    fn validate_tls_is_a_no_op_on_an_empty_node_list() {
+        let cfg = ClusterConfig {
+            nodes: vec![],
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        cfg.validate_tls()
+            .expect("no nodes means nothing to disagree");
     }
 }

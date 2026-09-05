@@ -33,6 +33,15 @@ pub mod prod;
 #[cfg(feature = "prod")]
 pub use prod::{FsSegmentStore, ProdEnv};
 
+/// TLS material for the intra-node wire (ADR 0064, S-01 step 1) — gated
+/// alongside `prod.rs` since it exists only to serve `ProdEnv`'s real
+/// sockets. See the module's own doc for `TlsConfig`/`TlsMaterial`/
+/// `MaybeTlsStream` and the certificate SAN requirement.
+#[cfg(feature = "prod")]
+pub mod tls;
+#[cfg(feature = "prod")]
+pub use tls::{MaybeTlsStream, TlsConfig, TlsMaterial};
+
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 

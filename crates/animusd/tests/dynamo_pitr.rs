@@ -59,6 +59,7 @@ async fn start_single_node_with_knobs(dir: &Path, knobs: StreamSealKnobs) -> (No
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

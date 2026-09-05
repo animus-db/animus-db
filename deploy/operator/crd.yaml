@@ -158,6 +158,68 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              tls:
+                description: |-
+                  TLS material for the cluster (ADR 0064 commit 3). `None` (default)
+                  keeps every pod on plain TCP, byte-for-byte the pre-existing
+                  behavior. See [`TlsSpec`]'s own doc for the two mutually exclusive
+                  shapes and how the resolved `Secret` is mounted/wired.
+                nullable: true
+                properties:
+                  certManager:
+                    description: |-
+                      Have cert-manager issue and renew the cluster's cert via a
+                      `Certificate` resource this operator creates and owns (`crate::
+                      desired::certificate::build`). Mutually exclusive with `secretName`.
+                    nullable: true
+                    properties:
+                      duration:
+                        description: |-
+                          `Certificate.spec.duration` (e.g. `"2160h"`), passed through
+                          verbatim. Omitted lets cert-manager/the issuer apply its own
+                          default.
+                        nullable: true
+                        type: string
+                      issuerRef:
+                        description: |-
+                          `spec.tls.certManager.issuerRef` — mirrors cert-manager's own
+                          `ObjectReference` shape (`name`/`kind`/`group`).
+                        properties:
+                          group:
+                            description: |-
+                              `Certificate.spec.issuerRef.group` — omitted lets cert-manager
+                              apply its own default (`cert-manager.io`).
+                            nullable: true
+                            type: string
+                          kind:
+                            default: Issuer
+                            description: |-
+                              `"Issuer"` (namespace-scoped) or `"ClusterIssuer"`. Defaults to
+                              `"Issuer"`, matching cert-manager's own default when `kind` is
+                              omitted from a `Certificate`'s `issuerRef`.
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      renewBefore:
+                        description: |-
+                          `Certificate.spec.renewBefore` (e.g. `"360h"`), passed through
+                          verbatim.
+                        nullable: true
+                        type: string
+                    required:
+                    - issuerRef
+                    type: object
+                  secretName:
+                    description: |-
+                      Name of a pre-existing `Secret` (same namespace, `kubernetes.io/tls`
+                      shape: `tls.crt`/`tls.key`/`ca.crt`) an operator user issued and
+                      placed by hand. Mutually exclusive with `certManager`.
+                    nullable: true
+                    type: string
+                type: object
             required:
             - nodes
             type: object

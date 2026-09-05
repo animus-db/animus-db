@@ -61,6 +61,7 @@ use animus_control::ColumnType;
 use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
+use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_node::host::AdminHost;
 use animus_storage::{StorageError, WalRecordView};
@@ -68,7 +69,8 @@ use animus_tablet::{TOKEN_BYTES, TabletId};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tracing::Instrument;
 
 use crate::http;
@@ -209,12 +211,39 @@ pub(crate) struct CpTxnView {
 
 /// Accept loop for the admin HTTP endpoint. One task per connection; HTTP/1.1
 /// keep-alive lets a client reuse the connection (mirrors `dynamo::serve`).
-pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
+///
+/// **TLS (ADR 0064, S-01 commit 2)**: `tls` is the admin port's own
+/// **server-only** acceptor (`animus_env::TlsMaterial::server_acceptor`) —
+/// `None` (the default) is plain TCP, byte-for-byte unchanged. A failed
+/// handshake (a plain-TCP dial into a TLS listener, or any other TLS
+/// error) is logged at `warn` with the peer's address and the connection
+/// dropped; the loop keeps serving every other connection, mirroring
+/// `animus_env::prod::spawn_accept`'s own contract.
+pub(crate) async fn serve(
+    listener: TcpListener,
+    ctx: ClientCtx,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer_addr)) => {
                 let ctx = ctx.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
+                    let stream = match tls {
+                        None => MaybeTlsStream::Plain(stream),
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    %peer_addr,
+                                    "admin TLS handshake failed (dropping connection)"
+                                );
+                                return;
+                            }
+                        },
+                    };
                     if let Err(err) = handle_conn(stream, ctx).await {
                         tracing::debug!(?err, "admin connection closed");
                     }
@@ -228,7 +257,10 @@ pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
+async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    ctx: ClientCtx,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     loop {
         let Some(request) = http::read_http_request(&mut stream, &mut buf).await? else {
@@ -2536,6 +2568,7 @@ mod system_table_tests {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

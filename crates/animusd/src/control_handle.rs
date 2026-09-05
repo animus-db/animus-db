@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use animus_env::ProdEnv;
+use animus_env::{ProdEnv, TlsMaterial};
 use animus_node::host::RelayClient;
 use animus_node::{ClientRequest, ClientResponse};
 
@@ -44,8 +44,17 @@ pub(crate) type RemoteControlClient =
 /// all, and this crate's `disallowed_methods` lint would refuse it there
 /// even if the dependency existed — see that crate's own `CLAUDE.md`'s "no
 /// tokio" invariant).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct AnimusdRelayClient;
+///
+/// **No longer zero-sized since ADR 0064 (S-01 commit 2)**: it carries this
+/// node's own [`TlsMaterial`] (`None` when TLS is unconfigured) so a
+/// data-only node's [`RemoteControlClient`] can dial the (mutual-TLS)
+/// `intra` port of a separately-deployed control plane exactly like every
+/// other cross-node relay in this crate — see [`relay_request_with_timeout`]'s
+/// own TLS doc.
+#[derive(Clone, Default)]
+pub(crate) struct AnimusdRelayClient {
+    pub(crate) tls: Option<TlsMaterial>,
+}
 
 #[async_trait::async_trait]
 impl RelayClient for AnimusdRelayClient {
@@ -55,6 +64,6 @@ impl RelayClient for AnimusdRelayClient {
         request: &ClientRequest,
         timeout: Duration,
     ) -> ClientResponse {
-        relay_request_with_timeout(addr, request, timeout).await
+        relay_request_with_timeout(addr, request, timeout, self.tls.as_ref()).await
     }
 }

@@ -94,9 +94,31 @@ tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
+# TLS on the client/intra/admin/console listeners and every dialer (ADR
+# 0064, S-01 commit 2) — the accept-side `TlsAcceptor`/`MaybeTlsStream`
+# plumbing this crate's own listeners need on top of what `animus-env`
+# (commit 1) already provides for the internal wire. Same pinned `ring`
+# feature set as `animus-env`'s own `tokio-rustls` dependency (one crypto
+# backend workspace-wide, ADR 0064 Decision 5).
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The TLS test-PKI helper (`tests/support/mod.rs::tls_pki`, ADR 0064 commit
+# 2) — a self-signed CA + per-node leaf certs, generated fresh per test run,
+# never shipped. Mirrors `animus-env`'s own `prod::tests` use of the same
+# crate (its helper is `#[cfg(test)]`-private to that crate, so this is an
+# independent, small copy rather than a cross-crate reuse — see this
+# crate's own `CLAUDE.md`).
+rcgen = "0.13"
+# `tests/tls_e2e.rs`'s own test-side TLS clients: a server-only `rustls`
+# `ClientConfig` (no client cert — mirrors `animus-cli`'s `--tls-ca`) for
+# the client/dynamo/admin/console ports, and reading the test PKI's PEM
+# files directly for the intra-port mutual-TLS negative test. Test-only —
+# `animusd`'s own production TLS material always goes through `animus-env`
+# (already a normal dependency).
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 # For the reconfigure-loop test (#3), which drives the replicated tablet map
 # directly: `CasTabletReplicas` needs `TabletId` + `Epoch`.
 animus-tablet.workspace = true

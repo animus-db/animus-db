@@ -220,3 +220,17 @@ these responses are rendered at the `animusd` edge rather than through
   for any future header-reading feature.
 - Plaintext secrets in config files are an accepted interim posture,
   consistent with "no back-compat until further notice" pre-alpha status.
+
+## Amendment (2026-09-05, ADR 0064)
+
+The Non-goals section above named TLS explicitly: "a separate concern;
+SigV4 does not protect confidentiality." [ADR 0064](
+0064-tls-on-every-port.md) takes up that concern: server-only TLS on the
+client port (confidentiality + server authenticity) layers underneath
+SigV4 (caller identity via a static secret) with neither depending on the
+other — exactly the independence this ADR anticipated. The intra/admin/
+console posture note above ("auth on the intra, admin, or console ports
+… postures unchanged") is about *authentication*, not TLS, and is
+unaffected: ADR 0064 adds mutual TLS on the intra port and server-only TLS
+on the admin/console ports, none of which is an authentication scheme in
+the SigV4 sense.

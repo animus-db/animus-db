@@ -265,3 +265,19 @@ DynamoDB port** (default-off). The **intra port deliberately stays
 unauthenticated**, exactly per this ADR's stance: it is the more-trusted,
 cluster-internal segment, kept off any externally-reachable Service by
 the operator topology.
+
+## Amendment (2026-09-05, ADR 0064)
+
+"Deliberately stays unauthenticated" (above) is narrowed, not reversed:
+[ADR 0064](0064-tls-on-every-port.md) adds **mutual TLS** as an opt-in
+transport-layer authentication for the internal Raft wire and, in that
+ADR's commit 2, this ADR's own `intra` port — every node presents a
+cluster-CA-signed cert and verifies its peer's, so a non-member host can
+no longer complete a handshake at all. This is orthogonal to the
+port-class split this ADR makes (audience/reachability, per the Context
+section above): TLS is a mode each port is independently configured
+into, not a new class, and the `client`/`admin`/`console` ports get a
+different (server-only) TLS mode under the same ADR. `intra` remains
+unauthenticated in the SigV4/application sense either way — mutual TLS
+authenticates *cluster membership* at the transport, a different and
+lower-level guarantee than an application-level identity check.

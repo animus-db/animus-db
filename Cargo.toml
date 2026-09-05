@@ -77,6 +77,30 @@ bigdecimal = "0.4"
 # allow-list); safe Rust throughout, honouring `unsafe_code = "forbid"`.
 sha2 = "0.10"
 hmac = "0.12"
+# TLS on the intra-node wire (ADR 0064, S-01 step 1). `rustls`/`tokio-rustls`
+# are already in the dependency graph via `kube`'s `rustls-tls` feature
+# (`animus-operator`) — pinned here to the same `ring` crypto provider so the
+# workspace carries one crypto backend, not two (`aws-lc-rs`, each crate's
+# own default, is explicitly turned off). `rustls-pki-types`'s `pem` module
+# (`rustls_pki_types::pem::PemObject`, on by default via its `alloc`
+# feature) parses the PEM files a `TlsConfig` names into the DER types
+# rustls itself consumes — `rustls-pemfile` used to do this and was dropped
+# (2026-09-05): it was flagged unmaintained by a `cargo deny` advisory
+# (rustls/pemfile#61), and the advisory's own recommendation is exactly this
+# migration. `rcgen` is dev-only (test PKI generation, `prod::tests`).
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls-pki-types = "1"
+rcgen = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

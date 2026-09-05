@@ -44,6 +44,111 @@ impl StorageSpec {
     }
 }
 
+/// `spec.tls` — TLS material for the cluster (ADR 0064 commit 3). Exactly
+/// one of `secretName`/`certManager` must be set; both or neither is
+/// rejected by [`TlsSpec::validate`] (called from `crate::controller`,
+/// since there is no admission webhook in v1 to reject the write itself —
+/// same posture as `controlNodes`' immutability check).
+///
+/// Either shape resolves to the *same* `Secret` name
+/// ([`TlsSpec::secret_name_or_default`]): a pre-existing `kubernetes.io/tls`
+/// Secret the operator only reads (`secretName`), or one cert-manager
+/// issues and keeps renewed (`certManager`, materialized by
+/// `crate::desired::certificate::build`'s `Certificate.spec.secretName`).
+/// Either way every pod mounts it read-only at `/etc/animus/tls`
+/// (`crate::desired::statefulset::build`) and every generated node's
+/// `RoleAddrs.tls` in `cluster.json` points at the three files inside it
+/// (`crate::desired::cluster_config::build_cluster_config`) — one shared
+/// cert/key across every pod, not a per-pod one: simpler to issue and mount
+/// than a distinct cert per ordinal, and every pod's certificate already
+/// needs the union of every ordinal's SANs for cross-node dialing to work,
+/// so a per-pod split would buy no smaller a SAN list, only more objects to
+/// manage.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsSpec {
+    /// Name of a pre-existing `Secret` (same namespace, `kubernetes.io/tls`
+    /// shape: `tls.crt`/`tls.key`/`ca.crt`) an operator user issued and
+    /// placed by hand. Mutually exclusive with `certManager`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// Have cert-manager issue and renew the cluster's cert via a
+    /// `Certificate` resource this operator creates and owns (`crate::
+    /// desired::certificate::build`). Mutually exclusive with `secretName`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_manager: Option<CertManagerSpec>,
+}
+
+impl TlsSpec {
+    /// `Ok(())` iff exactly one of `secretName`/`certManager` is set.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.secret_name, &self.cert_manager) {
+            (Some(_), Some(_)) => Err(
+                "spec.tls: exactly one of secretName/certManager must be set, not both".to_string(),
+            ),
+            (None, None) => Err(
+                "spec.tls: exactly one of secretName/certManager must be set, neither is"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// The `Secret` name every pod mounts at `/etc/animus/tls` — the
+    /// explicit `secretName`, or, for `certManager`, the name the generated
+    /// `Certificate` is told to write to (`{cluster_name}-tls`).
+    ///
+    /// # Panics
+    /// Never in practice: only called after [`Self::validate`] has
+    /// confirmed exactly one variant is set.
+    #[must_use]
+    pub fn secret_name_or_default(&self, cluster_name: &str) -> String {
+        self.secret_name
+            .clone()
+            .unwrap_or_else(|| format!("{cluster_name}-tls"))
+    }
+}
+
+/// `spec.tls.certManager` — issue via cert-manager against an existing
+/// `Issuer`/`ClusterIssuer` (referenced, never created by this operator).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CertManagerSpec {
+    pub issuer_ref: IssuerRef,
+    /// `Certificate.spec.duration` (e.g. `"2160h"`), passed through
+    /// verbatim. Omitted lets cert-manager/the issuer apply its own
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    /// `Certificate.spec.renewBefore` (e.g. `"360h"`), passed through
+    /// verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renew_before: Option<String>,
+}
+
+/// `spec.tls.certManager.issuerRef` — mirrors cert-manager's own
+/// `ObjectReference` shape (`name`/`kind`/`group`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuerRef {
+    pub name: String,
+    /// `"Issuer"` (namespace-scoped) or `"ClusterIssuer"`. Defaults to
+    /// `"Issuer"`, matching cert-manager's own default when `kind` is
+    /// omitted from a `Certificate`'s `issuerRef`.
+    #[serde(default = "IssuerRef::default_kind")]
+    pub kind: String,
+    /// `Certificate.spec.issuerRef.group` — omitted lets cert-manager
+    /// apply its own default (`cert-manager.io`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl IssuerRef {
+    fn default_kind() -> String {
+        "Issuer".to_string()
+    }
+}
+
 /// The client-facing `dynamo` port's `Service` configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientServiceSpec {
@@ -131,6 +236,12 @@ pub struct AnimusClusterSpec {
     /// to every pod (both roles accept the flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamo_auth_secret_name: Option<String>,
+    /// TLS material for the cluster (ADR 0064 commit 3). `None` (default)
+    /// keeps every pod on plain TCP, byte-for-byte the pre-existing
+    /// behavior. See [`TlsSpec`]'s own doc for the two mutually exclusive
+    /// shapes and how the resolved `Secret` is mounted/wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsSpec>,
 }
 
 impl AnimusClusterSpec {
@@ -216,6 +327,9 @@ pub const CONDITION_IMMUTABLE_FIELD_CHANGED: &str = "ImmutableFieldChanged";
 pub const CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED: &str = "ScaleBelowControlNodesRefused";
 /// Condition type name used when a member-drain step of a scale-down fails.
 pub const CONDITION_DRAIN_FAILED: &str = "DrainFailed";
+/// Condition type name used when `spec.tls` sets both or neither of
+/// `secretName`/`certManager` — see [`TlsSpec::validate`].
+pub const CONDITION_TLS_SPEC_INVALID: &str = "TlsSpecInvalid";
 
 #[cfg(test)]
 mod tests {
@@ -249,5 +363,64 @@ mod tests {
         let storage = StorageSpec::default();
         assert_eq!(storage.size_or_default(), "10Gi");
         assert!(!storage.is_ephemeral());
+    }
+
+    // --- TlsSpec (ADR 0064 commit 3) -------------------------------------
+
+    #[test]
+    fn tls_spec_rejects_both_shapes_set() {
+        let tls = TlsSpec {
+            secret_name: Some("s".to_string()),
+            cert_manager: Some(CertManagerSpec {
+                issuer_ref: IssuerRef {
+                    name: "i".to_string(),
+                    kind: "Issuer".to_string(),
+                    group: None,
+                },
+                duration: None,
+                renew_before: None,
+            }),
+        };
+        assert!(tls.validate().is_err());
+    }
+
+    #[test]
+    fn tls_spec_rejects_neither_shape_set() {
+        assert!(TlsSpec::default().validate().is_err());
+    }
+
+    #[test]
+    fn tls_spec_secret_name_shape_is_valid() {
+        let tls = TlsSpec {
+            secret_name: Some("my-tls".to_string()),
+            cert_manager: None,
+        };
+        assert!(tls.validate().is_ok());
+        assert_eq!(tls.secret_name_or_default("c"), "my-tls");
+    }
+
+    #[test]
+    fn tls_spec_cert_manager_shape_is_valid_and_defaults_secret_name() {
+        let tls = TlsSpec {
+            secret_name: None,
+            cert_manager: Some(CertManagerSpec {
+                issuer_ref: IssuerRef {
+                    name: "letsencrypt".to_string(),
+                    kind: "ClusterIssuer".to_string(),
+                    group: None,
+                },
+                duration: None,
+                renew_before: None,
+            }),
+        };
+        assert!(tls.validate().is_ok());
+        assert_eq!(tls.secret_name_or_default("c"), "c-tls");
+    }
+
+    #[test]
+    fn issuer_ref_kind_defaults_to_issuer() {
+        let json = serde_json::json!({ "name": "my-issuer" });
+        let issuer_ref: IssuerRef = serde_json::from_value(json).unwrap();
+        assert_eq!(issuer_ref.kind, "Issuer");
     }
 }

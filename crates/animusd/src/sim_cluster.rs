@@ -511,6 +511,7 @@ impl SimCluster {
                 remote_metadata: Arc::new(Mutex::new(None)),
                 control_storage: None,
                 dynamo_auth: None,
+                tls: None,
                 relay: relays[i].clone(),
             };
             ctxs.push(ctx);

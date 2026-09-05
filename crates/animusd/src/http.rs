@@ -10,11 +10,19 @@
 //! `console.rs`'s per-table routing) moved to `animus-node` whole (ADR 0061
 //! rung C4c), so nothing in this crate calls it directly today. Real tokio
 //! sockets — this is `ProdEnv`-only edge code, never under `SimEnv`.
+//!
+//! **Generic over the stream type (ADR 0064, S-01 commit 2)**: every
+//! function here is `S: AsyncRead + AsyncWrite + Unpin` rather than a
+//! concrete `TcpStream`, so the exact same code serves a plain connection
+//! or a [`animus_env::MaybeTlsStream`] (TLS on/off per listener, ADR 0064)
+//! with zero duplication — the body never touches a `TcpStream`-specific
+//! method (`peer_addr`/`set_nodelay`/etc), only `AsyncRead`/`AsyncWrite`.
+//! Every existing call site keeps compiling unchanged (the concrete
+//! `TcpStream` it already passes satisfies the new bound by inference).
 
 pub(crate) use animus_node::http::{CORS_HEADERS, HttpRequest, MAX_BODY, eof, query_param};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Read one HTTP/1.1 request from `stream`, buffering into `buf` (which may
 /// already hold bytes of the next pipelined request). Returns `None` at clean
@@ -22,8 +30,8 @@ use tokio::net::TcpStream;
 /// `Content-Length` validation, header lowercasing/comma-joining) happens in
 /// `animus_node::http::parse_request_head`; this function does only the
 /// socket reads.
-pub(crate) async fn read_http_request(
-    stream: &mut TcpStream,
+pub(crate) async fn read_http_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<HttpRequest>> {
     // Read until we have the full header block (terminated by CRLFCRLF).
@@ -78,8 +86,8 @@ pub(crate) async fn read_http_request(
 /// The `Connection` header echoes the client's keep-alive choice so a
 /// `Connection: close` client (which then reads to EOF) is unblocked by the
 /// socket closing.
-pub(crate) async fn write_response(
-    stream: &mut TcpStream,
+pub(crate) async fn write_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     content_type: &str,
     body: &str,
@@ -93,8 +101,8 @@ pub(crate) async fn write_response(
 /// the blank line. Pass `""` for none. Formatting happens in
 /// `animus_node::http::format_response`; this function does only the socket
 /// write.
-pub(crate) async fn write_response_with(
-    stream: &mut TcpStream,
+pub(crate) async fn write_response_with<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     content_type: &str,
     body: &str,
@@ -108,8 +116,8 @@ pub(crate) async fn write_response_with(
 }
 
 /// Write a DynamoDB-protocol JSON response (`application/x-amz-json-1.0`).
-pub(crate) async fn write_amz_json_response(
-    stream: &mut TcpStream,
+pub(crate) async fn write_amz_json_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     body: &str,
     keep_alive: bool,
@@ -126,8 +134,8 @@ pub(crate) async fn write_amz_json_response(
 
 /// Write a `text/plain` response — used by the `/metrics` route, whose body is the
 /// line-oriented metrics export rather than JSON.
-pub(crate) async fn write_text_response(
-    stream: &mut TcpStream,
+pub(crate) async fn write_text_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     body: &str,
     keep_alive: bool,

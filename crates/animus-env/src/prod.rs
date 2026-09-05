@@ -39,8 +39,10 @@ use tokio::sync::{Mutex, mpsc};
 
 #[cfg(test)]
 use crate::nid;
+use crate::tls::server_name_for;
 use crate::{
-    Clock, Disk, Env, Envelope, MetricsHandle, Nanos, Network, NodeId, Rng, Spawner, UnixMillis,
+    Clock, Disk, Env, Envelope, MaybeTlsStream, MetricsHandle, Nanos, Network, NodeId, Rng,
+    Spawner, TlsConfig, TlsMaterial, UnixMillis,
 };
 
 /// A production environment for a single node.
@@ -100,7 +102,13 @@ struct Inner {
     /// concurrent senders to one peer never interleave frames, without
     /// head-of-line blocking *across* peers.
     #[allow(clippy::type_complexity)]
-    conns: Arc<StdMutex<BTreeMap<String, Arc<Mutex<Option<TcpStream>>>>>>,
+    conns: Arc<StdMutex<BTreeMap<String, Arc<Mutex<Option<MaybeTlsStream>>>>>>,
+    /// This node's intra-wire TLS material (ADR 0064), or `None` for plain
+    /// TCP — the default, and the only mode this crate had before this ADR.
+    /// Shared (not per-connection) since every accept/dial this env performs
+    /// speaks the same mode: a cluster is either all-TLS or all-plain on the
+    /// internal wire (config-validated one layer up, `animusd`, commit 2).
+    tls: Option<TlsMaterial>,
     data_dir: PathBuf,
     /// Files whose *directory entry* is already durable — i.e. whose containing
     /// directory chain has been fsynced since the file was (re)created. A file's
@@ -143,11 +151,37 @@ impl ProdEnv {
         listen: SocketAddr,
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<(Self, SocketAddr)> {
+        Self::bind_with_tls(node_id, listen, data_dir, None).await
+    }
+
+    /// Like [`bind`](Self::bind), but with the intra-node wire's TLS mode
+    /// explicit (ADR 0064, S-01 step 1): `None` is plain TCP — byte-for-byte
+    /// the same transport [`bind`](Self::bind) has always used — `Some`
+    /// loads the given [`TlsConfig`]'s PEM files once and speaks **mutual**
+    /// TLS on every accept and dial this env performs (see the `tls` module
+    /// doc for what that means and why it's the only mode built so far).
+    ///
+    /// This is `bind`'s general form specifically so every existing caller
+    /// of `bind` — and every test — keeps compiling and behaving identically
+    /// with no change; only a caller that actually wants TLS reaches for
+    /// this constructor instead.
+    ///
+    /// # Errors
+    /// Returns an error if the listen address cannot be bound, the data
+    /// directory cannot be created, or (when `tls` is `Some`) its PEM files
+    /// cannot be read or rustls rejects the resulting material.
+    pub async fn bind_with_tls(
+        node_id: NodeId,
+        listen: SocketAddr,
+        data_dir: impl Into<PathBuf>,
+        tls: Option<TlsConfig>,
+    ) -> std::io::Result<(Self, SocketAddr)> {
+        let tls = tls.map(|cfg| cfg.load()).transpose()?;
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        let (raw_rx, accept_abort) = spawn_accept(listener);
+        let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone());
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
 
@@ -158,6 +192,7 @@ impl ProdEnv {
                 peers: Arc::new(StdMutex::new(BTreeMap::new())),
                 local_addr,
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
+                tls,
                 data_dir,
                 dir_synced: StdMutex::new(BTreeSet::new()),
                 demux,
@@ -342,7 +377,7 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
 /// connection — `spawn_pump` fans them out by `stream` into an env's
 /// [`Demux`].
 async fn read_frames(
-    mut stream: TcpStream,
+    mut stream: MaybeTlsStream,
     tx: mpsc::UnboundedSender<Envelope>,
 ) -> std::io::Result<()> {
     loop {
@@ -538,7 +573,16 @@ impl Network for ProdEnv {
             let mut conns = self.inner.conns.lock().expect("conns poisoned");
             Arc::clone(conns.entry(addr.clone()).or_default())
         };
-        if let Err(err) = send_frame_pooled(&slot, &addr, from, stream, &payload).await {
+        if let Err(err) = send_frame_pooled(
+            &slot,
+            &addr,
+            from,
+            stream,
+            &payload,
+            self.inner.tls.as_ref(),
+        )
+        .await
+        {
             tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
         }
     }
@@ -611,16 +655,41 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// ([`ACCEPT_ERROR_BACKOFF`]) on every error and keeps accepting; the only
 /// way it stops is this env's own `AbortHandle` being aborted
 /// ([`ProdEnv::shutdown`]/[`ProdEnv::shutdown_and_wait`]).
+///
+/// **TLS (ADR 0064):** when `tls` is `Some`, every accepted socket is first
+/// run through [`TlsMaterial::acceptor`] (requiring and verifying the peer's
+/// client certificate against the cluster CA) before any frame is read. A
+/// failed handshake — a plain-TCP dial into a TLS listener, or a peer
+/// presenting a cert from a different CA — is logged at `warn` with the
+/// peer's address and the connection is simply dropped: exactly like a
+/// failed accept, never a panic, and the listener keeps serving every other
+/// (genuine) peer without interruption.
 fn spawn_accept(
     listener: TcpListener,
+    tls: Option<TlsMaterial>,
 ) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
     let (tx, rx) = mpsc::unbounded_channel();
     let accept = tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _addr)) => {
+                Ok((stream, peer_addr)) => {
                     let tx = tx.clone();
+                    let tls = tls.clone();
                     tokio::spawn(async move {
+                        let stream = match tls {
+                            None => MaybeTlsStream::Plain(stream),
+                            Some(tls) => match tls.acceptor.accept(stream).await {
+                                Ok(tls_stream) => MaybeTlsStream::Tls(Box::new(tls_stream.into())),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        %peer_addr,
+                                        "TLS handshake failed (dropping connection)"
+                                    );
+                                    return;
+                                }
+                            },
+                        };
                         if let Err(err) = read_frames(stream, tx).await {
                             tracing::debug!(?err, "peer connection closed");
                         }
@@ -650,22 +719,32 @@ fn spawn_accept(
 /// frame (the receiver never saw a partial frame: the dead connection took
 /// it), then surface the error if that also fails, matching the old
 /// connect-per-message fire-and-forget semantics.
+///
+/// **TLS (ADR 0064):** when `tls` is `Some`, both the initial connect and
+/// any reconnect run the outbound handshake through [`TlsMaterial::
+/// connector`] (presenting this node's own cert, verifying the peer's
+/// against the cluster CA) before the frame is written. A handshake failure
+/// (e.g. the peer presents a cert from a different CA) surfaces as a plain
+/// `io::Error` from `connect_maybe_tls` — handled by the exact same
+/// reconnect-once-then-surface path a failed plain dial already used, no
+/// special-casing needed here.
 async fn send_frame_pooled(
-    slot: &Mutex<Option<TcpStream>>,
+    slot: &Mutex<Option<MaybeTlsStream>>,
     addr: &str,
     from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
+    tls: Option<&TlsMaterial>,
 ) -> std::io::Result<()> {
     let mut guard = slot.lock().await;
     if guard.is_none() {
-        *guard = Some(connect_nodelay(addr).await?);
+        *guard = Some(connect_maybe_tls(addr, tls).await?);
     }
     let conn = guard.as_mut().expect("connection just ensured");
     if let Err(err) = write_frame(conn, from, msg_stream, payload).await {
         tracing::debug!(?err, %addr, "cached connection failed; reconnecting once");
         *guard = None; // drop the stale stream before dialing afresh
-        let mut fresh = connect_nodelay(addr).await?;
+        let mut fresh = connect_maybe_tls(addr, tls).await?;
         write_frame(&mut fresh, from, msg_stream, payload).await?;
         *guard = Some(fresh); // cache only a stream that just carried a frame
     }
@@ -685,13 +764,34 @@ async fn connect_nodelay(addr: &str) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
+/// Dial `addr` (see [`connect_nodelay`]) and, when `tls` is configured, run
+/// the outbound TLS handshake on top — presenting this node's own
+/// certificate and verifying the peer's against the cluster CA (ADR 0064).
+/// The `ServerName` the handshake verifies against is derived from `addr`
+/// itself ([`server_name_for`]), so a peer's certificate SAN must cover
+/// whatever string the peer book holds for it (see the `tls` module doc).
+async fn connect_maybe_tls(
+    addr: &str,
+    tls: Option<&TlsMaterial>,
+) -> std::io::Result<MaybeTlsStream> {
+    let stream = connect_nodelay(addr).await?;
+    match tls {
+        None => Ok(MaybeTlsStream::Plain(stream)),
+        Some(tls) => {
+            let server_name = server_name_for(addr)?;
+            let tls_stream = tls.connector.connect(server_name, stream).await?;
+            Ok(MaybeTlsStream::Tls(Box::new(tls_stream.into())))
+        }
+    }
+}
+
 /// Write one length-prefixed `[from_len: u32][from: utf8 bytes][stream:
 /// u64][len: u32][payload]` frame (ADR 0040 PR3 length-prefixed the `from`
 /// field to carry a string id instead of a fixed `u64`; ADR 0026 added the
 /// `stream` field) over a pooled connection — the receive side
 /// (`read_frames`, which already loops until EOF) needs no further change.
 async fn write_frame(
-    conn: &mut TcpStream,
+    conn: &mut MaybeTlsStream,
     from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
@@ -1145,6 +1245,7 @@ impl Env for ProdEnv {
 mod tests {
     use super::*;
     use crate::{Disk, SegmentStore};
+    use rustls_pki_types::pem::PemObject;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A unique temp directory for one test (no extra deps): the system temp dir
@@ -1788,5 +1889,366 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- TLS (ADR 0064, S-01 step 1) -------------------------------------
+    //
+    // Every test below drives a real self-signed CA + node certs through
+    // `rcgen` (dev-only), writes them to a real temp dir, and exercises
+    // `ProdEnv::bind_with_tls` end to end over real loopback sockets — the
+    // same "real thread, real socket" shape as the plain-TCP tests above,
+    // not a mock of rustls. The plain-TCP tests above are unmodified and
+    // stay green: `ProdEnv::bind` (all of them) still takes the identical
+    // path it always did (`bind_with_tls(..., None)`), so TLS existing at
+    // all in this crate changes nothing for a caller that never asks for it.
+
+    /// Generate a self-signed test CA plus one leaf certificate per entry in
+    /// `names`, each leaf's Subject Alternative Name (and CN, for
+    /// readability) set to that exact string — so a leaf minted for
+    /// `"127.0.0.1"` satisfies [`server_name_for`]'s derivation for a
+    /// loopback dial address on any port, matching the SAN requirement
+    /// documented on the `tls` module. Returns the CA's own PEM plus one
+    /// `(cert_pem, key_pem)` pair per name, in the same order as `names`.
+    fn test_pki(names: &[&str]) -> (String, Vec<(String, String)>) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "animus-env test CA");
+        let ca_key = KeyPair::generate().expect("generate ca key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign ca");
+        let ca_pem = ca_cert.pem();
+
+        let leafs = names
+            .iter()
+            .map(|name| {
+                let mut leaf_params =
+                    CertificateParams::new(vec![(*name).to_string()]).expect("leaf params");
+                leaf_params
+                    .distinguished_name
+                    .push(DnType::CommonName, *name);
+                let leaf_key = KeyPair::generate().expect("generate leaf key");
+                let leaf_cert = leaf_params
+                    .signed_by(&leaf_key, &ca_cert, &ca_key)
+                    .expect("sign leaf with ca");
+                (leaf_cert.pem(), leaf_key.serialize_pem())
+            })
+            .collect();
+
+        (ca_pem, leafs)
+    }
+
+    /// [`test_pki`], written to real PEM files under `dir` and wrapped as one
+    /// [`TlsConfig`] per name — the file-path shape [`TlsConfig::load`]
+    /// actually reads, so these tests exercise the real load path, not the
+    /// in-memory PEM strings directly.
+    fn write_test_pki(dir: &Path, names: &[&str]) -> (PathBuf, Vec<TlsConfig>) {
+        let (ca_pem, leafs) = test_pki(names);
+        let ca_path = dir.join("ca.pem");
+        std::fs::write(&ca_path, &ca_pem).expect("write ca.pem");
+
+        let configs = leafs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (cert_pem, key_pem))| {
+                let cert_path = dir.join(format!("node{i}.cert.pem"));
+                let key_path = dir.join(format!("node{i}.key.pem"));
+                std::fs::write(&cert_path, cert_pem).expect("write cert pem");
+                std::fs::write(&key_path, key_pem).expect("write key pem");
+                TlsConfig {
+                    cert_path,
+                    key_path,
+                    ca_path: Some(ca_path.clone()),
+                }
+            })
+            .collect();
+        (ca_path, configs)
+    }
+
+    /// The TLS counterpart to [`bound_pair`]: two `ProdEnv`s, both trusting
+    /// the same CA and each presenting a cert naming `"127.0.0.1"` (matching
+    /// what [`server_name_for`] derives from a loopback dial address on any
+    /// port), with `sender` pointed at `receiver` in the peer book.
+    async fn bound_tls_pair(dir_a: &PathBuf, dir_b: &PathBuf) -> (ProdEnv, ProdEnv, SocketAddr) {
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &["127.0.0.1", "127.0.0.1"]);
+        let cfg_b = configs.pop().expect("node b tls config");
+        let cfg_a = configs.pop().expect("node a tls config");
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, _) = ProdEnv::bind_with_tls(nid(0), loop0, dir_a, Some(cfg_a))
+            .await
+            .expect("bind a with tls");
+        let (b, b_addr) = ProdEnv::bind_with_tls(nid(1), loop0, dir_b, Some(cfg_b))
+            .await
+            .expect("bind b with tls");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+        (a, b, b_addr)
+    }
+
+    /// A TLS-configured `bound_pair`: frames flow both ways over the mutual
+    /// TLS handshake, exactly like the plain-TCP `bound_pair` tests above.
+    #[tokio::test]
+    async fn tls_bound_pair_frames_flow_both_ways() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let (a, b, _b_addr) = bound_tls_pair(&dir_a, &dir_b).await;
+
+        a.send(nid(1), b"hello-over-tls".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv over tls timed out");
+        assert_eq!(env.from, nid(0));
+        assert_eq!(env.payload, b"hello-over-tls");
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// A peer presenting a certificate signed by a **different** CA is
+    /// refused: the sender's own handshake fails (its `ClientConfig` trusts
+    /// only its own CA), the receiver never sees the frame, and neither side
+    /// panics — a rejected handshake is handled exactly like a failed dial.
+    #[tokio::test]
+    async fn tls_peer_from_different_ca_is_refused() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let pki_dir_a = unique_tmp_dir();
+        let pki_dir_b = unique_tmp_dir();
+
+        // Two independent CAs — `a` and `b` each trust only their own.
+        let (_ca_a, mut leafs_a) = write_test_pki(&pki_dir_a, &["127.0.0.1"]);
+        let (_ca_b, mut leafs_b) = write_test_pki(&pki_dir_b, &["127.0.0.1"]);
+        let cfg_a = leafs_a.pop().expect("a's tls config");
+        let cfg_b = leafs_b.pop().expect("b's tls config");
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, _) = ProdEnv::bind_with_tls(nid(0), loop0, &dir_a, Some(cfg_a))
+            .await
+            .expect("bind a with tls");
+        let (b, b_addr) = ProdEnv::bind_with_tls(nid(1), loop0, &dir_b, Some(cfg_b))
+            .await
+            .expect("bind b with tls");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+
+        a.send(nid(1), b"should-never-arrive".to_vec()).await;
+
+        // `b` must never see this frame — a short bounded wait, not a
+        // fixed-deadline race: any delivery at all within the window is a
+        // failure of the CA-mismatch rejection.
+        let never_arrived = tokio::time::timeout(Duration::from_millis(500), b.recv()).await;
+        assert!(
+            never_arrived.is_err(),
+            "a frame from a different-CA peer must never be delivered"
+        );
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&pki_dir_a);
+        let _ = std::fs::remove_dir_all(&pki_dir_b);
+    }
+
+    /// A plain-TCP dial into a TLS listener fails cleanly (no valid TLS
+    /// handshake ever completes) and — the important part — the listener
+    /// keeps right on serving genuine TLS peers afterward, exactly as
+    /// `spawn_accept`'s "never stop on one failed connection" contract
+    /// already guarantees for a failed `accept()` itself.
+    #[tokio::test]
+    async fn tls_listener_rejects_plain_dial_and_keeps_serving_tls_peers() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &["127.0.0.1", "127.0.0.1"]);
+        let cfg_b = configs.pop().expect("node b tls config");
+        let cfg_a = configs.pop().expect("node a tls config");
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, _) = ProdEnv::bind_with_tls(nid(0), loop0, &dir_a, Some(cfg_a))
+            .await
+            .expect("bind a with tls");
+        let (b, b_addr) = ProdEnv::bind_with_tls(nid(1), loop0, &dir_b, Some(cfg_b))
+            .await
+            .expect("bind b with tls");
+
+        // A raw, non-TLS dial: write a few plaintext bytes (not a TLS
+        // ClientHello) and drop the connection. The listener's handshake
+        // must fail and be logged/dropped, never panic or wedge the loop.
+        {
+            let mut plain = TcpStream::connect(b_addr).await.expect("plain dial");
+            let _ = plain.write_all(b"not-a-tls-hello").await;
+            drop(plain);
+        }
+        // Give the accept loop a moment to observe and drop the bad
+        // connection before proving the listener still works.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+        a.send(nid(1), b"still-serving-tls".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("recv after bad plain dial timed out");
+        assert_eq!(env.payload, b"still-serving-tls");
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
+    /// The TLS counterpart to [`send_reconnects_after_peer_restart`]: after
+    /// the receiving env is torn down and a new one rebinds the same address
+    /// with the same TLS material, sends recover — the pooled sender drops
+    /// the stale (now-broken) TLS stream and re-handshakes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_send_reconnects_after_peer_restart() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &["127.0.0.1", "127.0.0.1"]);
+        let cfg_b = configs.pop().expect("node b tls config");
+        let cfg_a = configs.pop().expect("node a tls config");
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, _) = ProdEnv::bind_with_tls(nid(0), loop0, &dir_a, Some(cfg_a))
+            .await
+            .expect("bind a with tls");
+        let (b, b_addr) = ProdEnv::bind_with_tls(nid(1), loop0, &dir_b, Some(cfg_b.clone()))
+            .await
+            .expect("bind b with tls");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+
+        a.send(nid(1), b"before-restart".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("first recv timed out");
+        assert_eq!(env.payload, b"before-restart");
+
+        b.shutdown();
+        drop(b);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let b2 = loop {
+            match ProdEnv::bind_with_tls(nid(1), b_addr, &dir_b, Some(cfg_b.clone())).await {
+                Ok((env, _)) => break env,
+                Err(err) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "could not rebind {b_addr} within budget: {err}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            a.send(nid(1), b"after-restart".to_vec()).await;
+            match tokio::time::timeout(Duration::from_millis(200), b2.recv()).await {
+                Ok(env) => {
+                    assert_eq!(env.from, nid(0));
+                    assert_eq!(env.payload, b"after-restart");
+                    break;
+                }
+                Err(_elapsed) => assert!(
+                    Instant::now() < deadline,
+                    "sends never recovered after tls peer restart"
+                ),
+            }
+        }
+
+        a.shutdown();
+        b2.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
+
+    /// [`TlsMaterial::server_acceptor`] (ADR 0064 commit 2) accepts a TLS
+    /// client that presents **no** client certificate at all — unlike
+    /// [`TlsMaterial::acceptor`] (mutual, exercised by every test above,
+    /// which would refuse this same client). This is a raw loopback
+    /// listener/dial, not a `ProdEnv` — `animusd`'s own client/dynamo/
+    /// admin/console listeners are the real consumer of this acceptor
+    /// (commit 2), but the acceptor itself is this crate's surface, so its
+    /// server-only behavior is proven here directly.
+    #[tokio::test]
+    async fn server_only_acceptor_accepts_a_client_with_no_certificate() {
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &["127.0.0.1"]);
+        let cfg = configs.pop().expect("node tls config");
+        let material = cfg.load().expect("load tls material");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            let mut tls_stream = material
+                .server_acceptor
+                .accept(stream)
+                .await
+                .expect("server-only handshake must succeed with no client cert");
+            let mut buf = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut buf)
+                .await
+                .expect("read client hello payload");
+            assert_eq!(&buf, b"hello");
+        });
+
+        // A bare rustls `ClientConfig` trusting the CA but presenting no
+        // client certificate — exactly the shape a server-only-TLS client
+        // (a DynamoDB caller, `animus-cli --tls-ca`) uses, deliberately
+        // built independently of `TlsConfig::load()` (which always builds
+        // a *mutual* `ClientConfig`) to prove the acceptor imposes no
+        // client-cert requirement.
+        let (ca_pem, _leafs) = {
+            let ca_bytes = std::fs::read(&_ca_path).expect("read ca pem");
+            (ca_bytes, ())
+        };
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&ca_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse ca certs")
+        {
+            root_store.add(cert).expect("add ca cert");
+        }
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let server_name = crate::tls::server_name_for(&addr.to_string()).expect("server name");
+        let mut tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .expect("client-side server-only handshake must succeed");
+        tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"hello")
+            .await
+            .expect("write hello");
+        tls_stream.flush().await.expect("flush");
+
+        accept_task.await.expect("accept task panicked");
+        let _ = std::fs::remove_dir_all(&pki_dir);
     }
 }

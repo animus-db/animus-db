@@ -136,6 +136,33 @@
 //! and Streams alike — must carry a valid `Authorization: AWS4-HMAC-SHA256
 //! ...` header (`GET /metrics` stays unauthenticated, matching ADR 0057).
 //!
+//! `--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit 2)
+//! give this **one** process its own TLS material — all three or none
+//! (mutual TLS on the internal wire always needs a CA to verify peers
+//! against). Absent (the default), every listener/dialer stays plain TCP,
+//! byte-identical to before this ADR. Accepted on `--config`/`--node`
+//! (combined mode) and `data --config`/`data --seed` — applied to this
+//! process's own node entry (`--config` modes: a hard startup error if the
+//! config file's own `nodes[index].tls` section is *also* present, the same
+//! "specify it one way, not both" contract `--dynamo-auth` uses; `data
+//! --seed`: set directly, no config file to conflict with). **Not yet
+//! accepted by `--cluster N`/`--cluster-control`/`--cluster-data`/`join`/
+//! `control`** — an in-process dev cluster has no per-node config entries
+//! for the flag to attach to, and `join`/`control` mirror `--dynamo-auth`'s
+//! own non-acceptance here; a config file whose own node entries each carry
+//! a `tls` section is the way to run any of these modes under TLS today.
+//! Every port a node binds gets **mutual** TLS on `internal`/`intra`,
+//! **server-only** TLS on `client`/`dynamo`/`admin`/`console` (ADR 0064
+//! Decision 1/2) — see `crates/animusd/CLAUDE.md`'s TLS section for the
+//! full per-port table. **A cluster is either all-TLS or all-plain on the
+//! internal wire** — `ClusterConfig::from_json`/`validate_tls` rejects a
+//! config file whose own per-node `tls` sections disagree; that check does
+//! not (and cannot) see across separate processes' own `--tls-*` flags, so
+//! mixing "some processes pass the flag, others don't" against one shared,
+//! TLS-less config file is a real, only-at-runtime-visible misconfiguration
+//! (a failed handshake on first cross-node contact), not one this CLI can
+//! catch at any single process's startup.
+//!
 //! `--backup-store cluster|fs:PATH` (ADR 0059 §1) selects the on-demand
 //! backup subsystem's own `SegmentStore` handle — a second, independently
 //! configured store alongside `--segment-store`'s streams one, sharing the
@@ -165,6 +192,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use animus_env::NodeId;
+use animusd::config::TlsSection;
 use animusd::{ClusterConfig, RoleAddrs};
 
 #[tokio::main]
@@ -222,13 +250,13 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH]\n  \
-    animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH]\n  \
-    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH]";
+    animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]";
 
 /// `gen-config`: print a generated cluster config as JSON — either combined-mode
 /// (`--nodes N`) or the ADR 0035 split-deployment shape (`--control-nodes N
@@ -374,6 +402,21 @@ async fn run(args: &[String]) -> Result<(), String> {
     // since `run_in_process_split_cluster` has no per-node-advertise-host
     // wrapper to call.
     let mut advertise_host: Option<String> = None;
+    // `--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01
+    // commit 2) — this node's own TLS material, applied to `config.
+    // nodes[index]` (`apply_tls_flag`, the same per-node "flag and config
+    // both set it is a hard error" shape as `--advertise-host`). **Only
+    // `--config`/`--node` wires this through today** — `--cluster N`/
+    // `--cluster-control`/`--cluster-data` (in-process dev clusters with no
+    // per-node config entries to apply the flag to) reject it outright
+    // rather than silently starting a plaintext cluster the operator
+    // believes is TLS-enabled (a deliberate deviation from the silent-gap
+    // precedent `--quiesce-after`/`--advertise-host` set on this same
+    // dev-only path — TLS is security-relevant, so a wrong assumption here
+    // should fail loudly, not silently downgrade).
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut tls_ca: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -424,9 +467,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--advertise-host" => {
                 advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
             }
+            "--tls-cert" => tls_cert = Some(parse_next(&mut it, "--tls-cert")?),
+            "--tls-key" => tls_key = Some(parse_next(&mut it, "--tls-key")?),
+            "--tls-ca" => tls_ca = Some(parse_next(&mut it, "--tls-ca")?),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
     // S-06: the raw (un-defaulted) CLI values for every knob
     // `animusd::config::ClusterSettings` can also carry in a config file's
     // own `cluster_settings` section — `--config`/`--node`'s dispatch below
@@ -470,6 +517,12 @@ async fn run(args: &[String]) -> Result<(), String> {
                     .into(),
             );
         }
+        if tls_flag.is_some() {
+            return Err("--tls-cert/--tls-key/--tls-ca are not yet supported with \
+                 --cluster-control/--cluster-data — use --config/--node against a config file \
+                 whose own node entries carry a tls section (ADR 0064)"
+                .into());
+        }
         let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
         let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
         // `--quiesce-after` does not thread through the split-deployment dev
@@ -505,10 +558,19 @@ async fn run(args: &[String]) -> Result<(), String> {
                 dynamo_auth_flag,
                 backup_store_config,
                 advertise_host,
+                tls_flag,
             )
             .await
         }
         (None, Some(n)) => {
+            if tls_flag.is_some() {
+                return Err(
+                    "--tls-cert/--tls-key/--tls-ca are not yet supported with --cluster N — \
+                     use --config/--node against a config file whose own node entries carry a \
+                     tls section (ADR 0064)"
+                        .into(),
+                );
+            }
             run_in_process_cluster(
                 n,
                 ip,
@@ -685,6 +747,83 @@ fn apply_dynamo_auth_flag(
     }
 }
 
+/// Parse `--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01
+/// commit 2) into a [`TlsSection`] — the three flags are **all-or-none**:
+/// TLS on the internal wire is always mutual (see `animus_env::tls`'s own
+/// doc), so a `TlsConfig` with no CA to verify peers against is never
+/// meaningful, and a cert/key with no matching CA (or vice versa) is
+/// always a mistake worth failing loudly on rather than guessing.
+///
+/// # Errors
+/// A message if exactly one or two of the three flags were given.
+fn resolve_tls_flags(
+    cert: Option<String>,
+    key: Option<String>,
+    ca: Option<String>,
+) -> Result<Option<TlsSection>, String> {
+    match (cert, key, ca) {
+        (None, None, None) => Ok(None),
+        (Some(cert_path), Some(key_path), Some(ca_path)) => Ok(Some(TlsSection {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            ca_path: Some(ca_path.into()),
+        })),
+        _ => Err(
+            "--tls-cert, --tls-key, and --tls-ca must be given together (all three) or omitted \
+             entirely — the internal wire is mutual TLS and always needs a CA to verify peers \
+             against (ADR 0064)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Apply a parsed `--tls-*` flag (ADR 0064, S-01 commit 2) onto
+/// `config.nodes[index]` — this process's own entry only, mirroring
+/// [`apply_advertise_host_flag`]'s exact shape (**not**
+/// [`apply_dynamo_auth_flag`]'s cluster-wide one): unlike a SigV4 credential
+/// map, TLS material is inherently per-node (each node presents its own
+/// cert), so there is no single cluster-wide field to merge into — only
+/// `ca_path` is conventionally the same file on every node, and even that
+/// is a deployment convention this function doesn't assume or enforce
+/// (`ClusterConfig::validate_tls`, called by `from_json`, enforces the one
+/// thing that *is* cluster-wide: every node has a `tls` section or none
+/// does).
+///
+/// # Errors
+/// A message if `config.nodes[index]` already carries a `tls` section
+/// **and** the flag was also given — "specify it one way, not both",
+/// [`apply_dynamo_auth_flag`]'s own contract, applied per-node here.
+fn apply_tls_flag(
+    config: &mut ClusterConfig,
+    index: usize,
+    flag: Option<TlsSection>,
+) -> Result<(), String> {
+    let entry = config
+        .nodes
+        .get_mut(index)
+        .ok_or_else(|| format!("node index {index} out of range"))?;
+    match (&entry.tls, flag) {
+        (Some(_), Some(_)) => Err(format!(
+            "node {index}'s tls section is set both in the config file and via --tls-* — \
+             specify it one way, not both"
+        )),
+        (None, Some(flag)) => {
+            entry.tls = Some(flag);
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
+/// The URL scheme a startup banner should print for a port this node bound
+/// with (`true`) or without (`false`) TLS material (ADR 0064) — every
+/// `println!` banner below that used to hardcode `http` regardless of
+/// `spec.tls`/`--tls-*`/a config file's own `tls` section now goes through
+/// this, so the two never drift again.
+fn scheme(tls_enabled: bool) -> &'static str {
+    if tls_enabled { "https" } else { "http" }
+}
+
 /// Apply `--advertise-host NAME` (ADR 0060) onto `config.nodes[index]`
 /// (this process's own entry only — every other node's `advertise_host`
 /// stays exactly what its own config entry already says): the same
@@ -817,11 +956,22 @@ async fn run_single(
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
+    tls_flag: Option<TlsSection>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
+    // Deliberately NOT re-running `ClusterConfig::validate_tls` after this
+    // per-node merge: that check is the whole-file, all-nodes-or-none
+    // invariant (already enforced once, above, by `from_json` against the
+    // config file's own baked-in `tls` sections) — a real >1-node
+    // deployment where each process supplies its *own* node's cert/key via
+    // this flag (rather than baking every node's section into one shared
+    // file) would otherwise see every other node's entry as `None` in its
+    // own local, single-process view and fail a check that has nothing to
+    // do with what this process actually controls.
+    apply_tls_flag(&mut config, index, tls_flag)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
     let settings = resolve_cluster_settings(config.cluster_settings.as_ref(), &cli_settings)?;
@@ -851,8 +1001,9 @@ async fn run_single(
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
@@ -948,8 +1099,9 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("failed to start control node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: control node {index}/{} up — client {} — admin http://{}",
+        "animusd: control node {index}/{} up — client {} — admin {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.admin_addr(),
@@ -993,6 +1145,14 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     let mut dynamo_auth_path: Option<String> = None;
     // `--advertise-host NAME` (ADR 0060) — see `run_join`'s own doc.
     let mut advertise_host: Option<String> = None;
+    // `--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit
+    // 2) — see `run`'s own doc for the shared shape. `--config`: applied to
+    // `config.nodes[index]` via `apply_tls_flag`, same as `run_single`.
+    // `--seed`: this node's `RoleAddrs` is built ad hoc (no config file at
+    // all), so the flag is set directly with no conflict to check against.
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut tls_ca: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1011,6 +1171,9 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--advertise-host" => {
                 advertise_host = Some(parse_next::<String>(&mut it, "--advertise-host")?);
             }
+            "--tls-cert" => tls_cert = Some(parse_next(&mut it, "--tls-cert")?),
+            "--tls-key" => tls_key = Some(parse_next(&mut it, "--tls-key")?),
+            "--tls-ca" => tls_ca = Some(parse_next(&mut it, "--tls-ca")?),
             other => return Err(format!("unknown data argument `{other}`")),
         }
     }
@@ -1018,12 +1181,22 @@ async fn run_data(args: &[String]) -> Result<(), String> {
         .as_deref()
         .map(load_dynamo_auth_file)
         .transpose()?;
+    let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
 
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
         (Some(path), None) => {
             let index = node.ok_or("data requires --node I")?;
-            run_data_config(&path, index, dir, backend, dynamo_auth_flag, advertise_host).await
+            run_data_config(
+                &path,
+                index,
+                dir,
+                backend,
+                dynamo_auth_flag,
+                advertise_host,
+                tls_flag,
+            )
+            .await
         }
         (None, Some(seed_arg)) => {
             let id = id
@@ -1043,6 +1216,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 backend,
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 advertise_host,
+                tls_flag,
             )
             .await
         }
@@ -1071,11 +1245,15 @@ async fn run_data_config(
     backend: animusd::StorageBackend,
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     advertise_host: Option<String>,
+    tls_flag: Option<TlsSection>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
+    // See `run_single`'s identical note: deliberately not re-checking the
+    // whole-config all-or-none TLS invariant after this per-node merge.
+    apply_tls_flag(&mut config, index, tls_flag)?;
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-data-{index}")));
 
     let settings = config.cluster_settings.clone().unwrap_or_default();
@@ -1100,8 +1278,9 @@ async fn run_data_config(
     )
     .await
     .map_err(|e| format!("failed to start data node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: data node {index}/{} up (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
@@ -1135,12 +1314,14 @@ async fn run_data_join(
     backend: animusd::StorageBackend,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     advertise_host: Option<String>,
+    tls_flag: Option<TlsSection>,
 ) -> Result<(), String> {
     let seeds: Vec<String> = parse_seed_arg(seed_arg)?;
     if seeds.is_empty() {
         return Err("data --seed requires at least one address".into());
     }
 
+    let tls_enabled = tls_flag.is_some();
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         // Unread placeholder: `Node::bind_data` takes the real (proposed or
@@ -1155,6 +1336,10 @@ async fn run_data_join(
         intra: p(4),
         console: p(5),
         advertise_host,
+        // No config file exists on this join path at all (ADR 0064, S-01
+        // commit 2) — the flag is this node's only source, set directly
+        // with no "set both ways" conflict to check.
+        tls: tls_flag,
     };
     let dir_name = id
         .as_ref()
@@ -1174,8 +1359,9 @@ async fn run_data_join(
     )
     .await
     .map_err(|e| format!("failed to join as a data node: {e}"))?;
+    let scheme = scheme(tls_enabled);
     println!(
-        "animusd: data node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: data node joined (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.admin_addr(),
@@ -1261,6 +1447,10 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         intra: p(4),
         console: p(5),
         advertise_host,
+        // `join` accepts no `--tls-*` flag (like `--dynamo-auth`, it isn't
+        // wired here — ADR 0064, S-01 commit 2 scope; use `--config`/
+        // `--node` against a config file with a `tls` section instead).
+        tls: None,
     };
     let dir_name = id
         .as_ref()
@@ -1271,8 +1461,11 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     let node = animusd::run_node_join(seeds, id, addrs, &dir, backend, BTreeMap::new())
         .await
         .map_err(|e| format!("failed to join: {e}"))?;
+    // `join` accepts no `--tls-*` flag at all (see `addrs.tls: None` above)
+    // — always plain HTTP.
+    let scheme = scheme(false);
     println!(
-        "animusd: node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: node joined (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.admin_addr(),
@@ -1341,9 +1534,12 @@ async fn run_in_process_cluster(
     if let Some(rate) = auto_split_ops_rate {
         println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
+    // The in-process `--cluster N` dev convenience has no `--tls-*` knob of
+    // its own — always plain HTTP.
+    let scheme = scheme(false);
     for (i, node) in nodes.iter().enumerate() {
         println!(
-            "  node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
+            "  node {i}: client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.admin_addr(),
@@ -1411,16 +1607,19 @@ async fn run_in_process_split_cluster(
     if let Some(rate) = auto_split_ops_rate {
         println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
+    // The in-process `--cluster-control N --cluster-data M` dev convenience
+    // has no `--tls-*` knob of its own — always plain HTTP.
+    let scheme = scheme(false);
     for (i, node) in nodes.iter().take(control_n).enumerate() {
         println!(
-            "  control node {i}: client {} — admin http://{}",
+            "  control node {i}: client {} — admin {scheme}://{}",
             node.client_addr(),
             node.admin_addr(),
         );
     }
     for (i, node) in nodes.iter().skip(control_n).enumerate() {
         println!(
-            "  data node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
+            "  data node {i}: client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.admin_addr(),
@@ -1700,5 +1899,87 @@ mod tests {
             .expect_err("quiesce_after_secs conflicts even though auto_split_bytes doesn't");
         assert!(err.contains("quiesce_after_secs"), "{err}");
         assert!(!err.contains("auto_split_bytes"), "{err}");
+    }
+
+    // --- `--tls-cert`/`--tls-key`/`--tls-ca` (ADR 0064, S-01 commit 2) ----
+
+    #[test]
+    fn resolve_tls_flags_none_given_is_none() {
+        assert_eq!(resolve_tls_flags(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_tls_flags_all_three_given_builds_a_section() {
+        let section = resolve_tls_flags(
+            Some("cert.pem".to_string()),
+            Some("key.pem".to_string()),
+            Some("ca.pem".to_string()),
+        )
+        .expect("all three must parse")
+        .expect("must be Some");
+        assert_eq!(section.cert_path, std::path::PathBuf::from("cert.pem"));
+        assert_eq!(section.key_path, std::path::PathBuf::from("key.pem"));
+        assert_eq!(section.ca_path, Some(std::path::PathBuf::from("ca.pem")));
+    }
+
+    #[test]
+    fn resolve_tls_flags_rejects_exactly_one_given() {
+        let err = resolve_tls_flags(Some("cert.pem".to_string()), None, None)
+            .expect_err("cert alone must be rejected");
+        assert!(err.contains("--tls-cert"), "{err}");
+        assert!(err.contains("--tls-key"), "{err}");
+        assert!(err.contains("--tls-ca"), "{err}");
+    }
+
+    #[test]
+    fn resolve_tls_flags_rejects_exactly_two_given() {
+        let err = resolve_tls_flags(
+            Some("cert.pem".to_string()),
+            Some("key.pem".to_string()),
+            None,
+        )
+        .expect_err("cert+key without ca must be rejected");
+        assert!(err.contains("all three"), "{err}");
+    }
+
+    fn tls_flag_for_test(tag: &str) -> TlsSection {
+        TlsSection {
+            cert_path: format!("{tag}.cert.pem").into(),
+            key_path: format!("{tag}.key.pem").into(),
+            ca_path: Some("ca.pem".into()),
+        }
+    }
+
+    #[test]
+    fn apply_tls_flag_sets_the_named_nodes_entry_only() {
+        let mut config = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        apply_tls_flag(&mut config, 0, Some(tls_flag_for_test("n0"))).expect("applies cleanly");
+        assert!(config.nodes[0].tls.is_some());
+        assert!(config.nodes[1].tls.is_none(), "only node 0 was targeted");
+    }
+
+    #[test]
+    fn apply_tls_flag_none_is_a_no_op() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        apply_tls_flag(&mut config, 0, None).expect("None must be a no-op");
+        assert!(config.nodes[0].tls.is_none());
+    }
+
+    #[test]
+    fn apply_tls_flag_conflicts_with_a_config_supplied_section() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        config.nodes[0].tls = Some(tls_flag_for_test("from-config"));
+        let err = apply_tls_flag(&mut config, 0, Some(tls_flag_for_test("from-flag")))
+            .expect_err("config file's own tls section and the flag must conflict");
+        assert!(err.contains("node 0"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn apply_tls_flag_rejects_an_out_of_range_index() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        let err = apply_tls_flag(&mut config, 5, Some(tls_flag_for_test("n5")))
+            .expect_err("index 5 is out of range for a 1-node config");
+        assert!(err.contains("out of range"), "{err}");
     }
 }

@@ -93,6 +93,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         let config = ClusterConfig {

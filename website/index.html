@@ -246,13 +246,14 @@
       <li><span class="t">Metrics endpoint, admin API and a built-in dashboard</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</span><span class="pill yes">Works today</span></li>
       <li><span class="t">A Kubernetes operator (an <code>AnimusCluster</code> custom resource, one <code>StatefulSet</code> per cluster), with a CI-gated <code>kind</code> cluster smoke test — create, bootstrap, scale, delete</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">TLS on every port; authentication beyond the client port's opt-in SigV4</span><span class="pill opt">Planned</span></li>
+      <li><span class="t">TLS on every port — mutual on the internal Raft/intra wire, server-only on the client, admin and console ports — config-gated, default off</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Authentication beyond the client port's opt-in SigV4 (key rotation, per-table policy, dynamic credential management)</span><span class="pill opt">Planned</span></li>
       <li><span class="t">On-disk format stability, then rolling upgrades</span><span class="pill opt">Planned</span></li>
       <li><span class="t">Published benchmarks with disclosed methodology</span><span class="pill opt">Planned</span></li>
     </ul>
     <div class="warnbox">
       <span class="label">Before you point anything at it</span>
-      <p><strong>There is no TLS today, and no authentication beyond opt-in SigV4 on the client DynamoDB port.</strong> Every port assumes a trusted network. Don't put this on the public internet, and don't store data you can't recreate.</p>
+      <p><strong>TLS is available but off by default, and SigV4 is still the only caller-identity story on the DynamoDB port.</strong> A cluster with no TLS configured is plain TCP end to end, exactly as before; turning TLS on gets you mutual authentication between cluster members plus encryption everywhere, but not a richer client-auth model than SigV4's static key map. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
     </div>
     <div class="ctalink-row">
       <a class="ctalink" href="compatibility.html">Full API compatibility →</a>

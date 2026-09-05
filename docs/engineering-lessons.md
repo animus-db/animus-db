@@ -16468,6 +16468,201 @@ expensive) must add `--lib` explicitly — and both must be run (and
 reported) before a fixture sweep — or the check it's preparing for — can
 be called complete.
 
+## Before writing code against an unfamiliar crate's exact API, read its real source from the local registry cache — don't guess from memory (ADR 0064, S-01 `rustls`/`rcgen` integration)
+
+Adding `animus-env`'s TLS support meant writing real code against
+`rustls` 0.23's typestate builder API (`ServerConfig::builder_with_provider
+(..).with_safe_default_protocol_versions()?.with_client_cert_verifier(..)
+.with_single_cert(..)?`), `rustls-pemfile` 2.x's `certs`/`private_key`
+free functions, `rustls-pki-types`'s `ServerName`/`CertificateDer`/
+`PrivateKeyDer`, and `rcgen` 0.13's `CertificateParams`/`KeyPair`/
+`signed_by`/`self_signed` — none memorized precisely enough to write
+correct call sites from recollection alone, and the rustls 0.20→0.23
+builder API in particular has changed shape across major versions in ways
+a stale memory would get subtly wrong (e.g. `with_safe_defaults()` no
+longer exists; the provider is now chosen explicitly).
+
+**What worked**: before writing a line of `tls.rs`, `cargo metadata` (in a
+disposable scratch crate) fetched the exact candidate versions and their
+license fields for the cargo-deny check, then a real `cargo check -p
+animus-env --features prod` on a *minimal* module (just the types, no
+`prod.rs` wiring yet) pulled the actual crate sources into
+`~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/` — at which
+point `grep`/`sed` over that real source (not docs.rs, which this sandbox
+cannot fetch reliably; not memory) answered every "what's the exact
+method signature / builder state name / return type" question in seconds,
+including the parts that were *not* how a prior-version API would have
+shaped them (`ServerConfig::builder_with_provider` returns
+`ConfigBuilder<Self, WantsVersions>`, not `WantsVerifier` directly; the
+client-cert verifier is `Arc<dyn ClientCertVerifier>` built through
+`WebPkiClientVerifier::builder_with_provider(..).build()`, not a bare
+`RootCertStore`). Writing the full module against that ground truth, then
+compiling, produced **zero API-mismatch errors** on the first `cargo
+check` of the complete file — every fix cycle a guess-first approach would
+have spent was avoided entirely.
+
+**General form**: when a task requires calling into a crate already
+resolved somewhere in the workspace's dependency graph (directly or
+transitively — here, `rustls`/`tokio-rustls` via `kube`'s `rustls-tls`
+feature) or about to be added fresh, don't write call sites from memory of
+"roughly how this kind of API usually looks." `find /root/.cargo/registry/
+src -iname '<crate>-<version>*'` (populated by any prior `cargo check`/
+`metadata` touching that crate) or a throwaway `cargo check` to populate it
+first, then `grep`/`sed -n` the real `src/*.rs` for the exact struct/trait/
+method signature, costs one extra tool call and eliminates an entire class
+of compile-fix-recompile cycles — especially valuable for crates (rustls
+chief among them) whose typestate-builder APIs are easy to get plausibly,
+confidently wrong.
+
+## A named generic type parameter breaks existing turbofish call sites; an `impl Trait` argument doesn't (ADR 0064, S-01 commit 2)
+
+Generalizing `animusd::write_frame`/`read_frame` from a concrete
+`&mut TcpStream` to something that also accepts `&mut
+animus_env::MaybeTlsStream` looked like the obvious move: add a second
+type parameter, `S: AsyncRead + Unpin` (or `AsyncWrite`), alongside the
+existing `T: Serialize`/`T: DeserializeOwned`. That compiled the function
+itself fine, but broke every one of the ~100 pre-existing
+`read_frame::<SomeType>(&mut stream)` call sites across the test suite
+with "function takes 2 generic arguments but 1 generic argument was
+supplied" — Rust does **not** infer an unspecified *trailing* explicit
+type parameter from context, no matter which position it's declared in
+relative to the one the caller does specify. `read_frame::<T, S>`
+(caller-specified-first) and `read_frame::<S, T>` (caller-specified-last)
+both broke every existing `read_frame::<ClientResponse>(..)` turbofish
+identically — the *number* of parameters is what matters to arity
+checking, not which one the caller happened to name.
+
+The fix: make the stream parameter an anonymous `impl AsyncRead + Unpin`
+**argument** instead of a named type parameter at all. An `impl Trait`
+argument is generic under the hood but never participates in turbofish, so
+`T`'s own explicit-generic slot stays exactly where it always was and
+every existing call site kept compiling unchanged. `write_frame`'s `T`
+(inferred from the `&T` argument, never turbofished anywhere) didn't
+strictly need this, but was changed the same way for consistency and
+because the identical reasoning would bite the moment anyone *did* start
+turbofishing it.
+
+**General form**: before adding a second type parameter to a function that
+already has turbofish call sites, check whether any of those sites specify
+fewer type arguments than the function will end up declaring. If so, an
+`impl Trait` argument (when the new parameter is only ever used in
+argument position, never returned or named in a bound elsewhere) sidesteps
+the whole arity-break — it costs nothing at every existing call site and
+still gets full monomorphization. Reordering the parameter list does
+*not* help; only making it non-turbofishable does.
+
+## A TLS client's `connect()` future can resolve `Ok` before it has read the server's rejection of the client's own certificate
+
+Testing "a client cert signed by an unrelated CA is refused" by asserting
+`TlsConnector::connect(..).await.is_err()` failed — the connect future
+resolved `Ok(stream)` even though the server's `WebPkiClientVerifier` (via
+`with_client_cert_verifier`) does reject the cert. The reason is TLS 1.3's
+handshake shape: the client's own handshake state machine considers itself
+"done" once it has *sent* its last flight (`Certificate`,
+`CertificateVerify`, `Finished`) — it does not have to *read* anything
+further back to consider the handshake complete from its own side, since
+in the success case the server also has nothing more to send beyond
+optional session tickets. The server only learns the client's cert is
+untrusted *after* receiving that flight, at which point it sends a fatal
+alert and closes the connection — but the client only observes that alert
+on its *next* read (or a failed write once the socket is torn down), never
+retroactively failing the already-resolved `connect()` future.
+`animus-env`'s own `tls_peer_from_different_ca_is_refused` test (ADR 0064
+commit 1) already sidesteps this correctly by asserting on a higher-level
+effect (no frame ever delivered to the peer) rather than on the dial call
+itself; the commit 2 e2e test hit it fresh at the raw-`rustls` layer and
+was fixed the same way — assert on a write+read after the handshake, not
+on the handshake future's own `Result`.
+
+**General form**: when writing a TLS negative test around **client**-side
+certificate rejection specifically (as opposed to a client rejecting a bad
+*server* cert, which normally does fail the connect future — the client
+validates the server's cert before sending its own final flight), don't
+trust `connect()`'s own `Result`. Attempt a real read or write immediately
+after and assert *that* fails; if the handshake already failed outright,
+the same assertion still passes (there's nothing to write to).
+
+## `rustls` treats a peer's abrupt TCP close as an error, not clean EOF — even when every byte you wanted was already delivered
+
+A `Connection: close` HTTP/1.x server (this crate's hand-rolled admin/
+dynamo/console edges) closes the raw socket once its response is fully
+written, without sending a TLS `close_notify` alert first. A plain
+`TcpStream` client sees this as ordinary EOF; a `tokio_rustls`-wrapped
+client's `read_to_end` instead resolves to
+`Err(UnexpectedEof("peer closed connection without sending TLS
+close_notify"))` — `rustls` treats a missing `close_notify` as a
+truncation attack signal by design (RFC 8446 §6.1), regardless of whether
+the peer's *application data* was in fact complete. The bytes that did
+arrive are still fully present in the caller's buffer (tokio's
+`read_to_end` mutates the buffer in place as it reads, independent of the
+final `Result`); only the `Result` itself reports failure.
+
+**General form**: a TLS test client reading a `Connection: close`-style
+response until EOF should ignore `read_to_end`'s `Result` and trust the
+buffer's contents instead (`let _ = stream.read_to_end(&mut buf).await;`)
+— treating that specific error as fatal would make every otherwise-correct
+response look like a failure. This is specific to a peer that closes
+without `close_notify`; a peer that shuts its TLS session down properly
+gives a real `Ok` and needs no such workaround.
+
+## Adding TLS to a `hyper-util` legacy `Client` some crates use needs a hand-written connector, not a shared `MaybeTlsStream` (ADR 0064, S-01 commit 3)
+
+`animus-operator`'s admin client (`hyper_util::client::legacy::Client`)
+needed the same "plain TCP or TLS" choice `animus-env`'s `MaybeTlsStream`
+and `animus-cli`'s connector already solved — but neither was reusable
+here, for two independent reasons, both worth knowing before reaching for
+`hyper-rustls` as the default fix: (1) this crate deliberately depends on
+neither `animus-env` nor `animus-cli` (a standing architectural boundary,
+not an oversight), and (2) even ignoring that, `hyper-util`'s legacy
+`Client<C, B>` wants its connector shaped as a `tower_service::
+Service<Uri>` returning something implementing `hyper::rt::{Read, Write}`
+plus `hyper_util::client::legacy::connect::Connection` — a materially
+different shape than an `AsyncRead + AsyncWrite` enum wrapped for direct
+`tokio::net` use. The orphan rule bites here too: `Connection` (a
+`hyper-util` trait) can't be implemented directly for `tokio_rustls::
+client::TlsStream<TcpStream>` (a foreign type from a different crate) —
+it needs a local newtype/enum wrapper, which is itself the same amount of
+code a `MaybeTlsStream`-shaped type would have needed anyway, just with a
+different trait to satisfy at the end. `hyper-rustls` would have solved
+this in one dependency, but this codebase already special-cases `rustls`
+usage per crate for good reasons (see this ADR's own "why `ring`, why not
+a shared abstraction" decisions) — check whether the existing pattern
+even applies before assuming a wrapper crate is the answer.
+
+**General form**: "we already solved this exact problem elsewhere" is not
+the same question as "can I reuse that solution here" — check the actual
+trait/type shape the new call site needs (a `tower_service::Service<Uri>`
+connector is not interchangeable with an `AsyncRead+AsyncWrite` wrapper,
+even though both exist to answer "plain or TLS?") before writing a
+duplicate, and don't be surprised when the duplicate is warranted by a
+real architectural boundary (a crate that must not depend on another)
+rather than an oversight.
+
+## `kube`'s `DynamicObject` is the right tool for a CRD-adjacent resource from an API group `k8s-openapi` doesn't ship (ADR 0064, S-01 commit 3)
+
+Building a `cert-manager.io/v1` `Certificate` from `animus-operator` hit
+the same problem any operator managing a non-core, non-`k8s-openapi`
+resource will hit: there is no typed Rust struct for it anywhere in the
+dependency graph, and vendoring cert-manager's own Rust types (if they
+even exist as a published crate) is a heavier dependency than the one
+object this operator ever creates warrants. `kube::core::DynamicObject`
+(`ApiResource::from_gvk` for the type descriptor, `.data(serde_json::
+json!({...}))` for the actual spec) is built exactly for this: a
+`serde_json::Value` payload plus enough metadata (`TypeMeta`/
+`ObjectMeta`) to round-trip through `kube::Api::namespaced_with` and
+server-side-apply like any typed object. The trade-off is real but
+narrow — no compile-time field checking on the `Certificate`'s own spec
+shape, same as this crate's pre-existing hand-maintained `animusd::config`
+mirror already accepts for a different reason (see this crate's own
+`CLAUDE.md`) — and it's the right one for a single, simple object rather
+than pulling in or hand-rolling a whole second CRD's typed bindings.
+
+**General form**: before reaching for a full typed-struct dependency (or
+writing one by hand) for a foreign CRD your own operator only ever
+creates/patches one shape of, check whether `kube::core::DynamicObject` +
+a `serde_json::json!` literal covers it — it usually does, and it keeps
+the dependency graph from growing for a resource you don't own the schema
+of anyway.
 ## A "no stray terminator byte" invariant test must be scoped to the digit-run, not the whole encoding (W-03 step 2, `numkey.rs`)
 
 Building `animus_dynamo::numkey` (an order-preserving codec for DynamoDB
@@ -17309,3 +17504,162 @@ existing one already violates the rule the exemption is hiding, and fix
 both together if the fix is a pure refactor with no behavior change — the
 same "in scope because the two must share one shape anyway" reasoning that
 applies to any other shared-code touch.
+
+## Merging a TLS-wrapping branch onto a #596-era generic-stream refactor: `TcpStream::peek` has no substitute on a generic/TLS stream — a zero-length read doesn't work either (merging S-01 onto main)
+
+Merging `claude/s01-tls` (ADR 0064, TLS on every port) onto a `main` that
+had, in the meantime, generalized the client-protocol connection handler
+to race the request handler against peer abandonment (issue #596,
+`peer_closed`/`handle_connection`) found a real integration gap between
+two independently-reasonable designs: #596's `peer_closed` used
+`OwnedReadHalf::peek` (a raw-socket, non-consuming primitive) to detect a
+dropped peer without stealing bytes a pipelined next frame might have
+already sent; S-01 wraps that same connection in `MaybeTlsStream`, whose
+`Tls` variant is `tokio_rustls::TlsStream` — no such peek exists once the
+bytes on the wire are TLS records, and there is no way to "peek behind"
+the encryption at the raw socket without duplicating rustls's own framing
+logic. A tempting shortcut — read into a zero-length buffer instead — is a
+dead end: most `AsyncRead` implementations, `TcpStream` included, special
+case an empty destination buffer and return immediately without ever
+polling the underlying transport, so it can never actually observe EOF or
+wait for anything; it would busy-loop, not detect a close.
+
+**Fixed** with a small purpose-built wrapper (`Rewindable<R>`, `lib.rs`):
+an `AsyncRead` adapter holding one optional stashed byte. `peer_closed`
+does a real one-byte read (which genuinely waits on the transport and
+distinguishes "closed" from "nothing yet", exactly like `peek` did); if a
+byte comes back, `Rewindable` stores it and the very next real read
+(`read_frame`, the following loop iteration) drains the stash first — from
+every caller's point of view this is byte-for-byte identical to a
+non-consuming peek, whether the underlying transport is a plain
+`TcpStream` or a `MaybeTlsStream::Tls`. `handle_connection` moved from a
+generic `<S: AsyncRead + AsyncWrite + Unpin>` (S-01's own shape, which
+never needed to split the stream) to a concrete `MaybeTlsStream` parameter
+using `tokio::io::split` (the generic splitter, not `TcpStream::
+into_split`) — the two designs turned out not to compose by simple
+substitution; reconciling them needed a new primitive, not just picking a
+side. **General form**: when two branches each generalize the same
+function along a different axis (one over the stream *type*, ADR 0064; one
+over the stream *usage pattern* — split + race, issue #596), check whether
+a primitive one side depends on (`peek`) survives the other side's
+generalization before assuming the two diffs will merge cleanly — a
+socket-specific capability is exactly the kind of thing a "make it generic"
+refactor silently drops.
+
+## A relayed-request indirection added on two branches under confusingly similar names leaves a stale free function as silent dead code (merging S-01 onto ADR 0061 rung C3d)
+
+`main` grew a `ClientCtx.relay: R` field (ADR 0061 rung C3d) so every
+cross-node relay call in `forwarding.rs`/`read_path.rs`/`schema.rs` goes
+through `self.relay.relay(..)` instead of the free `relay_request`/
+`relay_request_with_timeout` functions directly. Independently, `S-01`'s
+own TLS commit had threaded a `tls: Option<&TlsMaterial>` parameter through
+those same two free functions and every one of their call sites. Reconciling
+the two (per this repo's own review guidance: the TLS dial belongs in
+`AnimusdRelayClient` — the one `RelayClient` implementor — not at each
+generic call site) meant moving `self.tls.as_ref()` off every call site and
+into `AnimusdRelayClient::relay`'s own body, which already called
+`relay_request_with_timeout` directly. That left the *other*, timeout-less
+wrapper — `relay_request(addr, request, tls) { relay_request_with_timeout(
+addr, request, CLIENT_TIMEOUT, tls) }` — with zero remaining callers
+anywhere in the crate, `pub(crate)` and therefore invisible to any
+downstream crate's own dead-code lint, and *already* dead on the
+pre-merge `S-01` branch tip itself (confirmed by grepping that commit's
+own tree) — an unrelated, same-shaped `RemoteControlClient::relay()`
+accessor S-01 had added for `remote_metadata_watch_loop` (a method on a
+*different* type, coincidentally named identically to the field this
+merge introduced) had already made it redundant, and nothing had rebuilt
+that one file with `-D warnings` since. Caught only by an actual `cargo
+check -p animusd --lib` after resolving the textual conflicts, not by
+inspection: `cargo build`/`cargo test` don't run the same dead-code
+diagnostics the moment a function keeps at least one internal caller from
+before the refactor, and a purely textual merge can leave a fully
+well-typed function with nothing left calling it. **General form**: after
+resolving a conflict that redirects a call site from one relay/dispatch
+primitive to another, grep every other call site of the primitive being
+abandoned before assuming it still earns its keep — a same-named-but-
+unrelated indirection on the other side of the merge can make a function
+look load-bearing right up until the compiler's own unused-function
+warning says otherwise.
+
+## A moving `origin/main` mid-merge is cheaper to handle by re-merging from scratch than by stacking two merge commits
+
+While resolving this same TLS-branch merge, `origin/main` advanced again
+(one more PR merged) partway through conflict resolution, before the
+in-progress merge had been committed. Since nothing had been committed
+yet, `git merge --abort` followed by a fresh `git merge origin/main`
+against the new tip was cheaper and safer than committing the
+already-resolved merge and layering a second merge commit on top: most of
+the conflicts reappeared byte-for-byte identical (the append-only docs,
+the same relay/TLS call sites) and were fixed by reapplying the same
+edits, while the handful of genuinely new conflicts the second PR
+introduced (a new `--auto-split-ops-rate` CLI usage line, a new wave-table
+row) were then resolved once, in their final form, rather than resolved
+once and then re-touched again in a follow-up merge commit. **General
+form**: if `origin/main` moves while a merge's conflicts are still being
+resolved and nothing has been committed, prefer aborting and re-merging
+against the new tip over finishing the stale merge and chaining a second
+one — a single merge commit against the true current tip is both the
+cleaner history and, in practice, less total conflict-resolution work than
+two.
+
+## A dependency added on a branch is not gate-green until `cargo deny check` has actually run against it
+
+PR #630 (S-01, "TLS on every port") landed `rustls-pemfile = "2"` as a new
+workspace dependency and merged with every other gate green — but nobody
+had run `cargo deny check` against the branch before merge (the sandbox
+this work happened in didn't have `cargo-deny` installed, and that was
+treated as a reason to skip the gate rather than a reason to install it).
+`rustls-pemfile` had in fact been unmaintained since before the PR merged
+(`RUSTSEC` advisory, upstream issue rustls/pemfile#61) — `deny.toml`'s
+`[advisories]` section has an empty `ignore = []`, so `cargo deny check`
+would have failed on `main` the moment CI's `gates` job actually ran it,
+which is exactly what happened. The fix was a migration, not an ignore
+entry: the advisory's own recommendation is to depend on
+`rustls_pki_types::pem::PemObject` (`CertificateDer::pem_slice_iter`/
+`PrivateKeyDer::from_pem_slice`, in the `rustls-pki-types` crate already in
+the graph at a recent-enough version) instead of `rustls-pemfile` — a
+straight drop-in at every call site, since `rustls-pki-types` was already
+a transitive dependency doing the DER-typing half of the same job.
+**General form, two lessons**: (1) a new external dependency introduced on
+a branch is not proven gate-green by fmt/clippy/build/test alone — `cargo
+deny check` (advisories/bans/licenses/sources) is a fifth, equally
+mandatory gate per the root `CLAUDE.md`'s Commands section, and skipping
+it because the tool happens not to be installed in the current sandbox is
+exactly the "bypass a gate because it's inconvenient right now" move
+Session operating mode item 4 calls out — the correct response is to
+install `cargo-deny` (`cargo install cargo-deny`, or find it already on
+`PATH`), not to defer the check. (2) when an advisory recommends a
+specific migration target, check first whether that target is already in
+the dependency graph (here, `rustls-pki-types` was — pulled in for the DER
+types `rustls`/`tokio-rustls` themselves consume) — the fix can be a pure
+subtraction (delete the flagged dependency, add no new one) rather than a
+net-new dependency trading one advisory for a different future one.
+
+## Turning TLS on for a probed port changes the prober's contract too, and no sandbox without a real cluster can see that (ADR 0064's first real `e2e-kind-tls` CI run)
+
+ADR 0064 commit 3 made `animus-operator`'s `StatefulSet` mount TLS material
+and wire it into `animusd` when `spec.tls` is set — server-only TLS on the
+`admin` port, among others. It did **not** touch the `StatefulSet`'s own
+`readinessProbe`/`livenessProbe`, which the same commit's own builder had
+always pointed at `http://:$ADMIN_PORT/admin/health` with no `scheme`
+field, because nothing in the unit-test suite (or in review) treats the
+kubelet as a *consumer* of the admin port the way `animus-operator`'s admin
+client or `animusd`'s own dashboard are — it's a platform component
+issuing plaintext HTTP requests from outside the process entirely. The
+result: every pod's admin listener now spoke TLS-only, the kubelet kept
+probing plain HTTP, `rustls` rejected the plaintext bytes as
+`InvalidMessage(InvalidContentType)` on the server side once per probe
+period forever, and every pod stayed `NotReady` and got restart-looped —
+found only on the **first real run** of the `e2e-kind-tls` CI job, because
+this repo's own dev sandbox cannot bring up a `kind` cluster at all
+(`CAP_SYS_RESOURCE`), so nothing short of real CI could ever have exercised
+a real kubelet probing a real TLS-enabled pod. The fix needed no CA
+plumbed into the kubelet: its `scheme: HTTPS` probe mode already skips
+certificate verification, so flipping the `HTTPGetAction.scheme` alongside
+`spec.tls` was the whole change. **General form**: when a change turns TLS
+on for a port, enumerate every *out-of-process* consumer of that port, not
+just the ones this codebase's own clients dial — a kubelet health check, a
+cloud load balancer's health check, a service mesh sidecar's own probe are
+all separate contracts with the port that a design review focused on "who
+in our code dials this" will walk right past, and a sandbox that cannot
+run the real orchestrator cannot catch the gap before CI does.

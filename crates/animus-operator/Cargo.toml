@@ -48,6 +48,18 @@ http-body-util = "0.1.5"
 serde_yaml = "0.9.34"
 bytes = "1.12.1"
 http = "1.5.0"
+# The admin client's server-only TLS connector (ADR 0064 commit 3): trusts
+# the cluster CA read out of the `Secret` `spec.tls` names/generates,
+# mirroring `animus-cli`'s own `build_tls_connector` shape (this crate does
+# not depend on `animus-env`/`animus-cli`, so it builds its own small
+# equivalent rather than reusing theirs — see `admin_client.rs`'s own doc).
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+# `tower_service::Service<Uri>` is the trait a custom hyper-util client
+# connector implements (`admin_client.rs::AdminConnector`) — already in the
+# dependency graph transitively via `hyper-util`/`kube`, named directly here
+# only because this crate implements the trait itself, not just calls it.
+tower-service = "0.3"
 
 [dev-dependencies]
 # `tokio::time::pause`/`start_paused = true`, for the `drain_and_remove_node`

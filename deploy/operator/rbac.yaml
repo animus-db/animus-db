@@ -31,6 +31,22 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # cert-manager's Certificate (ADR 0064 commit 3) — created/owned by this
+  # operator only when spec.tls.certManager is set; the Issuer/ClusterIssuer
+  # it references is never created here (deploy/operator/README.md's own
+  # TLS section names the prerequisite).
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: spec.tls's resolved Secret (a pre-existing one, or
+  # cert-manager's own output) is read for its `ca.crt`, both to mount into
+  # a pod (via the StatefulSet spec, not read directly by the controller)
+  # and, here, for the scale-down drain sequence's admin-port TLS client
+  # (crate::admin_client) — this operator never creates or writes a Secret
+  # of its own.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
   # Read-only: the controller reads pod status/conditions as part of
   # computing AnimusCluster status, but pods themselves are owned by the
   # StatefulSet controller, not this operator.

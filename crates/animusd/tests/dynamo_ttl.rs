@@ -50,6 +50,7 @@ async fn start_single_node_fast_ttl(dir: &Path) -> (Node, ClusterConfig) {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

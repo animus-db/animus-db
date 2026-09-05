@@ -302,6 +302,18 @@ impl<R: RelayClient> RemoteControlClient<R> {
         self.watch.clone()
     }
 
+    /// This handle's own [`RelayClient`] implementor (ADR 0064, S-01
+    /// commit 2) — lets a caller outside this type's own `metadata_fresh`
+    /// reach the identical relay path (and its TLS material, for whichever
+    /// concrete `R` a host crate supplies) instead of re-dialing by hand.
+    /// `animusd`'s `remote_metadata_watch_loop` is the motivating caller:
+    /// it drives its own `WatchMetadata`/`Status` round trips outside
+    /// `metadata_fresh`, but must still speak whatever transport (plain or
+    /// mutual TLS) this handle's own `AnimusdRelayClient` was built with.
+    pub fn relay(&self) -> &R {
+        &self.relay
+    }
+
     /// The last live control-voter set observed on the wire (ADR 0037 PR2) —
     /// see the `control_voters` field's doc for what this is (and is not)
     /// the same thing as. `None` until [`observe`](Self::observe) has landed

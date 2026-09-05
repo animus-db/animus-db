@@ -29,24 +29,120 @@
 )]
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
+use animus_env::MaybeTlsStream;
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
+use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args).await {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--tls-ca PATH` (ADR 0064, S-01 commit 2) may appear anywhere in the
+    // argument list — extracted up front, before any subcommand's own
+    // positional parsing runs, so it never collides with a subcommand's own
+    // argument shape. Server-only TLS (this CLI never presents a client
+    // certificate): it verifies the node it talks to, on both the
+    // client-protocol and admin ports.
+    let tls = match extract_tls_ca(&mut args)
+        .and_then(|ca| ca.as_deref().map(build_tls_connector).transpose())
+    {
+        Ok(tls) => tls,
+        Err(msg) => {
+            eprintln!("animus: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(&args, tls.as_ref()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus status <node-addr>\n  animus put <node-addr> <table> <key> <value>\n  animus get <node-addr> <table> <key>\n  animus get-eventual <node-addr> <table> <key>\n{ADMIN_USAGE}"
+                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Pull `--tls-ca PATH` out of `args` (in place), wherever it appears —
+/// returns its value, or `None` if the flag was never given.
+///
+/// # Errors
+/// A message if `--tls-ca` is given with no following value.
+fn extract_tls_ca(args: &mut Vec<String>) -> Result<Option<String>, String> {
+    let Some(pos) = args.iter().position(|a| a == "--tls-ca") else {
+        return Ok(None);
+    };
+    let value = args
+        .get(pos + 1)
+        .cloned()
+        .ok_or("--tls-ca requires a PATH argument")?;
+    args.remove(pos + 1);
+    args.remove(pos);
+    Ok(Some(value))
+}
+
+/// Build a **server-only** TLS client config trusting `ca_path` (ADR 0064,
+/// S-01 commit 2) — this CLI verifies the node it dials but never presents
+/// a client certificate of its own (it is not a cluster member; mutual TLS
+/// is only for the internal/intra ports). Independent of `animus_env::
+/// TlsConfig::load` (which always builds a *mutual* `ClientConfig`) for
+/// exactly that reason.
+///
+/// # Errors
+/// A message if the file cannot be read, contains no certificate, or
+/// `rustls` rejects the resulting root store.
+fn build_tls_connector(ca_path: &str) -> Result<tokio_rustls::TlsConnector, String> {
+    let bytes = std::fs::read(ca_path).map_err(|e| format!("reading --tls-ca {ca_path}: {e}"))?;
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(&bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parsing --tls-ca {ca_path}: {e}"))?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| format!("--tls-ca {ca_path}: {e}"))?;
+    }
+    if root_store.is_empty() {
+        return Err(format!("no certificates found in --tls-ca {ca_path}"));
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("building TLS client config: {e}"))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+}
+
+/// Dial `addr`, optionally through `tls` (ADR 0064, S-01 commit 2) — `None`
+/// is a plain `TcpStream` (byte-for-byte unchanged); `Some` runs a
+/// server-only TLS handshake first, deriving the `ServerName` to verify the
+/// peer against from exactly the address string dialed
+/// (`animus_env::tls::server_name_for`) — the node's certificate SAN must
+/// cover whatever string `addr` names it by.
+async fn maybe_tls_connect(
+    addr: &str,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<MaybeTlsStream, String> {
+    let stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    match tls {
+        None => Ok(MaybeTlsStream::Plain(stream)),
+        Some(connector) => {
+            let server_name = animus_env::tls::server_name_for(addr)
+                .map_err(|e| format!("invalid TLS server name for {addr}: {e}"))?;
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| format!("TLS handshake with {addr} failed: {e}"))?;
+            Ok(MaybeTlsStream::Tls(Box::new(tls_stream.into())))
         }
     }
 }
@@ -72,10 +168,10 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
 
-async fn run(args: &[String]) -> Result<(), String> {
+async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
     if cmd == "admin" {
-        return run_admin(&args[1..]).await;
+        return run_admin(&args[1..], tls).await;
     }
     let addr = args.get(1).ok_or("missing <node-addr>")?;
 
@@ -108,9 +204,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown command `{other}`")),
     };
 
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    let mut stream = maybe_tls_connect(addr, tls).await?;
     write_frame(&mut stream, &request)
         .await
         .map_err(|e| format!("send failed: {e}"))?;
@@ -128,7 +222,10 @@ async fn run(args: &[String]) -> Result<(), String> {
 
 /// The `admin` subcommand group: speak the HTTP/JSON admin interface (ADR 0020)
 /// on a node's admin address. `args[0]` is the subcommand, `args[1]` the address.
-async fn run_admin(args: &[String]) -> Result<(), String> {
+async fn run_admin(
+    args: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
     let sub = args
         .first()
         .map(String::as_str)
@@ -142,7 +239,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     if sub == "decommission" {
         let node = arg(2).ok_or("decommission needs <node-id>")?;
         let force_control_remove = arg(3) == Some("--force-control-remove");
-        return run_decommission(addr, node, force_control_remove).await;
+        return run_decommission(addr, node, force_control_remove, tls).await;
     }
 
     // `control-add`/`control-remove`/`control-grow` (ADR 0037 PR3) are the
@@ -159,8 +256,8 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     if sub == "control-add" {
         let rest = &args[2..];
         return match rest.len() {
-            1 => run_control_add_allocated(addr, &rest[0]).await,
-            2 => run_control_add(addr, &rest[0], &rest[1]).await,
+            1 => run_control_add_allocated(addr, &rest[0], tls).await,
+            2 => run_control_add(addr, &rest[0], &rest[1], tls).await,
             _ => Err(
                 "control-add needs <new-node-admin-addr> (self-minted id) or \
                  <node-id> <new-node-admin-addr> (operator-supplied id)"
@@ -171,7 +268,7 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
     if sub == "control-remove" {
         let node = arg(2).ok_or("control-remove needs <node-id>")?;
         let force = arg(3) == Some("--force");
-        return run_control_remove(addr, node, force).await;
+        return run_control_remove(addr, node, force, tls).await;
     }
     if sub == "control-grow" {
         let pairs = &args[2..];
@@ -180,12 +277,12 @@ async fn run_admin(args: &[String]) -> Result<(), String> {
                 "control-grow needs one or more <node-id> <new-node-admin-addr> pairs".into(),
             );
         }
-        return run_control_grow(addr, pairs).await;
+        return run_control_grow(addr, pairs, tls).await;
     }
 
     let (method, path, body) = admin_request(sub, args)?;
 
-    let (status, response) = http_call(addr, method, &path, body).await?;
+    let (status, response) = http_call(addr, method, &path, body, tls).await?;
     println!("{response}");
     if !(200..300).contains(&status) {
         return Err(format!("admin request failed (HTTP {status})"));
@@ -407,12 +504,13 @@ async fn run_decommission(
     addr: &str,
     node: &str,
     force_control_remove: bool,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(), String> {
     // Unreachable / non-200 (e.g. an old binary with no such route, or a
     // follower's admin port before the caller even knows who leads):
     // skip the pre-check and let the ordinary flow's own final `remove`
     // step surface the authoritative refusal, if any.
-    if let Ok((200, resp)) = http_call(addr, "GET", "/admin/control/members", None).await {
+    if let Ok((200, resp)) = http_call(addr, "GET", "/admin/control/members", None, tls).await {
         let is_live_voter = serde_json::from_str::<serde_json::Value>(&resp)
             .ok()
             .and_then(|v| v.get("voters").cloned())
@@ -433,10 +531,11 @@ async fn run_decommission(
             // `run_control_remove`'s doc). If the removal itself is refused
             // by the liveness guard, the operator must retry with `animus
             // admin control-remove <addr> <node> --force` explicitly.
-            run_control_remove(addr, node, false).await?;
+            run_control_remove(addr, node, false, tls).await?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
-                let (status, resp) = http_call(addr, "GET", "/admin/control/members", None).await?;
+                let (status, resp) =
+                    http_call(addr, "GET", "/admin/control/members", None, tls).await?;
                 if status != 200 {
                     return Err(format!(
                         "control/members failed while polling for {node}'s \
@@ -467,7 +566,7 @@ async fn run_decommission(
     }
 
     let drain_body = serde_json::json!({"node": node}).to_string();
-    let (status, resp) = http_call(addr, "POST", "/admin/drain", Some(drain_body)).await?;
+    let (status, resp) = http_call(addr, "POST", "/admin/drain", Some(drain_body), tls).await?;
     if !(200..300).contains(&status) {
         return Err(format!("drain failed (HTTP {status}): {resp}"));
     }
@@ -476,7 +575,7 @@ async fn run_decommission(
     let status_path = format!("/admin/member/drain-status?node={node}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let (status, resp) = http_call(addr, "GET", &status_path, None).await?;
+        let (status, resp) = http_call(addr, "GET", &status_path, None, tls).await?;
         if !(200..300).contains(&status) {
             return Err(format!("drain-status failed (HTTP {status}): {resp}"));
         }
@@ -501,7 +600,8 @@ async fn run_decommission(
     }
 
     let remove_body = serde_json::json!({"node": node}).to_string();
-    let (status, resp) = http_call(addr, "POST", "/admin/member/remove", Some(remove_body)).await?;
+    let (status, resp) =
+        http_call(addr, "POST", "/admin/member/remove", Some(remove_body), tls).await?;
     if !(200..300).contains(&status) {
         return Err(format!("remove failed (HTTP {status}): {resp}"));
     }
@@ -526,8 +626,9 @@ async fn run_control_add(
     leader_admin_addr: &str,
     node: &str,
     new_node_admin_addr: &str,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(), String> {
-    let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/config", None).await?;
+    let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/config", None, tls).await?;
     if !(200..300).contains(&status) {
         return Err(format!(
             "could not reach the new node's admin port {new_node_admin_addr} \
@@ -547,6 +648,7 @@ async fn run_control_add(
         "POST",
         "/admin/control/member/add",
         Some(body),
+        tls,
     )
     .await?;
     if !(200..300).contains(&status) {
@@ -556,9 +658,15 @@ async fn run_control_add(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let (status, resp) = http_call(new_node_admin_addr, "GET", "/admin/control/members", None)
-            .await
-            .unwrap_or((0, String::new()));
+        let (status, resp) = http_call(
+            new_node_admin_addr,
+            "GET",
+            "/admin/control/members",
+            None,
+            tls,
+        )
+        .await
+        .unwrap_or((0, String::new()));
         if status == 200
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp)
             && v["voters"]
@@ -597,6 +705,7 @@ async fn run_control_add(
 async fn run_control_add_allocated(
     leader_admin_addr: &str,
     new_node_control_addr: &str,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(), String> {
     let body = serde_json::json!({"addr": new_node_control_addr}).to_string();
     let (status, resp) = http_call(
@@ -604,6 +713,7 @@ async fn run_control_add_allocated(
         "POST",
         "/admin/control/member/add",
         Some(body),
+        tls,
     )
     .await?;
     if !(200..300).contains(&status) {
@@ -637,6 +747,7 @@ async fn run_control_remove(
     leader_admin_addr: &str,
     node: &str,
     force: bool,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(), String> {
     let body = serde_json::json!({"node": node, "force": force}).to_string();
     let (status, resp) = http_call(
@@ -644,6 +755,7 @@ async fn run_control_remove(
         "POST",
         "/admin/control/member/remove",
         Some(body),
+        tls,
     )
     .await?;
     println!("{resp}");
@@ -666,11 +778,15 @@ async fn run_control_remove(
 /// next is even proposed (a second concurrent change would be rejected as
 /// "already in flight" anyway). `pairs` is `args[2..]`, already validated
 /// non-empty and even-length by the caller.
-async fn run_control_grow(leader_admin_addr: &str, pairs: &[String]) -> Result<(), String> {
+async fn run_control_grow(
+    leader_admin_addr: &str,
+    pairs: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
     for chunk in pairs.chunks(2) {
         let node = &chunk[0];
         let new_node_admin_addr = &chunk[1];
-        run_control_add(leader_admin_addr, node, new_node_admin_addr).await?;
+        run_control_add(leader_admin_addr, node, new_node_admin_addr, tls).await?;
     }
     Ok(())
 }
@@ -683,10 +799,9 @@ async fn http_call(
     method: &str,
     path: &str,
     body: Option<String>,
+    tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(u16, String), String> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    let mut stream = maybe_tls_connect(addr, tls).await?;
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.0\r\n\
@@ -964,5 +1079,62 @@ mod tests {
         let a = args(&["--a", "1", "--b", "2"]);
         assert_eq!(flag_value(&a, "--b"), Some("2"));
         assert_eq!(flag_value(&a, "--missing"), None);
+    }
+
+    // --- `--tls-ca` (ADR 0064, S-01 commit 2) -----------------------------
+
+    #[test]
+    fn extract_tls_ca_absent_is_none_and_leaves_args_untouched() {
+        let mut a = vec!["status".to_string(), "127.0.0.1:9000".to_string()];
+        let before = a.clone();
+        assert_eq!(extract_tls_ca(&mut a).unwrap(), None);
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn extract_tls_ca_removes_the_flag_and_its_value_wherever_it_appears() {
+        let mut a = vec![
+            "status".to_string(),
+            "--tls-ca".to_string(),
+            "ca.pem".to_string(),
+            "127.0.0.1:9000".to_string(),
+        ];
+        assert_eq!(extract_tls_ca(&mut a).unwrap(), Some("ca.pem".to_string()));
+        assert_eq!(a, vec!["status".to_string(), "127.0.0.1:9000".to_string()]);
+    }
+
+    #[test]
+    fn extract_tls_ca_at_the_end_with_no_value_is_an_error() {
+        let mut a = vec!["status".to_string(), "--tls-ca".to_string()];
+        let err = extract_tls_ca(&mut a).expect_err("no value must be rejected");
+        assert!(err.contains("--tls-ca"), "{err}");
+    }
+
+    #[test]
+    fn build_tls_connector_rejects_a_missing_file() {
+        let err = build_tls_connector("/no/such/ca.pem")
+            .err()
+            .expect("a nonexistent CA file must be rejected");
+        assert!(err.contains("--tls-ca"), "{err}");
+    }
+
+    #[test]
+    fn build_tls_connector_rejects_a_file_with_no_certificates() {
+        let dir = std::env::temp_dir().join(format!(
+            "animus-cli-tls-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.pem");
+        std::fs::write(&path, b"not a certificate").unwrap();
+        let err = build_tls_connector(path.to_str().unwrap())
+            .err()
+            .expect("a file with no certificates must be rejected");
+        assert!(err.contains("no certificates"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

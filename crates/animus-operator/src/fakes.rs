@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetStatus};
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use kube::core::DynamicObject;
 use serde_json::Value;
 
 use crate::admin_client::AdminOps;
@@ -30,18 +31,21 @@ pub enum AppliedKind {
     Service,
     NetworkPolicy,
     StatefulSet,
+    Certificate,
 }
 
 /// An in-memory [`ClusterApi`]: records every apply call (kind + name, in
-/// call order) and serves `get_configmap`/`get_statefulset` from a small
-/// seedable store, so a test can both seed "what a previous reconcile
-/// already applied" and assert on "what this reconcile just applied".
+/// call order) and serves `get_configmap`/`get_statefulset`/`get_secret`
+/// from a small seedable store, so a test can both seed "what a previous
+/// reconcile already applied" and assert on "what this reconcile just
+/// applied".
 #[derive(Default)]
 pub struct FakeClusterApi {
     applies: Mutex<Vec<(AppliedKind, String)>>,
     configmaps: Mutex<BTreeMap<String, ConfigMap>>,
     statefulsets: Mutex<BTreeMap<String, StatefulSet>>,
     status_patches: Mutex<Vec<AnimusClusterStatus>>,
+    secrets: Mutex<BTreeMap<String, Secret>>,
 }
 
 impl FakeClusterApi {
@@ -104,6 +108,15 @@ impl FakeClusterApi {
     #[must_use]
     pub fn configmap(&self, name: &str) -> Option<ConfigMap> {
         self.configmaps.lock().unwrap().get(name).cloned()
+    }
+
+    /// Seed a `Secret` (e.g. `spec.tls`'s resolved cert Secret) — used to
+    /// drive the admin client's TLS-CA lookup.
+    pub fn seed_secret(&self, name: &str, secret: Secret) {
+        self.secrets
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), secret);
     }
 }
 
@@ -190,6 +203,23 @@ impl ClusterApi for FakeClusterApi {
         self.status_patches.lock().unwrap().push(status.clone());
         Ok(())
     }
+
+    async fn apply_certificate(
+        &self,
+        _ns: &str,
+        cert: &DynamicObject,
+    ) -> Result<(), ReconcileError> {
+        let name = cert.metadata.name.clone().unwrap();
+        self.applies
+            .lock()
+            .unwrap()
+            .push((AppliedKind::Certificate, name));
+        Ok(())
+    }
+
+    async fn get_secret(&self, _ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
+        Ok(self.secrets.lock().unwrap().get(name).cloned())
+    }
 }
 
 /// An in-memory [`AdminOps`]: records every call (method + url, in call
@@ -246,7 +276,12 @@ impl FakeAdminClient {
 
 #[async_trait::async_trait]
 impl AdminOps for FakeAdminClient {
-    async fn post_json(&self, url: &str, _body: &Value) -> Result<Value, String> {
+    async fn post_json(
+        &self,
+        url: &str,
+        _body: &Value,
+        _ca_pem: Option<&[u8]>,
+    ) -> Result<Value, String> {
         self.calls
             .lock()
             .unwrap()
@@ -261,7 +296,7 @@ impl AdminOps for FakeAdminClient {
         Ok(serde_json::json!({}))
     }
 
-    async fn get_json(&self, url: &str) -> Result<Value, String> {
+    async fn get_json(&self, url: &str, _ca_pem: Option<&[u8]>) -> Result<Value, String> {
         self.calls
             .lock()
             .unwrap()

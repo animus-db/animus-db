@@ -22,7 +22,9 @@
 
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
+use animus_env::MaybeTlsStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 
 // Re-exported so every existing `console::X` call site in `lib.rs` (the
 // `ConsoleBackend` impl, the `TableSnapshotFn` construction in
@@ -59,17 +61,38 @@ const JS: &str = include_str!("console.js");
 
 /// Accept loop for the console HTTP endpoint. One task per connection,
 /// mirroring `admin::serve`/`dynamo::serve`'s own shape.
+///
+/// **TLS (ADR 0064, S-01 commit 2)**: `tls` is the console port's own
+/// **server-only** acceptor — `None` (the default) is plain TCP,
+/// byte-for-byte unchanged. A failed handshake is logged at `warn` with
+/// the peer's address and the connection dropped; the loop keeps serving.
 pub(crate) async fn serve(
     listener: TcpListener,
     tables: TableSnapshotFn,
     backend: Arc<dyn ConsoleBackend>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer_addr)) => {
                 let tables = tables.clone();
                 let backend = backend.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
+                    let stream = match tls {
+                        None => MaybeTlsStream::Plain(stream),
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    %peer_addr,
+                                    "console TLS handshake failed (dropping connection)"
+                                );
+                                return;
+                            }
+                        },
+                    };
                     if let Err(err) = handle_conn(stream, tables, backend).await {
                         tracing::debug!(?err, "console connection closed");
                     }
@@ -83,8 +106,8 @@ pub(crate) async fn serve(
     }
 }
 
-async fn handle_conn(
-    mut stream: TcpStream,
+async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     tables: TableSnapshotFn,
     backend: Arc<dyn ConsoleBackend>,
 ) -> std::io::Result<()> {

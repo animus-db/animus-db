@@ -48,6 +48,21 @@
 #   ANIMUSD_IMAGE    - the animusd image tag to load into kind and run.
 #                       Default: animusd:e2e (built separately, e.g. `docker
 #                       build -t animusd:e2e .`).
+#   E2E_TLS          - "1" runs the ADR 0064 commit 3 TLS path instead of
+#                       plain TCP: installs cert-manager, creates a
+#                       self-signed ClusterIssuer, sets spec.tls.certManager
+#                       on the AnimusCluster, waits for the Certificate to
+#                       be issued, and drives the DynamoDB wire over
+#                       `curl --cacert` instead of plain HTTP. Default "0"
+#                       (unset) is the pre-existing plain-TCP path, byte-
+#                       for-byte unchanged. UNVERIFIED in this sandbox: kind
+#                       itself cannot come up here at all (see this repo's
+#                       crates/animus-operator/CLAUDE.md e2e section, the
+#                       CAP_SYS_RESOURCE note) — this path is new, careful,
+#                       `bash -n`-checked code that has not been run end to
+#                       end anywhere yet. Treat a first real CI failure here
+#                       as "the TLS e2e found its first bug," not as this
+#                       comment lying.
 #
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
 # always tears down the kind cluster and background processes it started,
@@ -57,6 +72,9 @@ set -euo pipefail
 
 ANIMUSD_IMAGE="${ANIMUSD_IMAGE:-animusd:e2e}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
+E2E_TLS="${E2E_TLS:-0}"
+CERT_MANAGER_VERSION="v1.16.2"
+CLUSTER_ISSUER_NAME="e2e-selfsigned"
 
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
@@ -75,6 +93,23 @@ KIND_KUBECONFIG="${WORKDIR}/kubeconfig"
 OPERATOR_LOG="${WORKDIR}/operator.log"
 PORT_FORWARD_LOG="${WORKDIR}/port-forward.log"
 MANIFEST_FILE="${WORKDIR}/animuscluster.yaml"
+CA_FILE="${WORKDIR}/ca.crt"
+# Every `curl` hitting the dynamo OR the admin port, plain or TLS — kept as
+# arrays so "no extra args" (plain path) and "--cacert ... --resolve ..."
+# (TLS path) compose the same call sites without a second, near-duplicate
+# function. `spec.tls` turns TLS on for every port this cluster binds, not
+# just dynamo (ADR 0064) — the admin-port readiness probes below
+# (`admin_port_forward_ready`/`admin_health_ready`) need the identical
+# treatment, or they'd TLS-handshake-fail against a server-only-TLS admin
+# port under `E2E_TLS=1`. `ADMIN_HOST` reuses the same hostname as
+# `DYNAMO_HOST` (a name already covered by the issued cert's SAN list,
+# `desired::certificate::dns_names`) — SAN coverage doesn't depend on which
+# port that name is dialed on, only `--resolve` naming a different port.
+DYNAMO_SCHEME="http"
+ADMIN_SCHEME="http"
+CURL_TLS_ARGS=()
+DYNAMO_HOST="127.0.0.1"
+ADMIN_HOST="127.0.0.1"
 
 OPERATOR_PID=""
 PORT_FORWARD_PID=""
@@ -214,15 +249,20 @@ port_forward_ready() {
     # Any real HTTP response (even a 4xx from an unrecognized bare GET)
     # proves the forwarded port is accepting and relaying connections;
     # curl exit 52 (empty reply, server accepted then closed) still proves
-    # the same. Connection-refused (7) or timeout (28) means not yet.
+    # the same. Connection-refused (7) or timeout (28) means not yet. Over
+    # TLS a handshake failure surfaces as a curl error too (35/60) — those
+    # are real failures, not "not ready yet", but this check only needs to
+    # know the port is listening at all, so it isn't split further.
     local rc=0
-    curl -sS -o /dev/null -m 2 "http://127.0.0.1:${DYNAMO_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
+    curl -sS -o /dev/null -m 2 "${CURL_TLS_ARGS[@]}" \
+        "${DYNAMO_SCHEME}://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ]
 }
 
 admin_port_forward_ready() {
     local rc=0
-    curl -sS -o /dev/null -m 2 "http://127.0.0.1:${ADMIN_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
+    curl -sS -o /dev/null -m 2 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ]
 }
 
@@ -235,15 +275,16 @@ admin_port_forward_ready() {
 # so this checks the exact precondition, not a proxy for it.
 admin_health_ready() {
     local code
-    code="$(curl -sS -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:${ADMIN_LOCAL_PORT}/admin/health" 2>/dev/null)" || code=""
+    code="$(curl -sS -o /dev/null -m 2 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/health" 2>/dev/null)" || code=""
     [ "$code" = "200" ]
 }
 
 dynamo_call() {
     # dynamo_call TARGET BODY -> prints "STATUS\nRESPONSE_BODY"
     local target="$1" body="$2"
-    curl -sS -w '\n%{http_code}' \
-        -X POST "http://127.0.0.1:${DYNAMO_LOCAL_PORT}/" \
+    curl -sS -w '\n%{http_code}' "${CURL_TLS_ARGS[@]}" \
+        -X POST "${DYNAMO_SCHEME}://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}/" \
         -H "X-Amz-Target: ${target}" \
         -H "Content-Type: application/x-amz-json-1.0" \
         -d "$body"
@@ -286,6 +327,35 @@ phase "apply CRD + namespace"
 kubectl apply -f "${REPO_ROOT}/deploy/operator/crd.yaml"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
+TLS_SPEC_YAML=""
+if [ "$E2E_TLS" = "1" ]; then
+    phase "install cert-manager"
+    kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+    for deploy in cert-manager cert-manager-webhook cert-manager-cainjector; do
+        kubectl -n cert-manager rollout status "deployment/${deploy}" --timeout=180s
+    done
+
+    phase "create self-signed ClusterIssuer"
+    # A self-signed root is the right, and only sane, choice for a
+    # throwaway e2e cluster — no ACME account, no real CA, nothing to wait
+    # on external to this kind cluster.
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ${CLUSTER_ISSUER_NAME}
+spec:
+  selfSigned: {}
+EOF
+    kubectl wait "clusterissuer/${CLUSTER_ISSUER_NAME}" --for=condition=Ready --timeout=60s
+
+    TLS_SPEC_YAML="  tls:
+    certManager:
+      issuerRef:
+        name: ${CLUSTER_ISSUER_NAME}
+        kind: ClusterIssuer"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -299,6 +369,7 @@ spec:
   controlNodes: 3
   storage:
     ephemeral: true
+${TLS_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
@@ -318,6 +389,35 @@ log "operator running as PID ${OPERATOR_PID}, logging to ${OPERATOR_LOG}"
 
 phase "wait for 3/3 ready replicas"
 wait_for "statefulset readyReplicas==3" 300 5 -- sts_ready_equals 3
+
+if [ "$E2E_TLS" = "1" ]; then
+    phase "wait for the cert-manager Certificate to be issued"
+    kubectl wait "certificate/${AC_NAME}-tls" -n "$NAMESPACE" \
+        --for=condition=Ready --timeout=120s
+
+    phase "extract the cluster CA for curl"
+    kubectl get secret "${AC_NAME}-tls" -n "$NAMESPACE" \
+        -o jsonpath='{.data.ca\.crt}' | base64 -d >"$CA_FILE"
+    [ -s "$CA_FILE" ] || fail "extracted CA file is empty: ${CA_FILE}"
+
+    # The dynamo Service's cluster-DNS name is one of the Certificate's own
+    # SANs (crate::desired::certificate::dns_names), so TLS hostname
+    # verification passes when curl is told (via --resolve) to dial that
+    # name at the locally-forwarded port instead of the port-forward's own
+    # 127.0.0.1 — the port-forward still tunnels the actual bytes to
+    # 127.0.0.1:${DYNAMO_LOCAL_PORT}, this only changes what curl verifies
+    # the presented certificate against.
+    DYNAMO_SCHEME="https"
+    ADMIN_SCHEME="https"
+    DYNAMO_HOST="${AC_NAME}-dynamo.${NAMESPACE}.svc.cluster.local"
+    ADMIN_HOST="$DYNAMO_HOST"
+    CURL_TLS_ARGS=(
+        --cacert "$CA_FILE"
+        --resolve "${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}:127.0.0.1"
+        --resolve "${ADMIN_HOST}:${ADMIN_LOCAL_PORT}:127.0.0.1"
+    )
+    log "TLS e2e path: curl will dial https://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT} (dynamo) and https://${ADMIN_HOST}:${ADMIN_LOCAL_PORT} (admin) (--cacert ${CA_FILE})"
+fi
 
 phase "resolve which pod svc/${AC_NAME}-dynamo currently routes to"
 # `kubectl port-forward svc/...` resolves to exactly one backing pod for the

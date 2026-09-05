@@ -47,13 +47,28 @@ pub enum NodeRole {
     Both,
 }
 
+/// Mirrors `animusd::config::TlsSection`'s JSON shape field-for-field (ADR
+/// 0064) — `cert_path`/`key_path`/`ca_path` are plain path strings
+/// (`PathBuf`'s own serde encoding). This crate always points every field
+/// at the identical mounted-`Secret` paths (see [`build_cluster_config`]'s
+/// own doc): one shared cert/key across every pod, not a per-pod one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TlsSection {
+    pub cert_path: String,
+    pub key_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
+}
+
 /// Mirrors `animusd::lib::RoleAddrs`'s JSON shape field-for-field
 /// (`internal`/`client`/`intra`/`dynamo`/`admin`/`console` are plain
 /// `"host:port"` strings — `SocketAddr`'s own serde encoding — and
 /// `advertise_host` is the ADR 0060 groundwork field: `Option<String>`,
 /// `#[serde(default)]` on the `animusd` side, so an operator-generated
 /// config that always sets it round-trips unchanged against an `animusd`
-/// build that predates the field too).
+/// build that predates the field too). `tls` is the ADR 0064 commit 3
+/// field, also `#[serde(default)]` on the `animusd` side — `None` (the
+/// default: no `spec.tls`) round-trips unchanged too.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoleAddrs {
     pub id: String,
@@ -66,6 +81,8 @@ pub struct RoleAddrs {
     pub console: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsSection>,
 }
 
 /// Mirrors `animusd::config::ClusterSettings`'s JSON shape field-for-field
@@ -152,6 +169,13 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
     let base_port = spec.base_port_or_default();
     let control_nodes = spec.control_nodes_or_default();
     let bind = |offset: i32| format!("0.0.0.0:{}", base_port + offset);
+    // ADR 0064 commit 3: every node gets the identical `tls` section
+    // (pointing at the one `Secret` mounted on every pod) when `spec.tls`
+    // is set — `TlsSpec::validate`'s "exactly one shape" rule is enforced
+    // by `crate::controller` before this function is ever called with an
+    // invalid `spec.tls`; this function itself only cares whether `tls` is
+    // present at all.
+    let tls = spec.tls.as_ref().map(|_| tls_section());
 
     let nodes = (0..spec.nodes)
         .map(|i| RoleAddrs {
@@ -168,6 +192,7 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
             admin: bind(PORT_ADMIN),
             console: bind(PORT_CONSOLE),
             advertise_host: Some(super::pod_fqdn(name, ns, i)),
+            tls: tls.clone(),
         })
         .collect();
 
@@ -227,6 +252,27 @@ pub const DYNAMO_AUTH_MOUNT_DIR: &str = "/etc/animus/dynamo-auth";
 /// `animusd::DynamoAuthConfig` parses (`{"credentials": {"AKID...":
 /// "secret...", ...}}`).
 pub const DYNAMO_AUTH_FILE_NAME: &str = "credentials.json";
+/// The absolute in-container path `spec.tls`'s resolved `Secret` (when set)
+/// is mounted at, read-only (ADR 0064 commit 3) — the same directory
+/// whether the `Secret` is a pre-existing `kubernetes.io/tls` one
+/// (`secretName`) or cert-manager's own output (`certManager`); either way
+/// it carries `tls.crt`/`tls.key`/`ca.crt` (a `kubernetes.io/tls` `Secret`'s
+/// standard three keys — cert-manager's own output `Secret` always
+/// populates all three, adding `ca.crt` on top of the two Kubernetes
+/// requires).
+pub const TLS_MOUNT_DIR: &str = "/etc/animus/tls";
+
+/// The [`RoleAddrs::tls`] section every node gets when `spec.tls` is set —
+/// every field points into [`TLS_MOUNT_DIR`], the one `Secret` mounted
+/// identically on every pod.
+#[must_use]
+pub fn tls_section() -> TlsSection {
+    TlsSection {
+        cert_path: format!("{TLS_MOUNT_DIR}/tls.crt"),
+        key_path: format!("{TLS_MOUNT_DIR}/tls.key"),
+        ca_path: Some(format!("{TLS_MOUNT_DIR}/ca.crt")),
+    }
+}
 
 /// Build the `entrypoint.sh` script every pod runs (`["/bin/sh",
 /// "/etc/animus/entrypoint.sh"]`): a POSIX `sh` script that derives its own
@@ -674,6 +720,39 @@ mod tests {
     fn entrypoint_omits_dynamo_auth_flag_when_secret_absent() {
         let script = entrypoint_script(&spec(3));
         assert!(!script.contains("--dynamo-auth"));
+    }
+
+    // --- `tls` (ADR 0064 commit 3) ---------------------------------------
+
+    #[test]
+    fn tls_section_absent_when_spec_tls_unset() {
+        let cfg = build_cluster_config("c", "ns", &spec(3));
+        assert!(cfg.nodes.iter().all(|n| n.tls.is_none()));
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value["nodes"][0].get("tls").is_none(),
+            "expected no tls key, got {value}"
+        );
+    }
+
+    #[test]
+    fn tls_section_present_and_identical_on_every_node_when_spec_tls_set() {
+        use crate::crd::TlsSpec;
+        let mut s = spec(3);
+        s.tls = Some(TlsSpec {
+            secret_name: Some("my-tls".to_string()),
+            cert_manager: None,
+        });
+        let cfg = build_cluster_config("c", "ns", &s);
+        for n in &cfg.nodes {
+            let tls = n.tls.as_ref().expect("tls section present");
+            assert_eq!(tls.cert_path, "/etc/animus/tls/tls.crt");
+            assert_eq!(tls.key_path, "/etc/animus/tls/tls.key");
+            assert_eq!(tls.ca_path.as_deref(), Some("/etc/animus/tls/ca.crt"));
+        }
+        // Byte-identical across nodes: one shared Secret, not a per-pod one.
+        assert_eq!(cfg.nodes[0].tls, cfg.nodes[1].tls);
+        assert_eq!(cfg.nodes[1].tls, cfg.nodes[2].tls);
     }
 
     #[test]

@@ -241,7 +241,7 @@
     </div>
     <div class="warnbox">
       <span class="label">Before you point anything at it</span>
-      <p><strong>None of these ports authenticate anyone, and none of them speak TLS, except the DynamoDB endpoint's opt-in SigV4 check.</strong> The exposure column is a description of what you must enforce yourself, at the network layer, today.</p>
+      <p><strong>TLS is available on every port but off by default, config-gated per cluster.</strong> Turned on, the internal/intra ports speak mutual TLS (every node presents a cluster-CA-signed certificate and verifies its peer's, so a non-member cannot complete a handshake at all) and the client/admin/console ports speak server-only TLS; turned off — the default — every port is exactly as plain and unauthenticated as the exposure column implies. Caller identity on the DynamoDB endpoint is still opt-in SigV4 either way, unaffected by TLS. The exposure column is a description of what you must additionally enforce at the network layer regardless of your TLS setting.</p>
     </div>
   </div>
 </section>
@@ -272,10 +272,11 @@
         <li><strong>Metrics</strong> — a line-oriented <code>name value</code> export at <code>GET /metrics</code> on the DynamoDB port: counters and leadership gauges.</li>
         <li><strong>Tracing</strong> — optional OpenTelemetry export with W3C trace-context propagation.</li>
         <li><strong>Introspection</strong> — admin JSON endpoints for health, Raft state, storage internals, in-flight transactions and the tablet map, per node, plus a dashboard that renders them with no external dependencies.</li>
+        <li><strong>TLS</strong> — mutual on the internal Raft/intra wire, server-only on the client, admin and console ports; config-gated, off by default (a cluster with no TLS configured is unchanged plain TCP). The Kubernetes operator can wire it up from a pre-existing <code>Secret</code> or a cert-manager <code>Certificate</code>.</li>
       </ul></div>
       <div class="lcard"><h3>Missing</h3><ul>
         <li><strong>Upgrades</strong> — on-disk formats change between revisions, so upgrading means recreating the cluster and reloading the data.</li>
-        <li><strong>TLS</strong> — absent on every port. <strong>Authentication</strong> — opt-in SigV4 on the client DynamoDB port only; every other port is unauthenticated.</li>
+        <li><strong>Authentication beyond SigV4</strong> — opt-in SigV4 on the client DynamoDB port is still the only caller-identity story; a static key map, no rotation, no per-table policy. TLS (above) adds transport confidentiality and, on the internal ports, cluster-membership authentication — it doesn't add a richer client-identity model.</li>
         <li><strong>Alerting rules</strong> — metrics are exported, but no reference dashboards or alert definitions ship with them.</li>
       </ul></div>
     </div>
@@ -288,7 +289,7 @@
     <span class="kicker">Known limits</span>
     <h2>The list we'd want to be shown.</h2>
     <ul style="font-size:14.5px;max-width:720px">
-      <li>No TLS on any port, and no authentication beyond opt-in SigV4 on the client DynamoDB port.</li>
+      <li>TLS is config-gated and off by default; no authentication beyond opt-in SigV4 on the client DynamoDB port either way.</li>
       <li>No format compatibility between revisions. Upgrading means recreating the cluster.</li>
       <li>Restore always creates a brand-new table, never in-place.</li>
       <li>Tablets never merge, so a table that shrinks keeps its tablet count.</li>

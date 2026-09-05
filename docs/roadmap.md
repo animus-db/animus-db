@@ -19,7 +19,9 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0064**.
+The next free ADR number at the time of writing is **0065** (0064 is
+[TLS on every port](adr/0064-tls-on-every-port.md), S-01 — landed in full
+2026-09-05, no longer carried as a section below).
 
 ---
 
@@ -83,24 +85,6 @@ the still-true paragraph after the table.
 ---
 
 ## 2. Security, storage, and deployment
-
-### S-01 TLS on every port
-
-- **Gap:** none anywhere: client, intra-node, admin, console.
-- **Plan:** `rustls` (already in the workspace via `kube`, `ring`
-  provider). Wrap `TcpListener::accept()` streams in a `TlsAcceptor` at
-  `Node::bind`/`bind_control`/`bind_data` (`lib.rs:4184,4237,4275`) and
-  `serve_requests` (~8612); wrap `ProdEnv`'s outbound dial in a
-  `TlsConnector`. The intra wire sits inside `ProdEnv`, so `Network` does
-  not change; the client/admin/console listeners live in `animusd` outside
-  the seam. Operator: cert-manager `Certificate`/`Issuer` + volume mounts +
-  `ClusterConfig` cert-path fields.
-- **Tests:** `prod::tests` loopback for intra; a TLS variant of each
-  real-listener `animusd` test (`prod`-feature-gated real-thread tests).
-- **ADR:** **yes, 0063 (or next)** — crosses ADR 0047, 0057, 0060.
-- **PRs:** (1) intra/`ProdEnv` with file certs; (2) client/admin/console
-  listeners; (3) operator cert-manager wiring; (4) ADR closing note +
-  website "Planned" pill. **Size:** L.
 
 ### S-02 SigV4 hardening (ADR 0057 follow-on)
 
@@ -177,8 +161,12 @@ the still-true paragraph after the table.
   `control/member/add` against a pod's admin port, mirroring
   `drain_and_remove_node`; extend `scripts/e2e-kind.sh` with a
   control-grow step. Size L.
-- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert,
-  so after S-01. Size L.
+- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
+  the prerequisite this used to be sequenced behind is done: TLS on every
+  port ([ADR 0064](adr/0064-tls-on-every-port.md)) shipped in full,
+  including this crate's own cert-manager `Certificate` builder and CRD
+  shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
+  directly. No longer blocked; open to pick up on its own schedule. Size L.
 - **ADR:** amend 0060 for a–c; d and e get their own section or a new
   number if the webhook design grows.
 
@@ -308,8 +296,12 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 ## 5. Documentation
 
 D-01 (the stale-prose sweep) and S-07a landed 2026-09-02; waves 1 and 2
-landed 2026-09-04. What remains
-here: `website/index.html`'s "Planned" pills stay until S-01 lands.
+landed 2026-09-04; S-01's own website update (moving its "Planned" pill to
+"Works today" and correcting the "no TLS"/"trusted network" statements
+across `index.html`, `architecture.html`, `how-it-works.html`, `docs.html`,
+`install.html`) landed 2026-09-05 alongside ADR 0064's closing amendment.
+Nothing outstanding here at present — add a row when the next
+documentation-lagging-code gap turns up.
 
 ---
 
@@ -341,9 +333,9 @@ wave are independent and can run in parallel.
 | 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3; W-08 now depends on nothing |
 | 3 | U-05, U-07, U-08(ii) | U-05 after its members panel |
-| 4 | S-01, S-02, W-08 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054) |
+| 4 | S-02, W-08 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
-| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
+| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

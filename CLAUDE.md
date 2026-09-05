@@ -400,7 +400,10 @@ truth; this map is just for navigation.
   `animusd join` (ADR 0032 growth), `--cluster-control N --cluster-data M`
   (in-process split cluster for dev), `gen-config`, and `--auto-split-bytes`.
   A config can mix combined-mode indices with control-only/data-only ones for
-  an incremental migration.
+  an incremental migration. **TLS is available on every port, config-gated
+  and off by default** (ADR 0064): mutual on `internal`/`intra`, server-only
+  on `client`/`dynamo`/`admin`/`console` — a per-node `tls` config section
+  or `--tls-cert/--tls-key/--tls-ca` flags; `animus-cli` gets `--tls-ca`.
 - **Kubernetes operator** (ADR 0060) — `animus-operator`: a `kube-rs`
   controller for the `AnimusCluster` custom resource, reconciling it into a
   `ConfigMap` (an `animusd::config::ClusterConfig` mirror + dispatch
@@ -409,15 +412,23 @@ truth; this map is just for navigation.
   cluster. Only the client-facing wire edge (DynamoDB) is exposed outside
   the cluster; this is what motivated the ADR 0047 client/intra port split
   — review any design touching listeners, ports, or address resolution
-  against this shape. An e2e smoke (`scripts/e2e-kind.sh`,
+  against this shape. `spec.tls` (ADR 0064) turns TLS on for the whole
+  cluster from either a pre-existing `Secret` or a cert-manager
+  `Certificate`/`Issuer` this operator only references, mounted read-only
+  on every pod and wired into the generated `cluster.json`; the scale-down
+  drain sequence's own admin-port calls follow suit automatically. Two CI
+  jobs run the `kind`-cluster-driven e2e smoke (`scripts/e2e-kind.sh`,
   `.github/workflows/e2e-kind.yml`, CI-gated on every push/PR touching this
-  surface) drives a real `kind` cluster through create → bootstrap → scale
-  → delete with the DynamoDB wire exercised throughout — the mechanism no
-  unit test can reach; see `crates/animus-operator/CLAUDE.md`'s e2e section
-  for what it does and does not prove, including a sandbox environment that
-  cannot run it at all (no `CAP_SYS_RESOURCE`, which `kind`'s own
-  control-plane bootstrap needs independent of anything here). The
-  operator's own container image is published as `ghcr.io/animus-db/
+  surface): the plain-TCP path drives a real `kind` cluster through create →
+  bootstrap → scale → delete with the DynamoDB wire exercised throughout —
+  the mechanism no unit test can reach — and a second, `E2E_TLS=1` job
+  additionally installs cert-manager and exercises the same flow over TLS
+  (unverified in any sandbox that cannot run `kind` at all, this repo's own
+  dev environment included); see `crates/animus-operator/CLAUDE.md`'s e2e
+  section for what both do and do not prove, including a sandbox
+  environment that cannot run either at all (no `CAP_SYS_RESOURCE`, which
+  `kind`'s own control-plane bootstrap needs independent of anything here).
+  The operator's own container image is published as `ghcr.io/animus-db/
   animus-operator` (the root `Dockerfile`'s `runtime-operator` stage,
   `.github/workflows/image.yml`'s `animus-operator` matrix entry, S-07a,
   2026-09-02) alongside `animusd`, and `deploy/operator/deployment.yaml`

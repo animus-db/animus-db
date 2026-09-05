@@ -31,7 +31,8 @@ use crate::admin_client::{AdminClient, AdminOps};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
-    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_TLS_SPEC_INVALID, ClusterCondition,
+    ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 
@@ -84,6 +85,14 @@ async fn apply_children<C: ClusterApi>(
 
     let cm = desired::configmap::build(cluster, spec);
     cluster_api.apply_configmap(ns, &cm).await?;
+
+    // ADR 0064 commit 3: a sixth child, applied only when `spec.tls.
+    // certManager` is set (`build` returns `None` for the `secretName`
+    // shape and for no TLS at all) — before the `StatefulSet` so the
+    // `Secret` it names has a chance to exist by the time a pod starts.
+    if let Some(cert) = desired::certificate::build(cluster, spec) {
+        cluster_api.apply_certificate(ns, &cert).await?;
+    }
 
     let internal_svc = desired::services::build_internal(cluster, spec);
     cluster_api.apply_service(ns, &internal_svc).await?;
@@ -145,9 +154,14 @@ async fn control_nodes_changed<C: ClusterApi>(
 
 /// The admin base URL for pod ordinal `ordinal` of cluster `name` in
 /// namespace `ns` — the headless internal `Service`'s own per-pod DNS name.
-fn admin_base_url(name: &str, ns: &str, ordinal: i32, admin_port: i32) -> String {
+/// `tls`: whether the admin port speaks TLS (ADR 0064 commit 3, server-only
+/// — `animusd` serves `admin` that way whenever `spec.tls` is set), which
+/// selects the URL scheme; the caller must pass the matching CA bytes to
+/// `AdminOps::get_json`/`post_json` in that case (see [`drain_and_remove_node`]).
+fn admin_base_url(name: &str, ns: &str, ordinal: i32, admin_port: i32, tls: bool) -> String {
+    let scheme = if tls { "https" } else { "http" };
     format!(
-        "http://{}:{admin_port}",
+        "{scheme}://{}:{admin_port}",
         desired::pod_fqdn(name, ns, ordinal)
     )
 }
@@ -155,19 +169,27 @@ fn admin_base_url(name: &str, ns: &str, ordinal: i32, admin_port: i32) -> String
 /// Drain and remove one pod ordinal before it is scaled away, via the
 /// sequence `crate::CLAUDE.md`/the delivery brief document: `POST
 /// /admin/drain {node}`, poll `GET /admin/member/drain-status?node=` to
-/// completion, then `POST /admin/member/remove {node}`.
+/// completion, then `POST /admin/member/remove {node}`. `tls_ca` (ADR 0064
+/// commit 3): `Some(pem)` dials the admin port over TLS trusting `pem` as
+/// the cluster CA; `None` plain TCP — see `reconcile`'s own call site for
+/// where this is read out of `spec.tls`'s resolved `Secret`.
 async fn drain_and_remove_node<A: AdminOps>(
     admin: &A,
     name: &str,
     ns: &str,
     ordinal: i32,
     admin_port: i32,
+    tls_ca: Option<&[u8]>,
 ) -> Result<(), String> {
     let node_id = desired::cluster_config::node_id(name, ordinal);
-    let base = admin_base_url(name, ns, ordinal, admin_port);
+    let base = admin_base_url(name, ns, ordinal, admin_port, tls_ca.is_some());
 
     admin
-        .post_json(&format!("{base}/admin/drain"), &json!({ "node": node_id }))
+        .post_json(
+            &format!("{base}/admin/drain"),
+            &json!({ "node": node_id }),
+            tls_ca,
+        )
         .await
         .map_err(|e| format!("draining {node_id}: {e}"))?;
 
@@ -175,7 +197,10 @@ async fn drain_and_remove_node<A: AdminOps>(
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     for attempt in 0..MAX_POLLS {
         let status: serde_json::Value = admin
-            .get_json(&format!("{base}/admin/member/drain-status?node={node_id}"))
+            .get_json(
+                &format!("{base}/admin/member/drain-status?node={node_id}"),
+                tls_ca,
+            )
             .await
             .map_err(|e| format!("polling drain-status for {node_id}: {e}"))?;
         let tablets_remaining = status["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
@@ -204,6 +229,7 @@ async fn drain_and_remove_node<A: AdminOps>(
         .post_json(
             &format!("{base}/admin/member/remove"),
             &json!({ "node": node_id }),
+            tls_ca,
         )
         .await
         .map_err(|e| format!("removing {node_id}: {e}"))?;
@@ -235,6 +261,28 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
 
     let mut status = cluster.status.clone().unwrap_or_default();
     status.observed_generation = cluster.metadata.generation;
+
+    // Validate `spec.tls` (ADR 0064 commit 3): no admission webhook in v1
+    // to reject the write itself, so — same posture as `controlNodes`'
+    // immutability check above — this is the one place that can catch a
+    // spec setting both or neither of `secretName`/`certManager`. Set a
+    // condition and reconcile the rest of the spec with TLS stripped
+    // (every other field — image, resources, scale — still deserves to
+    // converge) rather than getting stuck entirely on one bad field; the
+    // next reconcile (30s later, or sooner on a spec edit) retries the
+    // validation once the spec is fixed.
+    if let Some(tls) = &cluster.spec.tls
+        && let Err(e) = tls.validate()
+    {
+        warn!(cluster = %name, error = %e, "refusing invalid spec.tls");
+        set_condition(&mut status, CONDITION_TLS_SPEC_INVALID, e);
+        let mut pinned = (*cluster).clone();
+        pinned.spec.tls = None;
+        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_TLS_SPEC_INVALID);
 
     // Refuse an immutable `controlNodes` change: set a condition, keep
     // going (the rest of the spec — image, resources, scale — still
@@ -293,9 +341,38 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         if target_replicas < current_replicas {
             let admin_port =
                 cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+            // ADR 0064 commit 3: the admin port speaks server-only TLS
+            // whenever `spec.tls` is set (`animusd` serves it that way —
+            // see `crd::TlsSpec`'s own doc); read the cluster CA out of
+            // the resolved `Secret` once, up front, for every drain call
+            // below. `None` here when `spec.tls` names a `Secret`
+            // cert-manager hasn't finished issuing yet — the drain call
+            // then fails against a TLS-only admin port (a real, surfaced
+            // `DrainFailed` condition), retried on the next reconcile once
+            // the `Secret` exists, rather than silently dialing plaintext
+            // into a TLS listener.
+            let tls_ca: Option<Vec<u8>> = match &cluster.spec.tls {
+                Some(tls) => {
+                    let secret_name = tls.secret_name_or_default(&name);
+                    ctx.cluster_api
+                        .get_secret(&ns, &secret_name)
+                        .await?
+                        .and_then(|s| s.data)
+                        .and_then(|d| d.get("ca.crt").cloned())
+                        .map(|b| b.0)
+                }
+                None => None,
+            };
             for ordinal in (target_replicas..current_replicas).rev() {
-                if let Err(e) =
-                    drain_and_remove_node(&ctx.admin, &name, &ns, ordinal, admin_port).await
+                if let Err(e) = drain_and_remove_node(
+                    &ctx.admin,
+                    &name,
+                    &ns,
+                    ordinal,
+                    admin_port,
+                    tls_ca.as_deref(),
+                )
+                .await
                 {
                     error!(cluster = %name, ordinal, error = %e, "scale-down drain failed");
                     set_condition(
@@ -430,7 +507,7 @@ mod tests {
     use k8s_openapi::api::core::v1::ConfigMap;
 
     use super::*;
-    use crate::crd::AnimusClusterSpec;
+    use crate::crd::{AnimusClusterSpec, CertManagerSpec, IssuerRef, TlsSpec};
     use crate::desired::test_support::test_cluster;
     use crate::fakes::{AppliedKind, FakeAdminClient, FakeClusterApi};
 
@@ -445,7 +522,10 @@ mod tests {
     /// assert on `FakeAdminClient::calls()` without duplicating
     /// `drain_and_remove_node`'s own URL-building logic.
     fn admin_url(name: &str, ns: &str, ordinal: i32, admin_port: i32, path: &str) -> String {
-        format!("{}{path}", admin_base_url(name, ns, ordinal, admin_port))
+        format!(
+            "{}{path}",
+            admin_base_url(name, ns, ordinal, admin_port, false)
+        )
     }
 
     /// A `ConfigMap` shaped exactly like the one a previous reconcile would
@@ -576,7 +656,7 @@ mod tests {
         // No response queued: FakeAdminClient's default GET response is
         // "already fully drained", so the sequence completes in one poll.
         let admin = FakeAdminClient::new();
-        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003).await;
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003, None).await;
         assert!(result.is_ok(), "{result:?}");
 
         assert_eq!(
@@ -618,7 +698,7 @@ mod tests {
         // `drain_and_remove_node`'s completion check.
         admin.queue_drain_status(3, "Draining");
 
-        let result = drain_and_remove_node(&admin, "demo", "ns1", 4, 14003).await;
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 4, 14003, None).await;
         let err = result.expect_err("a drain that never completes must eventually give up");
         assert!(
             err.contains("did not finish draining after 120 polls"),
@@ -772,5 +852,166 @@ mod tests {
             .filter(|n| matches!(n.role, desired::cluster_config::NodeRole::Both))
             .count();
         assert_eq!(both_count, 3);
+    }
+
+    // --- (6) spec.tls (ADR 0064 commit 3) --------------------------------
+
+    fn cert_manager_tls() -> TlsSpec {
+        TlsSpec {
+            secret_name: None,
+            cert_manager: Some(CertManagerSpec {
+                issuer_ref: IssuerRef {
+                    name: "i".to_string(),
+                    kind: "ClusterIssuer".to_string(),
+                    group: None,
+                },
+                duration: None,
+                renew_before: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_a_certificate_as_a_sixth_child_when_cert_manager_configured() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(cert_manager_tls());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let applies = ctx.cluster_api.applies();
+        assert_eq!(applies.len(), 6, "{applies:?}");
+        assert_eq!(
+            applies[1],
+            (AppliedKind::Certificate, "demo-tls".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_no_certificate_for_the_secret_name_shape() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: Some("preexisting".to_string()),
+            cert_manager: None,
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let applies = ctx.cluster_api.applies();
+        assert_eq!(applies.len(), 5, "{applies:?}");
+        assert!(!applies.iter().any(|(k, _)| *k == AppliedKind::Certificate));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_tls_spec_with_both_shapes_set() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: Some("preexisting".to_string()),
+            cert_manager: Some(match cert_manager_tls().cert_manager {
+                Some(cm) => cm,
+                None => unreachable!(),
+            }),
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_TLS_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+        // Reconciled as if TLS were unset: no Certificate applied.
+        assert!(
+            !ctx.cluster_api
+                .applies()
+                .iter()
+                .any(|(k, _)| *k == AppliedKind::Certificate)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_tls_spec_with_neither_shape_set() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(TlsSpec::default());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_TLS_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_and_remove_node_over_tls_dials_https_and_forwards_the_ca() {
+        let admin = FakeAdminClient::new();
+        let ca = b"fake-ca-pem";
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003, Some(ca)).await;
+        assert!(result.is_ok(), "{result:?}");
+        let calls = admin.calls();
+        assert!(
+            calls.iter().all(|(_, url)| url.starts_with("https://")),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_scale_down_over_tls_reads_the_ca_from_the_resolved_secret() {
+        use k8s_openapi::ByteString;
+        use k8s_openapi::api::core::v1::Secret;
+
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_statefulset("demo", 5, 5);
+        fake_cluster.seed_secret(
+            "my-tls",
+            Secret {
+                data: Some(BTreeMap::from([(
+                    "ca.crt".to_string(),
+                    ByteString(b"fake-ca-pem".to_vec()),
+                )])),
+                ..Default::default()
+            },
+        );
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: Some("my-tls".to_string()),
+            cert_manager: None,
+        });
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let drain_posts: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            drain_posts,
+            vec![
+                admin_url("demo", "ns1", 4, 14003, "/admin/drain")
+                    .replacen("http://", "https://", 1),
+                admin_url("demo", "ns1", 3, 14003, "/admin/drain")
+                    .replacen("http://", "https://", 1),
+            ]
+        );
     }
 }

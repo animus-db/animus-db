@@ -79,6 +79,7 @@ fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
         intra: a[4],
         console: a[5],
         advertise_host: None,
+        tls: None,
     }
 }
 
