@@ -261,12 +261,15 @@ it, applies the CRD and an `AnimusCluster`, runs the controller **out of
 cluster** (`cargo run -p animus-operator -- run` against the kind
 kubeconfig — in-cluster deployment of the operator's own image, per
 `deploy/operator/deployment.yaml`, is exercised in production, not by this
-smoke), waits for the `StatefulSet` to reach 3/3 ready, exercises the real
-DynamoDB wire through a `kubectl port-forward` (`CreateTable`/`PutItem`/
-`GetItem`, asserting the item round-trips), scales to 4 nodes and confirms
-the item still reads back, then deletes the `AnimusCluster` and confirms
-every owned child is garbage-collected. Local invocation (mirrors the
-script's own header comment):
+smoke), waits for the `StatefulSet` to reach 3/3 ready, resolves which specific
+pod `svc/{name}-dynamo` currently routes to (via that Service's own
+`Endpoints`) and port-forwards that POD directly on both its dynamo and
+admin ports (issue #595 — see below), waits for that same pod's own `GET
+/admin/health` to report `200`, then exercises the real DynamoDB wire
+(`CreateTable`/`PutItem`/`GetItem`, asserting the item round-trips), scales
+to 4 nodes and confirms the item still reads back, then deletes the
+`AnimusCluster` and confirms every owned child is garbage-collected. Local
+invocation (mirrors the script's own header comment):
 
 ```sh
 docker build -t animusd:e2e --build-arg BASE_REGISTRY=mirror.gcr.io/library \
@@ -280,6 +283,24 @@ TLS-intercepting egress proxy that can't reach Docker Hub's blob CDN (see
 the Dockerfile's own header) — CI and an ordinary developer machine just
 run `docker build -t animusd:e2e .` with `KIND_NODE_IMAGE` unset (kind
 picks its own pinned default).
+
+**Two script-side hardenings for a flake this smoke hit twice with the
+identical signature (issue #595)**, on top of the actual root-cause fix
+(ADR 0020's 2026-09-04 amendment; `animus-control`/`animusd::admin` — a
+follower's `/admin/health` used to read the raw, pre-vote-hair-triggered
+`leader_id` belief instead of a hysteresis-gated one): (1) the script no
+longer trusts the `StatefulSet`'s aggregate `3/3 ready` count as proof that
+the ONE pod it is about to port-forward is itself, right now, ready —
+it resolves that specific pod off `svc/{name}-dynamo`'s own `Endpoints`
+and polls that pod's own `/admin/health` before issuing any DynamoDB call
+against it; (2) the first `CreateTable` (the call this issue's two failing
+runs both died on) is now a bounded converged-or-timeout retry scoped
+narrowly to the one transient 500 ("did not commit to the control plane in
+time") this issue is about — `CreateTable` is idempotent server-side, so a
+retry that lands on an already-committed table is treated as success
+(`ResourceInUseException`), and every other error class still fails the
+run immediately, on the first attempt, unchanged. See the script's own
+header comment for the two failing run links and the full reasoning.
 
 **A sandboxed dev/build host can be structurally unable to run this at
 all — not a bug in this script or the operator.** `kind`'s own control
