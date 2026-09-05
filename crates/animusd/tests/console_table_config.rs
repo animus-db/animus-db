@@ -724,30 +724,60 @@ async fn table_detail_shows_pitr_status_and_backups() {
             .expect("BackupArn")
             .to_string();
 
-        // The `backups` list is an eventual property, not a one-shot one:
-        // enabling PITR makes `pitr_snapshot_loop` propose its first base
-        // snapshot (`BeginBackup`) and only THEN tag it
-        // (`MarkBackupPitrBase`, a second commit), so for a few ms that
-        // internal row is indistinguishable from a user's own `CreateBackup`
-        // and the projection transiently shows two rows. Poll until the tag
-        // lands rather than asserting the first read (converged-or-timeout,
-        // per `docs/engineering-lessons.md`); the transient wire-level
-        // visibility itself is tracked as its own issue.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // Issue #593 regression: enabling PITR makes `pitr_snapshot_loop`
+        // propose its own internally-triggered base snapshot
+        // (`BeginBackup { pitr_base: true, .. }`) on its own 200ms tick
+        // cadence, racing this test's own `CreateBackup`. Before the fix,
+        // the loop minted that row via `BeginBackup` and only THEN tagged
+        // it via a separate `MarkBackupPitrBase` commit — a real committed
+        // window in which the internal row was an ordinary, untagged
+        // `Creating` backup, indistinguishable from the user's own
+        // `CreateBackup` and double-counted by this console projection
+        // (which mirrors `ListBackups`' default `USER`-only filter,
+        // `Metadata::pitr_base_backups`). The fix folds the tag into
+        // `BeginBackup` itself, so no committed state should ever show 2
+        // backups here. Poll repeatedly through several of the loop's own
+        // tick intervals and fail on the FIRST sighting of a second
+        // (untagged) row — not a converged-or-timeout tolerance of a
+        // transient miscount, which would only prove the race eventually
+        // resolves, not that it never happens.
+        let poll_window = tokio::time::Instant::now() + Duration::from_secs(5);
         let (d, body) = loop {
             let (status, body) =
                 console(console_addr, "GET", "/console/api/tables/orders", "").await;
             assert_eq!(status, 200, "table detail failed: {body}");
             let d = json(&body);
-            if d["backups"].as_array().map(Vec::len) == Some(1) {
+            let count = d["backups"].as_array().map_or(0, Vec::len);
+            assert!(
+                count <= 1,
+                "a PITR base snapshot was observably untagged: saw {count} \
+                 backups (expected at most the user's own one): {body}"
+            );
+            if count == 1 {
                 break (d, body);
             }
             assert!(
-                tokio::time::Instant::now() < deadline,
-                "backups did not converge to exactly the user's one: {body}"
+                tokio::time::Instant::now() < poll_window,
+                "backups never reached the user's own one: {body}"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        // Keep polling for the rest of the window: the user's own backup is
+        // now visible, but `pitr_snapshot_loop` may still fire its own
+        // internally-triggered snapshot within this test's lifetime — it
+        // must never appear as a second row either.
+        while tokio::time::Instant::now() < poll_window {
+            let (status, body) =
+                console(console_addr, "GET", "/console/api/tables/orders", "").await;
+            assert_eq!(status, 200, "table detail failed: {body}");
+            let count = json(&body)["backups"].as_array().map_or(0, Vec::len);
+            assert!(
+                count <= 1,
+                "a PITR base snapshot was observably untagged: saw {count} \
+                 backups (expected at most the user's own one): {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let pitr = &d["pitr"];
         assert!(!pitr.is_null(), "PITR enabled: {body}");

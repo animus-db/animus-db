@@ -663,6 +663,7 @@ async fn admin_backups_view_reflects_the_catalog() {
             table: "widgets".to_string(),
             created_wall_ms: 1_000,
             backup_name: "backup".to_string(),
+            pitr_base: false,
         };
         timeout(Duration::from_secs(10), async {
             loop {

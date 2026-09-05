@@ -897,18 +897,6 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // proposal, from wherever that leader actually runs — the
         // identical relay reasoning as `SealStreamShard` above.
         | MetaCommand::SealPitrSegment { .. }
-        // Tagging a `BeginBackup` row as a PITR base snapshot: proposed
-        // by `pitr_janitor::pitr_snapshot_loop` (`animusd`), a
-        // control-plane-leader-only background loop with its own live
-        // `RaftNode` handle on every node shape it runs on — this crate
-        // never relays it through the wire edge today, but it is
-        // included here defensively, mirroring `SealPitrSegment`'s own
-        // class, rather than surfacing as an opaque relay refusal if
-        // that ever changes. `ExpirePitrSegments` is deliberately NOT
-        // included, for the identical reason `ExpireStreamShards` isn't:
-        // its only intended caller (`pitr_janitor::pitr_janitor_loop`)
-        // already proposes directly off its own live `RaftNode` handle.
-        | MetaCommand::MarkBackupPitrBase { .. }
         // Directed-Placing completion record (ADR 0062 §3): a tablet
         // leader's own "my locally-driven Raft membership has converged
         // to this child's placement target" report, from wherever that
@@ -1334,6 +1322,7 @@ mod tests {
                 table: table.clone(),
                 created_wall_ms: 0,
                 backup_name: "b1-name".to_string(),
+                pitr_base: false,
             },
             MetaCommand::RecordBackupTabletComplete {
                 backup_id: "b1".to_string(),
@@ -1376,9 +1365,6 @@ mod tests {
                 seal_wall_ms: 0,
                 replicas: vec![],
                 object_id: "obj".to_string(),
-            },
-            MetaCommand::MarkBackupPitrBase {
-                backup_id: "b1".to_string(),
             },
             MetaCommand::MarkSplitPlacingDone {
                 tablet: TabletId(2),

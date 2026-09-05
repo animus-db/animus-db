@@ -408,20 +408,26 @@ pub struct Metadata {
     /// §9) rather than ordinary on-demand backups — an internally-triggered
     /// `BeginBackup` the PITR machinery proposed on its own schedule (§9's
     /// "reusing the Train 1 capture path unchanged"), tagged via
-    /// [`MetaCommand::MarkBackupPitrBase`] once its row is known to exist.
+    /// [`MetaCommand::BeginBackup`]'s own `pitr_base` flag **in the same
+    /// apply that mints the row** (issue #593; see that field's own doc).
     /// **Deliberately a side-set, not a [`BackupRow`] field** — this avoids
-    /// widening `MetaCommand::BeginBackup`'s own signature (and, with it,
-    /// every one of its many existing construction sites across this crate,
-    /// `animus-test`, and `animusd`) for a fact only the PITR janitor and
-    /// `DescribeContinuousBackups` ever need to know; see
-    /// `MetaCommand::MarkBackupPitrBase`'s own doc for the brief window
-    /// this trades away (a PITR base snapshot is indistinguishable from an
-    /// ordinary on-demand one for the instant between its `BeginBackup` and
-    /// its own `MarkBackupPitrBase` committing — harmless, since nothing
-    /// else queries this set). Pruned by [`MetaCommand::DeleteBackup`]'s
-    /// existing apply arm (the same finalizing command an on-demand
-    /// backup's own reclaim already uses). `#[serde(default)]` keeps
-    /// pre-PITR snapshots loading (empty set).
+    /// widening `BackupRow` itself (and, with it, every reader of a
+    /// serialized row) for a fact only the PITR janitor and
+    /// `DescribeContinuousBackups` ever need to know. Pruned by
+    /// [`MetaCommand::DeleteBackup`]'s existing apply arm (the same
+    /// finalizing command an on-demand backup's own reclaim already uses).
+    /// `#[serde(default)]` keeps pre-PITR snapshots loading (empty set).
+    ///
+    /// **Never observably untagged**: because the tag rides the same
+    /// `BeginBackup` command as the mint, there is no committed state in
+    /// which this row exists but isn't yet in this set — unlike the
+    /// now-deleted two-command mint-then-tag sequence (`BeginBackup` followed
+    /// by a separate `MarkBackupPitrBase`), which left exactly that window
+    /// open between the two commits (a `ListBackups` default `USER` filter,
+    /// or the console's per-table backups projection, could observe the row
+    /// as an ordinary user backup for the instant in between). See
+    /// `docs/adr/0059-backup-restore.md` §9's 2026-09-04 as-built amendment
+    /// for the full incident.
     #[serde(default)]
     pub pitr_base_backups: BTreeSet<BackupId>,
 }
@@ -1587,16 +1593,6 @@ pub enum MetaCommand {
         rows: Vec<(TabletId, u64)>,
         remove: bool,
     },
-    /// Tag an already-`BeginBackup`'d row as a **PITR base snapshot** (ADR
-    /// 0059 §9) rather than an ordinary on-demand backup — proposed by the
-    /// PITR periodic-snapshot loop immediately after it observes its own
-    /// `BeginBackup` row exist. Idempotent insert into
-    /// [`Metadata::pitr_base_backups`]; rejected if `backup_id` names no
-    /// existing row (the proposer always sequences `BeginBackup` first and
-    /// only proposes this once that row is confirmed present, so a
-    /// rejection here should never happen in production — a defensive
-    /// seatbelt, not an expected path).
-    MarkBackupPitrBase { backup_id: BackupId },
     /// Register (or update) a **CP group member's address** (Phase 2): the
     /// `raftkv`-role listen address of member `id`, stored opaquely in
     /// [`Metadata::cp_member_addrs`] and replicated so every node's peer-sync loop
@@ -1773,6 +1769,22 @@ pub enum MetaCommand {
         /// own identity (that's `backup_id` alone, per this catalog's own
         /// "scar," [`Metadata::backups`]'s doc).
         backup_name: String,
+        /// Whether this backup is a **PITR base snapshot** (ADR 0059 §9)
+        /// rather than an ordinary on-demand one — set by the PITR periodic
+        /// snapshot loop, `false` for every other proposer (an explicit
+        /// `CreateBackup`, the admin seeder, every existing test fixture).
+        /// `true` inserts `backup_id` into [`Metadata::pitr_base_backups`]
+        /// **in this same apply**, atomically with minting the row itself
+        /// (issue #593) — replacing a now-deleted two-command sequence
+        /// (`BeginBackup` followed by a separate `MetaCommand::
+        /// MarkBackupPitrBase`) that left a PITR base snapshot observable,
+        /// for the instant between the two commits, as an ordinary untagged
+        /// user backup (a `ListBackups` default `USER` filter, or the
+        /// console's per-table backups projection, could catch it in that
+        /// window). See [`Metadata::pitr_base_backups`]'s own doc and
+        /// `docs/adr/0059-backup-restore.md` §9's 2026-09-04 as-built
+        /// amendment for the full incident this closes.
+        pitr_base: bool,
     },
     /// One pinned tablet's capture-completion report (ADR 0059 §3/§4) —
     /// mirroring [`MarkIndexBackfilled`](Self::MarkIndexBackfilled)'s
@@ -2808,6 +2820,7 @@ impl Metadata {
                 table,
                 created_wall_ms,
                 backup_name,
+                pitr_base,
             } => {
                 if self.backups.contains_key(backup_id) {
                     return ApplyOutcome::Rejected("backup id already exists");
@@ -2869,6 +2882,14 @@ impl Metadata {
                         total_bytes: 0,
                     },
                 );
+                // Atomic with the mint (issue #593): a PITR base snapshot is
+                // never observable as an untagged, ordinary user backup —
+                // see `BeginBackup::pitr_base`'s own doc and
+                // `Metadata::pitr_base_backups`'s doc for the incident this
+                // closes.
+                if *pitr_base {
+                    self.pitr_base_backups.insert(backup_id.clone());
+                }
                 ApplyOutcome::Applied
             }
             MetaCommand::RecordBackupTabletComplete {
@@ -3392,16 +3413,6 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
-            }
-            MetaCommand::MarkBackupPitrBase { backup_id } => {
-                if !self.backups.contains_key(backup_id) {
-                    return ApplyOutcome::Rejected("no such backup");
-                }
-                if self.pitr_base_backups.contains(backup_id) {
-                    return ApplyOutcome::NoOp;
-                }
-                self.pitr_base_backups.insert(backup_id.clone());
-                ApplyOutcome::Applied
             }
             MetaCommand::RegisterCpAddr { id, addr, tablet } => {
                 // A tablet-scoped registration for a tablet not (yet or anymore)
@@ -4771,6 +4782,7 @@ mod tests {
                 table: "ghost".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Rejected("no such table schema")
         );
@@ -4782,6 +4794,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -4806,6 +4819,7 @@ mod tests {
                 table: "orders".to_owned(),
                 created_wall_ms: 2000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Rejected("backup id already exists")
         );
@@ -4827,6 +4841,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -4925,6 +4940,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5013,6 +5029,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5070,6 +5087,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5130,6 +5148,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5169,6 +5188,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5223,6 +5243,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5290,6 +5311,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5532,6 +5554,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5610,6 +5633,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5746,6 +5770,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5805,6 +5830,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1_000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -5838,6 +5864,7 @@ mod tests {
                 table: "users".to_owned(),
                 created_wall_ms: 1000,
                 backup_name: "backup".to_string(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
@@ -9291,10 +9318,67 @@ mod tests {
         assert_eq!(m.pitr_generation.get("orders"), Some(&1));
     }
 
-    /// `MarkBackupPitrBase` tags an existing backup row, is idempotent on a
-    /// repeat, and is rejected against an unknown backup id.
+    /// `BeginBackup { pitr_base: true }` tags the row in the SAME apply that
+    /// mints it (issue #593) — never a separate command, so there is no
+    /// committed state in which the row exists but the tag doesn't. Covers
+    /// every reachable `BackupStatus` (`Creating` at mint, then `Available`
+    /// via `CompleteBackup`) to prove the tag survives every transition, not
+    /// just the instant of creation.
     #[test]
-    fn mark_backup_pitr_base_tags_an_existing_backup() {
+    fn begin_backup_pitr_base_tags_atomically_with_the_mint() {
+        let mut m = Metadata::default();
+        table_with_schema(&mut m, "orders");
+        assert_eq!(
+            m.apply(&MetaCommand::UpdateContinuousBackups {
+                table: "orders".to_owned(),
+                enabled: true,
+                wall_ms: 500,
+            }),
+            ApplyOutcome::Applied
+        );
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_owned()),
+            range: KeyRange::whole(),
+            replicas: Vec::new(),
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::BeginBackup {
+                backup_id: "b1".to_owned(),
+                table: "orders".to_owned(),
+                created_wall_ms: 1_000,
+                backup_name: "__pitr_base__orders".to_owned(),
+                pitr_base: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        // Tagged immediately — no separate command ever ran, and the row is
+        // `Creating` at this point: the exact state the pre-fix two-command
+        // sequence used to leave briefly untagged.
+        assert_eq!(m.backups["b1"].status, BackupStatus::Creating);
+        assert!(m.pitr_base_backups.contains("b1"));
+
+        // Still tagged once the backup completes.
+        m.apply(&MetaCommand::RecordBackupTabletComplete {
+            backup_id: "b1".to_owned(),
+            tablet: TabletId(1),
+            cut_version: 1,
+            bytes: 0,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteBackup {
+                backup_id: "b1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.backups["b1"].status, BackupStatus::Available);
+        assert!(m.pitr_base_backups.contains("b1"));
+    }
+
+    /// An ordinary on-demand backup (`pitr_base: false`, every non-PITR
+    /// proposer) is never tagged — the flag is not a blanket default-true.
+    #[test]
+    fn begin_backup_without_pitr_base_is_never_tagged() {
         let mut m = Metadata::default();
         table_with_schema(&mut m, "orders");
         m.apply(&MetaCommand::CreateTablet {
@@ -9303,31 +9387,17 @@ mod tests {
             range: KeyRange::whole(),
             replicas: Vec::new(),
         });
-        m.apply(&MetaCommand::BeginBackup {
-            backup_id: "b1".to_owned(),
-            table: "orders".to_owned(),
-            created_wall_ms: 1_000,
-            backup_name: "pitr-base".to_owned(),
-        });
         assert_eq!(
-            m.apply(&MetaCommand::MarkBackupPitrBase {
+            m.apply(&MetaCommand::BeginBackup {
                 backup_id: "b1".to_owned(),
+                table: "orders".to_owned(),
+                created_wall_ms: 1_000,
+                backup_name: "my-backup".to_owned(),
+                pitr_base: false,
             }),
             ApplyOutcome::Applied
         );
-        assert!(m.pitr_base_backups.contains("b1"));
-        assert_eq!(
-            m.apply(&MetaCommand::MarkBackupPitrBase {
-                backup_id: "b1".to_owned(),
-            }),
-            ApplyOutcome::NoOp
-        );
-        assert_eq!(
-            m.apply(&MetaCommand::MarkBackupPitrBase {
-                backup_id: "no-such-backup".to_owned(),
-            }),
-            ApplyOutcome::Rejected("no such backup")
-        );
+        assert!(!m.pitr_base_backups.contains("b1"));
     }
 
     /// `DeleteBackup` prunes a PITR base tag alongside the row it tags.
@@ -9346,9 +9416,7 @@ mod tests {
             table: "orders".to_owned(),
             created_wall_ms: 1_000,
             backup_name: "pitr-base".to_owned(),
-        });
-        m.apply(&MetaCommand::MarkBackupPitrBase {
-            backup_id: "b1".to_owned(),
+            pitr_base: true,
         });
         assert_eq!(
             m.apply(&MetaCommand::DeleteBackup {

@@ -10,13 +10,23 @@
 //! ## [`pitr_snapshot_loop`] — periodic base snapshots
 //!
 //! For every table with PITR currently enabled, proposes an internally-
-//! triggered `MetaCommand::BeginBackup` on a schedule once its most recent
-//! PITR base snapshot has aged past `snapshot_cadence` — reusing Train 1's
-//! capture driver/aggregator completely unmodified. This loop's only extra
-//! job is tagging the resulting row via `MetaCommand::MarkBackupPitrBase`
-//! once it exists, plus a **self-healing tag sweep** every tick (a named,
-//! accepted residual — see `animusd/CLAUDE.md`'s `pitr_janitor.rs` entry
-//! for the full reasoning, unchanged by this move).
+//! triggered `MetaCommand::BeginBackup { pitr_base: true, .. }` on a
+//! schedule once its most recent PITR base snapshot has aged past
+//! `snapshot_cadence` — reusing Train 1's capture driver/aggregator
+//! completely unmodified. **The `pitr_base` flag tags the row in the same
+//! apply that mints it (issue #593)** — there used to be a separate
+//! `MetaCommand::MarkBackupPitrBase` proposed only once this loop observed
+//! its own `BeginBackup` row exist, which left a real committed window (the
+//! instant between the two commits) where the row was an ordinary,
+//! untagged `Creating` backup — visible under `ListBackups`' default `USER`
+//! filter and the console's per-table backups projection. Folding the tag
+//! into `BeginBackup` itself closes that window structurally: every replica
+//! that ever observes the row observes it already tagged, and there is no
+//! longer a self-healing sweep to run (there is nothing left for one to
+//! heal — a `BeginBackup` either commits fully tagged or doesn't commit at
+//! all). See `Metadata::pitr_base_backups`'s own doc (`animus-control`) and
+//! `docs/adr/0059-backup-restore.md` §9's 2026-09-04 as-built amendment for
+//! the full incident.
 //!
 //! ## [`pitr_janitor_loop`] — retention
 //!
@@ -55,8 +65,10 @@ pub const DEFAULT_PITR_RETENTION: Duration = Duration::from_secs(35 * 24 * 60 * 
 pub const DEFAULT_PITR_SNAPSHOT_CADENCE: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The `BackupName` marker every internally-triggered PITR base snapshot
-/// carries (`{prefix}{table}`) — a self-healing **hint** only, never the
-/// source of truth (`Metadata::pitr_base_backups` is).
+/// carries (`{prefix}{table}`) — purely a human-readable label for
+/// `DescribeBackup`/`ListBackups`/the console; never the source of truth
+/// (`Metadata::pitr_base_backups`, set atomically by `BeginBackup`'s own
+/// `pitr_base` flag, is — see the module doc).
 const PITR_SNAPSHOT_BACKUP_NAME_PREFIX: &str = "__pitr_base__";
 
 fn pitr_snapshot_backup_name(table: &str) -> String {
@@ -89,20 +101,6 @@ fn pitr_snapshot_tick<E: Env>(
     let now_ms = env.now().0 / 1_000_000;
     let cadence_ms = u64::try_from(snapshot_cadence.as_millis()).unwrap_or(u64::MAX);
 
-    // Self-healing tag sweep (module doc): closes the gap left by a
-    // `BeginBackup` whose own `MarkBackupPitrBase` never landed.
-    for (backup_id, row) in meta.backups.iter() {
-        if row
-            .backup_name
-            .starts_with(PITR_SNAPSHOT_BACKUP_NAME_PREFIX)
-            && !meta.pitr_base_backups.contains(backup_id)
-        {
-            let _ = leader.propose(MetaCommand::MarkBackupPitrBase {
-                backup_id: backup_id.clone(),
-            });
-        }
-    }
-
     for (table, schema) in meta.schemas.iter() {
         if schema.pitr.is_none() {
             continue;
@@ -126,6 +124,7 @@ fn pitr_snapshot_tick<E: Env>(
             table: table.clone(),
             created_wall_ms,
             backup_name: pitr_snapshot_backup_name(table),
+            pitr_base: true,
         });
         // One fresh snapshot proposal per table per tick is enough — the
         // next tick's own re-derived `has_recent_or_inflight` (once the

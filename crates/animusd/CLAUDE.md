@@ -607,19 +607,22 @@ reusing the captured config is the point of the test.
 - **`pitr_janitor.rs`** (ADR 0059 §9, Train 3) — PITR's two control-plane-
   leader-only background loops, mirroring `segment_janitor.rs`/
   `backup_janitor.rs`'s own shape: `pitr_snapshot_loop` (periodic
-  internally-triggered `BeginBackup` for a PITR-enabled table, reusing
-  Train 1's capture driver/aggregator completely unmodified, then tagging
-  the row via `MetaCommand::MarkBackupPitrBase` with a self-healing sweep
-  for a dropped tag ack) and `pitr_janitor_loop` (two-phase mark/reclaim
-  over `Metadata::pitr_segments`, subject to the identical epoch-derivation
-  guard `segment_janitor.rs` established for streams, plus a base-snapshot
-  keep-anchor mark step that leaves the actual reclaim to the *existing*
-  `backup_janitor_loop`, which already reclaims any `Expired`/`Failed`
-  `BackupRow` regardless of a PITR tag). `DEFAULT_PITR_RETENTION`
-  (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h) are hardcoded production
-  defaults — no CLI knob yet, the identical documented gap `ttl_reaper.rs`'s
-  own sweep interval has. The module's own doc has the full design
-  including the self-healing-tag residual. **The retention loop's own
+  internally-triggered `BeginBackup { pitr_base: true, .. }` for a
+  PITR-enabled table, reusing Train 1's capture driver/aggregator
+  completely unmodified — the `pitr_base` flag tags the row **atomically
+  with the mint**, in the same apply, since issue #593's fix; there is no
+  longer a separate tagging proposal or a self-healing sweep, both deleted
+  along with `MetaCommand::MarkBackupPitrBase`) and `pitr_janitor_loop`
+  (two-phase mark/reclaim over `Metadata::pitr_segments`, subject to the
+  identical epoch-derivation guard `segment_janitor.rs` established for
+  streams, plus a base-snapshot keep-anchor mark step that leaves the
+  actual reclaim to the *existing* `backup_janitor_loop`, which already
+  reclaims any `Expired`/`Failed` `BackupRow` regardless of a PITR tag).
+  `DEFAULT_PITR_RETENTION` (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h)
+  are hardcoded production defaults — no CLI knob yet, the identical
+  documented gap `ttl_reaper.rs`'s own sweep interval has. The module's own
+  doc has the full design, including the incident the atomic-tag fix
+  closed. **The retention loop's own
   control-only-leader scope gap is closed (W-10)**: `pitr_janitor_loop`'s
   segment-object reclaim now has a real `BackupStoreHandle`
   (`ClientCtx::backup_store`) on every node shape. `pitr_snapshot_loop`'s
