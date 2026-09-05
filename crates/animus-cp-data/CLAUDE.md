@@ -631,6 +631,91 @@ State once here; cross-referenced from the sections below.
   and never the stage's own ts — ADR 0018 §2 B1). Regression:
   `tests/txn_kind_writes.rs::kind_batch_and_txn_resolve_materialize_byte_
   identical_rows_for_identical_payloads`.
+- **`KvCommand::KindEval` — the self-contained evaluated write (ADR 0054
+  step 2), unwired.** This crate now depends on `animus-item` (`WriteSchema`/
+  `derive_kind_writes`/`AttributeValue`/`Item`/`ConditionExpression`/
+  `UpdateAction` — no `animus-env`/wire-crate transitively pulled in).
+  Unlike `KindBatch` (leader-evaluated bytes + an apply-time OCC seatbelt
+  against staleness), this variant carries the *operation* — `schema:
+  WriteSchema` (frozen at propose time; apply has no `Metadata` access at
+  all, a structural boundary, not an omission — two replicas of one entry
+  reading different catalog versions would derive different index rows and
+  diverge), `pk`/`sk`, `op: KindEvalOp` (`Put`/`Delete`/`Update{key_item,
+  actions}`), `condition: Option<ConditionExpression>` (the client's own
+  rich expression — no seatbelt needed, since apply's own read already IS
+  current state), `ttl_expired`, `ts`. No `base_key`/token field: apply
+  derives both from `pk`/`sk` via `animus_tablet::partition_token` (this
+  crate already depends on `animus-tablet`; carrying a leader-computed
+  token would just be a value that could disagree with `pk` in principle).
+  Apply (`evaluate_kind_eval`, a **pure** function factored out of the arm
+  so the decision is unit-testable without an engine): drain the pending
+  run (mirrors `KindBatch`'s own `conditions` read); check the seal/freeze
+  gate; read the current value, unwrap its envelope — an unresolved intent
+  from a concurrent transaction is `ConditionFailed` (ambiguous, never
+  guessed at, the identical foreign-intent discipline `KindBatch.
+  conditions`/`Cas` already have); evaluate `condition`; compute `new` via
+  `op`; derive `writes`/`change_log` via `animus_item::derive_kind_writes`;
+  materialize via the same shared `materialize_derived` helper above — no
+  third copy. Codec version `25` (tag `16`): the four rich, evolving nested
+  field types each ride as one `serde_json` blob inside the binary
+  envelope (`put_json`/`Cursor::json`) — the same convention `backup.rs`'s
+  `BackupManifestObject` already uses for `TableSchema`'s own evolving
+  shape, since a hand-encoded field-by-field layout for four
+  still-growing types would need a codec change on every one of their own
+  future field additions.
+
+  **Outcome mapping**: reuses the existing, bounded `KindBatchOutcomes` map
+  (no `KindEval`-specific outcome map) — `Applied`/`ConditionFailed`/
+  `Sealed` exactly as `KindBatch` already has them, plus a new
+  `KindBatchOutcome::Rejected { key, code, message }` for the two cases a
+  plain false condition doesn't cover: `condition.evaluate` returning `Err`
+  (a domain violation, e.g. `size()` on the wrong type) or `op`'s `Update`
+  folding via `animus_item::apply_update` and returning `Err` (a malformed
+  update, a type mismatch, or the post-update item over the size cap).
+  `code`/`message` copy `ConditionError`'s/`UpdateError`'s own fields
+  verbatim, kept as an owned `String` rather than assuming
+  `"ValidationException"` (both types' only code today) stays the only one
+  forever. **No wire-level mapping exists yet** — that is step 3's job;
+  `animusd::classify_kind_batch_outcome`'s existing wildcard arm already
+  treats an unrecognized outcome as `Inconclusive` (safe, since nothing
+  produces `KindEval` yet), but step 3 should fold `Rejected` into the
+  `NoOp` arm alongside `ConditionFailed`/`Sealed` once a real producer
+  exists.
+
+  **The leader-local result payload (ADR 0054 mechanism 3) — `KindEvalResult`/
+  `KindEvalResults`, deliberately a SEPARATE structure from
+  `KindBatchOutcomes`, never replicated, never in a snapshot.** The reason
+  is memory, not correctness: every replica derives the identical `old`/
+  `new` images as a normal part of evaluating the write, but only the node
+  that proposed a given entry (if any — a recovery push registers nothing)
+  ever wants them back; folding the payload into the replicated outcome map
+  would grow every follower's retention for a value nobody there reads.
+  `RaftKvNode::propose_kind_eval` registers this node's interest in an
+  accepted entry's index **while still holding the same `core` mutex the
+  apply task needs to lock before it can ever drain that entry** — a real
+  ordering guarantee, not a hopeful race window, on every executor
+  (`SimEnv`'s single-threaded scheduler and a genuine second OS thread
+  under `ProdEnv` alike), since the apply task's `drain_apply` call cannot
+  proceed until the registration's own critical section releases the lock.
+  `RaftKvNode::take_kind_eval_result(index, term)` removes the slot on
+  read (never a peek), mirroring `kind_batch_outcome`'s identical
+  index-and-term identity discipline for the identical reason (an
+  uncommitted entry's index can be reoccupied by a different command after
+  a leadership change). Both `interested` and `results` are bounded by the
+  same generous `RETAIN = 8192` `KindBatchOutcomes` already uses.
+
+  **No production caller as of this PR** — `kind_write_item_at_leader`
+  (`animusd`) still evaluates at the leader and proposes `KindBatch`,
+  byte-identical to before this step; step 3 (ADR 0054 Sequencing) cuts it
+  over. Tests: `tests/kind_eval.rs` — a differential test against a
+  hand-built `KindBatch` calling the identical `derive_kind_writes`; a
+  false condition leaving every replica's row untouched; two `ADD`
+  proposals issued back-to-back before either applies (the ADR's own
+  motivating property) landing with zero refusals; the leader-local
+  payload's three properties; the frozen/sealed gate; and a crash/restart
+  replaying two entries to the identical state including the stale LSI
+  row's removal. `animus-item`'s own `write_schema` module carries
+  `derive_kind_writes`'s pure-function unit tests.
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
   follows), `1` = an intent naming the staging `TxnId`, its record's

@@ -17099,3 +17099,152 @@ own implementation staying that way, so a doc comment at the call site
 naming the assumption (as this fixture's own `run_delete_probe`/
 `final_state` docs now do) is worth writing down rather than trusting
 memory the next time either function's own internals change.
+
+## Extracting a pure crate below a wire adapter: split parser from evaluator, not by file (ADR 0054 step 1, C-01)
+
+Moving `animus-dynamo`'s item model into a new crate below it (`animus-item`)
+so a future protocol-agnostic apply path could depend on it without pulling
+in the wire adapter looked at first like a file-level move: `condition.rs`,
+`index.rs`, and `numkey.rs` were already fully pure (no `serde_json::Value`
+anywhere) and moved wholesale, tests included. `wire.rs`'s
+`UpdateExpression` machinery did not split that cleanly, because it is two
+things wearing one name: a **tokenizer/parser** that turns request JSON
+(`ExpressionAttributeNames`/`Values`, both `serde_json::Value`-shaped) into
+`Vec<UpdateAction>`, and an **evaluator** (`apply_update` and everything it
+calls) that folds those already-resolved actions against an `Item`. Only the
+evaluator half is genuinely part of the pure item-mutation model; the parser
+half is JSON/wire-decode work that has no business in a crate meant to sit
+below the wire adapter, even though both halves reference the exact same
+`UpdateAction`/`PathSegment` types. The fix was to move the **data types**
+(needed by both halves) and the **evaluator** together, and leave the
+**parser** in `wire.rs`, importing the types back across the new crate
+boundary. The general rule: when a "this whole module needs to move below
+crate X" instinct meets a module that decodes wire-format input into a
+value and also *evaluates* that value, check whether the decode step reaches
+for a wire-specific type (`serde_json::Value`, a JSON `Map`, an HTTP header)
+that the evaluator itself never touches — if so, the boundary is inside the
+file, at the parse/evaluate seam, not at the file's edges.
+
+**A second reusable trick for this kind of move**: a large single-file test
+module (this one had 247 `#[test]` functions in one `mod tests` block) can be
+split into individually-relocatable chunks *without* a real Rust parser by
+exploiting `cargo fmt`'s own indentation invariant — every top-level item
+inside `mod tests { .. }` is indented exactly 4 spaces, so its own closing
+brace is a line that is *exactly* `"    }"`, regardless of what braces or
+JSON-string-literal punctuation appear inside the item's body (those are all
+indented deeper). A small script walking line-by-line, treating each run
+from one non-blank line up to the next bare `"    }"` line as one item, gave
+a correct decomposition of the whole test module into individually
+classifiable chunks (by keyword: does this chunk call `decode_request`/
+`Operation::` → stays; does it only touch `apply_update`/`UpdateAction`
+construction → moves) — verified by reconstructing the total test count
+(324 before, 324 after, exactly redistributed) rather than trusting the
+classifier's keyword list alone. This is much faster and less error-prone
+than hand-copying dozens of test functions, and generalizes to any
+similarly-large rustfmt'd test module that needs splitting by content rather
+than by file.
+
+**A third pattern, for keeping "no behaviour change" honest across a crate
+boundary that also needs a different error type**: when a moved function
+used to return the enclosing crate's own error type (here, `WireError`, with
+a `code`/`message` shape client-visible error handling depends on) but the
+new crate cannot depend on that type, give the new crate its own minimal
+error type with the **same field shape** (`UpdateError { code, message }`,
+mirroring the existing `ConditionError` precedent in the same codebase)
+rather than collapsing to a bare `String`. Every test that used to assert
+`err.code == "ValidationException"` then keeps working unchanged after the
+move, and the original crate's wrapper becomes a one-line `From` impl
+instead of a place where message text has to be retyped and could silently
+drift.
+
+## A leader-local side channel that apply fills needs a registration step that is provably ordered before apply, not merely likely to be (ADR 0054 step 2, `KindEvalResults`)
+
+Building the leader-local result payload for `KvCommand::KindEval`
+(`animus-cp-data`), the first draft registered "this node wants entry N's
+payload" in a bounded map **after** `propose_ordered`-style code returned
+`ProposeResult::Accepted`, using the freshly-known `index`. That is exactly
+the natural place to put it, and it is unsound in general: the apply task is
+a *separate*, independently-scheduled consumer of the same `core`'s
+committed effects, and under `ProdEnv` it can run on a different OS thread.
+Nothing stops it from draining and applying the just-appended entry — and
+therefore looking up (and finding nothing in) the interest set — in the gap
+between "propose returns" and "the next line registers interest," so a
+registration written this way is a race that usually wins, not a guarantee.
+
+The fix costs nothing extra: `propose_ordered`'s own shape already holds a
+`core: MutexGuard` across "build the command, call `core.propose`, note the
+accepted result" — and the apply task cannot drain a freshly-committed
+effect without first acquiring that *same* lock (`apply_and_compact`'s
+`core.lock().drain_apply()`). Moving the registration step **inside** that
+still-held critical section, before `drop(core)`, converts "usually before"
+into "provably before, on every executor" for free — the apply side is
+*structurally* unable to observe the entry until the registration's own
+lock release happens, no timing assumption required. `RaftKvNode::
+propose_kind_eval` does this: `self.kind_eval_results.lock()...register(index)`
+runs one statement before the `drop(core)` that ends the section
+`propose_ordered` itself already delimits.
+
+The general form: whenever a proposer wants to leave a note for its own
+entry's future apply to find, ask whether apply's own path to that entry
+shares a lock with the proposer's own critical section — if it does (as it
+almost always will for anything routed through `propose_ordered`'s shape),
+writing the note inside that section is free correctness a "make it happen
+right after accept" version of the same code would only get by luck. The
+inverse mistake — registering the note in a *different*, unrelated lock, or
+after the shared lock has already been released — reintroduces exactly the
+race this pattern exists to close, and a `SimEnv`-only test suite cannot
+catch it: `SimEnv`'s single-threaded cooperative scheduler never actually
+interleaves the two sides at the vulnerable instant (there is no `.await`
+between "propose returns" and "the next synchronous statement runs"), so
+the bug is invisible in the deterministic corpus and would only show up as
+an intermittent `ProdEnv` flake under real concurrent load — the same
+"`SimEnv` proves logic and ordering, not real-thread liveness" class of gap
+the root `CLAUDE.md` already names for locks/wakers/group commit, extended
+here to "a side-channel handoff between two lock users" as a new instance
+of the same family.
+
+## A leader-side "seatbelt double-check" kept alongside an apply-evaluated write must predict the client's own decision, not replicate the byte-level mechanism it replaces (ADR 0054 step 3)
+
+Cutting `kind_write_item_at_leader` over to `KvCommand::KindEval` (ADR 0054
+step 3), the task brief for the kept seatbelt double-check assumed the
+classic "two concurrent `ADD`s, one refused" scenario would be the thing the
+mismatch metric catches. Tracing the actual code paths found this is not so:
+the *old* seatbelt was a byte-level OCC check (`KindBatch.conditions =
+vec![(base_key, raw_old)]`, comparing the leader's exact read bytes against
+whatever is committed at apply) with no relationship to the client's own
+`ConditionExpression` — a plain, unconditional `ADD` has no condition to
+evaluate at all, so a leader-side prediction built from `condition.evaluate`
+can *only* ever answer `Applied` for it, never `ConditionFailed`. Reproducing
+the old byte-level seatbelt's staleness signal was not what was asked for,
+and would have required inspecting engine state at apply time from the
+leader side, which nothing exposes. The seatbelt double-check that actually
+matters — and that the metric's own doc had to be worded around — is
+narrower: it predicts what the SAME evaluation logic (`condition.evaluate` +
+`apply_update`) would decide from the leader's own resolved read, and
+compares that prediction against apply's confirmed decision. That only ever
+disagrees for a **conditioned** write, and only because the value legitimately
+changed between the leader's read and apply's own fresher one — which is
+symmetric in principle (a leader's stale read can go stale in either
+direction) but the task's intended semantics single out one direction as
+"expected" (leader too pessimistic, apply succeeds) and the other as
+"worth investigating" (leader too optimistic, apply rejects). Both directions
+are mechanically ordinary races, not distinguishable by looking at a single
+disagreement in isolation; the asymmetry is a policy call about which
+direction, if it dominated the counter's rate over time, would suggest a
+real evaluator divergence between the leader-side and apply-side code paths
+(which *are* meant to agree) rather than ordinary timing — worth recording
+in a comment precisely because nothing in the mechanism itself enforces it.
+
+**Testing implication**: a regression that manufactures a specific
+disagreement direction needs a *conditioned* write and a genuine timing race
+between two writes to the same key, not just concurrent unconditional ones —
+the existing `rmw285_confirm_gate` test hook (issue #285, already `#[cfg(test)]`
+in `dynamo.rs`) that delays a write's own post-rmw_lock phase is exactly the
+tool for this: arm it, let the gated write's leader-side read observe a
+before-image its own `ConditionExpression` would reject, land a second,
+ungated write in the gap that makes the condition become true, then let the
+first write's entry apply against the now-favorable state. This is a cheap,
+deterministic way to prove a "kept old evaluator vs. new evaluator" double
+check both fires correctly and never fails the request — worth reusing for
+any future ADR 0054-style migration that keeps a comparison-only legacy
+evaluator alongside a cut-over one.

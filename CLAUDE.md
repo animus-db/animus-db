@@ -97,6 +97,7 @@ the relevant one before working in a crate:
 | `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
 | `animus-cp-data` | [crates/animus-cp-data/CLAUDE.md](crates/animus-cp-data/CLAUDE.md) |
+| `animus-item` | [crates/animus-item/CLAUDE.md](crates/animus-item/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
@@ -333,9 +334,19 @@ truth; this map is just for navigation.
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam
   so its crash recovery is sim-tested).
+- **Item model** — `animus-item` (ADR 0054 step 1). The pure DynamoDB item
+  model — `AttributeValue`/`Item`/`TableSchema`, key encoding, `condition`
+  and `index` (GSI/LSI row derivation), the `UpdateExpression` data model and
+  its apply-time evaluator, the stored-item codec — extracted from
+  `animus-dynamo` to sit **below both** it and `animus-cp-data`, since the
+  latter is a protocol-agnostic KV state machine that cannot depend on a wire
+  crate; `animus-dynamo` re-exports everything unchanged. No `animus-env`
+  dependency, by design — see `crates/animus-item/CLAUDE.md`.
 - **Wire adapter** — `animus-dynamo` (ADR 0006; a CQL adapter, `animus-cql`,
   also shipped for a time but was dropped, ADR 0053 — v1 is DynamoDB-only).
-  DynamoDB JSON/HTTP, served by `animusd`, routed through the **CP data
+  **Its pure item model now lives in `animus-item`, below it** (ADR 0054 step
+  1), re-exported unchanged. DynamoDB JSON/HTTP, served by `animusd`, routed
+  through the **CP data
   plane** (v1, ADR 0019); consumes the replicated schema catalog (ADR 0013)
   and builds ADR 0022 token-prefixed keys. **`ConsistentRead` selects a real
   read path** (ADR 0055): `true` is the linearizable ReadIndex read, `false`

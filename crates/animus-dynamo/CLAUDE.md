@@ -9,6 +9,19 @@ common storage core (ADR 0006) — the data-model + surface-syntax halves of the
 adapter wedge. The transport (HTTP, sockets) and the distributed routing live in
 `animusd`; this crate stays pure and deterministic.
 
+**The pure item model itself now lives in `animus-item`, below this crate**
+(ADR 0054 step 1 — see `crates/animus-item/CLAUDE.md`): `AttributeValue`/
+`Item`/`TableSchema`, the key-encoding primitives, `condition`, `index`,
+`numkey`, the `UpdateExpression` data model + apply-time evaluator, the
+stored-item codec, and the item-size formula. This crate re-exports all of it
+unchanged (every `animus_dynamo::X`/`animus_dynamo::wire::X` path below still
+resolves) and keeps the parts that are genuinely wire/JSON concerns: the HTTP
+request/response codec (`wire`), the `UpdateExpression`/`ConditionExpression`
+**string parser** (needs `ExpressionAttributeNames`/`Values`, JSON-specific),
+`registry`/`schema` (the catalog bridge), `capacity` (`ConsumedCapacity`
+response shaping — re-exports the item-size formula itself from
+`animus-item`), `sigv4`, `streams_wire`, and `ttl`.
+
 ## Entry points
 
 Module-by-module pointers — every module here is pure (no I/O/storage/
@@ -17,11 +30,14 @@ comment for its full type/method inventory.
 
 - `AttributeValue`/`Item`/`TableSchema` — the DynamoDB type system (scalars,
   document `M`/`L`, set `SS`/`NS`/`BS`) and the simple/composite key schema.
+  **Defined in `animus-item`, re-exported here** (ADR 0054 step 1).
 - `Table<S: StorageEngine>` — the local-engine item API (`put_item`/
   `get_item`/`delete_item`/`query`/`query_with`), used by this crate's own
-  tests.
+  tests. Stays here (it depends on `animus-storage`'s `StorageEngine`, which
+  `animus-item` deliberately does not).
 - `condition` — `SortKeyCondition` and `ConditionExpression`: pure predicates
-  for `Query` sort conditions and conditional writes.
+  for `Query` sort conditions and conditional writes. **Defined in
+  `animus-item::condition`, re-exported here** (ADR 0054 step 1).
 - `registry` — `SchemaRegistry`: a pure, in-memory per-table schema +
   secondary-index-**shape** map (`sync_indexes` resyncs definitions to a
   desired set). **Neither the base table's items nor an index's entries are
@@ -46,11 +62,16 @@ comment for its full type/method inventory.
   bridge" entry for why this is a name-keyed edge merge rather than a
   field threaded through `SecondaryIndex`/`GlobalSecondaryIndex`/
   `LocalSecondaryIndex` (registry.rs), which never needed to carry it.
-- `storage_key(pk, sk)` — the data-plane key for an item.
+- `storage_key(pk, sk)` — the data-plane key for an item. **Defined in
+  `animus-item`, re-exported here** (ADR 0054 step 1).
 - `index` (**ADR 0041 — the codec every layer of materialized secondary
   indexes is built on**: the write path, the GSI drain, and the native index
   read path all construct/parse keys through these same functions, so every
-  layer agrees by construction). Two contracts worth stating explicitly:
+  layer agrees by construction). **Defined in `animus-item::index`,
+  re-exported here** (ADR 0054 step 1) — moved because a future
+  `animus-cp-data` apply-path evaluator will need to derive these same
+  rows and cannot depend on this wire crate. Two contracts worth stating
+  explicitly:
   - **Row kinds are separate `StorageScope`s, not bytes in the key** (ADR
     0041 §3) — because a tablet is a range over *token* space (a kind above
     the token would break `KeyRange`/the router/split), **and** because
@@ -404,7 +425,15 @@ comment for its full type/method inventory.
   `TransactWriteItems` contention).
 - `BatchGetItem` is implemented (`decode_batch_get` in `wire.rs`).
 - **`UpdateExpression` (issue #375/roadmap W-01) is now the full documented
-  subset**: `SET path = expr` (`expr` is one `UpdateOperand` — a `:value`, a
+  subset** (ADR 0054's 2026-09-05 step-1 amendment: `PathSegment`/
+  `UpdateOperand`/`UpdateExpr`/`UpdateAction` and the evaluator this bullet
+  describes — `apply_update` and everything it calls — now live in
+  `animus-item::update`, re-exported here; every reference below to a
+  function living "in `wire.rs`" means the **parser** producing a
+  `Vec<UpdateAction>` from request JSON, which is the half that stayed,
+  since it needs `ExpressionAttributeNames`/`Values`. See that crate's
+  `CLAUDE.md` for the full account of the split): `SET path = expr` (`expr`
+  is one `UpdateOperand` — a `:value`, a
   document path read from the item, or `if_not_exists(path, default)`/
   `list_append(a, b)` — or `operand + operand`/`operand - operand`, exactly
   one arithmetic operator, both sides `N`), `REMOVE path`, `ADD path :v`, and
@@ -422,12 +451,14 @@ comment for its full type/method inventory.
   containing a literal `+`/`-` needs `#alias`, mirroring the pre-existing
   `.`/`[` rule), then nested-path targets last (the data-model change to
   `UpdateAction`/`UpdateOperand`, from a bare `String` to `Vec<PathSegment>`).
-  **Evaluation happens at apply time** (`eval_update_expr`/
-  `eval_update_operand` in `wire.rs`, called from `apply_update` — which
-  itself always runs at the leader, under the same `rmw_lock`-guarded scope
-  ADD's read-modify-write already used, via `animusd::dynamo::
-  kind_write_item_at_leader`; nothing new needed there, since `apply_update`'s
-  signature/call sites are unchanged), against the item as the fold has
+  **Evaluation happens as the fold applies** (`eval_update_expr`/
+  `eval_update_operand`, now in `animus-item::update`, called from
+  `apply_update` — which itself still always runs at the leader, under the
+  same `rmw_lock`-guarded scope ADD's read-modify-write already used, via
+  `animusd::dynamo::kind_write_item_at_leader`; `apply_update`'s call sites
+  in `animusd` are unchanged — ADR 0054 step 1 is a pure relocation, not
+  yet the move to the tablet's actual Raft-apply path that name evokes),
+  against the item as the fold has
   built it so far — a documented simplification of DynamoDB's own
   within-one-expression ordering semantics (see `UpdateOperand`'s own doc),
   not a modeled property. `SET`'s target path validates that every segment
@@ -514,25 +545,15 @@ comment for its full type/method inventory.
 
 ## Tests
 
-`condition`'s decimal bignum ops (`decimal_parts`/`add_digits`/`sub_digits`,
-backing `compare_numeric`/`add_numeric`) also carry a **differential
-proptest** against `bigdecimal::BigDecimal` (`condition.rs::
-decimal_differential_tests`, a `[dev-dependencies]`-only crate, ADR 0061
-rung A5) — compare/add and add-of-a-negated-operand (this crate's only
-subtraction path; there is no standalone `sub_numeric`) against the
-reference over randomly generated up-to-38-significant-digit decimal
-strings. This implementation has no digit-count cap of its own (arbitrary
-length, exact), so it is already a strict superset of DynamoDB's documented
-38-digit contract — the generator is bounded to 38 digits to keep inputs
-realistic, not because either side would lose precision past that. Compares
-parsed **values**, not rendered text: this crate's arithmetic deliberately
-normalizes trailing zeros/`-0` (`"1.10" + "0.90"` renders `"2"`, never
-`"2.00"`), so a naive string-equality assertion against the reference would
-fail on exactly the cases most worth covering.
+**ADR 0054 step 1 moved `condition`/`index`/`numkey`'s own tests, plus
+`apply_update`'s and the stored-item codec's, into `animus-item`** (they
+moved with the code they test — no assertion changed) — see that crate's
+`CLAUDE.md` Tests section. What follows here describes what stayed.
 
 `cargo test -p animus-dynamo` — `item_api.rs` over `MemoryEngine`, plus unit
-tests for `wire`/`streams_wire`/`condition`/`registry`/`schema`/`index`/`ttl`
-(JSON decode/encode, the index key-layout invariants, iterator-token
+tests for `wire`/`streams_wire`/`registry`/`schema`/`ttl`
+(JSON decode/encode, the `UpdateExpression`/`ConditionExpression` **parser**
+— as opposed to the evaluator, whose own tests moved — iterator-token
 round-trip, response-shape encoders, and `ttl`'s expiry-boundary table —
 absent/wrong-type attributes, future/past/equal-to-now, fractional
 truncation, the negative-value fold, and both sides of the
