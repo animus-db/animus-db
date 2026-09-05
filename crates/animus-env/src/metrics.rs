@@ -661,12 +661,32 @@ pub enum Metric {
     /// had insufficient tokens (`ProvisionedThroughputExceededException`,
     /// or — inside a `BatchGetItem` call — an `UnprocessedKeys` entry).
     ThrottledReads,
+    // --- SigV4 hardening (ADR 0066, S-02) --- Appended after the
+    // client-cancellation variant above; every earlier variant's slot and
+    // the text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Added by S-02 step 2 (the replicated credential
+    // catalog + admin CRUD); recorded starting with S-02 step 3 (the
+    // allow-list enforcement at dispatch, a later change) — added now so
+    // that step only has to wire them, not widen this enum.
+    /// A caller's signature verified against a credential's **outgoing**
+    /// (`previous`) secret during an open rotation grace window (ADR 0066
+    /// §3 step 4) — an operator-visible signal that a client hasn't yet
+    /// cut over to the new secret before the window closes.
+    AuthRotatedSecretUsed,
+    /// A request was refused with `AccessDeniedException` (ADR 0066 §5): a
+    /// signature verified, but the resolved policy did not allow the
+    /// request's operation class against every table it named.
+    AuthDenied,
+    /// A request's access key id matched neither the replicated credential
+    /// catalog nor the static bootstrap map (ADR 0066 §4) —
+    /// `UnrecognizedClientException`.
+    AuthUnknownKey,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 85] = [
+    pub const ALL: [Metric; 88] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -752,6 +772,9 @@ impl Metric {
         Metric::ClientRequestsAbandoned,
         Metric::ThrottledWrites,
         Metric::ThrottledReads,
+        Metric::AuthRotatedSecretUsed,
+        Metric::AuthDenied,
+        Metric::AuthUnknownKey,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -844,6 +867,9 @@ impl Metric {
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
             Metric::ThrottledWrites => "throttled_writes",
             Metric::ThrottledReads => "throttled_reads",
+            Metric::AuthRotatedSecretUsed => "auth_rotated_secret_used",
+            Metric::AuthDenied => "auth_denied",
+            Metric::AuthUnknownKey => "auth_unknown_key",
         }
     }
 

@@ -924,6 +924,55 @@ reusing the captured config is the point of the test.
   dashboard_role_gating_split_deployment` covers the control-vs-data
   null/present split.
 
+  **The credential admin CRUD (ADR 0066 §1/§2/§6, S-02 step 2)**: `GET
+  /admin/credentials` (`credentials_view`) and `POST /admin/credentials`/
+  `/rotate`/`/revoke` (`action_put_credential`/`action_rotate_credential`/
+  `action_revoke_credential`) — the replicated credential catalog's own
+  admin surface, mirroring `dynamo.rs::update_time_to_live`'s propose-then-
+  commit-wait shape exactly (`ctx.propose_schema` + a bounded
+  `ctx.metadata_fresh()` poll loop, `SCHEMA_COMMIT_TIMEOUT`/
+  `SCHEMA_POLL_INTERVAL` — widened to `pub(crate)` in `dynamo.rs` for this
+  reuse). **Never a secret in any response**: `credential_row_redacted`
+  (shared by `credentials_view` and `system_table_value_display`'s own new
+  `EntityKind::Credential` arm — the generic system-keyspace browse would
+  otherwise leak one via its usual JSON-passthrough convention) renders
+  only `enabled`/`policy`/`created_at`/`updated_at`/`rotation` — never
+  `secret`/`previous.secret`. `policy_json`/`parse_policy` are this
+  surface's own small, human-readable wire shape for
+  `animus_control::Policy` (`{"tables": {"kind": "all"|"names"|"prefixes",
+  ...}, "ops": [...]}`) — deliberately not `Policy`'s own `#[derive(
+  Serialize)]` output (externally-tagged enum JSON is a worse shape for an
+  operator or the CLI to read/build by hand). `config_view` gained one more
+  field, `credentials_count` — computed live from `effective_metadata()`,
+  never stored on `AdminInfo` (unlike every other field there, this one
+  changes at runtime through this very admin surface, not only at node
+  assembly); `auth_enabled` (ADR 0057) already answered "is the static
+  bootstrap map present," so this catalog needed no second boolean.
+  **A real defect found by this feature's own tests, not by inspection**:
+  the first cut's convergence check compared `row.updated_at == now`
+  (`now` being this catalog's own epoch-**seconds** convention — see
+  `animus-control/CLAUDE.md`'s matching entry for why it's seconds, not
+  the millisecond `wall_ms` most of this crate's commit-waits key on) —
+  coarse enough that a `Put` immediately followed by a `Rotate` in the same
+  wall-clock second computed an identical `now` for both, so `Rotate`'s
+  very first poll iteration could read back the **pre-rotate** row and
+  return it as already-converged. Fixed to compare content instead
+  (`row.secret == command_secret && row.policy == ... && row.enabled ==
+  ...` for `Put`; `row.secret == command_new_secret` for `Rotate`) — see
+  `docs/engineering-lessons.md`'s matching entry for the general lesson.
+  `Metric::AuthRotatedSecretUsed`/`AuthDenied`/`AuthUnknownKey`
+  (`animus-env`) were appended to the enum now so S-02 step 3 (allow-list
+  enforcement at dispatch) only has to wire them, not widen it — none of
+  the three are recorded yet. Tests: `tests/admin_endpoint.rs`'s
+  `admin_credentials_view_never_serves_a_secret` (the load-bearing
+  never-a-secret assertion, mirroring `admin_config_reports_auth_state_
+  and_never_serves_the_secret`'s own raw-body-string-search idiom),
+  `admin_credentials_put_rotate_revoke_round_trip` (the full life cycle,
+  including the rotate-idempotence-bug regression above), and
+  `admin_credentials_put_on_a_follower_is_relayed_to_the_leader` (the
+  `is_relayable_command` allowlist regression, mirroring
+  `schema_ddl_relay.rs`'s precedent for `SetTableTtl`/`TagResource`/etc.).
+
   **`GET /admin/health` — the Kubernetes readiness probe (ADR 0060) — reads
   a HYSTERESIS-gated leader belief, not the raw one (issue #595, ADR 0020's
   2026-09-04 amendment).** `ctx.control.leader().is_some()` (the raw

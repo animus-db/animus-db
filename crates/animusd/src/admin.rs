@@ -53,14 +53,20 @@
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
+//! - `GET  /admin/credentials`         — the replicated credential catalog: id, policy, enabled, rotation state — **never secrets** (ADR 0066 §6)
+//! - `POST /admin/credentials`         — `{id, secret, policy?, enabled?}` — create/redefine a credential (ADR 0066 §1/§2)
+//! - `POST /admin/credentials/rotate`  — `{id, new_secret, grace_secs}` — rotate a credential's secret with a dual-secret grace window
+//! - `POST /admin/credentials/revoke`  — `{id}` — revoke a credential outright
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use animus_control::ColumnType;
+use animus_control::MetaCommand;
 use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
+use animus_env::Clock;
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_node::host::AdminHost;
@@ -508,6 +514,18 @@ impl AdminHost for ClientCtx {
     async fn action_set_throttle_defaults(&self, body: &[u8]) -> (u16, Value) {
         action_set_throttle_defaults(self, body).await
     }
+    async fn credentials_view(&self) -> Value {
+        credentials_view(self)
+    }
+    async fn action_put_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_put_credential(self, body).await
+    }
+    async fn action_rotate_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_rotate_credential(self, body).await
+    }
+    async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value) {
+        action_revoke_credential(self, body).await
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
@@ -578,6 +596,14 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "auth_enabled": a.auth_enabled,
         "auth_access_key_ids": a.auth_access_key_ids,
         "otlp_endpoint": a.otlp_endpoint,
+        // ADR 0066 §6: the replicated credential catalog's current size —
+        // `auth_enabled` above already answers "is the static bootstrap map
+        // configured" (ADR 0057's own field, unchanged by this ADR), so
+        // this is the one new fact this catalog needs surfaced here rather
+        // than a duplicate boolean. Computed live from `meta`, never stored
+        // on `AdminInfo` — unlike every other field above, this one changes
+        // at runtime through the admin API, not only at node assembly.
+        "credentials_count": meta.credentials.len(),
     })
 }
 
@@ -1296,6 +1322,22 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // Presence-only (ADR 0059 §9: the value is always empty — the tag
         // row's existence is the fact), same convention as `IndexBackfill`.
         syskv::EntityKind::PitrBaseBackup => Value::Null,
+        // A `CredentialRow` (ADR 0066 §1) — **deliberately NOT** the plain
+        // `serde_json` passthrough every other JSON-encoded kind above
+        // uses: the raw value contains the secret (current and, mid-
+        // rotation, previous) in the clear, and this generic system-table
+        // browse must never render one, matching the dedicated `GET
+        // /admin/credentials` view's own redaction (ADR 0066 §6). Decodes
+        // the row and re-renders only its non-secret fields; a malformed
+        // value (defensive only — every real writer produces valid JSON
+        // here) renders as `null` rather than falling through to the raw
+        // bytes.
+        syskv::EntityKind::Credential => {
+            match serde_json::from_slice::<animus_control::CredentialRow>(value) {
+                Ok(row) => credential_row_redacted(&row),
+                Err(_) => Value::Null,
+            }
+        }
     }
 }
 
@@ -2497,6 +2539,316 @@ fn wal_record_json(r: &WalRecordView) -> Value {
         WalRecordView::MergeBatch { ops, max_version } => {
             json!({"type": "merge_batch", "ops": ops, "max_version": max_version})
         }
+    }
+}
+
+// ---- credential catalog (ADR 0066 §6, S-02 step 2) -----------------------
+
+/// Render one [`animus_control::CredentialRow`] with **no secret material
+/// at all** — never `secret`, never `previous.secret`. Shared by `GET
+/// /admin/credentials` and `system_table_value_display`'s own `Credential`
+/// arm, so there is exactly one place in this crate that decides what a
+/// credential row's admin-visible shape is.
+fn credential_row_redacted(row: &animus_control::CredentialRow) -> Value {
+    json!({
+        "enabled": row.enabled,
+        "policy": policy_json(&row.policy),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        // `rotation` is `null` outside a grace window — a caller checks
+        // `rotation != null` rather than `previous_valid_until` alone
+        // (which, absent a wrapper, could be confused with "0" or a stale
+        // reading of a field that isn't there).
+        "rotation": row.previous.as_ref().map(|p| json!({
+            "previous_valid_until": p.valid_until,
+        })),
+    })
+}
+
+/// Render a [`animus_control::Policy`] as its own small JSON shape — not
+/// `serde_json::to_value` on the type directly, so the wire shape is
+/// stable and human-readable regardless of how `animus_control::TableMatch`/
+/// `OpClass`'s own `#[derive(Serialize)]` happens to render (externally
+/// tagged enum JSON, not the friendliest shape for an operator or the CLI
+/// to read/build by hand).
+fn policy_json(policy: &animus_control::Policy) -> Value {
+    let tables = match &policy.tables {
+        animus_control::TableMatch::All => json!({"kind": "all"}),
+        animus_control::TableMatch::Names(names) => json!({"kind": "names", "names": names}),
+        animus_control::TableMatch::Prefixes(prefixes) => {
+            json!({"kind": "prefixes", "prefixes": prefixes})
+        }
+    };
+    json!({
+        "tables": tables,
+        "ops": policy.ops.iter().map(op_class_str).collect::<Vec<_>>(),
+    })
+}
+
+fn op_class_str(class: &animus_control::OpClass) -> &'static str {
+    match class {
+        animus_control::OpClass::Read => "read",
+        animus_control::OpClass::Write => "write",
+        animus_control::OpClass::Ddl => "ddl",
+        animus_control::OpClass::Streams => "streams",
+        animus_control::OpClass::Backup => "backup",
+        animus_control::OpClass::Admin => "admin",
+    }
+}
+
+/// The inverse of [`op_class_str`] — used only by [`parse_policy`] below.
+fn parse_op_class(s: &str) -> Option<animus_control::OpClass> {
+    Some(match s {
+        "read" => animus_control::OpClass::Read,
+        "write" => animus_control::OpClass::Write,
+        "ddl" => animus_control::OpClass::Ddl,
+        "streams" => animus_control::OpClass::Streams,
+        "backup" => animus_control::OpClass::Backup,
+        "admin" => animus_control::OpClass::Admin,
+        _ => return None,
+    })
+}
+
+/// The request-body shape [`policy_json`] renders, parsed back — the
+/// `{"tables": {"kind": "all"|"names"|"prefixes", ...}, "ops": [...]}`
+/// shape `animus-cli`'s `--policy-tables`/`--policy-ops` flags build.
+#[derive(Deserialize)]
+struct PolicyBody {
+    tables: PolicyTablesBody,
+    ops: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PolicyTablesBody {
+    kind: String,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    prefixes: Vec<String>,
+}
+
+/// Parse a [`PolicyBody`] into a real `animus_control::Policy`, or a `400`
+/// error response naming exactly what was wrong.
+fn parse_policy(body: PolicyBody) -> Result<animus_control::Policy, (u16, Value)> {
+    let tables = match body.tables.kind.as_str() {
+        "all" => animus_control::TableMatch::All,
+        "names" => animus_control::TableMatch::Names(body.tables.names.into_iter().collect()),
+        "prefixes" => {
+            animus_control::TableMatch::Prefixes(body.tables.prefixes.into_iter().collect())
+        }
+        other => {
+            return Err((
+                400,
+                json!({"error": format!("unknown policy.tables.kind `{other}` (expected all/names/prefixes)")}),
+            ));
+        }
+    };
+    let mut ops = std::collections::BTreeSet::new();
+    for op in &body.ops {
+        match parse_op_class(op) {
+            Some(class) => {
+                ops.insert(class);
+            }
+            None => {
+                return Err((
+                    400,
+                    json!({"error": format!("unknown policy op `{op}` (expected read/write/ddl/streams/backup/admin)")}),
+                ));
+            }
+        }
+    }
+    Ok(animus_control::Policy { tables, ops })
+}
+
+/// `GET /admin/credentials` (ADR 0066 §6) — every replicated credential
+/// catalog row, redacted. **Never a secret** — see
+/// [`credential_row_redacted`]'s own doc; regression:
+/// `tests/admin_endpoint.rs::admin_credentials_view_never_serves_a_secret`.
+fn credentials_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let rows: Vec<Value> = meta
+        .credentials
+        .iter()
+        .map(|(id, row)| {
+            let mut v = credential_row_redacted(row);
+            v["id"] = json!(id);
+            v
+        })
+        .collect();
+    json!({ "credentials": rows })
+}
+
+#[derive(Deserialize)]
+struct PutCredentialReq {
+    id: String,
+    secret: String,
+    #[serde(default)]
+    policy: Option<PolicyBody>,
+    #[serde(default = "default_credential_enabled")]
+    enabled: bool,
+}
+
+fn default_credential_enabled() -> bool {
+    true
+}
+
+/// `POST /admin/credentials {id, secret, policy?, enabled?}` (ADR 0066
+/// §1/§2/§6) — create or redefine a credential. `policy` defaults to
+/// [`animus_control::Policy::allow_all`] (the pre-S-02 "every table, every
+/// class but Admin" behaviour) when omitted. Proposes through the control
+/// plane exactly like `dynamo.rs::update_time_to_live` — relayed to the
+/// leader when this node isn't one — and commit-waits before answering, so
+/// a `200` means the row is genuinely durable and replicated, not merely
+/// accepted locally.
+async fn action_put_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: PutCredentialReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if req.id.is_empty() {
+        return (400, json!({"error": "`id` must not be empty"}));
+    }
+    let policy = match req.policy {
+        Some(p) => match parse_policy(p) {
+            Ok(policy) => policy,
+            Err(e) => return e,
+        },
+        None => animus_control::Policy::allow_all(),
+    };
+    let now = ctx.env.wall_now().0 / 1000;
+    let command_secret = animus_control::SecretKey::new(req.secret);
+    let command_policy = policy;
+    let command = MetaCommand::PutCredential {
+        id: req.id.clone(),
+        secret: command_secret.clone(),
+        policy: command_policy.clone(),
+        enabled: req.enabled,
+        now,
+    };
+    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&command).await;
+        let meta = ctx.metadata_fresh().await;
+        // The convergence check compares CONTENT (secret/policy/enabled),
+        // never `updated_at == now` alone — `now` is whole seconds
+        // (`CredentialRow::created_at`'s own doc), so a `Put` and a later
+        // `Rotate`/`Put` issued within the same wall-clock second can
+        // legitimately share the identical `now` value; a timestamp-only
+        // check can then spuriously match the row from *before* this
+        // specific command applied, on the very first poll, before the
+        // propose above has had any chance to take effect. Content
+        // equality has no such collision (see
+        // `docs/engineering-lessons.md`'s matching entry, and the sibling
+        // "a commit-wait must never pin a transient value" lesson this is
+        // an instance of).
+        if let Some(row) = meta.credential(&req.id)
+            && row.secret == command_secret
+            && row.policy == command_policy
+            && row.enabled == req.enabled
+        {
+            let mut v = credential_row_redacted(row);
+            v["id"] = json!(req.id);
+            return (200, v);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (
+                500,
+                json!({"error": "PutCredential did not commit to the control plane in time \
+                     (no leader reachable?)"}),
+            );
+        }
+        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct RotateCredentialReq {
+    id: String,
+    new_secret: String,
+    grace_secs: u64,
+}
+
+/// `POST /admin/credentials/rotate {id, new_secret, grace_secs}` (ADR 0066
+/// §2/§3/§6) — rotate a credential's secret with a dual-secret grace
+/// window; the same propose-then-commit-wait shape as
+/// [`action_put_credential`]. Rejected (`404`) against an unknown id —
+/// there is nothing to rotate, mirroring `MetaCommand::RotateCredential`'s
+/// own apply-time rejection.
+async fn action_rotate_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: RotateCredentialReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if ctx.metadata_fresh().await.credential(&req.id).is_none() {
+        return (
+            404,
+            json!({"error": format!("no such credential `{}`", req.id)}),
+        );
+    }
+    let now = ctx.env.wall_now().0 / 1000;
+    let command_new_secret = animus_control::SecretKey::new(req.new_secret);
+    let command = MetaCommand::RotateCredential {
+        id: req.id.clone(),
+        new_secret: command_new_secret.clone(),
+        grace_secs: req.grace_secs,
+        now,
+    };
+    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&command).await;
+        let meta = ctx.metadata_fresh().await;
+        // Content equality (the new current secret), never `updated_at ==
+        // now` alone — see `action_put_credential`'s matching comment for
+        // why a timestamp-only check can spuriously match pre-mutation
+        // state when two commands share the same whole-second `now`.
+        if let Some(row) = meta.credential(&req.id)
+            && row.secret == command_new_secret
+        {
+            let mut v = credential_row_redacted(row);
+            v["id"] = json!(req.id);
+            return (200, v);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (
+                500,
+                json!({"error": "RotateCredential did not commit to the control plane in time \
+                     (no leader reachable?)"}),
+            );
+        }
+        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct RevokeCredentialReq {
+    id: String,
+}
+
+/// `POST /admin/credentials/revoke {id}` (ADR 0066 §2/§6) — revoke a
+/// credential outright; the same propose-then-commit-wait shape as
+/// [`action_put_credential`]. Idempotent — revoking an already-absent id
+/// is a `200`, not an error, mirroring `MetaCommand::RevokeCredential`'s
+/// own no-op-on-repeat semantics.
+async fn action_revoke_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: RevokeCredentialReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let command = MetaCommand::RevokeCredential { id: req.id.clone() };
+    let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&command).await;
+        if ctx.metadata_fresh().await.credential(&req.id).is_none() {
+            return (200, json!({"ok": true, "id": req.id}));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (
+                500,
+                json!({"error": "RevokeCredential did not commit to the control plane in time \
+                     (no leader reachable?)"}),
+            );
+        }
+        tokio::time::sleep(crate::dynamo::SCHEMA_POLL_INTERVAL).await;
     }
 }
 

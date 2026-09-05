@@ -485,6 +485,19 @@ sub-rungs below shipped.
   `crate::dashboard`-owned `include_str!` constants no `AdminHost` method
   has a reason to carry).
 
+  **`AdminHost` gained four more methods post-rung, for ADR 0066 (S-02 step
+  2)**: `credentials_view`/`action_put_credential`/
+  `action_rotate_credential`/`action_revoke_credential`, backing
+  `GET /admin/credentials`/`POST /admin/credentials`/`/rotate`/`/revoke` —
+  added the same way and at the same granularity as every route above (one
+  method per route, returning the exact shape the route produces); `impl
+  AdminHost for ClientCtx` in `animusd::admin` delegates to that file's own
+  handler functions, which propose through the control plane and
+  commit-wait exactly like a DDL mutation (see that crate's own CLAUDE.md
+  entry). `admin::tests::FakeHost` and `dispatch`'s routing table both
+  needed the four new arms too — the trait has no default methods, so a
+  missing impl is a compile error here, not a silent gap.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an

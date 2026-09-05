@@ -155,6 +155,11 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     key <admin-addr> <key> [tablet]\n    \
     storage-scan <admin-addr> [--tablet <id>] [--start <key>] [--limit <n>]\n    \
     system-table <admin-addr> [--kind <kind>] [--limit <n>] [--after <cursor>]\n    \
+    credentials <admin-addr>\n    \
+    credentials-put <admin-addr> <id> <secret> [--enabled true|false] \
+    [--policy-tables all|name1,name2|prefix:pfx1,pfx2] [--policy-ops read,write,ddl,streams,backup]\n    \
+    credentials-rotate <admin-addr> <id> <new-secret> <grace-secs>\n    \
+    credentials-revoke <admin-addr> <id>\n    \
     split <admin-addr> <tablet> <split-key>\n    \
     stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
@@ -433,8 +438,98 @@ fn admin_request(
             let body = serde_json::json!({"node": node}).to_string();
             ("POST", "/admin/member/remove".into(), Some(body))
         }
+        // The replicated credential catalog (ADR 0066 §1/§2/§6) — never
+        // echoes a secret in its own output; see `print_response`/
+        // `http_call`'s plain "print the server's JSON verbatim" contract,
+        // which is safe here precisely because `GET /admin/credentials`'s
+        // own response never carries one (`animusd::admin::
+        // credential_row_redacted`).
+        "credentials" => ("GET", "/admin/credentials".into(), None),
+        "credentials-put" => {
+            let id = arg(2).ok_or("credentials-put needs <id>")?;
+            let secret = arg(3).ok_or("credentials-put needs <secret>")?;
+            let enabled: bool = match flag_value(args, "--enabled") {
+                Some(v) => v
+                    .parse()
+                    .map_err(|_| "--enabled must be `true` or `false`")?,
+                None => true,
+            };
+            let mut body = serde_json::json!({"id": id, "secret": secret, "enabled": enabled});
+            if let Some(policy) = build_policy_body(args)? {
+                body["policy"] = policy;
+            }
+            ("POST", "/admin/credentials".into(), Some(body.to_string()))
+        }
+        "credentials-rotate" => {
+            let id = arg(2).ok_or("credentials-rotate needs <id>")?;
+            let new_secret = arg(3).ok_or("credentials-rotate needs <new-secret>")?;
+            let grace_secs: u64 = arg(4)
+                .ok_or("credentials-rotate needs <grace-secs>")?
+                .parse()
+                .map_err(|_| "grace-secs must be a number")?;
+            let body = serde_json::json!({
+                "id": id,
+                "new_secret": new_secret,
+                "grace_secs": grace_secs,
+            })
+            .to_string();
+            ("POST", "/admin/credentials/rotate".into(), Some(body))
+        }
+        "credentials-revoke" => {
+            let id = arg(2).ok_or("credentials-revoke needs <id>")?;
+            let body = serde_json::json!({"id": id}).to_string();
+            ("POST", "/admin/credentials/revoke".into(), Some(body))
+        }
         other => return Err(format!("unknown admin subcommand `{other}`")),
     })
+}
+
+/// Build the `{"tables": {"kind": ..., ...}, "ops": [...]}` policy body
+/// `animusd`'s `POST /admin/credentials` expects (ADR 0066 §1/§6) from
+/// `--policy-tables`/`--policy-ops` — `Ok(None)` when neither flag is
+/// given (the server then defaults to `Policy::allow_all()`). Giving only
+/// one flag fills the other in with its own `allow_all()`-shaped default
+/// (every table, or every class but `admin`) rather than requiring both —
+/// an operator narrowing just one axis shouldn't have to spell out the
+/// other. `--policy-tables` is `all` (every table), a bare comma-separated
+/// list of exact table names, or `prefix:` followed by a comma-separated
+/// list of prefixes; `--policy-ops` is a comma-separated list of
+/// `read`/`write`/`ddl`/`streams`/`backup`/`admin`.
+fn build_policy_body(args: &[String]) -> Result<Option<serde_json::Value>, String> {
+    let tables_flag = flag_value(args, "--policy-tables");
+    let ops_flag = flag_value(args, "--policy-ops");
+    if tables_flag.is_none() && ops_flag.is_none() {
+        return Ok(None);
+    }
+    let tables = match tables_flag {
+        None | Some("all") => serde_json::json!({"kind": "all"}),
+        Some(v) if v.starts_with("prefix:") => {
+            let prefixes: Vec<&str> = v
+                .trim_start_matches("prefix:")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if prefixes.is_empty() {
+                return Err("--policy-tables prefix:... needs at least one prefix".into());
+            }
+            serde_json::json!({"kind": "prefixes", "prefixes": prefixes})
+        }
+        Some(v) => {
+            let names: Vec<&str> = v.split(',').filter(|s| !s.is_empty()).collect();
+            if names.is_empty() {
+                return Err("--policy-tables needs at least one table name".into());
+            }
+            serde_json::json!({"kind": "names", "names": names})
+        }
+    };
+    let ops: Vec<&str> = match ops_flag {
+        None => vec!["read", "write", "ddl", "streams", "backup"],
+        Some(v) => v.split(',').filter(|s| !s.is_empty()).collect(),
+    };
+    if ops.is_empty() {
+        return Err("--policy-ops needs at least one op".into());
+    }
+    Ok(Some(serde_json::json!({"tables": tables, "ops": ops})))
 }
 
 /// Look up a `--name value` pair anywhere in `args` (order-independent,
@@ -1072,6 +1167,149 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_an_error() {
         assert!(admin_request("no-such-thing", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn credentials_list_is_a_flat_get() {
+        let (method, path, body) = admin_request("credentials", &args(&[])).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/admin/credentials");
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn credentials_put_defaults_enabled_true_and_omits_policy() {
+        let (method, path, body) =
+            admin_request("credentials-put", &args(&["AKID1", "s3cr3t"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/credentials");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["id"], "AKID1");
+        assert_eq!(v["secret"], "s3cr3t");
+        assert_eq!(v["enabled"], true);
+        assert!(v.get("policy").is_none(), "no policy flags given");
+    }
+
+    #[test]
+    fn credentials_put_never_echoes_the_secret_in_the_path() {
+        // The secret must travel only in the POST body, never the URL (which
+        // could end up in a proxy/access log) — a cheap regression against a
+        // future refactor that moves it into a query string by mistake.
+        let (_, path, _) = admin_request("credentials-put", &args(&["AKID1", "s3cr3t"])).unwrap();
+        assert!(!path.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn credentials_put_disabled_flag() {
+        let (_, _, body) = admin_request(
+            "credentials-put",
+            &args(&["AKID1", "s3cr3t", "--enabled", "false"]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["enabled"], false);
+    }
+
+    #[test]
+    fn credentials_put_invalid_enabled_flag_is_an_error() {
+        assert!(
+            admin_request(
+                "credentials-put",
+                &args(&["AKID1", "s3cr3t", "--enabled", "maybe"]),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn credentials_put_policy_tables_all() {
+        let (_, _, body) = admin_request(
+            "credentials-put",
+            &args(&[
+                "AKID1",
+                "s3cr3t",
+                "--policy-tables",
+                "all",
+                "--policy-ops",
+                "read,write",
+            ]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["policy"]["tables"], serde_json::json!({"kind": "all"}));
+        assert_eq!(v["policy"]["ops"], serde_json::json!(["read", "write"]));
+    }
+
+    #[test]
+    fn credentials_put_policy_tables_names() {
+        let (_, _, body) = admin_request(
+            "credentials-put",
+            &args(&[
+                "AKID1",
+                "s3cr3t",
+                "--policy-tables",
+                "orders,customers",
+                "--policy-ops",
+                "read",
+            ]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["policy"]["tables"],
+            serde_json::json!({"kind": "names", "names": ["orders", "customers"]})
+        );
+    }
+
+    #[test]
+    fn credentials_put_policy_tables_prefix() {
+        let (_, _, body) = admin_request(
+            "credentials-put",
+            &args(&[
+                "AKID1",
+                "s3cr3t",
+                "--policy-tables",
+                "prefix:tenant-a-,tenant-b-",
+            ]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["policy"]["tables"],
+            serde_json::json!({"kind": "prefixes", "prefixes": ["tenant-a-", "tenant-b-"]})
+        );
+        // `--policy-ops` was omitted: defaults to the `allow_all()` shape.
+        assert_eq!(
+            v["policy"]["ops"],
+            serde_json::json!(["read", "write", "ddl", "streams", "backup"])
+        );
+    }
+
+    #[test]
+    fn credentials_rotate_body() {
+        let (method, path, body) =
+            admin_request("credentials-rotate", &args(&["AKID1", "newsecret", "3600"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/credentials/rotate");
+        assert_eq!(
+            body,
+            Some(r#"{"grace_secs":3600,"id":"AKID1","new_secret":"newsecret"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn credentials_rotate_needs_a_numeric_grace_secs() {
+        assert!(
+            admin_request("credentials-rotate", &args(&["AKID1", "newsecret", "soon"]),).is_err()
+        );
+    }
+
+    #[test]
+    fn credentials_revoke_body() {
+        let (method, path, body) = admin_request("credentials-revoke", &args(&["AKID1"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/credentials/revoke");
+        assert_eq!(body, Some(r#"{"id":"AKID1"}"#.to_string()));
     }
 
     #[test]

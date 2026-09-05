@@ -1577,3 +1577,228 @@ async fn admin_config_reports_auth_state_and_never_serves_the_secret() {
     .await
     .expect("test timed out");
 }
+
+// --- ADR 0066: the replicated credential catalog's admin CRUD -------------
+
+/// `POST /admin/credentials` → `GET /admin/credentials`: the row commits and
+/// is visible, redacted, with no secret anywhere in the raw response —
+/// mirroring `admin_config_reports_auth_state_and_never_serves_the_secret`'s
+/// own load-bearing assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_credentials_view_never_serves_a_secret() {
+    timeout(Duration::from_secs(30), async {
+        const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+        const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        let put_body =
+            serde_json::json!({"id": ACCESS_KEY_ID, "secret": SECRET, "enabled": true}).to_string();
+        let (status, put_resp) =
+            admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {put_resp}");
+        assert_eq!(put_resp["id"], ACCESS_KEY_ID);
+        assert_eq!(put_resp["enabled"], true);
+        assert_eq!(put_resp["rotation"], Value::Null);
+
+        let (status, view) = admin_get(admin_addr, "/admin/credentials").await;
+        assert_eq!(status, 200, "credentials view: {view}");
+        let rows = view["credentials"].as_array().expect("credentials array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], ACCESS_KEY_ID);
+
+        // The load-bearing assertion: the secret never leaves this node's
+        // admin surface, in this field or any other, on either response.
+        let raw_put = serde_json::to_string(&put_resp).expect("put_resp serializes");
+        let raw_view = serde_json::to_string(&view).expect("view serializes");
+        assert!(
+            !raw_put.contains(SECRET),
+            "PutCredential's own response must never echo the secret: {raw_put}"
+        );
+        assert!(
+            !raw_view.contains(SECRET),
+            "GET /admin/credentials must never serve a secret: {raw_view}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// The full `Put`/`Rotate`/`Revoke` life cycle through the admin API,
+/// including the redacted rotation-grace-window fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_credentials_put_rotate_revoke_round_trip() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // Put — a scoped policy, not allow_all, to prove policy round-trips.
+        let put_body = serde_json::json!({
+            "id": "AKID1",
+            "secret": "s0",
+            "policy": {
+                "tables": {"kind": "names", "names": ["orders"]},
+                "ops": ["read", "write"],
+            },
+            "enabled": true,
+        })
+        .to_string();
+        let (status, put_resp) =
+            admin(admin_addr, "POST", "/admin/credentials", Some(&put_body)).await;
+        assert_eq!(status, 200, "PutCredential: {put_resp}");
+        assert_eq!(
+            put_resp["policy"]["tables"],
+            serde_json::json!({"kind": "names", "names": ["orders"]})
+        );
+        assert_eq!(
+            put_resp["policy"]["ops"],
+            serde_json::json!(["read", "write"])
+        );
+
+        // Rotate — a grace window opens; `rotation` is non-null.
+        let rotate_body =
+            serde_json::json!({"id": "AKID1", "new_secret": "s1", "grace_secs": 3600}).to_string();
+        let (status, rotate_resp) = admin(
+            admin_addr,
+            "POST",
+            "/admin/credentials/rotate",
+            Some(&rotate_body),
+        )
+        .await;
+        assert_eq!(status, 200, "RotateCredential: {rotate_resp}");
+        assert!(
+            !rotate_resp["rotation"].is_null(),
+            "a grace window should be open right after rotating: {rotate_resp}"
+        );
+        assert!(rotate_resp["rotation"]["previous_valid_until"].is_u64());
+
+        // Rotating an unknown id is rejected.
+        let (status, err) = admin(
+            admin_addr,
+            "POST",
+            "/admin/credentials/rotate",
+            Some(
+                &serde_json::json!({"id": "no-such-id", "new_secret": "x", "grace_secs": 1})
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 404, "unknown id rotate: {err}");
+
+        // Revoke — the row disappears; revoking again is idempotent (still
+        // 200).
+        let revoke_body = serde_json::json!({"id": "AKID1"}).to_string();
+        let (status, revoke_resp) = admin(
+            admin_addr,
+            "POST",
+            "/admin/credentials/revoke",
+            Some(&revoke_body),
+        )
+        .await;
+        assert_eq!(status, 200, "RevokeCredential: {revoke_resp}");
+        let (status, view) = admin_get(admin_addr, "/admin/credentials").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            view["credentials"].as_array().map(Vec::len),
+            Some(0),
+            "revoked credential should be gone: {view}"
+        );
+        let (status, revoke_again) = admin(
+            admin_addr,
+            "POST",
+            "/admin/credentials/revoke",
+            Some(&revoke_body),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "repeated revoke should be idempotent, not an error: {revoke_again}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A `PutCredential` issued against a **follower's** admin port relays to
+/// the control-plane leader and replicates to every node — the
+/// `is_relayable_command` allowlist regression this catalog's own commands
+/// need, mirroring `schema_ddl_relay.rs`'s precedent (the bimodal
+/// per-process flake the root `CLAUDE.md` warns a missed allowlist entry
+/// causes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_credentials_put_on_a_follower_is_relayed_to_the_leader() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+        let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+        let follower_admin = nodes[follower].admin_addr();
+
+        let put_body =
+            serde_json::json!({"id": "AKID-FOLLOWER", "secret": "s0", "enabled": true}).to_string();
+        // Retry while a leader settles/moves, exactly like the DDL relay
+        // regression this mirrors.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, resp) = admin(
+                follower_admin,
+                "POST",
+                "/admin/credentials",
+                Some(&put_body),
+            )
+            .await;
+            if status == 200 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "PutCredential via a follower-connected admin port never committed: {resp}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // Every node — leader and followers alike — converges on the same
+        // catalog.
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let mut all_present = true;
+                for node in &nodes {
+                    let (status, view) = admin_get(node.admin_addr(), "/admin/credentials").await;
+                    let has_it = status == 200
+                        && view["credentials"]
+                            .as_array()
+                            .is_some_and(|rows| rows.iter().any(|r| r["id"] == "AKID-FOLLOWER"));
+                    if !has_it {
+                        all_present = false;
+                        break;
+                    }
+                }
+                if all_present {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("credential relayed via a follower did not replicate to every node in time");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

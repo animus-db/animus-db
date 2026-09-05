@@ -326,4 +326,16 @@ pub trait AdminHost: Send + Sync {
     /// `CreateTable` config surface through instead. See that method's own
     /// doc for the full "step 4 should replace this" note.
     async fn action_set_throttle_defaults(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/credentials` (ADR 0066 §6) — the replicated credential
+    /// catalog, redacted: never a secret, current or previous.
+    async fn credentials_view(&self) -> Value;
+    /// `POST /admin/credentials` (ADR 0066 §1/§2) — create or redefine a
+    /// credential.
+    async fn action_put_credential(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/credentials/rotate` (ADR 0066 §2/§3) — rotate a
+    /// credential's secret with a dual-secret grace window.
+    async fn action_rotate_credential(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/credentials/revoke` (ADR 0066 §2) — revoke a credential
+    /// outright.
+    async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value);
 }

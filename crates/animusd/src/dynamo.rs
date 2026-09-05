@@ -193,11 +193,14 @@ use crate::write_path::KindEvalApplied;
 use crate::{ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
-/// the replicated catalog before giving up.
-const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// the replicated catalog before giving up. `pub(crate)` since `credentials.rs`
+/// (ADR 0066 §6) reuses the identical propose-then-commit-wait shape for
+/// `PutCredential`/`RotateCredential`/`RevokeCredential`.
+pub(crate) const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often `CreateTable` re-checks (and re-proposes against the current leader)
-/// while waiting for the schema to commit.
-const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// while waiting for the schema to commit. `pub(crate)` — see
+/// [`SCHEMA_COMMIT_TIMEOUT`]'s own doc.
+pub(crate) const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Max actions per `TransactWriteItems` request / keys per `TransactGetItems`
 /// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
