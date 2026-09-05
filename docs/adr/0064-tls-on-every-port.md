@@ -1,11 +1,13 @@
 # ADR 0064 — TLS on every port
 
-- **Status:** Proposed — commits 1 and 2 of 4 (`S-01`) implemented: mutual
-  TLS on the intra-node wire inside `ProdEnv` (commit 1), and TLS on every
+- **Status:** Proposed — commits 1–3 of 4 (`S-01`) implemented: mutual
+  TLS on the intra-node wire inside `ProdEnv` (commit 1); TLS on every
   `animusd` listener and dialer — client, intra-`ClientRequest`, admin,
   console — plus `animus-cli`'s client-protocol and admin dials (commit
-  2), both config-gated, default off. Commits 3–4 (operator cert-manager
-  wiring, website/closing notes) are not yet built.
+  2); and the Kubernetes operator's cert-manager `Certificate`/`Secret`
+  wiring plus its admin client's TLS connector (commit 3) — all
+  config-gated, default off. Commit 4 (website/closing notes) is not yet
+  built.
 - **Date:** 2026-09-05
 - **Amends:** [ADR 0047](0047-intra-node-port.md) (port classes — TLS is
   orthogonal to the internal/intra/client/admin/console split that ADR
@@ -377,7 +379,8 @@ specifics worth recording:
 - **What stays plain**: `cluster_bench` (the wire benchmark) is untouched
   — a deliberate scope cut, not an oversight; benchmarking the TLS
   handshake/record-layer cost is a follow-up if ever needed.
-  `animus-operator`'s admin client is commit 3's job.
+  `animus-operator`'s admin client was commit 3's job (see that
+  amendment note below).
 - **Tests**: `crates/animus-env/src/prod.rs`'s
   `server_only_acceptor_accepts_a_client_with_no_certificate` (commit 1's
   file, since `TlsMaterial::server_acceptor` is that crate's own type);
@@ -391,3 +394,97 @@ specifics worth recording:
   mixed-config validation error); config round-trip + `validate_tls` unit
   tests in `config.rs`; flag-parsing/conflict unit tests in `main.rs`; and
   parser + connector-construction unit tests in `animus-cli`.
+
+## Amendment note (commit 3 landed, 2026-09-05)
+
+Commit 3 (S-01 step 3) gives `animus-operator` (ADR 0060) something to
+point at commits 1–2's TLS-capable `animusd`: `AnimusClusterSpec.tls`, a
+`cert-manager.io/v1` `Certificate` builder, the `StatefulSet`/
+`ClusterConfig` mirror wiring, and a TLS-capable admin client for the
+scale-down drain sequence — no further design change to Decisions 1–7
+above. As-built specifics worth recording:
+
+- **CRD shape**: `AnimusClusterSpec.tls: Option<TlsSpec>`
+  (`crates/animus-operator/src/crd.rs`), two mutually exclusive shapes —
+  `secretName: String` (a pre-existing `kubernetes.io/tls` `Secret`) or
+  `certManager: { issuerRef: { name, kind, group? }, duration?,
+  renewBefore? }` — validated by `TlsSpec::validate` at reconcile time (no
+  admission webhook in v1, same posture as `controlNodes`' immutability
+  check): both or neither set is rejected with a `TlsSpecInvalid` status
+  condition, and that reconcile proceeds with TLS stripped rather than
+  getting stuck. Both shapes resolve to the same `Secret` name
+  (`TlsSpec::secret_name_or_default` — the explicit `secretName`, or
+  `{cluster}-tls` for `certManager`).
+- **One shared cert, not per-pod.** Every pod mounts the identical
+  resolved `Secret` at `/etc/animus/tls` (`desired::statefulset::build`,
+  mirroring the pre-existing `dynamo_auth` mount pattern) and every node's
+  generated `cluster.json` gets the identical `RoleAddrs.tls`
+  (`desired::cluster_config::{TlsSection, tls_section}`), pointing at
+  `/etc/animus/tls/{tls.crt,tls.key,ca.crt}` — baked into the config file,
+  not per-pod `--tls-*` flags, which is what makes `ClusterConfig::
+  validate_tls`'s whole-*file* check (commit 2's own as-built note) apply
+  cleanly here: this operator always generates one `--config FILE --node
+  I` config carrying every node's own `tls` section up front. This
+  departs from commit 2's "TLS material is inherently per-node" framing in
+  the letter but not the substance: nothing stops every pod legitimately
+  presenting the *same* certificate (its SAN list already has to cover
+  every ordinal for cross-node dialing to work at all, so a per-pod split
+  would shrink no SAN list, only multiply objects to manage) — see
+  `crd::TlsSpec`'s own doc.
+- **The `Certificate`, only for `certManager`.** `desired::certificate::
+  build` returns `None` for the `secretName` shape (nothing to create —
+  the operator only *reads* that `Secret`) and for no TLS at all; for
+  `certManager` it builds a `cert-manager.io/v1` `Certificate` (a `kube::
+  core::DynamicObject`, since that API group isn't in `k8s-openapi`) named
+  `{cluster}-tls`, `secretName: {cluster}-tls`, `usages: [server auth,
+  client auth]`, `isCA: false`, and a `dnsNames` list
+  (`desired::certificate::dns_names`) covering every pod's own stable
+  per-ordinal FQDN plus both the headless internal `Service` and the
+  client-facing `dynamo` `Service` (short and fully-qualified forms of
+  each) — satisfying Decision 7's SAN requirement for every string a peer
+  (or a client) might dial by. Applied as a sixth `apply_children` child,
+  before the `StatefulSet`; the referenced `Issuer`/`ClusterIssuer` is
+  never created by this operator, matching Decision 6's "no CA-issuance
+  logic lives in this codebase."
+- **The admin client's TLS connector is a small independent one, not a
+  shared crate.** `animus-operator` depends on neither `animus-env` nor
+  `animus-cli` (a standing constraint, see that crate's own `CLAUDE.md`),
+  and `hyper-util`'s legacy `Client` needs a connector shaped as a
+  `tower_service::Service<Uri>` — a different shape than either
+  `MaybeTlsStream` (an `AsyncRead+AsyncWrite` enum) or `animus-cli`'s own
+  connector build. `admin_client.rs` grew `AdminConnector`/`MaybeTlsIo`
+  (the same plain-or-TLS-stream shape, implemented against `hyper-util`'s
+  own `Connect`/`Connection` traits instead) and `AdminOps::post_json`/
+  `get_json` grew a `ca_pem: Option<&[u8]>` parameter — `Some` dials TLS
+  trusting those CA bytes (server-only, no client cert — this crate never
+  joins the cluster), `None` plain TCP. `crate::controller::reconcile`
+  reads the resolved `Secret`'s `ca.crt` via a new `ClusterApi::
+  get_secret` (RBAC `secrets: get/list/watch`,
+  `deploy/operator/rbac.yaml`) — the Kubernetes API, not a file mounted
+  into the *operator's own* pod, which is what makes this work identically
+  whether the operator runs in-cluster
+  (`deploy/operator/deployment.yaml`) or out-of-cluster via `cargo run -p
+  animus-operator -- run` against a local kubeconfig (what
+  `scripts/e2e-kind.sh` does — see ADR 0060's own "no `Env` seam" framing
+  for why this crate is production-only wiring either way).
+- **e2e**: `scripts/e2e-kind.sh` gained an `E2E_TLS=1` path (cert-manager
+  install, a self-signed `ClusterIssuer`, `spec.tls.certManager` on the
+  manifest, waiting on the `Certificate`'s own `Ready` condition, then
+  `curl --cacert --resolve` against the dynamo Service's own SAN instead
+  of plain HTTP) and `.github/workflows/e2e-kind.yml` gained a second job,
+  `e2e-kind-tls`, running it. **Unverified in this repository's sandboxed
+  dev environment** — `kind` cannot come up here at all regardless of
+  anything TLS-specific (see `crates/animus-operator/CLAUDE.md`'s e2e
+  section, the `CAP_SYS_RESOURCE` note) — so this path is new, carefully
+  written, `bash -n`-checked code that has not been run end to end
+  anywhere yet; the first real CI run of `e2e-kind-tls` is this path's
+  first real test, per the Testing expectation section above.
+- **Tests**: `crd::tests` (both/neither-shape rejection, secret-name
+  resolution); `desired::certificate::tests` (SAN list, GVK/name,
+  issuerRef/usages/isCA, duration/renewBefore pass-through, owner
+  reference); `desired::cluster_config::tests`/`desired::statefulset::
+  tests` (the `tls` section/mount present and byte-identical across every
+  node, absent when unset); `controller::tests` (a `Certificate` applied
+  as a sixth child for `certManager` and none for `secretName`; both/
+  neither rejected with `TlsSpecInvalid`; the scale-down drain sequence
+  reading a seeded `Secret`'s `ca.crt` and dialing `https://`).

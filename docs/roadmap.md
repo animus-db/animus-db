@@ -127,28 +127,25 @@ the still-true paragraph after the table.
 
 ### S-01 TLS on every port
 
-- **Gap:** client, admin, console still plaintext. **Intra-node closed**:
-  mutual TLS on the raw Raft wire inside `ProdEnv` landed (commit 1,
-  [ADR 0064](adr/0064-tls-on-every-port.md)), config-gated and default off
-  — `ProdEnv::bind` is unchanged; `ProdEnv::bind_with_tls` is the new,
-  general entry point.
-- **Plan:** `rustls` (already in the workspace via `kube`, `ring`
-  provider). Wrap `TcpListener::accept()` streams in a `TlsAcceptor` at
-  `Node::bind`/`bind_control`/`bind_data` (`lib.rs:4184,4237,4275`) and
-  `serve_requests` (~8612); wrap `ProdEnv`'s outbound dial in a
-  `TlsConnector`. The intra wire sits inside `ProdEnv`, so `Network` does
-  not change; the client/admin/console listeners live in `animusd` outside
-  the seam. Operator: cert-manager `Certificate`/`Issuer` + volume mounts +
-  `ClusterConfig` cert-path fields.
-- **Tests:** `prod::tests` loopback for intra (**done** — TLS `bound_pair`,
-  different-CA rejection, plain-dial-into-TLS-listener, reconnect after
-  restart); a TLS variant of each real-listener `animusd` test
-  (`prod`-feature-gated real-thread tests, commit 2).
+- **Gap:** closed through commit 3 — client/intra: mutual on
+  `internal`/`intra`, server-only on `client`/`dynamo`/`admin`/`console`
+  (commits 1–2, [ADR 0064](adr/0064-tls-on-every-port.md)); the Kubernetes
+  operator's `spec.tls` (a pre-existing `Secret` or a cert-manager
+  `Certificate`) plus its admin client's TLS connector (commit 3) —
+  config-gated and default off throughout. Only commit 4 (ADR closing note
+  + website "Planned" pill removal) remains.
+- **Tests:** `prod::tests` loopback for intra (commit 1); a TLS variant of
+  each real-listener `animusd` test, `tests/tls_e2e.rs` (commit 2);
+  `animus-operator`'s `desired::certificate`/`cluster_config`/`statefulset`
+  builder tests + `controller::tests`' TLS cases, plus an unverified-in-
+  sandbox `E2E_TLS=1` `kind` e2e path (commit 3).
 - **ADR:** **yes, [0064](adr/0064-tls-on-every-port.md)** — crosses ADR
-  0047, 0057, 0060; commit 1 implemented, commits 2–4 still to come.
+  0047, 0057, 0060; commits 1–3 implemented, commit 4 (closing note) still
+  to come.
 - **PRs:** (1) intra/`ProdEnv` with file certs — **done**; (2)
-  client/admin/console listeners; (3) operator cert-manager wiring; (4)
-  ADR closing note + website "Planned" pill. **Size:** L.
+  client/admin/console listeners — **done**; (3) operator cert-manager
+  wiring — **done**; (4) ADR closing note + website "Planned" pill.
+  **Size:** L.
 
 ### S-02 SigV4 hardening (ADR 0057 follow-on)
 
@@ -225,8 +222,11 @@ the still-true paragraph after the table.
   `control/member/add` against a pod's admin port, mirroring
   `drain_and_remove_node`; extend `scripts/e2e-kind.sh` with a
   control-grow step. Size L.
-- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert,
-  so after S-01. Size L.
+- **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
+  S-01 commit 3 (ADR 0064) already gives this crate a cert-manager
+  `Certificate` builder and CRD shape (`spec.tls.certManager`) a webhook's
+  own cert-issuance could reuse the same pattern from; still sequenced
+  after S-01 closes (commit 4) rather than started early. Size L.
 - **ADR:** amend 0060 for a–c; d and e get their own section or a new
   number if the webhook design grows.
 

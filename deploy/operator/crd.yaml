@@ -22,12 +22,14 @@ spec:
             properties:
               autoSplitBytes:
                 description: |-
-                  **Not currently wired into `entrypoint.sh`** — `animusd`'s
-                  `--config FILE --node I` invocation (what every pod in this
-                  deployment shape runs) does not accept `--auto-split-bytes` today;
-                  that flag exists only on the dev-only `--cluster N` in-process mode.
-                  Kept on the spec for forward compatibility and documented loudly
-                  here and in the crate guide rather than silently dropped.
+                  The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
+                  **S-06**: like `quiesce_after_secs` above, now emitted into the
+                  generated `cluster.json`'s `cluster_settings.auto_split_bytes`
+                  section rather than a CLI flag — `--auto-split-bytes` itself only
+                  ever existed on the dev-only `--cluster N` in-process mode, so this
+                  field went from **never wired into `entrypoint.sh` at all** to
+                  reaching every pod (combined and data-role) through the config file
+                  instead.
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -84,8 +86,14 @@ spec:
                 type: integer
               quiesceAfterSecs:
                 description: |-
-                  `--quiesce-after SECS` (combined-role pods only — see
-                  `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table).
+                  The idle-before-quiescing grace period for a data-plane CP group
+                  (ADR 0044 phase-1 / ADR 0048). **S-06**: emitted into the generated
+                  `cluster.json`'s `cluster_settings.quiesce_after_secs` section
+                  (`desired::cluster_config::build_cluster_config`), not a CLI flag —
+                  this now applies to **every** pod, combined and data-role alike (an
+                  `animusd` data-only node had no route to quiescence at all before
+                  S-06 closed that gap; see `crates/animus-operator/CLAUDE.md`'s
+                  CLI-flag-support table for the full before/after picture).
                 format: uint64
                 minimum: 0.0
                 nullable: true
@@ -151,6 +159,68 @@ spec:
                     description: |-
                       `StorageClassName` for the PVC. Omitted lets the cluster default
                       apply.
+                    nullable: true
+                    type: string
+                type: object
+              tls:
+                description: |-
+                  TLS material for the cluster (ADR 0064 commit 3). `None` (default)
+                  keeps every pod on plain TCP, byte-for-byte the pre-existing
+                  behavior. See [`TlsSpec`]'s own doc for the two mutually exclusive
+                  shapes and how the resolved `Secret` is mounted/wired.
+                nullable: true
+                properties:
+                  certManager:
+                    description: |-
+                      Have cert-manager issue and renew the cluster's cert via a
+                      `Certificate` resource this operator creates and owns (`crate::
+                      desired::certificate::build`). Mutually exclusive with `secretName`.
+                    nullable: true
+                    properties:
+                      duration:
+                        description: |-
+                          `Certificate.spec.duration` (e.g. `"2160h"`), passed through
+                          verbatim. Omitted lets cert-manager/the issuer apply its own
+                          default.
+                        nullable: true
+                        type: string
+                      issuerRef:
+                        description: |-
+                          `spec.tls.certManager.issuerRef` — mirrors cert-manager's own
+                          `ObjectReference` shape (`name`/`kind`/`group`).
+                        properties:
+                          group:
+                            description: |-
+                              `Certificate.spec.issuerRef.group` — omitted lets cert-manager
+                              apply its own default (`cert-manager.io`).
+                            nullable: true
+                            type: string
+                          kind:
+                            default: Issuer
+                            description: |-
+                              `"Issuer"` (namespace-scoped) or `"ClusterIssuer"`. Defaults to
+                              `"Issuer"`, matching cert-manager's own default when `kind` is
+                              omitted from a `Certificate`'s `issuerRef`.
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      renewBefore:
+                        description: |-
+                          `Certificate.spec.renewBefore` (e.g. `"360h"`), passed through
+                          verbatim.
+                        nullable: true
+                        type: string
+                    required:
+                    - issuerRef
+                    type: object
+                  secretName:
+                    description: |-
+                      Name of a pre-existing `Secret` (same namespace, `kubernetes.io/tls`
+                      shape: `tls.crt`/`tls.key`/`ca.crt`) an operator user issued and
+                      placed by hand. Mutually exclusive with `certManager`.
                     nullable: true
                     type: string
                 type: object

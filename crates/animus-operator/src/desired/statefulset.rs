@@ -15,7 +15,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::cluster_config::{
-    CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENTRYPOINT_FILE_NAME,
+    CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENTRYPOINT_FILE_NAME, TLS_MOUNT_DIR,
 };
 use super::{
     common_labels, config_map_name, internal_service_name, owner_reference, selector_labels,
@@ -60,6 +60,7 @@ const DEFAULT_RUST_LOG: &str = "info";
 const CONFIG_VOLUME: &str = "config";
 const DATA_VOLUME: &str = "data";
 const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
+const TLS_VOLUME: &str = "tls";
 
 fn admin_probe(admin_port: i32, extra: impl FnOnce(&mut Probe)) -> Probe {
     let mut probe = Probe {
@@ -158,6 +159,27 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         volume_mounts.push(VolumeMount {
             name: DYNAMO_AUTH_VOLUME.to_string(),
             mount_path: DYNAMO_AUTH_MOUNT_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    // ADR 0064 commit 3: one shared `Secret` (a pre-existing
+    // `kubernetes.io/tls` one, or cert-manager's own output) mounted
+    // identically on every pod — see `TlsSpec`'s own doc for why one
+    // shared cert, not a per-pod one.
+    if let Some(tls) = &spec.tls {
+        volumes.push(Volume {
+            name: TLS_VOLUME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(tls.secret_name_or_default(name)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: TLS_VOLUME.to_string(),
+            mount_path: TLS_MOUNT_DIR.to_string(),
             read_only: Some(true),
             ..Default::default()
         });
@@ -430,6 +452,72 @@ mod tests {
                 .iter()
                 .any(|v| v.name == "dynamo-auth")
         );
+    }
+
+    #[test]
+    fn tls_secret_mounted_when_tls_set_secret_name_shape() {
+        use crate::crd::TlsSpec;
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: Some("preexisting-tls".to_string()),
+            cert_manager: None,
+        });
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod_spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "tls")
+            .expect("tls volume present");
+        assert_eq!(
+            vol.secret.unwrap().secret_name.as_deref(),
+            Some("preexisting-tls")
+        );
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "tls")
+            .expect("tls mount present");
+        assert_eq!(mount.mount_path, "/etc/animus/tls");
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn tls_secret_mounted_at_the_default_name_for_cert_manager_shape() {
+        use crate::crd::{CertManagerSpec, IssuerRef, TlsSpec};
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: None,
+            cert_manager: Some(CertManagerSpec {
+                issuer_ref: IssuerRef {
+                    name: "i".to_string(),
+                    kind: "ClusterIssuer".to_string(),
+                    group: None,
+                },
+                duration: None,
+                renew_before: None,
+            }),
+        });
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod_spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "tls")
+            .expect("tls volume present");
+        assert_eq!(vol.secret.unwrap().secret_name.as_deref(), Some("c-tls"));
+    }
+
+    #[test]
+    fn no_tls_volume_when_tls_unset() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "tls"));
     }
 
     #[test]

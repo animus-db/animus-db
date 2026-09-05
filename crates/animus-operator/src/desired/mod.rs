@@ -7,6 +7,7 @@
 //! result; the desired *shape* of a child is proven here, once, independent
 //! of the k8s API.
 
+pub mod certificate;
 pub mod cluster_config;
 pub mod configmap;
 pub mod networkpolicy;

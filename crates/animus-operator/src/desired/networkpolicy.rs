@@ -3,6 +3,11 @@
 //! the operator, the dynamo port is open to any source, and everything else
 //! is denied by default (ADR 0047's Kubernetes deployment intent — see this
 //! crate's `CLAUDE.md`).
+//!
+//! **Unaffected by `spec.tls` (ADR 0064 commit 3).** TLS is a mode each
+//! port's own listener can be configured into, not a change to which pods
+//! may reach which port at all — the port topology (and therefore this
+//! builder's own output) is identical whether or not `spec.tls` is set.
 
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
