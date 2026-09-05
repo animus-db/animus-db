@@ -130,16 +130,257 @@ fn placeholder_addr() -> SocketAddr {
 /// alias's own doc states).
 type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// One node's `ClientCtx` handle, named for the same clippy `type_complexity`
+/// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
+/// `Vec` of these behind an `Arc<Mutex<..>>`.
+type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
 /// What this fixture knows about one tablet it has provisioned: its table
 /// name (diagnostics only), its declared range (always
 /// [`KeyRange::whole`] — this fixture never splits a table), and the node
 /// ids currently hosting a replica (in the order [`SimCluster::
 /// create_table`] chose them — `replicas[0]` has no special status, it's
 /// simply this fixture's own bookkeeping order, not a leader hint).
+///
+/// `Clone` (ADR 0061 rung D1 step 3, the [`SimClusterHandle`] refactor
+/// below): a corpus's own concurrently-spawned client tasks read a
+/// **snapshot** of this map (`SimClusterHandle::replicas_of`/
+/// `tablets_snapshot`) rather than holding the shared lock across an
+/// `.await`.
+#[derive(Clone)]
 struct TabletInfo {
     table: String,
     range: KeyRange,
     replicas: Vec<u64>,
+}
+
+/// A cheap, `Clone`-able handle onto this cluster's per-node `ClientCtx`s
+/// and provisioned-tablet bookkeeping (ADR 0061 rung D1 step 3, "What
+/// commit 3 needs" item (b)) — every field the *driver* (`SimCluster`,
+/// below) mutates, behind a `Mutex` so a corpus's own concurrently
+/// `env.spawn_task`-ed client-op tasks can share one cluster: each op
+/// method below clones the target node's own `ClientCtx` out from under a
+/// **brief** lock (never held across an `.await` — `ClientCtx::clone` is
+/// cheap, every field is either `Copy`, an `Arc`, or a small handle) and
+/// then awaits on that owned clone, so many concurrent ops on different
+/// (or the same) node never contend on the lock for longer than a clone.
+///
+/// **Why a handle at all, instead of just `Arc<Mutex<SimCluster>>`**: the
+/// driver's own fault-injection methods (`crash`/`restart`/`partition`/
+/// `heal_all`/`run_for`) also need `&mut self.sim` (`Simulator` is not
+/// `Sync`-shareable the way a plain data map is) — see the module's own
+/// "Design decisions" doc, below, for why those stay `&mut self` methods
+/// on the outer [`SimCluster`] rather than moving onto this handle too.
+/// `SimClusterHandle` carries only the two fields client-issued ops
+/// actually read/write (`ctxs`, `tablets`); `sim`/`controls`/`crashed` stay
+/// exclusively on the driver.
+///
+/// Every op method here is self-bounded: `ClientCtx::cp_kind_write_raw`/
+/// `cp_get`/`cp_scan` each carry their own internal `CLIENT_TIMEOUT`-bounded
+/// retry loop (`cp_route`'s own deadline, `forward_to_tablet_leader`'s own
+/// hint-chasing deadline), so a call here always resolves — `Ok` or a
+/// timeout-shaped `Err` — well inside the corpus's own per-op poll window,
+/// with **no wrapper `spawn_and_capture`/`OP_BUDGET` needed for a handle
+/// method awaited directly inside an already-spawned task** (unlike
+/// [`SimCluster::put`]/`get`/`delete`/`scan` below, which still need that
+/// wrapper because they're driven synchronously from a test's own `&mut
+/// self` call, not from inside a task the corpus itself spawned).
+#[derive(Clone)]
+pub(crate) struct SimClusterHandle {
+    ctxs: Arc<Mutex<Vec<SimNodeCtx>>>,
+    tablets: Arc<Mutex<BTreeMap<TabletId, TabletInfo>>>,
+}
+
+impl SimClusterHandle {
+    fn new(ctxs: Vec<SimNodeCtx>) -> Self {
+        SimClusterHandle {
+            ctxs: Arc::new(Mutex::new(ctxs)),
+            tablets: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// A brief-lock clone of `node`'s own `ClientCtx` — every op method
+    /// below builds on this rather than holding the lock across an
+    /// `.await`. `ClientCtx::clone` is cheap (every field is `Copy`, an
+    /// `Arc`, or a small handle) — see [`SimClusterHandle`]'s own doc.
+    fn ctx(&self, node: u64) -> SimNodeCtx {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize].clone()
+    }
+
+    fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize] = ctx;
+    }
+
+    fn register_raftkv(&self, node: u64, tablet: TabletId, group: CpGroup<SimEnv>) {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize]
+            .edge
+            .register_raftkv(tablet, group);
+    }
+
+    fn insert_tablet(&self, tablet: TabletId, info: TabletInfo) {
+        self.tablets
+            .lock()
+            .expect("tablets poisoned")
+            .insert(tablet, info);
+    }
+
+    /// A snapshot clone of the whole tablet map — used by [`SimCluster::
+    /// restart`], which must iterate every provisioned tablet while also
+    /// driving the simulator (an `.await`-free loop over a held lock would
+    /// be sound too, but a snapshot keeps this method's shape identical to
+    /// every other reader here, which all snapshot-then-release).
+    fn tablets_snapshot(&self) -> BTreeMap<TabletId, TabletInfo> {
+        self.tablets.lock().expect("tablets poisoned").clone()
+    }
+
+    fn all_have_table_tablet(&self, table: &str) -> bool {
+        self.ctxs
+            .lock()
+            .expect("ctxs poisoned")
+            .iter()
+            .all(|ctx| ctx.effective_metadata().has_table_tablet(table))
+    }
+
+    fn is_leader_local(&self, node: u64, tablet: TabletId) -> bool {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize]
+            .edge
+            .local_cp(tablet)
+            .is_some_and(|g| g.is_leader())
+    }
+
+    /// `node`'s own internal `SimEnv` — the env a corpus spawns a
+    /// node-issued op's own driving task onto, mirroring [`SimCluster::
+    /// spawn_and_capture`]'s identical read. Cheap: `SimEnv` is itself a
+    /// small `Clone`-able handle.
+    pub(crate) fn env(&self, node: u64) -> SimEnv {
+        self.ctx(node).env.clone()
+    }
+
+    /// The tablet id [`SimCluster::create_table`] minted for `table`, if
+    /// this fixture created one.
+    pub(crate) fn tablet_of(&self, table: &str) -> Option<TabletId> {
+        self.tablets
+            .lock()
+            .expect("tablets poisoned")
+            .iter()
+            .find(|(_, info)| info.table == table)
+            .map(|(&tablet, _)| tablet)
+    }
+
+    /// `tablet`'s own provisioned replica set, in [`SimCluster::
+    /// create_table`]'s own bookkeeping order — empty if this fixture never
+    /// provisioned `tablet` (should not happen for a tablet id this handle
+    /// itself minted, but a corpus's own bug should read "no replicas"
+    /// rather than panic).
+    pub(crate) fn replicas_of(&self, tablet: TabletId) -> Vec<u64> {
+        self.tablets
+            .lock()
+            .expect("tablets poisoned")
+            .get(&tablet)
+            .map(|info| info.replicas.clone())
+            .unwrap_or_default()
+    }
+
+    /// The node id currently hosting `tablet`'s own leader replica, if any
+    /// one of its known replicas believes it leads — [`SimCluster::
+    /// leader_index_of`]'s handle-callable twin.
+    pub(crate) fn leader_index_of(&self, tablet: TabletId) -> Option<u64> {
+        self.replicas_of(tablet)
+            .into_iter()
+            .find(|&n| self.is_leader_local(n, tablet))
+    }
+
+    /// `node`'s own view of the replicated control-plane `Metadata`.
+    pub(crate) fn metadata(&self, node: u64) -> Metadata {
+        self.ctx(node).effective_metadata()
+    }
+
+    /// Write `value` at `(pk, sk)` in `table`, issued from `node`'s own
+    /// `ClientCtx` — awaited directly (no wrapper): see this type's own doc
+    /// for why every op here is already self-bounded.
+    pub(crate) async fn put(
+        &self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        sk: &str,
+        value: &[u8],
+    ) -> Result<(), String> {
+        let ctx = self.ctx(node);
+        let key = item_key(pk, sk);
+        ctx.cp_kind_write_raw(
+            table,
+            vec![(KIND_BASE, key, Some(value.to_vec()))],
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Delete the item at `(pk, sk)` in `table`, issued from `node`'s own
+    /// `ClientCtx` — [`SimClusterHandle::put`]'s sibling.
+    pub(crate) async fn delete(
+        &self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        sk: &str,
+    ) -> Result<(), String> {
+        let ctx = self.ctx(node);
+        let key = item_key(pk, sk);
+        ctx.cp_kind_write_raw(table, vec![(KIND_BASE, key, None)], Vec::new())
+            .await
+    }
+
+    /// Read `(pk, sk)` in `table`, issued from `node`'s own `ClientCtx` —
+    /// see [`SimCluster::get`]'s own doc for the `consistent` contract.
+    pub(crate) async fn get(
+        &self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        sk: &str,
+        consistent: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let ctx = self.ctx(node);
+        let key = item_key(pk, sk);
+        match ctx.cp_get(table, key, !consistent).await {
+            ClientResponse::Value(v) => Ok(v),
+            ClientResponse::Error(e) => Err(e),
+            other => Err(format!("unexpected get response: {other:?}")),
+        }
+    }
+
+    /// Whole-table scan, issued from `node`'s own `ClientCtx`.
+    pub(crate) async fn scan(
+        &self,
+        node: u64,
+        table: &str,
+        consistent: bool,
+    ) -> Result<ScanRows, String> {
+        let ctx = self.ctx(node);
+        let consistency = ReadConsistency::from_consistent_read(consistent);
+        ctx.cp_scan(table, Vec::new(), None, None, false, consistency)
+            .await
+    }
+
+    /// A **raw, unrouted** local-engine read of `(pk, sk)` on `node`'s own
+    /// replica of `tablet` — `None` if `node` hosts no replica of `tablet`
+    /// or the key is absent there. Mirrors `raftkv_linearizable.rs`'s own
+    /// `final_state`'s use of `local_get` (never `cp_get`, which always
+    /// routes to *a* leader and so can never distinguish two replicas'
+    /// own raw state) — the primitive a corpus's own cross-replica
+    /// durability/convergence check needs.
+    pub(crate) async fn local_value(
+        &self,
+        node: u64,
+        tablet: TabletId,
+        pk: &str,
+        sk: &str,
+    ) -> Option<Vec<u8>> {
+        let ctx = self.ctx(node);
+        let group = ctx.edge.local_cp(tablet)?;
+        group.local_get(&item_key(pk, sk)).await
+    }
 }
 
 /// See the module doc for the full design. Every node id is `0..nodes`; a
@@ -163,13 +404,15 @@ pub(crate) struct SimCluster {
     /// why this fixture proposes on these handles directly rather than
     /// through any node's own `ClientCtx`).
     controls: Vec<RaftNode<SimEnv>>,
-    /// One `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` per node id, index ==
-    /// node id — every client op in this fixture goes through one of these.
-    ctxs: Vec<ClientCtx<SimEnv, SimRelayClient<SimEnv>>>,
-    /// Every tablet this fixture has provisioned, by id — the source of
-    /// truth [`SimCluster::restart`] reads to know which groups to rebuild
-    /// on a node, and [`SimCluster::leader_of`]/`tablet_of` read to answer.
-    tablets: BTreeMap<TabletId, TabletInfo>,
+    /// The `Clone`-able, `Mutex`-backed handle onto every node's own
+    /// `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` and the provisioned-
+    /// tablet bookkeeping (ADR 0061 rung D1 step 3) — [`SimCluster::
+    /// handle`] hands a cheap clone of this to a corpus's own concurrently
+    /// spawned client-op tasks; every driver method below that used to read
+    /// `self.ctxs`/`self.tablets` directly now goes through it too, so
+    /// there is exactly one copy of this bookkeeping, shared identically by
+    /// the driver and by any handle a corpus holds.
+    shared: SimClusterHandle,
     next_tablet_id: u64,
     /// Node ids currently [`SimCluster::crash`]ed (muted, tasks still
     /// alive) — tracked so [`SimCluster::heal_all`] knows which ones need
@@ -221,7 +464,7 @@ impl SimCluster {
             .map(|id| SimRelayClient::new(sim.env(id.clone())))
             .collect();
 
-        let mut ctxs: Vec<ClientCtx<SimEnv, SimRelayClient<SimEnv>>> = Vec::with_capacity(nodes);
+        let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
             let admin = Arc::new(AdminInfo {
                 node_id: Some(id.clone()),
@@ -243,7 +486,7 @@ impl SimCluster {
                 auth_access_key_ids: None,
                 otlp_endpoint: None,
             });
-            let ctx: ClientCtx<SimEnv, SimRelayClient<SimEnv>> = ClientCtx {
+            let ctx: SimNodeCtx = ClientCtx {
                 control: GenericControlHandle::Local(controls[i].clone()),
                 edge: ClusterEdgeState::<SimEnv>::new(),
                 env: sim.env(id.clone()),
@@ -290,8 +533,7 @@ impl SimCluster {
             nodes,
             replication,
             controls,
-            ctxs,
-            tablets: BTreeMap::new(),
+            shared: SimClusterHandle::new(ctxs),
             next_tablet_id: 1,
             crashed: BTreeSet::new(),
         };
@@ -305,6 +547,31 @@ impl SimCluster {
     /// The number of nodes this cluster was built with.
     pub(crate) fn node_count(&self) -> usize {
         self.nodes
+    }
+
+    /// A cheap `Clone` of this cluster's [`SimClusterHandle`] — the one
+    /// thing a corpus hands into its own concurrently `env.spawn_task`-ed
+    /// client-op tasks (ADR 0061 rung D1 step 3). The driver itself
+    /// (`crash`/`restart`/`partition`/`heal_all`/`run_for`, plus DDL) stays
+    /// on `&mut self` here — see [`SimClusterHandle`]'s own doc for why
+    /// those don't move onto the handle too.
+    pub(crate) fn handle(&self) -> SimClusterHandle {
+        self.shared.clone()
+    }
+
+    /// A `SimEnv` for a **client-only** id, disjoint from every node id
+    /// this cluster's own `0..nodes` range uses (mirroring `animus_test`'s
+    /// `raftkv_linearizable.rs::CLIENT_IDS` convention) — never targeted by
+    /// [`SimCluster::crash`]/`restart`/`partition`, so a corpus's own
+    /// client-driver task spawned on this env always keeps making progress
+    /// (retrying/rotating nodes) regardless of which node it currently
+    /// targets. `idx` is the corpus's own client index (`0..clients`);
+    /// distinct `idx`s never collide with each other or with a real node id
+    /// for any `nodes` this fixture is ever built with (well under this
+    /// offset).
+    pub(crate) fn client_env(&self, idx: u64) -> SimEnv {
+        const CLIENT_ID_BASE: u64 = 10_000;
+        self.sim.env(nid(CLIENT_ID_BASE + idx))
     }
 
     /// Index (in `0..node_count()`) of whichever control `RaftNode`
@@ -407,12 +674,10 @@ impl SimCluster {
         // the freshly seeded schema/tablet before this fixture hosts
         // anything against it.
         self.poll_until(Duration::from_secs(5), |c| {
-            c.ctxs
-                .iter()
-                .all(|ctx| ctx.effective_metadata().has_table_tablet(table))
+            c.shared.all_have_table_tablet(table)
         });
 
-        self.tablets.insert(
+        self.shared.insert_tablet(
             tablet,
             TabletInfo {
                 table: table.to_owned(),
@@ -429,20 +694,15 @@ impl SimCluster {
                 StorageScope::new(KeyRange::whole()),
                 tablet.0,
             );
-            self.ctxs[n as usize]
-                .edge
-                .register_raftkv(tablet, CpGroup::Mem(kv));
+            self.shared.register_raftkv(n, tablet, CpGroup::Mem(kv));
         }
 
         // Let the fresh group elect a leader before returning — same
         // converged-or-timeout shape, never a fixed sleep.
         self.poll_until(Duration::from_secs(3), move |c| {
-            replicas.iter().any(|&n| {
-                c.ctxs[n as usize]
-                    .edge
-                    .local_cp(tablet)
-                    .is_some_and(|g| g.is_leader())
-            })
+            replicas
+                .iter()
+                .any(|&n| c.shared.is_leader_local(n, tablet))
         });
 
         tablet
@@ -452,10 +712,7 @@ impl SimCluster {
     /// this fixture created one (this fixture never splits a table, so the
     /// mapping is always 1:1 and stable for the table's whole lifetime).
     pub(crate) fn tablet_of(&self, table: &str) -> Option<TabletId> {
-        self.tablets
-            .iter()
-            .find(|(_, info)| info.table == table)
-            .map(|(&tablet, _)| tablet)
+        self.shared.tablet_of(table)
     }
 
     /// The node id currently hosting `tablet`'s own leader replica, if
@@ -475,20 +732,14 @@ impl SimCluster {
     /// should ever need to parse back out of a `NodeId` to get a usable
     /// index again).
     pub(crate) fn leader_index_of(&self, tablet: TabletId) -> Option<u64> {
-        let info = self.tablets.get(&tablet)?;
-        info.replicas.iter().copied().find(|&n| {
-            self.ctxs[n as usize]
-                .edge
-                .local_cp(tablet)
-                .is_some_and(|g| g.is_leader())
-        })
+        self.shared.leader_index_of(tablet)
     }
 
     /// `node`'s own view of the replicated control-plane `Metadata` —
     /// `ClientCtx::effective_metadata`'s exact read, so a caller can
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
-        self.ctxs[node as usize].effective_metadata()
+        self.shared.metadata(node)
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for
@@ -503,7 +754,7 @@ impl SimCluster {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
-        let env = self.ctxs[node as usize].env.clone();
+        let env = self.shared.env(node);
         let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
         let out = slot.clone();
         env.spawn_task(async move {
@@ -529,13 +780,15 @@ impl SimCluster {
         sk: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        let key = item_key(pk, sk);
-        let ctx = self.ctxs[node as usize].clone();
-        let value = value.to_vec();
-        let table = table.to_owned();
+        let handle = self.shared.clone();
+        let (table, pk, sk, value) = (
+            table.to_owned(),
+            pk.to_owned(),
+            sk.to_owned(),
+            value.to_vec(),
+        );
         self.spawn_and_capture(node, async move {
-            ctx.cp_kind_write_raw(&table, vec![(KIND_BASE, key, Some(value))], Vec::new())
-                .await
+            handle.put(node, &table, &pk, &sk, &value).await
         })
         .unwrap_or_else(|| {
             Err(format!(
@@ -553,13 +806,12 @@ impl SimCluster {
         pk: &str,
         sk: &str,
     ) -> Result<(), String> {
-        let key = item_key(pk, sk);
-        let ctx = self.ctxs[node as usize].clone();
-        let table = table.to_owned();
-        self.spawn_and_capture(node, async move {
-            ctx.cp_kind_write_raw(&table, vec![(KIND_BASE, key, None)], Vec::new())
-                .await
-        })
+        let handle = self.shared.clone();
+        let (table, pk, sk) = (table.to_owned(), pk.to_owned(), sk.to_owned());
+        self.spawn_and_capture(
+            node,
+            async move { handle.delete(node, &table, &pk, &sk).await },
+        )
         .unwrap_or_else(|| {
             Err(format!(
                 "delete on node {node} did not complete within {OP_BUDGET:?}"
@@ -583,20 +835,16 @@ impl SimCluster {
         sk: &str,
         consistent: bool,
     ) -> Result<Option<Vec<u8>>, String> {
-        let key = item_key(pk, sk);
-        let ctx = self.ctxs[node as usize].clone();
-        let table = table.to_owned();
-        let stale = !consistent;
-        let resp =
-            self.spawn_and_capture(node, async move { ctx.cp_get(&table, key, stale).await });
-        match resp {
-            Some(ClientResponse::Value(v)) => Ok(v),
-            Some(ClientResponse::Error(e)) => Err(e),
-            Some(other) => Err(format!("unexpected get response: {other:?}")),
-            None => Err(format!(
+        let handle = self.shared.clone();
+        let (table, pk, sk) = (table.to_owned(), pk.to_owned(), sk.to_owned());
+        self.spawn_and_capture(node, async move {
+            handle.get(node, &table, &pk, &sk, consistent).await
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
                 "get on node {node} did not complete within {OP_BUDGET:?}"
-            )),
-        }
+            ))
+        })
     }
 
     /// Whole-table scan, issued from `node`'s own `ClientCtx` — the cheap
@@ -608,13 +856,12 @@ impl SimCluster {
         table: &str,
         consistent: bool,
     ) -> Result<ScanRows, String> {
-        let ctx = self.ctxs[node as usize].clone();
+        let handle = self.shared.clone();
         let table = table.to_owned();
-        let consistency = ReadConsistency::from_consistent_read(consistent);
-        self.spawn_and_capture(node, async move {
-            ctx.cp_scan(&table, Vec::new(), None, None, false, consistency)
-                .await
-        })
+        self.spawn_and_capture(
+            node,
+            async move { handle.scan(node, &table, consistent).await },
+        )
         .unwrap_or_else(|| {
             Err(format!(
                 "scan on node {node} did not complete within {OP_BUDGET:?}"
@@ -654,11 +901,11 @@ impl SimCluster {
             RaftNode::start(self.sim.env(id.clone()), all_ids, MemoryEngine::new());
         let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
 
-        let mut ctx = self.ctxs[node as usize].clone();
+        let mut ctx = self.shared.ctx(node);
         ctx.control = GenericControlHandle::Local(fresh_control.clone());
         ctx.relay = fresh_relay.clone();
 
-        for (&tablet, info) in &self.tablets {
+        for (&tablet, info) in &self.shared.tablets_snapshot() {
             if !info.replicas.contains(&node) {
                 continue;
             }
@@ -681,7 +928,7 @@ impl SimCluster {
         });
 
         self.controls[node as usize] = fresh_control;
-        self.ctxs[node as usize] = ctx;
+        self.shared.set_ctx(node, ctx);
     }
 
     /// Symmetrically partition `a` and `b` (`Simulator::partition_pair`).

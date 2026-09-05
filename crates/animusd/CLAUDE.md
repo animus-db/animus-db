@@ -3764,6 +3764,80 @@ only ever uses the `Fs` placeholder — nothing it drives reads either
 field); and a `DataRole` (`data: None` on every node — no DynamoDB wire
 edge, no TTL reaper, no stream/backup loops).
 
+### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
+
+`crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod
+sim_cluster_corpus;` from `lib.rs`, a sibling of `sim_cluster` for the
+identical reason — same descendant-of-the-crate-root privacy property, no
+visibility widened) is the first cycles/durability corpus over the
+fixture above: a list-append `Recorder`/`History` model over
+`SimClusterHandle::put`/`get` (see that type's own doc in `sim_cluster.rs`
+for why it, not `SimCluster` itself, is what a concurrently spawned client
+task calls), checked with `animus_test::check::{check_cycles,
+check_durability, check_convergence}` — the identical oracle
+`raftkv_linearizable.rs` (`animus-test`) uses. Run via `cargo test -p
+animusd --lib sim_cluster_corpus`; depth knob `ANIMUS_SIMCLUSTER_SEEDS`
+(default 1 = 8 frozen cells, ~14s; held at 25 in the nightly
+`corpus-deep.yml` tier).
+
+**`SimClusterHandle` (ADR 0061 rung D1 step 3) is what made a concurrent
+workload possible at all** — `SimCluster` itself is `&mut self`
+everywhere (every fault-injection method, and even its own `put`/`get`/
+`delete`/`scan`, drives the simulator internally), which is fine for one
+op at a time from a test's own thread but not for several overlapping
+client tasks. The handle is `Clone`-able and holds only the two fields a
+client-issued op ever reads/writes (`ctxs`, `tablets`) behind their own
+`Mutex`es — never the whole fixture behind one coarse lock, which would
+have serialized every concurrent op behind whichever one is currently
+mid-`.await`. Its `put`/`get`/`delete`/`scan` are plain `&self` async
+methods with **no internal simulator driving** of their own: `ClientCtx::
+cp_kind_write_raw`/`cp_get`/`cp_scan` are already `CLIENT_TIMEOUT`-bounded
+internally, so a client task spawned via `env.spawn_task` can `.await` one
+directly while this corpus's own runner drives `Simulator::run_for`
+exactly once per scenario — the identical `client_loop`/`Group::apply`
+split `raftkv_linearizable.rs` uses, generalized to a whole cluster.
+`SimCluster`'s own driver methods (`crash`/`restart`/`partition`/
+`heal_all`/`run_for`, plus DDL) stay `&mut self`, since `Simulator` itself
+isn't safely shareable that way and nothing but the driver ever needs it.
+
+**Cells**: `baseline` (no faults), `leader_crash`, `follower_crash`,
+`stop_restart` (a true process restart, not a mute), `leader_partition`
+(isolate the tablet leader from the whole cluster), `split_brain`
+(partition the whole cluster into two non-empty halves, not keyed to
+wherever the leader lands), `forward_heavy` (RF 2 of 4 nodes — most ops
+route through a node hosting no local replica), and `two_tables` (two
+independently-provisioned tables, ops interleaved by the same client
+tasks — see the module doc's own `Key`-space note for how two tables'
+key ranges stay disjoint without a `Mop`/`History` model change). Every
+op's issuing node is drawn fresh from the scenario's own seed each round
+(`env.gen_below(node_count)`), so `forward_heavy` routinely forwards.
+
+**`delete` is exercised but deliberately never fed into `check_cycles`**
+— the shared `Mop`/`History` model is list-append-only (every observed
+read must be a prefix of its key's one recovered order), an invariant a
+tombstoning delete cannot satisfy without manufacturing a false-positive
+divergence. `run_delete_probe` instead does a direct put→get(present)→
+delete→get(absent) round trip from every node in the cluster in turn,
+post-heal — proving a forwarded delete too, not just a forwarded put/get.
+
+**A hang found and fixed while building this**: `run_delete_probe`'s
+first draft called `SimClusterHandle::put`/`get`/`delete` via a bare
+`futures::executor::block_on`, mirroring `raftkv_linearizable.rs`'s own
+`final_state`'s `block_on(node.local_get(..))` — sound there because
+`local_get` is a pure local read with no internal wait. `SimClusterHandle`'s
+ops, unlike `local_get`, internally `.await` real `env.sleep()`-paced
+poll loops; `block_on`ing one directly with nothing advancing `SimEnv`'s
+virtual clock hangs forever. Fixed by driving the probe through
+`SimCluster`'s own synchronous `put`/`get`/`delete` (which spawn +
+`run_for` internally) instead. See `docs/engineering-lessons.md` and ADR
+0061's 2026-09-05 (2) amendment for the general rule.
+
+**Non-vacuity teeth**: `ok_writes > 0` every cell; `forward_heavy`
+additionally asserts a write from a non-hosting node succeeded (tracked
+per-issuing-node); `delete_probe.is_ok()` every cell. Shrink wiring
+(`ANIMUS_SHRINK=1`, `sim_cluster_shrink_replay`) mirrors
+`raftkv_linearizable.rs`'s own exactly. No product bug found.
+
 ## Tests
 
 `cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`

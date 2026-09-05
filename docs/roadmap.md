@@ -262,11 +262,14 @@ the still-true paragraph after the table.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
-- **D1:** a `SimCluster` fixture over `ClientCtx<SimEnv>`
-  (`lib.rs:6275`, already generic), reusing the existing multi-node
-  `SimEnv` setup from `animus-control`/`animus-cp-data` tests and the B1
-  seed harness in `animus-test`; then a first cycles/durability corpus.
-  Size M. Land before C-01.
+- **D1 landed 2026-09-05** (`SimCluster`, a multi-node `ClientCtx<SimEnv,
+  SimRelayClient<SimEnv>>` fixture with a real fault surface, plus
+  `sim_cluster_corpus`, its first cycles/durability corpus over
+  `animus-test`'s `check_cycles`/`check_durability`/`check_convergence`
+  oracle, depth knob `ANIMUS_SIMCLUSTER_SEEDS`; ADR 0061's 2026-09-05
+  amendments). D2-D4 remain open (an end-to-end DynamoDB-wire corpus, the
+  `animusd` integration-suite migration, and deterministic coverage for
+  auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). E2 (`animus-cli` coverage) stays folded into
@@ -392,7 +395,8 @@ wave are independent and can run in parallel.
 |---|---|---|
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
-| 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
+| 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
+| 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii) | W-03 after W-05; U-05 after its members panel |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |

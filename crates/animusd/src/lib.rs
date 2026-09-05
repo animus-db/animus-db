@@ -13987,6 +13987,20 @@ mod two_node_relay_tests {
 #[cfg(test)]
 mod sim_cluster;
 
+/// The first cycles/durability corpus over [`sim_cluster`] (ADR 0061 rung
+/// D1, C-04 D1 step 3): a list-append `Recorder` over `SimClusterHandle::
+/// put`/`get`/`delete`, checked with `animus_test::check::{check_cycles,
+/// check_durability, check_convergence}`, run via `cargo test -p animusd
+/// --lib sim_cluster_corpus`. See that module's own doc for the cell list,
+/// the oracle, and the `ANIMUS_SIMCLUSTER_SEEDS` depth knob. Declared here
+/// (not from inside `sim_cluster`) as its own sibling `#[cfg(test)] mod`
+/// for the identical reason `sim_cluster` itself is its own file rather
+/// than inline in this one — both are descendants of this crate root, so
+/// `ClientCtx`'s (and `SimCluster`/`SimClusterHandle`'s own `pub(crate)`)
+/// private fields stay reachable with no further visibility widened.
+#[cfg(test)]
+mod sim_cluster_corpus;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by

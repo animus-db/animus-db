@@ -1012,6 +1012,123 @@ along the way were fixture-construction mistakes: `nid`'s concrete
 added specifically to avoid that fragility — `SimCluster::leader_index_of`
 alongside the spec-shaped `leader_of -> Option<NodeId>`).
 
+#### 2026-09-05 amendment (2) — D1 step 3 landed: `sim_cluster_corpus`, the SimCluster cycles/durability corpus
+
+D1's own commit-3 residual (the previous amendment's "what commit 3
+needs" note) is closed, gaps (a) and (b) both. `crates/animusd/src/
+sim_cluster_corpus.rs` (`#[cfg(test)] mod sim_cluster_corpus;`, declared
+from `lib.rs` next to `sim_cluster` exactly as that note predicted — not a
+`tests/*.rs` binary, since `sim_cluster.rs` compiles only under `cfg(test)`
+and is unreachable from a separate integration-test crate) is a
+list-append `Recorder`/`History` corpus over the fixture, checked with
+`animus_test::check::{check_cycles, check_durability, check_convergence}`
+— the identical oracle `raftkv_linearizable.rs` uses, run via `cargo test
+-p animusd --lib sim_cluster_corpus`, depth knob `ANIMUS_SIMCLUSTER_SEEDS`
+(default 1 = 8 frozen cells, ~14s; nightly tier at 25).
+
+**Gap (b) — making `SimCluster` safely shareable with concurrently
+spawned client tasks — closed by `SimClusterHandle`, not the `Arc<Mutex<
+SimCluster>>` wrapper the previous amendment's note suggested as the
+precedent to follow.** Wrapping the *whole* fixture in one mutex would
+have serialized every concurrent client task's op behind a single lock
+held for that op's entire (potentially `CLIENT_TIMEOUT`-bounded) duration
+— exactly the "several concurrent client tasks" property a corpus needs
+would have been defeated by the naive version of the suggested fix. The
+actual design instead moves only the two fields client-issued ops ever
+read/write (`ctxs: Vec<ClientCtx<..>>`, `tablets: BTreeMap<TabletId,
+TabletInfo>`) into a `Clone`-able `SimClusterHandle` (`Arc<Mutex<..>>`
+each), whose `put`/`get`/`delete`/`scan` methods take `&self` and briefly
+lock only to clone out the target node's own `ClientCtx` before
+`.await`ing on the owned clone — never holding the lock across an
+`.await`. `SimCluster` itself keeps `sim: Simulator`/`controls: Vec<
+RaftNode<SimEnv>>`/`crashed: BTreeSet<u64>` unshared (nothing but the
+driver ever touches them), and its own `put`/`get`/`delete`/`scan`/
+`restart` now delegate to the identical handle methods. This is a cheaper
+answer to "make it shareable" than a single coarse lock, and follows
+naturally once the actual read/write surface a concurrent task needs is
+named explicitly instead of wrapping the whole struct.
+
+**Gap (a) — the `Recorder`/`History` wrapper — turned out to need no
+extra "wrap each call" plumbing beyond that handle**, because `SimCluster::
+put`/`get`/`delete`/`cp_kind_write_raw`/`cp_get` are already internally
+`CLIENT_TIMEOUT`-bounded (`cp_route`'s own deadline, `forward_to_tablet_
+leader`'s own hint-chasing deadline) — a client task can simply `.await`
+`SimClusterHandle::put`/`get` directly inside its own spawned loop and
+get back `Ok`/a timeout-shaped `Err` well within the corpus's own poll
+window, with no wrapper `spawn_and_capture`/`OP_BUDGET` of its own (that
+wrapper is still needed, and kept, on `SimCluster`'s own synchronous
+`put`/`get`/`delete`/`scan` — the ones a plain, non-spawned test-thread
+caller uses, which is exactly what `run_delete_probe`, below, needs).
+
+**Gap (c) (replica-set-change-mid-corpus) was skipped, per the task's own
+brief** ("optionally a replica-move primitive, skip unless cheap") — no
+`SimCluster::move_replica` was added; every cell in `corpus_cells` uses
+`SimCluster::create_table`'s existing hand-hosted, fixed-replica-set
+shape.
+
+**`delete` is exercised but deliberately NOT fed into `check_cycles`.**
+The shared, cross-crate `Mop`/`History` model (`animus-test::history`) is
+list-append-only — every observed read must be a *prefix* of its key's
+one recovered order, an invariant a tombstoning `delete` cannot satisfy
+without either teaching that model a semantics no other corpus needs or
+manufacturing a workload-artifact false positive (the exact class of trap
+`raftkv_linearizable.rs`'s own doc names for value reuse). Instead
+`run_delete_probe` puts a real DynamoDB API to actual verification
+directly and separately: after every scenario's fault schedule heals and
+drains, it round-trips put→get(present)→delete→get(absent) **from every
+node in the cluster in turn**, so a cell with more nodes than replicas
+(`forward_heavy`) proves a forwarded delete, not just a forwarded put/get.
+
+**A real hang, found and fixed while building this rung — not a product
+bug, a harness mistake with a lesson that generalizes past this file**:
+the first version of `run_delete_probe` called `SimClusterHandle::put`/
+`get`/`delete` directly via a bare `futures::executor::block_on`, mirroring
+`raftkv_linearizable.rs`'s own `final_state`'s `block_on(node.local_get(..))`
+idiom. `local_get` is a pure local-engine read with no internal `.await`
+on simulated time, so `block_on` alone resolves it on the very first poll
+— sound. `SimClusterHandle::put`/`get`, unlike `local_get`, internally
+`.await` real `env.sleep()`-paced route/confirm-poll loops; `block_on`ing
+one of those directly, with no `Simulator::run_for`/`run_until` anywhere
+concurrently advancing virtual time, hangs **forever** (the future's own
+`sleep` never wakes, since nothing is driving `SimEnv`'s cooperative
+executor). The very first `cargo test -p animusd --lib sim_cluster` run of
+this file never returned. Fixed by driving `run_delete_probe` through
+`SimCluster`'s own synchronous `put`/`get`/`delete` (which each spawn +
+`run_for` internally, exactly the shape `SimCluster::put`/`get`/`delete`/
+`scan` already used before this rung) instead of the handle + bare
+`block_on`. **The general rule, added to `docs/engineering-lessons.md`**:
+`block_on`ing a `SimEnv`-driven future is only sound when that future is
+known to resolve without needing the simulator's own clock to advance
+(a pure local read); a future that itself `.await`s `env.sleep()` needs
+`spawn_task` + `Simulator::run_for`/`run_until` somewhere in its call
+chain, or it hangs silently rather than erroring — and a hang under
+`cargo test` with no timeout looks identical to a slow compile until
+someone kills it, so this is worth checking explicitly whenever a new
+`block_on` call is added against a `SimEnv`-backed future.
+
+**Non-vacuity teeth**: every cell asserts `ok_writes > 0`; a cell with
+`nodes > replication` (`forward_heavy`) additionally asserts at least one
+acked write was issued from a node hosting no local replica of the
+tablet — tracked per-issuing-node in `Shared::ok_writes_by_node`, so a
+regression that silently stopped exercising the forward path (not just
+one that broke it) would also be caught. `delete_probe.is_ok()` (every
+node, including a non-hosting one) is asserted for every cell.
+
+**No product bug found** — every cell passed on the first fully-wired
+attempt once the `block_on` hang above was fixed.
+
+**Gates**: `cargo fmt --all`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` (clean — required one new named type alias,
+`SimNodeCtx`, to satisfy `clippy::type_complexity` on `SimClusterHandle`'s
+own `Arc<Mutex<Vec<ClientCtx<SimEnv, SimRelayClient<SimEnv>>>>>` field —
+the same "name it instead of nesting it inline" convention `ScanRows`
+already set in this file), `cargo test -p animusd --lib` (131 passed, 2
+pre-existing/new ignored replay entry points), `ANIMUS_SIMCLUSTER_SEEDS=5
+cargo test -p animusd --lib sim_cluster_corpus_is_consistent` (40
+scenarios, ~70s), and `cargo test -p animus-test --test raftkv_linearizable`
+(unchanged, 10 passed / 1 ignored — proof this rung touched nothing in
+the model it copied).
+
 ### Phase E — the untested crates
 
 | Rung | Work |
