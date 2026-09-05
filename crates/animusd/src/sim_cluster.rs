@@ -513,6 +513,8 @@ impl SimCluster {
                 dynamo_auth: None,
                 tls: None,
                 relay: relays[i].clone(),
+                throttle: ThrottleTracker::new(),
+                throttle_defaults: Arc::new(ThrottleDefaults::default()),
             };
             ctxs.push(ctx);
         }

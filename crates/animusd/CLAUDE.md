@@ -2415,6 +2415,48 @@ through writes alone. When hot, splits via the identical
 `byte_weighted_median`/`trigger_split` path every other trigger uses. No
 production-tuned default exists — omitting the flag is a true no-op.
 
+**Per-table throttling (ADR 0065, W-08 step 2/3)**: `ThrottleTracker`
+(`lib.rs`, beside `ChangeRateTracker`/`RequestRateTracker`) is the
+admission-control sibling of the rate trackers above — a per-tablet token
+bucket in DynamoDB capacity units (`ThrottleBucket`: `tokens`/`rate`/
+`capacity = 300 × rate`/`last: Nanos`, clocked exclusively on `env.now()`),
+not a reporting-only estimate. **Unlike `ChangeRateTracker`/
+`RequestRateTracker`, `ThrottleTracker` lives directly on `ClientCtx`, not
+behind `DataRole`'s `Option`** — every `SimEnv` `ClientCtx` fixture in this
+crate (`simenv_client_ctx_tests`, `two_node_relay_tests`, `sim_cluster.rs`)
+constructs `data: None`, and this ADR's own testing section needs a real
+`SimCluster`-driven virtual-clock corpus to exercise admission decisions, so
+a `DataRole`-gated tracker could never be reached by any of them.
+`ClientCtx::throttle_limits_for(meta, table) -> ThrottleLimits` resolves the
+effective `read_units`/`write_units` limits: the cluster-wide default
+(`ClientCtx::throttle_defaults`, a lock-free `AtomicU64`-backed pair —
+`None`/`None` means `PAY_PER_REQUEST`, the default, byte-for-byte unchanged
+from before this ADR) today; a per-table `TableSchema.throughput` override
+is roadmap W-08 step 4's own follow-up commit (the config surface:
+`ClusterSettings`/CLI/`CreateTable`'s `BillingMode`/`ProvisionedThroughput`/
+`MetaCommand::SetTableThroughput`), which this function already has a named
+hook for. A tablet's own per-tablet **share** is the table's limit divided
+by its current tablet count (`meta.tablets_for_table(table).count()`,
+re-derived fresh on every check, never cached — a split re-divides the
+budget the instant the new tablet map commits) — the identical
+"re-derive from live `Metadata`, never a snapshot" discipline
+`RequestRateTracker::retain_existing` already follows. Enforced strictly
+*before* propose (never inside Raft apply, ADR 0054's determinism
+requirement) at the same two write choke points `RequestRateTracker`
+observes plus the transaction stage point, and read-side at whichever node
+serves the read (leader for `ConsistentRead: true`, any replica for
+`false`) — see this ADR's own Decision 2 for the full enforcement-point
+list and `dynamo.rs`/`write_path.rs`/`read_path.rs`/`txn_coordinator.rs`'s
+own entries below for exactly where each check lives. `ThrottledWrites`/
+`ThrottledReads` (`animus-env::Metric`) count every refusal; `/admin/
+metrics`'s `throttle` array (`ClientCtx::throttle_snapshot`) mirrors
+`request_rates`'s own shape, one entry per currently-tracked tablet (tokens,
+rate, throttled counts, read and write separately). When no limit is
+configured anywhere (the overwhelming common case), every enforcement point
+costs at most two lock-free atomic loads and an `Option` check — no
+`Mutex` lock, no `BTreeMap` lookup — verified by `tests/batch_write.rs`'s
+existing ADR 0049 fast-arm throughput assertion staying green unmodified.
+
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own
 byte-weighted median in one action (`ClientCtx::grow_stream` →

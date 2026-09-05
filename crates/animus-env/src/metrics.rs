@@ -643,12 +643,30 @@ pub enum Metric {
     /// rate under a hint-chasing forward means abandoned server-side work is
     /// piling up, not necessarily a client bug (see the issue #596 lesson).
     ClientRequestsAbandoned,
+
+    // --- Per-table throttling (ADR 0065, W-08 step 2/3) --- Appended after
+    // the client-cancellation variant above; every earlier variant's slot
+    // and the text-export order stay stable. Recorded by `animusd`'s
+    // enforcement points (`dynamo::kind_write_item_at_leader`,
+    // `write_path::cp_kind_write_raw`, `txn_coordinator::txn_stage_local`,
+    // `read_path`'s strong/eventual read and scan primitives) at the exact
+    // moment a tablet's own token bucket refuses admission — see
+    // `ThrottleTracker::check_write`/`check_read` (`animusd::lib`).
+    /// A write was refused because its tablet's own per-table write bucket
+    /// had insufficient tokens (`ProvisionedThroughputExceededException`,
+    /// or — inside a `TransactWriteItems`/`BatchWriteItem` call —
+    /// `ThrottlingError`/an `UnprocessedItems` entry).
+    ThrottledWrites,
+    /// A read was refused because its tablet's own per-table read bucket
+    /// had insufficient tokens (`ProvisionedThroughputExceededException`,
+    /// or — inside a `BatchGetItem` call — an `UnprocessedKeys` entry).
+    ThrottledReads,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 83] = [
+    pub const ALL: [Metric; 85] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -732,6 +750,8 @@ impl Metric {
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
         Metric::ClientRequestsAbandoned,
+        Metric::ThrottledWrites,
+        Metric::ThrottledReads,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -822,6 +842,8 @@ impl Metric {
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
+            Metric::ThrottledWrites => "throttled_writes",
+            Metric::ThrottledReads => "throttled_reads",
         }
     }
 

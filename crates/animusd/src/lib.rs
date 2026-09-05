@@ -3656,6 +3656,8 @@ fn spawn_common_tail(
         dynamo_auth,
         tls: tls.clone(),
         relay: AnimusdRelayClient { tls: tls.clone() },
+        throttle: ThrottleTracker::new(),
+        throttle_defaults: Arc::new(ThrottleDefaults::default()),
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -7085,6 +7087,522 @@ mod rate_tracker_tests {
     }
 }
 
+/// ADR 0065 (per-table throttling) — a per-tablet token bucket in DynamoDB
+/// capacity units, the admission-control sibling of [`RateSample`]'s pure
+/// EWMA estimate (it shares nothing with it beyond "keyed by `TabletId`,
+/// clocked on [`Nanos`]"). `tokens`/`capacity` are fractional capacity units
+/// (DynamoDB's own units are fractional — an eventually-consistent read
+/// costs `0.5` RCU); `rate` is the tablet's current per-tablet share
+/// (units/sec, set via [`Self::set_rate`] — ADR 0065 Decision 1: re-derived
+/// from live `Metadata` on every check, never fixed at bucket creation);
+/// `capacity` is [`THROTTLE_BURST_SECS`] (300s) of that share, the
+/// DynamoDB-documented burst window (Decision 4: "DynamoDB retains up to
+/// 300 seconds... of unused capacity"); `last` is the [`Env::now`] this
+/// bucket was last refilled through — never a wall clock, never
+/// `tokio::time::Instant` (both `write_path.rs` and `read_path.rs`, this
+/// bucket's two enforcement homes, carry the crate's `#[deny(clippy::
+/// disallowed_methods)]`, ADR 0061 Phase C).
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+struct ThrottleBucket {
+    tokens: f64,
+    rate: f64,
+    capacity: f64,
+    last: Nanos,
+}
+
+/// The DynamoDB-documented burst window (ADR 0065 Decision 4).
+const THROTTLE_BURST_SECS: f64 = 300.0;
+
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+impl ThrottleBucket {
+    /// A freshly observed tablet (a [`ThrottleTracker`] map entry just
+    /// created) starts **full** at `rate`'s own 300s burst — matching
+    /// DynamoDB's own "a freshly provisioned table can immediately absorb
+    /// its whole burst" behavior; there is no history to refill from yet.
+    fn new(rate: f64, now: Nanos) -> Self {
+        let capacity = rate * THROTTLE_BURST_SECS;
+        Self {
+            tokens: capacity,
+            rate,
+            capacity,
+            last: now,
+        }
+    }
+
+    /// Refill for the elapsed time since the last touch, at this bucket's
+    /// own current `rate` — capped at `capacity` (a bucket never holds more
+    /// than one burst window's worth). `now` at or before `last` (a clock
+    /// that hasn't advanced, or a stale caller) refills nothing, never
+    /// negative.
+    fn refill(&mut self, now: Nanos) {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + self.rate * elapsed).min(self.capacity);
+        }
+        self.last = now;
+    }
+
+    /// Re-derive this bucket's rate/capacity from a fresh per-tablet share
+    /// (ADR 0065 Decision 1 — a split, or a changed limit, re-divides the
+    /// budget the moment it's observed). Refills at the OLD rate through
+    /// `now` first (time already elapsed under the prior share is
+    /// honored), then adopts the new rate/capacity, capping the token
+    /// level down so a lowered budget can never retain more burst than it
+    /// could legally earn. A refill-only no-op when `rate` is unchanged
+    /// from last time — the common case, every check after the tablet's
+    /// first.
+    fn set_rate(&mut self, rate: f64, now: Nanos) {
+        self.refill(now);
+        self.rate = rate;
+        self.capacity = rate * THROTTLE_BURST_SECS;
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
+    /// Refill, then admit `cost` if there are enough tokens, debiting it
+    /// atomically with the decision. Never lets `tokens` go negative
+    /// through this path — a refusal charges nothing; see [`Self::charge`]
+    /// for the ADR §3 case that deliberately can.
+    fn try_take(&mut self, cost: f64, now: Nanos) -> bool {
+        self.refill(now);
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Refill, then unconditionally debit `cost` (which may be negative,
+    /// correcting an earlier over-charge) — allowed to drive `tokens`
+    /// negative (ADR 0065 §3: a large read/write can temporarily exceed a
+    /// small tablet's allotment, recovering on subsequent refill exactly
+    /// like DynamoDB's own documented "a large item read can temporarily
+    /// exceed a small partition's allotment" behavior). A negative bucket
+    /// still returns the result that produced it — only the *next*
+    /// operation against that tablet observes the deficit.
+    fn charge(&mut self, cost: f64, now: Nanos) {
+        self.refill(now);
+        self.tokens -= cost;
+    }
+}
+
+/// One tablet's read/write bucket pair plus lifetime throttled-request
+/// counters (ADR 0065 §7 — `/admin/metrics`'s `throttle` array).
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+struct ThrottleBuckets {
+    read: ThrottleBucket,
+    write: ThrottleBucket,
+    read_throttled: u64,
+    write_throttled: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+impl ThrottleBuckets {
+    fn new(read_rate: f64, write_rate: f64, now: Nanos) -> Self {
+        Self {
+            read: ThrottleBucket::new(read_rate, now),
+            write: ThrottleBucket::new(write_rate, now),
+            read_throttled: 0,
+            write_throttled: 0,
+        }
+    }
+}
+
+/// ADR 0065's per-tablet token-bucket admission-control tracker — the
+/// throttle sibling of [`ChangeRateTracker`]/[`RequestRateTracker`]: same
+/// `Arc<Mutex<BTreeMap<TabletId, _>>>` shape, same "every access is a quick
+/// lock/mutate/drop with no `.await` held across it" discipline. **Lives
+/// directly on [`ClientCtx`]**, not behind [`DataRole`]'s `Option` — a
+/// deliberate departure from `ChangeRateTracker`/`RequestRateTracker`'s own
+/// home (see [`ClientCtx::throttle`]'s own doc for why: this ADR's own
+/// testing section requires a `SimCluster`-driven virtual-clock corpus, and
+/// every `SimEnv` `ClientCtx` fixture in this crate — `simenv_client_ctx_
+/// tests`, `two_node_relay_tests`, `sim_cluster.rs` — constructs its nodes
+/// with `data: None`; a `DataRole`-gated tracker could never be exercised by
+/// any of them).
+///
+/// A bucket pair is created lazily, at first use, with its tablet's
+/// then-current per-tablet share; every subsequent [`Self::check_write`]/
+/// [`Self::check_read`] re-derives that share fresh (never cached) via
+/// [`ThrottleBucket::set_rate`], so a split or a changed limit is reflected
+/// the moment it's observed, per ADR 0065 Decision 1.
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+struct ThrottleTracker {
+    inner: Arc<Mutex<BTreeMap<TabletId, ThrottleBuckets>>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
+)]
+impl ThrottleTracker {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Admit a write of `cost` capacity units against `tablet`'s own
+    /// current per-tablet `share` (units/sec — the caller's job to divide
+    /// the table's configured limit by its current tablet count, ADR 0065
+    /// Decision 1), lazily creating the bucket pair at `share`'s own full
+    /// burst on first observation. Debits `cost` and returns `true` on
+    /// admission; refuses (charging nothing) and bumps the tablet's own
+    /// `write_throttled` counter otherwise.
+    fn check_write(&self, tablet: TabletId, share: f64, cost: f64, now: Nanos) -> bool {
+        let mut inner = self.inner.lock().expect("throttle tracker lock");
+        let buckets = inner
+            .entry(tablet)
+            .or_insert_with(|| ThrottleBuckets::new(share, share, now));
+        buckets.write.set_rate(share, now);
+        let ok = buckets.write.try_take(cost, now);
+        if !ok {
+            buckets.write_throttled = buckets.write_throttled.saturating_add(1);
+        }
+        ok
+    }
+
+    /// [`Self::check_write`]'s read-side twin.
+    fn check_read(&self, tablet: TabletId, share: f64, cost: f64, now: Nanos) -> bool {
+        let mut inner = self.inner.lock().expect("throttle tracker lock");
+        let buckets = inner
+            .entry(tablet)
+            .or_insert_with(|| ThrottleBuckets::new(share, share, now));
+        buckets.read.set_rate(share, now);
+        let ok = buckets.read.try_take(cost, now);
+        if !ok {
+            buckets.read_throttled = buckets.read_throttled.saturating_add(1);
+        }
+        ok
+    }
+
+    /// Unconditional post-charge correction (ADR 0065 §3): `delta` is
+    /// `actual_cost - precharge`, may be negative, allowed to drive the
+    /// write bucket negative. A no-op if `tablet` was never observed by
+    /// [`Self::check_write`] first (nothing to correct) or `delta` is
+    /// exactly zero (the common case for a fast-arm write, which precharges
+    /// its own exact final cost with nothing left to correct).
+    fn charge_write(&self, tablet: TabletId, delta: f64, now: Nanos) {
+        if delta == 0.0 {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("throttle tracker lock");
+        if let Some(buckets) = inner.get_mut(&tablet) {
+            buckets.write.charge(delta, now);
+        }
+    }
+
+    /// [`Self::charge_write`]'s read-side twin — every read uses this, since
+    /// a read's true cost is never known until after it runs (ADR 0065 §3).
+    fn charge_read(&self, tablet: TabletId, delta: f64, now: Nanos) {
+        if delta == 0.0 {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("throttle tracker lock");
+        if let Some(buckets) = inner.get_mut(&tablet) {
+            buckets.read.charge(delta, now);
+        }
+    }
+
+    /// Every currently-tracked tablet's own read/write bucket snapshot, in
+    /// tablet-id order — for `/admin/metrics`'s `throttle` array
+    /// (`admin::metrics_view`).
+    fn snapshot(&self) -> Vec<ThrottleSnapshotEntry> {
+        self.inner
+            .lock()
+            .expect("throttle tracker lock")
+            .iter()
+            .map(|(&tablet, b)| ThrottleSnapshotEntry {
+                tablet,
+                read_tokens: b.read.tokens,
+                read_rate: b.read.rate,
+                read_throttled: b.read_throttled,
+                write_tokens: b.write.tokens,
+                write_rate: b.write.rate,
+                write_throttled: b.write_throttled,
+            })
+            .collect()
+    }
+
+    /// Drop every tracked tablet no longer present in `meta` — see
+    /// [`ChangeRateTracker::retain_existing`]'s identical doc.
+    fn retain_existing(&self, meta: &Metadata) {
+        self.inner
+            .lock()
+            .expect("throttle tracker lock")
+            .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
+/// One [`ThrottleTracker::snapshot`] entry — a currently-tracked tablet's
+/// own read/write bucket level, configured rate, and lifetime
+/// throttled-request counts.
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — rendered on /admin/metrics in step 3"
+)]
+pub(crate) struct ThrottleSnapshotEntry {
+    pub(crate) tablet: TabletId,
+    pub(crate) read_tokens: f64,
+    pub(crate) read_rate: f64,
+    pub(crate) read_throttled: u64,
+    pub(crate) write_tokens: f64,
+    pub(crate) write_rate: f64,
+    pub(crate) write_throttled: u64,
+}
+
+/// ADR 0065 §5(a): the cluster-wide default `ReadCapacityUnits`/
+/// `WriteCapacityUnits` applied to a table with no per-table override —
+/// `None`/`None` (the default) means `PAY_PER_REQUEST`: no throttling,
+/// byte-for-byte unchanged from before this ADR. Sentinel-encoded as plain
+/// `AtomicU64`s (`u64::MAX` = `None`) rather than a `Mutex`-guarded
+/// `Option<u64>` pair specifically so [`ClientCtx::throttle_limits_for`]'s
+/// hot "is anything configured at all" check is a lock-free relaxed load,
+/// never a `Mutex` lock — the root `CLAUDE.md`/this task's own rule that
+/// the enforcement hot path costs "at most one `Option` check: no lock, no
+/// map lookup" when nothing is configured.
+///
+/// **This commit's only route to a nonzero value is [`ClientCtx::
+/// set_throttle_defaults`]**, a `pub(crate)` setter reachable from tests —
+/// there is no `ClusterSettings`/CLI/config-file path yet. Step 4 (roadmap
+/// W-08's remaining config-surface commit) is what threads a real
+/// operator-facing value in here, and gives [`ClientCtx::
+/// throttle_limits_for`]'s currently-`None` per-table hook a real
+/// `TableSchema.throughput` to read.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — read by throttle_limits_for in step 3"
+)]
+struct ThrottleDefaults {
+    read_units: std::sync::atomic::AtomicU64,
+    write_units: std::sync::atomic::AtomicU64,
+}
+
+/// Sentinel for "no limit configured" in [`ThrottleDefaults`]'s atomic
+/// storage. A real DynamoDB `ReadCapacityUnits`/`WriteCapacityUnits` is
+/// always far below `u64::MAX` in practice.
+const THROTTLE_UNSET: u64 = u64::MAX;
+
+impl Default for ThrottleDefaults {
+    fn default() -> Self {
+        Self {
+            read_units: std::sync::atomic::AtomicU64::new(THROTTLE_UNSET),
+            write_units: std::sync::atomic::AtomicU64::new(THROTTLE_UNSET),
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — read by throttle_limits_for in step 3"
+)]
+impl ThrottleDefaults {
+    fn read_units(&self) -> Option<u64> {
+        match self.read_units.load(std::sync::atomic::Ordering::Relaxed) {
+            THROTTLE_UNSET => None,
+            v => Some(v),
+        }
+    }
+
+    fn write_units(&self) -> Option<u64> {
+        match self.write_units.load(std::sync::atomic::Ordering::Relaxed) {
+            THROTTLE_UNSET => None,
+            v => Some(v),
+        }
+    }
+
+    fn set(&self, read_units: Option<u64>, write_units: Option<u64>) {
+        self.read_units.store(
+            read_units.unwrap_or(THROTTLE_UNSET),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.write_units.store(
+            write_units.unwrap_or(THROTTLE_UNSET),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The resolved per-table throttle limits (ADR 0065 §5) — the cluster
+/// default today; step 4 layers a per-table `TableSchema.throughput`
+/// override on top (taking priority when set — see [`ClientCtx::
+/// throttle_limits_for`]'s doc). `None` in either field means unthrottled
+/// for that direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "unwired plumbing (ADR 0065 W-08 step 2) — constructed by throttle_limits_for in step 3"
+)]
+pub(crate) struct ThrottleLimits {
+    pub(crate) read_units: Option<u64>,
+    pub(crate) write_units: Option<u64>,
+}
+
+/// `SimEnv`-driven, virtual-time-only coverage of the token bucket's own
+/// refill/debit/burst arithmetic (ADR 0065) — no real sleep anywhere,
+/// mirroring `rate_tracker_tests` above exactly (`Simulator::run_for`
+/// advances the clock, a caller reads it back via `env.now()`).
+#[cfg(test)]
+mod throttle_bucket_tests {
+    use std::time::Duration;
+
+    use animus_control::Metadata;
+    use animus_env::{Clock, nid};
+    use animus_sim::Simulator;
+    use animus_tablet::TabletId;
+
+    use super::{ThrottleBucket, ThrottleTracker};
+
+    const TABLET: TabletId = TabletId(1);
+    const OTHER_TABLET: TabletId = TabletId(2);
+
+    #[test]
+    fn a_fresh_bucket_admits_a_full_burst_then_refuses() {
+        let sim = Simulator::new(0x5448_524f_0001);
+        let env = sim.env(nid(0));
+        // rate = 10/s ⇒ capacity = 3000 (300s burst).
+        let tracker = ThrottleTracker::new();
+        assert!(tracker.check_write(TABLET, 10.0, 3000.0, env.now()));
+        // The very next unit costs more than the (now empty) bucket holds.
+        assert!(!tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+        let snap = tracker.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].write_throttled, 1);
+        assert!(snap[0].write_tokens.abs() < 1e-9);
+    }
+
+    #[test]
+    fn refill_accrues_at_the_configured_rate_per_virtual_second() {
+        let mut sim = Simulator::new(0x5448_524f_0002);
+        let env = sim.env(nid(0));
+        let tracker = ThrottleTracker::new();
+        // Drain the bucket to zero.
+        assert!(tracker.check_write(TABLET, 10.0, 3000.0, env.now()));
+        assert!(!tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+        // 5 virtual seconds at 10 units/s refills exactly 50 units.
+        sim.run_for(Duration::from_secs(5));
+        assert!(tracker.check_write(TABLET, 10.0, 50.0, env.now()));
+        assert!(!tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+    }
+
+    #[test]
+    fn charge_can_drive_the_bucket_negative_and_it_recovers_on_refill() {
+        let mut sim = Simulator::new(0x5448_524f_0003);
+        let env = sim.env(nid(0));
+        let tracker = ThrottleTracker::new();
+        // Charge a big post-hoc correction directly, well past what the
+        // bucket holds (ADR 0065 §3's "a large read can temporarily
+        // exceed a small partition's allotment" case).
+        tracker.check_write(TABLET, 10.0, 100.0, env.now()); // seed the entry
+        tracker.charge_write(TABLET, 5000.0, env.now());
+        let snap = tracker.snapshot();
+        assert!(
+            snap[0].write_tokens < 0.0,
+            "expected a negative token level, got {}",
+            snap[0].write_tokens
+        );
+        // The read that produced the deficit still returned its result —
+        // this only proves the *next* op observes a depleted bucket.
+        assert!(!tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+        // A long enough refill recovers past zero again.
+        sim.run_for(Duration::from_secs(600));
+        assert!(tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+    }
+
+    #[test]
+    fn a_share_change_caps_tokens_to_the_new_lower_capacity() {
+        let sim = Simulator::new(0x5448_524f_0004);
+        let env = sim.env(nid(0));
+        let tracker = ThrottleTracker::new();
+        // Full burst at 10/s = 3000 tokens.
+        assert!(tracker.check_write(TABLET, 10.0, 1.0, env.now()));
+        let before = tracker.snapshot()[0].write_tokens;
+        assert!(before > 2000.0);
+        // A split (or a lowered limit) drops this tablet's share to 1/s —
+        // capacity is now only 300; the held level must cap down to it,
+        // not silently retain the old burst forever.
+        assert!(tracker.check_write(TABLET, 1.0, 0.0, env.now()));
+        let after = tracker.snapshot()[0].write_tokens;
+        assert!(
+            after <= 300.0,
+            "expected the token level capped to the new 300-unit capacity, got {after}"
+        );
+    }
+
+    #[test]
+    fn retain_existing_drops_a_vanished_tablet() {
+        let env_seed = 0x5448_524f_0005;
+        let sim = Simulator::new(env_seed);
+        let env = sim.env(nid(0));
+        let tracker = ThrottleTracker::new();
+        tracker.check_write(TABLET, 10.0, 1.0, env.now());
+        tracker.check_write(OTHER_TABLET, 10.0, 1.0, env.now());
+        assert_eq!(tracker.snapshot().len(), 2);
+
+        // Only `OTHER_TABLET` survives in the live tablet map.
+        let mut meta = Metadata::default();
+        meta.tablets.insert(
+            OTHER_TABLET,
+            animus_tablet::Tablet::new(
+                OTHER_TABLET,
+                animus_tablet::KeyRange::new(Vec::new(), None),
+                Vec::new(),
+            ),
+        );
+        tracker.retain_existing(&meta);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].tablet, OTHER_TABLET);
+    }
+
+    #[test]
+    fn read_and_write_buckets_are_independent() {
+        let sim = Simulator::new(0x5448_524f_0006);
+        let env = sim.env(nid(0));
+        let tracker = ThrottleTracker::new();
+        // Drain the write bucket only.
+        assert!(tracker.check_write(TABLET, 5.0, 1500.0, env.now()));
+        assert!(!tracker.check_write(TABLET, 5.0, 1.0, env.now()));
+        // The read bucket, sharing the same tablet entry, is untouched.
+        assert!(tracker.check_read(TABLET, 5.0, 1500.0, env.now()));
+    }
+
+    #[test]
+    fn a_bare_bucket_refills_and_admits_deterministically() {
+        // Direct `ThrottleBucket` coverage, independent of the tracker's
+        // own lazy-creation/lock plumbing — the arithmetic in isolation.
+        let mut sim = Simulator::new(0x5448_524f_0007);
+        let env = sim.env(nid(0));
+        let mut bucket = ThrottleBucket::new(2.0, env.now());
+        assert_eq!(bucket.capacity, 600.0); // 2.0 * 300s
+        assert!(bucket.try_take(600.0, env.now()));
+        assert!(!bucket.try_take(0.001, env.now()));
+        sim.run_for(Duration::from_secs(10));
+        // 10s * 2.0/s = 20 tokens refilled.
+        assert!(bucket.try_take(20.0, env.now()));
+        assert!(!bucket.try_take(0.001, env.now()));
+    }
+}
+
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
@@ -7296,6 +7814,33 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// lives inside the control handle itself; this field is every *other*
     /// relay call `ClientCtx`'s own methods make directly.
     relay: R,
+    /// ADR 0065 (per-table throttling, W-08 step 2): this node's own
+    /// per-tablet token-bucket admission-control state. **Provisioned on
+    /// every node shape**, including a control-only one that will never
+    /// use it (mirrors `segment_store`/`backup_store`'s own W-10 rationale
+    /// for living here rather than inside [`DataRole`]) — see
+    /// [`ThrottleTracker`]'s own doc for why this placement is load-bearing
+    /// rather than incidental: every `SimEnv` `ClientCtx` fixture in this
+    /// crate (`simenv_client_ctx_tests`, `two_node_relay_tests`,
+    /// `sim_cluster.rs`) constructs `data: None`, and this ADR's own
+    /// testing section requires a `SimCluster`-driven virtual-clock corpus
+    /// to exercise real admission decisions.
+    #[allow(
+        dead_code,
+        reason = "unwired plumbing (ADR 0065 W-08 step 2) — read at every write/read enforcement point in step 3"
+    )]
+    throttle: ThrottleTracker,
+    /// ADR 0065 §5(a): the cluster-wide default read/write capacity
+    /// units — see [`ThrottleDefaults`]'s own doc. `Arc`-shared (not
+    /// `Arc<Mutex<_>>`; see that type's doc for why) so [`Self::
+    /// set_throttle_defaults`] mutates one value every clone of this
+    /// `ClientCtx` (one per connection) observes, the same sharing
+    /// discipline `client_route`/`intra_route` already use.
+    #[allow(
+        dead_code,
+        reason = "unwired plumbing (ADR 0065 W-08 step 2) — read at every write/read enforcement point in step 3"
+    )]
+    throttle_defaults: Arc<ThrottleDefaults>,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -7502,6 +8047,70 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .as_ref()
             .map(|d| d.request_rates.snapshot())
             .unwrap_or_default()
+    }
+
+    /// ADR 0065 (per-table throttling, W-08 step 2): this node's own
+    /// per-tablet throttle-bucket state, for `/admin/metrics`'s `throttle`
+    /// array. Unlike [`stream_change_rates`](Self::stream_change_rates)/
+    /// [`request_rates`](Self::request_rates), never gated on `self.data`
+    /// — `throttle` is provisioned on every node shape (see that field's
+    /// own doc), so this is simply empty on a node that has never observed
+    /// a configured limit or hosted a tablet.
+    #[allow(
+        dead_code,
+        reason = "unwired plumbing (ADR 0065 W-08 step 2) — rendered on /admin/metrics in step 3"
+    )]
+    pub(crate) fn throttle_snapshot(&self) -> Vec<ThrottleSnapshotEntry> {
+        self.throttle.snapshot()
+    }
+
+    /// ADR 0065 §5(a): resolve `table`'s effective throttle limits — the
+    /// per-table override if one is configured, else the cluster default
+    /// (`self.throttle_defaults`), else unthrottled (`None`/`None` =
+    /// `PAY_PER_REQUEST`). Takes `meta`/`table` (rather than reading
+    /// `self.effective_metadata()` itself) so a caller that already has a
+    /// `Metadata` in hand for other reasons (`kind_write_item_at_leader`,
+    /// `txn_stage_local`) pays no extra fetch — the cheap common case (no
+    /// limit anywhere) costs exactly two lock-free atomic loads.
+    ///
+    /// **Step 4 hook**: `TableSchema` does not yet carry a `throughput`
+    /// field (that is roadmap W-08 step 4's own commit) — every table
+    /// falls through to the cluster default today. A future per-table
+    /// override reads `meta.schemas`/`table` here and takes priority over
+    /// `self.throttle_defaults` when set, per ADR 0065 Decision 5(b)
+    /// ("per-table settings override the cluster default").
+    #[allow(
+        dead_code,
+        reason = "unwired plumbing (ADR 0065 W-08 step 2) — called from every write/read enforcement point in step 3"
+    )]
+    pub(crate) fn throttle_limits_for(&self, _meta: &Metadata, _table: &str) -> ThrottleLimits {
+        ThrottleLimits {
+            read_units: self.throttle_defaults.read_units(),
+            write_units: self.throttle_defaults.write_units(),
+        }
+    }
+
+    /// **Test-reachable hook for ADR 0065's cluster-wide default (§5(a)),
+    /// step 4's own config surface does not exist yet** — the smallest
+    /// thing that lets this commit's tests exercise real admission
+    /// decisions: an in-crate `SimEnv` test calls this directly; a
+    /// real-thread `tests/*.rs` binary (which cannot name `ClientCtx` at
+    /// all, `pub(crate)`) reaches it indirectly via `POST /admin/throttle/
+    /// defaults` (`admin::action_set_throttle_defaults`, below), the one
+    /// genuinely `pub`-reachable surface this commit adds. **Step 4 should
+    /// replace both the admin action and this method's call site with the
+    /// real config plumbing** (`ClusterSettings::default_{read,write}_
+    /// capacity_units` threaded through `ClientCtx` construction, plus a
+    /// per-table `TableSchema.throughput` override read inside
+    /// `throttle_limits_for`) — not delete this setter outright, since an
+    /// operator-facing debug lever in the same shape may still be worth
+    /// keeping.
+    #[allow(
+        dead_code,
+        reason = "unwired plumbing (ADR 0065 W-08 step 2) — reached from an admin action in step 3"
+    )]
+    pub(crate) fn set_throttle_defaults(&self, read_units: Option<u64>, write_units: Option<u64>) {
+        self.throttle_defaults.set(read_units, write_units);
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
@@ -14277,6 +14886,8 @@ mod simenv_client_ctx_tests {
             dynamo_auth: None,
             tls: None,
             relay: NeverRelay,
+            throttle: ThrottleTracker::new(),
+            throttle_defaults: Arc::new(ThrottleDefaults::default()),
         };
 
         (sim, ctx, control, kv)
@@ -14552,6 +15163,8 @@ mod two_node_relay_tests {
             dynamo_auth: None,
             tls: None,
             relay: relay_a.clone(),
+            throttle: ThrottleTracker::new(),
+            throttle_defaults: Arc::new(ThrottleDefaults::default()),
         };
 
         // Node A answers relayed requests through the generic dispatcher
@@ -14606,6 +15219,8 @@ mod two_node_relay_tests {
             dynamo_auth: None,
             tls: None,
             relay: relay_b,
+            throttle: ThrottleTracker::new(),
+            throttle_defaults: Arc::new(ThrottleDefaults::default()),
         };
 
         (sim, ctx_a, ctx_b, control)
