@@ -815,6 +815,15 @@ fn apply_tls_flag(
     }
 }
 
+/// The URL scheme a startup banner should print for a port this node bound
+/// with (`true`) or without (`false`) TLS material (ADR 0064) — every
+/// `println!` banner below that used to hardcode `http` regardless of
+/// `spec.tls`/`--tls-*`/a config file's own `tls` section now goes through
+/// this, so the two never drift again.
+fn scheme(tls_enabled: bool) -> &'static str {
+    if tls_enabled { "https" } else { "http" }
+}
+
 /// Apply `--advertise-host NAME` (ADR 0060) onto `config.nodes[index]`
 /// (this process's own entry only — every other node's `advertise_host`
 /// stays exactly what its own config entry already says): the same
@@ -992,8 +1001,9 @@ async fn run_single(
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: node {index}/{} up (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
@@ -1089,8 +1099,9 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("failed to start control node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: control node {index}/{} up — client {} — admin http://{}",
+        "animusd: control node {index}/{} up — client {} — admin {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.admin_addr(),
@@ -1267,8 +1278,9 @@ async fn run_data_config(
     )
     .await
     .map_err(|e| format!("failed to start data node {index}: {e}"))?;
+    let scheme = scheme(config.nodes[index].tls.is_some());
     println!(
-        "animusd: data node {index}/{} up (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: data node {index}/{} up (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         config.len(),
         node.client_addr(),
         node.dynamo_addr(),
@@ -1309,6 +1321,7 @@ async fn run_data_join(
         return Err("data --seed requires at least one address".into());
     }
 
+    let tls_enabled = tls_flag.is_some();
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
     let addrs = RoleAddrs {
         // Unread placeholder: `Node::bind_data` takes the real (proposed or
@@ -1346,8 +1359,9 @@ async fn run_data_join(
     )
     .await
     .map_err(|e| format!("failed to join as a data node: {e}"))?;
+    let scheme = scheme(tls_enabled);
     println!(
-        "animusd: data node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: data node joined (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.admin_addr(),
@@ -1447,8 +1461,11 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     let node = animusd::run_node_join(seeds, id, addrs, &dir, backend, BTreeMap::new())
         .await
         .map_err(|e| format!("failed to join: {e}"))?;
+    // `join` accepts no `--tls-*` flag at all (see `addrs.tls: None` above)
+    // — always plain HTTP.
+    let scheme = scheme(false);
     println!(
-        "animusd: node joined (CP) — client {} — dynamo http {} — admin http://{} — console http://{}",
+        "animusd: node joined (CP) — client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
         node.client_addr(),
         node.dynamo_addr(),
         node.admin_addr(),
@@ -1517,9 +1534,12 @@ async fn run_in_process_cluster(
     if let Some(rate) = auto_split_ops_rate {
         println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
+    // The in-process `--cluster N` dev convenience has no `--tls-*` knob of
+    // its own — always plain HTTP.
+    let scheme = scheme(false);
     for (i, node) in nodes.iter().enumerate() {
         println!(
-            "  node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
+            "  node {i}: client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.admin_addr(),
@@ -1587,16 +1607,19 @@ async fn run_in_process_split_cluster(
     if let Some(rate) = auto_split_ops_rate {
         println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
+    // The in-process `--cluster-control N --cluster-data M` dev convenience
+    // has no `--tls-*` knob of its own — always plain HTTP.
+    let scheme = scheme(false);
     for (i, node) in nodes.iter().take(control_n).enumerate() {
         println!(
-            "  control node {i}: client {} — admin http://{}",
+            "  control node {i}: client {} — admin {scheme}://{}",
             node.client_addr(),
             node.admin_addr(),
         );
     }
     for (i, node) in nodes.iter().skip(control_n).enumerate() {
         println!(
-            "  data node {i}: client {} — dynamo http {} — admin http://{} — console http://{}",
+            "  data node {i}: client {} — dynamo {scheme} {} — admin {scheme}://{} — console {scheme}://{}",
             node.client_addr(),
             node.dynamo_addr(),
             node.admin_addr(),

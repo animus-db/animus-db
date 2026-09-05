@@ -253,6 +253,14 @@ Either shape resolves to the same `Secret` name
   SAN list (`dns_names`) covers every pod's own FQDN plus both Services.
 - `desired::statefulset::build` mounts the resolved `Secret` read-only at
   `/etc/animus/tls` on every pod — identical mount for either shape.
+- **2026-09-05**: `desired::statefulset::build` also switches the
+  readiness/liveness probes' `GET /admin/health` to `scheme: HTTPS` when
+  `spec.tls` is set (admin is server-only TLS, so a plaintext kubelet probe
+  against a TLS-only listener fails the handshake server-side every probe
+  period and the pod never goes Ready — the bug the `e2e-kind-tls` job's
+  first real CI run caught, run 33963360763). The kubelet's HTTPS probe
+  scheme does not verify the server certificate, so this needs no CA
+  plumbed into the kubelet itself.
 - `desired::cluster_config::build_cluster_config` gives every node's
   `RoleAddrs` the identical `TlsSection` (`tls_section()`), pointing at
   `/etc/animus/tls/{tls.crt,tls.key,ca.crt}` — baked into the generated

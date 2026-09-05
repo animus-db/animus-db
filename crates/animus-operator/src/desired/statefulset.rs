@@ -1,6 +1,10 @@
 //! The `StatefulSet` builder: one pod per node ordinal, running
 //! `entrypoint.sh` off the cluster `ConfigMap`, probed on the admin port's
-//! `GET /admin/health`.
+//! `GET /admin/health`. The probes' scheme follows `spec.tls`: HTTP when
+//! unset, HTTPS (unverified, as the kubelet itself does not check the
+//! server certificate) when set — admin is server-only TLS (ADR 0064), so
+//! a plaintext probe against a TLS-only listener fails the handshake on
+//! the server side every probe period and the pod never goes Ready.
 
 use std::collections::BTreeMap;
 
@@ -62,11 +66,18 @@ const DATA_VOLUME: &str = "data";
 const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
 const TLS_VOLUME: &str = "tls";
 
-fn admin_probe(admin_port: i32, extra: impl FnOnce(&mut Probe)) -> Probe {
+/// `tls_enabled` mirrors `spec.tls.is_some()`: admin is server-only TLS
+/// (ADR 0064), so when it's on the probe's `GET /admin/health` must speak
+/// HTTPS too, or the kubelet's plaintext request just fails the TLS
+/// handshake on the server side every probe period. The kubelet's HTTPS
+/// probe scheme does not verify the server certificate, so this needs no
+/// CA plumbed into it — see ADR 0064 and the fix that added this.
+fn admin_probe(admin_port: i32, tls_enabled: bool, extra: impl FnOnce(&mut Probe)) -> Probe {
     let mut probe = Probe {
         http_get: Some(HTTPGetAction {
             path: Some("/admin/health".to_string()),
             port: IntOrString::Int(admin_port),
+            scheme: tls_enabled.then(|| "HTTPS".to_string()),
             ..Default::default()
         }),
         ..Default::default()
@@ -168,6 +179,7 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
     // `kubernetes.io/tls` one, or cert-manager's own output) mounted
     // identically on every pod — see `TlsSpec`'s own doc for why one
     // shared cert, not a per-pod one.
+    let tls_enabled = spec.tls.is_some();
     if let Some(tls) = &spec.tls {
         volumes.push(Volume {
             name: TLS_VOLUME.to_string(),
@@ -202,11 +214,11 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
             .resources
             .clone()
             .or(Some(ResourceRequirements::default())),
-        readiness_probe: Some(admin_probe(admin_port, |p| {
+        readiness_probe: Some(admin_probe(admin_port, tls_enabled, |p| {
             p.period_seconds = Some(READINESS_PERIOD_SECS);
             p.failure_threshold = Some(READINESS_FAILURE_THRESHOLD);
         })),
-        liveness_probe: Some(admin_probe(admin_port, |p| {
+        liveness_probe: Some(admin_probe(admin_port, tls_enabled, |p| {
             p.initial_delay_seconds = Some(LIVENESS_INITIAL_DELAY_SECS);
             p.period_seconds = Some(LIVENESS_PERIOD_SECS);
             p.failure_threshold = Some(LIVENESS_FAILURE_THRESHOLD);
@@ -518,6 +530,67 @@ mod tests {
         let sts = build(&cluster, &cluster.spec);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "tls"));
+    }
+
+    #[test]
+    fn probes_use_https_scheme_when_tls_set_secret_name_shape() {
+        use crate::crd::TlsSpec;
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: Some("preexisting-tls".to_string()),
+            cert_manager: None,
+        });
+        let sts = build(&cluster, &cluster.spec);
+        let c = container(&sts);
+        let readiness = c.readiness_probe.unwrap();
+        let liveness = c.liveness_probe.unwrap();
+        for probe in [&readiness, &liveness] {
+            let get = probe.http_get.as_ref().unwrap();
+            assert_eq!(
+                get.scheme.as_deref(),
+                Some("HTTPS"),
+                "kubelet probe must speak TLS to a TLS-only admin listener"
+            );
+        }
+    }
+
+    #[test]
+    fn probes_use_https_scheme_when_tls_set_cert_manager_shape() {
+        use crate::crd::{CertManagerSpec, IssuerRef, TlsSpec};
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.tls = Some(TlsSpec {
+            secret_name: None,
+            cert_manager: Some(CertManagerSpec {
+                issuer_ref: IssuerRef {
+                    name: "i".to_string(),
+                    kind: "ClusterIssuer".to_string(),
+                    group: None,
+                },
+                duration: None,
+                renew_before: None,
+            }),
+        });
+        let sts = build(&cluster, &cluster.spec);
+        let c = container(&sts);
+        let readiness = c.readiness_probe.unwrap();
+        let liveness = c.liveness_probe.unwrap();
+        for probe in [&readiness, &liveness] {
+            let get = probe.http_get.as_ref().unwrap();
+            assert_eq!(get.scheme.as_deref(), Some("HTTPS"));
+        }
+    }
+
+    #[test]
+    fn probes_have_no_scheme_override_when_tls_unset() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let c = container(&sts);
+        let readiness = c.readiness_probe.unwrap();
+        let liveness = c.liveness_probe.unwrap();
+        for probe in [&readiness, &liveness] {
+            let get = probe.http_get.as_ref().unwrap();
+            assert_eq!(get.scheme, None, "plain HTTP probe leaves scheme unset");
+        }
     }
 
     #[test]

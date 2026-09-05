@@ -434,6 +434,18 @@ above. As-built specifics worth recording:
   every ordinal for cross-node dialing to work at all, so a per-pod split
   would shrink no SAN list, only multiply objects to manage) — see
   `crd::TlsSpec`'s own doc.
+- **(2026-09-05 fix) The kubelet probes follow `spec.tls` too.** Admin is
+  server-only TLS (Decision 2), and the `StatefulSet`'s readiness/liveness
+  probes hit that same port — a plaintext `GET /admin/health` against a
+  TLS-only listener fails the handshake on the server side every probe
+  period, so every pod stayed `NotReady` and was restart-looped by the
+  kubelet (the first real CI run of the `e2e-kind-tls` job below caught
+  this: `admin TLS handshake failed ... InvalidContentType`).
+  `desired::statefulset::admin_probe` now sets `HTTPGetAction.scheme:
+  HTTPS` whenever `spec.tls` is set, else leaves it unset (plain HTTP).
+  The kubelet's HTTPS probe scheme does not verify the server certificate,
+  so this needed no CA plumbed into the kubelet itself — no other change
+  to Decisions 1–7.
 - **The `Certificate`, only for `certManager`.** `desired::certificate::
   build` returns `None` for the `secretName` shape (nothing to create —
   the operator only *reads* that `Secret`) and for no TLS at all; for

@@ -82,6 +82,13 @@ every pod, and every generated node's `cluster.json` gets a `tls` section
 pointing at those three files — the *same* cert/key on every pod, not a
 distinct one per ordinal (see `crd::TlsSpec`'s own doc for why).
 
+**(2026-09-05)** The pod's own readiness/liveness probes (`GET
+/admin/health`) switch to `scheme: HTTPS` once `spec.tls` is set — admin is
+server-only TLS, so a plaintext kubelet probe against a TLS-only listener
+fails the handshake on the server side, and without this every pod stays
+NotReady and gets restart-looped by the kubelet. The kubelet's HTTPS probe
+does not verify the server certificate, so no CA needs plumbing into it.
+
 The scale-down drain sequence's admin-port calls (`crate::admin_client`)
 switch to TLS automatically once `spec.tls` is set: the controller reads
 the resolved `Secret`'s `ca.crt` through the same `kube::Api` the rest of
