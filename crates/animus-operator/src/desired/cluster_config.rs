@@ -119,6 +119,15 @@ pub struct ClusterSettings {
     pub stream_seal_age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_retention_secs: Option<u64>,
+    /// ADR 0065 §5(a), W-08 step 4: the cluster-wide default throttle
+    /// budget. Same precedent as `auto_split_ops_rate` — no
+    /// `AnimusClusterSpec` field exposes either of these yet, so this crate
+    /// never populates them; they stay `None`/absent from the emitted JSON
+    /// like every other CRD-unexposed knob in this mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle_read_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle_write_units: Option<u64>,
 }
 
 impl ClusterSettings {
@@ -444,6 +453,36 @@ mod tests {
                 .get("auto_split_ops_rate")
                 .is_none(),
             "expected no auto_split_ops_rate key, got {value}"
+        );
+    }
+
+    #[test]
+    fn cluster_settings_throttle_fields_are_never_populated_by_this_crate() {
+        // ADR 0065 §5(a), W-08 step 4: same precedent as `auto_split_ops_rate`
+        // above — no `AnimusClusterSpec` field exposes either throttle knob
+        // yet, so both stay `None` and never appear in the emitted JSON even
+        // when the section is otherwise non-empty.
+        let mut s = spec(3);
+        s.auto_split_bytes = Some(1);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let settings = cfg
+            .cluster_settings
+            .clone()
+            .expect("auto_split_bytes alone is enough for the section to appear");
+        assert_eq!(settings.throttle_read_units, None);
+        assert_eq!(settings.throttle_write_units, None);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value["cluster_settings"]
+                .get("throttle_read_units")
+                .is_none(),
+            "expected no throttle_read_units key, got {value}"
+        );
+        assert!(
+            value["cluster_settings"]
+                .get("throttle_write_units")
+                .is_none(),
+            "expected no throttle_write_units key, got {value}"
         );
     }
 

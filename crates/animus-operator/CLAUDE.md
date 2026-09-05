@@ -180,6 +180,14 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   reconciled (`resolve_cluster_settings` in `animusd`'s own `main.rs`); do
   not reintroduce it as a flag without removing it from the emitted
   section, or vice versa.
+  **`desired::cluster_config::ClusterSettings` also mirrors
+  `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
+  4) — shape parity only, the same precedent `auto_split_ops_rate` (W-09)
+  already set**: no `AnimusClusterSpec` field exposes either yet, so
+  `build_cluster_config` never populates them (`cluster_settings_throttle_
+  fields_are_never_populated_by_this_crate` pins this), and there is no
+  `spec.throttle*` CRD surface to add here until a future ADR/PR wires one
+  up.
   **`--split-mode` no longer exists (fixed, #590)**: `crates/animusd/src/
   main.rs`'s own module doc states the flag and the copy-based split
   workflow it selected were deleted outright (2026-09-01, ADR 0058's rung 4

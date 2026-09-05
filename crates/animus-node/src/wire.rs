@@ -787,6 +787,11 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // follower-connected `UpdateTimeToLive` must reach the control
         // leader.
         | MetaCommand::SetTableTtl { .. }
+        // Per-table provisioned throughput (ADR 0065 §5(b)): schema-catalog
+        // class, same relay reason as `SetTableTtl` — a follower-connected
+        // `CreateTable`/`UpdateTable` carrying `BillingMode`/
+        // `ProvisionedThroughput` must reach the control leader.
+        | MetaCommand::SetTableThroughput { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1175,8 +1180,8 @@ pub enum ClientResponse {
 #[cfg(test)]
 mod tests {
     use animus_control::{
-        ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, NodeAddrs, StreamSpec,
-        StreamViewType, TableSchema, TtlSpec,
+        ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, NodeAddrs,
+        ProvisionedThroughput, StreamSpec, StreamViewType, TableSchema, TtlSpec,
     };
     use animus_env::nid;
     use animus_tablet::{Epoch, KeyRange, TabletId};
@@ -1252,6 +1257,13 @@ mod tests {
                 table: table.clone(),
                 spec: Some(TtlSpec {
                     attribute_name: "expires_at".to_string(),
+                }),
+            },
+            MetaCommand::SetTableThroughput {
+                table: table.clone(),
+                spec: Some(ProvisionedThroughput {
+                    read_units: 5,
+                    write_units: 5,
                 }),
             },
             MetaCommand::TagResource {

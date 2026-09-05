@@ -369,9 +369,9 @@
         <table>
           <thead><tr><th style="width:280px">Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
           <tbody>
-            <tr><td><code>CreateTable</code></td><td><span class="pill yes">Yes</span></td><td>Partition and sort keys, GSIs and LSIs at creation</td></tr>
-            <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Yes</span></td><td>Includes index status and stream configuration</td></tr>
-            <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Yes</span></td><td>Add or drop a GSI on a populated table, with online backfill</td></tr>
+            <tr><td><code>CreateTable</code></td><td><span class="pill yes">Yes</span></td><td>Partition and sort keys, GSIs and LSIs at creation, plus <code>BillingMode</code>/<code>ProvisionedThroughput</code></td></tr>
+            <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Yes</span></td><td>Includes index status, stream configuration, and billing mode/throughput</td></tr>
+            <tr><td><code>UpdateTable</code></td><td><span class="pill yes">Yes</span></td><td>Add or drop a GSI on a populated table with online backfill, toggle streams, or change <code>BillingMode</code>/<code>ProvisionedThroughput</code> — one of the three per call</td></tr>
             <tr><td><code>PutItem</code> · <code>GetItem</code> · <code>DeleteItem</code></td><td><span class="pill yes">Yes</span></td><td>Condition expressions, projections, all attribute types</td></tr>
             <tr><td><code>UpdateItem</code></td><td><span class="pill yes">Yes</span></td><td>Update expressions with conditions</td></tr>
             <tr><td><code>Query</code></td><td><span class="pill yes">Yes</span></td><td>Key conditions, filters, index queries, pagination</td></tr>
@@ -385,7 +385,8 @@
             <tr><td>Authentication (SigV4)</td><td><span class="pill opt">Opt-in</span></td><td>Off by default. Without it, any caller that can reach the port is trusted</td></tr>
             <tr><td><code>CreateBackup</code> · <code>DescribeBackup</code> · <code>ListBackups</code> · <code>DeleteBackup</code> · <code>RestoreTableFromBackup</code></td><td><span class="pill yes">Yes</span></td><td>On-demand backups and restore. A backup outlives a dropped source table and restores into a brand-new table</td></tr>
             <tr><td><code>UpdateContinuousBackups</code> · <code>DescribeContinuousBackups</code> · <code>RestoreTableToPointInTime</code></td><td><span class="pill yes">Yes</span></td><td>Continuous backups (PITR). Restore to any second within the continuous-coverage window, into a brand-new table; works even if the source table has since been dropped</td></tr>
-            <tr><td>Global tables, on-demand capacity accounting</td><td><span class="pill no">No</span></td><td>Out of scope for now</td></tr>
+            <tr><td>Provisioned throughput / throttling</td><td><span class="pill yes">Yes</span></td><td>A table's declared <code>ProvisionedThroughput</code>, or a cluster-wide default, is enforced as a real per-tablet admission budget — an exhausted budget returns <code>ProvisionedThroughputExceededException</code> (or a <code>ThrottlingError</code> cancellation reason for <code>TransactWriteItems</code>)</td></tr>
+            <tr><td>Global tables, on-demand billing metering</td><td><span class="pill no">No</span></td><td>Out of scope for now — throttling is admission control, not an invoice</td></tr>
           </tbody>
         </table>
       </div>

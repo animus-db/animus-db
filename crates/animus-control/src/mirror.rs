@@ -324,6 +324,9 @@ pub fn apply_and_derive_mirror(
         // ADR 0051: TTL is likewise part of the table's schema entry, so it
         // mirrors exactly the same way.
         | MetaCommand::SetTableTtl { table, .. }
+        // ADR 0065 §5(b): provisioned throughput is likewise part of the
+        // table's schema entry, so it mirrors exactly the same way.
+        | MetaCommand::SetTableThroughput { table, .. }
         // W-06: a table's tags are likewise part of its schema entry.
         | MetaCommand::TagResource { table, .. }
         | MetaCommand::UntagResource { table, .. } => {

@@ -1159,7 +1159,28 @@ per-tablet CP data plane (`animus-cp-data`).
   snapshot is a full `Metadata` image). Secondary-index *definitions* ride the
   same path (`TableSchema.indexes`, mutated by `Create/DropTableIndex`) — only
   the index *shape* is replicated; the index *entry data* stays at the wire edge,
-  rebuilt from observed writes.
+  rebuilt from observed writes. **`TableSchema.throughput: Option<
+  ProvisionedThroughput>` (ADR 0065 §5(b), W-08 step 4)** — a table's
+  provisioned read/write capacity units, mutated only through
+  `MetaCommand::SetTableThroughput { table, spec }`, modeled directly on
+  `SetTableTtl`'s own apply semantics (`ProvisionedThroughput` mints no
+  identity label either): `spec: Some(new)` equal to the current value is a
+  `NoOp`; a genuinely different value (including a live in-place unit
+  change) is `Applied`; `spec: None` reverts to `PAY_PER_REQUEST`, itself a
+  `NoOp` when already unset. `Metadata::table_throughput(table)` is the read
+  accessor (`animusd`'s per-tablet throttle bucket resolves a table's
+  effective limits from this, falling back to the cluster-wide default when
+  `None`). On `is_relayable_command`'s allowlist (`animus-node/src/
+  wire.rs`) and `mirror.rs`'s schema-catalog-class mirror bucket beside
+  `SetTableTtl`/`TagResource` — a follower-connected `CreateTable`/
+  `UpdateTable` carrying `BillingMode`/`ProvisionedThroughput` must reach
+  the control leader like every other DDL mutation. `animus-dynamo`'s wire
+  layer decodes `CreateTable`/`UpdateTable`'s `BillingMode`/
+  `ProvisionedThroughput` into this type directly (re-exported, no
+  wire-local duplicate) — see that crate's own `CLAUDE.md` entry for the
+  decode/response-shape details, and `animusd/CLAUDE.md`'s "Per-table
+  throttling" entry for the full end-to-end design (both configuration
+  layers, enforcement, and tests).
 
 - **Observability metrics (ADR 0015).** All from `Env`-supplied or core-derived
   inputs (deterministic): election counters + `is_leader` gauge

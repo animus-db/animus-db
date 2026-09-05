@@ -58,7 +58,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use animus_control::{IndexStatus, StreamViewType};
+use animus_control::{IndexStatus, ProvisionedThroughput, StreamViewType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -592,20 +592,28 @@ pub enum Operation {
         /// stream, or `StreamEnabled: false`. The `label` is minted by
         /// `animusd`, not decoded here — this is a pure wire layer.
         stream_view_type: Option<StreamViewType>,
+        /// `BillingMode: PROVISIONED` + `ProvisionedThroughput` (ADR 0065
+        /// §5(b)). `None` for `BillingMode: PAY_PER_REQUEST` or an absent
+        /// `BillingMode` (this adapter's default, unlike real DynamoDB's own
+        /// legacy `PROVISIONED` default — matching this adapter's
+        /// pre-existing "never inspects `BillingMode`" behavior for the
+        /// unthrottled case).
+        throughput: Option<ProvisionedThroughput>,
     },
-    /// `UpdateTable`: either a `StreamSpecification` change (ADR 0042 §2) or
-    /// a single secondary-index change (ADR 0045 §6) — never both in one
-    /// call (decode-time rejected, Fork C). Exactly one of `stream`/
-    /// `index_update` is `Some`; any other index/key/throughput change is
-    /// rejected up front at decode time.
+    /// `UpdateTable`: exactly one of a `StreamSpecification` change (ADR
+    /// 0042 §2), a single secondary-index change (ADR 0045 §6), or a
+    /// `BillingMode`/`ProvisionedThroughput` change (ADR 0065 §5(b)) — never
+    /// more than one in one call (decode-time rejected, Fork C, extended by
+    /// ADR 0065). Exactly one of `stream`/`index_update`/`throughput_update`
+    /// is `Some`; any other key change is rejected up front at decode time.
     UpdateTable {
         /// Target table name.
         table: String,
         /// The requested stream (de)configuration, if this call changes the
-        /// stream rather than an index.
+        /// stream rather than an index or throughput.
         stream: Option<StreamUpdate>,
         /// The requested secondary-index change, if this call changes an
-        /// index rather than the stream (ADR 0045 §6).
+        /// index rather than the stream or throughput (ADR 0045 §6).
         index_update: Option<IndexUpdate>,
         /// The declared `AttributeType` for each attribute named in this
         /// call's own `AttributeDefinitions` (issue #319) — the identical
@@ -613,11 +621,19 @@ pub enum Operation {
         /// CreateTable)'s own `key_types` field carries. Populated whenever
         /// `index_update` is `Some(IndexUpdate::Create(..))` (the one
         /// `UpdateTable` shape that can introduce a brand-new key
-        /// attribute); empty for every other call (a `Delete`, or a stream
-        /// change), since neither needs it. `animusd` threads this into the
-        /// new index's own `IndexDef` so it records a real declared type
-        /// instead of always defaulting to `S`.
+        /// attribute); empty for every other call (a `Delete`, a stream
+        /// change, or a throughput change), since none of those need it.
+        /// `animusd` threads this into the new index's own `IndexDef` so it
+        /// records a real declared type instead of always defaulting to `S`.
         key_types: Vec<(String, String)>,
+        /// The requested provisioned-throughput change (ADR 0065 §5(b)), if
+        /// this call changes throughput rather than the stream or an index.
+        /// `Some(Some(spec))` = `BillingMode: PROVISIONED` with `spec`;
+        /// `Some(None)` = `BillingMode: PAY_PER_REQUEST` (or restating an
+        /// already-`PROVISIONED` table's units via a bare
+        /// `ProvisionedThroughput`, no `BillingMode` restated); `None` =
+        /// this call doesn't touch throughput at all.
+        throughput_update: Option<Option<ProvisionedThroughput>>,
     },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
@@ -1192,6 +1208,23 @@ impl CancellationReason {
             item: None,
         }
     }
+
+    /// A `TransactWriteItems` action's own participant tablet refused it
+    /// for insufficient per-table capacity (ADR 0065 §6) — the
+    /// `CancellationReasons` code AWS uses for a throttled action inside a
+    /// transaction, distinct from the single-item
+    /// `ProvisionedThroughputExceededException`
+    /// ([`WireError::provisioned_throughput_exceeded`]) a non-transactional
+    /// write/read returns for the identical underlying refusal. Never
+    /// carries `Item`, mirroring [`Self::transaction_conflict`].
+    #[must_use]
+    pub fn throttling_error() -> Self {
+        Self {
+            code: "ThrottlingError",
+            message: Some("Throughput exceeds the current capacity of your table or index".into()),
+            item: None,
+        }
+    }
 }
 
 /// The bracketed aggregate `message` AWS derives from a `CancellationReasons`
@@ -1344,6 +1377,24 @@ impl WireError {
         }
     }
 
+    /// A single-item write or read (`PutItem`/`GetItem`/`UpdateItem`/
+    /// `DeleteItem`/`Query`/`Scan`) was refused because its tablet's own
+    /// per-table token bucket had insufficient capacity units (ADR 0065
+    /// §6). The AWS-faithful, client-SDK-retryable code every DynamoDB SDK
+    /// already backs off on — HTTP 400, matching `error_status`'s existing
+    /// "400 for client errors, 500 only for our own internal failures"
+    /// rule (`animusd::dynamo::error_status` falls through to 400 for any
+    /// code it doesn't special-case, so no wire-edge change was needed to
+    /// make this land as 400).
+    #[must_use]
+    pub fn provisioned_throughput_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: "ProvisionedThroughputExceededException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// Render as the DynamoDB error JSON body (`{"__type":..,"message":..}`,
     /// plus a `"CancellationReasons"` sibling array when [`Self::reasons`]
     /// is `Some`, ADR 0018's 2026-08-24 `CancellationReasons` amendment).
@@ -1431,12 +1482,14 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
                 &key_types,
             )?;
             let stream_view_type = decode_create_table_stream_spec(obj)?;
+            let throughput = decode_create_table_throughput(obj)?;
             Ok(Operation::CreateTable {
                 table,
                 schema,
                 key_types,
                 indexes,
                 stream_view_type,
+                throughput,
             })
         }
         "UpdateTable" => decode_update_table(obj),
@@ -3016,6 +3069,70 @@ fn decode_create_table_stream_spec(
     Ok(Some(decode_stream_view_type(spec)?))
 }
 
+/// Decode a `ProvisionedThroughput` object's required `ReadCapacityUnits`/
+/// `WriteCapacityUnits`, both required to be at least 1 — matching real
+/// DynamoDB, which rejects a `PROVISIONED` table with either at 0.
+fn decode_provisioned_throughput(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<ProvisionedThroughput, WireError> {
+    let pt = obj
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation(format!("missing object field `{key}`")))?;
+    let read_units = pt
+        .get("ReadCapacityUnits")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| WireError::validation(format!("`{key}` missing `ReadCapacityUnits`")))?;
+    let write_units = pt
+        .get("WriteCapacityUnits")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| WireError::validation(format!("`{key}` missing `WriteCapacityUnits`")))?;
+    if read_units < 1 || write_units < 1 {
+        return Err(WireError::validation(
+            "One or more parameter values were invalid: ReadCapacityUnits and \
+             WriteCapacityUnits must both be at least 1",
+        ));
+    }
+    Ok(ProvisionedThroughput {
+        read_units,
+        write_units,
+    })
+}
+
+/// Decode a `CreateTable`'s optional `BillingMode`/`ProvisionedThroughput`
+/// (ADR 0065 §5(b)). `BillingMode` absent or `PAY_PER_REQUEST` (this
+/// adapter's default, unlike real DynamoDB's own legacy `PROVISIONED`
+/// default — matching this adapter's pre-existing "never inspects
+/// `BillingMode`" behavior for the unthrottled case) ⇒ `None`, and
+/// `ProvisionedThroughput` is rejected if present alongside it (a
+/// `PAY_PER_REQUEST` table declaring capacity units is a real DynamoDB
+/// `ValidationException` too). `BillingMode: PROVISIONED` requires
+/// `ProvisionedThroughput`.
+fn decode_create_table_throughput(
+    obj: &Map<String, Value>,
+) -> Result<Option<ProvisionedThroughput>, WireError> {
+    let mode = obj.get("BillingMode").and_then(Value::as_str);
+    match mode {
+        Some("PROVISIONED") => Ok(Some(decode_provisioned_throughput(
+            obj,
+            "ProvisionedThroughput",
+        )?)),
+        Some("PAY_PER_REQUEST") | None => {
+            if obj.contains_key("ProvisionedThroughput") {
+                return Err(WireError::validation(
+                    "ProvisionedThroughput cannot be specified when BillingMode is \
+                     PAY_PER_REQUEST",
+                ));
+            }
+            Ok(None)
+        }
+        Some(other) => Err(WireError::validation(format!(
+            "unsupported BillingMode `{other}` (expected PROVISIONED or PAY_PER_REQUEST)"
+        ))),
+    }
+}
+
 /// Decode a `StreamSpecification` object's required `StreamViewType`.
 fn decode_stream_view_type(spec: &Map<String, Value>) -> Result<StreamViewType, WireError> {
     let raw = spec
@@ -3052,31 +3169,22 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 }
 
 /// `UpdateTable` top-level keys this adapter never implements a change for —
-/// there is no provisioned-capacity model, no encryption-at-rest toggle, and
-/// no global-tables replica set (see `website/compatibility.html`'s "no
-/// billing meter" framing). Present unconditionally, so a body carrying only
-/// one of these is a clear `ValidationException` naming the key rather than
-/// the generic "requires either..." fallback or, worse, a silent no-op.
-const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &[
-    "SSESpecification",
-    "ReplicaUpdates",
-    "ProvisionedThroughput",
-];
+/// no encryption-at-rest toggle, and no global-tables replica set (see
+/// `website/compatibility.html`'s "no billing meter" framing — provisioned
+/// throughput itself **is** now supported, ADR 0065 §5(b); `BillingMode`/
+/// `ProvisionedThroughput` are handled separately, by
+/// [`decode_update_table_throughput`], not this blanket list). Present
+/// unconditionally, so a body carrying either of these is a clear
+/// `ValidationException` naming the key rather than the generic "requires
+/// either..." fallback or, worse, a silent no-op.
+const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &["SSESpecification", "ReplicaUpdates"];
 
-/// Reject any `UpdateTable` top-level key this adapter doesn't model, each
-/// with its own named `ValidationException` (mirroring
-/// [`decode_index_updates`]'s per-shape rejections). `BillingMode` is a
-/// deliberate special case, not a blanket rejection: `CreateTable` already
-/// accepts (and never inspects) `BillingMode: "PAY_PER_REQUEST"` — the only
-/// billing mode this adapter has, since there is no provisioned-capacity
-/// model to switch to — so an `UpdateTable` re-asserting that same value is
-/// tolerated the same way (a common SDK/CLI habit, e.g. `aws dynamodb
-/// update-table --billing-mode PAY_PER_REQUEST`), while any other value
-/// (`"PROVISIONED"`, or a non-string) is rejected by name. Tolerating the
-/// key does not by itself satisfy the call — a `BillingMode`-only body still
-/// falls through to the "requires either..." rejection below, since this
-/// adapter models no billing-mode *change*, only the redundant restatement
-/// of the mode it already has.
+/// Reject any `UpdateTable` top-level key this adapter doesn't model at all,
+/// each with its own named `ValidationException` (mirroring
+/// [`decode_index_updates`]'s per-shape rejections). `BillingMode`/
+/// `ProvisionedThroughput` are deliberately **not** checked here since ADR
+/// 0065 §5(b) — they are a real, modeled change now, decoded by
+/// [`decode_update_table_throughput`] instead.
 fn reject_unsupported_update_table_keys(obj: &Map<String, Value>) -> Result<(), WireError> {
     for key in UNSUPPORTED_UPDATE_TABLE_KEYS {
         if obj.contains_key(*key) {
@@ -3085,15 +3193,48 @@ fn reject_unsupported_update_table_keys(obj: &Map<String, Value>) -> Result<(), 
             )));
         }
     }
-    if let Some(mode) = obj.get("BillingMode")
-        && mode.as_str() != Some("PAY_PER_REQUEST")
-    {
-        return Err(WireError::validation(
-            "UpdateTable: BillingMode is not supported (only PAY_PER_REQUEST, \
-             this adapter's only billing mode, may be restated)",
-        ));
-    }
     Ok(())
+}
+
+/// Decode an `UpdateTable`'s `BillingMode`/`ProvisionedThroughput` change
+/// (ADR 0065 §5(b)) — called only once [`decode_update_table`] has already
+/// established one of those two keys is present. `BillingMode: PROVISIONED`
+/// requires `ProvisionedThroughput` (`Some(Some(spec))`); `BillingMode:
+/// PAY_PER_REQUEST` reverts to unthrottled (`Some(None)`) and rejects a
+/// `ProvisionedThroughput` alongside it; a bare `ProvisionedThroughput` with
+/// no `BillingMode` restated updates the units in place (real DynamoDB's own
+/// shape for an already-`PROVISIONED` table — this adapter does not check
+/// the table's *current* billing mode at decode time, since that lives in
+/// the replicated catalog this pure wire layer never sees; `animusd`
+/// proposes the resulting spec unconditionally either way, matching
+/// `MetaCommand::SetTableThroughput`'s own "always legal, no disable-first
+/// step" semantics).
+fn decode_update_table_throughput(
+    obj: &Map<String, Value>,
+) -> Result<Option<ProvisionedThroughput>, WireError> {
+    match obj.get("BillingMode").and_then(Value::as_str) {
+        Some("PROVISIONED") => Ok(Some(decode_provisioned_throughput(
+            obj,
+            "ProvisionedThroughput",
+        )?)),
+        Some("PAY_PER_REQUEST") => {
+            if obj.contains_key("ProvisionedThroughput") {
+                return Err(WireError::validation(
+                    "UpdateTable: ProvisionedThroughput is not allowed with BillingMode \
+                     PAY_PER_REQUEST",
+                ));
+            }
+            Ok(None)
+        }
+        Some(other) => Err(WireError::validation(format!(
+            "UpdateTable: unsupported BillingMode `{other}` (expected PROVISIONED or \
+             PAY_PER_REQUEST)"
+        ))),
+        None => Ok(Some(decode_provisioned_throughput(
+            obj,
+            "ProvisionedThroughput",
+        )?)),
+    }
 }
 
 /// Decode an `UpdateTable` request: either a `StreamSpecification` change
@@ -3124,6 +3265,7 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
         ));
     }
     if has_index_updates {
+        reject_billing_mode_combined_with_other_change(obj)?;
         let index_update = decode_index_updates(obj)?;
         let key_types = decode_attribute_types(obj);
         if let IndexUpdate::Create(ref index) = index_update {
@@ -3134,32 +3276,85 @@ fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError>
             stream: None,
             index_update: Some(index_update),
             key_types,
+            throughput_update: None,
         });
     }
-    let Some(spec) = obj.get("StreamSpecification") else {
+    if has_stream_spec {
+        reject_billing_mode_combined_with_other_change(obj)?;
+        let spec = obj
+            .get("StreamSpecification")
+            .and_then(Value::as_object)
+            .ok_or_else(|| WireError::validation("`StreamSpecification` must be an object"))?;
+        let enabled = spec
+            .get("StreamEnabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                WireError::validation("`StreamSpecification` missing `StreamEnabled`")
+            })?;
+        let stream = if enabled {
+            StreamUpdate::Enable(decode_stream_view_type(spec)?)
+        } else {
+            StreamUpdate::Disable
+        };
+        return Ok(Operation::UpdateTable {
+            table,
+            stream: Some(stream),
+            index_update: None,
+            key_types: Vec::new(),
+            throughput_update: None,
+        });
+    }
+    // Neither an index nor a stream change: this call, if it names anything
+    // at all, is entirely about throughput (ADR 0065 §5(b)) — a bare
+    // `BillingMode: PAY_PER_REQUEST` restatement is a genuine call here
+    // (unlike the tolerated-alongside-another-change case above), since
+    // it's the only thing the call says: revert to unthrottled.
+    if obj.contains_key("BillingMode") || obj.contains_key("ProvisionedThroughput") {
+        let throughput_update = decode_update_table_throughput(obj)?;
+        return Ok(Operation::UpdateTable {
+            table,
+            stream: None,
+            index_update: None,
+            key_types: Vec::new(),
+            throughput_update: Some(throughput_update),
+        });
+    }
+    Err(WireError::validation(
+        "UpdateTable requires one of a StreamSpecification, a GlobalSecondaryIndexUpdates, \
+         or a BillingMode/ProvisionedThroughput change in this adapter",
+    ))
+}
+
+/// Reject a `BillingMode`/`ProvisionedThroughput` combined with a
+/// (`GlobalSecondaryIndexUpdates`/`StreamSpecification`) change already
+/// established present — except a bare `BillingMode: "PAY_PER_REQUEST"`
+/// restatement, tolerated exactly as before ADR 0065 §5(b) (a common SDK/
+/// CLI habit, e.g. `aws dynamodb update-table --billing-mode
+/// PAY_PER_REQUEST`, that must not block an otherwise-valid stream/index
+/// change) — a genuine `PROVISIONED`/units change alongside another change
+/// is real "more than one change in one call" (Fork C, extended), and any
+/// other `BillingMode` value is simply unsupported.
+fn reject_billing_mode_combined_with_other_change(
+    obj: &Map<String, Value>,
+) -> Result<(), WireError> {
+    if obj.contains_key("ProvisionedThroughput")
+        || obj.get("BillingMode").and_then(Value::as_str) == Some("PROVISIONED")
+    {
         return Err(WireError::validation(
-            "UpdateTable requires either a StreamSpecification or a \
-             GlobalSecondaryIndexUpdates change in this adapter",
+            "UpdateTable supports exactly one of a GlobalSecondaryIndexUpdates change, a \
+             StreamSpecification change, or a BillingMode/ProvisionedThroughput change in \
+             one call, not more than one (ADR 0045 §6 Fork C, extended by ADR 0065 §5(b))",
         ));
-    };
-    let spec = spec
-        .as_object()
-        .ok_or_else(|| WireError::validation("`StreamSpecification` must be an object"))?;
-    let enabled = spec
-        .get("StreamEnabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| WireError::validation("`StreamSpecification` missing `StreamEnabled`"))?;
-    let stream = if enabled {
-        StreamUpdate::Enable(decode_stream_view_type(spec)?)
-    } else {
-        StreamUpdate::Disable
-    };
-    Ok(Operation::UpdateTable {
-        table,
-        stream: Some(stream),
-        index_update: None,
-        key_types: Vec::new(),
-    })
+    }
+    if let Some(mode) = obj.get("BillingMode").and_then(Value::as_str)
+        && mode != "PAY_PER_REQUEST"
+    {
+        return Err(WireError::validation(format!(
+            "UpdateTable: unsupported BillingMode `{mode}` (expected PROVISIONED or \
+             PAY_PER_REQUEST)"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode `GlobalSecondaryIndexUpdates` (ADR 0045 §6) into a single
@@ -4422,19 +4617,37 @@ pub fn transact_get_response(items: &[Option<Item>]) -> String {
 /// `BatchGetItem` reports misses by omission, unlike `TransactGetItems`, whose
 /// response is positional and carries an empty object per missing key.
 ///
-/// `UnprocessedKeys` is always empty: this adapter reads every requested key
-/// before responding rather than shedding load, so there is never a remainder
-/// for the client to retry.
+/// `unprocessed` (ADR 0065 §6) is every `(table, key)` this adapter refused
+/// to read because its tablet's own per-table read bucket was exhausted —
+/// rendered as `{"<table>": {"Keys": [key, ..]}}` under `UnprocessedKeys`,
+/// AWS's own shape for a shed `BatchGetItem` key, grouped by table exactly
+/// like `Responses` is. Empty (the common case, and the only case before
+/// this ADR — a throttled key is the only reason this adapter ever sheds
+/// one) renders `"UnprocessedKeys":{}`.
 #[must_use]
-pub fn batch_get_response(tables: &[(String, Vec<Item>)]) -> String {
+pub fn batch_get_response(
+    tables: &[(String, Vec<Item>)],
+    unprocessed: &[(String, Item)],
+) -> String {
     let mut responses = Map::new();
     for (table, items) in tables {
         let encoded: Vec<Value> = items.iter().map(encode_item).collect();
         responses.insert(table.clone(), Value::Array(encoded));
     }
+    let mut unprocessed_keys: Map<String, Value> = Map::new();
+    for (table, key) in unprocessed {
+        let entry = unprocessed_keys.entry(table.clone()).or_insert_with(|| {
+            Value::Object(Map::from_iter([("Keys".into(), Value::Array(Vec::new()))]))
+        });
+        if let Value::Object(o) = entry
+            && let Some(Value::Array(keys)) = o.get_mut("Keys")
+        {
+            keys.push(encode_item(key));
+        }
+    }
     let mut obj = Map::new();
     obj.insert("Responses".into(), Value::Object(responses));
-    obj.insert("UnprocessedKeys".into(), Value::Object(Map::new()));
+    obj.insert("UnprocessedKeys".into(), Value::Object(unprocessed_keys));
     serde_json::to_string(&Value::Object(obj)).expect("batch get response serializes")
 }
 
@@ -4510,12 +4723,43 @@ fn changed_attributes(old: Option<&Item>, new: Option<&Item>, from: Option<&Item
         .collect()
 }
 
-/// The JSON body for a successful `BatchWriteItem`: `{"UnprocessedItems": {}}`
-/// (we process every request, so nothing is ever left unprocessed).
+/// The JSON body for a `BatchWriteItem`: `{"UnprocessedItems": {"<table>":
+/// [{"PutRequest":{"Item":..}} | {"DeleteRequest":{"Key":..}}, ..], ..}}`.
+///
+/// `unprocessed` (ADR 0065 §6) is every `(table, WriteRequest)` this adapter
+/// refused to commit because its tablet's own per-table write bucket was
+/// exhausted — echoed back in the client's own request shape, exactly as
+/// AWS defines a shed `BatchWriteItem` request, so a real SDK's retry
+/// machinery can resubmit it unmodified. Empty (the common case, and the
+/// only case before this ADR — every request commits or the whole call
+/// errors) renders `"UnprocessedItems":{}`.
 #[must_use]
-pub fn batch_write_response() -> String {
+pub fn batch_write_response(unprocessed: &[(String, WriteRequest)]) -> String {
+    let mut by_table: Map<String, Value> = Map::new();
+    for (table, req) in unprocessed {
+        let entry = by_table
+            .entry(table.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(arr) = entry else {
+            unreachable!("by_table entries are always Value::Array")
+        };
+        let mut obj = Map::new();
+        match req {
+            WriteRequest::Put(item) => {
+                let mut put = Map::new();
+                put.insert("Item".into(), encode_item(item));
+                obj.insert("PutRequest".into(), Value::Object(put));
+            }
+            WriteRequest::Delete(key) => {
+                let mut del = Map::new();
+                del.insert("Key".into(), encode_item(key));
+                obj.insert("DeleteRequest".into(), Value::Object(del));
+            }
+        }
+        arr.push(Value::Object(obj));
+    }
     let mut obj = Map::new();
-    obj.insert("UnprocessedItems".into(), Value::Object(Map::new()));
+    obj.insert("UnprocessedItems".into(), Value::Object(by_table));
     serde_json::to_string(&Value::Object(obj)).expect("batch response serializes")
 }
 
@@ -4661,6 +4905,7 @@ fn table_description_object(
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
     status: &str,
+    throughput: Option<&ProvisionedThroughput>,
 ) -> Map<String, Value> {
     let mut key_schema = vec![key_schema_entry(&schema.partition_key, "HASH")];
     if let Some(sk) = &schema.sort_key {
@@ -4719,7 +4964,63 @@ fn table_description_object(
         );
         desc.insert("LatestStreamLabel".into(), Value::String(s.label.clone()));
     }
+    // ADR 0065 §5(b): `BillingModeSummary`/`ProvisionedThroughput` — a
+    // `PAY_PER_REQUEST` table reports 0/0 units (real DynamoDB's own
+    // documented shape for that billing mode), never omits the keys.
+    match throughput {
+        Some(t) => {
+            desc.insert(
+                "BillingModeSummary".into(),
+                Value::Object(billing_mode_summary_object("PROVISIONED")),
+            );
+            desc.insert(
+                "ProvisionedThroughput".into(),
+                Value::Object(provisioned_throughput_description_object(
+                    t.read_units,
+                    t.write_units,
+                )),
+            );
+        }
+        None => {
+            desc.insert(
+                "BillingModeSummary".into(),
+                Value::Object(billing_mode_summary_object("PAY_PER_REQUEST")),
+            );
+            desc.insert(
+                "ProvisionedThroughput".into(),
+                Value::Object(provisioned_throughput_description_object(0, 0)),
+            );
+        }
+    }
     desc
+}
+
+/// The `BillingModeSummary` object (ADR 0065 §5(b)) — just `BillingMode`;
+/// this adapter has no `LastUpdateToPayPerRequestDateTime`-style transient
+/// timestamp to report, mirroring `DescribeTimeToLive`'s own "no transient
+/// `ENABLING`/`DISABLING` state" precedent.
+fn billing_mode_summary_object(mode: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("BillingMode".into(), Value::String(mode.to_owned()));
+    m
+}
+
+/// The `ProvisionedThroughput` description object (ADR 0065 §5(b)) —
+/// `NumberOfDecreasesToday` is always `0` (this adapter tracks no such
+/// history; real DynamoDB itself no longer enforces the decrease limit this
+/// field used to report on).
+fn provisioned_throughput_description_object(
+    read_units: u64,
+    write_units: u64,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("ReadCapacityUnits".into(), Value::Number(read_units.into()));
+    m.insert(
+        "WriteCapacityUnits".into(),
+        Value::Number(write_units.into()),
+    );
+    m.insert("NumberOfDecreasesToday".into(), Value::Number(0.into()));
+    m
 }
 
 /// The JSON body for a successful `CreateTable`: a minimal `TableDescription`
@@ -4734,6 +5035,7 @@ pub fn create_table_response(
     schema: &TableSchema,
     indexes: &[SecondaryIndex],
     stream: Option<&StreamDescription>,
+    throughput: Option<&ProvisionedThroughput>,
 ) -> String {
     // Every index a `CreateTable` declares is `Active` by construction (ADR
     // 0041 §5: an empty, just-created table) — no status side channel needed.
@@ -4741,7 +5043,7 @@ pub fn create_table_response(
     // the table is genuinely `ACTIVE` before ever returning, so this is
     // never `CREATING` here the way `RestoreTableFromBackup`'s own initial
     // response can be (see `restore_table_response`).
-    let desc = table_description_object(table, schema, indexes, &[], stream, "ACTIVE");
+    let desc = table_description_object(table, schema, indexes, &[], stream, "ACTIVE", throughput);
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("create-table response serializes")
@@ -4767,7 +5069,10 @@ pub fn restore_table_response(
     indexes: &[SecondaryIndex],
     status: &str,
 ) -> String {
-    let desc = table_description_object(table, schema, indexes, &[], None, status);
+    // A restored table starts unthrottled (`PAY_PER_REQUEST`) — restoring a
+    // source table's own throughput configuration is not modeled, matching
+    // this function's own "no `StreamSpecification` either" precedent.
+    let desc = table_description_object(table, schema, indexes, &[], None, status, None);
     let mut obj = Map::new();
     obj.insert("TableDescription".into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("restore-table response serializes")
@@ -4788,6 +5093,7 @@ pub fn restore_table_response(
 /// from the table's own tablet states (`Building` ⇒ `CREATING`), never
 /// stored redundantly.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn describe_table_response(
     table: &str,
     schema: &TableSchema,
@@ -4796,8 +5102,17 @@ pub fn describe_table_response(
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
     status: &str,
+    throughput: Option<&ProvisionedThroughput>,
 ) -> String {
-    let mut desc = table_description_object(table, schema, indexes, index_statuses, stream, status);
+    let mut desc = table_description_object(
+        table,
+        schema,
+        indexes,
+        index_statuses,
+        stream,
+        status,
+        throughput,
+    );
     desc.insert(
         "AttributeDefinitions".into(),
         Value::Array(attribute_definitions(schema, key_types, indexes)),
@@ -4825,13 +5140,21 @@ pub fn delete_table_response(
     indexes: &[SecondaryIndex],
     index_statuses: &[(String, IndexStatus)],
     stream: Option<&StreamDescription>,
+    throughput: Option<&ProvisionedThroughput>,
 ) -> String {
     // "ACTIVE" here is a placeholder immediately overridden below —
     // `table_description_object` always needs a status, but this response's
     // whole point is to report `DELETING` regardless of the table's actual
     // last-known status.
-    let mut desc =
-        table_description_object(table, schema, indexes, index_statuses, stream, "ACTIVE");
+    let mut desc = table_description_object(
+        table,
+        schema,
+        indexes,
+        index_statuses,
+        stream,
+        "ACTIVE",
+        throughput,
+    );
     desc.insert("TableStatus".into(), Value::String("DELETING".into()));
     desc.insert(
         "AttributeDefinitions".into(),
@@ -6521,7 +6844,7 @@ mod tests {
 
     #[test]
     fn create_table_response_shape() {
-        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[], None);
+        let body = create_table_response("t", &TableSchema::composite("pk", "sk"), &[], None, None);
         assert!(body.contains("\"TableStatus\":\"ACTIVE\""));
         assert!(body.contains("\"HASH\""));
         assert!(body.contains("\"RANGE\""));
@@ -6535,7 +6858,7 @@ mod tests {
             view_type: StreamViewType::NewAndOldImages,
             label: "2026-08-14T00:00:00.000-n1".into(),
         };
-        let body = create_table_response("t", &TableSchema::simple("id"), &[], Some(&stream));
+        let body = create_table_response("t", &TableSchema::simple("id"), &[], Some(&stream), None);
         assert!(body.contains("\"StreamEnabled\":true"));
         assert!(body.contains("\"StreamViewType\":\"NEW_AND_OLD_IMAGES\""));
         assert!(body.contains(
@@ -6558,6 +6881,7 @@ mod tests {
             &[],
             Some(&stream),
             "ACTIVE",
+            None,
         );
         assert!(body.contains("\"Table\""));
         assert!(body.contains("\"AttributeDefinitions\""));
@@ -6616,6 +6940,7 @@ mod tests {
             &[],
             None,
             "ACTIVE",
+            None,
         );
         // Scope the assertions to the `AttributeDefinitions` array itself —
         // `AttributeName` also appears inside `KeySchema`/
@@ -6676,6 +7001,7 @@ mod tests {
                 &[("by-email".into(), status)],
                 None,
                 "ACTIVE",
+                None,
             );
             assert!(
                 body.contains(&format!("\"IndexStatus\":\"{want_status_str}\"")),
@@ -6705,7 +7031,7 @@ mod tests {
             sort_attribute: None,
             projection: IndexProjection::All,
         });
-        let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None);
+        let body = create_table_response("t", &TableSchema::simple("id"), &[gsi], None, None);
         assert!(body.contains("\"IndexStatus\":\"ACTIVE\""));
         assert!(!body.contains("Backfilling"));
     }
@@ -6723,6 +7049,7 @@ mod tests {
             &[],
             &[],
             Some(&stream),
+            None,
         );
         // Wrapped under `TableDescription` (matching `CreateTable`/
         // `UpdateTable`), not `DescribeTable`'s `Table`.
@@ -6862,6 +7189,7 @@ mod tests {
                 stream,
                 index_update,
                 key_types,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(stream, None);
@@ -6978,20 +7306,75 @@ mod tests {
         assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
     }
 
+    /// ADR 0065 §5(b): a bare `ProvisionedThroughput`, no `BillingMode`
+    /// restated, updates the units in place — real DynamoDB's own shape for
+    /// an already-`PROVISIONED` table.
     #[test]
-    fn update_table_rejects_provisioned_throughput() {
+    fn update_table_decodes_provisioned_throughput_without_restating_billing_mode() {
         let body = br#"{"TableName":"t",
-            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
-        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
-        assert_eq!(
-            err.message,
-            "UpdateTable: ProvisionedThroughput is not supported"
-        );
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":10}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable {
+                throughput_update, ..
+            } => {
+                assert_eq!(
+                    throughput_update,
+                    Some(Some(ProvisionedThroughput {
+                        read_units: 5,
+                        write_units: 10,
+                    }))
+                );
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
     }
 
+    /// `BillingMode: PROVISIONED` + `ProvisionedThroughput` decodes to the
+    /// same `Some(Some(spec))` shape, explicit `BillingMode` and all.
     #[test]
-    fn update_table_rejects_an_unsupported_billing_mode() {
+    fn update_table_decodes_billing_mode_provisioned_with_throughput() {
+        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}"#;
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable {
+                throughput_update, ..
+            } => {
+                assert_eq!(
+                    throughput_update,
+                    Some(Some(ProvisionedThroughput {
+                        read_units: 5,
+                        write_units: 5,
+                    }))
+                );
+            }
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
+    }
+
+    /// `BillingMode: PROVISIONED` with no `ProvisionedThroughput` is
+    /// rejected.
+    #[test]
+    fn update_table_rejects_provisioned_billing_mode_without_throughput() {
+        let body = br#"{"TableName":"t","BillingMode":"PROVISIONED"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    /// A genuinely unsupported `BillingMode` value is rejected by name.
+    #[test]
+    fn update_table_rejects_an_unsupported_billing_mode_value() {
+        let body = br#"{"TableName":"t","BillingMode":"WEIRD"}"#;
+        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("BillingMode"), "{}", err.message);
+    }
+
+    /// `BillingMode: PROVISIONED` (or a bare `ProvisionedThroughput`)
+    /// combined with a `StreamSpecification` change in one call is rejected
+    /// — a genuine second change, not a tolerated restatement (ADR 0065
+    /// §5(b) extends Fork C's "exactly one change per call" rule).
+    #[test]
+    fn update_table_rejects_billing_mode_provisioned_combined_with_stream_change() {
         let body = br#"{"TableName":"t","BillingMode":"PROVISIONED",
             "StreamSpecification":{"StreamEnabled":false}}"#;
         let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
@@ -7015,14 +7398,20 @@ mod tests {
         }
     }
 
+    /// ADR 0065 §5(b): unlike before that ADR (when `BillingMode` alone
+    /// modeled no change at all), a bare `BillingMode: PAY_PER_REQUEST` with
+    /// no GSI/stream change alongside it is now a genuine, real call — the
+    /// only way to *revert* an already-`PROVISIONED` table's throughput
+    /// back to unthrottled.
     #[test]
-    fn update_table_rejects_a_billing_mode_only_body_with_no_modeled_change() {
-        // Tolerating the key isn't the same as modeling a billing-mode
-        // *change*: with no GSI/stream change alongside it, this still
-        // falls through to the generic "requires either..." rejection.
+    fn update_table_billing_mode_pay_per_request_alone_reverts_throughput() {
         let body = br#"{"TableName":"t","BillingMode":"PAY_PER_REQUEST"}"#;
-        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTable {
+                throughput_update, ..
+            } => assert_eq!(throughput_update, Some(None)),
+            other => panic!("expected UpdateTable, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8647,6 +9036,7 @@ mod tests {
             &[],
             None,
             "ACTIVE",
+            None,
         );
         assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
     }
@@ -9663,20 +10053,95 @@ mod tests {
         }
     }
 
-    /// The response groups items by table and always reports an empty
-    /// `UnprocessedKeys`, since every requested key is read before responding.
+    /// The response groups items by table and reports an empty
+    /// `UnprocessedKeys` when nothing was throttled.
     #[test]
     fn batch_get_response_groups_by_table() {
         let mut a = Item::new();
         a.insert("id".into(), s("a"));
-        let body =
-            batch_get_response(&[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())]);
+        let body = batch_get_response(
+            &[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())],
+            &[],
+        );
         assert!(body.contains(r#""t1":[{"id":{"S":"a"}}]"#), "{body}");
         assert!(
             body.contains(r#""t2":[]"#),
             "a table with no hits is an empty list: {body}"
         );
         assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
+    }
+
+    /// ADR 0065 §6: a throttled `BatchGetItem` key is echoed back under
+    /// `UnprocessedKeys`, grouped by table, never dropped or turned into a
+    /// whole-call error.
+    #[test]
+    fn batch_get_response_reports_unprocessed_keys_grouped_by_table() {
+        let mut k1 = Item::new();
+        k1.insert("id".into(), s("k1"));
+        let mut k2 = Item::new();
+        k2.insert("id".into(), s("k2"));
+        let body = batch_get_response(
+            &[],
+            &[("t1".to_string(), k1), ("t1".to_string(), k2.clone())],
+        );
+        let v: Value = serde_json::from_str(&body).expect("valid JSON");
+        let keys = v["UnprocessedKeys"]["t1"]["Keys"]
+            .as_array()
+            .expect("Keys array");
+        assert_eq!(keys.len(), 2, "{body}");
+        assert_eq!(keys[1]["id"]["S"], "k2");
+    }
+
+    /// ADR 0065 §6: `BatchWriteItem`'s `UnprocessedItems` echoes a throttled
+    /// request in the client's own `PutRequest`/`DeleteRequest` shape.
+    #[test]
+    fn batch_write_response_reports_unprocessed_items_in_request_shape() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("p1"));
+        let mut key = Item::new();
+        key.insert("id".into(), s("d1"));
+        let body = batch_write_response(&[
+            ("t1".to_string(), WriteRequest::Put(item)),
+            ("t1".to_string(), WriteRequest::Delete(key)),
+        ]);
+        let v: Value = serde_json::from_str(&body).expect("valid JSON");
+        let entries = v["UnprocessedItems"]["t1"].as_array().expect("array");
+        assert_eq!(entries.len(), 2, "{body}");
+        assert_eq!(entries[0]["PutRequest"]["Item"]["id"]["S"], "p1");
+        assert_eq!(entries[1]["DeleteRequest"]["Key"]["id"]["S"], "d1");
+    }
+
+    /// A `BatchWriteItem` response with nothing throttled still reports the
+    /// empty-object shape every existing caller/test assumed.
+    #[test]
+    fn batch_write_response_with_nothing_unprocessed_is_empty() {
+        let body = batch_write_response(&[]);
+        assert_eq!(body, r#"{"UnprocessedItems":{}}"#);
+    }
+
+    /// ADR 0065 §6: the single-item throttle refusal's wire shape.
+    #[test]
+    fn provisioned_throughput_exceeded_renders_the_aws_faithful_code() {
+        let err = WireError::provisioned_throughput_exceeded("table t is throttled");
+        assert_eq!(err.code, "ProvisionedThroughputExceededException");
+        let json = err.to_json();
+        assert!(
+            json.contains(
+                "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException"
+            ),
+            "{json}"
+        );
+        assert!(json.contains("table t is throttled"), "{json}");
+    }
+
+    /// ADR 0065 §6: a throttled `TransactWriteItems` action's own
+    /// `CancellationReasons` entry.
+    #[test]
+    fn throttling_error_cancellation_reason_carries_no_item() {
+        let reason = CancellationReason::throttling_error();
+        assert_eq!(reason.code, "ThrottlingError");
+        assert!(reason.item.is_none());
+        assert!(reason.message.is_some());
     }
 
     /// `Segment`/`TotalSegments` decode together and are validated.

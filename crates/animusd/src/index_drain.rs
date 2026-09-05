@@ -356,6 +356,22 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // W-09 (ADR 0034 amendment): bound the request-rate tracker the
         // same way, for the same reason.
         ctx.data().request_rates.retain_existing(&meta);
+        // ADR 0065 (per-table throttling): bound the throttle tracker the
+        // same way — unlike the two trackers above, `ctx.throttle` lives
+        // directly on `ClientCtx` (see that field's own doc), so this call
+        // needs no `ctx.data()` at all and is technically safe on a
+        // control-only node too; this loop is only ever spawned for a
+        // data-capable node either way, so the distinction doesn't matter
+        // in practice.
+        ctx.throttle.retain_existing(&meta);
+        // ADR 0065 §5(b): this is also the metadata-watch recompute point
+        // for `ClientCtx::any_table_throughput` — see that field's own doc
+        // for the full list of recompute sites and why `Relaxed` is safe. A
+        // node that itself served the `UpdateTable`/`CreateTable` commit
+        // already recomputed synchronously (`dynamo::create_table`/
+        // `update_table_throughput`); every other node picks it up here on
+        // its next tick.
+        ctx.recompute_any_table_throughput(&meta);
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -3536,6 +3552,8 @@ mod stream_sealer_tests {
                 None,
                 crate::BackupStoreConfig::default(),
                 crate::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+                None,
+                None,
             )
             .await
             .expect("bring up single node with streams + quiescence");

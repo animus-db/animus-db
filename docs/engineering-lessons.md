@@ -17663,3 +17663,228 @@ cloud load balancer's health check, a service mesh sidecar's own probe are
 all separate contracts with the port that a design review focused on "who
 in our code dials this" will walk right past, and a sandbox that cannot
 run the real orchestrator cannot catch the gap before CI does.
+
+## New per-tablet node state must sit outside `DataRole`'s `Option` if any `SimEnv` `ClientCtx` fixture is expected to exercise it (ADR 0065, W-08 step 2)
+
+`ChangeRateTracker`/`RequestRateTracker` (W-09, ADR 0034) both live inside
+`DataRole` — a reasonable, established precedent, since a control-only node
+never hosts a tablet and `DataRole` is exactly the "fields that only make
+sense with a data role" grouping. ADR 0065's per-tablet token bucket
+(`ThrottleTracker`) looked like the obvious third member of that family
+until its own testing requirement was checked against this crate's actual
+`SimEnv` fixtures: `simenv_client_ctx_tests`, `two_node_relay_tests`, and
+`sim_cluster.rs` (the fixture the ADR's own testing section names —
+"a `SimEnv` virtual-clock test... exercised over the D1 `SimCluster`
+fixture") all construct every node's `ClientCtx` with `data: None` — none
+of them build a `DataRole` at all, since nothing they drive
+(`cp_kind_write_raw`/`cp_get`/`cp_scan`) needs one. A `DataRole`-gated
+`ThrottleTracker` would have compiled fine and passed every existing test,
+then been silently unreachable from the one corpus this ADR's testing
+section explicitly requires — a design mistake no compiler or existing
+test would have caught, only discovered by tracing exactly which fixtures
+the new testing requirement names and checking what fields they populate.
+The fix was to place `throttle`/`throttle_defaults` directly on `ClientCtx`
+itself (mirroring the W-10 precedent that already moved `segment_store`/
+`backup_store` off `DataRole` for the analogous "a control-only leader must
+still reach this" reason) rather than inside `DataRole`. **General form**:
+before copying an existing field's placement inside a gated `Option` group,
+check what the *new* field's own testing requirement actually needs
+constructed — a precedent's placement was correct for what it had to prove
+at the time, not necessarily for what the next field needs to prove.
+
+## Wiring a new refusal sentinel into a wire error requires auditing EVERY error-mapping call site, not just the primary write path (ADR 0065, W-08 step 3)
+
+Enforcing per-table throttling (`ThrottleTracker::check_write`/`check_read`)
+needed a plain `Result<_, String>` sentinel (`dynamo::THROTTLE_WRITE_
+REFUSAL`/`THROTTLE_READ_REFUSAL`) to propagate up from deep inside
+`write_path.rs`/`read_path.rs` to `dynamo.rs`, where it has to render as
+`ProvisionedThroughputExceededException` rather than a generic `500`. The
+obvious place to add that mapping (`map_throttleable_error`) is the single
+call site the throttled write path most directly feeds — but a
+`String`-typed error has no compiler-visible identity, so nothing forced an
+audit of every OTHER place a `.map_err(|e| internal(&e))`-shaped closure
+converts the identical error type into a wire response. Five separate call
+sites needed the fix, found only by grepping every `internal(&e)`-shaped
+mapping in `dynamo.rs`, not by inspection of the "main" path:
+`fast_marker_write`'s own `cp_kind_write_raw` error mapping, `raw_quorum_
+read`, `native_scan`, and two LSI-scan pagination call sites
+(`paginated_table_examine`'s `cp_scan_kind_table` call, `paginated_kind_
+examine_one`'s `cp_scan_kind` call). One of these (`fast_marker_write`) was
+caught only by a real integration test getting an unexpected `500` instead
+of a `400` — the other four were found by then auditing every structurally
+identical mapping pattern rather than trusting that the first fix was
+complete. **General form**: when a new internal sentinel error needs a
+wire-level translation, grep every `.map_err`/error-conversion call site
+that touches the same underlying `Result<_, String>`-shaped function family,
+not just the one test that happened to exercise the sentinel first — a
+string-typed error carries no type-system signal that a translation step
+was skipped, so the compiler will not find the other four sites for you.
+
+## A fixture whose op helper auto-advances virtual time must size per-op cost against the PER-CALL refill, not the nominal configured rate (ADR 0065, W-08 step 3)
+
+`SimCluster::spawn_and_capture` (the helper every `put`/`get`/`delete`/
+`scan` call goes through) advances the simulator's virtual clock by up to
+`OP_BUDGET` (12s) per call, regardless of how quickly the operation itself
+actually resolves — a deliberate design so a route/propose/confirm loop
+inside one op call can never itself hang the corpus. This is invisible to
+an ordinary op sequence, but it is directly load-bearing for a token-bucket
+throttle test: at a naively "obviously enough" rate like 1 unit/sec, a
+12-second-per-call refill hands back ~12 units between every single op —
+so a test whose per-op cost is anywhere near that (e.g. a ~10-RCU read on a
+40 KiB item) never nets any drain at all; `sim_cluster_throttle.rs`'s first
+draft of its read-throttle test admitted all 60 of 60 attempted reads with
+zero refusals, not because the throttle mechanism was broken but because
+the fixture's own per-call refill was outrunning the configured debit. The
+fix was sizing the test's own item at 512 KiB (~128 RCU/consistent-read),
+clearing the per-call refill by an order of magnitude rather than merely
+exceeding the nominal rate on paper; the write-throttle test's own ~100
+KiB/~100 WCU item was already, by luck, well clear of the identical
+12-WCU/call refill. **General form**: when a fixture's own driving loop
+advances a deterministic simulator's clock by a fixed budget per call (for
+liveness/hang-prevention reasons unrelated to what the test is actually
+proving), any rate-based assertion built on that fixture must size its
+per-op cost against that PER-CALL budget, not just against the nominal
+rate under test — read the fixture's own op-driving helper before picking
+"a rate that should obviously throttle."
+
+## An atomic multi-row Raft-entry batching optimization cannot offer finer admission granularity than "the whole entry" — a real, user-visible behavior difference, not a bug to fix (ADR 0065, W-08 step 3)
+
+The ADR 0049 fast marker arm commits an entire tablet's share of a
+`BatchWriteItem` call as ONE `KindBatch` Raft entry, specifically because
+that batching is what gives a plain unindexed/unstreamed table its
+throughput (N sequential fsync round trips would otherwise serialize a
+whole batch). Wiring per-table throttling into this path found — via a
+real integration test, not by inspection — that admission control
+necessarily inherits the same atomicity: `throttle_check_write_raw` checks
+and charges the WHOLE per-tablet group's cost against the bucket in one
+call, so a partially-exhausted budget either admits or refuses every
+request in that tablet's group together, never a subset. This is not a bug
+to work around; it is the direct, structural consequence of the same
+design choice that gives the fast arm its throughput, and "fix" it would
+mean either losing that atomicity (re-fragmenting the batch into per-item
+entries, undoing the throughput win it exists for) or charging an
+estimated per-item share speculatively (which cannot be made to agree with
+what the entry, once it commits, actually costs). The integration test
+covering `BatchWriteItem`'s true per-item throttle granularity had to
+target a **streamed** table instead — streamed/indexed writes already go
+through the per-item evaluate-at-leader funnel for unrelated correctness
+reasons (ADR 0054), so genuine per-item admission control falls out of
+that path for free, while a plain table's own regression proves only the
+coarser per-tablet-group behavior. **General form**: before writing a test
+that assumes an admission-control (or any per-request) decision is made at
+per-item granularity, check whether the write path it rides was already
+batched into one atomic unit for a *different*, unrelated reason (here,
+throughput) — the atomicity is not negotiable without undoing the reason
+the batching exists, and the right fix is usually "pick a different
+existing code path to test the finer-grained behavior," not "make this one
+path finer-grained."
+
+## A rate-change on a token bucket only ever governs refill for elapsed time AFTER the check that applies it — the very next check still pays the OLD rate (ADR 0065, W-08 step 4)
+
+`ThrottleBucket::set_rate` refills at `self.rate` (the OLD value) for
+whatever time has elapsed since the bucket's last touch, and only *then*
+reassigns `self.rate`/`self.capacity` to the new values — a deliberate
+design (a lowered budget must never retroactively grant burst it could not
+legally have earned). The consequence, easy to miss when writing a test
+for "raising a table's `ProvisionedThroughput` admits more": raising the
+rate does nothing to the bucket's *current* token count — there is no
+retroactive top-up — and the very first check-write/check-read call after
+the raise is the one that pays the reassignment, refilling at the OLD rate
+for the (possibly large) gap since the bucket was last touched, since the
+config-changing call itself (`UpdateTable`) never touches the bucket at
+all. Only the check AFTER that one sees real elapsed time refill at the
+NEW rate. A first draft of `update_table_raising_units_admits_more`
+(`tests/dynamo_throttling.rs`) raised the write units by six orders of
+magnitude, slept 50ms, and asserted the very next `PutItem` succeeded —
+and failed deterministically on every run, not flakily, because that
+single post-raise write was exactly the reassignment-paying call. The fix
+was a converged-or-timeout retry loop (root `CLAUDE.md`'s own testing
+discipline for an eventual property) rather than a one-shot assert after a
+fixed sleep of any length. **General form**: a token bucket (or any
+stateful rate limiter) whose "current rate" is a field mutated lazily on
+next use, not proactively on every rate change, needs at least two
+touches after a rate change before the new rate is genuinely reflected in
+admission decisions — write the test as a bounded retry, not a single
+post-change assertion, and don't assume "raise the rate enough and any gap
+will do."
+
+## A "skip the fetch when nothing is configured" fast path is only sound while there is exactly one configuration layer to check (ADR 0065, W-08 steps 3→4)
+
+Step 3's `write_path.rs`/`read_path.rs` throttle checks peeked
+`ClientCtx::throttle_defaults` (a lock-free atomic pair) *before* ever
+fetching `Metadata`, specifically to keep the overwhelmingly common
+"nothing configured" case at "one `Option` check, no lock, no `BTreeMap`
+lookup, no `Metadata` clone." That was correct when the cluster-wide
+default was the *only* place a limit could live. Step 4 added a second,
+independent configuration layer — a per-table `TableSchema.throughput`
+override, which by design can throttle a table even when the cluster-wide
+default is entirely unset (ADR 0065 §5(b): "a table with its own
+`throughput` set ignores `ClusterSettings`' default entirely") — and the
+old fast path could no longer see it: the peek only ever looked at the
+cluster-wide layer, so a per-table override with no cluster default
+configured would have been silently invisible to `write_path.rs`/
+`read_path.rs` (though not to `kind_write_item_at_leader`/
+`txn_stage_local`, which already had `Metadata` in hand for other reasons
+and so already called `throttle_limits_for` — the two-choke-point design
+this ADR's own Decision 2 calls out — meaning the gap was real but
+inconsistent between enforcement points, itself a second, harder-to-spot
+bug shape). The fix removes the peek entirely: `Metadata` is now fetched
+unconditionally before checking the effective limit, accepting the modest,
+already-paid-elsewhere cost of one cached local clone even on the fully
+unconfigured path. **General form**: a hot-path optimization that special-
+cases "nothing is configured" by checking only one of several possible
+configuration sources is a correctness bug waiting for the next
+configuration source to be added, not merely a missed optimization
+opportunity — when a second layer is added to a "check cheaply, else do
+the expensive thing" gate, re-examine every existing fast-path short
+circuit built against the single-layer assumption, not just the new code
+path being added.
+
+## A per-request deep clone hidden behind an innocuous accessor is a cost to design around with a cheap invalidated flag, not to accept as "already paid elsewhere" (ADR 0065, W-08 step 5)
+
+Step 4's fix above (the previous entry) was the right correctness call —
+dropping the single-layer fast path entirely — but its own justification
+("the modest, already-paid-elsewhere cost of one cached local clone... the
+identical cost the surrounding write/read path already pays for routing")
+undersold what `effective_metadata()` actually does: it locks a `Mutex`
+and deep-clones the **entire** `Metadata` — the whole tablet map, the
+whole schema catalog, the whole backup catalog — not a cheap `Arc` bump.
+"Every other call site on this path already pays this" is true, but it
+doesn't make the cost free to add to a THIRD call site (the throttle
+check) that used to cost nothing at all when unconfigured; it just means
+the new cost was already being paid for a different reason on the same
+request, which is a justification for tolerating it briefly, not a reason
+to stop looking for a cheaper alternative. On a cluster that configures no
+throttling anywhere — the default, and likely the overwhelming majority of
+real deployments — step 4 turned "check two atomics, return" into "clone
+the whole metadata graph, then check two atomics, return" on every raw
+write and every read.
+
+The fix (step 5) was not a return to the single-layer peek step 4
+correctly killed, but a proper **invalidated flag** covering both
+configuration layers at once: `ClientCtx::any_table_throughput`, a plain
+`AtomicBool` recomputed at the handful of points this node actually
+observes a schema-catalog change (construction, the metadata-watch tick,
+and immediately after this node's own DDL commit) rather than read fresh
+on every request. Combined with the pre-existing lock-free
+`throttle_defaults` peek, this restores the "no lock, no clone" fast path
+for the truly common case while staying correct for a per-table override
+with no cluster default — the exact case step 4 exists to catch. The
+`Metadata` fetch still happens, but only on the request path that could
+possibly need it.
+
+**General form**: when a correctness fix removes a fast path because a
+cheap check can no longer see everything that needs seeing, look for a
+cheap *invalidated* check that can, before accepting the expensive
+fallback as the new steady state — especially when the expensive call
+sits behind an accessor name (`effective_metadata()`) that reads like a
+cache hit and doesn't advertise the lock+clone underneath, and especially
+when "something else on this path already pays this cost" is offered as
+the reason not to look further. A flag recomputed at the write side (here:
+construction, the metadata-watch loop, and the DDL handler's own
+post-commit point) is usually cheap to add once the read side already has
+a natural "is anything configured at all" gate to attach it to, and it
+generalizes past this specific ADR: any per-request hot-path check that
+degrades from "cheap local read" to "acquire a lock and clone a large
+structure" the moment a second configuration source is added is a
+candidate for this pattern, not just this one.

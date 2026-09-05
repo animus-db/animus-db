@@ -19,8 +19,8 @@ use animus_tablet::{
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    IndexDef, IndexStatus, PitrSpec, SchemaCatalog, StreamSpec, StreamViewType, TableName,
-    TableSchema, TtlSpec,
+    IndexDef, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
+    StreamViewType, TableName, TableSchema, TtlSpec,
 };
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
@@ -1418,6 +1418,36 @@ pub enum MetaCommand {
     SetTableTtl {
         table: TableName,
         spec: Option<TtlSpec>,
+    },
+    /// Enable, reconfigure, or disable a table's **provisioned throughput**
+    /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
+    /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
+    /// if the table has no schema.
+    ///
+    /// Modeled directly on [`MetaCommand::SetTableTtl`]'s own apply
+    /// semantics (`ProvisionedThroughput` mints no identity label either,
+    /// see that type's own doc), **not** `SetTableStream`'s
+    /// enabled-already-rejects-re-enable shape:
+    /// - `spec: Some(new_spec)` where `new_spec` equals the currently
+    ///   recorded spec is a **no-op** — idempotent, since there is no label
+    ///   to go stale.
+    /// - `spec: Some(new_spec)` that differs from what is currently
+    ///   recorded — including changing the units in place while already
+    ///   `PROVISIONED` — is **applied**: a live `UpdateTable
+    ///   ProvisionedThroughput` change is a legal DynamoDB call, not an
+    ///   error.
+    /// - `spec: None` (`PAY_PER_REQUEST`) is a **no-op** if throughput is
+    ///   already unset, else applied.
+    ///
+    /// Because this is a replicated `MetaCommand`, the throughput
+    /// configuration is durable and agreed cluster-wide, like the rest of
+    /// the catalog. `animusd`'s per-tablet throttle bucket (ADR 0065
+    /// Decision 1) re-derives its own share from this field (or the
+    /// cluster-wide default when `None`) on every refill — never cached
+    /// across a change.
+    SetTableThroughput {
+        table: TableName,
+        spec: Option<ProvisionedThroughput>,
     },
     /// Add or overwrite tags on a table (ADR-less, roadmap W-06): the
     /// `TagResource` wire operation's own catalog mutation. Rejected if the
@@ -3139,6 +3169,20 @@ impl Metadata {
                 schema.ttl = spec.clone();
                 ApplyOutcome::Applied
             }
+            MetaCommand::SetTableThroughput { table, spec } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if schema.throughput == *spec {
+                    // Covers both idempotent shapes at once: re-asserting an
+                    // identical spec, and reverting to `PAY_PER_REQUEST`
+                    // when already unset (`spec` and `schema.throughput`
+                    // both `None`) — the identical `SetTableTtl` idiom.
+                    return ApplyOutcome::NoOp;
+                }
+                schema.throughput = *spec;
+                ApplyOutcome::Applied
+            }
             MetaCommand::TagResource { table, tags } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -3662,6 +3706,30 @@ impl Metadata {
     #[must_use]
     pub fn table_ttl(&self, table: &str) -> Option<&TtlSpec> {
         self.schemas.get(table).and_then(|s| s.ttl.as_ref())
+    }
+
+    /// This table's provisioned throughput configuration (ADR 0065 §5(b)),
+    /// if `BillingMode` is `PROVISIONED`. `None` for an unknown table or one
+    /// with no throughput declared (`PAY_PER_REQUEST`), mirroring
+    /// [`table_stream`](Self::table_stream)/[`table_ttl`](Self::table_ttl)
+    /// exactly. A read accessor for `animusd`'s per-tablet throttle bucket
+    /// and the wire adapters that consume the replicated catalog.
+    #[must_use]
+    pub fn table_throughput(&self, table: &str) -> Option<&ProvisionedThroughput> {
+        self.schemas.get(table).and_then(|s| s.throughput.as_ref())
+    }
+
+    /// Whether **any** table in the current catalog has a per-table
+    /// `throughput` override set (ADR 0065 §5(b)) — the cheap catalog-wide
+    /// question `animusd`'s `ClientCtx::any_table_throughput` flag needs to
+    /// recompute itself from a freshly-applied `Metadata` without the
+    /// caller having to iterate `schemas` by hand. `O(tables)`, called only
+    /// at the handful of recompute points (construction, the metadata
+    /// watch, and right after this node's own DDL apply) — never on the
+    /// per-request hot path, which reads the cached flag instead.
+    #[must_use]
+    pub fn any_table_throughput(&self) -> bool {
+        self.schemas.iter().any(|(_, s)| s.throughput.is_some())
     }
 
     /// This table's point-in-time recovery (PITR) configuration (ADR 0059
@@ -8496,6 +8564,173 @@ mod tests {
             }),
             ApplyOutcome::Rejected("no such table schema")
         );
+    }
+
+    // --- ADR 0065 §5(b): per-table provisioned throughput ---------------
+
+    fn throughput_spec(read_units: u64, write_units: u64) -> ProvisionedThroughput {
+        ProvisionedThroughput {
+            read_units,
+            write_units,
+        }
+    }
+
+    /// Setting throughput on a table with a schema records the spec,
+    /// `Applied` — the `SetTableTtl` idiom.
+    #[test]
+    fn set_table_throughput_enables_and_records_the_spec() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().throughput,
+            Some(throughput_spec(5, 5))
+        );
+        assert_eq!(m.table_throughput("orders"), Some(&throughput_spec(5, 5)));
+    }
+
+    /// Re-asserting the identical spec is idempotent — `ProvisionedThroughput`
+    /// mints no label, so there is nothing that goes stale on a repeat set.
+    #[test]
+    fn set_table_throughput_re_set_with_same_spec_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().throughput,
+            Some(throughput_spec(5, 5))
+        );
+    }
+
+    /// Changing the units in place — no disable/re-enable round trip
+    /// required — is a legal live `UpdateTable ProvisionedThroughput` and is
+    /// `Applied`, recording the new units.
+    #[test]
+    fn set_table_throughput_change_units_in_place_applies() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(10, 20)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.schemas.get("orders").unwrap().throughput,
+            Some(throughput_spec(10, 20))
+        );
+    }
+
+    /// Reverting to `PAY_PER_REQUEST` (`spec: None`) clears the spec
+    /// (`Applied`); reverting again is a no-op.
+    #[test]
+    fn set_table_throughput_revert_to_pay_per_request_then_again_is_noop() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.schemas.get("orders").unwrap().throughput, None);
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "orders".to_owned(),
+                spec: None,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.schemas.get("orders").unwrap().throughput, None);
+    }
+
+    /// `SetTableThroughput` against a table with no schema is `Rejected`.
+    #[test]
+    fn set_table_throughput_rejects_unknown_table() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::SetTableThroughput {
+                table: "no-such-table".to_owned(),
+                spec: Some(throughput_spec(5, 5)),
+            }),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+    }
+
+    /// A table with no `throughput` set falls back to `None` (the cluster
+    /// default, resolved by `animusd::ClientCtx::throttle_limits_for`, not
+    /// by this crate).
+    #[test]
+    fn table_throughput_is_none_for_a_table_with_no_spec() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "orders".to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.table_throughput("orders"), None);
+        assert_eq!(m.table_throughput("no-such-table"), None);
     }
 
     // --- W-06: resource tagging -----------------------------------------

@@ -789,8 +789,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 };
                 match self.cp_stale_local(tablet) {
                     Some(group) if group.scope_range().contains(&key) => {
+                        // ADR 0065 §2: this node is the replica actually
+                        // serving the eventual read — the check/charge
+                        // happens here, on the serving side, never on the
+                        // relaying caller. A refusal is deliberately
+                        // distinguishable from `STALE_READ_REFUSAL` (see
+                        // `dynamo::THROTTLE_READ_REFUSAL`'s own doc): the
+                        // caller must propagate it as an error, not treat
+                        // it as "not served cheaply, fall back".
+                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
+                            Ok(p) => p,
+                            Err(e) => return ClientResponse::Error(e),
+                        };
                         match group.stale_get_served(&key).await {
-                            Some(v) => ClientResponse::Value(v),
+                            Some(v) => {
+                                self.throttle_postcharge_read(
+                                    precharge,
+                                    v.as_ref().map_or(0, Vec::len),
+                                    false,
+                                );
+                                ClientResponse::Value(v)
+                            }
                             None => ClientResponse::Error(STALE_READ_REFUSAL.into()),
                         }
                     }
@@ -809,10 +828,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // Local arm. Serve-or-error only (never re-forward, never
                     // wait): the forwarder's own retry loop re-resolves routing on
                     // a `"; retry"` error.
-                    Some(leader) => match self.cp_get_local_resolving(&leader, &key).await {
-                        Ok(v) => ClientResponse::Value(v),
-                        Err(e) => ClientResponse::Error(e),
-                    },
+                    Some(leader) => {
+                        match self.cp_get_local_resolving(&leader, &table, &key).await {
+                            Ok(v) => ClientResponse::Value(v),
+                            Err(e) => ClientResponse::Error(e),
+                        }
+                    }
                     None => self.not_leader_refusal(tablet),
                 }
             }
@@ -861,11 +882,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let requested = KeyRange::new(start.clone(), end.clone());
                 match self.cp_stale_local(tablet) {
                     Some(group) if group.scope_range().contains_range(&requested) => {
-                        ClientResponse::Pairs(
-                            group
-                                .stale_scan(&start, end.as_deref(), limit, reverse)
-                                .await,
-                        )
+                        // ADR 0065 §2/§3 — this node is the serving replica.
+                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
+                            Ok(p) => p,
+                            Err(e) => return ClientResponse::Error(e),
+                        };
+                        let p = group
+                            .stale_scan(&start, end.as_deref(), limit, reverse)
+                            .await;
+                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                        self.throttle_postcharge_read(precharge, bytes, false);
+                        ClientResponse::Pairs(p)
                     }
                     _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
                 }
@@ -886,8 +913,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a
                 // scope lagging the metadata-derived scan window would
                 // silently truncate results, not error.
+                //
+                // ADR 0065 §2/§3 — the identical per-tablet check
+                // `cp_scan_one`'s own Local arm makes.
+                let precharge = match tablet {
+                    Some(t) => match self.throttle_precharge_read(&table, t, true) {
+                        Ok(p) => p,
+                        Err(e) => return ClientResponse::Error(e),
+                    },
+                    None => None,
+                };
                 match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await {
-                    Ok(p) => ClientResponse::Pairs(p),
+                    Ok(p) => {
+                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                        self.throttle_postcharge_read(precharge, bytes, true);
+                        ClientResponse::Pairs(p)
+                    }
                     Err(e) => ClientResponse::Error(e),
                 }
             }
@@ -911,11 +952,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let requested = KeyRange::new(start.clone(), end.clone());
                 match self.cp_stale_local(tablet) {
                     Some(group) if group.scope_range().contains_range(&requested) => {
-                        ClientResponse::Pairs(
-                            group
-                                .stale_scan_kind(kind, &start, end.as_deref(), limit, reverse)
-                                .await,
-                        )
+                        // ADR 0065 §2/§3 — this node is the serving replica.
+                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
+                            Ok(p) => p,
+                            Err(e) => return ClientResponse::Error(e),
+                        };
+                        let p = group
+                            .stale_scan_kind(kind, &start, end.as_deref(), limit, reverse)
+                            .await;
+                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                        self.throttle_postcharge_read(precharge, bytes, false);
+                        ClientResponse::Pairs(p)
                     }
                     _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
                 }
@@ -933,6 +980,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
                     return self.not_leader_refusal(tablet);
                 };
+                // ADR 0065 §2/§3 — the identical per-tablet check
+                // `cp_scan_kind_one`'s own Local arm makes.
+                let precharge = match tablet {
+                    Some(t) => match self.throttle_precharge_read(&table, t, true) {
+                        Ok(p) => p,
+                        Err(e) => return ClientResponse::Error(e),
+                    },
+                    None => None,
+                };
                 match Self::cp_scan_kind_local(
                     &leader,
                     kind,
@@ -943,7 +999,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 )
                 .await
                 {
-                    Ok(p) => ClientResponse::Pairs(p),
+                    Ok(p) => {
+                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                        self.throttle_postcharge_read(precharge, bytes, true);
+                        ClientResponse::Pairs(p)
+                    }
                     Err(e) => ClientResponse::Error(e),
                 }
             }

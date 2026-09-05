@@ -704,6 +704,20 @@
       </div>
       <p class="fixed-note">A table's key schema is fixed at creation and can't be changed afterward.</p>
 
+      <h3 class="subhead">Capacity</h3>
+      <div class="fact-strip">
+        <div class="fact"><span class="fact-label">Billing mode</span><span class="fact-value">${
+          d.throughput.enabled ? "PROVISIONED" : "PAY_PER_REQUEST"
+        }</span></div>
+        <div class="fact"><span class="fact-label">Read capacity</span><span class="fact-value">${
+          d.throughput.enabled ? `${d.throughput.read_units} RCU` : '<span class="dash">—</span>'
+        }</span></div>
+        <div class="fact"><span class="fact-label">Write capacity</span><span class="fact-value">${
+          d.throughput.enabled ? `${d.throughput.write_units} WCU` : '<span class="dash">—</span>'
+        }</span></div>
+      </div>
+      <p class="fixed-note">Set via <code>CreateTable</code>/<code>UpdateTable</code>'s <code>BillingMode</code>/<code>ProvisionedThroughput</code>, or a cluster-wide default when unset — not editable here.</p>
+
       <div class="config-row">
         <div class="config-row-head">
           <h3>TTL</h3>

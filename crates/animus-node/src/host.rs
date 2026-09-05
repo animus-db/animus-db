@@ -319,4 +319,11 @@ pub trait AdminHost: Send + Sync {
     async fn action_drop_table(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/data/seed`.
     async fn action_data_seed(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/throttle/defaults` (ADR 0065 W-08 step 3) — sets this
+    /// node's cluster-wide default throttle limits
+    /// (`ClientCtx::set_throttle_defaults`), the smallest test-reachable
+    /// hook until roadmap W-08 step 4 threads a real `ClusterSettings`/CLI/
+    /// `CreateTable` config surface through instead. See that method's own
+    /// doc for the full "step 4 should replace this" note.
+    async fn action_set_throttle_defaults(&self, body: &[u8]) -> (u16, Value);
 }

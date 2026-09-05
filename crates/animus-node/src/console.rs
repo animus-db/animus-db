@@ -87,6 +87,20 @@ pub struct TtlSummary {
     pub attribute_name: Option<String>,
 }
 
+/// A table's billing mode / provisioned-throughput configuration (ADR 0065
+/// §5(b)), console-shaped: `enabled: false` for `PAY_PER_REQUEST` (the
+/// default); `enabled: true` with the declared units for `PROVISIONED` —
+/// the same "`enabled` gates a companion field" shape [`StreamSummary`]/
+/// [`TtlSummary`] already use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ThroughputSummary {
+    pub enabled: bool,
+    /// `Some` exactly when `enabled`.
+    pub read_units: Option<u64>,
+    /// `Some` exactly when `enabled`.
+    pub write_units: Option<u64>,
+}
+
 /// One user-visible table, projected for the tables-list screen. Plain,
 /// fully owned data — no borrow, no cluster type reachable from any field.
 ///
@@ -212,6 +226,9 @@ pub struct TableDetail {
     pub lsis: Vec<LsiDetail>,
     pub stream: StreamSummary,
     pub ttl: TtlSummary,
+    /// This table's billing mode / provisioned-throughput configuration
+    /// (ADR 0065 §5(b)).
+    pub throughput: ThroughputSummary,
     /// This table's continuous-backups (PITR) status — `None` when disabled.
     pub pitr: Option<PitrStatus>,
     /// This table's own on-demand backups (table-scoped: a backup outliving
@@ -1303,6 +1320,11 @@ mod tests {
                 enabled: false,
                 attribute_name: None,
             },
+            throughput: ThroughputSummary {
+                enabled: true,
+                read_units: Some(5),
+                write_units: Some(5),
+            },
             pitr: Some(PitrStatus {
                 earliest_restorable_ms: Some(1_000),
                 latest_restorable_ms: Some(2_000),
@@ -1336,6 +1358,9 @@ mod tests {
             json["lsis"][0].get("status").is_none(),
             "an LSI row carries no lifecycle status field at all"
         );
+        assert_eq!(json["throughput"]["enabled"], true);
+        assert_eq!(json["throughput"]["read_units"], 5);
+        assert_eq!(json["throughput"]["write_units"], 5);
         assert_eq!(json["pitr"]["earliest_restorable_ms"], 1_000);
         assert_eq!(json["pitr"]["latest_restorable_ms"], 2_000);
         assert_eq!(

@@ -216,10 +216,10 @@ impl TlsSection {
 ///   the control-plane **leader** (the segment janitor's own gate) — a
 ///   data-only node's `ControlHandle` is always `Remote`, so it never runs
 ///   that loop and ignores the field too.
-/// - The other six fields (`auto_split_bytes`, `auto_split_change_rate`,
+/// - The other eight fields (`auto_split_bytes`, `auto_split_change_rate`,
 ///   `auto_split_ops_rate`, `quiesce_after_secs`, `stream_seal_bytes`,
-///   `stream_seal_age_secs`) apply to any data-hosting node (combined or
-///   data-only).
+///   `stream_seal_age_secs`, `throttle_read_units`, `throttle_write_units`)
+///   apply to any data-hosting node (combined or data-only).
 ///
 /// A CLI flag naming the same knob **and** a config file's `cluster_
 /// settings` section setting it is a hard startup error, checked field by
@@ -266,6 +266,19 @@ pub struct ClusterSettings {
     /// janitor's own retention grace period.
     #[serde(default)]
     pub stream_retention_secs: Option<u64>,
+    /// `--throttle-read-units N` (ADR 0065 §5(a), W-08 step 4): the
+    /// cluster-wide default read-capacity-units budget applied to any table
+    /// that has not set its own `ProvisionedThroughput` — seeds `ClientCtx`'s
+    /// [`ThrottleDefaults`](crate::ThrottleDefaults) at node start. `None`
+    /// (the default) means `PAY_PER_REQUEST` — no throttling — byte-for-byte
+    /// unchanged from before ADR 0065.
+    #[serde(default)]
+    pub throttle_read_units: Option<u64>,
+    /// `--throttle-write-units N` (ADR 0065 §5(a), W-08 step 4): the
+    /// write-capacity-units sibling of
+    /// [`throttle_read_units`](Self::throttle_read_units).
+    #[serde(default)]
+    pub throttle_write_units: Option<u64>,
 }
 
 /// A whole-cluster configuration shared (identically) by every node's process.
@@ -717,6 +730,8 @@ mod tests {
             stream_seal_bytes: Some(4_194_304),
             stream_seal_age_secs: Some(3600),
             stream_retention_secs: Some(86_400),
+            throttle_read_units: Some(50),
+            throttle_write_units: Some(25),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -744,6 +759,8 @@ mod tests {
         assert_eq!(settings.stream_retention_secs, None);
         assert_eq!(settings.auto_split_change_rate, None);
         assert_eq!(settings.auto_split_ops_rate, None);
+        assert_eq!(settings.throttle_read_units, None);
+        assert_eq!(settings.throttle_write_units, None);
     }
 
     // --- `tls` (ADR 0064, S-01 commit 2) ----------------------------------

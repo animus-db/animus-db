@@ -241,11 +241,58 @@ impl SimClusterHandle {
             .all(|ctx| ctx.effective_metadata().has_table_tablet(table))
     }
 
+    /// ADR 0065 §5(b): every node's own view of `table`'s per-table
+    /// `throughput` matches `spec` — the `SetTableThroughput` convergence
+    /// check [`SimCluster::set_table_throughput`] polls on, mirroring
+    /// [`all_have_table_tablet`]'s own shape.
+    fn all_have_table_throughput(
+        &self,
+        table: &str,
+        spec: Option<&animus_control::ProvisionedThroughput>,
+    ) -> bool {
+        self.ctxs
+            .lock()
+            .expect("ctxs poisoned")
+            .iter()
+            .all(|ctx| ctx.effective_metadata().table_throughput(table) == spec)
+    }
+
+    /// ADR 0065 §5(b): recompute every node's own `ClientCtx::
+    /// any_table_throughput` flag from that node's own just-converged
+    /// `effective_metadata()` — this fixture never spawns
+    /// `index_drain::change_consumer_loop` (the real cluster's own
+    /// metadata-watch recompute site), and its DDL calls
+    /// (`SimCluster::create_table_with_replication`/`set_table_throughput`)
+    /// propose directly on the control leader rather than through
+    /// `dynamo::create_table`/`update_table_throughput` (the real
+    /// cluster's own synchronous recompute site), so nothing in this
+    /// harness would otherwise ever flip the flag at all. Called after
+    /// [`SimCluster::set_table_throughput`]'s own convergence poll, once
+    /// every node's metadata already agrees.
+    fn recompute_any_table_throughput_all(&self) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter() {
+            let meta = ctx.effective_metadata();
+            ctx.recompute_any_table_throughput(&meta);
+        }
+    }
+
     fn is_leader_local(&self, node: u64, tablet: TabletId) -> bool {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize]
             .edge
             .local_cp(tablet)
             .is_some_and(|g| g.is_leader())
+    }
+
+    /// ADR 0065's test-reachable hook (`ClientCtx::set_throttle_defaults`)
+    /// on one node — mutates through the node's own `Arc<ThrottleDefaults>`,
+    /// so it's visible to every clone of that node's `ClientCtx`, including
+    /// the one closed over by its own relay-serving handler (installed
+    /// before this handle's `ctxs` vec was ever built — both clones share
+    /// the identical `Arc`). Plain sync: `set_throttle_defaults` itself
+    /// does no I/O and needs no simulator drive.
+    fn set_throttle_defaults(&self, node: u64, read_units: Option<u64>, write_units: Option<u64>) {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize]
+            .set_throttle_defaults(read_units, write_units);
     }
 
     /// `node`'s own internal `SimEnv` — the env a corpus spawns a
@@ -468,6 +515,8 @@ impl SimCluster {
         for (i, id) in ids.iter().enumerate() {
             let admin = Arc::new(AdminInfo {
                 auto_split_ops_rate_threshold: None,
+                throttle_read_units: None,
+                throttle_write_units: None,
                 node_id: Some(id.clone()),
                 internal_addr: Some(placeholder_addr()),
                 client_addr: placeholder_addr(),
@@ -513,6 +562,9 @@ impl SimCluster {
                 dynamo_auth: None,
                 tls: None,
                 relay: relays[i].clone(),
+                throttle: ThrottleTracker::new(),
+                throttle_defaults: Arc::new(ThrottleDefaults::default()),
+                any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             ctxs.push(ctx);
         }
@@ -742,6 +794,75 @@ impl SimCluster {
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.shared.metadata(node)
+    }
+
+    /// ADR 0065 §5(b): `node`'s own current `ClientCtx::
+    /// any_table_throughput` flag — a relaxed load, matching the flag's
+    /// own real-request read. Test-only accessor proving the flag's
+    /// recompute points (`SimCluster::set_table_throughput`'s tail call to
+    /// [`SimClusterHandle::recompute_any_table_throughput_all`]) actually
+    /// flip it, both directions.
+    pub(crate) fn any_table_throughput(&self, node: u64) -> bool {
+        self.shared
+            .ctx(node)
+            .any_table_throughput
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// ADR 0065's test-reachable hook: set `node`'s cluster-wide default
+    /// throttle limits — `None`/`None` (every node's own default) means
+    /// `PAY_PER_REQUEST`, unthrottled. See `ClientCtx::set_throttle_
+    /// defaults`'s own doc for why this exists at all (step 4's real
+    /// config surface doesn't yet).
+    pub(crate) fn set_throttle_defaults(
+        &self,
+        node: u64,
+        read_units: Option<u64>,
+        write_units: Option<u64>,
+    ) {
+        self.shared
+            .set_throttle_defaults(node, read_units, write_units);
+    }
+
+    /// [`SimCluster::set_throttle_defaults`] on every node at once — the
+    /// shape a real cluster-wide config knob would have, once step 4 adds
+    /// one.
+    pub(crate) fn set_throttle_defaults_all(
+        &self,
+        read_units: Option<u64>,
+        write_units: Option<u64>,
+    ) {
+        for node in 0..self.nodes as u64 {
+            self.set_throttle_defaults(node, read_units, write_units);
+        }
+    }
+
+    /// ADR 0065 §5(b), W-08 step 4: set (or clear, `spec: None`) `table`'s
+    /// own **per-table** provisioned throughput — `MetaCommand::
+    /// SetTableThroughput`, proposed on the control group's current leader
+    /// and converged-or-timeout polled across every node, the identical
+    /// shape [`SimCluster::create_table_with_replication`]'s own tail uses.
+    /// Overrides [`SimCluster::set_throttle_defaults_all`]'s cluster-wide
+    /// default for this table (ADR 0065 Decision 5(b)) — `ClientCtx::
+    /// throttle_limits_for` reads this back before falling through to it.
+    pub(crate) fn set_table_throughput(
+        &mut self,
+        table: &str,
+        spec: Option<animus_control::ProvisionedThroughput>,
+    ) {
+        let leader = self.control_leader_index();
+        let outcome = self.controls[leader].propose(MetaCommand::SetTableThroughput {
+            table: table.to_owned(),
+            spec,
+        });
+        assert!(
+            matches!(outcome, ProposeResult::Accepted { .. }),
+            "SetTableThroughput must be accepted by the current control leader (table={table})"
+        );
+        self.poll_until(Duration::from_secs(5), |c| {
+            c.shared.all_have_table_throughput(table, spec.as_ref())
+        });
+        self.shared.recompute_any_table_throughput_all();
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for

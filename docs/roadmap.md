@@ -20,8 +20,9 @@ How to maintain this file:
   reviewable step stacks by default.
 
 The next free ADR number at the time of writing is **0066** (0065 is
-[Per-table throttling](adr/0065-per-table-throttling.md), W-08 — the
-design of record for the section below; the implementation removes it).
+[Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
+record — W-08 itself landed 2026-09-05 and is removed from this file, per
+this document's own maintenance rule above).
 
 ---
 
@@ -59,28 +60,6 @@ the still-true paragraph after the table.
   (4) Batch; (5) ExecuteTransaction. **Size:** XL.
 - **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
   2026-09-04) if it generalises.
-
-### W-08 Per-table throttling
-
-- **Gap:** `capacity.rs` computes `ConsumedCapacity` but nothing gates a
-  request; no protection against a noisy tenant.
-- **Plan:** token bucket keyed per tablet (shape copied from
-  `ChangeRateTracker`, `crates/animusd/src/lib.rs:6123-6203`, including its
-  `retain_existing(&Metadata)` GC), checked in `kind_write_item_at_leader`
-  and the read-path entry before proposing; returns
-  `ProvisionedThroughputExceededException`. Configure first with a
-  cluster flag, then per table via a replicated `TableSchema` field set by
-  `UpdateTable ProvisionedThroughput`.
-- **Seam:** `write_path.rs` is `#[deny(clippy::disallowed_methods)]` —
-  the bucket must use `env.now()`, never `tokio::time::Instant`.
-- **Tests:** new `dynamo_throttling.rs` over `SimEnv`'s virtual clock.
-- **ADR:** **yes** — per-table vs per-tablet scope, per-node vs
-  coordinated, interaction with transaction atomicity.
-- **PRs:** (1) ADR; (2) bucket + tracker; (3) enforcement + error mapping;
-  (4) config surface. **Size:** L.
-- **Depends:** none — W-09 landed 2026-09-05, so `RequestRateTracker`
-  (`crates/animusd/src/lib.rs`) already exists as the per-tablet tracker
-  shape to copy.
 
 ---
 
@@ -316,8 +295,10 @@ documentation-lagging-code gap turns up.
 - **Global tables, on-demand/provisioned billing, Lambda triggers, DAX,
   CloudWatch, Kinesis destinations, Contributor Insights, replica
   auto-scaling.** Properties of the managed service, declared out of scope
-  on `website/compatibility.html`. W-08 gives throttling without a
-  billing meter.
+  on `website/compatibility.html`. W-08 (landed 2026-09-05, ADR 0065) gives
+  real per-table throttling in DynamoDB capacity units without a billing
+  meter — `BillingMode`/`ProvisionedThroughput` are supported and enforced,
+  but nothing here meters or invoices.
 
 ---
 
@@ -331,9 +312,10 @@ wave are independent and can run in parallel.
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
 | 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
-| — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3; W-08 now depends on nothing |
+| — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
+| — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
 | 3 | U-05, U-07, U-08(ii) | U-05 after its members panel |
-| 4 | S-02, W-08 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064) |
+| 4 | S-02 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 

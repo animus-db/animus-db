@@ -67,6 +67,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/data/dynamo") => host.action_data_dynamo(body).await,
         ("POST", "/admin/data/drop-table") => host.action_drop_table(body).await,
         ("POST", "/admin/data/seed") => host.action_data_seed(body).await,
+        ("POST", "/admin/throttle/defaults") => host.action_set_throttle_defaults(body).await,
         // A known admin path with the wrong verb vs. an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => (
             404,
@@ -237,6 +238,9 @@ mod tests {
             unreachable!()
         }
         async fn action_data_seed(&self, _body: &[u8]) -> (u16, Value) {
+            unreachable!()
+        }
+        async fn action_set_throttle_defaults(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
     }
