@@ -96,6 +96,7 @@ fn local_scan_kind_snapshot_pins_a_version_and_never_surfaces_a_pending_intent()
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = node.clone();
     let staged = drive(&mut sim, node.env(), SETTLE, async move {

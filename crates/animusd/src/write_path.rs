@@ -25,9 +25,9 @@ use crate::{
 /// but-payload-lost `KindEval` (ADR 0054 mechanism 3's own documented
 /// residual: the leader-local result slot ages out or this node's own
 /// registration never got recorded) when there is nothing safe to
-/// substitute — deliberately the SAME string [`ClientCtx::cp_kind_local`]'s
-/// `poll_probe`-driven confirm returns for an ordinary confirm timeout
-/// (`ProbeWait::TimedOut`), not a new one: both are the identical
+/// substitute — deliberately the SAME string a `poll_probe`-driven confirm
+/// returns for an ordinary confirm timeout (`ProbeWait::TimedOut`), not a
+/// new one: both are the identical
 /// wire-visible shape — "the write may have happened, but this node cannot
 /// honestly report what changed" — and the caller-facing behavior (a
 /// terminal `InternalServerError`, no retry — this string does not carry
@@ -55,9 +55,7 @@ pub(crate) enum KindEvalApplied {
     /// The write's own `ConditionExpression` evaluated to `false` against
     /// apply's fresh read — a genuine `ConditionalCheckFailedException`.
     /// (Apply's identical outcome variant also covers an unresolved
-    /// foreign transaction intent on this key — see this crate's own
-    /// `KindEvalSeatbeltMismatch` doc and `kind_write_item_at_leader`'s
-    /// comment on the mapping call site for why that rare race is not, and
+    /// foreign transaction intent on this key — a rare race not, and
     /// cannot cheaply be, told apart from a genuine condition failure at
     /// this layer.)
     ConditionFailed,
@@ -96,10 +94,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// [`decide::read_should_retry`] matches the error.
     /// Before this fix a client writing during a split's freeze window got a
     /// terminal error instead of the write succeeding once the child
-    /// activates a moment later. The retry loop lives *outside*
-    /// `kind_write_item_at_leader`'s own `rmw_lock` scope (issue #285 narrowed
-    /// that lock to read+evaluate only), so retrying here — including the
-    /// sleep between attempts — never pins the lock across the wait.
+    /// activates a moment later. `kind_write_item_at_leader` holds no lock
+    /// at all any more (ADR 0054 step 4b deleted `rmw_lock` outright), so
+    /// retrying here — including the sleep between attempts — was never at
+    /// risk of pinning one across the wait.
     pub(crate) async fn cp_kind_write_item(
         &self,
         meta: &Metadata,
@@ -128,8 +126,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             let err = match self.cp_route(table, &base_key).await {
                 CpRoute::Local(leader) => {
-                    match dynamo::kind_write_item_at_leader(
-                        self,
+                    match dynamo::kind_write_item_at_leader::<E, R>(
                         &leader,
                         meta,
                         table,
@@ -328,11 +325,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// tombstone (see `cp_kind_write_raw`'s doc for why the last write
     /// proves the whole entry). The ONE confirm implementation for a raw
     /// kind batch, shared by `cp_kind_write_raw`'s `Local` arm and
-    /// `cp_serve_forwarded`'s `KindWrite` arm — they diverged once
-    /// (the serve arm used [`cp_kind_local`](Self::cp_kind_local), whose
-    /// confirm *requires* a `Some`-valued base write), so a raw batch whose
-    /// base write is a tombstone erred iff the connected node did not lead
-    /// the tablet (leader-placement-bimodal).
+    /// `cp_serve_forwarded`'s `KindWrite` arm — they diverged once (the
+    /// serve arm used the now-deleted `cp_kind_local`, whose confirm
+    /// *required* a `Some`-valued base write), so a raw batch whose base
+    /// write is a tombstone erred iff the connected node did not lead the
+    /// tablet (leader-placement-bimodal).
     pub(crate) async fn cp_kind_raw_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
@@ -360,8 +357,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         else {
             return Ok(()); // empty batch is a no-op
         };
-        let accepted_index = match leader.put_kind_batch_conditioned(writes, change_log, Vec::new())
-        {
+        let accepted_index = match leader.put_kind_batch(writes, change_log) {
             ProposeResult::Accepted { index, .. } => index,
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
@@ -399,119 +395,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         Err("kind batch did not apply in time".into())
     }
 
-    /// Propose a `KindBatch` on a **known-leader** local handle and confirm it.
-    ///
-    /// Confirmation probes the batch's **base-kind** write, the one row a
-    /// client can observe: `poll_probe` reads through the group's base scope,
-    /// so an LSI/footprint/change-log write is not observable to it. Every
-    /// caller includes a base write (a put's item, or a delete's tombstone
-    /// *value*), so there is always a probe; a batch with none is refused
-    /// rather than acked unconfirmed — a fenced-out entry commits as a no-op,
-    /// so acking without a probe would falsely report a write that never
-    /// happened (the hazard `cp_batch_local`'s doc spells out).
-    ///
-    /// **`conditions` (ADR 0046 U3, `pub(crate)` since [`dynamo::
-    /// kind_write_item_at_leader`] calls this from outside `impl ClientCtx`)**:
-    /// threaded straight through to `put_kind_batch_fenced`'s own
-    /// `KvCommand::KindBatch.conditions` field — see that field's doc. Every
-    /// pre-existing caller here passes an empty `Vec` (zero behavior
-    /// change); `kind_write_item_at_leader` is the one caller that supplies
-    /// its own-key OCC seatbelt. A failed condition no-ops the whole batch
-    /// silently, indistinguishable from a fence miss, so it surfaces through
-    /// this same function's existing `"CP kind write did not commit in
-    /// time"` timeout — deliberately no new outcome channel.
-    ///
-    /// **`identity` (issue #469)**: threaded straight through to
-    /// [`poll_probe`](Self::poll_probe)'s value-equality fallback gate — see
-    /// [`ProbeIdentity`]'s doc for why an idempotent write may confirm on
-    /// value equality alone but a non-idempotent one (a numeric `ADD`) may
-    /// not. The caller already knows this (`dynamo::
-    /// kind_write_is_idempotent`, computed once per write); `poll_probe`
-    /// never recomputes it.
-    ///
-    /// **No production caller as of ADR 0054 step 3.** `kind_write_item_at_
-    /// leader` — this function's one production caller — now proposes
-    /// `KvCommand::KindEval` via [`cp_kind_eval_local`](Self::
-    /// cp_kind_eval_local) instead, so the client's own `condition` is
-    /// evaluated fresh at apply rather than carried here as a byte-level
-    /// `conditions` seatbelt. This function stays for its own regression
-    /// coverage (`confirm_futility_tests::
-    /// a_condition_failed_kind_batch_fails_fast_with_a_retryable_error`,
-    /// issue #268 — the confirm-futility fast-fail on a raw `KindBatch`,
-    /// independent of ADR 0054) until step 4 deletes `rmw_lock`/the
-    /// `KindBatch.conditions` seatbelt outright and this function along
-    /// with them. The `cfg_attr` mirrors `local_scan_kind_bounded`'s own
-    /// precise, not blanket, dead-code allowance: only the non-`cfg(test)`
-    /// build (the `tests/` binaries and the release lib) sees it — `cargo
-    /// test -p animusd --lib`, which actually calls this, sees no
-    /// allowance at all.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn cp_kind_local(
-        leader: &CpGroup<E>,
-        writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
-        change_log: Vec<(Vec<u8>, Vec<u8>)>,
-        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        identity: ProbeIdentity,
-    ) -> Result<(), String> {
-        let probe = writes
-            .iter()
-            .find(|(kind, _, v)| *kind == animus_cp_data::KIND_BASE && v.is_some())
-            .map(|(_, k, v)| (k.clone(), v.clone().expect("filtered to Some")));
-        let Some((probe_key, probe_val)) = probe else {
-            return Err("a kind batch must carry a base-kind write to confirm on".into());
-        };
-        decide::frozen_refusal(leader.is_frozen())?;
-        // Pre-propose range check, the same reasoning as `cp_batch_propose`:
-        // a fenced-out entry applies as a no-op, and the probe below would then
-        // just time out with a generic error instead of a clean routing error.
-        let fence = leader.scope_range();
-        for (_, key, _) in &writes {
-            if !fence.contains(key) {
-                return Err("kind write outside this group's live range; retry".into());
-            }
-        }
-        let (accepted_index, accepted_term) =
-            match leader.put_kind_batch_conditioned(writes, change_log, conditions) {
-                ProposeResult::Accepted { index, term } => (index, term),
-                other => return Err(format!("kind write not accepted: {other:?}")),
-            };
-        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
-        match Self::poll_probe(
-            leader,
-            accepted_index,
-            accepted_term,
-            &probe_key,
-            &probe_val,
-            identity,
-            deadline,
-        )
-        .await
-        {
-            ProbeWait::Confirmed => Ok(()),
-            // A failed own-key `conditions` entry lands here too: the entry
-            // applies as a silent no-op (see `KindBatch.conditions`' doc in
-            // `animus-cp-data`), so "superseded" is the caller's cue to
-            // re-read and re-evaluate — the ordinary OCC retry round.
-            ProbeWait::Superseded => Err(
-                "CP kind write superseded before its effect appeared (leadership churn, an \
-                 apply-time no-op, or a failed write condition); retry"
-                    .into(),
-            ),
-            ProbeWait::TimedOut => Err("CP kind write did not commit in time".into()),
-        }
-    }
-
-    /// Propose a self-contained **evaluated write** (ADR 0054 step 3 —
-    /// `KvCommand::KindEval`) and confirm it —
-    /// [`cp_kind_local`](Self::cp_kind_local)'s sibling for the cut-over
-    /// single-item write path. `dynamo::kind_write_item_at_leader` is the
-    /// one caller: it builds `schema`/`op`/`condition` from the client's
-    /// request and this node's own `Metadata` read, then hands the write
-    /// to apply rather than computing its own diff (the ADR 0054 fix).
+    /// Propose a self-contained **evaluated write** (ADR 0054 — `KvCommand::
+    /// KindEval`) and confirm it — the single-item write path's whole
+    /// evaluate-and-write primitive. `dynamo::kind_write_item_at_leader` is
+    /// the one caller: it builds `schema`/`op`/`condition` from the
+    /// client's request and this node's own `Metadata` read, then hands the
+    /// write to apply rather than computing its own diff (the ADR 0054 fix).
     ///
     /// **Reuses `poll_probe`'s term-checked confirm channel**
     /// (`classify_kind_batch_outcome`, the same identity-checked
-    /// `(index, term)` proof `cp_kind_local`'s own confirm uses) but
+    /// `(index, term)` proof `cp_batch_local`'s own confirm uses) but
     /// **not** its value-equality fallback: apply computes the written
     /// bytes itself, so there is no leader-known `probe_val` to compare
     /// against here — the confirm question is always "what did MY entry's
@@ -528,8 +421,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// no benefit, since `RaftKvNode::propose_kind_eval` derives the
     /// identical key internally from its own `pk`/`sk` arguments anyway
     /// (this function's `base_key` is used only for the pre-propose range
-    /// check below, mirroring `cp_kind_local`'s own tripwire).
-    #[allow(clippy::too_many_arguments)] // one item write's full identity, mirrors cp_kind_local's sibling shape
+    /// check below, a routing-bug tripwire mirroring `cp_batch_local`'s own).
+    #[allow(clippy::too_many_arguments)] // one item write's full identity
     pub(crate) async fn cp_kind_eval_local(
         leader: &CpGroup<E>,
         schema: animus_item::WriteSchema,
@@ -543,7 +436,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ) -> Result<KindEvalApplied, String> {
         decide::frozen_refusal(leader.is_frozen())?;
         // Pre-propose range check — the identical routing-bug tripwire
-        // `cp_kind_local`/`cp_batch_propose` already carry (ADR 0050 Train
+        // `cp_batch_local`/`cp_batch_propose` already carry (ADR 0050 Train
         // B rung 7: ranges are immutable now, so this is belt-and-
         // suspenders against a stale `cp_route` resolution, never a fence).
         let fence = leader.scope_range();
@@ -632,9 +525,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// NOT recoverable this way: the current value could already reflect a
     /// later write, and reporting it as this entry's own `new` would be a
     /// silent lie about which write produced it — so this returns the same
-    /// ambiguous, non-retried error [`cp_kind_local`](Self::cp_kind_local)
-    /// already returns for its own unconfirmable case
-    /// ([`KIND_EVAL_CONFIRM_AMBIGUOUS`]), never a new one. Either way the
+    /// ambiguous, non-retried error ([`KIND_EVAL_CONFIRM_AMBIGUOUS`]) an
+    /// ordinary confirm timeout does, never a new one. Either way the
     /// write **did** apply — this is a reporting gap, not a correctness
     /// one; see ADR 0054's own "Not removed, deliberately: Ambiguity"
     /// consequence for why the ADR accepts this rather than inventing a
@@ -682,9 +574,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///   this write; unlike the two above, this is NOT a decision about
     ///   the write's own content, so the caller must re-route (via
     ///   `cp_kind_write_item`'s own retry loop) rather than treat it as a
-    ///   terminal answer, mirroring `cp_kind_local`'s identical `Sealed`
-    ///   handling one layer up (folded into its own generic `Superseded`
-    ///   message there, since that path never distinguishes the three).
+    ///   terminal answer.
     /// - `Applied`/`None` never reach here — `classify_kind_batch_outcome`
     ///   only ever returns `NoOp` for one of the three variants above.
     fn kind_eval_noop(outcome: Option<(u64, KindBatchOutcome)>) -> Result<KindEvalApplied, String> {
@@ -1091,27 +981,34 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
 /// value-equality fallback. `poll_probe` is private to this module (no
 /// `pub(crate)`) — this lives as a child module here, not in `lib.rs` or an
 /// external `tests/*.rs` file, specifically so it can call `poll_probe`
-/// directly rather than only its `cp_kind_local`/`cp_batch_local` wrappers,
-/// which is what lets this test pin the exact accepted-but-unapplied window
+/// directly rather than only its `cp_batch_local` wrapper (the now-deleted
+/// `cp_kind_local` was its other caller), which is what lets this test pin
+/// the exact accepted-but-unapplied window
 /// the bug lives in (see `poll_probe`'s own doc for the mechanism). Mirrors
 /// `lib.rs`'s `simenv_client_ctx_tests` harness style (a single-voter
 /// `RaftKvNode<SimEnv, MemoryEngine>`, no sockets, no `ProdEnv`) — see that
 /// module's doc for why constructing these types here widens nothing.
 ///
 /// **The scenario.** Entry A is an ordinary unconditioned `KindBatch` that
-/// writes `(key, value)` and is allowed to fully commit + apply. Entry B
-/// proposes the exact SAME `(key, value)` bytes but carries an own-key OCC
-/// seatbelt engineered to legitimately fail once entry B itself applies (a
-/// guard key with an expected value that can never match) — the same shape
-/// a concurrent numeric `ADD` evaluator produces from a stale read (issue
-/// #469's own account: two evaluators reading identical stale `old` under
-/// `kind_write_item_at_leader`'s released-before-propose lock compute
-/// byte-identical `new`). With entry B accepted but not yet applied,
+/// writes `(key, value)` and is allowed to fully commit + apply. The group
+/// is then frozen (`KvCommand::Freeze`, ADR 0050 rung 5's whole-range seal —
+/// exercised here purely as a test tool for "the next mutating entry
+/// legitimately no-ops," never a live production path since split now
+/// forks in place, ADR 0058), so entry B — proposing the exact SAME `(key,
+/// value)` bytes as entry A, with no condition of its own — is guaranteed
+/// to apply as `Sealed`: the identical `NoOp`-bucket outcome ADR 0054's own
+/// evaluate-at-apply design produces for a genuinely false condition (a
+/// concurrent numeric `ADD` evaluator reading identical stale state
+/// computes byte-identical `new` bytes the same way, issue #469's own
+/// account) — `poll_probe`'s own confirm loop treats every `NoOp` reason
+/// identically (`classify_kind_batch_outcome`), so `Sealed` here exercises
+/// the exact same code path a `ConditionFailed` would. With entry B
+/// accepted but not yet applied,
 /// `poll_probe` is driven directly for entry B's own `(index, term)`. The
 /// pre-fix code's ungated value-equality fallback matches entry A's already-
 /// visible bytes at the very first poll and falsely reports `Confirmed` —
-/// before entry B has had any chance to apply and legitimately
-/// `ConditionFailed`. The fix (`ProbeIdentity::RequiresOwnEntry`) never
+/// before entry B has had any chance to apply and legitimately `Sealed`.
+/// The fix (`ProbeIdentity::RequiresOwnEntry`) never
 /// consults the value at all for a non-idempotent write, so the wait
 /// continues until entry B's own outcome resolves — `Superseded`, never a
 /// false `Confirmed`.
@@ -1210,9 +1107,8 @@ mod poll_probe_identity_tests {
 
         // Entry A: an ordinary unconditioned put, allowed to fully commit
         // and apply before entry B is ever proposed.
-        let (a_index, _a_term) = match leader.put_kind_batch_conditioned(
+        let (a_index, _a_term) = match leader.put_kind_batch(
             vec![(KIND_BASE, key.clone(), Some(value.clone()))],
-            Vec::new(),
             Vec::new(),
         ) {
             ProposeResult::Accepted { index, term } => (index, term),
@@ -1230,13 +1126,28 @@ mod poll_probe_identity_tests {
              (seed={seed})"
         );
 
-        // Entry B: proposes the exact SAME (key, value) bytes, guarded by an
-        // own-key OCC seatbelt that can never hold (the guard key is never
-        // written) — engineered to legitimately `ConditionFailed` once
-        // entry B itself applies. This is the concurrent-`ADD`-evaluator
-        // shape from issue #469's own account, reproduced directly rather
-        // than through a real race: both entries propose byte-identical
-        // `new` bytes, and only one of them may legitimately win.
+        // Freeze the group (`KvCommand::Freeze`, ADR 0050 rung 5's
+        // whole-range seal — a test tool here, never a live production path
+        // since split now forks in place, ADR 0058): every later-ordered
+        // mutating entry legitimately no-ops as `Sealed`, with no seatbelt
+        // condition of its own needed.
+        let raftkv = match &leader {
+            CpGroup::Mem(n) => n,
+            CpGroup::Lsm(_) => unreachable!("single_voter_group always builds CpGroup::Mem"),
+        };
+        assert!(matches!(
+            raftkv.propose_freeze(),
+            ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_millis(200));
+
+        // Entry B: proposes the exact SAME (key, value) bytes as entry A,
+        // no condition of its own — engineered to legitimately `Sealed`
+        // once entry B itself applies, against the now-frozen group. This
+        // is the concurrent-`ADD`-evaluator shape from issue #469's own
+        // account, reproduced directly rather than through a real race:
+        // both entries propose byte-identical `new` bytes, and only one of
+        // them may legitimately win.
         //
         // **Entry B's own propose lives INSIDE the spawned task, as the
         // first thing its future does — not before spawning it.** This is
@@ -1256,7 +1167,6 @@ mod poll_probe_identity_tests {
         // the very window this test exists to pin, and the pre-fix code
         // then genuinely never got a chance to consult the stale value
         // (silently passing for the wrong reason).
-        let guard_key = b"guard-never-written".to_vec();
         let deadline = leader.env().now().saturating_add(Duration::from_secs(5));
         let env = leader.env().clone();
         let sanity_unapplied_at_probe_start: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
@@ -1266,10 +1176,9 @@ mod poll_probe_identity_tests {
             let value = value.clone();
             let sanity = sanity_unapplied_at_probe_start.clone();
             async move {
-                let (b_index, b_term) = match leader.put_kind_batch_conditioned(
+                let (b_index, b_term) = match leader.put_kind_batch(
                     vec![(KIND_BASE, key.clone(), Some(value.clone()))],
                     Vec::new(),
-                    vec![(guard_key, Some(b"can-never-match".to_vec()))],
                 ) {
                     ProposeResult::Accepted { index, term } => (index, term),
                     other => panic!("entry B not accepted: {other:?}"),
@@ -1309,14 +1218,14 @@ mod poll_probe_identity_tests {
              THIS entry applied (seed={seed}): {result:?}"
         );
         // Not just "not Confirmed" — the scenario is engineered to resolve
-        // cleanly once entry B's own outcome is recorded (`ConditionFailed`
-        // -> `NoOp` -> `Superseded`), proving the fixed loop actually made
+        // cleanly once entry B's own outcome is recorded (`Sealed` ->
+        // `NoOp` -> `Superseded`), proving the fixed loop actually made
         // progress rather than degrading to a `TimedOut` guess.
         assert_eq!(
             result,
             Some(ProbeWait::Superseded),
-            "entry B's own ConditionFailed outcome should resolve the wait \
-             once applied (seed={seed}): {result:?}"
+            "entry B's own Sealed outcome should resolve the wait once \
+             applied (seed={seed}): {result:?}"
         );
     }
 }

@@ -10,12 +10,15 @@
 //! This is the primitive-level suite for the mechanism itself; the wire
 //! edge (participant-leader evaluation, `run_transact`'s rejection removal)
 //! is `animusd`'s PR2, and corpus depth is PR3's `txn_serializable.rs`
-//! extension. It also pins the issue-#266 residual-window interleaving (a
-//! conditioned `KindBatch` — the U3 funnel's artifact — racing the
-//! stage→resolve window of a transactional write of the same item; see
-//! `a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_
-//! an_lsi_row`); the cross-node wire-level twin is `animusd`'s
-//! `dynamo_index_writes.rs`.
+//! extension. The issue-#266 residual-window interleaving this file used
+//! to pin (a conditioned `KindBatch` — the U3 funnel's now-deleted
+//! leader-evaluated-write artifact — racing the stage→resolve window of a
+//! transactional write of the same item) is retired as a TOMBSTONE below
+//! (ADR 0054 step 4b) — the mechanism it exercised no longer exists; its
+//! still-live twin for the mechanism that replaced it is
+//! `a_kind_eval_racing_a_still_unresolved_pending_stage_gets_condition_
+//! failed_then_succeeds_after_resolve`, added in step 4a. The cross-node
+//! wire-level suite is `animusd`'s `dynamo_index_writes.rs`.
 //!
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`,
 //! never `run()` (the driver has perpetual heartbeat/election timers).
@@ -23,11 +26,16 @@
 use std::time::Duration;
 
 use animus_cp_data::{
-    KIND_BASE, KIND_CHANGE, KIND_LSI, RaftKvNode, StorageScope, TxnOutcome, TxnWrite, hlc,
+    KIND_BASE, KIND_CHANGE, KIND_LSI, KindBatchOutcome, KindEvalOp, PendingTxnWrite, RaftKvNode,
+    StorageScope, TxnOutcome, TxnWrite, hlc,
 };
 use animus_env::{EnvExt, nid};
+use animus_item::{
+    AttributeValue, Comparator, ConditionExpression, Item, LsiDef, PathSegment, Projection,
+    TableSchema, UpdateAction, WriteSchema, decode_stored_item, encode_stored_item,
+};
 use animus_sim::{SimEnv, Simulator};
-use animus_storage::{MemoryEngine, StorageEngine};
+use animus_storage::MemoryEngine;
 use animus_tablet::{KeyRange, escape, partition_token};
 use futures::executor::block_on;
 
@@ -105,6 +113,7 @@ fn kind_bearing_write(pk: &[u8], base_value: Vec<u8>, lsi_value: Vec<u8>) -> Txn
         kind_writes: vec![(KIND_LSI, lsi, Some(lsi_value))],
         change_log: Some((change_prefix, b"change-record".to_vec())),
         stage_marker: None,
+        pending: None,
     }
 }
 
@@ -393,196 +402,32 @@ fn leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone() {
     );
 }
 
-/// **The issue-#266 residual-window interleaving, pinned**: a
-/// non-transactional evaluate-at-leader write (ADR 0046 U3 — modeled here
-/// as its literal proposed artifact, a conditioned `KindBatch` carrying the
-/// old bytes its evaluator read plus the LSI diff derived from them) lands
-/// inside the stage→resolve window of a transactional write of the SAME
-/// item. The seatbelt's unresolved-intent arm (`KvCommand::KindBatch`'s
-/// conditions check: an intent is never a match) must no-op the WHOLE stale
-/// batch — the one arm `tests/kind_batch_conditions.rs`'s committed-value
-/// scenarios never reach, and exactly the guard that keeps the funnel
-/// write's stale diff (delete `row-v0` / put `row-v2`) from landing between
-/// the stage and the resolve; were it admitted, the resolve's own
-/// materialization (delete `row-v0` / put `row-v1`, from the intent alone,
-/// pushed by a `txn_resolver_loop` that never takes `rmw_lock`) would then
-/// re-derive against a base the batch already moved, leaving an LSI row
-/// orphaned forever (nothing reconciles a stale LSI row; only the GSI
-/// drain self-heals). After the resolve, the funnel caller's re-evaluated
-/// retry (fresh old bytes, fresh diff) applies cleanly — ending on the
-/// invariant the whole mechanism exists to keep: exactly one live LSI row,
-/// derived from the base row's own current value.
-#[test]
-fn a_conditioned_kind_batch_racing_the_stage_resolve_window_never_orphans_an_lsi_row() {
-    let seed = 0x0266_0001;
-    let (mut sim, node) = group(seed);
-    sim.run_for(ELECT);
-
-    let pk = b"heidi";
-    let base = logical(pk, b"");
-    let lsi_v0 = logical(pk, b"\x01alt-v0");
-    let lsi_v1 = logical(pk, b"\x01alt-v1");
-    let lsi_v2 = logical(pk, b"\x01alt-v2");
-
-    // The committed starting state a real indexed item has: a base value
-    // plus its one derived LSI row, written atomically.
-    assert!(matches!(
-        node.put_kind_batch(
-            vec![
-                (KIND_BASE, base.clone(), Some(b"v0".to_vec())),
-                (KIND_LSI, lsi_v0.clone(), Some(b"row-v0".to_vec())),
-            ],
-            Vec::new(),
-        ),
-        animus_control::ProposeResult::Accepted { .. }
-    ));
-    sim.run_for(SETTLE);
-
-    // The transactional write stages v0 → v1: its leader-side eval's LSI
-    // diff rides opaque inside the intent, and the C1 mandatory own-key OCC
-    // condition carries the exact bytes that eval read.
-    let write = TxnWrite {
-        key: base.clone(),
-        value: Some(b"v1".to_vec()),
-        kind_writes: vec![
-            (KIND_LSI, lsi_v0.clone(), None),
-            (KIND_LSI, lsi_v1.clone(), Some(b"row-v1".to_vec())),
-        ],
-        change_log: None,
-        stage_marker: None,
-    };
-    let n = node.clone();
-    let base_c = base.clone();
-    let (txn_id, record_key, outcome) = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_stage_anchor(
-            TABLE,
-            vec![write],
-            Vec::new(),
-            vec![(base_c, Some(b"v0".to_vec()))],
-        )
-        .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"));
-    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged);
-
-    // The racing non-transactional write of the same item: its evaluator
-    // read v0 (before the stage applied — the eval-to-apply gap `rmw_lock`
-    // does not cover), so its batch carries the v0 seatbelt and the
-    // v0-derived stale diff, and applies while the key holds the unresolved
-    // intent.
-    assert!(matches!(
-        node.put_kind_batch_conditioned(
-            vec![
-                (KIND_BASE, base.clone(), Some(b"v2".to_vec())),
-                (KIND_LSI, lsi_v0.clone(), None),
-                (KIND_LSI, lsi_v2.clone(), Some(b"row-v2".to_vec())),
-            ],
-            Vec::new(),
-            vec![(base.clone(), Some(b"v0".to_vec()))],
-        ),
-        animus_control::ProposeResult::Accepted { .. }
-    ));
-    sim.run_for(SETTLE);
-
-    // Whole-or-nothing: the intent still stands on the base key, and
-    // neither half of the stale diff landed.
-    let raw_base = block_on(node.storage().get(&node.physical_key(KIND_BASE, &base)))
-        .expect("engine read ok")
-        .expect("base key must still exist")
-        .value;
-    assert_eq!(
-        raw_base.first().copied(),
-        Some(1u8),
-        "the base key must still hold the unresolved intent envelope — the stale batch must \
-         not have overwritten it (seed={seed})"
-    );
-    assert_eq!(
-        block_on(node.local_get_kind(KIND_LSI, &lsi_v0)),
-        Some(b"row-v0".to_vec()),
-        "the stale batch's LSI delete must not have landed (seed={seed})"
-    );
-    assert_eq!(
-        block_on(node.local_get_kind(KIND_LSI, &lsi_v2)),
-        None,
-        "the stale batch's LSI put must not have landed (seed={seed})"
-    );
-
-    // Commit, then resolve — as the coordinator's own push or
-    // `txn_resolver_loop`'s recovery push equally would (the resolver knows
-    // only `(txn_id, record_key, keys, outcome)`; the diff comes from the
-    // intent on the key itself). The base rewrite and the LSI
-    // materialization land in ONE entry.
-    let n = node.clone();
-    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
-    let commit_ts = drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
-            .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("commit did not complete (seed={seed})"));
-    let n = node.clone();
-    let (txn_id_r, record_key_r, base_r) = (txn_id.clone(), record_key.clone(), base.clone());
-    drive(&mut sim, node.env(), SETTLE, async move {
-        n.txn_resolve(
-            txn_id_r,
-            record_key_r,
-            vec![base_r],
-            TxnOutcome::Committed { commit_ts },
-        )
-        .await
-    })
-    .flatten()
-    .unwrap_or_else(|| panic!("resolve did not complete (seed={seed})"));
-
-    assert_eq!(
-        block_on(node.local_get(&base)),
-        Some(b"v1".to_vec()),
-        "the transaction's own value must be the committed base (seed={seed})"
-    );
-    assert_eq!(
-        block_on(node.local_get_kind(KIND_LSI, &lsi_v0)),
-        None,
-        "the resolve's materialized delete must have removed the v0 row (seed={seed})"
-    );
-    assert_eq!(
-        block_on(node.local_get_kind(KIND_LSI, &lsi_v1)),
-        Some(b"row-v1".to_vec()),
-        "the resolve must have materialized the v1 row (seed={seed})"
-    );
-
-    // The funnel caller's retry, re-evaluated against the NOW-committed v1
-    // (fresh seatbelt, fresh diff — exactly what a real
-    // `kind_write_item_at_leader` caller's retry recomputes), applies
-    // cleanly.
-    assert!(matches!(
-        node.put_kind_batch_conditioned(
-            vec![
-                (KIND_BASE, base.clone(), Some(b"v2".to_vec())),
-                (KIND_LSI, lsi_v1.clone(), None),
-                (KIND_LSI, lsi_v2.clone(), Some(b"row-v2".to_vec())),
-            ],
-            Vec::new(),
-            vec![(base.clone(), Some(b"v1".to_vec()))],
-        ),
-        animus_control::ProposeResult::Accepted { .. }
-    ));
-    sim.run_for(SETTLE);
-
-    assert_eq!(block_on(node.local_get(&base)), Some(b"v2".to_vec()));
-    for (row, expect, label) in [
-        (&lsi_v0, None, "v0"),
-        (&lsi_v1, None, "v1"),
-        (&lsi_v2, Some(b"row-v2".to_vec()), "v2"),
-    ] {
-        assert_eq!(
-            block_on(node.local_get_kind(KIND_LSI, row)),
-            expect,
-            "after the full interleaving, exactly one live LSI row (v2) may remain — \
-             {label} disagrees (seed={seed})"
-        );
-    }
-}
+// TOMBSTONE (ADR 0054 step 4b): `a_conditioned_kind_batch_racing_the_
+// stage_resolve_window_never_orphans_an_lsi_row` (the issue-#266 residual-
+// window regression) died here. It modeled a *non-transactional*
+// evaluate-at-leader write (ADR 0046 U3's original design) as a
+// `put_kind_batch_conditioned` call carrying the stale bytes that write's
+// leader-side evaluator had read, proving `KindBatch.conditions`'
+// unresolved-intent arm no-op'd the whole stale batch rather than
+// orphaning an LSI row racing a transactional write's stage→resolve
+// window of the same item. Both halves of that scenario are gone now, not
+// just untestable: step 3 (ADR 0054) already moved every non-transactional
+// write off leader-side evaluation onto apply-time `KindEval` before this
+// PR, so nothing produces a "stale batch carrying a stale seatbelt" for a
+// plain write any more; step 4b then deleted `KindBatch.conditions`
+// itself, so `put_kind_batch_conditioned` no longer exists to call. The
+// underlying hazard (a stale before-image racing a transactional stage) is
+// closed structurally rather than by a byte-level seatbelt for this write
+// shape too: `KvCommand::KindEval`'s own apply-time read of the current
+// committed value already IS a fresh read, so a "stale diff" cannot be
+// constructed to propose in the first place. The still-live twin of this
+// scenario for a genuinely evaluated write racing a stage is
+// `a_kind_eval_racing_a_still_unresolved_pending_stage_gets_condition_
+// failed_then_succeeds_after_resolve` in `tests/txn_kind_writes.rs`'s own
+// sibling suite (added in step 4a) — it proves the equivalent invariant
+// (an intent blocks a racing `KindEval`, and a fresh retry after resolve
+// succeeds) for the mechanism that actually exists now. Pre-deletion cell
+// retrievable from git history.
 
 // TOMBSTONE (ADR 0050 Train B rung 2): two cells died here with the
 // live-narrowable scope — `resolve_of_a_kind_bearing_write_is_fenced_whole_
@@ -636,6 +481,7 @@ fn kind_batch_and_txn_resolve_materialize_byte_identical_rows_for_identical_payl
         kind_writes: vec![(KIND_LSI, txn_lsi_key.clone(), Some(lsi_value.clone()))],
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = node.clone();
     let (txn_id, record_key, _outcome) = drive(&mut sim, node.env(), SETTLE, async move {
@@ -962,5 +808,410 @@ fn a_change_log_prefix_off_its_own_token_is_rejected_at_apply() {
         block_on(node.local_get(&base)),
         None,
         "whole-or-nothing: no intent may land either (seed={seed})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0054 step 4a: `TxnWrite::pending` — apply-time evaluation of a
+// transactional write, extending `KvCommand::KindEval`'s own evaluator to
+// `KvCommand::TxnStage`. These scenarios use real `AttributeValue`-keyed
+// items (mirroring `kind_eval.rs`'s own helpers) rather than this file's
+// opaque-byte `logical`/`kind_bearing_write` helpers above, since a pending
+// write's `pk`/`sk` must be real `AttributeValue`s the evaluator can read.
+// ---------------------------------------------------------------------------
+
+fn s(v: &str) -> AttributeValue {
+    AttributeValue::S(v.to_owned())
+}
+
+fn n(v: &str) -> AttributeValue {
+    AttributeValue::N(v.to_owned())
+}
+
+fn av_item(pairs: &[(&str, AttributeValue)]) -> Item {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+        .collect()
+}
+
+/// The `KIND_BASE`/`KIND_LSI` logical key an item's own identity resolves
+/// to — matches `RaftKvNode::propose_kind_eval`'s private `kind_eval_base_key`
+/// exactly (see `kind_eval.rs`'s identical helper).
+fn av_base_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+    let mut key = partition_token(&animus_item::storage_key(pk, None)).to_vec();
+    key.extend_from_slice(&animus_item::storage_key(pk, sk));
+    key
+}
+
+fn schema_with_lsi() -> WriteSchema {
+    WriteSchema {
+        key: TableSchema::simple("pk"),
+        lsis: vec![LsiDef {
+            name: "byAge".to_owned(),
+            sort_attribute: "age".to_owned(),
+            projection: Projection::All,
+        }],
+        change_records_carry_images: true,
+    }
+}
+
+/// Stage `pending` as a fresh anchor transaction and return its
+/// `(txn_id, record_key, outcome)` — panics if the stage propose itself
+/// never even applies (a routing/leadership failure, not a real scenario
+/// here: every test in this section runs a single-voter whole-range group).
+fn stage_pending(
+    sim: &mut Simulator,
+    node: &KvNode,
+    key: Vec<u8>,
+    pending: PendingTxnWrite,
+    seed: u64,
+) -> (animus_cp_data::TxnId, Vec<u8>, animus_cp_data::StageOutcome) {
+    let write = TxnWrite::pending_eval(key, None, pending);
+    let n = node.clone();
+    drive(sim, node.env(), SETTLE, async move {
+        n.txn_stage_anchor(TABLE, vec![write], Vec::new(), Vec::new())
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("txn_stage_anchor did not complete (seed={seed})"))
+}
+
+/// Commit-then-resolve `txn_id`/`record_key` at `key` — the ordinary
+/// success path every pending-eval scenario below drives once it wants the
+/// staged intent materialized.
+fn commit_and_resolve(
+    sim: &mut Simulator,
+    node: &KvNode,
+    txn_id: animus_cp_data::TxnId,
+    record_key: Vec<u8>,
+    key: Vec<u8>,
+    seed: u64,
+) {
+    let n = node.clone();
+    let (txn_id_c, record_key_c) = (txn_id.clone(), record_key.clone());
+    let commit_ts = drive(sim, node.env(), SETTLE, async move {
+        n.txn_commit_at_least(txn_id_c, record_key_c, txn_id.ts)
+            .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("commit did not complete (seed={seed})"));
+    let n = node.clone();
+    drive(sim, node.env(), SETTLE, async move {
+        n.txn_resolve(
+            txn_id,
+            record_key,
+            vec![key],
+            TxnOutcome::Committed { commit_ts },
+        )
+        .await
+    })
+    .flatten()
+    .unwrap_or_else(|| panic!("resolve did not complete (seed={seed})"));
+}
+
+/// A pending write's own evaluation, once resolved, derives exactly the
+/// same base/LSI/change-record rows `KvCommand::KindEval`'s identical
+/// evaluator (`kind_eval.rs`'s own differential test) derives for the
+/// identical operation — the whole point of sharing one evaluator core.
+#[test]
+fn pending_eval_stage_resolves_to_the_same_rows_kind_eval_would_derive() {
+    let seed = 0x0054_0401;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let schema = schema_with_lsi();
+    let pk = s("henry");
+    let new = av_item(&[("pk", pk.clone()), ("age", n("40"))]);
+    let key = av_base_key(&pk, None);
+
+    let (txn_id, record_key, outcome) = stage_pending(
+        &mut sim,
+        &node,
+        key.clone(),
+        PendingTxnWrite {
+            schema: schema.clone(),
+            pk: pk.clone(),
+            sk: None,
+            op: KindEvalOp::Put(new.clone()),
+            condition: None,
+            ttl_expired: false,
+        },
+        seed,
+    );
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged, "seed={seed}");
+    // Before resolve: the intent stands, no LSI row yet (materialize-at-
+    // resolve, ADR 0046 Decision 2).
+    assert_eq!(
+        block_on(node.local_get_kind(KIND_LSI, &av_base_key(&pk, Some(&n("40"))))),
+        None,
+        "no kind scope may be touched before resolve (seed={seed})"
+    );
+
+    commit_and_resolve(&mut sim, &node, txn_id, record_key, key.clone(), seed);
+
+    let expected = animus_item::derive_kind_writes(
+        &schema,
+        &pk,
+        None,
+        &partition_token(&animus_item::storage_key(&pk, None)),
+        encode_stored_item(&new),
+        None,
+        Some(&new),
+        false,
+        KIND_BASE,
+        KIND_LSI,
+    );
+    for (kind, k, v) in &expected.writes {
+        assert_eq!(
+            block_on(node.local_get_kind(*kind, k)),
+            *v,
+            "kind {kind} row must match the same evaluator's own direct derivation (seed={seed})"
+        );
+    }
+    assert_eq!(
+        block_on(node.local_get(&key)),
+        Some(encode_stored_item(&new)),
+        "seed={seed}"
+    );
+}
+
+/// A pending write's own condition evaluating false rejects the WHOLE
+/// stage (`StageOutcome::ConditionFailed`) and stages nothing — the
+/// transactional mirror of `kind_eval.rs`'s
+/// `a_false_condition_leaves_every_row_untouched_on_every_replica`.
+#[test]
+fn pending_eval_stage_with_a_false_condition_records_condition_failed_and_stages_nothing() {
+    let seed = 0x0054_0402;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let schema = schema_with_lsi();
+    let pk = s("iris");
+    let key = av_base_key(&pk, None);
+    let original = av_item(&[("pk", pk.clone()), ("age", n("21"))]);
+
+    // Seed the committed starting state directly (no evaluation needed —
+    // this is a hand-built `KindBatch`, mirroring `kind_eval.rs`'s own
+    // seeding step).
+    assert!(matches!(
+        node.put_kind_batch(
+            vec![(KIND_BASE, key.clone(), Some(encode_stored_item(&original)))],
+            Vec::new(),
+        ),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    let false_condition = ConditionExpression::Compare("age".to_owned(), Comparator::Eq, n("999"));
+    let (_txn_id, _record_key, outcome) = stage_pending(
+        &mut sim,
+        &node,
+        key.clone(),
+        PendingTxnWrite {
+            schema,
+            pk: pk.clone(),
+            sk: None,
+            op: KindEvalOp::Update {
+                key_item: av_item(&[("pk", pk.clone())]),
+                actions: vec![UpdateAction::Set(
+                    vec![PathSegment::Field("age".to_owned())],
+                    animus_item::UpdateExpr::value(n("999")),
+                )],
+            },
+            condition: Some(false_condition),
+            ttl_expired: false,
+        },
+        seed,
+    );
+    match outcome {
+        animus_cp_data::StageOutcome::ConditionFailed { key: k } => assert_eq!(k, key),
+        other => panic!("expected ConditionFailed, got {other:?} (seed={seed})"),
+    }
+    assert_eq!(
+        block_on(node.local_get(&key)),
+        Some(encode_stored_item(&original)),
+        "the row must be unchanged by the rejected write (seed={seed})"
+    );
+}
+
+/// A `KvCommand::KindEval` racing a still-unresolved pending stage on the
+/// SAME key sees the foreign intent and reports `ConditionFailed`
+/// (`KvCommand::KindEval`'s own foreign-intent discipline, `kind_eval.rs`'s
+/// module doc) — never guessing at "the current committed value." Once the
+/// transaction resolves, an identical `KindEval` on the same key succeeds.
+#[test]
+fn a_kind_eval_racing_a_still_unresolved_pending_stage_gets_condition_failed_then_succeeds_after_resolve()
+ {
+    let seed = 0x0054_0403;
+    let (mut sim, node) = group(seed);
+    sim.run_for(ELECT);
+
+    let schema = schema_with_lsi();
+    let pk = s("jack");
+    let key = av_base_key(&pk, None);
+    let staged_item = av_item(&[("pk", pk.clone()), ("age", n("50"))]);
+
+    let (txn_id, record_key, outcome) = stage_pending(
+        &mut sim,
+        &node,
+        key.clone(),
+        PendingTxnWrite {
+            schema: schema.clone(),
+            pk: pk.clone(),
+            sk: None,
+            op: KindEvalOp::Put(staged_item.clone()),
+            condition: None,
+            ttl_expired: false,
+        },
+        seed,
+    );
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged, "seed={seed}");
+
+    // A racing `KindEval` on the same key, while the stage is still
+    // unresolved.
+    let other_item = av_item(&[("pk", pk.clone()), ("age", n("51"))]);
+    match node.propose_kind_eval(
+        schema.clone(),
+        pk.clone(),
+        None,
+        KindEvalOp::Put(other_item.clone()),
+        None,
+        false,
+    ) {
+        animus_control::ProposeResult::Accepted { index, .. } => {
+            sim.run_for(SETTLE);
+            match node.kind_batch_outcome(index) {
+                Some((_, KindBatchOutcome::ConditionFailed { key: k })) => assert_eq!(k, key),
+                other => panic!(
+                    "expected ConditionFailed against the unresolved intent, got {other:?} \
+                     (seed={seed})"
+                ),
+            }
+        }
+        other => panic!("KindEval propose rejected: {other:?} (seed={seed})"),
+    }
+    // The foreign write never landed.
+    assert_ne!(
+        block_on(node.local_get(&key)),
+        Some(encode_stored_item(&other_item)),
+        "seed={seed}"
+    );
+
+    commit_and_resolve(&mut sim, &node, txn_id, record_key, key.clone(), seed);
+    assert_eq!(
+        block_on(node.local_get(&key)),
+        Some(encode_stored_item(&staged_item)),
+        "the transaction's own value must have landed (seed={seed})"
+    );
+
+    // Now a fresh `KindEval` on the same key succeeds cleanly.
+    match node.propose_kind_eval(
+        schema,
+        pk,
+        None,
+        KindEvalOp::Put(other_item.clone()),
+        None,
+        false,
+    ) {
+        animus_control::ProposeResult::Accepted { index, .. } => {
+            sim.run_for(SETTLE);
+            assert_eq!(
+                node.kind_batch_outcome(index).map(|(_, o)| o),
+                Some(KindBatchOutcome::Applied),
+                "seed={seed}"
+            );
+        }
+        other => panic!("KindEval propose rejected: {other:?} (seed={seed})"),
+    }
+    assert_eq!(
+        block_on(node.local_get(&key)),
+        Some(encode_stored_item(&other_item))
+    );
+}
+
+/// **Same-txn WAL replay must not double-apply a non-idempotent update.**
+/// A pending `ADD` stage's own intent, once merged, sits on the base key;
+/// if this crate's driver ever replays the `TxnStage` entry a second time
+/// against a still-intact engine (the ordinary "no compaction has run yet,
+/// so the persisted applied watermark is behind the log" restart shape —
+/// see `leader_kill_between_stage_and_resolve_recovers_from_the_intent_alone`'s
+/// identical restart discipline just above), re-evaluating `op` against
+/// "the current value" would read the intent's own already-computed new
+/// value as if it were the pre-stage baseline and double-add. The apply
+/// arm's same-txn-replay branch (`TxnWrite::pending`'s own doc) exists
+/// precisely to make this a no-op instead: reuse the intent's own already-
+/// computed payload verbatim rather than re-evaluating against it.
+#[test]
+fn pending_add_stage_survives_a_same_engine_restart_without_double_applying() {
+    let seed = 0x0054_0404;
+    let mut sim = Simulator::new(seed);
+    let engine = MemoryEngine::new();
+    let id = nid(0);
+    let node: KvNode = RaftKvNode::start_scoped(
+        sim.env(id.clone()),
+        vec![id.clone()],
+        engine.clone(),
+        StorageScope::new(KeyRange::whole()),
+    );
+    sim.run_for(ELECT);
+
+    let schema = schema_with_lsi();
+    let pk = s("karl");
+    let key = av_base_key(&pk, None);
+    let seed_item = av_item(&[("pk", pk.clone()), ("age", n("10"))]);
+    assert!(matches!(
+        node.put_kind_batch(
+            vec![(KIND_BASE, key.clone(), Some(encode_stored_item(&seed_item)))],
+            Vec::new(),
+        ),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    sim.run_for(SETTLE);
+
+    let (txn_id, record_key, outcome) = stage_pending(
+        &mut sim,
+        &node,
+        key.clone(),
+        PendingTxnWrite {
+            schema,
+            pk: pk.clone(),
+            sk: None,
+            op: KindEvalOp::Update {
+                key_item: av_item(&[("pk", pk.clone())]),
+                actions: vec![UpdateAction::Add(
+                    vec![PathSegment::Field("age".to_owned())],
+                    n("5"),
+                )],
+            },
+            condition: None,
+            ttl_expired: false,
+        },
+        seed,
+    );
+    assert_eq!(outcome, animus_cp_data::StageOutcome::Staged, "seed={seed}");
+
+    // A genuine restart over the SAME (intact) engine — no compaction has
+    // run, so this replays the stage entry again from the WAL, exactly as
+    // the pre-existing sibling test above documents.
+    sim.stop(id.clone());
+    let restarted: KvNode = RaftKvNode::start_scoped(
+        sim.env(id.clone()),
+        vec![id.clone()],
+        engine.clone(),
+        StorageScope::new(KeyRange::whole()),
+    );
+    sim.run_for(ELECT);
+
+    commit_and_resolve(&mut sim, &restarted, txn_id, record_key, key.clone(), seed);
+
+    let final_item = block_on(restarted.local_get(&key))
+        .and_then(|bytes| decode_stored_item(&bytes).expect("decode"))
+        .unwrap_or_else(|| panic!("row must exist (seed={seed})"));
+    assert_eq!(
+        final_item.get("age"),
+        Some(&n("15")),
+        "age must be exactly 10+5 once — a replayed re-evaluation against the intent's own \
+         already-computed value would double-add to 20 (seed={seed})"
     );
 }

@@ -229,11 +229,7 @@ fn write_pre_existing_row(
     seed: u64,
 ) {
     let key = base_key(pk);
-    let result = node.put_kind_batch_conditioned(
-        vec![(KIND_BASE, key, Some(b"v".to_vec()))],
-        Vec::new(),
-        Vec::new(),
-    );
+    let result = node.put_kind_batch(vec![(KIND_BASE, key, Some(b"v".to_vec()))], Vec::new());
     propose_confirmed(sim, node, seed, result);
 }
 
@@ -254,10 +250,9 @@ fn write_base_row_live(sim: &mut Simulator, node: &KvNode, _range: &KeyRange, pk
         ttl_expired: false,
     }
     .encode();
-    let result = node.put_kind_batch_conditioned(
+    let result = node.put_kind_batch(
         vec![(KIND_BASE, key.clone(), Some(b"v".to_vec()))],
         vec![(key, record)],
-        Vec::new(),
     );
     propose_confirmed(sim, node, seed, result);
 }
@@ -314,8 +309,7 @@ fn backfill_seed_tick(
             ttl_expired: false,
         }
         .encode();
-        let result =
-            node.put_kind_batch_conditioned(Vec::new(), vec![(prefix.clone(), record)], Vec::new());
+        let result = node.put_kind_batch(Vec::new(), vec![(prefix.clone(), record)]);
         propose_confirmed(sim, node, seed, result);
         scan_start = dynamo_index::range_end(&prefix);
         last_seeded = Some(prefix);
@@ -335,9 +329,8 @@ fn backfill_seed_tick(
         // cursor row's identity is already fully captured by its own tag
         // plus range-start, disjoint from base data by row kind, and needs
         // no range-fencing at all).
-        let result = node.put_kind_batch_conditioned(
+        let result = node.put_kind_batch(
             vec![(KIND_CURSOR, cursor_key_bytes, Some(cursor_val))],
-            Vec::new(),
             Vec::new(),
         );
         propose_confirmed(sim, node, seed, result);

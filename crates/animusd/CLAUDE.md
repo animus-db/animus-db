@@ -73,7 +73,8 @@ symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach — e.g. `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
-`CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_local`; `split_fence_tests`
+`CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_eval_local` (retargeted
+from the now-deleted `cp_kind_local`, ADR 0054 step 4b); `split_fence_tests`
 and `hot_read_latch_tests` were deleted with their fence/latch subjects in
 the ADR 0050 Train B rung-7 sweep). `kind_batch_signal_tests` is the newest
 of these, but for a different reason than the others — it needs no bring-up
@@ -665,8 +666,9 @@ reusing the captured config is the point of the test.
   voters) reclaims stream segments correctly with no data-role node ever
   needing to take the lead. `segment_store`/`backup_store` moved off
   `DataRole` onto `ClientCtx` itself for this — `DataRole` now holds only
-  genuinely data-role-specific fields (`rmw_lock`, `raftkv_metrics`,
-  `base_id`, `stream_seal_knobs`, `change_rates`); `ClientCtx::data()`
+  genuinely data-role-specific fields (`raftkv_metrics`, `base_id`,
+  `stream_seal_knobs`, `change_rates` — `rmw_lock` itself was later
+  deleted outright, ADR 0054 step 4b); `ClientCtx::data()`
   (panicking) survives for those, but `data_opt()` (the non-panicking
   accessor this module used to be the sole caller of) was deleted as dead
   code. Regression: `tests/stream_janitor.rs::
@@ -1548,7 +1550,11 @@ marker per mutation, full-raw-key-as-prefix; `Put`/`PutBatch` auto-provision
 like the old `cp_put` did, `Delete` deliberately never does).
 
 **`poll_probe` is the shared durable-before-ack confirm wait behind
-`cp_kind_local`/`cp_batch_local`** — it prefers `animus-cp-data`'s
+`cp_batch_local`** (its other caller, the now-deleted `cp_kind_local`,
+went with ADR 0054 step 4b; `cp_kind_eval_local`'s own confirm loop
+consults `classify_kind_batch_outcome` directly rather than going through
+`poll_probe` at all — see that method's own doc) — it prefers
+`animus-cp-data`'s
 per-`KindBatch` apply-time outcome (`RaftKvNode::kind_batch_outcome`) over a
 raw value re-read, since value equality alone can't distinguish "my entry
 no-op'd" from "my entry applied and a concurrent write then overwrote it"
@@ -1578,22 +1584,29 @@ used to fall back to plain value equality — "does the key already hold the
 bytes I proposed?" — at both sites in its loop, unconditionally. That fallback
 proves the bytes are *visible*, never that *this proposer's entry* put them
 there, and for a **non-idempotent** write (a numeric `ADD`) that distinction
-is load-bearing, not academic: `kind_write_item_at_leader` reads `old` under
-`ctx.data().rmw_lock`, which is released *before* proposing (issue #285), so
-two concurrent evaluators of the same key can read the identical stale `old`
+was load-bearing, not academic — this bug was found on the pre-ADR-0054
+leader-evaluated design, where `kind_write_item_at_leader` read `old` under
+`ctx.data().rmw_lock` (released *before* proposing, issue #285), so two
+concurrent evaluators of the same key could read the identical stale `old`
 and compute byte-identical `new` (a pure function of `(cur, delta)`) —
-nothing downstream disambiguates them. Each proposes an entry carrying those
+nothing downstream disambiguated them. Each proposed an entry carrying those
 same bytes guarded by an own-key OCC seatbelt keyed to that same stale `old`;
-the first to apply wins the seatbelt and writes the bytes, every later one
-legitimately `ConditionFailed`s. In the window after the winner's bytes are
-visible and before a *loser* entry's own outcome is recorded, the old
+the first to apply won the seatbelt and wrote the bytes, every later one
+legitimately `ConditionFailed`ed. In the window after the winner's bytes were
+visible and before a *loser* entry's own outcome was recorded, the old
 ungated fallback matched on value alone and returned `Confirmed` for the
 loser — acking an increment that never applied. Fixed by threading
 `ProbeIdentity` (`ValueProves`/`RequiresOwnEntry`) down from whichever caller
-already knows `dynamo::kind_write_is_idempotent`'s answer
-(`kind_write_item_at_leader` for `cp_kind_local`; `cp_batch_local` hardcodes
-`ValueProves` since the raw `Batch` command only ever carries Put semantics,
-never `ADD`) — `poll_probe` never recomputes idempotency itself. A
+already knows `dynamo::kind_write_is_idempotent`'s answer; `cp_batch_local`
+hardcodes `ValueProves` since the raw `Batch` command only ever carries Put
+semantics, never `ADD` — `poll_probe` never recomputes idempotency itself.
+**`ProbeIdentity` outlived the mechanism it was built for**: ADR 0054
+deleted `cp_kind_local`/`rmw_lock` and the leader-side read entirely, but
+the same enum now gates `cp_kind_eval_local`'s own, analogous lost-payload
+recovery (`kind_eval_confirmed`, `write_path.rs`) — whether a best-effort
+re-read can stand in for a leader-local `old`/`new` slot that aged out from
+under an unusually slow confirm; `kind_write_item_at_leader` still passes
+the identical `kind_write_is_idempotent`-derived identity into that call. A
 non-idempotent write's `Inconclusive` branch now never consults `local_get`
 at all, at either site; it keeps polling `classify_kind_batch_outcome` for
 its own (index, term) until that resolves or the deadline ends the wait in
@@ -2128,11 +2141,16 @@ no longer rejects it. `TxnTableWrite` carries either an already-known
 kind-write-path table's write: the item identity + op + condition, no
 coordinator-computed diff). `ClientCtx::txn_stage_local` — the ONE place a
 stage actually executes on the leader's own node, shared by `txn_prepare`'s
-own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — evaluates
-every `pending_kind_writes` entry there (`dynamo::eval_kind_txn_write`,
-mirroring `kind_write_item_at_leader`'s own U3 shape) under the identical
-`ctx.data().rmw_lock`, merging the result into `writes` immediately before
-staging; a mandatory own-key OCC condition rides alongside (Fork C1). For a
+own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — turns every
+`pending_kind_writes` entry into a self-contained `TxnWrite::pending`
+payload there, with no read/evaluation at all (ADR 0054 step 4a,
+2026-09-05): `KvCommand::TxnStage`'s own apply arm evaluates every
+pending write itself, in commit order, reusing the identical evaluator
+`KvCommand::KindEval` uses. `dynamo::eval_kind_txn_write` — the original
+leader-side evaluator this producer called under `ctx.data().rmw_lock`
+before that step, plus the mandatory own-key OCC condition (ADR 0046
+Fork C1) it used to build alongside — is deleted outright; see ADR 0054's
+step 4a as-built amendment for the full design. For a
 transaction touching any kind-write-path table, `cp_txn`'s post-commit
 resolve is **awaited under a short bounded budget**
 (`TXN_RESOLVE_ALL_AWAIT_BUDGET`) and parallelized across participants
@@ -2598,79 +2616,63 @@ route below the edge through the same `ClientCtx` CP primitives.
   bookkeeping, never index entries (there is no in-memory index at all). An
   indexed/streamed table's `PutItem`/`DeleteItem`/`UpdateItem` commits the
   base row, its **LSI rows** and a **change-log record** as one
-  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — but the *diff*
-  is now evaluated **at the tablet's own leader**, not at the receiving edge
-  node: `ClientCtx::cp_kind_write_item` routes a `ClientRequest::
-  KindWriteItem { table, pk, sk, op: KindWriteOp, condition }` to the leader
-  (in-process if local, one forwarded hop via `cp_serve_forwarded` if not),
-  and `dynamo::kind_write_item_at_leader` — the only caller of
-  `kind_writes_for_item` — reads its own `old` image, evaluates `condition`,
-  computes `new` from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the
-  last folding `UpdateItem`'s base-value RMW into the same mechanism), then
-  proposes. **This is the ADR 0046 ("the tablet log model", draft PR #222)
-  U3 fix**: `index_aware_write`'s prior edge-evaluated design (now deleted)
-  read/diffed under a **node-local** `ctx.data().rmw_lock`, so two edge
-  nodes writing the same item never contended on the same lock and could
-  both diff against the same stale `old` — the loser's stale LSI row
-  orphaned forever (nothing reconciles it; only the GSI drain self-heals).
-  Locking `rmw_lock` **at the leader** instead serializes every write of one
-  item regardless of which edge node received it, since every write now
-  funnels through the same function on the same node. A `KindBatch.
-  conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
-  the lock alone can't: a `txn_resolver_loop` recovery push never takes
-  `rmw_lock` — real now that `TransactWriteItems` participates on these
-  tables too (see below). **`rmw_lock` is scoped to read+evaluate only
-  (issue #285)** — `kind_write_item_at_leader` drops it before proposing,
-  mirroring `txn_stage_local`'s identical scoping just below; it used to
-  span the whole `cp_kind_local` propose+confirm-poll too, so one item's
-  slow confirm (apply backlog) stalled every *other* evaluated write on the
-  node behind it, not just racing writers of the same item — the seatbelt
-  above is what actually keeps concurrent writers of one item safe, and it
-  already has to work lock-free for the `txn_resolver_loop` case, so the
-  lock never needed the wider span for correctness. The regression test for
-  this (`confirm_futility_tests::an_unrelated_evaluated_write_is_not_
-  stalled_behind_another_writes_confirm_wait`) needs write A's propose+
-  confirm phase to reliably still be running when an unrelated write
-  returns — racing a real apply backlog against real time to manufacture
-  that was itself load-sensitive (a starved flood can fail to build any
-  backlog, so the "slow" write finishes first; see
-  `docs/engineering-lessons.md`'s Testing section, 2026-08-22 entry), so it
-  now uses `dynamo::rmw285_confirm_gate`, a `#[cfg(test)]`-only hook that
-  holds that phase open for a fixed delay under the test's own control.
-
-  **ADR 0054 step 3 cut the write itself over to apply-time evaluation —
-  everything in this bullet above describes the pre-step-3 design, kept
-  here because step 4 (deleting `rmw_lock`/the seatbelt outright) hasn't
-  landed yet.** `kind_write_item_at_leader` no longer computes the write's
-  finished bytes at all: it builds the `WriteSchema` slice
+  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — with the
+  *diff* evaluated **inside `KvCommand::KindEval`'s own apply arm, in
+  commit order** (ADR 0054, Accepted): `ClientCtx::cp_kind_write_item`
+  routes a `ClientRequest::KindWriteItem { table, pk, sk, op: KindWriteOp,
+  condition }` to the item's tablet leader (in-process if local, one
+  forwarded hop via `cp_serve_forwarded` if not), and
+  `dynamo::kind_write_item_at_leader` builds the `WriteSchema` slice
   (`write_schema_for`) and a `KindEvalOp` mirror of the client's operation,
-  then proposes a self-contained `KvCommand::KindEval`
-  (`ClientCtx::cp_kind_eval_local`, `write_path.rs` — `cp_kind_local`'s
-  sibling) and reads back the **apply-side** confirmed decision — apply
-  evaluates `condition`/`op` against the current committed value in commit
-  order, so two evaluators of one key no longer race a stale before-image
-  (the exact defect the `index_aware_write`→leader-evaluated fix above
-  never closed for concurrent evaluators of the identical key, only for
-  evaluators on different nodes). The read+evaluate this bullet describes
-  (`rmw_lock`, `cp_get_local_resolving`, the condition/op evaluation) is
-  **still performed**, but now purely as a double-check
-  (`predict_kind_eval_decision`/`report_kind_eval_seatbelt_mismatch`)
-  compared against apply's own outcome — never as the source of the
-  client-visible result, and never failing the request on a disagreement
-  (see `Metric::KindEvalSeatbeltMismatch`'s own doc in `animus-env` for the
-  two disagreement directions and which one is a bug). The `KindBatch.
-  conditions` OCC seatbelt this bullet describes is **no longer proposed
-  for a single-item write** — `KvCommand::KindEval` carries no byte-level
-  seatbelt at all, since apply's own fresh read already is the
-  authoritative current state. `TransactWriteItems`
-  (`eval_kind_txn_write`/`txn_stage_local`) is the one write path this step
-  did **not** move — it still evaluates at the leader and proposes
-  `KindBatch` with the OCC seatbelt exactly as this bullet describes; ADR
-  0054 step 4 moves it and deletes `rmw_lock`/the seatbelt/the mismatch
-  metric entirely. See ADR 0054's own step-3 as-built amendment for the
-  full design, the flipped `concurrent_increments_all_land_exactly_once`
-  regression (now zero refusals, not "2 of 10 is correct"), and the
-  before/after benchmark numbers.
+  proposes a self-contained `KvCommand::KindEval`
+  (`ClientCtx::cp_kind_eval_local`, `write_path.rs`), and reads back the
+  **apply-side** confirmed decision. Apply itself — not the leader — reads
+  the item's current committed value, evaluates `condition`, computes `new`
+  from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the last folding
+  `UpdateItem`'s base-value RMW into the same mechanism), and derives the
+  LSI diff and change record (`kind_writes_for_item`'s own logic, now
+  called from apply rather than the leader), all against **the same fresh
+  read that decides the write**, so no before-image can ever go stale
+  between being read and being applied.
+
+  **This closes the propose→apply staleness window two earlier designs each
+  left open, one after the other** — see ADR 0054 for the full account of
+  both and why each was a real, measured defect, not a theoretical one:
+  the original edge-evaluated design (`index_aware_write`, deleted by ADR
+  0046) diffed under a node-local lock two different edge nodes never
+  shared, so two nodes writing the same item could both diff against the
+  same stale `old`; the leader-evaluated design that replaced it (ADR 0046
+  U3) closed that by serializing every write of one item on its own
+  tablet's leader, but still computed the finished bytes **before** the
+  log, guarded only by a byte-level OCC seatbelt
+  (`KvCommand::KindBatch.conditions`) that made a losing write a hard
+  refusal rather than a race the leader could resolve — measured at 2 of
+  10 concurrent `ADD`s refused under a starved apply task (ADR 0054's own
+  Context section). **Neither `rmw_lock`, the OCC seatbelt, nor a
+  leader-side read of any kind survive in this path today** (ADR 0054 step
+  4b, 2026-09-05) — `KvCommand::KindEval` carries no byte-level seatbelt at
+  all, since apply's own fresh read already is the authoritative current
+  state, and `DataRole` no longer has an `rmw_lock` field for anything to
+  take. See ADR 0054's Decision/Sequencing sections and its closing
+  amendment for the full design, every deleted mechanism (`predict_kind_
+  eval_decision`, `Metric::KindEvalSeatbeltMismatch`, `cp_kind_local`, and
+  more), and the `concurrent_increments_all_land_exactly_once`/
+  `concurrent_conditional_add_all_land_exactly_once` regressions
+  (`dynamo_update_add_delete.rs`) that prove zero refusals under contention.
+
+  **`TransactWriteItems` evaluates the identical way (ADR 0054 step 4a)** —
+  `ClientCtx::txn_stage_local` builds a self-contained `TxnWrite::pending`
+  payload (the schema slice, `pk`/`sk`/`op`/`condition`, no `ts` — the
+  enclosing stage entry supplies one) and appends it unevaluated, with no
+  read or lock of its own; `KvCommand::TxnStage`'s own apply arm evaluates
+  every pending write in commit order, reusing the identical
+  `evaluate_kind_eval` core `KvCommand::KindEval` uses — no second
+  evaluator, and no mandatory own-key OCC `conditions` entry for these
+  writes either, for the identical reason the single-item path needs none.
+  See ADR 0054's step-4a amendment for the full design, including the
+  same-txn WAL-replay discipline a non-idempotent `ADD` needs when a
+  transaction's own already-staged intent can be re-observed as "current
+  state" on an ordinary crash restart.
 
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
@@ -3391,7 +3393,8 @@ route below the edge through the same `ClientCtx` CP primitives.
   hosted CP group handles (keyed by tablet), and the DynamoDB `SchemaRegistry`.
   No process-global (`OnceLock`) mutable state.
 - **`ClientCtx.data: Option<DataRole>`** groups the data-role-only fields
-  (`rmw_lock`, `raftkv_metrics`, `base_id`). `ClientCtx::data()` **panics** if
+  (`raftkv_metrics`, `base_id` — `rmw_lock` was deleted, ADR 0054 step
+  4b). `ClientCtx::data()` **panics** if
   absent — safe only from paths that structurally can't run on a control-only node
   (the dynamo edge, `auto_split_loop`). `resolve_cp_route` must never panic — it
   matches `self.data.as_ref()` directly (control-only node ⇒ zero local replicas).
@@ -4005,7 +4008,8 @@ incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the `pub(crate)`
-`ClientCtx::cp_kind_local`) that no external `tests/` file can reach;
+`ClientCtx::cp_kind_eval_local`, retargeted from the now-deleted
+`cp_kind_local`, ADR 0054 step 4b) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private

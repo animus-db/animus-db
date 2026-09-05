@@ -197,23 +197,6 @@ the still-true paragraph after the table.
 
 ## 3. Core design items still proposed
 
-### C-01 Evaluate writes at apply (ADR 0054)
-
-- **Gap:** `rmw_lock` and evaluate-at-leader remain
-  (`dynamo.rs:3154,5760`, `txn_coordinator.rs:57`, `lib.rs:6218`);
-  contention-induced write refusals persist.
-- **Plan:** follow ADR 0054's Decision and Sequencing sections: a
-  self-contained entry evaluated in the `KindBatch` apply arm of
-  `animus-cp-data`, results returned via a leader-local payload; keep the
-  leader seatbelt as a double-check for one PR; then remove `rmw_lock` and
-  the OCC precondition machinery.
-- **Tests:** flip the concurrent-increment regression ADR 0054 cites;
-  `animus-cp-data` apply-path sims; run C-04's `SimCluster` corpus first.
-- **ADR:** none new; flip 0054 to Accepted on landing.
-- **PRs:** (1) entry shape + apply-side single-item; (2) ADD/conditional
-  cutover; (3) remove `rmw_lock`. **Size:** L. Land in isolation from the
-  listener work in S-01.
-
 ### C-02 Heartbeat amortization (ADR 0044 phase 2)
 
 - **Plan:** a per-node-pair heartbeat batcher below each `RaftCore` tick
@@ -368,7 +351,7 @@ wave are independent and can run in parallel.
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
 | 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
 | 3 | W-09, U-05, U-07, U-08(ii) | U-05 after its members panel |
-| 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
+| 4 | S-01, S-02, W-08 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
 
