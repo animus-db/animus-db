@@ -133,7 +133,7 @@ use animus_storage::{
 use animus_tablet::{KeyRange, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 // Pure CP-topology decision logic (routing predicates), extracted into
@@ -9040,12 +9040,55 @@ async fn serve_requests(listener_socket: TcpListener, ctx: ClientCtx, listener: 
     }
 }
 
+/// Wait for the peer to close (or error on) its connection while we are not
+/// otherwise reading from it (issue #596) — **without disturbing any bytes
+/// it has already written**.
+///
+/// Peeks at `read_half` (`OwnedReadHalf::peek`, which never consumes what it
+/// sees) rather than reading it. An `Ok(0)` peek is a clean EOF and an `Err`
+/// is a transport error; either means the peer is definitely gone, so this
+/// resolves. An `Ok(n)` with `n > 0` means the peer is alive and has simply
+/// written more bytes before reading this request's reply — a pipelined next
+/// frame, which the client protocol this seam serves
+/// (`ClientRequest`/`ClientResponse`, ADR 0047's two listeners) does not
+/// forbid even though no client in this repo happens to do it today. That is
+/// not abandonment, so this future must not resolve on it: consuming that
+/// byte here (a plain `read` did, in an earlier version of this function)
+/// would silently eat the start of the next frame and the enclosing
+/// `select!` in [`handle_connection`] would drop the *current* response on
+/// the floor even though the peer was still there waiting for it. Instead it
+/// parks forever via [`std::future::pending`] — registers no waker, costs
+/// nothing to hold — so the `select!` falls through to the handler's own
+/// completion, and the next loop iteration's `read_frame` consumes that
+/// pipelined frame the normal way. Never loops on `peek` itself to wait out
+/// the close either: that would busy-spin the task for as long as the
+/// connection stays open.
+///
+/// Never returns `Err` to its caller — a read error IS the signal this
+/// function exists to produce, not a failure of the function itself.
+async fn peer_closed(read_half: &mut tokio::net::tcp::OwnedReadHalf) {
+    let mut scratch = [0u8; 1];
+    match read_half.peek(&mut scratch).await {
+        Ok(0) | Err(_) => {}
+        Ok(_) => std::future::pending::<()>().await,
+    }
+}
+
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     ctx: ClientCtx,
     listener: ListenerKind,
 ) -> std::io::Result<()> {
-    while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
+    // Split so the read half can be raced against the in-flight handler
+    // (issue #596) while the write half stays free for the eventual reply —
+    // `read_frame`/`write_frame` are generic over `AsyncRead`/`AsyncWrite`
+    // precisely so the two owned halves work here without their own
+    // special-cased framing.
+    let (mut read_half, mut write_half) = stream.into_split();
+    loop {
+        let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
+            return Ok(());
+        };
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
         // handling ends up forwarding to another node (`cp_forward`), and what
@@ -9059,12 +9102,31 @@ async fn handle_connection(
         {
             otel::set_parent_traceparent(&span, tp);
         }
-        let response = handle_request(&ctx, request, listener)
-            .instrument(span)
-            .await;
-        write_frame(&mut stream, &response).await?;
+        // Cancel an abandoned request server-side (issue #596): a forwarded
+        // hop's own confirm-wait can run for up to `CLIENT_TIMEOUT` — with
+        // nobody listening once the caller has given up (a forwarder's own
+        // `FORWARD_HOP_TIMEOUT`, or a plain client disconnect). Racing the
+        // handler against `peer_closed` lets this connection's task exit as
+        // soon as the peer is gone rather than run the handler to its full
+        // budget regardless. `biased` orders the response arm first so a
+        // handler that finishes at the same poll as the peer-close read
+        // still gets its reply written — the peer-closed arm only wins when
+        // the handler has genuinely not finished. See this crate's
+        // `CLAUDE.md` fire-and-forget-connection entry and the #596 PR
+        // description for the per-request-family cancellation-safety
+        // argument for why dropping the handler future here, at any await
+        // point, is no worse than the process crashing at that same point
+        // (which every request family already tolerates).
+        let response = tokio::select! {
+            biased;
+            response = handle_request(&ctx, request, listener).instrument(span) => response,
+            () = peer_closed(&mut read_half) => {
+                ctx.env.metrics().incr(Metric::ClientRequestsAbandoned);
+                return Ok(());
+            }
+        };
+        write_frame(&mut write_half, &response).await?;
     }
-    Ok(())
 }
 
 /// A short, closed label for `ClientRequest`'s variant — the `client_request`
@@ -10928,7 +10990,7 @@ async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<Clien
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
             write_frame(&mut stream, request).await.ok()?;
-            read_frame::<ClientResponse>(&mut stream).await.ok()?
+            read_frame::<ClientResponse, _>(&mut stream).await.ok()?
         })
         .await;
         if let Ok(Some(resp)) = reply
@@ -11442,7 +11504,7 @@ async fn relay_request_with_timeout(
     match tokio::time::timeout(timeout, async {
         let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
         write_frame(&mut stream, request).await.ok()?;
-        read_frame::<ClientResponse>(&mut stream).await.ok()?
+        read_frame::<ClientResponse, _>(&mut stream).await.ok()?
     })
     .await
     {
@@ -11514,7 +11576,16 @@ const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
 /// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
 /// receiver would drop the connection anyway — failing at the sender names the
 /// culprit instead of surfacing as a mysterious peer hang-up).
-pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
+///
+/// **Generic over `AsyncWrite + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. This is what lets
+/// [`handle_connection`] write the reply on a socket's split
+/// `OwnedWriteHalf` after racing the read half against peer-close.
+pub async fn write_frame<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &T,
+) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
     stream.write_all(&framed).await?;
     stream.flush().await?;
@@ -11534,7 +11605,13 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::
 /// Propagates read failures and decode errors; a declared length over
 /// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
 /// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
-pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
+///
+/// **Generic over `AsyncRead + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. See [`write_frame`]'s matching note.
+pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -12919,6 +12996,338 @@ mod forward_hop_timeout_tests {
         );
 
         nodes[caller].shutdown_graceful().await;
+    }
+}
+
+/// Regression for issue #596: [`handle_connection`] cancels an in-flight
+/// request server-side once the peer's connection closes, instead of
+/// running the handler to its full budget (`CLIENT_TIMEOUT`, 10s) with
+/// nobody listening. In-crate (not `tests/`) for the same reason
+/// `forward_hop_timeout_tests`/`halted_shutdown_tests` are: it needs
+/// `node.edge.local_cp` (private) to find the tablet's own CP leader so it
+/// can deliberately strand it without a commit quorum, and `node.test_ctx`
+/// (`#[cfg(test)]`-only) to read the leader's own live metrics sink
+/// directly rather than scraping `/metrics` over another socket.
+#[cfg(test)]
+mod client_cancellation_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_env::{Env, Metric};
+    use animus_tablet::TabletId;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+
+    // Hand-rolled fixture helpers, duplicated from the sibling in-crate test
+    // modules above rather than shared (see this crate's own `CLAUDE.md`,
+    // "Every in-crate bring-up retries the port-TOCTOU race").
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn cluster_config(n: usize) -> ClusterConfig {
+        let addrs = free_addrs(n * 6);
+        let nodes = (0..n)
+            .map(|i| RoleAddrs {
+                id: crate::config::node_id(i),
+                role: NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+            })
+            .collect();
+        ClusterConfig {
+            nodes,
+            dynamo_auth: None,
+            cluster_settings: None,
+        }
+    }
+
+    async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
+        for attempt in 0..16 {
+            let config = cluster_config(n);
+            let mut nodes = Vec::new();
+            let mut failed = false;
+            for i in 0..n {
+                match run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                    Ok(node) => nodes.push(node),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed {
+                return nodes;
+            }
+            for node in &nodes {
+                node.shutdown();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    }
+
+    async fn await_bootstrap(nodes: &[Node]) {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes.iter().any(Node::is_control_leader)
+                    && nodes.iter().all(|n| !n.metadata().members.is_empty())
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not bootstrap in 20s");
+    }
+
+    async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+        timeout(Duration::from_secs(40), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                crate::write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: table.to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match crate::read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 40s");
+    }
+
+    /// Bring up a 3-node RF-3 cluster, seed one tablet, kill every replica
+    /// except its own leader (so a *new* write on that leader can never
+    /// reach commit quorum and blocks server-side for the full
+    /// `CLIENT_TIMEOUT`), send a write directly to the stranded leader, and
+    /// abandon the connection ~100ms later — well before that leader could
+    /// possibly answer on its own. Asserts the `client_requests_abandoned`
+    /// counter increments on the leader far inside `CLIENT_TIMEOUT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoning_a_connection_cancels_its_stuck_write_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nodes = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        put_until_ok(nodes[0].client_addr(), "cancel596", b"seed", b"v").await;
+        let tablet: TabletId = *nodes[0]
+            .metadata()
+            .tablets_for_table("cancel596")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+
+        // RF is an eventual property (`provision_tablet` seeds a best-effort
+        // initial set, `reconcile_placement` grows it) -- poll to
+        // convergence rather than asserting the first read, exactly like
+        // `forward_hop_timeout_tests` does for the identical reason.
+        let rf_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let replicas = nodes[0]
+                .metadata()
+                .tablets
+                .get(&tablet)
+                .expect("tablet exists")
+                .replicas
+                .clone();
+            if replicas.len() == 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < rf_deadline,
+                "RF did not converge to 3 replicas: {replicas:?}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // Find which of the 3 nodes actually leads this tablet's own CP
+        // group (never assumed to be the control leader or node 0).
+        let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let leader_idx = loop {
+            if let Some(idx) = nodes.iter().position(|n| {
+                n.edge
+                    .local_cp(tablet)
+                    .is_some_and(|group| group.is_leader())
+            }) {
+                break idx;
+            }
+            assert!(
+                tokio::time::Instant::now() < leader_deadline,
+                "no node ever became this tablet's CP leader"
+            );
+            sleep(Duration::from_millis(50)).await;
+        };
+
+        // Strand the leader: kill the other two replicas so a *new*
+        // propose on the leader is durably appended locally (`Accepted`)
+        // but can never reach the 2-of-3 commit quorum it needs -- exactly
+        // the "accepted-unconfirmed, polling until CLIENT_TIMEOUT" shape
+        // `poll_probe` exists to wait out. A Raft leader does not
+        // unilaterally step down just because it cannot reach followers
+        // (nothing left alive can out-campaign it), so it keeps believing
+        // it leads for the rest of this test.
+        for (i, node) in nodes.iter().enumerate() {
+            if i != leader_idx {
+                node.shutdown();
+            }
+        }
+
+        let leader_addr = nodes[leader_idx].client_addr();
+        let before = nodes[leader_idx]
+            .test_ctx
+            .env
+            .metrics()
+            .get(Metric::ClientRequestsAbandoned);
+
+        // Send a write for a NEW key in the same (single-tablet) table
+        // straight to the now-quorum-less leader, then abandon the
+        // connection ~100ms later -- long before the leader could ever
+        // finish on its own (its only path to finishing without our help
+        // is CLIENT_TIMEOUT, 10s away).
+        let mut stream = tokio::net::TcpStream::connect(leader_addr)
+            .await
+            .expect("connect to stranded leader");
+        crate::write_frame(
+            &mut stream,
+            &ClientRequest::Put {
+                key: b"stuck-key".to_vec(),
+                value: b"v2".to_vec(),
+                table: "cancel596".to_string(),
+            },
+        )
+        .await
+        .expect("send put to stranded leader");
+        sleep(Duration::from_millis(100)).await;
+        // Abandon the connection without ever reading a reply -- exactly
+        // the scenario this mechanism exists for (a forwarder's own
+        // `FORWARD_HOP_TIMEOUT`, or a plain client disconnect).
+        stream.shutdown().await.ok();
+        drop(stream);
+
+        // 5s, not the naive "should be near-instant": this whole process can
+        // be starved of CPU for a while on a loaded, build-contended sandbox
+        // (several other agents' `cargo` invocations sharing the same 4
+        // cores), and a stall on this SAME runtime can just as easily delay
+        // this polling loop's own ticks as it delays the server's read().
+        // The bound only has to stay comfortably under the 10s
+        // `CLIENT_TIMEOUT` the stuck write would otherwise burn in full --
+        // it does not have to be tight. Mirrors `forward_hop_timeout_tests`'
+        // own generous multi-second bounds for the identical "prove this
+        // finished the fast way, not the slow way" shape under load.
+        let started = tokio::time::Instant::now();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let after = nodes[leader_idx]
+                    .test_ctx
+                    .env
+                    .metrics()
+                    .get(Metric::ClientRequestsAbandoned);
+                if after > before {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "client_requests_abandoned did not increment within 5s of the peer closing its \
+             connection -- the stuck write's handler was not cancelled",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "cancellation took {elapsed:?}, nowhere near the 10s CLIENT_TIMEOUT it must avoid \
+             paying"
+        );
+
+        nodes[leader_idx].shutdown();
+        // Only the surviving (leader) node needs a graceful wait; the other
+        // two were already hard-killed above to strand it.
+        nodes.truncate(0);
+    }
+
+    /// Regression for `peer_closed`'s own peek-vs-read distinction: a client
+    /// that pipelines a second request ahead of reading the first reply
+    /// must not be treated as having abandoned the first one. Nothing in
+    /// this repo's own clients pipelines today, but the wire protocol
+    /// itself never forbids it, and an earlier version of `peer_closed`
+    /// used a plain `read` that consumed the pipelined frame's first byte
+    /// and dropped the still-wanted first response on the floor. Writes two
+    /// `Status` requests back to back on one connection with no read in
+    /// between, then asserts both replies come back in order and
+    /// `client_requests_abandoned` never moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_requests_are_not_mistaken_for_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let before = nodes[0]
+            .test_ctx
+            .env
+            .metrics()
+            .get(Metric::ClientRequestsAbandoned);
+
+        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        // Both requests go out before either reply is read -- the exact
+        // shape `peer_closed`'s peek must tolerate.
+        crate::write_frame(&mut stream, &ClientRequest::Status)
+            .await
+            .expect("send first status request");
+        crate::write_frame(&mut stream, &ClientRequest::Status)
+            .await
+            .expect("send second, pipelined status request");
+
+        for which in ["first", "second"] {
+            match timeout(Duration::from_secs(5), crate::read_frame(&mut stream))
+                .await
+                .unwrap_or_else(|_| panic!("{which} reply did not arrive within 5s"))
+                .expect("read")
+                .unwrap_or_else(|| panic!("connection closed before the {which} reply"))
+            {
+                ClientResponse::Status { .. } => {}
+                other => panic!("unexpected {which} response: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            nodes[0]
+                .test_ctx
+                .env
+                .metrics()
+                .get(Metric::ClientRequestsAbandoned),
+            before,
+            "a pipelined second request must never be counted as an abandoned connection"
+        );
     }
 }
 

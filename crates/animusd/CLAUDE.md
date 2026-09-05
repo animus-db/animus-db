@@ -2202,6 +2202,16 @@ handler's `select! { changed(..), sleep(8s) }` always falls through to the
 timeout arm and replies with stale-but-plausible cached data up to 8s late.
 A fixed-sleep assertion right after a test's node-kill can be outrun by
 this; poll to convergence instead (see the engineering-lessons log).
+**This specific scenario is unchanged by the issue #596 cancellation**
+(see the "`handle_connection` cancels an in-flight request" entry in the
+module map above): #596 detects the *caller's* socket closing, and here
+nothing closes it — the server process being killed doesn't touch the
+already-open TCP connection or the untracked handler task sitting on it,
+so the zombie still runs its full `WATCH_METADATA_SERVER_TIMEOUT`. What
+#596 *does* fix is the more common case where the caller itself gives up
+on the connection (a client-side timeout tearing down the socket, or a
+plain disconnect) — that zombie now exits as soon as the close is
+observed instead of running the full server-side budget regardless.
 
 **`WatchMetadata`'s reply is incremental (ADR 0038).** After the long-poll
 resolves, `ClientCtx::watch_metadata` tries the serving node's own
@@ -3235,6 +3245,70 @@ route below the edge through the same `ClientCtx` CP primitives.
   hint-field-conflation finding that shaped this split, and the standing
   rule in `docs/engineering-lessons.md` (machine relay →
   `intra_leader_hint`; anything a human reads → `leader_hint`).
+- **`handle_connection` cancels an in-flight request when the peer closes the
+  connection (issue #596), on both listeners.** `serve_requests` still
+  spawns one untracked, fire-and-forget task per accepted connection (see
+  the `WatchMetadata` gotcha below for what that still doesn't fix), but
+  the per-connection loop itself no longer runs a request to completion
+  with nobody listening: `handle_connection` splits the socket
+  (`TcpStream::into_split`) once, then races `handle_request(..)` against a
+  `peer_closed(&mut read_half)` future in a `tokio::select! { biased; .. }`
+  — `biased` so a response that finishes at the same poll as the
+  peer-close observation still gets written; the peer-closed arm only wins
+  when the handler has genuinely not finished. `peer_closed` **peeks**
+  (`OwnedReadHalf::peek`, which never consumes what it sees) rather than
+  reading, and resolves on a clean EOF (`Ok(0)`) or a transport error —
+  either means the peer is definitely gone. An `Ok(n)` with `n > 0` means
+  the peer is alive and has simply written ahead of reading this request's
+  reply — a pipelined next frame, which this protocol doesn't forbid even
+  though no client in this repo happens to do it today — and that is not
+  abandonment: an earlier version of this function used a plain `read`
+  here, which consumed that byte and silently ate the start of the next
+  frame while dropping the *current* response on the floor even though the
+  peer was still waiting for it. On `Ok(n > 0)` the future instead parks
+  forever via `std::future::pending` (registers no waker, cheap to hold),
+  so `select!` falls through to the handler's own completion and the next
+  loop iteration's `read_frame` consumes the pipelined frame the normal
+  way — never loop-and-`peek` to wait out the close either, that would
+  busy-spin the task. On the peer-closed branch the in-flight response
+  future is simply dropped and the connection loop returns, incrementing
+  the `client_requests_abandoned` metric (ADR 0015, `/admin/metrics`) as
+  the observable signal.
+  `read_frame`/`write_frame` are generic over `AsyncRead`/`AsyncWrite` +
+  `Unpin` (not hardcoded to `&mut TcpStream`) precisely so the split
+  `OwnedReadHalf`/`OwnedWriteHalf` halves work here with no change to any
+  other caller's framing.
+  **Why dropping the handler future here is safe, not just convenient**:
+  every CP mutation on the client path (`schema`/`read_path`/`write_path`/
+  `txn_coordinator`/`forwarding`) already has to tolerate a mid-flight
+  **process crash** — `ProposeResult::Accepted` means "appended to the
+  local Raft log", never "committed", and every proposer already
+  distinguishes never-accepted from accepted-unconfirmed (see the root
+  `CLAUDE.md`'s durable-before-visible entry) — so an entry this node
+  already proposed keeps living in the Raft log regardless of whether
+  anything is still awaiting `poll_probe`'s confirm loop; dropping that
+  await is equivalent to the process crashing right after the propose
+  call, a case the whole design already has to handle. The one lock these
+  modules hold across an await, `ctx.data().rmw_lock`
+  (`kind_write_item_at_leader`'s/`txn_stage_local`'s read+evaluate scope,
+  narrowed off the propose+confirm path since issue #285), is a
+  `tokio::sync::Mutex` — its guard releases on drop exactly like an
+  ordinary panic unwind, never poisoning, so a cancelled holder leaves the
+  lock exactly as available as a crashed one would. `watch_metadata`'s own
+  long-poll is a pure read with no lock at all, so cancelling it is
+  strictly safe too — and is, incidentally, a genuine improvement for that
+  path's own stale-reply gotcha below, whenever the *client's* own
+  connection (not the whole server process) is what goes away. No admin/
+  dashboard/DynamoDB-wire handler is reachable through this code path —
+  those are separate HTTP listeners, out of scope for this mechanism.
+  Regression: `client_cancellation_tests` (in-crate, grep
+  `client_requests_abandoned`) — one test drives a request that blocks
+  server-side for the write path's full confirm budget, closes the client
+  socket shortly after sending, and asserts the metric increments well
+  inside that budget; a second sends two cheap requests back to back on
+  one connection with no read in between (a pipelined client) and asserts
+  both responses come back in order and the metric stays at zero — the
+  regression for `peer_closed`'s own peek-not-read distinction above.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its

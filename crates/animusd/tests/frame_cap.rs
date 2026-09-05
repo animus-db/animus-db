@@ -36,7 +36,7 @@ async fn read_frame_rejects_oversized_length_prefix() {
     client.write_all(b"junk").await.expect("write junk");
     client.flush().await.expect("flush");
 
-    let err = read_frame::<Value>(&mut server)
+    let err = read_frame::<Value, _>(&mut server)
         .await
         .expect_err("an over-cap frame must be an error, not a read");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "got: {err}");
@@ -52,7 +52,7 @@ async fn read_frame_round_trips_a_normal_frame() {
     let (mut client, mut server) = socket_pair().await;
     let msg = json!({"op": "put", "key": "k", "value": "v"});
     write_frame(&mut client, &msg).await.expect("write frame");
-    let got = read_frame::<Value>(&mut server)
+    let got = read_frame::<Value, _>(&mut server)
         .await
         .expect("read frame")
         .expect("not EOF");
