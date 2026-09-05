@@ -3195,7 +3195,16 @@ route below the edge through the same `ClientCtx` CP primitives.
   reconfigure_multi_replica_diff.rs`, and `docs/engineering-lessons.md`.
   This loop's own convergence predicate reaches `done` for a
   multi-replica-difference target exactly like a one-replica one; no
-  known gap remains.
+  known gap remains. **Issue #596**: that e2e test's own assertion that the
+  swap passes through the transient 5-voter intermediate used to sample
+  `/admin/raftkv` externally every 200ms and assert on the observed max —
+  flaky under load (a fast-enough pair of consecutive reconciler ticks can
+  remove both extras between two samples), since the intermediate's own
+  *duration* was never a guarantee, only that it is logically reached. Fixed
+  by reading `RaftKvNode::voter_history()` (`animus-cp-data`) — a durable
+  in-process record of every distinct voter configuration adopted, not an
+  external poll — instead; see that crate's `CLAUDE.md` for the mechanism
+  and `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
   **Issue #528 (this loop's own predicate never firing under sustained
   load) was root-caused and fixed entirely in `animus-control` — this
@@ -3538,6 +3547,18 @@ route below the edge through the same `ClientCtx` CP primitives.
   metering `storage_sstable_block_reads` rather than wall clock. Any new
   O(dataset) admin read needs the same question asked of it (ADR 0020's
   2026-08-19 amendment).
+- **`CpRaftView.voter_history` (issue #596)** — every distinct voter
+  configuration this replica's group has adopted, in adoption order, each
+  entry a sorted `Vec<String>` of node ids (`CpGroup::voter_history()`
+  forwarding to `RaftKvNode::voter_history()`, see `animus-cp-data/
+  CLAUDE.md`'s matching entry for the recording mechanism). A pure
+  diagnostic like `quiesced`/`learners` above — building this view never
+  wakes a quiesced group, and it costs nothing extra to poll since the
+  underlying ring is already maintained per consensus-loop iteration
+  regardless of who reads it. Exists so a caller doesn't have to reconstruct
+  a transient intermediate configuration from an external poll that can
+  race a fast reconciler shut — see `split_placing_two_replica_diff_e2e.rs`'s
+  own entry below for the incident this closes.
 - **CP writes need no client-assigned version — but the MVCC version is a
   packed HLC commit timestamp, NOT the Raft log index (stale text corrected
   2026-08-19).** ADR 0018 §2/PR2 (2026-08-11) retired the interim

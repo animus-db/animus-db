@@ -125,7 +125,7 @@ use animus_cp_data::{
     FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
     TxnOutcome, TxnRecordView,
 };
-use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, Nanos, NodeId, ProdEnv};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -1183,6 +1183,11 @@ impl<E: Env> CpGroup<E> {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
+                    voter_history: self
+                        .voter_history()
+                        .into_iter()
+                        .map(|(_, voters)| voters.into_iter().map(|id| id.to_string()).collect())
+                        .collect(),
                 }
             };
         }
@@ -1553,6 +1558,20 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.config(),
             CpGroup::Mem(n) => n.config(),
+        }
+    }
+
+    /// Every distinct voter configuration this replica has adopted, in
+    /// adoption order (issue #596) — a pure diagnostic, never a wake. See
+    /// [`RaftKvNode::voter_history`]'s doc for why this exists:
+    /// `/admin/raftkv`'s own `voter_history` field (below) is what lets a
+    /// test — or an operator — prove a transient over-replicated
+    /// intermediate genuinely occurred without racing an external poll
+    /// against how fast the reconciler happens to converge past it.
+    fn voter_history(&self) -> Vec<(Nanos, BTreeSet<NodeId>)> {
+        match self {
+            CpGroup::Lsm(n) => n.voter_history(),
+            CpGroup::Mem(n) => n.voter_history(),
         }
     }
 }

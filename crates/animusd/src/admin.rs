@@ -133,6 +133,17 @@ pub(crate) struct CpRaftView {
     /// specifically to surface that the feature is working, the operator's
     /// own diagnostic.
     pub(crate) quiesced: bool,
+    /// Every distinct voter configuration this replica has adopted, in
+    /// adoption order (issue #596) — each entry the sorted `String` node ids
+    /// of one voter set, oldest first, dropping the timestamp `RaftKvNode::
+    /// voter_history` also carries (not wire-facing here; the ordering alone
+    /// is what a caller needs). A pure diagnostic like `quiesced` above:
+    /// building this view never wakes a quiesced group. Exists so a caller
+    /// (a test, or an operator) can prove a transient over-replicated
+    /// intermediate genuinely occurred without racing an external poll
+    /// against how fast the reconciler happens to converge past it — see
+    /// `RaftKvNode::voter_history`'s doc for the full incident this closes.
+    pub(crate) voter_history: Vec<Vec<String>>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
