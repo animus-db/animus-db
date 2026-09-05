@@ -2477,7 +2477,18 @@ async fn create_table(
     // the request's declarations — so the source of truth is the committed catalog).
     // A *fresh* snapshot on purpose: the request-entry snapshot predates the schema
     // this very request just committed.
-    mirror_catalog_schema(ctx, &metadata_fresh(ctx).await, table);
+    let final_meta = metadata_fresh(ctx).await;
+    mirror_catalog_schema(ctx, &final_meta, table);
+    // ADR 0065 §5(b): this node just committed a table with `throughput`
+    // set (if any) — recompute `ClientCtx::any_table_throughput` from the
+    // fresh post-commit catalog now, rather than waiting for the next
+    // metadata-watch tick (`index_drain::change_consumer_loop`) to notice.
+    // Only worth the catalog-wide scan when this create itself might have
+    // flipped it (`false → true`); a plain `PAY_PER_REQUEST` create can
+    // never flip an already-correct flag either direction.
+    if control_schema.throughput.is_some() {
+        ctx.recompute_any_table_throughput(&final_meta);
+    }
     let stream_desc = stream_spec.as_ref().map(stream_description);
     Ok(wire::create_table_response(
         table,
@@ -2661,7 +2672,19 @@ async fn update_table_throughput(
             spec,
         })
         .await;
-        if metadata_fresh(ctx).await.table_throughput(table) == spec.as_ref() {
+        let meta = metadata_fresh(ctx).await;
+        if meta.table_throughput(table) == spec.as_ref() {
+            // ADR 0065 §5(b): recompute `ClientCtx::any_table_throughput`
+            // from this fresh post-commit catalog immediately — this
+            // covers BOTH directions (a fresh `spec: Some(..)` may flip the
+            // flag to `true`; reverting to `PAY_PER_REQUEST`
+            // (`spec: None`) may flip it back to `false` if this was the
+            // last table with an override), unlike `create_table`'s own
+            // recompute, which only ever needs to consider the flip-to-
+            // `true` direction. See `ClientCtx::any_table_throughput`'s own
+            // doc for why this node-local recompute matters ahead of the
+            // metadata-watch tick every other node still waits for.
+            ctx.recompute_any_table_throughput(&meta);
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

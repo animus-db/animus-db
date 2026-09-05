@@ -274,21 +274,33 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// unlike [`dynamo::kind_write_item_at_leader`](super::dynamo::
     /// kind_write_item_at_leader) there is no post-charge step here.
     ///
-    /// **Step 4 (ADR 0065 §5(b)): fetches `Metadata` unconditionally**, since
-    /// a per-table `TableSchema.throughput` override (`throttle_limits_for`)
-    /// can throttle a table even when no cluster-wide default is configured
-    /// — the pre-step-4 "cheap lock-free peek before ever touching
-    /// `Metadata`" early return could only ever see the cluster-wide half of
-    /// ADR 0065 §5's two-layer configuration, so it is gone: a per-table
-    /// override with no cluster default set would otherwise silently never
-    /// throttle on this arm. `effective_metadata()` is the same cached,
-    /// no-network local clone `kind_write_item_at_leader`'s own write path
-    /// already pays per write for routing — this is not a new class of
-    /// cost, just no longer skippable on the fully-unthrottled default path.
-    fn throttle_check_write_raw(&self, table: &str, writes: &[RawKindWrite]) -> Result<(), String> {
+    /// **`Metadata` is fetched only when something might actually be
+    /// throttled (ADR 0065 §5(b), the `any_table_throughput` fast path)**.
+    /// A per-table `TableSchema.throughput` override (`throttle_limits_for`)
+    /// can throttle a table even when no cluster-wide default is
+    /// configured, so a cluster-default-only early return would have to
+    /// stay lock-free-but-wrong (silently never throttling such an
+    /// override) or drop the fast path outright and pay
+    /// `effective_metadata()`'s full `Metadata` clone on every raw write
+    /// even in the overwhelmingly common unthrottled-cluster case. Neither
+    /// is necessary: `self.throttle_maybe_configured()` — one relaxed
+    /// atomic load for the cluster default plus one for `self.
+    /// any_table_throughput` — answers the same "could anything here
+    /// possibly throttle" question the old peek did, correctly, for both
+    /// layers of ADR 0065 §5's configuration. See
+    /// [`ClientCtx::any_table_throughput`]'s own field doc for the flag's
+    /// recompute points and why a relaxed load is safe here.
+    pub(crate) fn throttle_check_write_raw(
+        &self,
+        table: &str,
+        writes: &[RawKindWrite],
+    ) -> Result<(), String> {
         let Some(first_key) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
+        if !self.throttle_maybe_configured() {
+            return Ok(());
+        }
         let meta = self.effective_metadata();
         let Some(write_limit) = self.throttle_limits_for(&meta, table).write_units else {
             return Ok(());

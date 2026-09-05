@@ -2452,25 +2452,52 @@ own entries below for exactly where each check lives. `ThrottledWrites`/
 metrics`'s `throttle` array (`ClientCtx::throttle_snapshot`) mirrors
 `request_rates`'s own shape, one entry per currently-tracked tablet (tokens,
 rate, throttled counts, read and write separately). When no limit is
-configured anywhere (the overwhelming common case), every enforcement point
-costs one `Metadata` fetch (`ClientCtx::effective_metadata`, a cached
-local clone — no network round trip, and the identical cost the surrounding
-write/read path already pays for routing) plus a `BTreeMap` lookup — the
-lock-free "skip the fetch entirely" fast path step 3 originally built for
-`write_path.rs`/`read_path.rs` is gone as of step 4, since a per-table
-override with no cluster default configured needs `Metadata` to see at all
-(the earlier "verified by `tests/batch_write.rs`'s throughput assertion"
-framing described the step-3 shape only). `kind_write_item_at_leader`/
-`txn_stage_local` were unaffected either way — both already had `Metadata`
-in hand for other reasons before ever checking throttle limits.
+configured anywhere (the overwhelming common case — no cluster-wide
+default and no table anywhere with its own `throughput` set), every
+enforcement point costs **at most one atomic load plus one `Option`
+check: no lock, no `BTreeMap` lookup, no `Metadata` clone** (step 5, ADR
+0065 §5(b), restoring the lock-free fast path step 4 had to drop). Step 4
+correctly removed the step-3 fast path — a lock-free peek at
+`ClientCtx::throttle_defaults` alone, before ever touching `Metadata` —
+because it could only ever see the cluster-wide half of ADR 0065 §5's
+two-layer configuration: a per-table override with no cluster default set
+would otherwise silently never throttle. But the replacement (fetch
+`Metadata` unconditionally) was more expensive than its own "the identical
+cost the surrounding write/read path already pays for routing" framing let
+on: `effective_metadata()` locks a `Mutex` and deep-clones the **entire**
+`Metadata` — the whole tablet map, schema catalog, and backup catalog —
+not a cheap `Arc` bump, so step 4 put that clone on the hot path of every
+raw write and every read even on a cluster that throttles nothing at all.
+Step 5 closes that gap with `ClientCtx::any_table_throughput: Arc<
+AtomicBool>` — `true` iff at least one table in this node's last-observed
+`Metadata` has `throughput.is_some()` — checked together with
+`throttle_defaults` via `ClientCtx::throttle_maybe_configured()` **before**
+`throttle_check_write_raw`/`throttle_precharge_read` ever call
+`effective_metadata()`. The flag is recomputed (never guessed) at
+`ClientCtx` construction (from the initial `metadata_cached()`), on every
+tick of the metadata-watch loop (`index_drain::change_consumer_loop`,
+alongside `self.throttle.retain_existing(&meta)`), and — so the node that
+itself served the DDL doesn't wait a whole watch tick — immediately after
+this node's own `CreateTable`/`UpdateTable(ProvisionedThroughput)` commit
+(`dynamo::create_table`/`update_table_throughput`). `Relaxed` ordering
+throughout: this is a pure hint, so a reader observing a stale value for
+one more request either falls through to `effective_metadata()` one
+request later than ideal (never earlier) or pays one avoidable
+`effective_metadata()` call before the next recompute clears it — neither
+is a correctness hazard. `kind_write_item_at_leader`/`txn_stage_local`
+needed no such flag either at step 4 or since — both already had
+`Metadata` in hand for other reasons (routing, schema resolution) before
+ever checking throttle limits, so neither ever called
+`effective_metadata()` a second time just for throttling. See
+`docs/engineering-lessons.md`'s matching entry for the general lesson (a
+per-request deep clone hidden behind an innocuous accessor name is a cost
+to design around with a cheap invalidated flag, not to accept as
+"already paid elsewhere").
 
 **Enforcement points, as built**: `write_path.rs`'s
 `cp_kind_write_raw` (the ADR 0049 fast marker arm, `throttle_check_write_raw`
-— unconditionally fetches `Metadata` and calls `throttle_limits_for`, **not**
-a lock-free peek before touching `Metadata` the way step 3 originally built
-it: a per-table override can throttle even with no cluster-wide default
-configured, so the "nothing configured anywhere, skip the fetch" fast path
-step 3 had is gone — see this file's own engineering-lessons entry on this);
+— `throttle_maybe_configured()` first, then `Metadata` and
+`throttle_limits_for` only if that says something might throttle);
 `dynamo.rs`'s `kind_write_item_at_leader` (the evaluate-at-leader funnel —
 pre-charge before propose, a post-charge correction once the real
 `ConsumedCapacity` is known from the applied outcome); `read_path.rs`'s
@@ -2578,8 +2605,25 @@ test's per-op cost must clear that refill by a wide margin, not just the
 nominal configured rate; `SimCluster::set_table_throughput` (proposing
 `MetaCommand::SetTableThroughput` on the control leader and
 converged-or-timeout polling every node, the identical shape
-`create_table_with_replication`'s own tail uses) backs one dedicated
-per-table-override-wins-over-a-restrictive-cluster-default cell. `tests/
+`create_table_with_replication`'s own tail uses, then a
+`SimClusterHandle::recompute_any_table_throughput_all()` call so every
+node's own `ClientCtx::any_table_throughput` reflects the freshly
+converged catalog — this fixture never spawns
+`index_drain::change_consumer_loop`, the real cluster's own recompute
+site, so nothing else here would ever flip the flag) backs one dedicated
+per-table-override-wins-over-a-restrictive-cluster-default cell, plus
+`any_table_throughput_flag_tracks_the_catalog_through_set_and_revert`
+(step 5's own flag proof: `false` on a fresh table, `true` once a
+per-table `throughput` is set, `false` again once it reverts to
+`PAY_PER_REQUEST`). `lib.rs`'s own `simenv_client_ctx_tests` module has a
+companion unit test,
+`unconfigured_throttle_checks_return_ok_from_the_default_state` — with
+nothing configured on a fresh `ClientCtx`, both `throttle_check_write_raw`/
+`throttle_precharge_read` return `Ok` from the guard clause alone (there is
+no clean way to assert "no clone happened" directly, so this test instead
+pins the default flag/defaults state the guard's correctness rests on;
+the guard's placement as each function's first statement is a
+code-review invariant, documented on both). `tests/
 dynamo_throttling.rs` is the real-thread, real-socket regression: single-item
 write/read throttling and recovery, `ProvisionedThroughputExceededException`'s
 wire shape, `BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s

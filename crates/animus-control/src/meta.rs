@@ -3719,6 +3719,19 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.throughput.as_ref())
     }
 
+    /// Whether **any** table in the current catalog has a per-table
+    /// `throughput` override set (ADR 0065 §5(b)) — the cheap catalog-wide
+    /// question `animusd`'s `ClientCtx::any_table_throughput` flag needs to
+    /// recompute itself from a freshly-applied `Metadata` without the
+    /// caller having to iterate `schemas` by hand. `O(tables)`, called only
+    /// at the handful of recompute points (construction, the metadata
+    /// watch, and right after this node's own DDL apply) — never on the
+    /// per-request hot path, which reads the cached flag instead.
+    #[must_use]
+    pub fn any_table_throughput(&self) -> bool {
+        self.schemas.iter().any(|(_, s)| s.throughput.is_some())
+    }
+
     /// This table's point-in-time recovery (PITR) configuration (ADR 0059
     /// §9), if enabled. `None` for an unknown table or one with no PITR
     /// declared, mirroring [`table_stream`](Self::table_stream)/

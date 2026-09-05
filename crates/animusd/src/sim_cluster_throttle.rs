@@ -158,6 +158,50 @@ fn read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill() {
 /// overrides the cluster-wide default entirely — a restrictive cluster
 /// default would throttle this write, but the table's own generous
 /// override wins, so it never does.
+/// The `ClientCtx::any_table_throughput` fast-path flag (ADR 0065 §5(b))
+/// flips `true` the moment a table's per-table `throughput` is set through
+/// the real schema path, and back to `false` once every throughput-carrying
+/// table reverts to `PAY_PER_REQUEST` — proving `SimCluster::
+/// set_table_throughput`'s tail recompute (`SimClusterHandle::
+/// recompute_any_table_throughput_all`) actually keeps the flag correct in
+/// both directions, the exact behavior `ClientCtx::any_table_throughput`'s
+/// own field doc documents as its real-cluster recompute points'
+/// (`dynamo::create_table`/`update_table_throughput`, `index_drain::
+/// change_consumer_loop`) job. A fresh cluster with no throughput anywhere
+/// starts `false` — the same default state [`a_table_with_no_configured_limit_is_never_refused`]
+/// exercises functionally; this test asserts the flag's own value directly.
+#[test]
+fn any_table_throughput_flag_tracks_the_catalog_through_set_and_revert() {
+    let mut cluster = SimCluster::new(0x5448_524f_5735, 1, 1);
+    cluster.create_table("t");
+    assert!(
+        !cluster.any_table_throughput(0),
+        "a fresh table with no throughput configured must leave the flag false"
+    );
+
+    cluster.set_table_throughput(
+        "t",
+        Some(animus_control::ProvisionedThroughput {
+            read_units: 100,
+            write_units: 100,
+        }),
+    );
+    assert!(
+        cluster.any_table_throughput(0),
+        "setting a table's own throughput must flip the flag true"
+    );
+
+    // `UpdateTable` reverting to `PAY_PER_REQUEST` (`spec: None`) is the
+    // real wire shape `update_table_throughput` proposes for a disable —
+    // mirrored here via the identical `MetaCommand::SetTableThroughput`
+    // the real DDL handler sends.
+    cluster.set_table_throughput("t", None);
+    assert!(
+        !cluster.any_table_throughput(0),
+        "reverting the last table's own throughput to PAY_PER_REQUEST must flip the flag back false"
+    );
+}
+
 #[test]
 fn per_table_throughput_override_wins_over_a_restrictive_cluster_default() {
     let mut cluster = SimCluster::new(0x5448_524f_5734, 1, 1);

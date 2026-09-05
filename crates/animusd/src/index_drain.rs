@@ -364,6 +364,14 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // data-capable node either way, so the distinction doesn't matter
         // in practice.
         ctx.throttle.retain_existing(&meta);
+        // ADR 0065 §5(b): this is also the metadata-watch recompute point
+        // for `ClientCtx::any_table_throughput` — see that field's own doc
+        // for the full list of recompute sites and why `Relaxed` is safe. A
+        // node that itself served the `UpdateTable`/`CreateTable` commit
+        // already recomputed synchronously (`dynamo::create_table`/
+        // `update_table_throughput`); every other node picks it up here on
+        // its next tick.
+        ctx.recompute_any_table_throughput(&meta);
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;

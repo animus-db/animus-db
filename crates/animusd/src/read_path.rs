@@ -53,29 +53,36 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     }
 
     /// ADR 0065 §2/§3 read-side pre-charge, shared by every read enforcement
-    /// point in this module and `forwarding.rs`'s serving arms. **Step 4**:
-    /// resolves `table`'s effective limit via [`ClientCtx::
-    /// throttle_limits_for`] (the cluster default or a per-table override),
-    /// which needs `Metadata` regardless of whether anything is
-    /// configured — a per-table override can throttle even with no
-    /// cluster-wide default set, so there is no longer a lock-free peek
-    /// that skips the fetch. When a limit *is* configured, resolves
-    /// `tablet`'s current per-tablet share and pre-charges the cheapest
-    /// this read could possibly cost (`1.0` RCU for a consistent read,
-    /// `0.5` for an eventual one — the same halving `capacity::read_units`
-    /// applies), refusing (`Err`, deliberately never `"; retry"`-suffixed —
-    /// a refused read must not be silently retried inline, nor an eventual
-    /// refusal fall back to the linearizable path, ADR 0065 §2) if the
-    /// bucket can't cover even that minimum. Returns `Some((tablet,
-    /// share, precharge))` for [`Self::throttle_postcharge_read`] to
-    /// correct once the real byte count is known, or `None` when nothing
-    /// was configured for `table` (post-charge is then a no-op).
+    /// point in this module and `forwarding.rs`'s serving arms. Resolves
+    /// `table`'s effective limit via [`ClientCtx::throttle_limits_for`]
+    /// (the cluster default or a per-table override) — but only fetches
+    /// `Metadata` at all when [`ClientCtx::throttle_maybe_configured`]
+    /// says something might actually throttle: a per-table override can
+    /// throttle even with no cluster-wide default set, so the fast path
+    /// checks both `self.throttle_defaults` and `self.
+    /// any_table_throughput` (see that field's own doc) rather than either
+    /// silently missing the override case or paying `effective_metadata()`'s
+    /// clone on every read regardless. When a limit *is* configured,
+    /// resolves `tablet`'s current per-tablet share and pre-charges the
+    /// cheapest this read could possibly cost (`1.0` RCU for a consistent
+    /// read, `0.5` for an eventual one — the same halving
+    /// `capacity::read_units` applies), refusing (`Err`, deliberately never
+    /// `"; retry"`-suffixed — a refused read must not be silently retried
+    /// inline, nor an eventual refusal fall back to the linearizable path,
+    /// ADR 0065 §2) if the bucket can't cover even that minimum. Returns
+    /// `Some((tablet, share, precharge))` for [`Self::
+    /// throttle_postcharge_read`] to correct once the real byte count is
+    /// known, or `None` when nothing was configured for `table`
+    /// (post-charge is then a no-op).
     pub(crate) fn throttle_precharge_read(
         &self,
         table: &str,
         tablet: TabletId,
         consistent: bool,
     ) -> Result<Option<(TabletId, f64)>, String> {
+        if !self.throttle_maybe_configured() {
+            return Ok(None);
+        }
         let meta = self.effective_metadata();
         let Some(read_limit) = self.throttle_limits_for(&meta, table).read_units else {
             return Ok(None);

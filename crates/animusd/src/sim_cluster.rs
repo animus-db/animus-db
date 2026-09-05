@@ -257,6 +257,25 @@ impl SimClusterHandle {
             .all(|ctx| ctx.effective_metadata().table_throughput(table) == spec)
     }
 
+    /// ADR 0065 §5(b): recompute every node's own `ClientCtx::
+    /// any_table_throughput` flag from that node's own just-converged
+    /// `effective_metadata()` — this fixture never spawns
+    /// `index_drain::change_consumer_loop` (the real cluster's own
+    /// metadata-watch recompute site), and its DDL calls
+    /// (`SimCluster::create_table_with_replication`/`set_table_throughput`)
+    /// propose directly on the control leader rather than through
+    /// `dynamo::create_table`/`update_table_throughput` (the real
+    /// cluster's own synchronous recompute site), so nothing in this
+    /// harness would otherwise ever flip the flag at all. Called after
+    /// [`SimCluster::set_table_throughput`]'s own convergence poll, once
+    /// every node's metadata already agrees.
+    fn recompute_any_table_throughput_all(&self) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter() {
+            let meta = ctx.effective_metadata();
+            ctx.recompute_any_table_throughput(&meta);
+        }
+    }
+
     fn is_leader_local(&self, node: u64, tablet: TabletId) -> bool {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize]
             .edge
@@ -545,6 +564,7 @@ impl SimCluster {
                 relay: relays[i].clone(),
                 throttle: ThrottleTracker::new(),
                 throttle_defaults: Arc::new(ThrottleDefaults::default()),
+                any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             ctxs.push(ctx);
         }
@@ -776,6 +796,19 @@ impl SimCluster {
         self.shared.metadata(node)
     }
 
+    /// ADR 0065 §5(b): `node`'s own current `ClientCtx::
+    /// any_table_throughput` flag — a relaxed load, matching the flag's
+    /// own real-request read. Test-only accessor proving the flag's
+    /// recompute points (`SimCluster::set_table_throughput`'s tail call to
+    /// [`SimClusterHandle::recompute_any_table_throughput_all`]) actually
+    /// flip it, both directions.
+    pub(crate) fn any_table_throughput(&self, node: u64) -> bool {
+        self.shared
+            .ctx(node)
+            .any_table_throughput
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// ADR 0065's test-reachable hook: set `node`'s cluster-wide default
     /// throttle limits — `None`/`None` (every node's own default) means
     /// `PAY_PER_REQUEST`, unthrottled. See `ClientCtx::set_throttle_
@@ -829,6 +862,7 @@ impl SimCluster {
         self.poll_until(Duration::from_secs(5), |c| {
             c.shared.all_have_table_throughput(table, spec.as_ref())
         });
+        self.shared.recompute_any_table_throughput_all();
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for

@@ -3693,6 +3693,11 @@ fn spawn_common_tail(
     // Read before `admin_info` moves into `ctx.admin` below.
     let throttle_read_units = admin_info.throttle_read_units;
     let throttle_write_units = admin_info.throttle_write_units;
+    // ADR 0065 §5(b): seed `any_table_throughput` from this node's own
+    // initial view of the catalog, the construction-time recompute point
+    // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
+    // `control` below still moves into the struct unchanged.
+    let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
     let ctx = ClientCtx {
         control,
         edge,
@@ -3713,6 +3718,9 @@ fn spawn_common_tail(
         throttle_defaults: Arc::new(ThrottleDefaults::new(
             throttle_read_units,
             throttle_write_units,
+        )),
+        any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
+            initial_any_table_throughput,
         )),
     };
 
@@ -7489,6 +7497,15 @@ impl ThrottleDefaults {
         }
     }
 
+    /// Whether **neither** direction has a cluster-wide default configured
+    /// — two lock-free relaxed loads, the other half of the "nothing
+    /// configured" fast path alongside `ClientCtx::any_table_throughput`
+    /// (see that field's doc). `true` is every deployment's default state.
+    fn is_unset(&self) -> bool {
+        self.read_units.load(std::sync::atomic::Ordering::Relaxed) == THROTTLE_UNSET
+            && self.write_units.load(std::sync::atomic::Ordering::Relaxed) == THROTTLE_UNSET
+    }
+
     fn set(&self, read_units: Option<u64>, write_units: Option<u64>) {
         self.read_units.store(
             read_units.unwrap_or(THROTTLE_UNSET),
@@ -7888,6 +7905,45 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// `ClientCtx` (one per connection) observes, the same sharing
     /// discipline `client_route`/`intra_route` already use.
     throttle_defaults: Arc<ThrottleDefaults>,
+    /// ADR 0065 §5(b)'s cheap **invalidated flag** half of the "nothing
+    /// configured" fast path: `true` iff at least one table in this node's
+    /// last-observed `Metadata` has `throughput.is_some()` — see
+    /// [`animus_control::Metadata::any_table_throughput`]. Every throttle
+    /// check helper (`write_path::throttle_check_write_raw`, `read_path::
+    /// throttle_precharge_read`) tests `self.throttle_defaults` (also
+    /// lock-free) together with this flag **before** ever calling
+    /// [`effective_metadata`](Self::effective_metadata) — a cluster-default-only
+    /// early return alone would silently never throttle a per-table
+    /// override with no cluster default set (the bug step 4 fixed by
+    /// removing the early return outright, at the cost of an
+    /// `effective_metadata()` deep clone on *every* raw write and read even
+    /// when nothing is configured at all, the default case). This flag
+    /// restores the lock-free skip for that default case while staying
+    /// correct for the override case.
+    ///
+    /// `Relaxed` is enough on both the load and every store below: this is
+    /// a pure hint, not a synchronization point — a reader that observes a
+    /// stale `false` for one more request after a `SetTableThroughput`/
+    /// `CreateTable` commits elsewhere just falls through to
+    /// `effective_metadata()` one request later than it ideally would
+    /// (never *earlier*, since every write site below only ever recomputes
+    /// from an already-applied `Metadata`), and a stale `true` merely costs
+    /// one avoidable `effective_metadata()` call before the next recompute
+    /// clears it — neither direction is a correctness hazard, so there is
+    /// nothing for a stronger ordering to buy here.
+    ///
+    /// Recomputed at construction (`spawn_common_tail`, from this node's
+    /// own initial `metadata_cached()`), on every metadata-watch tick
+    /// (`index_drain::change_consumer_loop`, right alongside `self.throttle
+    /// .retain_existing`), and — so the node that itself served the DDL
+    /// doesn't wait a whole watch tick — immediately after this node's own
+    /// `CreateTable`/`UpdateTable` (`ProvisionedThroughput`) commit
+    /// (`dynamo::create_table`/`dynamo::update_table_throughput`). Every
+    /// recompute site calls [`recompute_any_table_throughput`](Self::
+    /// recompute_any_table_throughput) with the `Metadata` it already just
+    /// applied/fetched — never guessed from the request that triggered it.
+    /// `Arc`-shared for the same reason `throttle_defaults` is.
+    any_table_throughput: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -8151,6 +8207,35 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// keeping.
     pub(crate) fn set_throttle_defaults(&self, read_units: Option<u64>, write_units: Option<u64>) {
         self.throttle_defaults.set(read_units, write_units);
+    }
+
+    /// The lock-free "might anything be throttled" test —
+    /// [`throttle_check_write_raw`](write_path)/[`throttle_precharge_read`]
+    /// (`read_path`) call this **before** ever reaching
+    /// [`effective_metadata`](Self::effective_metadata): `false` means
+    /// neither a cluster-wide default nor any per-table override is
+    /// configured, so the caller can return unthrottled immediately with no
+    /// lock and no clone. See [`any_table_throughput`](Self::
+    /// any_table_throughput)'s own field doc for the flag's recompute
+    /// points and why `Relaxed` is safe here.
+    fn throttle_maybe_configured(&self) -> bool {
+        !self.throttle_defaults.is_unset()
+            || self
+                .any_table_throughput
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Recompute [`any_table_throughput`](Self::any_table_throughput) from
+    /// a `Metadata` this node just applied or fetched — see that field's
+    /// doc for the full list of call sites and why each one is safe to
+    /// call this from (always an already-applied/committed `Metadata`,
+    /// never a guess). A plain relaxed store: see the field's doc for why
+    /// that ordering is enough.
+    pub(crate) fn recompute_any_table_throughput(&self, meta: &Metadata) {
+        self.any_table_throughput.store(
+            meta.any_table_throughput(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// A snapshot of this node's metrics-history ring buffer (oldest first),
@@ -15013,6 +15098,7 @@ mod simenv_client_ctx_tests {
             relay: NeverRelay,
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
+            any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         (sim, ctx, control, kv)
@@ -15091,6 +15177,71 @@ mod simenv_client_ctx_tests {
             read_result,
             Some(ClientResponse::Value(None)),
             "an unprovisioned table must read as a clean absent, not an error (seed={seed})"
+        );
+    }
+
+    /// ADR 0065 §5(b): with nothing configured anywhere (a fresh
+    /// `ClientCtx`'s default state — `throttle_defaults` unset,
+    /// `any_table_throughput` `false`), both throttle check helpers must
+    /// return `Ok` — the guard clause
+    /// (`if !self.throttle_maybe_configured() { return Ok(..) }`) is
+    /// documented, both on `throttle_check_write_raw`/
+    /// `throttle_precharge_read` themselves and on `ClientCtx::
+    /// any_table_throughput`'s own field doc, as the very first statement
+    /// in each function — so reaching it is a lock-free, clone-free two
+    /// atomic loads, never an `effective_metadata()` call. This harness has
+    /// no clean way to assert "no clone happened" directly (there is no
+    /// counter on `effective_metadata()` to observe), so this test instead
+    /// pins the two facts that *make* the guard sufficient: the flag/
+    /// defaults genuinely start in the "nothing configured" state on a
+    /// fresh `ClientCtx`, and both helpers genuinely return `Ok` from that
+    /// state — the guard's own placement as the function's first statement
+    /// is a standing code-review invariant, not something this test can
+    /// re-verify by construction.
+    #[test]
+    fn unconfigured_throttle_checks_return_ok_from_the_default_state() {
+        let seed = 0x514E_0006;
+        let (_sim, ctx, _control, _kv) = single_node_ctx(seed);
+
+        // The "nothing configured" state itself, asserted directly against
+        // the two private fields the guard reads.
+        assert!(
+            ctx.throttle_defaults.is_unset(),
+            "a fresh ClientCtx must start with no cluster-wide throttle default (seed={seed})"
+        );
+        assert!(
+            !ctx.any_table_throughput
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a fresh ClientCtx must start with any_table_throughput false (seed={seed})"
+        );
+        assert!(
+            !ctx.throttle_maybe_configured(),
+            "the combined fast-path predicate must read false from the default state (seed={seed})"
+        );
+
+        // The read-side helper: `Ok(None)` (no precharge to correct later)
+        // with no table/tablet ever provisioned — the guard must fire
+        // before any `Metadata` lookup could even resolve a route.
+        assert_eq!(
+            ctx.throttle_precharge_read("nonexistent-table", TabletId(999), true),
+            Ok(None),
+            "an unconfigured consistent read-side check must return Ok(None) (seed={seed})"
+        );
+        assert_eq!(
+            ctx.throttle_precharge_read("nonexistent-table", TabletId(999), false),
+            Ok(None),
+            "an unconfigured eventual read-side check must return Ok(None) (seed={seed})"
+        );
+
+        // The write-side helper: same guard, same unconfigured state, no
+        // table ever provisioned either.
+        assert_eq!(
+            ctx.throttle_check_write_raw(
+                "nonexistent-table",
+                &[(0u8, b"k".to_vec(), Some(b"v".to_vec()))],
+            ),
+            Ok(()),
+            "an unconfigured write-side check must return Ok(()) (seed={seed})"
         );
     }
 
@@ -15292,6 +15443,7 @@ mod two_node_relay_tests {
             relay: relay_a.clone(),
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
+            any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Node A answers relayed requests through the generic dispatcher
@@ -15350,6 +15502,7 @@ mod two_node_relay_tests {
             relay: relay_b,
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
+            any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         (sim, ctx_a, ctx_b, control)
