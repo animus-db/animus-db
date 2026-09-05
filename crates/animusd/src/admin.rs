@@ -2288,6 +2288,13 @@ fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
 /// or one shorter than the token width — is shown as text unchanged. Inverse of
 /// [`parse_key_display`], so a token-prefixed key shown in the browse view
 /// round-trips back through the key inspector.
+///
+/// **An `N` sort key's remainder is no longer readable decimal text (ADR
+/// 0063)** — `numkey`'s order-preserving encoding is binary, so it renders
+/// through the same lossy-UTF-8 fallback as any other binary key bytes
+/// (replacement characters, not the original digits). This is unchanged
+/// display behavior for *this* function (it never special-cased `N`), just a
+/// new case that now hits the binary path instead of showing clean text.
 pub(crate) fn key_display(bytes: &[u8]) -> String {
     let printable = |b: &u8| (0x20..0x7f).contains(b);
     if bytes.len() < TOKEN_BYTES || bytes[..TOKEN_BYTES].iter().all(printable) {

@@ -85,3 +85,15 @@ ADR 0006 audit note.)*
   under ADR 0033, until ADR 0044 removed it — tablets are split-only). Only
   the *space the ranges partition* changed (raw keyspace → hashed token
   space).
+
+## Amendment (2026-09-04): `N` key encoding changes the token input
+
+[ADR 0063](0063-order-preserving-number-keys.md) replaces
+`AttributeValue::key_bytes()`'s `N` encoding (raw decimal text) with a
+canonical, order-preserving byte layout — exactly the kind of key-layout
+change this ADR's own "frozen on-disk format... changing it is a data
+migration, not a code tweak" line warns about. Because `partition_token` is
+computed over `escape(pk.key_bytes())`, an `N` partition key's token input
+changes too, which changes which tablet a row hashes to. No migration is
+attempted (root `CLAUDE.md`'s "No back-compat until further notice"); see
+ADR 0063 for the full decision and its Scope/Consequences.

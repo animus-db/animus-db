@@ -4008,6 +4008,23 @@ debugging anything that feels like it might have happened before.
   `ClusterApi`/`AdminOps`) — matching it costs one small dependency and one
   boxed allocation per call, never on a hot path for a controller
   reconcile loop.
+- **A DynamoDB Streams record's `Keys` is reconstructed from its own
+  `NewImage`/`OldImage` (`streams_wire::keys_from_images`), never decoded
+  from `ChangeRecord.base_sk`** — found while writing W-03 step 4's stream
+  regression for ADR 0063's `N` key encoding. It is tempting to assume a
+  stream-record-keys test exercises `numkey::decode` the same way
+  `SortKeyCondition::matches_raw` does, since both ultimately answer "what
+  was this row's sort key" — but `base_sk` is only ever used to *position*
+  the record in its shard/sequence, and the value shown to a consumer comes
+  straight from the item text the write path already stored in the image. A
+  regression here (`dynamo_streams.rs::
+  stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`)
+  is real coverage — a break in `base_sk`'s own byte shape can still surface
+  as a missing/misordered record, since the change-log storage key is
+  `partition_prefix || base_sk || hlc` — but it is not equivalent to a
+  `numkey::decode` unit test, and a doc comment should say so explicitly
+  rather than let a reader assume the wire round-trip proves more than it
+  does.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -16377,6 +16394,76 @@ own Tests section) has two disjoint test surfaces. A full `cargo test -p
 expensive) must add `--lib` explicitly — and both must be run (and
 reported) before a fixture sweep — or the check it's preparing for — can
 be called complete.
+
+## A "no stray terminator byte" invariant test must be scoped to the digit-run, not the whole encoding (W-03 step 2, `numkey.rs`)
+
+Building `animus_dynamo::numkey` (an order-preserving codec for DynamoDB
+`N` — sign class byte, then a fixed-width 2-byte offset-binary exponent
+field, then a digit run terminated by `0x00`, everything after byte 0
+bitwise-inverted for negatives), the first draft of a "the terminator byte
+is the only `0x00` in the encoding" unit test scanned the *entire* output
+including the exponent field. It failed immediately on `encode("0.5")`:
+that value's exponent is `0`, which biases to `1024` (`0x0400`) — a
+perfectly valid 2-byte field whose low byte legitimately is `0x00`. The
+claim "no stray terminator byte" is only true of the **digit-run region**
+(bytes are `1..=10`, so `0x00` can only be the terminator there by
+construction); a fixed-width binary field elsewhere in the layout has no
+such constraint and will contain every byte value across a large enough
+sample, `0x00` included.
+
+**Fixed** by rewriting the test to slice off the known-width exponent
+field first (`&encoded[3..]`) and only assert the "0x00 appears exactly
+once, at the end" claim over that remaining digit-run slice — the region
+the invariant actually describes.
+
+**General form**: when writing a "this reserved/terminator byte value
+appears nowhere else in the encoding" test for a multi-field binary
+layout, scope the scan to the specific field the invariant is *about*
+(here: a variable-length, digit-constrained run), never the whole record —
+a fixed-width field with no value constraint of its own (an exponent, a
+length prefix, a checksum) is a false positive waiting to happen the
+moment a real test input's field value happens to contain that byte. Pick
+a test sample specifically to exercise the "reserved value at exponent
+zero" boundary (`exp = 0` here) rather than only obviously-nonzero cases —
+that's exactly the input that caught this.
+
+## Reusing an order-erasing test helper to rewrite an order-sensitive test produces a silently vacuous assertion (W-03 step 3, `dynamo_query_range.rs`)
+
+Wiring `numkey` into `AttributeValue::key_bytes` (ADR 0063) flipped a test
+that used to pin the *old*, wrong byte-text order for an `N` sort key
+(`scan_index_forward_is_still_byte_order_not_numeric_order_for_n`) into one
+asserting the *correct* numeric order
+(`scan_index_forward_orders_n_sort_keys_numerically`). The fixture file
+already had an `sk_values(body) -> Vec<String>` helper used by every other
+test in the file — but its own doc comment said why: it ends with
+`out.sort()` and is documented "order-independent, so callers assert
+membership, not position." The first draft of the rewritten ordering test
+called `sk_values` anyway (it was the only extractor in scope, and its name
+looked right), asserting `sk_values(&asc) == vec![...expected numeric
+order...]`. That assertion would have passed **unconditionally** — sorting
+the extracted strings erases the exact property (result *order*) the test
+exists to check, so a regression back to byte-text order, or any other
+ordering bug entirely, would never fail it. Caught before commit only by
+rereading the helper's own doc comment, not by the test failing (it didn't
+— it can't).
+
+**Fixed** by adding a second, order-preserving helper (`sk_order`, the
+first-appearance-order extraction `sk_values` already did internally before
+its own final `.sort()`) and using that for the position-sensitive
+assertions, keeping `sk_values` for the file's other, genuinely
+membership-only assertions.
+
+**General form**: when a fixture file's existing helper is documented as
+order-erasing (a trailing `.sort()`, a `BTreeSet`/`HashSet` collect, a
+membership-only comparison), that documentation is not incidental — it is
+recording a *narrower contract than the function's name suggests*, and
+reusing it for a differently-shaped assertion (position/order rather than
+membership) produces a test that type-checks, reads naturally, and can
+never fail regardless of the code under test. Before reusing any helper to
+assert an order-sensitive property, re-read its own doc/implementation for
+exactly this kind of narrowing, and prefer writing a fresh order-preserving
+extractor (as this fix did) over trusting that a same-shaped helper already
+in scope must mean what its name implies.
 
 ## A client-side fix that widens how many hops a caller tries can silently multiply the server-side work abandoned callers leave behind (issue #596)
 

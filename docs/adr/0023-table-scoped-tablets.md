@@ -122,3 +122,16 @@ their own op already rides `cp_route`'s wait, so they need no extra gate.
 Regression: `crates/animusd/tests/create_table_ready.rs` (the readiness
 assertion is one-shot at ack time, deliberately — the property is "already
 true when the 200 arrives").
+
+## Amendment (2026-09-04): `N` key encoding changes the key layout
+
+[ADR 0063](0063-order-preserving-number-keys.md) replaces
+`AttributeValue::key_bytes()`'s `N` encoding (raw decimal text) with a
+canonical, order-preserving byte layout, so a `Query`'s `ScanIndexForward`
+order agrees with DynamoDB numeric order across magnitudes and signs. This
+is a change to the "Key layout" this ADR fixes (`partition_token(pk) ||
+escape(pk) || rk`) for any `N`-typed `pk`/`rk` — the `rk` (and any `N`
+GSI/LSI key component) is affected directly, and `pk`'s hash-ring token
+input changes too (ADR 0022's own amendment above). No migration is
+attempted (root `CLAUDE.md`'s "No back-compat until further notice"); see
+ADR 0063 for the full decision.
