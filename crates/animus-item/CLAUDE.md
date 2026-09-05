@@ -104,6 +104,57 @@ unchanged. Everything else that used to be `pub(crate)` in `animus-dynamo`
 either stayed `pub(crate)` here (`escape`, `AttributeValue::key_bytes`,
 `condition::add_numeric`/`negate_numeric`) or was already `pub`.
 
+## `write_schema` module (ADR 0054 step 2)
+
+The second consumer of this crate — `animus-cp-data`'s apply path — landed:
+`animus-cp-data` now depends on `animus-item` directly (no
+`animus-dynamo`/`animus-env` pulled in transitively). A new module,
+`write_schema`, holds:
+
+- **`WriteSchema`** — the frozen schema slice a `KvCommand::KindEval` entry
+  carries: `key: TableSchema`, `lsis: Vec<LsiDef>` (name/sort-attribute/
+  projection — **no** GSI list, since a write never commits a GSI row
+  directly; the asynchronous drain derives those later from the change-log
+  record), and `change_records_carry_images: bool`. See the type's own doc
+  for the "apply cannot read `Metadata`" rationale — the same reasoning
+  this crate's own module doc gives for why `animus-cp-data`'s apply path
+  needs a pure, dependency-free item model at all, one level more specific
+  (a live catalog read at apply, not just an `animus-dynamo` dependency,
+  would let two replicas of one entry derive different index rows).
+- **`Projection`**/**`LsiDef`** — a small, pure, `animus-item`-local copy of
+  `animus_control::schema::IndexProjection`/a narrowed `IndexDef`,
+  duplicated rather than imported for the identical layering reason this
+  crate's own "escape duplication" section gives for `animus-tablet`'s copy:
+  the control plane sits *above* this crate (it names `TableSchema`/
+  `AttributeValue` itself), so a reverse dependency would invert it.
+- **`derive_kind_writes`** — the pure core of what used to be
+  `animusd::dynamo::kind_writes_for_item`'s whole body (moved verbatim,
+  byte-identical output): given a `WriteSchema`, an item's identity, its own
+  ADR 0022 partition token (passed in — this crate still has no
+  `animus-tablet` dependency), the old/new item, and the caller's own
+  `KIND_BASE`/`KIND_LSI` byte constants (also passed in, for the identical
+  reason — this crate sits below `animus-cp-data`, which defines them),
+  derives the base/LSI writes and the one change-log record. `animusd::
+  dynamo::kind_writes_for_item` is now a thin wrapper: build a
+  `WriteSchema` (`write_schema_for`, next to the pre-existing `schema_for`),
+  call this, return its two fields as the pre-existing tuple — proven
+  byte-identical by every pre-existing `animusd` index/stream test staying
+  green unmodified (`dynamo_indexes`, `dynamo_index_writes`,
+  `dynamo_streams`, `dynamo_update_add_delete`).
+
+**`animusd` depends on `animus-item` directly too** (not only via
+`animus-dynamo`'s re-export list, which stays scoped to wire-adjacent item
+types) — `write_schema_for`/`kind_writes_for_item`'s wrapper body need
+`WriteSchema`/`LsiDef`/`Projection`/`derive_kind_writes` directly, and these
+are apply-evaluator machinery a wire-protocol consumer of `animus-dynamo`
+has no reason to see re-exported.
+
+See `crates/animus-cp-data/CLAUDE.md`'s own ADR 0054 step 2 entry for how
+`derive_kind_writes`'s output is consumed at apply (`KvCommand::KindEval`,
+`evaluate_kind_eval`), the outcome mapping, and the leader-local result
+slots — none of that lives in this crate, which stays pure and knows
+nothing about Raft, apply order, or outcomes.
+
 ## Tests
 
 `cargo test -p animus-item` — every unit test and proptest that moved with
@@ -115,4 +166,10 @@ row-key/footprint/change-record tests, `size`'s value/item-size tests
 directly, as opposed to `animus-dynamo::wire`'s tests that exercise the
 `UpdateExpression` string parser end to end — those stayed in `wire.rs`
 since the parser did). See `crates/animus-dynamo/CLAUDE.md`'s Tests section
-for what stayed there and why.
+for what stayed there and why. `write_schema`'s own tests cover
+`derive_kind_writes` directly (a plain insert with no index, an LSI diff
+that removes the stale row and writes the new one, an unchanged sort
+attribute that does not delete-then-reput the same row, and a delete) — the
+apply-path integration coverage (`KvCommand::KindEval` end to end) lives in
+`animus-cp-data`'s own `tests/kind_eval.rs` instead, since this crate has no
+Raft/apply machinery to integration-test against.

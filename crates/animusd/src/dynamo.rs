@@ -6766,6 +6766,22 @@ mod txn_resolve_awaited_tests {
 /// `false` for every ordinary client write and every transactional write
 /// ([`eval_kind_txn_write`]'s own call always passes `false`, since a
 /// transaction never carries a service identity).
+/// **ADR 0054 step 2**: this function is now a thin wrapper —
+/// [`write_schema_for`] builds the frozen schema slice from `Metadata` (the
+/// three lookups this function used to perform directly:
+/// `Metadata::table_indexes`, `schema_for`, `table_change_records_carry_
+/// images`), then [`animus_item::derive_kind_writes`] does the actual
+/// derivation (base row, LSI diff, change record) — the identical pure
+/// logic this function's body used to run inline, moved verbatim so
+/// `animus-cp-data`'s apply path can run it too (see `KvCommand::
+/// KindEval`'s own doc). Byte-identical output: nothing about `writes`/
+/// `change_log`'s content changed, only where the derivation lives.
+///
+/// `token_prefix` is recovered from `base_key`'s own leading ADR 0022
+/// bytes rather than re-derived from `pk` — every call site already builds
+/// `base_key` as `item_key(pk, sk)` (`partition_token(escape(pk)) ||
+/// storage_key(pk, sk)`, see [`item_key`]'s own doc), so its first
+/// [`animus_tablet::TOKEN_BYTES`] are that same token by construction.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 pub(crate) fn kind_writes_for_item(
     meta: &Metadata,
@@ -6778,63 +6794,67 @@ pub(crate) fn kind_writes_for_item(
     new: Option<&Item>,
     ttl_expired: bool,
 ) -> IndexedWrite {
-    let indexes = meta.table_indexes(table);
-    let base = schema_for(meta, table);
-    let base = &base;
-    let mut writes: Vec<KindWrite> = vec![(KIND_BASE, base_key.to_vec(), Some(base_value))];
-
-    for idx in indexes.iter().filter(|i| i.kind == IndexKind::Local) {
-        let Some(sort_attr) = &idx.sort_attribute else {
-            continue; // an LSI always declares one; a malformed def is skipped
-        };
-        let old_alt = old.and_then(|i| i.get(sort_attr));
-        let new_alt = new.and_then(|i| i.get(sort_attr));
-        // Remove the row the previous value occupied, unless it is the very row
-        // the new value writes (an unchanged sort attribute) — deleting and
-        // re-putting the same key in one entry would depend on ordering.
-        if let Some(prev) = old_alt
-            && old_alt != new_alt
-        {
-            writes.push((
-                KIND_LSI,
-                token_prefixed(pk, &dynamo_index::lsi_row_key(pk, &idx.name, prev, sk)),
-                None,
-            ));
-        }
-        if let Some(next) = new_alt {
-            let item = new.expect("a new alt value implies a new item");
-            writes.push((
-                KIND_LSI,
-                token_prefixed(pk, &dynamo_index::lsi_row_key(pk, &idx.name, next, sk)),
-                Some(wire::encode_stored_item(&projected_item(item, base, idx))),
-            ));
-        }
-    }
-
-    // The sort key's raw bytes, derived through the public key codec rather than
-    // `AttributeValue::key_bytes` (crate-private to `animus-dynamo`): the full
-    // storage key minus the partition-key prefix is exactly that suffix.
-    let base_sk = storage_key(pk, sk)[storage_key(pk, None).len()..].to_vec();
-    // ADR 0049 §1: the record always exists; only its *shape* follows the
-    // table's declarations. With a stream or an index the images ride along
-    // (view-type projection is read-time; the drain/LSI fidelity contract
-    // needs the old image); with neither, an image-less marker is the whole
-    // record — the dirty-key signal change-log consumers re-read rows from.
-    let carries_images = table_change_records_carry_images(meta, table);
-    let record = ChangeRecord {
-        base_sk,
-        old_image: if carries_images { old.cloned() } else { None },
-        new_image: if carries_images { new.cloned() } else { None },
-        seeded: false,
-        marker: !carries_images,
-        staged: false,
+    let schema = write_schema_for(meta, table);
+    let token_prefix = &base_key[..animus_tablet::TOKEN_BYTES.min(base_key.len())];
+    let derived = animus_item::derive_kind_writes(
+        &schema,
+        pk,
+        sk,
+        token_prefix,
+        base_value,
+        old,
+        new,
         ttl_expired,
-    };
-    let change_log = (
-        token_prefixed(pk, &dynamo_index::change_prefix(pk)),
-        record.encode(),
+        KIND_BASE,
+        KIND_LSI,
     );
-    (writes, change_log)
+    (derived.writes, derived.change_log)
+}
+
+/// Build the [`animus_item::WriteSchema`] slice a `KvCommand::KindEval`
+/// entry would carry for `table` (ADR 0054 step 2, mechanism 1) — exactly
+/// the three lookups [`kind_writes_for_item`] used to perform directly
+/// against `Metadata` before this step, now factored out so this same
+/// construction serves both [`kind_writes_for_item`]'s own wrapper body
+/// today and a future `KindEval` producer (ADR 0054 Sequencing step 3,
+/// `kind_write_item_at_leader`'s own cutover) without duplicating it.
+pub(crate) fn write_schema_for(meta: &Metadata, table: &str) -> animus_item::WriteSchema {
+    let key = schema_for(meta, table);
+    let lsis = meta
+        .table_indexes(table)
+        .iter()
+        .filter(|i| i.kind == IndexKind::Local)
+        .filter_map(|i| {
+            // An LSI always declares a sort attribute; a malformed
+            // definition is skipped, mirroring this function's own
+            // pre-extraction `let Some(sort_attr) = .. else { continue }`.
+            let sort_attribute = i.sort_attribute.clone()?;
+            Some(animus_item::LsiDef {
+                name: i.name.clone(),
+                sort_attribute,
+                projection: to_item_projection(&i.projection),
+            })
+        })
+        .collect();
+    animus_item::WriteSchema {
+        key,
+        lsis,
+        change_records_carry_images: table_change_records_carry_images(meta, table),
+    }
+}
+
+/// `animus_control::schema::IndexProjection` -> `animus_item::write_schema::
+/// Projection` — a pure, field-for-field bridge (the same shape
+/// `schema_bridge`'s other converters use), needed because `animus-item`
+/// keeps its own copy of this enum rather than depending on
+/// `animus-control` (see [`animus_item::write_schema::Projection`]'s own
+/// doc for why).
+fn to_item_projection(p: &CtlProjection) -> animus_item::Projection {
+    match p {
+        CtlProjection::All => animus_item::Projection::All,
+        CtlProjection::KeysOnly => animus_item::Projection::KeysOnly,
+        CtlProjection::Include(extra) => animus_item::Projection::Include(extra.clone()),
+    }
 }
 
 pub(crate) fn item_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {

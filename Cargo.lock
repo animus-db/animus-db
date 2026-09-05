@@ -63,6 +63,7 @@ version = "0.0.0"
 dependencies = [
  "animus-control",
  "animus-env",
+ "animus-item",
  "animus-placement",
  "animus-sim",
  "animus-storage",
@@ -227,6 +228,7 @@ dependencies = [
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
+ "animus-item",
  "animus-node",
  "animus-sim",
  "animus-storage",

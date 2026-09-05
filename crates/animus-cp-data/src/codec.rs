@@ -174,7 +174,21 @@ const MAGIC: u8 = 0xCB;
 /// `serde_json` path, per this crate's own doc: "a field added to the
 /// shared `LogEntry`/`RaftMsg` types needs an explicit encode/decode arm
 /// here too").
-const VERSION: u8 = 24;
+/// `25` (ADR 0054 step 2): new `KvCommand::KindEval` (tag 16) — the
+/// self-contained evaluated write apply evaluates in commit order (see the
+/// variant's own doc). Its rich, evolving nested types (`WriteSchema`,
+/// `AttributeValue`/`Option<AttributeValue>`, `KindEvalOp`,
+/// `Option<ConditionExpression>`) are each `serde_json`-encoded into one
+/// `put_bytes`-framed blob apiece rather than hand-encoded field-by-field —
+/// the same "JSON inside the binary envelope" convention `backup.rs`'s
+/// `BackupManifestObject` already uses for `TableSchema`'s own
+/// multi-field, evolving shape, for the identical reason: this is a
+/// low-frequency, deeply-nested payload (unlike the hot per-key
+/// `Vec<u8>`s every other variant's fields already are), so a field added
+/// to any of these four types needs no codec change here at all. `ts`
+/// stays the standard trailing fixed-width encoding. Same house
+/// convention otherwise: a clean bump, no cross-version compatibility.
+const VERSION: u8 = 25;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -197,6 +211,17 @@ fn put_bool(out: &mut Vec<u8>, v: bool) {
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_be_bytes());
     out.extend_from_slice(b);
+}
+
+/// `serde_json`-encode `value` into one `put_bytes`-framed blob (version
+/// `25` — see the const's own doc for why this crate's deeply-nested,
+/// evolving `KvCommand::KindEval` field types use JSON-inside-the-envelope
+/// rather than a hand-rolled field-by-field encoding).
+fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) {
+    put_bytes(
+        out,
+        &serde_json::to_vec(value).expect("KindEval field serializes"),
+    );
 }
 
 fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
@@ -289,6 +314,18 @@ impl<'a> Cursor<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
+    }
+
+    /// Read one [`put_json`]-framed blob back — the decode dual of every
+    /// `KvCommand::KindEval` field that rides as `serde_json` inside the
+    /// binary envelope. Safe against an untrusted length the same way
+    /// [`Cursor::bytes`] already is: `bytes()` bounds-checks the frame
+    /// against the remaining buffer BEFORE this ever allocates, so a
+    /// corrupted length here still yields a loud `Err`, never an
+    /// allocator abort.
+    fn json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, DecodeError> {
+        let raw = self.bytes()?;
+        serde_json::from_slice(&raw).map_err(|e| format!("KindEval field decode: {e}"))
     }
 
     fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
@@ -527,6 +564,24 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 put_bytes(out, k);
                 put_opt_bytes(out, expected);
             }
+            put_ts(out, *ts);
+        }
+        KvCommand::KindEval {
+            schema,
+            pk,
+            sk,
+            op,
+            condition,
+            ttl_expired,
+            ts,
+        } => {
+            put_u8(out, 16);
+            put_json(out, schema);
+            put_json(out, pk);
+            put_json(out, sk);
+            put_json(out, op);
+            put_json(out, condition);
+            put_bool(out, *ttl_expired);
             put_ts(out, *ts);
         }
         KvCommand::SeedBatch { rows, ts } => {
@@ -817,6 +872,15 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 ts: read_ts(c)?,
             }
         }
+        16 => KvCommand::KindEval {
+            schema: c.json()?,
+            pk: c.json()?,
+            sk: c.json()?,
+            op: c.json()?,
+            condition: c.json()?,
+            ttl_expired: c.bool()?,
+            ts: read_ts(c)?,
+        },
         13 => {
             let n = c.u32()?;
             // Capped pre-allocation against an untrusted wire count — see
@@ -1409,6 +1473,44 @@ mod tests {
                         },
                     ],
                     ts: ts(10, 0),
+                },
+                config: None,
+                learners: None,
+            },
+            // ADR 0054 step 2 (version 25): the self-contained evaluated
+            // write — exercises every one of its four `serde_json`-blob
+            // fields (`schema`/`pk`/`sk`/`op`/`condition`) at once.
+            LogEntry {
+                term: 8,
+                index: 30,
+                command: KvCommand::KindEval {
+                    schema: animus_item::WriteSchema {
+                        key: animus_item::TableSchema::composite("pk", "sk"),
+                        lsis: vec![animus_item::LsiDef {
+                            name: "byAge".to_owned(),
+                            sort_attribute: "age".to_owned(),
+                            projection: animus_item::Projection::KeysOnly,
+                        }],
+                        change_records_carry_images: true,
+                    },
+                    pk: animus_item::AttributeValue::S("alice".to_owned()),
+                    sk: Some(animus_item::AttributeValue::N("42".to_owned())),
+                    op: crate::KindEvalOp::Update {
+                        key_item: [(
+                            "pk".to_owned(),
+                            animus_item::AttributeValue::S("alice".to_owned()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        actions: vec![animus_item::UpdateAction::Remove(vec![
+                            animus_item::PathSegment::Field("stale".to_owned()),
+                        ])],
+                    },
+                    condition: Some(animus_item::ConditionExpression::AttributeExists(
+                        "pk".to_owned(),
+                    )),
+                    ttl_expired: true,
+                    ts: ts(11, 0),
                 },
                 config: None,
                 learners: None,

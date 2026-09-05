@@ -72,6 +72,7 @@ pub mod numkey;
 pub mod size;
 pub mod stored;
 pub mod update;
+pub mod write_schema;
 
 pub use condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
 pub use index::{
@@ -84,6 +85,7 @@ pub use update::{
     PathSegment, UpdateAction, UpdateError, UpdateExpr, UpdateOperand, apply_update,
     format_update_path,
 };
+pub use write_schema::{KindWrites, LsiDef, Projection, WriteSchema, derive_kind_writes};
 
 /// A DynamoDB-style attribute value (a useful subset). Beyond the scalar
 /// types (`S`/`N`/`B`/`BOOL`/`NULL`), this carries the **document** types
@@ -153,7 +155,7 @@ impl AttributeValue {
 pub type Item = BTreeMap<String, AttributeValue>;
 
 /// A table's key schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     /// Partition (hash) key attribute name.
     pub partition_key: String,
