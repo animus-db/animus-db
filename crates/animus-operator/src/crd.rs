@@ -114,9 +114,6 @@ pub struct AnimusClusterSpec {
     /// CLI-flag-support table for the full before/after picture).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiesce_after_secs: Option<u64>,
-    /// `--split-mode {copy,inplace}` (combined-role pods only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub split_mode: Option<String>,
     /// The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
     /// **S-06**: like `quiesce_after_secs` above, now emitted into the
     /// generated `cluster.json`'s `cluster_settings.auto_split_bytes`
