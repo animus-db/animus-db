@@ -17,7 +17,7 @@ use animus_env::nid;
 use animus_placement::PlacementPolicy;
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
-use animus_tablet::{Epoch, KeyRange, TabletId};
+use animus_tablet::{Epoch, KeyRange, TabletId, TabletState};
 
 const NODES: [u64; 3] = [0, 1, 2];
 
@@ -27,6 +27,21 @@ fn upsert(node: u64) -> MetaCommand {
         labels: BTreeMap::new(),
         status: NodeStatus::Active,
     }
+}
+
+/// The current epoch of a tablet, read fresh off `metadata()` — the same
+/// just-in-time read a real proposer's confirm loop does (see
+/// `animusd::ClientCtx::trigger_split`) before issuing an epoch-CAS'd
+/// command, rather than assuming a value computed earlier in the scenario
+/// is still current (placement repair/rebalance can bump a tablet's epoch
+/// out from under a hardcoded expectation — see the issue #539 note below).
+fn current_epoch(nodes: &[RaftNode<SimEnv>], leader: usize, tablet: TabletId) -> Epoch {
+    nodes[leader]
+        .metadata()
+        .tablets
+        .get(&tablet)
+        .unwrap_or_else(|| panic!("tablet {tablet:?} should exist"))
+        .epoch
 }
 
 fn unique_leader(nodes: &[RaftNode<SimEnv>], seed: u64) -> usize {
@@ -144,29 +159,58 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after SealStreamShard").await;
+        // Positive assertion: the seal actually landed a catalog row, not
+        // just left cache/engine agreeing on an unchanged empty map (a
+        // rejected/no-op `SealStreamShard` — e.g. an epoch-chain gap or a
+        // stale label — would pass the differential check just as
+        // trivially as a genuine apply would).
+        assert!(
+            nodes[leader]
+                .metadata()
+                .stream_shards
+                .contains_key(&(TabletId(1), 0)),
+            "seed={seed}: first SealStreamShard should have landed a (tablet 1, epoch 0) row"
+        );
 
         // In-place split (ADR 0058 Train 2 rung 3): `BeginSplitInPlace`, then
         // cutover — the child pair partitions the range, the parent
         // retires, lineage freezes.
         //
-        // NOTE (copy-split deletion stack, layer 1): this proposal's
-        // `expected_epoch: Epoch::INITIAL` is stale by the time it lands —
-        // something ahead of it in this same scenario has already bumped
-        // tablet 1's epoch past `INITIAL` — so it (and the mirrored second
-        // round on tablet 2 below) is rejected on the epoch-CAS and this
-        // whole split round has silently been a no-op ever since it was
-        // written, under BOTH `BeginSplit` and `BeginSplitInPlace` (the
-        // epoch mismatch, not F11 token-alignment, is the actual rejection
-        // reason — confirmed while porting this call for the copy-split
-        // deletion stack; see docs/engineering-lessons.md). Left AS A
-        // FAITHFUL, byte-for-byte command-type port rather than fixed here
-        // — diagnosing and correcting the stale epoch is an unrelated
-        // pre-existing bug and belongs in its own change with its own test,
-        // not folded into this test-surface-only layer.
-        let split_key = vec![128u8];
+        // issue #539 (was: NOTE, copy-split deletion stack, layer 1): a
+        // hardcoded `expected_epoch: Epoch::INITIAL` here used to be stale
+        // by the time it landed — `SetTabletPolicy`'s RF=2 policy treats
+        // tablet 1's replicas (`nid(210)`/`nid(211)`, chosen purely as
+        // stream-shard-row filler above and never `RegisterNode`d/`UpsertMember`-activated) as
+        // policy-violating, since only `nid(10)`/`nid(11)` are `Active`
+        // members; the leader's own placement-repair reconcile loop
+        // (`Metadata::reconcile`) swaps tablet 1's replicas onto those two
+        // `Active` members within the very first `run_for` above, bumping
+        // its epoch from `INITIAL` to `INITIAL.next().next()` well before
+        // this call ever proposes anything. Every `BeginSplitInPlace`/
+        // `CutoverSplit` call in this scenario now reads the tablet's
+        // CURRENT epoch off `metadata()` immediately before proposing —
+        // the same just-in-time pattern a real proposer's confirm loop
+        // uses (`animusd::ClientCtx::trigger_split`) — instead of assuming
+        // a value computed earlier in the scenario (or a bare
+        // `Epoch::INITIAL`) is still current. See
+        // `docs/engineering-lessons.md`'s entry on this for the full
+        // incident: every downstream command in this round used to
+        // silently no-op right along with the first rejection, and the
+        // differential oracle below never noticed because a rejected
+        // command changes neither side of the cache/engine comparison.
+        // F11 (ADR 0042 §14): a streamed table's split key must be exactly
+        // `TOKEN_BYTES` (8) long — `orders` already has a stream enabled
+        // (`SetTableStream` above), so the pre-fix single-byte `vec![128u8]`
+        // was ALSO rejected on this seatbelt, a second, independent
+        // no-op cause the epoch fix alone doesn't uncover until the epoch
+        // check stops shadowing it (the epoch-CAS is evaluated first in
+        // `BeginSplitInPlace`'s apply arm, so the original stale-epoch
+        // proposal never even reached this check).
+        let split_key = vec![0x80, 0, 0, 0, 0, 0, 0, 0];
+        let tablet1_epoch = current_epoch(&nodes, leader, TabletId(1));
         nodes[leader].propose(MetaCommand::BeginSplitInPlace {
             parent: TabletId(1),
-            expected_epoch: Epoch::INITIAL,
+            expected_epoch: tablet1_epoch,
             split_key,
             children: [
                 (TabletId(2), vec![nid(210), nid(211)]),
@@ -175,6 +219,31 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after begin-split-in-place").await;
+        // Positive assertion: `BeginSplitInPlace` actually applied — the
+        // parent flipped to `Splitting`, its epoch advanced by one, and it
+        // carries an intent naming exactly the two proposed children (never
+        // a silently-rejected epoch-CAS no-op).
+        {
+            let meta = nodes[leader].metadata();
+            let parent = meta.tablets.get(&TabletId(1)).unwrap_or_else(|| {
+                panic!("seed={seed}: parent tablet 1 should still be present while Splitting")
+            });
+            assert_eq!(
+                parent.state,
+                TabletState::Splitting,
+                "seed={seed}: BeginSplitInPlace should have flipped tablet 1 to Splitting"
+            );
+            assert_eq!(
+                parent.epoch,
+                tablet1_epoch.next(),
+                "seed={seed}: BeginSplitInPlace should have bumped tablet 1's epoch"
+            );
+            let intent = parent.inplace_split.as_ref().unwrap_or_else(|| {
+                panic!("seed={seed}: BeginSplitInPlace should have recorded a split intent")
+            });
+            assert_eq!(intent.children[0].id, TabletId(2));
+            assert_eq!(intent.children[1].id, TabletId(3));
+        }
 
         // The retired-to-be parent seals its next epoch (its final shard),
         // then cutover retires it; the child's own epoch-0 seal follows.
@@ -190,9 +259,10 @@ fn run_scenario(seed: u64) {
             replicas: vec![nid(210), nid(211)],
             object_id: "orders/seed-scenario-L1/1/1/test".to_owned(),
         });
+        let tablet1_splitting_epoch = current_epoch(&nodes, leader, TabletId(1));
         nodes[leader].propose(MetaCommand::CutoverSplit {
             parent: TabletId(1),
-            expected_epoch: Epoch::INITIAL.next(),
+            expected_epoch: tablet1_splitting_epoch,
             cutover_wall_ms: 1_700_000_000_010,
         });
         nodes[leader].propose(MetaCommand::SealStreamShard {
@@ -209,21 +279,49 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after split-child seal").await;
+        // Positive assertion: `CutoverSplit` actually applied — the parent
+        // is gone, both children are `Active` with `split_lineage` rows
+        // naming it, and the child's own seal landed too.
+        {
+            let meta = nodes[leader].metadata();
+            assert!(
+                !meta.tablets.contains_key(&TabletId(1)),
+                "seed={seed}: CutoverSplit should have retired parent tablet 1"
+            );
+            for child in [TabletId(2), TabletId(3)] {
+                let t = meta.tablets.get(&child).unwrap_or_else(|| {
+                    panic!("seed={seed}: child {child:?} should exist after CutoverSplit")
+                });
+                assert_eq!(t.state, TabletState::Active);
+                let lineage = meta.split_lineage.get(&child).unwrap_or_else(|| {
+                    panic!("seed={seed}: split_lineage entry missing for {child:?}")
+                });
+                assert_eq!(lineage.parent, TabletId(1));
+            }
+            assert!(
+                meta.stream_shards.contains_key(&(TabletId(2), 0)),
+                "seed={seed}: child tablet 2's own seal should have landed a row"
+            );
+        }
 
         // A full in-place split round on the split child — proves
         // `BeginSplitInPlace`'s mirror arm (parent state flip + recorded
         // intent + advanced allocator counter, no `Building` rows) and
         // `CutoverSplit`'s in-place branch (children activated straight
         // from the intent, parent tablet+policy DELETED, lineage rows
-        // written) replicate and durably survive like every other command
-        // — when it applies at all; see the NOTE on the first round above,
-        // which applies here too (this round is downstream of a parent that
-        // was never actually created).
+        // written) replicate and durably survive like every other command.
+        //
+        // Tablet 2 is the LEFT child of the first split (range `[start,
+        // 0x80..)`, `intent.children[0]` above) — its own split key must
+        // fall strictly inside THAT range, not the original whole-ring
+        // range, so `0x40..` (not the pre-fix `0xC0..`, which lies past
+        // tablet 2's own end and was silently swallowed by the same
+        // epoch-CAS no-op along with everything else in this round).
+        let tablet2_epoch = current_epoch(&nodes, leader, TabletId(2));
         nodes[leader].propose(MetaCommand::BeginSplitInPlace {
             parent: TabletId(2),
-            // Activated by the cutover above (child epoch bump).
-            expected_epoch: Epoch::INITIAL.next(),
-            split_key: vec![0xC0, 0, 0, 0, 0, 0, 0, 0],
+            expected_epoch: tablet2_epoch,
+            split_key: vec![0x40, 0, 0, 0, 0, 0, 0, 0],
             children: [
                 (TabletId(4), vec![nid(210), nid(211)]),
                 (TabletId(5), vec![nid(210), nid(211)]),
@@ -231,14 +329,45 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after BeginSplitInPlace").await;
+        {
+            let meta = nodes[leader].metadata();
+            let parent = meta.tablets.get(&TabletId(2)).unwrap_or_else(|| {
+                panic!("seed={seed}: parent tablet 2 should still be present while Splitting")
+            });
+            assert_eq!(parent.state, TabletState::Splitting);
+            assert_eq!(parent.epoch, tablet2_epoch.next());
+            let intent = parent.inplace_split.as_ref().unwrap_or_else(|| {
+                panic!("seed={seed}: second-round BeginSplitInPlace should have recorded an intent")
+            });
+            assert_eq!(intent.children[0].id, TabletId(4));
+            assert_eq!(intent.children[1].id, TabletId(5));
+        }
 
+        let tablet2_splitting_epoch = current_epoch(&nodes, leader, TabletId(2));
         nodes[leader].propose(MetaCommand::CutoverSplit {
             parent: TabletId(2),
-            expected_epoch: Epoch::INITIAL.next().next(),
+            expected_epoch: tablet2_splitting_epoch,
             cutover_wall_ms: 1_700_000_000_003,
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after CutoverSplit").await;
+        {
+            let meta = nodes[leader].metadata();
+            assert!(
+                !meta.tablets.contains_key(&TabletId(2)),
+                "seed={seed}: second-round CutoverSplit should have retired tablet 2"
+            );
+            for child in [TabletId(4), TabletId(5)] {
+                let t = meta.tablets.get(&child).unwrap_or_else(|| {
+                    panic!("seed={seed}: child {child:?} should exist after CutoverSplit")
+                });
+                assert_eq!(t.state, TabletState::Active);
+                let lineage = meta.split_lineage.get(&child).unwrap_or_else(|| {
+                    panic!("seed={seed}: split_lineage entry missing for {child:?}")
+                });
+                assert_eq!(lineage.parent, TabletId(2));
+            }
+        }
 
         // The janitor's two-phase reclaim (mark, then remove) — proves
         // `ExpireStreamShards`'s own mirror arm derives a `Put` (the marked
@@ -249,6 +378,17 @@ fn run_scenario(seed: u64) {
         });
         sim.run_for(Duration::from_millis(500));
         assert_cache_matches_engine(&nodes, &engines, seed, "after ExpireStreamShards mark").await;
+        assert!(
+            nodes[leader]
+                .metadata()
+                .stream_shards
+                .get(&(TabletId(1), 0))
+                .unwrap_or_else(|| panic!(
+                    "seed={seed}: (tablet 1, epoch 0) row should still exist to be marked"
+                ))
+                .expired,
+            "seed={seed}: ExpireStreamShards mark should have set expired=true"
+        );
 
         nodes[leader].propose(MetaCommand::ExpireStreamShards {
             rows: vec![(TabletId(1), 0)],
@@ -257,12 +397,24 @@ fn run_scenario(seed: u64) {
         sim.run_for(Duration::from_millis(500));
         assert_cache_matches_engine(&nodes, &engines, seed, "after ExpireStreamShards remove")
             .await;
+        assert!(
+            !nodes[leader]
+                .metadata()
+                .stream_shards
+                .contains_key(&(TabletId(1), 0)),
+            "seed={seed}: ExpireStreamShards remove should have deleted the (tablet 1, epoch 0) row"
+        );
 
         nodes[leader].propose(MetaCommand::DropTableTablets {
             table: "orders".to_string(),
         });
         sim.run_for(Duration::from_secs(1));
         assert_cache_matches_engine(&nodes, &engines, seed, "after drop-table").await;
+        assert_eq!(
+            nodes[leader].metadata().tablets_for_table("orders").count(),
+            0,
+            "seed={seed}: DropTableTablets should have removed every remaining \"orders\" tablet"
+        );
 
         // Crash-and-restart a follower on the same disk *and* the same
         // (durable) engine — recovery rebuilds the cache from the engine's

@@ -15037,6 +15037,29 @@ assumption is an unrelated pre-existing bug, out of scope for a
 test-surface-porting layer with no production-code changes); the
 NOTE left in `apply_engine.rs` at both split call sites points here.
 
+**Fixed for issue #539**: both `BeginSplitInPlace`/`CutoverSplit` rounds in
+`cache_matches_engine_through_a_mixed_scenario_and_a_restart` now read each
+tablet's `expected_epoch` fresh off `metadata()` immediately before
+proposing (the same just-in-time pattern `animusd::ClientCtx::trigger_
+split`'s confirm loop uses) instead of a hardcoded `Epoch::INITIAL`, and
+every step now carries a positive assertion of the command's actual
+effect (state/epoch/intent after `BeginSplitInPlace`; parent-gone +
+children-Active + `split_lineage` after `CutoverSplit`; catalog-row-present/
+expired/removed for `SealStreamShard`/`ExpireStreamShards`; empty
+`tablets_for_table` after `DropTableTablets`) — a full audit of every
+epoch-CAS'd or otherwise legitimately-no-op-capable command in this
+scenario, not just the split. **One thing the epoch fix alone didn't
+uncover, worth generalizing**: `BeginSplitInPlace`'s apply arm evaluates
+its epoch-CAS *before* its F11 token-alignment seatbelt, so the original
+stale-epoch proposal's rejection reason ("epoch mismatch") was correct but
+incomplete — it silently hid a SECOND, independent defect in the same
+scenario (a 1-byte, non-token-aligned split key on a table that already
+had a stream enabled) that only surfaced once the epoch was fixed and the
+apply arm actually reached the next guard. A chain of sequential guard
+checks in one apply arm means fixing whichever one your rejection message
+names does not prove the command now succeeds — only a positive
+post-propose assertion (not just "no longer rejected for reason X") does.
+
 ## Diagnose "my predicate never turns true" by instrumenting the state it READS, not its own bookkeeping (issues #532/#537)
 
 A learner catch-up predicate (`RaftCore::learner_caught_up`, keyed on
