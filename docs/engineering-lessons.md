@@ -16882,3 +16882,147 @@ error, and verify the retried operation's own idempotency contract first
 an already-committed table safe to treat as success) — a blanket retry
 without that check can silently paper over a genuinely different failure
 or double-apply a non-idempotent operation.
+
+## A request/reply relay's receive loop is not optional for the client half either — only for the server half (ADR 0061 rung C3d, `SimRelayClient`)
+
+Building `animus_node::sim_relay::SimRelayClient` (a `Network`-backed
+`RelayClient` implementor, modeled on `animus_cp_data::
+cluster_segment_store`'s own `req_id`/`Pending`-slot correlation) first
+shipped with `serve(handler)` as the thing that spawns the one
+`RELAY_STREAM` receive loop, documented as "a node that never calls this
+can still make outbound `relay()` calls; it just never answers one." That
+sentence is only half right, and the wrong half hid a real bug: **the
+identical receive loop is what demultiplexes an inbound *request* from an
+inbound *reply* on that same stream** (single-consumer, ADR 0026, so both
+directions share one inbox). A node that never calls `serve` never starts
+that loop at all — so a reply to its *own* outbound `relay()` call, sitting
+in its inbox, is never read out and stashed into its `Pending` map either.
+The first four-test suite (round trip, timeout, late-reply-not-matched,
+concurrent requests) had three of four fail with `None` — not a wrong
+answer, no answer ever arrived — because only the *server* side (`relay_a`)
+called `serve`; the *client* side (`relay_b`) never did, on the (false)
+assumption that "client-only" needs no receive loop.
+
+Root cause, stated generally: whenever one wire carries both a call's
+outbound leg and its own inbound reply (true of any request/reply protocol
+riding a single-consumer channel, not just this one), the receive loop that
+demultiplexes them is not a "server-only" concern — every participant that
+ever *originates* a call needs it running too, regardless of whether it
+ever *answers* one. Naming the loop-starter the same thing as "start
+answering" (this code's first-draft `serve`) actively invites the wrong
+mental model. Fixed by separating the two lifecycles: the constructor
+(`SimRelayClient::new`) now spawns the receive loop unconditionally (every
+node that exists needs it, the same way every node needs a socket bound
+before it can either send or receive on a real one), and `serve` was
+narrowed to *only* install a handler into an already-running loop's shared
+`Arc<Mutex<Option<Handler>>>` — a node that never calls `serve` still
+receives its own replies correctly; it just answers an inbound request with
+a fixed "no handler installed" error instead of ever hanging.
+
+**General form**: when designing (or reviewing) a request/reply layer over
+a shared duplex channel, ask "does the client half need the same receive
+loop the server half needs?" before assuming the answer is obviously yes —
+it's easy to reason about the server's own inbox and forget that a client
+awaiting a reply is *also* a reader of that same inbox, just for a
+different message shape. A test that drives a fixture built the "server
+only starts the loop" way will show every symptom of a missing reply
+(`None`, or a timeout that only ever fires) with no compiler error and no
+panic — the loop-driven poll below simply times out silently — so this
+class of bug is functional-tests-only to catch, never a build-time one.
+
+## A helper's own opaque id encoding must not be round-tripped through `Display`/`FromStr` when a plain accessor already avoids it (ADR 0061 rung D1, `SimCluster`)
+
+Building `SimCluster` (a multi-node `SimEnv` fixture over `ClientCtx<SimEnv,
+SimRelayClient<SimEnv>>`, ADR 0061 rung D1), `leader_of(tablet)` was written
+to return `Option<NodeId>` (matching the rung's own suggested signature),
+and several early test call sites then did the obvious-looking thing to get
+back a plain node index for every *other* method on the fixture (`put`/
+`get`/`crash`/`restart`, all of which take a `u64` index): `leader_of(t)
+.expect(..).to_string().parse::<u64>().expect(..)`. Every one of those
+calls panicked with `ParseIntError`. `animus_env::nid(n)` encodes a node id
+as the literal string `"n{n}"` (`NodeId::new_unchecked(format!("n{n}"))`),
+not the bare decimal `n` — a `Display`-then-`parse::<u64>` round trip is
+therefore not the inverse of `nid` at all, it's parsing a string that
+starts with a letter as an integer.
+
+The fix wasn't to fix the parsing (strip the leading `n` and parse the
+rest) — that would work, but it permanently couples every caller of this
+fixture to `nid`'s own concrete string format, which is `animus-env`'s
+private implementation choice, not part of any contract `SimCluster`
+should be re-exposing. Instead, `leader_of` grew a sibling,
+`leader_index_of(tablet) -> Option<u64>`, which is the *same* internal
+`replicas.iter().copied().find(..)` search `leader_of` already runs — it
+simply returns the `u64` it already has in hand, before wrapping it in
+`nid(..)` for `leader_of`'s own return, instead of throwing that plain
+index away and asking a caller to reconstruct it by parsing a string that
+was never designed to be parsed back.
+
+**General form**: when a type's own id encoding is a deliberately opaque
+implementation detail (a struct wrapping a `String`, an internal counter
+formatted for a wire, a hash), never let API design push a caller toward
+`Display`-then-`FromStr` as an implicit "get the underlying value back"
+idiom — that only works when the type's author *intended* the string
+representation to be the canonical roundtrip encoding, and nothing marks
+that intent at the call site (the code compiles and looks correct; it
+simply panics or silently misparses at runtime, exactly the "no compiler
+error, only a runtime symptom" class of bug the sibling `SimRelayClient`
+receive-loop entry above also describes). If a caller plausibly needs the
+value in another shape, expose an accessor that returns that shape
+directly from wherever the value is already in hand — never make the
+caller reconstruct it by parsing the type's own display format.
+
+## `block_on`ing a `SimEnv`-driven future is only sound when nothing inside it needs the simulator's own clock to advance (ADR 0061 rung D1 step 3, `sim_cluster_corpus`)
+
+Building the `SimCluster` cycles/durability corpus's `delete` probe
+(`run_delete_probe`, `crates/animusd/src/sim_cluster_corpus.rs`), the
+first draft drove `SimClusterHandle::put`/`get`/`delete` — each an `async
+fn` that internally calls `ClientCtx::cp_kind_write_raw`/`cp_get` — via a
+bare `futures::executor::block_on`, mirroring a pattern that already
+works elsewhere in this exact corpus family: `raftkv_linearizable.rs`'s
+own `final_state` does `block_on(node.local_get(&key_bytes(key)))`
+directly, with no `Simulator::run_for` anywhere near it, and that has
+always been fine. The difference wasn't visible from the call site's
+shape — both are `block_on(some_async_fn(..))` — and cost a fully hung
+`cargo test` run (it never returned) before it was found.
+
+The reason one is sound and the other isn't: `RaftKvNode::local_get` is a
+pure local-engine read — it resolves on its very first `poll`, so
+`block_on`'s busy-poll loop returns on the first iteration regardless of
+whether anything is advancing `SimEnv`'s virtual clock. `ClientCtx::
+cp_kind_write_raw`/`cp_get`, by contrast, internally `.await` real
+`env.sleep(..)`-paced route/confirm-poll loops (`cp_route`'s own
+`CLIENT_TIMEOUT` deadline, the exponential confirm-poll backoff) — a
+`sleep` future only resolves when `SimEnv`'s cooperative executor
+(`Simulator::run_for`/`run_until`) steps virtual time past its deadline
+and wakes it. `block_on` on a plain thread never does that; it just polls
+the same still-`Pending` future forever. Nothing panics, nothing errors,
+nothing times out — the process simply never returns, which under `cargo
+test` looks identical to "still compiling" until someone kills it.
+
+**Fix**: drive the op the way every other synchronous (non-spawned-task)
+caller in this fixture already does — `SimCluster`'s own `put`/`get`/
+`delete`/`scan` (`&mut self`, spawn the future via `env.spawn_task` onto
+the target node's own env, then `Simulator::run_for` a bounded budget,
+then read the result back out of a shared slot — `spawn_and_capture`).
+`run_delete_probe` now takes `&mut SimCluster` and calls those instead of
+`SimClusterHandle` + `block_on`. A client task spawned via `env.spawn_task`
+that itself `.await`s a `SimClusterHandle` op directly is a *third*, also
+sound, shape — the corpus's own outer scenario runner is what drives
+`Simulator::run_for` in that case, exactly once, covering every
+concurrently spawned task's needs at once.
+
+**General form**: before reaching for `futures::executor::block_on` (or
+any other real-thread blocking primitive) against a `SimEnv`-backed
+future, ask whether anything inside that future's own call chain
+`.await`s `env.sleep()`/a network round trip/anything else gated on the
+simulator's virtual clock. If yes, `block_on` alone is unsound — the
+future needs either `spawn_task` + a concurrently-running `Simulator::
+run_for`/`run_until` (this fixture's own `spawn_and_capture` idiom), or to
+be `.await`ed from inside a future that is *itself* being driven by one.
+If the answer is "no, it's a pure synchronous computation with no real
+wait," `block_on` alone (as `raftkv_linearizable.rs`'s own `final_state`
+already does) is fine — but that soundness rests entirely on the callee's
+own implementation staying that way, so a doc comment at the call site
+naming the assumption (as this fixture's own `run_delete_probe`/
+`final_state` docs now do) is worth writing down rather than trusting
+memory the next time either function's own internals change.

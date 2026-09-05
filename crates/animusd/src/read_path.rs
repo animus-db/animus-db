@@ -11,7 +11,6 @@ use animus_tablet::{KeyRange, TabletId};
 use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpGroup, CpRoute, ReadConsistency,
     SCHEMA_POLL_INTERVAL, STALE_READ_FORWARD_TIMEOUT, SnapshotRead, decide,
-    relay_request_with_timeout,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -103,15 +102,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// retry. One connection, one reply, [`STALE_READ_FORWARD_TIMEOUT`],
     /// no retries, no waiting out an election.
     async fn relay_stale_read(&self, addr: String, request: ClientRequest) -> ClientResponse {
-        relay_request_with_timeout(
-            addr,
-            &ClientRequest::Forwarded {
-                request: Box::new(request),
-                traceparent: crate::otel::current_traceparent(),
-            },
-            STALE_READ_FORWARD_TIMEOUT,
-        )
-        .await
+        self.relay
+            .relay(
+                addr,
+                &ClientRequest::Forwarded {
+                    request: Box::new(request),
+                    traceparent: crate::otel::current_traceparent(),
+                },
+                STALE_READ_FORWARD_TIMEOUT,
+            )
+            .await
     }
 
     /// One attempt at serving an **eventually-consistent** point read of
