@@ -267,6 +267,15 @@ already has.
   observed skew. A hot tablet under a table-wide budget divided evenly
   may throttle before the table's *aggregate* provisioned capacity is
   exhausted — a real, accepted limitation, not an oversight.
+  **2026-09-05 note**: the *tablet-count* half of this gap — ensuring a
+  table's tablet count is large enough for its declared throughput in the
+  first place, so the per-tablet share this ADR divides isn't funneled
+  through a single tablet indefinitely — is closed by
+  [ADR 0067](0067-throughput-derived-minimum-tablet-count.md) (W-08b), a
+  fourth `auto_split_loop` trigger deriving a minimum tablet count from
+  `ProvisionedThroughput` (DynamoDB's own `ceil(RCU/3000 + WCU/1000)`
+  formula). Adaptive, observed-skew-driven rebalancing of the share itself
+  remains out of scope, unchanged by that ADR.
 - **Auto-scaling** (DynamoDB's `ApplicationAutoScaling`-driven provisioned
   capacity adjustment) — a table's `ProvisionedThroughput` is a value an
   operator sets via `UpdateTable`, never one this codebase adjusts on its

@@ -68,7 +68,37 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
         let mut nodes = Vec::new();
         let mut failed = false;
         for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+            // ADR 0067 (W-08b): this file's own tests deliberately create
+            // tables with huge `ProvisionedThroughput` values (to drive the
+            // *throttle* bucket's arithmetic, not to test the auto-split
+            // trigger) — `run_node`'s own default per-tablet capacity
+            // ceilings (3000 RCU / 1000 WCU) would otherwise derive a huge
+            // minimum tablet count for those tables and repeatedly split
+            // them mid-test. `run_node_with_cluster_settings` with an
+            // explicit `Some(0)`/`Some(0)` disables that trigger entirely
+            // (see `TabletCapacityCeilings`'s own doc) while keeping every
+            // other knob at `run_node`'s own defaults.
+            match animusd::run_node_with_cluster_settings(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
+                Duration::ZERO,
+                None,
+                None,
+                None,
+                animusd::BackupStoreConfig::default(),
+                None,
+                None,
+                Some(0),
+                Some(0),
+            )
+            .await
+            {
                 Ok(node) => nodes.push(node),
                 Err(_) => {
                     failed = true;
@@ -123,6 +153,10 @@ async fn bring_up_with_throttle_defaults(
             cluster_settings: Some(animusd::config::ClusterSettings {
                 throttle_read_units,
                 throttle_write_units,
+                // ADR 0067 (W-08b): disabled here too — see `bring_up`'s
+                // identical comment.
+                tablet_max_read_units: Some(0),
+                tablet_max_write_units: Some(0),
                 ..Default::default()
             }),
         };
@@ -145,6 +179,8 @@ async fn bring_up_with_throttle_defaults(
                 animusd::BackupStoreConfig::default(),
                 throttle_read_units,
                 throttle_write_units,
+                Some(0),
+                Some(0),
             )
             .await
             {

@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
 mod index_drain;
+mod min_tablets;
 pub mod otel;
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -4017,6 +4018,8 @@ impl BoundNode {
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -4101,6 +4104,8 @@ impl BoundNode {
         pitr_snapshot_cadence: Duration,
         throttle_read_units: Option<u64>,
         throttle_write_units: Option<u64>,
+        tablet_max_read_units: Option<u64>,
+        tablet_max_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4621,26 +4626,32 @@ impl BoundNode {
             pitr_janitor::DEFAULT_PITR_RETENTION,
         )));
 
-        // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
-        // it leads once it exceeds **any** configured threshold (it checks
+        // Auto-split loop (Phase 2.4 / ADR 0034): a node splits a tablet it
+        // leads once it exceeds **any** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
         // Growth PR3 Fork F: `auto_split_change_rate` joins the same
         // any-trigger-fires gate, opt-in and streamed-tables-only. W-09:
         // `auto_split_ops_rate` joins it too, opt-in and applicable to any
-        // table (streamed or not).
-        if auto_split_bytes_threshold.is_some()
-            || auto_split_change_rate.is_some()
-            || auto_split_ops_rate.is_some()
-        {
-            tasks.push(tokio::spawn(auto_split_loop(
-                ctx.clone(),
-                AutoSplitThresholds {
-                    bytes: auto_split_bytes_threshold,
-                    change_rate: auto_split_change_rate,
-                    ops_rate: auto_split_ops_rate,
+        // table (streamed or not). ADR 0067 (W-08b): the fourth arm — a
+        // provisioned table's throughput-derived minimum tablet count — is
+        // **not** opt-in (its ceilings default on), so the loop is now
+        // spawned unconditionally; the loop's own first check inside each
+        // tick skips all the work when nothing at all is configured (see
+        // `auto_split_loop`'s own doc).
+        tasks.push(tokio::spawn(auto_split_loop(
+            ctx.clone(),
+            AutoSplitThresholds {
+                bytes: auto_split_bytes_threshold,
+                change_rate: auto_split_change_rate,
+                ops_rate: auto_split_ops_rate,
+                tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings {
+                    max_read_units: tablet_max_read_units
+                        .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_READ_UNITS),
+                    max_write_units: tablet_max_write_units
+                        .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_WRITE_UNITS),
                 },
-            )));
-        }
+            },
+        )));
         // The DynamoDB JSON/HTTP endpoint — data-role-only, unlike the
         // plain client server + admin endpoint (already spawned by
         // `spawn_common_tail`, which every node shape runs).
@@ -5317,6 +5328,10 @@ impl BoundControlNode {
             // own doc on `AdminInfo`.
             throttle_read_units: None,
             throttle_write_units: None,
+            // A control-only node never runs `auto_split_loop` either (see
+            // `auto_split_ops_rate_threshold` above) — these two report the
+            // production defaults purely for shape parity, never actually
+            // consulted on this role.
             // A control-only node never provisions a backup/segment store,
             // never runs the tablet-host reconciler (nothing to quiesce),
             // and never binds the dynamo listener (so SigV4 enforcement
@@ -5712,6 +5727,8 @@ impl BoundDataNode {
             BackupStoreConfig::default(),
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -5760,6 +5777,8 @@ impl BoundDataNode {
         backup_store_config: BackupStoreConfig,
         throttle_read_units: Option<u64>,
         throttle_write_units: Option<u64>,
+        tablet_max_read_units: Option<u64>,
+        tablet_max_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -6042,19 +6061,22 @@ impl BoundDataNode {
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
 
-        if auto_split_bytes_threshold.is_some()
-            || auto_split_change_rate.is_some()
-            || auto_split_ops_rate.is_some()
-        {
-            tasks.push(tokio::spawn(auto_split_loop(
-                ctx.clone(),
-                AutoSplitThresholds {
-                    bytes: auto_split_bytes_threshold,
-                    change_rate: auto_split_change_rate,
-                    ops_rate: auto_split_ops_rate,
+        // ADR 0067 (W-08b): unconditional spawn — see the combined-mode
+        // spawn site's identical comment above.
+        tasks.push(tokio::spawn(auto_split_loop(
+            ctx.clone(),
+            AutoSplitThresholds {
+                bytes: auto_split_bytes_threshold,
+                change_rate: auto_split_change_rate,
+                ops_rate: auto_split_ops_rate,
+                tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings {
+                    max_read_units: tablet_max_read_units
+                        .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_READ_UNITS),
+                    max_write_units: tablet_max_write_units
+                        .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_WRITE_UNITS),
                 },
-            )));
-        }
+            },
+        )));
         tasks.push(tokio::spawn(dynamo::serve(
             self.dynamo_listener,
             ctx.clone(),
@@ -10131,6 +10153,15 @@ struct AutoSplitThresholds {
     /// hot-but-small tablet under heavy write load, with no byte/key-count
     /// signal ever crossing threshold, can now still split.
     ops_rate: Option<u64>,
+    /// ADR 0067 (W-08b): the per-tablet capacity ceilings a provisioned
+    /// table's minimum tablet count is derived against
+    /// (`min_tablets::min_tablets_for`). **Not opt-in** — unlike the three
+    /// fields above, this is always in effect (at its production default,
+    /// `min_tablets::TabletCapacityCeilings::default()`, when no CLI flag/
+    /// config field overrides it) for any table with its own
+    /// `ProvisionedThroughput`; a table with no `throughput` is never
+    /// touched by this trigger regardless.
+    tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings,
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
@@ -10194,8 +10225,36 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
     let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    // ADR 0067 (W-08b): the fourth arm's own ceilings are always "on" (a
+    // production default, never `None`), so unlike the three fields below
+    // this can't be used to decide whether the loop has anything to do at
+    // all — `ctx.any_table_throughput` (checked inside the loop, below) is
+    // what answers that instead. Computed once, outside the loop: whether
+    // *any* of the first three (genuinely opt-in) triggers is configured.
+    let any_byte_rate_trigger_configured = thresholds.bytes.is_some()
+        || thresholds.change_rate.is_some()
+        || thresholds.ops_rate.is_some();
     loop {
         tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+
+        // ADR 0067 (W-08b): when NOTHING at all is configured — no byte/
+        // change-rate/ops-rate threshold, and no table anywhere in this
+        // node's last-observed `Metadata` carries its own
+        // `ProvisionedThroughput` — this whole tick is a guaranteed no-op
+        // for every one of the four arms. Skip even the `effective_
+        // metadata()` read (a `Mutex` lock + a deep clone of the whole
+        // tablet map/schema catalog/backup catalog, not a cheap `Arc`
+        // bump — see `ClientCtx::any_table_throughput`'s own doc for why
+        // this exact flag exists) rather than paying it every
+        // `AUTO_SPLIT_INTERVAL` on a cluster that never opts into any
+        // trigger — the common case today.
+        if !any_byte_rate_trigger_configured
+            && !ctx
+                .any_table_throughput
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            continue;
+        }
 
         // `effective_metadata()` so a mirror-fed node (ADR 0030 / ADR 0035 PR4)
         // sees the live tablet map, not an empty local core's. Held for the
@@ -10326,6 +10385,127 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                         tablet = tablet.0,
                         ?other,
                         "auto_split: split did not commit"
+                    );
+                }
+            }
+        }
+
+        // ADR 0067 (W-08b): fourth trigger, **per table** rather than
+        // per tablet like the three above — a provisioned table whose
+        // current `Active` tablet count sits below its throughput-derived
+        // minimum forks its widest led tablet, at most once per table per
+        // tick (convergence: `min - 1` ticks on a single-leader
+        // deployment, since only one split happens per table per tick
+        // regardless of tablet count; faster when a table's tablets are
+        // spread across several leaders, since each node's own tick
+        // independently evaluates and can split whichever tablet it
+        // leads). Deliberately its own pass over `meta.tablets`, after the
+        // per-tablet loop above, rather than folded into it — that loop's
+        // early per-tablet `continue`s are keyed to one tablet's own
+        // hotness; this trigger's "is this TABLE under-provisioned"
+        // question needs every one of a table's tablets counted together
+        // first.
+        let mut tablets_by_table: BTreeMap<String, Vec<TabletId>> = BTreeMap::new();
+        for (&id, t) in meta
+            .tablets
+            .iter()
+            .filter(|(_, t)| t.state == TabletState::Active)
+        {
+            if let Some(table) = &t.table {
+                tablets_by_table.entry(table.clone()).or_default().push(id);
+            }
+        }
+        for (table, tablet_ids) in tablets_by_table {
+            // Tables without their own `ProvisionedThroughput` are never
+            // touched by this trigger — see `AutoSplitThresholds::
+            // tablet_capacity_ceilings`'s own doc.
+            let Some(throughput) = meta.table_throughput(&table) else {
+                continue;
+            };
+            let min = min_tablets::min_tablets_for(throughput, thresholds.tablet_capacity_ceilings);
+            if (tablet_ids.len() as u64) >= min {
+                continue;
+            }
+            // Pick the WIDEST (by token range) `Active` tablet of this
+            // table that this node currently leads and isn't in cooldown
+            // — widest so each fork halves the ring as evenly as
+            // possible rather than lopsidedly. Unlike the byte/rate arms above,
+            // deliberately does NOT skip a quiesced candidate: this
+            // trigger fires on a *configured* minimum, not on activity —
+            // a provisioned-but-idle table still needs its tablets, and
+            // reading a quiesced group's own local pairs below never
+            // wakes it (ADR 0048 fork F); the propose this trigger makes
+            // if one is chosen lets the CP-data host reconciler un-quiesce
+            // it exactly as any other split would.
+            let mut best: Option<(TabletId, u128, CpGroup)> = None;
+            for id in tablet_ids {
+                if matches!(last_triggered.get(&id), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+                {
+                    continue;
+                }
+                let Some(leader) = ctx.edge.cp_leader(id) else {
+                    continue;
+                };
+                let Some(t) = meta.tablets.get(&id) else {
+                    continue;
+                };
+                let width = min_tablets::token_range_width(&t.range);
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best_width, _)| width > *best_width)
+                {
+                    best = Some((id, width, leader));
+                }
+            }
+            let Some((tablet, _, leader)) = best else {
+                continue;
+            };
+            let pairs = leader.local_pairs().await;
+            let split_key = if pairs.len() >= 2 {
+                // Real data exists: bisect it evenly, same as the other
+                // three triggers.
+                decide::byte_weighted_median(&pairs)
+            } else {
+                // An empty or single-row tablet — the common case for a
+                // table that just declared `ProvisionedThroughput` at
+                // `CreateTable` time, before any write — has no real key
+                // for `byte_weighted_median` to bisect (the byte/rate
+                // triggers above never even reach a tablet this sparse,
+                // since it can never cross a byte/rate threshold).
+                // Synthesize a token-midpoint split key instead so a
+                // provisioned-but-empty table still reaches its
+                // configured minimum tablet count up front, matching
+                // DynamoDB's own up-front partitioning — see
+                // `min_tablets::midpoint_split_key`'s own doc.
+                let Some(t) = meta.tablets.get(&tablet) else {
+                    continue;
+                };
+                match min_tablets::midpoint_split_key(&t.range) {
+                    Some(k) => k,
+                    // A single-token range: the accepted Fork E
+                    // single-token hot-partition limit — no interior
+                    // split point exists regardless of data.
+                    None => continue,
+                }
+            };
+            last_triggered.insert(tablet, tokio::time::Instant::now());
+            let span = tracing::info_span!(
+                "auto_split_min_tablets",
+                tablet = tablet.0,
+                table = %table
+            );
+            let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
+            match &response {
+                ClientResponse::PutOk => {
+                    ctx.env.metrics().incr(Metric::AutoSplitMinTablets);
+                }
+                ClientResponse::Error(msg) if msg == SPLIT_KEY_NOT_TOKEN_VIABLE => {}
+                other => {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        table = %table,
+                        ?other,
+                        "auto_split_min_tablets: split did not commit"
                     );
                 }
             }
@@ -10976,6 +11156,8 @@ pub async fn start_cluster_with(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11012,6 +11194,8 @@ pub async fn start_cluster_with_auto_split_bytes(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11043,6 +11227,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
         None,
         None,
     )
@@ -11085,6 +11271,8 @@ pub async fn start_cluster_with_streams(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11123,6 +11311,8 @@ pub async fn start_cluster_with_growth(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11158,6 +11348,8 @@ pub async fn start_cluster_with_quiesce_after(
         quiesce_after,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
         None,
         None,
     )
@@ -11209,6 +11401,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -11225,6 +11419,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         backup_store_config,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     )
     .await
 }
@@ -11245,6 +11441,8 @@ async fn start_cluster_inner(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -11327,6 +11525,8 @@ async fn start_cluster_inner(
                 pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
                 throttle_read_units,
                 throttle_write_units,
+                tablet_max_read_units,
+                tablet_max_write_units,
             )
             .await?;
         nodes.push(node);
@@ -11593,6 +11793,8 @@ pub async fn start_split_cluster_with_growth(
                 BackupStoreConfig::default(),
                 None,
                 None,
+                None,
+                None,
             )
             .await?,
         );
@@ -11730,6 +11932,8 @@ pub async fn run_node_with_streams_and_quiesce_after(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11774,6 +11978,8 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
+        None,
+        None,
         None,
         None,
     )
@@ -11823,6 +12029,8 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11866,6 +12074,8 @@ pub async fn run_node_with_cluster_settings(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -11885,6 +12095,8 @@ pub async fn run_node_with_cluster_settings(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     )
     .await
 }
@@ -11937,6 +12149,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     pitr_snapshot_cadence: Duration,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12010,6 +12224,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             pitr_snapshot_cadence,
             throttle_read_units,
             throttle_write_units,
+            tablet_max_read_units,
+            tablet_max_write_units,
         )
         .await
 }
@@ -12047,6 +12263,8 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
         None,
         None,
     )
@@ -12241,6 +12459,8 @@ pub async fn run_node_data(
         SegmentStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -12278,6 +12498,8 @@ pub async fn run_node_data_with_streams(
         Duration::ZERO,
         stream_seal_knobs,
         segment_store_config,
+        None,
+        None,
         None,
         None,
     )
@@ -12324,6 +12546,8 @@ pub async fn run_node_data_with_cluster_settings(
     segment_store_config: SegmentStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12418,6 +12642,8 @@ pub async fn run_node_data_with_cluster_settings(
             BackupStoreConfig::default(),
             throttle_read_units,
             throttle_write_units,
+            tablet_max_read_units,
+            tablet_max_write_units,
         )
         .await
 }
@@ -12993,6 +13219,8 @@ async fn finish_data_join(
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
+            None,
+            None,
             None,
             None,
         )

@@ -3561,6 +3561,8 @@ mod stream_sealer_tests {
                 crate::pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("bring up single node with streams + quiescence");

@@ -407,3 +407,25 @@ caller's own `env.now()` reading as an explicit `Nanos` parameter rather
 than reading a clock internally, and both gained a `SimEnv`-driven unit
 test over virtual time (no real sleep) proving the EWMA converges toward a
 sustained rate and decays once observations slow or stop.
+
+## Amendment (2026-09-05, W-08b): a fourth trigger, driven by configuration rather than observed activity
+
+[ADR 0067](0067-throughput-derived-minimum-tablet-count.md) adds a fourth
+`auto_split_loop` arm, distinct in kind from the three above (bytes,
+change-rate, ops-rate all fire on *observed* activity crossing a
+threshold): a provisioned table's minimum tablet count is *derived* from
+its declared `ProvisionedThroughput` (ADR 0065) via DynamoDB's own
+up-front partition-sizing formula, `ceil(RCU/3000 + WCU/1000)`, and this
+arm forks the table's widest currently-led tablet, at most once per table
+per tick, whenever the table's current `Active` tablet count sits below
+that derived minimum. Tables with no declared throughput are never touched
+by it. Its own per-tablet ceilings (`--tablet-max-read-units`/
+`--tablet-max-write-units`, DynamoDB's own 3000/1000 defaults) are — unlike
+every trigger above — **on by default**, not opt-in; `auto_split_loop`
+itself is correspondingly now spawned unconditionally rather than gated on
+at least one trigger being configured, with a cheap lock-free "is anything
+at all configured" check as the very first statement of each tick so an
+unprovisioned cluster's added cost stays one atomic load per interval. See
+ADR 0067 for the full design, including how it reaches a legal split key
+on a just-provisioned, still-empty tablet (a case the three triggers above
+structurally never encounter).

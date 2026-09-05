@@ -19,11 +19,12 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0067** (0066 is
-[SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's design of record —
-S-02 landed 2026-09-05; 0065 is [Per-table throttling](adr/0065-per-table-throttling.md),
-W-08's — W-08 landed 2026-09-05 too. Both roadmap sections are removed per
-this document's own maintenance rule above).
+The next free ADR number at the time of writing is **0068** (0065 is
+[Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
+record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
+0067 is [Throughput-derived minimum tablet count](adr/0067-throughput-derived-minimum-tablet-count.md),
+W-08b's. All three landed 2026-09-05 and their roadmap sections are removed
+per this document's own maintenance rule above).
 
 ---
 
@@ -297,6 +298,7 @@ wave are independent and can run in parallel.
 | 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
 | — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
+| — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | U-05, U-07, U-08(ii) | U-05 after its members panel |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |

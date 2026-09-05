@@ -216,9 +216,10 @@ impl TlsSection {
 ///   the control-plane **leader** (the segment janitor's own gate) — a
 ///   data-only node's `ControlHandle` is always `Remote`, so it never runs
 ///   that loop and ignores the field too.
-/// - The other eight fields (`auto_split_bytes`, `auto_split_change_rate`,
+/// - The other ten fields (`auto_split_bytes`, `auto_split_change_rate`,
 ///   `auto_split_ops_rate`, `quiesce_after_secs`, `stream_seal_bytes`,
-///   `stream_seal_age_secs`, `throttle_read_units`, `throttle_write_units`)
+///   `stream_seal_age_secs`, `throttle_read_units`, `throttle_write_units`,
+///   `tablet_max_read_units`, `tablet_max_write_units`)
 ///   apply to any data-hosting node (combined or data-only).
 ///
 /// A CLI flag naming the same knob **and** a config file's `cluster_
@@ -279,6 +280,29 @@ pub struct ClusterSettings {
     /// [`throttle_read_units`](Self::throttle_read_units).
     #[serde(default)]
     pub throttle_write_units: Option<u64>,
+    /// `--tablet-max-read-units N` (ADR 0067, W-08b): the per-tablet
+    /// **read**-capacity-units ceiling used to derive a provisioned table's
+    /// minimum tablet count — DynamoDB's own partition read ceiling.
+    /// `None` (the default) resolves to
+    /// [`DEFAULT_TABLET_MAX_READ_UNITS`](crate::DEFAULT_TABLET_MAX_READ_UNITS)
+    /// (3000); an explicit `0` means "no ceiling in this dimension" (reads
+    /// contribute nothing to the derived minimum). Unlike
+    /// `throttle_read_units`, this knob is **not** an opt-in — it is always
+    /// in effect (at its default) for any table with its own
+    /// `ProvisionedThroughput` set, mirroring `--quiesce-after`'s own
+    /// "default ON, `0` disables" shape rather than `throttle_read_units`'s
+    /// "default off" one.
+    #[serde(default)]
+    pub tablet_max_read_units: Option<u64>,
+    /// `--tablet-max-write-units N` (ADR 0067, W-08b): the write-capacity-
+    /// units sibling of
+    /// [`tablet_max_read_units`](Self::tablet_max_read_units). `None`
+    /// resolves to
+    /// [`DEFAULT_TABLET_MAX_WRITE_UNITS`](crate::DEFAULT_TABLET_MAX_WRITE_UNITS)
+    /// (1000); an explicit `0` disables the write dimension of the derived
+    /// minimum.
+    #[serde(default)]
+    pub tablet_max_write_units: Option<u64>,
 }
 
 /// A whole-cluster configuration shared (identically) by every node's process.
@@ -732,6 +756,8 @@ mod tests {
             stream_retention_secs: Some(86_400),
             throttle_read_units: Some(50),
             throttle_write_units: Some(25),
+            tablet_max_read_units: Some(100),
+            tablet_max_write_units: Some(100),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -761,6 +787,8 @@ mod tests {
         assert_eq!(settings.auto_split_ops_rate, None);
         assert_eq!(settings.throttle_read_units, None);
         assert_eq!(settings.throttle_write_units, None);
+        assert_eq!(settings.tablet_max_read_units, None);
+        assert_eq!(settings.tablet_max_write_units, None);
     }
 
     // --- `tls` (ADR 0064, S-01 commit 2) ----------------------------------
