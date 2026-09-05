@@ -737,6 +737,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 };
                 let meta = self.effective_metadata();
                 match dynamo::kind_write_item_at_leader::<E, R>(
+                    self,
                     &leader,
                     &meta,
                     &table,

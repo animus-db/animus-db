@@ -2331,6 +2331,13 @@ pub(crate) struct AdminInfo {
     /// tablet as "over threshold, about to split" without hardcoding the
     /// value.
     pub(crate) auto_split_bytes_threshold: Option<u64>,
+    /// The `--auto-split-ops-rate RATE` threshold (W-09, ADR 0034
+    /// amendment), if any — the request-rate sibling of
+    /// [`auto_split_bytes_threshold`](Self::auto_split_bytes_threshold),
+    /// surfaced on `/admin/config` and `/admin/metrics` the same way.
+    /// `None` on a control-only node (never runs `auto_split_loop`) or a
+    /// role/deployment that didn't set the flag/config knob.
+    pub(crate) auto_split_ops_rate_threshold: Option<u64>,
     /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
     /// root path — see [`StoreView`]. `None` on a control-only node: it
     /// never provisions one ([`BoundControlNode::start_control_with`] takes
@@ -3892,6 +3899,7 @@ impl BoundNode {
             segment_store_config,
             stream_retention,
             None,
+            None,
             Duration::ZERO,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
@@ -3963,6 +3971,7 @@ impl BoundNode {
         segment_store_config: SegmentStoreConfig,
         stream_retention: Duration,
         auto_split_change_rate: Option<u64>,
+        auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
@@ -4026,6 +4035,7 @@ impl BoundNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            auto_split_ops_rate_threshold: auto_split_ops_rate,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             quiesce_after_ms: (!quiesce_after.is_zero())
@@ -4178,6 +4188,7 @@ impl BoundNode {
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            request_rates: RequestRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -4484,16 +4495,22 @@ impl BoundNode {
         )));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
-        // it leads once it exceeds **either** configured threshold (it checks
+        // it leads once it exceeds **any** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
         // Growth PR3 Fork F: `auto_split_change_rate` joins the same
-        // either-triggers-fires gate, opt-in and streamed-tables-only.
-        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
+        // any-trigger-fires gate, opt-in and streamed-tables-only. W-09:
+        // `auto_split_ops_rate` joins it too, opt-in and applicable to any
+        // table (streamed or not).
+        if auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+            || auto_split_ops_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
+                    ops_rate: auto_split_ops_rate,
                 },
             )));
         }
@@ -5135,6 +5152,10 @@ impl BoundControlNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold: None,
+            // A control-only node never runs `auto_split_loop` at all (no
+            // CP-data tablet to split) — see `auto_split_ops_rate_threshold`'s
+            // own doc on `AdminInfo`.
+            auto_split_ops_rate_threshold: None,
             // A control-only node never provisions a backup/segment store,
             // never runs the tablet-host reconciler (nothing to quiesce),
             // and never binds the dynamo listener (so SigV4 enforcement
@@ -5520,6 +5541,7 @@ impl BoundDataNode {
             stream_seal_knobs,
             segment_store_config,
             None,
+            None,
             Duration::ZERO,
             None,
             BackupStoreConfig::default(),
@@ -5565,6 +5587,7 @@ impl BoundDataNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
+        auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
@@ -5610,6 +5633,7 @@ impl BoundDataNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            auto_split_ops_rate_threshold: auto_split_ops_rate,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             // S-06 wired `quiesce_after` through this data-only path (via
@@ -5668,6 +5692,7 @@ impl BoundDataNode {
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            request_rates: RequestRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -5843,12 +5868,16 @@ impl BoundDataNode {
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
 
-        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
+        if auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+            || auto_split_ops_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
+                    ops_rate: auto_split_ops_rate,
                 },
             )));
         }
@@ -6604,6 +6633,63 @@ fn build_backup_store(
     }
 }
 
+/// A per-tablet EWMA-smoothed rate sample — the shared storage shape behind
+/// both [`ChangeRateTracker`] and [`RequestRateTracker`] (W-09, ADR 0034
+/// amendment). A "rate" here is always derived the same way regardless of
+/// what is being counted: keep the last **total** observed value (a
+/// monotonically non-decreasing counter — bytes for the change tracker, a
+/// per-tablet op count for the request tracker) and the [`Nanos`] instant it
+/// was observed at, so the next observation's `(new_total - last_total) /
+/// elapsed` gives an instantaneous rate that [`RateSample::advance`] folds
+/// into a smoothed EWMA.
+#[derive(Clone, Copy)]
+struct RateSample {
+    rate: f64,
+    last_value: u64,
+    last_at: Nanos,
+}
+
+impl RateSample {
+    /// Fold one more observation (`value_now`, the counter's new total, at
+    /// `now`) into `prev`'s smoothed rate, returning the freshly-updated
+    /// sample. `prev: None` means "never observed before" — the rate starts
+    /// at `0.0` (there is no prior instant to compute an elapsed-time delta
+    /// against). `alpha` is the EWMA smoothing factor: closer to 1.0 tracks
+    /// the latest observation more closely (noisier); closer to 0.0 smooths
+    /// harder (slower to react).
+    fn advance(prev: Option<RateSample>, value_now: u64, now: Nanos, alpha: f64) -> RateSample {
+        let rate = match prev {
+            None => 0.0,
+            Some(p) => {
+                let elapsed = now.duration_since(p.last_at).as_secs_f64();
+                if elapsed <= 0.0 {
+                    p.rate
+                } else {
+                    let instantaneous = value_now.saturating_sub(p.last_value) as f64 / elapsed;
+                    alpha * instantaneous + (1.0 - alpha) * p.rate
+                }
+            }
+        };
+        RateSample {
+            rate,
+            last_value: value_now,
+            last_at: now,
+        }
+    }
+}
+
+/// The EWMA smoothing factor both [`ChangeRateTracker::observe`] and
+/// [`RequestRateTracker::observe`] use — see [`RateSample::advance`]'s own
+/// doc for what "closer to 1.0/0.0" means. Chosen to settle within a handful
+/// of ticks (the change tracker's own `INDEX_DRAIN_INTERVAL`, ~1s; the
+/// request tracker's own per-write ticks) without being so reactive that a
+/// single tick dominates the reading. Shared by both trackers rather than
+/// each having its own constant — nothing about the smoothing behavior a
+/// maintainer would want differs between "bytes/sec" and "ops/sec"; a future
+/// caller that genuinely needs a different responsiveness for one of them
+/// can split this back into two constants at that point.
+const RATE_EWMA_ALPHA: f64 = 0.3;
+
 /// Growth PR3 Fork F (ADR 0042 §14): a per-node, per-tablet estimate of a
 /// streamed tablet's own change-append rate (bytes/sec of `KIND_CHANGE`
 /// growth) — derived entirely from data `index_drain::seal_tick` already
@@ -6617,62 +6703,47 @@ fn build_backup_store(
 /// tracker exists to close, per the growth plan's Fork F).
 ///
 /// A simple EWMA over each tick's own instantaneous bytes-delta ÷ elapsed
-/// (`ALPHA`), so one noisy tick doesn't whipsaw the signal; floored at zero
-/// (a seal + the hot-trim arm's later reclaim can shrink the hot scope
-/// between ticks, which is not a *negative* append rate — just this tick's
-/// own contribution being nothing). Surfaced read-only via
-/// `/admin/metrics`'s `stream_change_rates` array (`admin::metrics_view`)
-/// and consumed by the opt-in `--auto-split-change-rate` trigger
-/// (`auto_split_loop`, streamed tables only). A plain `std::sync::Mutex` is
-/// fine: every access is a quick lock/mutate/drop with no `.await` held
-/// across it, the same discipline `ClientCtx::metrics_history` already
-/// uses.
+/// ([`RateSample::advance`]/[`RATE_EWMA_ALPHA`]), so one noisy tick doesn't
+/// whipsaw the signal; floored at zero (a seal + the hot-trim arm's later
+/// reclaim can shrink the hot scope between ticks, which is not a *negative*
+/// append rate — just this tick's own contribution being nothing). Surfaced
+/// read-only via `/admin/metrics`'s `stream_change_rates` array
+/// (`admin::metrics_view`) and consumed by the opt-in
+/// `--auto-split-change-rate` trigger (`auto_split_loop`, streamed tables
+/// only). A plain `std::sync::Mutex` is fine: every access is a quick
+/// lock/mutate/drop with no `.await` held across it, the same discipline
+/// `ClientCtx::metrics_history` already uses.
+///
+/// **Clocked by the `Env` seam ([`Nanos`]), not `tokio::time::Instant::now()`
+/// (fixed alongside [`RequestRateTracker`]'s addition, W-09)** — this tracker
+/// used to read the wall clock directly, a determinism-rule violation (root
+/// `CLAUDE.md`'s "no wall clock" rule) the workspace's `disallowed_methods`
+/// lint does not catch here: `lib.rs` sits under `animusd`'s package-level
+/// lint exemption (this crate's own `CLAUDE.md`), so nothing short of a
+/// human catching it during a change that happened to look here would ever
+/// flag it. `observe` now takes `now: Nanos` — the caller's own `ctx.env.
+/// now()` reading — rather than this type holding an `E: Env` clone itself;
+/// both `ChangeRateTracker` and `RequestRateTracker` are plain `#[derive(
+/// Clone, Default)]` structs with no generic parameter at all, so they need
+/// no `E` threaded through their own construction (`DataRole`'s literal
+/// sites stay a one-line `ChangeRateTracker::default()`/`RequestRateTracker::
+/// default()`), and every call site already has a `ClientCtx`/`CpGroup`
+/// handle in scope to read `now` from immediately before calling `observe`.
 #[derive(Clone, Default)]
 pub(crate) struct ChangeRateTracker {
     inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
 }
 
-#[derive(Clone, Copy)]
-struct RateSample {
-    bytes_per_sec: f64,
-    last_bytes: u64,
-    last_at: tokio::time::Instant,
-}
-
-/// The EWMA smoothing factor for [`ChangeRateTracker::observe`] — closer to
-/// 1.0 tracks the latest tick more closely (noisier); closer to 0.0 smooths
-/// harder (slower to react). Chosen to settle within a handful of
-/// `INDEX_DRAIN_INTERVAL` ticks (~1s) without being so reactive that a
-/// single large write's own tick dominates the reading.
-const CHANGE_RATE_EWMA_ALPHA: f64 = 0.3;
-
 impl ChangeRateTracker {
-    /// Record this tick's own `KIND_CHANGE` byte level for `tablet` and
-    /// return the freshly-updated smoothed rate (bytes/sec).
-    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64) -> f64 {
-        let now = tokio::time::Instant::now();
+    /// Record this tick's own `KIND_CHANGE` byte level for `tablet`, as
+    /// observed at `now` ([`Env::now`], never a wall clock), and return the
+    /// freshly-updated smoothed rate (bytes/sec).
+    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64, now: Nanos) -> f64 {
         let mut inner = self.inner.lock().expect("change-rate tracker lock");
-        let rate = match inner.get(&tablet) {
-            None => 0.0,
-            Some(prev) => {
-                let elapsed = now.saturating_duration_since(prev.last_at).as_secs_f64();
-                if elapsed <= 0.0 {
-                    prev.bytes_per_sec
-                } else {
-                    let instantaneous = bytes_now.saturating_sub(prev.last_bytes) as f64 / elapsed;
-                    CHANGE_RATE_EWMA_ALPHA * instantaneous
-                        + (1.0 - CHANGE_RATE_EWMA_ALPHA) * prev.bytes_per_sec
-                }
-            }
-        };
-        inner.insert(
-            tablet,
-            RateSample {
-                bytes_per_sec: rate,
-                last_bytes: bytes_now,
-                last_at: now,
-            },
-        );
+        let sample =
+            RateSample::advance(inner.get(&tablet).copied(), bytes_now, now, RATE_EWMA_ALPHA);
+        let rate = sample.rate;
+        inner.insert(tablet, sample);
         rate
     }
 
@@ -6684,7 +6755,7 @@ impl ChangeRateTracker {
             .lock()
             .expect("change-rate tracker lock")
             .get(&tablet)
-            .map_or(0.0, |s| s.bytes_per_sec)
+            .map_or(0.0, |s| s.rate)
     }
 
     /// Every currently-tracked tablet's own smoothed rate, in tablet-id
@@ -6694,7 +6765,7 @@ impl ChangeRateTracker {
             .lock()
             .expect("change-rate tracker lock")
             .iter()
-            .map(|(&t, s)| (t, s.bytes_per_sec))
+            .map(|(&t, s)| (t, s.rate))
             .collect()
     }
 
@@ -6707,6 +6778,240 @@ impl ChangeRateTracker {
             .lock()
             .expect("change-rate tracker lock")
             .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
+/// W-09 (ADR 0034's deferred bullet, closed): a per-node, per-tablet
+/// estimate of a tablet's own leader-side **write** request rate (ops/sec),
+/// the request-rate sibling of [`ChangeRateTracker`]'s byte-rate signal —
+/// same [`RateSample`] EWMA shape ([`RATE_EWMA_ALPHA`]), just counting a
+/// tick per successful write instead of a byte level.
+///
+/// **Writes only, never reads — by design, mirroring `ChangeRateTracker`'s
+/// own byte-rate precedent.** Observed at **two** choke points, together
+/// covering every leader-side non-transactional write: `dynamo::
+/// kind_write_item_at_leader` (the ADR 0046 U3 evaluate-at-leader funnel —
+/// a condition, an old-image echo, or an images-carrying table) and
+/// `dynamo::fast_marker_write` (the ADR 0049 fast arm — an unconditioned
+/// `Put`/`Delete` on a plain, unindexed/unstreamed table, which never
+/// reaches the funnel at all). Missing either one would leave the signal
+/// blind to a real write shape — the fast arm in particular is the *common*
+/// case for a plain table, and a plain table under heavy unconditioned
+/// write load is exactly the hot-but-small-tablet failure mode this tracker
+/// exists to catch. Both observation points mean this tracker only ever
+/// sees a tablet's own **leader**. Folding reads in would be unsound, not
+/// just incomplete: since ADR 0055 an
+/// eventually-consistent read (the DynamoDB wire default) is served from
+/// *any* replica's own applied state and never reaches the leader at all —
+/// counting reads here would silently undercount a hot-but-eventual-read
+/// tablet by however many replicas share the load, a bias with no honest
+/// fix short of a second, cluster-wide aggregation this signal deliberately
+/// stays simple enough to avoid. A tablet whose *writes* are the hot path
+/// (the failure mode this tracker exists to catch — a small, low-byte
+/// tablet under a heavy `PutItem`/`UpdateItem`/`DeleteItem` burst that never
+/// crosses a byte or key-count threshold) is exactly what a write-rate
+/// signal answers soundly; a strong (`ConsistentRead: true`) read *does*
+/// reach the leader but is deliberately still excluded, for the same
+/// "writes are the sound first cut" reasoning — a future revision that
+/// wants read pressure factored in would need its own, separately-reasoned
+/// signal, not a silent extension of this one.
+///
+/// Read via [`ClientCtx::request_rates`] (`/admin/metrics`'s `request_rates`
+/// array) and consumed by the opt-in `--auto-split-ops-rate` trigger
+/// (`auto_split_loop`) — unlike [`ChangeRateTracker`], this applies to
+/// **every** table, not just streamed ones: nothing about counting writes
+/// requires a change log, so a plain table's hot-but-small tablet is exactly
+/// as visible here as a streamed one's.
+#[derive(Clone, Default)]
+pub(crate) struct RequestRateTracker {
+    inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
+}
+
+impl RequestRateTracker {
+    /// Record one successful write for `tablet`, observed at `now`
+    /// ([`Env::now`]), and return the freshly-updated smoothed rate
+    /// (ops/sec). Unlike [`ChangeRateTracker::observe`] there is no
+    /// externally-supplied level to report — each call is itself one more
+    /// unit of the counter, so this tracker keeps its own running op count
+    /// internally (`RateSample::last_value`) and advances it by exactly one
+    /// per observation.
+    pub(crate) fn observe(&self, tablet: TabletId, now: Nanos) -> f64 {
+        let mut inner = self.inner.lock().expect("request-rate tracker lock");
+        let prev = inner.get(&tablet).copied();
+        let value_now = prev.map_or(1, |p| p.last_value.saturating_add(1));
+        let sample = RateSample::advance(prev, value_now, now, RATE_EWMA_ALPHA);
+        let rate = sample.rate;
+        inner.insert(tablet, sample);
+        rate
+    }
+
+    /// The current smoothed write-rate for `tablet` (ops/sec), or `0.0` if
+    /// never observed (no successful write has gone through this node's own
+    /// `kind_write_item_at_leader` for this tablet).
+    pub(crate) fn get(&self, tablet: TabletId) -> f64 {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .get(&tablet)
+            .map_or(0.0, |s| s.rate)
+    }
+
+    /// Every currently-tracked tablet's own smoothed write-rate, in
+    /// tablet-id order — for `/admin/metrics`'s `request_rates` array.
+    pub(crate) fn snapshot(&self) -> Vec<(TabletId, f64)> {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .iter()
+            .map(|(&t, s)| (t, s.rate))
+            .collect()
+    }
+
+    /// Drop every tracked tablet no longer present in `meta` — see
+    /// [`ChangeRateTracker::retain_existing`]'s identical doc.
+    pub(crate) fn retain_existing(&self, meta: &Metadata) {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
+/// `SimEnv`-driven, virtual-time-only coverage of both rate trackers (W-09)
+/// — no real sleep anywhere, `Simulator::run_for` advances the clock a
+/// caller reads back via `env.now()` and hands to `observe`. Proves the
+/// EWMA both converges toward a sustained rate and decays once observations
+/// slow down or stop growing, for each tracker independently (they share
+/// [`RateSample::advance`], but each has its own call shape worth its own
+/// regression: `ChangeRateTracker::observe` takes an externally-supplied
+/// level, `RequestRateTracker::observe` takes none at all).
+#[cfg(test)]
+mod rate_tracker_tests {
+    use std::time::Duration;
+
+    use animus_control::Metadata;
+    use animus_env::{Clock, nid};
+    use animus_sim::Simulator;
+    use animus_tablet::TabletId;
+
+    use super::{ChangeRateTracker, RequestRateTracker};
+
+    const TABLET: TabletId = TabletId(1);
+
+    #[test]
+    fn change_rate_tracker_converges_toward_a_sustained_byte_growth_rate() {
+        let mut sim = Simulator::new(0x5241_5445);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+        // Never observed yet: reads as 0.0, not a panic/default-surprise.
+        assert_eq!(tracker.get(TABLET), 0.0);
+
+        // 20 ticks of exactly 100 bytes/sec, one second apart — the EWMA
+        // should climb toward (and stay close to) 100.0 well within that
+        // many ticks (alpha = 0.3 settles in a handful, per its own doc).
+        let mut bytes = 0u64;
+        let mut rate = 0.0;
+        for _ in 0..20 {
+            sim.run_for(Duration::from_secs(1));
+            bytes += 100;
+            rate = tracker.observe(TABLET, bytes, env.now());
+        }
+        assert!(
+            (95.0..=105.0).contains(&rate),
+            "expected the smoothed rate to converge near 100.0 bytes/sec, got {rate}"
+        );
+        assert_eq!(tracker.snapshot(), vec![(TABLET, rate)]);
+    }
+
+    #[test]
+    fn change_rate_tracker_decays_once_growth_stops() {
+        let mut sim = Simulator::new(0x5241_5446);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+
+        let mut bytes = 0u64;
+        let mut hot_rate = 0.0;
+        for _ in 0..20 {
+            sim.run_for(Duration::from_secs(1));
+            bytes += 100;
+            hot_rate = tracker.observe(TABLET, bytes, env.now());
+        }
+        assert!(hot_rate > 50.0, "expected a hot rate first, got {hot_rate}");
+
+        // The change log drains to zero (a seal + trim, per this tracker's
+        // own doc) and stays there for a while: the same `bytes` level
+        // observed again after a long idle gap is a zero-delta tick, which
+        // should pull the smoothed rate down, not leave it pinned hot.
+        sim.run_for(Duration::from_secs(30));
+        let cooled_rate = tracker.observe(TABLET, bytes, env.now());
+        assert!(
+            cooled_rate < hot_rate,
+            "expected the rate to decay after a zero-growth tick: hot={hot_rate}, cooled={cooled_rate}"
+        );
+    }
+
+    #[test]
+    fn request_rate_tracker_converges_toward_a_sustained_write_rate() {
+        let mut sim = Simulator::new(0x5241_5447);
+        let env = sim.env(nid(0));
+        let tracker = RequestRateTracker::default();
+        assert_eq!(tracker.get(TABLET), 0.0);
+
+        // One write every 100ms — a steady 10 ops/sec — for 5 virtual
+        // seconds' worth of ticks.
+        let mut rate = 0.0;
+        for _ in 0..50 {
+            sim.run_for(Duration::from_millis(100));
+            rate = tracker.observe(TABLET, env.now());
+        }
+        assert!(
+            (8.0..=12.0).contains(&rate),
+            "expected the smoothed rate to converge near 10.0 ops/sec, got {rate}"
+        );
+        assert_eq!(tracker.snapshot(), vec![(TABLET, rate)]);
+    }
+
+    #[test]
+    fn request_rate_tracker_decays_once_writes_slow_down() {
+        let mut sim = Simulator::new(0x5241_5448);
+        let env = sim.env(nid(0));
+        let tracker = RequestRateTracker::default();
+
+        let mut hot_rate = 0.0;
+        for _ in 0..50 {
+            sim.run_for(Duration::from_millis(100));
+            hot_rate = tracker.observe(TABLET, env.now());
+        }
+        assert!(hot_rate > 5.0, "expected a hot rate first, got {hot_rate}");
+
+        // A single write after a long idle gap has a tiny instantaneous
+        // rate (1 / a large elapsed), which should pull the smoothed rate
+        // down sharply rather than leave it pinned hot.
+        sim.run_for(Duration::from_secs(30));
+        let cooled_rate = tracker.observe(TABLET, env.now());
+        assert!(
+            cooled_rate < hot_rate,
+            "expected the rate to decay after a slow tick: hot={hot_rate}, cooled={cooled_rate}"
+        );
+    }
+
+    #[test]
+    fn both_trackers_retain_existing_bounds_the_map_to_live_tablets() {
+        let sim = Simulator::new(0x5241_5449);
+        let env = sim.env(nid(0));
+        let change = ChangeRateTracker::default();
+        let request = RequestRateTracker::default();
+        change.observe(TABLET, 100, env.now());
+        request.observe(TABLET, env.now());
+        assert_eq!(change.snapshot().len(), 1);
+        assert_eq!(request.snapshot().len(), 1);
+
+        // An empty `Metadata` (no tablets at all) drops every tracked entry.
+        let meta = Metadata::default();
+        change.retain_existing(&meta);
+        request.retain_existing(&meta);
+        assert!(change.snapshot().is_empty());
+        assert!(request.snapshot().is_empty());
     }
 }
 
@@ -6736,6 +7041,13 @@ struct DataRole {
     /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
     /// doc for the full design.
     pub(crate) change_rates: ChangeRateTracker,
+    /// W-09 (ADR 0034 amendment): this node's own per-tablet **write**
+    /// request-rate estimates, observed by `dynamo::kind_write_item_at_
+    /// leader` and read by `/admin/metrics` and the opt-in
+    /// `--auto-split-ops-rate` trigger (`auto_split_loop`). See
+    /// [`RequestRateTracker`]'s own doc for the full design, including why
+    /// it counts writes only.
+    pub(crate) request_rates: RequestRateTracker,
 }
 
 /// Shared context for the client request server and the DynamoDB endpoint:
@@ -7091,6 +7403,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         self.data
             .as_ref()
             .map(|d| d.change_rates.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// W-09 (ADR 0034 amendment): every currently-tracked tablet's own
+    /// smoothed **write** request-rate (ops/sec), for `/admin/metrics`'s
+    /// `request_rates` array — empty on a control-only node, mirroring
+    /// [`stream_change_rates`](Self::stream_change_rates)'s identical shape.
+    pub(crate) fn request_rates(&self) -> Vec<(TabletId, f64)> {
+        self.data
+            .as_ref()
+            .map(|d| d.request_rates.snapshot())
             .unwrap_or_default()
     }
 
@@ -8871,17 +9194,20 @@ const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// table's real bytes-per-entry below this.
 const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
-/// The auto-split trigger's configured thresholds (ADR 0034). Either, both, or
-/// neither field may be `Some`; `auto_split_loop` is only spawned when at
-/// least one is (see [`BoundNode::start_with`]'s doc). When both are set,
-/// **either** exceeding its threshold fires a split — bytes and change-rate
+/// The auto-split trigger's configured thresholds (ADR 0034; W-09's
+/// `ops_rate` amendment). Any subset of the three fields may be `Some`;
+/// `auto_split_loop` is only spawned when at least one is (see
+/// [`BoundNode::start_with`]'s doc). When more than one is set, **any**
+/// exceeding its threshold fires a split — bytes, change-rate, and ops-rate
 /// are different failure modes (snapshot/compaction/replica-move/recovery
 /// cost scales with bytes; change-rate catches a high-churn, small-footprint
-/// streamed table bytes alone can't see, ADR 0042 §14 Fork F), so neither
-/// trigger alone dominates the other. **The former key-count trigger
-/// (`--auto-split K`) was removed** — bytes and change-rate cover its use
-/// cases with no key-count-specific failure mode left to justify a third
-/// independent knob; see the root `CLAUDE.md`'s auto-split entry.
+/// *streamed* table bytes alone can't see, ADR 0042 §14 Fork F; ops-rate
+/// catches the same shape on **any** table — streamed or not — under a
+/// heavy write burst, W-09), so no trigger alone dominates the others.
+/// **The former key-count trigger (`--auto-split K`) was removed** — bytes,
+/// change-rate, and ops-rate cover its use cases with no key-count-specific
+/// failure mode left to justify a fourth independent knob; see the root
+/// `CLAUDE.md`'s auto-split entry.
 #[derive(Clone, Copy, Debug)]
 struct AutoSplitThresholds {
     /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
@@ -8896,6 +9222,16 @@ struct AutoSplitThresholds {
     /// tablet in the first place (`index_drain::seal_tick` only runs its
     /// seal arm, which feeds the tracker, when `stream_enabled`).
     change_rate: Option<u64>,
+    /// `--auto-split-ops-rate RATE` (W-09, ADR 0034 amendment): split once a
+    /// led tablet's own smoothed **write** request rate
+    /// ([`RequestRateTracker`], ops/sec) exceeds `RATE`. Absent by default
+    /// (opt-in, no surprise splits). Unlike `change_rate`, this applies to
+    /// **any** table — the tracker feeding it observes every successful
+    /// leader-side write regardless of whether the table is streamed. This
+    /// is the signal that closes ADR 0034's own deferred bullet: a
+    /// hot-but-small tablet under heavy write load, with no byte/key-count
+    /// signal ever crossing threshold, can now still split.
+    ops_rate: Option<u64>,
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
@@ -9024,7 +9360,15 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let change_rate_hot = thresholds
                 .change_rate
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
-            if !byte_hot && !change_rate_hot && !due_confirm {
+            // W-09 (ADR 0034 amendment): the opt-in ops-rate trigger —
+            // exactly the same cheap-read shape as `change_rate_hot` above,
+            // just backed by [`RequestRateTracker`] instead of
+            // [`ChangeRateTracker`]. Reads as `0.0` (never hot) for a tablet
+            // this node has never led a successful write for.
+            let ops_rate_hot = thresholds
+                .ops_rate
+                .is_some_and(|t| ctx.data().request_rates.get(tablet) > t as f64);
+            if !byte_hot && !change_rate_hot && !ops_rate_hot && !due_confirm {
                 continue;
             }
             // Materialize once: the authoritative byte total and (if over
@@ -9044,14 +9388,20 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let over_change_rate_threshold = thresholds
                 .change_rate
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
+            // W-09: re-read the same way, for the same reason.
+            let over_ops_rate_threshold = thresholds
+                .ops_rate
+                .is_some_and(|t| ctx.data().request_rates.get(tablet) > t as f64);
             // Need at least 2 distinct keys for any split to have an interior
             // point (`SplitTablet` requires `start < at < end`).
-            if key_count < 2 || (!over_byte_threshold && !over_change_rate_threshold) {
+            if key_count < 2
+                || (!over_byte_threshold && !over_change_rate_threshold && !over_ops_rate_threshold)
+            {
                 continue;
             }
             // Always byte-weighted (ADR 0034): a skewed value-size
             // distribution still bisects the tablet's *bytes* roughly
-            // evenly, whether the byte or the change-rate trigger fired.
+            // evenly, whichever trigger fired.
             let split_key = decide::byte_weighted_median(&pairs);
             // F11 (ADR 0042 §14, Fork D): the token-alignment rounding itself
             // now lives inside `ClientCtx::trigger_split` — the one choke
@@ -9627,6 +9977,7 @@ pub async fn start_cluster_with(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9660,6 +10011,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9689,6 +10041,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
         None,
         Duration::ZERO,
         None,
@@ -9727,6 +10080,7 @@ pub async fn start_cluster_with_streams(
         segment_store_config,
         stream_retention,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9751,6 +10105,7 @@ pub async fn start_cluster_with_growth(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -9761,6 +10116,7 @@ pub async fn start_cluster_with_growth(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        auto_split_ops_rate,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9794,6 +10150,7 @@ pub async fn start_cluster_with_quiesce_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
         None,
         quiesce_after,
         None,
@@ -9834,6 +10191,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
@@ -9847,6 +10205,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        auto_split_ops_rate,
         quiesce_after,
         dynamo_auth,
         backup_store_config,
@@ -9864,6 +10223,7 @@ async fn start_cluster_inner(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
@@ -9936,6 +10296,7 @@ async fn start_cluster_inner(
                 segment_store_config.clone(),
                 stream_retention,
                 auto_split_change_rate,
+                auto_split_ops_rate,
                 quiesce_after,
                 // `--cluster N` has no ttl-sweep-interval knob of its own
                 // yet (mirrors `stream_retention`'s own layered-stack
@@ -10031,6 +10392,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         orphan_sweep_after,
         None,
         None,
+        None,
     )
     .await
 }
@@ -10053,6 +10415,7 @@ pub async fn start_split_cluster_with_growth(
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
@@ -10198,6 +10561,7 @@ pub async fn start_split_cluster_with_growth(
                 StreamSealKnobs::default(),
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
+                auto_split_ops_rate,
                 // `--quiesce-after` doesn't thread through the
                 // `--cluster-control`/`--cluster-data` dev path yet — the
                 // same documented gap `run`'s own module doc names (S-06
@@ -10336,6 +10700,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
         quiesce_after,
         None,
         None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10377,6 +10742,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        None,
         None,
         None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
@@ -10423,6 +10789,7 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         quiesce_after,
         None,
         None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10457,6 +10824,7 @@ pub async fn run_node_with_cluster_settings(
     quiesce_after: Duration,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
@@ -10471,6 +10839,7 @@ pub async fn run_node_with_cluster_settings(
         quiesce_after,
         auto_split_bytes,
         auto_split_change_rate,
+        auto_split_ops_rate,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10515,6 +10884,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     quiesce_after: Duration,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     ttl_sweep_interval: Duration,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
@@ -10583,6 +10953,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             segment_store_config,
             stream_retention,
             auto_split_change_rate,
+            auto_split_ops_rate,
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
@@ -10619,6 +10990,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        None,
         None,
         None,
         ttl_sweep_interval,
@@ -10810,6 +11182,7 @@ pub async fn run_node_data(
         backend,
         None,
         None,
+        None,
         Duration::ZERO,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
@@ -10846,6 +11219,7 @@ pub async fn run_node_data_with_streams(
         backend,
         None,
         None,
+        None,
         Duration::ZERO,
         stream_seal_knobs,
         segment_store_config,
@@ -10880,6 +11254,7 @@ pub async fn run_node_data_with_cluster_settings(
     backend: StorageBackend,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
@@ -10968,6 +11343,7 @@ pub async fn run_node_data_with_cluster_settings(
             stream_seal_knobs,
             segment_store_config,
             auto_split_change_rate,
+            auto_split_ops_rate,
             quiesce_after,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
@@ -11539,6 +11915,7 @@ async fn finish_data_join(
             admin_addrs,
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
+            None,
             None,
             // `--quiesce-after` doesn't reach a seed/join startup yet — the
             // same documented gap `animusd`'s own module doc names for
@@ -13644,6 +14021,7 @@ mod simenv_client_ctx_tests {
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],
             auto_split_bytes_threshold: None,
+            auto_split_ops_rate_threshold: None,
             // This harness never builds a real `DataRole`/dynamo listener
             // (`data: None` below) — see `AdminInfo`'s own field docs.
             backup_store: None,
@@ -13919,6 +14297,7 @@ mod two_node_relay_tests {
         edge_a.register_raftkv(tablet, CpGroup::Mem(kv.clone()));
         let relay_a: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(1)));
         let admin_a = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
             node_id: Some(nid(1)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -13970,6 +14349,7 @@ mod two_node_relay_tests {
         let edge_b = ClusterEdgeState::<SimEnv>::new();
         let relay_b: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(2)));
         let admin_b = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
             node_id: Some(nid(2)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),

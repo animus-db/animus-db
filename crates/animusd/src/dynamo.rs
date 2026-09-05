@@ -5815,6 +5815,7 @@ pub(crate) enum KindWriteOutcome {
 /// client write. Every ordinary caller passes `false`.
 #[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
 pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     leader: &CpGroup<E>,
     meta: &Metadata,
     table: &str,
@@ -5858,6 +5859,21 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
 
     match result {
         KindEvalApplied::Ok { old, new } => {
+            // W-09 (ADR 0034 amendment): count this successful write toward
+            // the tablet's own request-rate signal — this is the one choke
+            // point every leader-side non-transactional write passes through
+            // (`ClientCtx::cp_kind_write_item`'s `Local` arm; the `Forward`
+            // arm lands here too, one hop over, on whichever node actually
+            // leads). `meta` is the same snapshot the caller already resolved
+            // the tablet route from, so this re-derives the tablet for free
+            // rather than paying a second `effective_metadata()` clone. See
+            // `RequestRateTracker`'s own doc for why this observes writes
+            // only, never reads, and only writes that actually applied.
+            if let Some(tablet) =
+                crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key)
+            {
+                ctx.data().request_rates.observe(tablet, ctx.env.now());
+            }
             let collection_bytes = collection_bytes_at_leader(leader).await;
             Ok(KindWriteOutcome::Ok {
                 old,
@@ -6177,7 +6193,8 @@ async fn fast_marker_write(
     // as `cp_kind_write_item`/`cp_batch_write` do — `cp_kind_write_raw`
     // itself never provisions (its other callers only ever write to tablets
     // that exist).
-    if !ctx.effective_metadata().has_table_tablet(table) {
+    let meta = ctx.effective_metadata();
+    if !meta.has_table_tablet(table) {
         ctx.provision_tablet(table)
             .await
             .map_err(|e| internal(&e))?;
@@ -6185,11 +6202,30 @@ async fn fast_marker_write(
     let base_key = item_key(pk, sk);
     ctx.cp_kind_write_raw(
         table,
-        vec![(animus_cp_data::KIND_BASE, base_key, Some(value))],
+        vec![(animus_cp_data::KIND_BASE, base_key.clone(), Some(value))],
         vec![item_marker_change_log(pk, sk)],
     )
     .await
-    .map_err(|e| internal(&e))
+    .map_err(|e| internal(&e))?;
+    // W-09 (ADR 0034 amendment): this fast arm is the OTHER structural half
+    // of "every leader-side non-transactional write" — an unconditioned
+    // `PutItem`/`DeleteItem` on a plain, unindexed/unstreamed table (this
+    // arm's whole reason to exist, per this function's own doc) ALWAYS
+    // takes this path, never `kind_write_item_at_leader`'s evaluate-at-
+    // leader one. That is exactly the hot-but-small-table shape ADR 0034
+    // deferred and `RequestRateTracker` exists to catch, so it must be
+    // observed here too, not only at the evaluated funnel — omitting this
+    // arm would leave the signal blind to the single most common write
+    // shape (an ordinary unconditioned item write). `meta` is the
+    // pre-provision snapshot from above; a first write on a brand-new
+    // table's tablet (just provisioned this call) misses this one tick —
+    // harmless, since every following write on the same tablet observes
+    // normally and the EWMA self-heals within a couple of ticks.
+    if let Some(tablet) = crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key)
+    {
+        ctx.data().request_rates.observe(tablet, ctx.env.now());
+    }
+    Ok(())
 }
 
 /// The per-tablet single-entry batch commit for a **marker** table's rows

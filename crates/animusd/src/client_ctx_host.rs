@@ -116,6 +116,7 @@ impl TtlScanHost for ClientCtx {
             expected,
         );
         match dynamo::kind_write_item_at_leader::<ProdEnv, AnimusdRelayClient>(
+            self,
             &group,
             &meta,
             table,
