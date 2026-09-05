@@ -451,6 +451,89 @@ Restated from the roadmap's boundary (Context) and made concrete:
   follower-connected node, beside `SetTableTtl`/`TagResource`/`SetTable-
   Throughput`'s existing precedent in `tests/schema_ddl_relay.rs`.
 
+## As-built (2026-09-05, S-02 step 3 — allow-list enforcement at dispatch)
+
+Steps 1-2 (the catalog and its admin CRUD) landed as designed. Step 3
+landed with a few concretizations this ADR left to the implementation:
+
+- **The gate is one merged function, `animus_node::sigv4_gate::
+  merged_sigv4_gate`**, not two sequential lookups — it takes the caller's
+  `Metadata` (the catalog) and the static bootstrap map together and
+  implements Decision 3/4's precedence in one pass: a row present in the
+  catalog for the caller's access key id (enabled or not) is authoritative
+  and the static map is never consulted for that id at all; only a
+  genuinely absent row falls through to the static map. Verification
+  itself still goes through `animus_dynamo::sigv4::verify` unchanged, tried
+  once per candidate secret (current, then previous while its grace window
+  is open) via a one-entry credential map per attempt — the ADR's own
+  "this ADR does not touch canonicalization, the HMAC chain, or clock-skew
+  checking" holds exactly. `animus_dynamo::sigv4::parse_credential` is a
+  small new export (structural parse only, no store lookup) the merged
+  gate needs to recover the access key id *before* it knows which
+  candidate secret(s) to try.
+- **A lock-free fast path avoids the gate's `Metadata` clone on an empty
+  catalog.** `ClusterEdgeState::has_catalog_credentials: Arc<AtomicBool>`
+  (recomputed at `ClientCtx` construction, on `index_drain::
+  change_consumer_loop`'s own per-tick metadata refresh, and immediately
+  after this node's own `PutCredential`/`RevokeCredential` commits) lets
+  `dynamo.rs::handle_conn` skip `effective_metadata()`'s deep clone
+  entirely when the flag is `false` **and** no static bootstrap map is
+  configured — the common case, and every pre-ADR-0066 deployment. Not
+  named in the Decision text; added because Decision 3's "the verifier the
+  request hits first" reads `Metadata` on every gated request, and a
+  cluster with SigV4 enabled purely for its static bootstrap map (no
+  catalog rows at all) must not pay a new per-request cost for a catalog
+  it never populated.
+- **The authenticated principal is `animusd::authz::Principal`**
+  (`Unrestricted` | `Scoped{access_key_id, region, policy}`) — the "whatever
+  minimal type" Decision 5 anticipated. `region` rides along from the
+  caller's own `Credential` scope (parsed once, at the gate) purely to
+  build `AccessDeniedException`'s synthesized table ARN without a second
+  parse at dispatch time.
+- **`RestoreTableFromBackup`/`RestoreTableToPointInTime`'s checked table is
+  the *target* table**, not the source — reusing `animus_dynamo::wire::
+  Operation::table()`'s own pre-existing convention (that accessor already
+  resolves both to their target name, for the unrelated duplicate-name
+  check `create_table`/`restore_table_from_backup` share) rather than
+  introducing a second table-resolution rule for the same two operations.
+  A scoped key can therefore restore *into* a table it may create, and the
+  ADR's own listed table set for a `Backup`-class call
+  (`BackupRow::table`) is what `DescribeBackup`/`DeleteBackup` (ARN-keyed,
+  no target) resolve against instead.
+- **`ListBackups`/`ListStreams` with no `TableName` filter are cross-table
+  reads, not table-less ones** — the ADR's Decision 1 table-less list
+  (`ListTables`/`DescribeLimits`/`DescribeEndpoints`) does not include
+  either, and neither can honestly answer "every backup/stream regardless
+  of table" for a policy scoped to specific tables. `authz::
+  authorize_unscoped` requires `TableMatch::All` **and** the class in
+  `policy.ops` for this shape; a table-scoped key gets `AccessDeniedException`
+  rather than a silently-narrowed result set. Not spelled out in Decision
+  5's text, which only lists per-operation table resolution for the
+  named multi-table operations (`BatchGetItem`/`BatchWriteItem`/
+  `TransactGetItems`/`TransactWriteItems`) — this is the same shape,
+  applied to a filterless list call.
+- **DynamoDB Streams (`ListStreams`/`DescribeStream`/`GetShardIterator`/
+  `GetRecords`) are gated too**, all under `OpClass::Streams`, table
+  resolved from the stream ARN (the first three) or, for `GetRecords`,
+  from the shard iterator's own tablet — a sealed shard's catalog row
+  (`StreamShardRow::table`) or, for an open shard, the tablet's own live
+  `table` field. Mirrors the base item API's own authorize-before-dispatch
+  order exactly.
+- **`classify`'s exhaustive match is the compiler-enforced guarantee**
+  Decision 5 asked for ("every DynamoDB operation maps to exactly one
+  class") — `animusd::authz::classify(op: &Operation) -> (&'static str,
+  OpClass)` has no wildcard arm, so a future `Operation` variant is a
+  compile error there until deliberately classified; `authz::
+  authorize_op`'s own table-resolution match is exhaustive the same way.
+  `authz::tests::every_operation_classifies_per_adr_0066_decision_1` pins
+  every variant's classification against this table.
+- **The static `--dynamo-auth` bootstrap credential's `Principal` carries
+  no policy at all (`Unrestricted`)** — Decision 6's "the static bootstrap
+  credential is unrestricted" is implemented as a variant with no `Policy`
+  field, not a `Policy::allow_all()` value, so a bootstrap-authenticated
+  request never touches `Policy::allows` at dispatch (structurally
+  unrestricted, not merely configured to allow everything).
+
 ## Alternatives rejected
 
 - **Hashed secrets** (store a password-hash-style digest instead of the raw

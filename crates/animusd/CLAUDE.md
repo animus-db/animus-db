@@ -565,34 +565,80 @@ reusing the captured config is the point of the test.
   without `ClientCtx` itself moving, which doesn't happen until rung C5.
 - **`dynamo.rs`** (~59 KB) — the DynamoDB JSON-over-HTTP edge; the `GET /metrics`
   route (ADR 0015) shares this listener. `dispatch` also forwards a
-  `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute`
+  `DynamoDBStreams_20120810.*` target to `dynamo_streams::execute_as`
   (below) — the two services share one listener/port. **SigV4 enforcement
-  (ADR 0057) lives in `handle_conn`, ahead of `dispatch`** — after the `GET
-  /metrics` special case, before every other request reaches `dispatch`/
-  `execute_routed`: when `ctx.dynamo_auth` is `Some` (a `dynamo_auth`
-  cluster-config section, or `--dynamo-auth PATH` on a config-less startup
-  mode), `ctx.env.wall_now()` supplies "now" (never `SystemTime::now()`,
-  ADR 0051 discipline) and is handed straight into `animus_node::
-  sigv4_gate(&request, credentials, now_epoch_ms)` (ADR 0061 rung C4b) —
-  the build-`SigV4Request`-then-`verify` sequence itself is pure and lives
-  in `animus-node` now; this connection handler does only the clock read
-  and the response-shaping on failure. A verification failure short-
-  circuits straight to a `400` with the AWS-faithful
-  `com.amazon.coral.service#...` body (`sigv4_error_body`, rendered via
-  `serde_json` rather than `WireError::to_json`'s DynamoDB-namespace
-  prefix — a different `__type` namespace entirely). This gates the item
-  API **and** Streams (both flow through `execute_routed`), and is
-  deliberately **not** inside `execute_routed` itself: that function is
-  also the admin dashboard's `POST /admin/data/dynamo` proxy's single
-  dispatch point (ADR 0021), which must stay unauthenticated (ADR 0020's
+  (ADR 0057, hardened by ADR 0066 S-02 step 3) lives in `handle_conn`,
+  ahead of `dispatch`** — after the `GET /metrics` special case, before
+  every other request reaches `dispatch`/`execute_routed_as`: whenever
+  `ctx.dynamo_auth` is `Some` **or** `ctx.has_catalog_credentials()`
+  answers `true` (the replicated credential catalog's own lock-free fast
+  path — see `authz.rs`'s own entry below), `ctx.env.wall_now()` supplies
+  "now" (never `SystemTime::now()`, ADR 0051 discipline) and is handed
+  straight into `animus_node::sigv4_gate::merged_sigv4_gate(&request,
+  &catalog, ctx.dynamo_auth.as_deref(), now_epoch_ms)` — the
+  build-`SigV4Request`-then-verify sequence, now merged against **both**
+  credential sources (the replicated catalog first, the static bootstrap
+  map only when the catalog has no row at all for that access key id,
+  ADR 0066 §3/§4), still lives in `animus-node` and is still pure; this
+  connection handler does only the clock read, a `Metadata::default()`
+  vs. a real `ctx.effective_metadata()` clone (gated on the same fast-path
+  flag, so an empty catalog costs nothing new), and the response-shaping
+  on failure/metrics-bumping on success (`Metric::AuthRotatedSecretUsed`
+  when the caller's previous secret matched during a rotation grace
+  window; `Metric::AuthUnknownKey` on `SigV4Error::UnrecognizedClient`). A
+  verification failure short-circuits straight to a `400` with the
+  AWS-faithful `com.amazon.coral.service#...` body (`sigv4_error_body`,
+  rendered via `serde_json` rather than `WireError::to_json`'s
+  DynamoDB-namespace prefix — a different `__type` namespace entirely). A
+  successful verification resolves an `authz::Principal` (`Unrestricted`
+  for the static bootstrap credential or auth-disabled; `Scoped{
+  access_key_id, region, policy}` for a catalog match) threaded down
+  through `dispatch`/`execute_routed_as`/`execute_as`/`run_operation` to
+  the allow-list check (`authz.rs`, below). This gates the item API **and**
+  Streams (both flow through `execute_routed_as`), and is deliberately
+  **not** inside `execute_routed_as` itself: that function is also the
+  admin dashboard's `POST /admin/data/dynamo` proxy's single dispatch
+  point (ADR 0021), which must stay unauthenticated (ADR 0020's
   trusted-operator-network posture) — gating inside it would silently
-  re-gate that surface too. `ctx.dynamo_auth: Option<Arc<BTreeMap<String,
-  String>>>` — `None` (every existing config/test/deployment) skips the
-  whole block, zero-cost and behavior-identical to pre-ADR-0057. `http.rs`'s
+  re-gate that surface too, so every such internal caller instead calls
+  the unrestricted-`Principal`-defaulted `execute_routed`/`dynamo_streams::
+  execute` wrappers, unchanged in signature from before this ADR. Neither
+  `ctx.dynamo_auth` nor the catalog fast path being set skips the whole
+  block — zero-cost and behavior-identical to pre-ADR-0057. `http.rs`'s
   `HttpRequest::headers` (every header, lowercased, repeats comma-joined —
-  added by this same ADR) is what makes the `SigV4Request` buildable at
-  all; a `SignedHeaders` list can name any header, not just the three this
-  crate used to retain.
+  added by ADR 0057) is what makes the `SigV4Request` buildable at all; a
+  `SignedHeaders` list can name any header, not just the three this crate
+  used to retain.
+- **`authz.rs`** (ADR 0066 §5/§6, S-02 step 3) — the per-key allow-list
+  enforcement `run_operation`/`dynamo_streams::run_operation` check after
+  the SigV4 gate resolves a `Principal`, before dispatching: `classify(op:
+  &Operation) -> (&'static str, OpClass)` is an **exhaustive** match (no
+  wildcard) over every wire operation, pinned by `authz::tests::
+  every_operation_classifies_per_adr_0066_decision_1`; `authorize_op`
+  resolves each operation's table(s) the same way (also exhaustive) and
+  calls `authorize`/`authorize_each_table`/`authorize_unscoped` against
+  the `Principal`'s own `Policy`. `BatchGetItem`/`BatchWriteItem`/
+  `TransactGetItems`/`TransactWriteItems` are deliberate no-ops in
+  `authorize_op` — each checks every one of its own tables **inside its
+  own handler**, before any of that request's work runs, so a request
+  spanning an allowed and a denied table is rejected whole (`dynamo.rs`'s
+  `BatchWriteItem` arm and `run_transact`/`run_transact_get` each call
+  `authz::authorize_each_table` up front). `RestoreTableFromBackup`/
+  `RestoreTableToPointInTime` check the **target** table (reusing
+  `Operation::table()`'s own pre-existing convention); `DescribeBackup`/
+  `DeleteBackup` (ARN-keyed) resolve the checked table from
+  `BackupRow::table`; `ListBackups`/DynamoDB Streams' `ListStreams` with no
+  `TableName` filter are cross-table reads, allowed only to a policy
+  scoped to `TableMatch::All` (`authorize_unscoped`) — a table-restricted
+  key gets `AccessDeniedException` rather than a silently-narrowed result.
+  A denial is `WireError::access_denied` (`AccessDeniedException`, the
+  ordinary DynamoDB-namespace `__type`, never the SigV4 auth-layer one)
+  naming the operation and a synthesized `arn:aws:dynamodb:<region>:
+  000000000000:table/<table>` — never the policy's own contents — and
+  bumps `Metric::AuthDenied`. `Principal::Unrestricted` (the static
+  bootstrap credential, or every call with no SigV4 gate at all) never
+  reaches `Policy::allows` — every check in this module is a structural
+  no-op for it. See ADR 0066's as-built amendment for the full design.
 - **`dynamo_streams.rs`** (ADR 0042 §3/§5/§6/§7/§9/§10/§11) — the
   DynamoDB Streams read API: `ListStreams`/`DescribeStream`/
   `GetShardIterator`/`GetRecords`. Full design (label resolution, the
@@ -961,9 +1007,11 @@ reusing the captured config is the point of the test.
   ...` for `Put`; `row.secret == command_new_secret` for `Rotate`) — see
   `docs/engineering-lessons.md`'s matching entry for the general lesson.
   `Metric::AuthRotatedSecretUsed`/`AuthDenied`/`AuthUnknownKey`
-  (`animus-env`) were appended to the enum now so S-02 step 3 (allow-list
-  enforcement at dispatch) only has to wire them, not widen it — none of
-  the three are recorded yet. Tests: `tests/admin_endpoint.rs`'s
+  (`animus-env`) were appended to the enum in this step so S-02 step 3
+  (allow-list enforcement at dispatch) only had to wire them, not widen
+  it — **now wired**, by `dynamo.rs::handle_conn` (the first two) and
+  `authz.rs::record_denied` (the third); see this file's own `authz.rs`
+  and `dynamo.rs` entries above. Tests: `tests/admin_endpoint.rs`'s
   `admin_credentials_view_never_serves_a_secret` (the load-bearing
   never-a-secret assertion, mirroring `admin_config_reports_auth_state_
   and_never_serves_the_secret`'s own raw-body-string-search idiom),

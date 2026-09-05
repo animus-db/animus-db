@@ -2748,6 +2748,10 @@ async fn action_put_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         {
             let mut v = credential_row_redacted(row);
             v["id"] = json!(req.id);
+            // ADR 0066 §1 (S-02 step 3): a `Put` can be the catalog's very
+            // first row — refresh the SigV4 gate's fast path from the
+            // `meta` this poll already fetched, no extra clone.
+            ctx.refresh_catalog_credentials_flag(&meta);
             return (200, v);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2838,7 +2842,12 @@ async fn action_revoke_credential(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) 
     let deadline = tokio::time::Instant::now() + crate::dynamo::SCHEMA_COMMIT_TIMEOUT;
     loop {
         ctx.propose_schema(&command).await;
-        if ctx.metadata_fresh().await.credential(&req.id).is_none() {
+        let meta = ctx.metadata_fresh().await;
+        if meta.credential(&req.id).is_none() {
+            // ADR 0066 §1 (S-02 step 3): a `Revoke` can be the catalog's
+            // last row — refresh the fast path from the `meta` this poll
+            // already fetched.
+            ctx.refresh_catalog_credentials_flag(&meta);
             return (200, json!({"ok": true, "id": req.id}));
         }
         if tokio::time::Instant::now() >= deadline {

@@ -276,7 +276,7 @@
       </ul></div>
       <div class="lcard"><h3>Missing</h3><ul>
         <li><strong>Upgrades</strong> — on-disk formats change between revisions, so upgrading means recreating the cluster and reloading the data.</li>
-        <li><strong>Authentication beyond SigV4</strong> — opt-in SigV4 on the client DynamoDB port is still the only caller-identity story; a static key map, no rotation, no per-table policy. TLS (above) adds transport confidentiality and, on the internal ports, cluster-membership authentication — it doesn't add a richer client-identity model.</li>
+        <li><strong>Authentication beyond SigV4</strong> — opt-in SigV4 on the client DynamoDB port is still the only caller-identity story. Credentials are now replicated (a static key file is only a bootstrap source, shadowed the moment a matching id is added through the admin API), rotatable with a dual-secret grace window, and each key can be scoped to a per-table, per-operation-class allow list — but this is a coarse allow list, not IAM: no condition keys, no temporary credentials, no per-item or attribute-level authorization, and the admin port itself still has no authentication at all. TLS (above) adds transport confidentiality and, on the internal ports, cluster-membership authentication — it doesn't add a richer client-identity model.</li>
         <li><strong>Alerting rules</strong> — metrics are exported, but no reference dashboards or alert definitions ship with them.</li>
       </ul></div>
     </div>
