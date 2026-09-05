@@ -159,6 +159,7 @@ fn role_addrs_at(id: usize, addrs: &[SocketAddr], advertise_host: Option<&str>) 
         intra: addrs[6 * id + 4],
         console: addrs[6 * id + 5],
         advertise_host: advertise_host.map(str::to_string),
+        tls: None,
     }
 }
 
@@ -292,6 +293,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
         intra: SocketAddr::new([127, 0, 0, 2].into(), config.nodes[1].intra.port()),
         console: SocketAddr::new([127, 0, 0, 2].into(), config.nodes[1].console.port()),
         advertise_host: Some(HOST.to_string()),
+        tls: None,
     };
     // Updating this node's own config entry in place is enough: every
     // other node's own peer/route books re-derive from replicated

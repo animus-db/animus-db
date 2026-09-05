@@ -2175,4 +2175,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&pki_dir);
     }
+
+    /// [`TlsMaterial::server_acceptor`] (ADR 0064 commit 2) accepts a TLS
+    /// client that presents **no** client certificate at all — unlike
+    /// [`TlsMaterial::acceptor`] (mutual, exercised by every test above,
+    /// which would refuse this same client). This is a raw loopback
+    /// listener/dial, not a `ProdEnv` — `animusd`'s own client/dynamo/
+    /// admin/console listeners are the real consumer of this acceptor
+    /// (commit 2), but the acceptor itself is this crate's surface, so its
+    /// server-only behavior is proven here directly.
+    #[tokio::test]
+    async fn server_only_acceptor_accepts_a_client_with_no_certificate() {
+        let pki_dir = unique_tmp_dir();
+        let (_ca_path, mut configs) = write_test_pki(&pki_dir, &["127.0.0.1"]);
+        let cfg = configs.pop().expect("node tls config");
+        let material = cfg.load().expect("load tls material");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            let mut tls_stream = material
+                .server_acceptor
+                .accept(stream)
+                .await
+                .expect("server-only handshake must succeed with no client cert");
+            let mut buf = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut buf)
+                .await
+                .expect("read client hello payload");
+            assert_eq!(&buf, b"hello");
+        });
+
+        // A bare rustls `ClientConfig` trusting the CA but presenting no
+        // client certificate — exactly the shape a server-only-TLS client
+        // (a DynamoDB caller, `animus-cli --tls-ca`) uses, deliberately
+        // built independently of `TlsConfig::load()` (which always builds
+        // a *mutual* `ClientConfig`) to prove the acceptor imposes no
+        // client-cert requirement.
+        let (ca_pem, _leafs) = {
+            let ca_bytes = std::fs::read(&_ca_path).expect("read ca pem");
+            (ca_bytes, ())
+        };
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse ca certs")
+        {
+            root_store.add(cert).expect("add ca cert");
+        }
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let server_name = crate::tls::server_name_for(&addr.to_string()).expect("server name");
+        let mut tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .expect("client-side server-only handshake must succeed");
+        tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"hello")
+            .await
+            .expect("write hello");
+        tls_stream.flush().await.expect("flush");
+
+        accept_task.await.expect("accept task panicked");
+        let _ = std::fs::remove_dir_all(&pki_dir);
+    }
 }

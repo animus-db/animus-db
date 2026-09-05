@@ -286,10 +286,21 @@ Phase D** — nothing here builds request/reply correlation.
   constant duplicated in this crate, since only the host crate
   (`animusd`'s `CLIENT_TIMEOUT`) knows the value it wants.
   `animusd`'s own `control_handle.rs` is now a thin wrapper: two type
-  aliases binding `E = ProdEnv`, `R = AnimusdRelayClient` (a zero-sized
-  `RelayClient` implementor wrapping the crate's unchanged
-  `relay_request_with_timeout`), plus that implementor itself — see that
-  crate's own `CLAUDE.md` entry.
+  aliases binding `E = ProdEnv`, `R = AnimusdRelayClient` (**no longer
+  zero-sized as of ADR 0064 commit 2** — it now carries this node's own
+  `Option<animus_env::TlsMaterial>` so a data-only node's relay dials can
+  speak the `intra` port's mutual TLS — a `RelayClient` implementor
+  wrapping the crate's unchanged `relay_request_with_timeout`), plus that
+  implementor itself — see that crate's own `CLAUDE.md` entry.
+  **`RemoteControlClient::relay(&self) -> &R`** (ADR 0064 commit 2) exposes
+  the handle's own relay implementor read-only — added because `animusd`'s
+  `remote_metadata_watch_loop` drives its own `WatchMetadata`/`Status`
+  round trips *outside* `metadata_fresh` (it needs candidate fallback and
+  long-poll timeout control `metadata_fresh` doesn't expose) but must
+  still reach the identical transport (and, since commit 2, TLS material)
+  `metadata_fresh` itself uses — a generic accessor over `&R` rather than
+  anything TLS-specific, so this crate still never names `animus-env` or
+  any concrete transport type.
 
 ## What's here (rung C4a/C4b/C4c/C4d — the HTTP edges)
 

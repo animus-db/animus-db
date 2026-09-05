@@ -16366,3 +16366,94 @@ method signature, costs one extra tool call and eliminates an entire class
 of compile-fix-recompile cycles — especially valuable for crates (rustls
 chief among them) whose typestate-builder APIs are easy to get plausibly,
 confidently wrong.
+
+## A named generic type parameter breaks existing turbofish call sites; an `impl Trait` argument doesn't (ADR 0064, S-01 commit 2)
+
+Generalizing `animusd::write_frame`/`read_frame` from a concrete
+`&mut TcpStream` to something that also accepts `&mut
+animus_env::MaybeTlsStream` looked like the obvious move: add a second
+type parameter, `S: AsyncRead + Unpin` (or `AsyncWrite`), alongside the
+existing `T: Serialize`/`T: DeserializeOwned`. That compiled the function
+itself fine, but broke every one of the ~100 pre-existing
+`read_frame::<SomeType>(&mut stream)` call sites across the test suite
+with "function takes 2 generic arguments but 1 generic argument was
+supplied" — Rust does **not** infer an unspecified *trailing* explicit
+type parameter from context, no matter which position it's declared in
+relative to the one the caller does specify. `read_frame::<T, S>`
+(caller-specified-first) and `read_frame::<S, T>` (caller-specified-last)
+both broke every existing `read_frame::<ClientResponse>(..)` turbofish
+identically — the *number* of parameters is what matters to arity
+checking, not which one the caller happened to name.
+
+The fix: make the stream parameter an anonymous `impl AsyncRead + Unpin`
+**argument** instead of a named type parameter at all. An `impl Trait`
+argument is generic under the hood but never participates in turbofish, so
+`T`'s own explicit-generic slot stays exactly where it always was and
+every existing call site kept compiling unchanged. `write_frame`'s `T`
+(inferred from the `&T` argument, never turbofished anywhere) didn't
+strictly need this, but was changed the same way for consistency and
+because the identical reasoning would bite the moment anyone *did* start
+turbofishing it.
+
+**General form**: before adding a second type parameter to a function that
+already has turbofish call sites, check whether any of those sites specify
+fewer type arguments than the function will end up declaring. If so, an
+`impl Trait` argument (when the new parameter is only ever used in
+argument position, never returned or named in a bound elsewhere) sidesteps
+the whole arity-break — it costs nothing at every existing call site and
+still gets full monomorphization. Reordering the parameter list does
+*not* help; only making it non-turbofishable does.
+
+## A TLS client's `connect()` future can resolve `Ok` before it has read the server's rejection of the client's own certificate
+
+Testing "a client cert signed by an unrelated CA is refused" by asserting
+`TlsConnector::connect(..).await.is_err()` failed — the connect future
+resolved `Ok(stream)` even though the server's `WebPkiClientVerifier` (via
+`with_client_cert_verifier`) does reject the cert. The reason is TLS 1.3's
+handshake shape: the client's own handshake state machine considers itself
+"done" once it has *sent* its last flight (`Certificate`,
+`CertificateVerify`, `Finished`) — it does not have to *read* anything
+further back to consider the handshake complete from its own side, since
+in the success case the server also has nothing more to send beyond
+optional session tickets. The server only learns the client's cert is
+untrusted *after* receiving that flight, at which point it sends a fatal
+alert and closes the connection — but the client only observes that alert
+on its *next* read (or a failed write once the socket is torn down), never
+retroactively failing the already-resolved `connect()` future.
+`animus-env`'s own `tls_peer_from_different_ca_is_refused` test (ADR 0064
+commit 1) already sidesteps this correctly by asserting on a higher-level
+effect (no frame ever delivered to the peer) rather than on the dial call
+itself; the commit 2 e2e test hit it fresh at the raw-`rustls` layer and
+was fixed the same way — assert on a write+read after the handshake, not
+on the handshake future's own `Result`.
+
+**General form**: when writing a TLS negative test around **client**-side
+certificate rejection specifically (as opposed to a client rejecting a bad
+*server* cert, which normally does fail the connect future — the client
+validates the server's cert before sending its own final flight), don't
+trust `connect()`'s own `Result`. Attempt a real read or write immediately
+after and assert *that* fails; if the handshake already failed outright,
+the same assertion still passes (there's nothing to write to).
+
+## `rustls` treats a peer's abrupt TCP close as an error, not clean EOF — even when every byte you wanted was already delivered
+
+A `Connection: close` HTTP/1.x server (this crate's hand-rolled admin/
+dynamo/console edges) closes the raw socket once its response is fully
+written, without sending a TLS `close_notify` alert first. A plain
+`TcpStream` client sees this as ordinary EOF; a `tokio_rustls`-wrapped
+client's `read_to_end` instead resolves to
+`Err(UnexpectedEof("peer closed connection without sending TLS
+close_notify"))` — `rustls` treats a missing `close_notify` as a
+truncation attack signal by design (RFC 8446 §6.1), regardless of whether
+the peer's *application data* was in fact complete. The bytes that did
+arrive are still fully present in the caller's buffer (tokio's
+`read_to_end` mutates the buffer in place as it reads, independent of the
+final `Result`); only the `Result` itself reports failure.
+
+**General form**: a TLS test client reading a `Connection: close`-style
+response until EOF should ignore `read_to_end`'s `Result` and trust the
+buffer's contents instead (`let _ = stream.read_to_end(&mut buf).await;`)
+— treating that specific error as fatal would make every otherwise-correct
+response look like a failure. This is specific to a peer that closes
+without `close_notify`; a peer that shuts its TLS session down properly
+gives a real `Ok` and needs no such workaround.

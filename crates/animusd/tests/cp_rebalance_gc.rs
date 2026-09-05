@@ -78,6 +78,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
                     intra: a[6 * i + 4],
                     console: a[6 * i + 5],
                     advertise_host: None,
+                    tls: None,
                 })
                 .collect(),
             dynamo_auth: None,

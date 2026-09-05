@@ -17,6 +17,33 @@ two transports —
 
 The whole crate is one file, `src/main.rs`.
 
+## TLS (`--tls-ca PATH`, ADR 0064, S-01 commit 2)
+
+Config-gated, default off — omitted, every dial is plain TCP,
+byte-for-byte unchanged. `--tls-ca PATH` may appear anywhere in the
+argument list (`extract_tls_ca` pulls it out, in place, before any
+subcommand's own positional parsing runs) and applies to **every** dial
+this invocation makes — the client-protocol port (`status`/`put`/`get`)
+and every admin-port call (`http_call`, reached by the flat one-shot
+routes and by the `decommission`/`control-add`/`control-remove`/
+`control-grow` orchestration functions, all of which now take an explicit
+`tls: Option<&tokio_rustls::TlsConnector>` parameter threaded down from
+`main`).
+
+This CLI is **never a cluster member** — it verifies the node it talks to
+(`build_tls_connector` builds a **server-only** `rustls::ClientConfig`
+trusting the given CA) but never presents a client certificate of its own,
+matching ADR 0064 Decision 2: every port this CLI dials (`client`/`admin`)
+is server-only TLS, never the mutual `internal`/`intra` ports. `animus_env`
+is a normal (non-dev) dependency purely for `MaybeTlsStream` (the dial
+wrapper `maybe_tls_connect` returns, so `write_frame`/`read_frame`/
+`read`/`write_all` all work unchanged) and `tls::server_name_for` (the
+identical `ServerName` derivation `animus-env`'s own internal wire and
+`animusd`'s intra dialer use) — this crate never constructs a `ProdEnv`
+itself. A missing/invalid `--tls-ca` file, or a handshake failure, is a
+plain startup/dial error (`main`'s usual `Err(String)` path) — never a
+panic.
+
 ## Client subcommands
 
 ```
@@ -165,4 +192,9 @@ behavior have no tests of their own here; they're covered end-to-end by
 (`tests/decommission.rs` among others). `main.rs` does carry a `#[cfg(test)]`
 module (`cargo test -p animus-cli`) for `admin_request` — the pure
 `(subcommand, args) -> (method, path, body)` step of `run_admin`'s flat GET
-dispatch — and its `flag_value` helper; it opens no sockets.
+dispatch — and its `flag_value` helper; it opens no sockets. Also
+`extract_tls_ca` (found anywhere in args / absent / trailing with no
+value) and `build_tls_connector` (rejects a missing file and a file with
+no certificates) — pure/local-filesystem-only, no socket, no live TLS
+handshake; `animusd`'s `tests/tls_e2e.rs` is the real end-to-end
+regression net for a genuine `--tls-ca` dial against a live node.

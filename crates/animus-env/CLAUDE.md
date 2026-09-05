@@ -450,7 +450,35 @@ the production implementation; the deterministic implementation lives in
     from a loopback dial address on any port); `write_test_pki` writes the
     PEMs to real files under a temp dir and returns one `TlsConfig` per
     leaf, so the tests exercise the real file-path `load()` path, not
-    in-memory PEM strings.
+    in-memory PEM strings. **`#[cfg(test)]`-private to this crate** — a
+    downstream crate needing the same shape (`animusd`'s own
+    `tests/support/mod.rs::tls_pki`, ADR 0064 commit 2) writes a small
+    independent copy rather than reusing this one across the crate
+    boundary.
+
+- **Server-only TLS + a second `TlsMaterial` acceptor (ADR 0064 commit 2)**
+  — `TlsMaterial` now carries `server_acceptor: tokio_rustls::TlsAcceptor`
+  alongside the original `acceptor` (still mutual) and `connector`:
+  `TlsConfig::load()` builds both `ServerConfig`s from the identical
+  cert/key (`with_client_cert_verifier` for `acceptor`, `with_no_client_
+  auth()` for `server_acceptor`), so `animusd`'s client/dynamo/admin/
+  console listeners (server-only TLS, ADR 0064 Decision 2) get an acceptor
+  from the same one `TlsConfig::load()` call the internal wire's mutual
+  mode already made — no second PEM read/parse for the server-only side.
+  `ca_path` stays required unconditionally in `load()` even though a
+  server-only port never reads it: a node's internal wire is always
+  mutual the moment TLS is configured at all, so there is no legitimate
+  case where a `TlsConfig` exists with nothing to verify peers against.
+  Tested directly here: `prod::tests::
+  server_only_acceptor_accepts_a_client_with_no_certificate` (a raw
+  loopback listener/dial, not a `ProdEnv` — proves the acceptor itself
+  imposes no client-cert requirement, independent of who ends up using
+  it).
+- **`server_name_for` is now `pub`, not `pub(crate)`** (ADR 0064 commit
+  2) — `animusd`'s own relay dialers (the intra `ClientRequest` port,
+  mutual TLS just like the internal wire) need the identical `ServerName`
+  derivation from the identical peer-book string, so it's shared via
+  `animus_env::tls::server_name_for` rather than duplicated.
 
 ## Tests
 
@@ -495,3 +523,11 @@ TLS material is picked up by the pooled sender's reconnect-once path).
 directly. Every plain-TCP test above this section is unmodified by ADR
 0064 and stays green under the same `cargo test -p animus-env --features
 prod` run.
+
+**Commit 2** adds one more: `prod::tests::
+server_only_acceptor_accepts_a_client_with_no_certificate` — a raw
+loopback listener/dial (no `ProdEnv`) proving `TlsMaterial::
+server_acceptor` imposes no client-cert requirement, unlike `acceptor`
+(mutual) on the exact same cert/key. `animusd`'s own `tests/tls_e2e.rs` is
+the real end-to-end regression net for this acceptor actually serving the
+client/dynamo/admin/console ports — see that crate's `CLAUDE.md`.

@@ -182,10 +182,11 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, Metric, Rng};
+use animus_env::{Clock, Env, MaybeTlsStream, Metric, Rng};
 use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 
 use crate::http;
 use crate::{ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead};
@@ -338,12 +339,38 @@ fn resolve_key(
 
 /// Accept loop for the DynamoDB HTTP endpoint. Each connection is handled on its
 /// own task; HTTP/1.1 keep-alive lets a client reuse the connection.
-pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
+///
+/// **TLS (ADR 0064, S-01 commit 2)**: `tls` is this port's own
+/// **server-only** acceptor (Decision 2 — SigV4, ADR 0057, remains the
+/// caller-identity story; TLS here is confidentiality + server
+/// authenticity only). `None` (the default) is plain TCP, byte-for-byte
+/// unchanged. A failed handshake is logged at `warn` with the peer's
+/// address and the connection dropped; the loop keeps serving.
+pub(crate) async fn serve(
+    listener: TcpListener,
+    ctx: ClientCtx,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer_addr)) => {
                 let ctx = ctx.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
+                    let stream = match tls {
+                        None => MaybeTlsStream::Plain(stream),
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    %peer_addr,
+                                    "dynamo TLS handshake failed (dropping connection)"
+                                );
+                                return;
+                            }
+                        },
+                    };
                     if let Err(err) = handle_conn(stream, ctx).await {
                         tracing::debug!(?err, "dynamo connection closed");
                     }
@@ -357,7 +384,10 @@ pub(crate) async fn serve(listener: TcpListener, ctx: ClientCtx) {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, ctx: ClientCtx) -> std::io::Result<()> {
+async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    ctx: ClientCtx,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     loop {
         let Some(request) = http::read_http_request(&mut stream, &mut buf).await? else {
@@ -7130,6 +7160,7 @@ mod stream_write_path_tests {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

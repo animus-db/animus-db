@@ -110,6 +110,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 traceparent: crate::otel::current_traceparent(),
             },
             STALE_READ_FORWARD_TIMEOUT,
+            self.tls.as_ref(),
         )
         .await
     }

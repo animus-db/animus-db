@@ -125,7 +125,10 @@ use animus_cp_data::{
     FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
     TxnOutcome, TxnRecordView,
 };
-use animus_env::{Clock, Disk, Env, FsSegmentStore, Metric, MetricsHandle, NodeId, ProdEnv};
+use animus_env::{
+    Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, NodeId, ProdEnv,
+    TlsMaterial,
+};
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
     WalRecordView,
@@ -133,7 +136,7 @@ use animus_storage::{
 use animus_tablet::{KeyRange, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 // Pure CP-topology decision logic (routing predicates), extracted into
@@ -2120,6 +2123,16 @@ pub struct RoleAddrs {
     /// advertises one pod identity, not six.
     #[serde(default)]
     pub advertise_host: Option<String>,
+    /// This node's TLS material (ADR 0064, S-01 commit 2) — `None` (every
+    /// pre-ADR-0064 config, `#[serde(default)]`) means plain TCP on every
+    /// port this node binds, byte-for-byte today's behavior. `Some` speaks
+    /// **mutual** TLS on `internal`/`intra` and **server-only** TLS on
+    /// `client`/`dynamo`/`admin`/`console` — see `Node::bind`/`bind_control`/
+    /// `bind_data` for which acceptor each port gets, and
+    /// [`config::ClusterConfig::validate_tls`] for the whole-config
+    /// all-or-none rule this field is checked against.
+    #[serde(default)]
+    pub tls: Option<config::TlsSection>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2182,6 +2195,9 @@ pub struct BoundNode {
     /// [`Node::bind`] was given — see [`advertised_addr`] and
     /// [`RoleAddrs::advertise_host`]'s own doc.
     advertise_host: Option<String>,
+    /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
+    /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
+    tls: Option<TlsMaterial>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -3506,6 +3522,7 @@ fn spawn_common_tail(
     control_storage: Option<SharedEngine>,
     env: ProdEnv,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    tls: Option<TlsMaterial>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3529,6 +3546,7 @@ fn spawn_common_tail(
         remote_metadata: Arc::new(Mutex::new(None)),
         control_storage,
         dynamo_auth,
+        tls: tls.clone(),
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -3581,18 +3599,31 @@ fn spawn_common_tail(
     // `Client` refuses every `Surface::Intra` request (`handle_request`'s one
     // guard clause); `Intra` serves everything (a deliberate superset, not a
     // partition — see `Surface`'s doc).
+    //
+    // **TLS mode (ADR 0064 Decision 1/2)**: `client` is a server-only port
+    // (SigV4/no caller identity requirement, like `dynamo`/`admin`/
+    // `console`); `intra` is **mutual** — it's a peer-to-peer relay port
+    // between cluster members, the same trust boundary as the internal
+    // Raft wire (`server_acceptor`/`acceptor` respectively).
     tasks.push(tokio::spawn(serve_requests(
         client_listener,
         ctx.clone(),
         ListenerKind::Client,
+        tls.as_ref().map(|m| m.server_acceptor.clone()),
     )));
     tasks.push(tokio::spawn(serve_requests(
         intra_listener,
         ctx.clone(),
         ListenerKind::Intra,
+        tls.as_ref().map(|m| m.acceptor.clone()),
     )));
-    // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020).
-    tasks.push(tokio::spawn(admin::serve(admin_listener, ctx.clone())));
+    // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020) —
+    // server-only TLS (ADR 0064 Decision 2).
+    tasks.push(tokio::spawn(admin::serve(
+        admin_listener,
+        ctx.clone(),
+        tls.as_ref().map(|m| m.server_acceptor.clone()),
+    )));
     // animusd console (ADR 0052's "AnimusDB Data Console") — `None` on a control-only node
     // (it hosts no CP-data tablet, so it has nothing for the console to
     // show; see `BoundControlNode::start_control_with`, the only caller that
@@ -3614,6 +3645,7 @@ fn spawn_common_tail(
             console_listener,
             table_source,
             backend,
+            tls.as_ref().map(|m| m.server_acceptor.clone()),
         )));
     }
 
@@ -4104,6 +4136,7 @@ impl BoundNode {
             Some(storage.clone()),
             self.env.clone(),
             dynamo_auth,
+            self.tls,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -4402,6 +4435,7 @@ impl BoundNode {
         tasks.push(tokio::spawn(dynamo::serve(
             self.dynamo_listener,
             ctx.clone(),
+            ctx.tls.as_ref().map(|m| m.server_acceptor.clone()),
         )));
 
         Ok(Node {
@@ -4495,8 +4529,18 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundNode> {
         let dir = data_dir.into();
+        // ADR 0064 (S-01 commit 2): a present `RoleAddrs::tls` section is
+        // loaded once here, then handed both to `ProdEnv::bind_with_tls`
+        // (the internal Raft wire, mutual — commit 1's own mechanism,
+        // unchanged) and kept as this node's own [`TlsMaterial`] for every
+        // other listener this function binds (`Node::bind`'s own doc has
+        // the full per-port acceptor table). `None` (the default) is
+        // byte-for-byte today's plain-TCP behavior on every port.
+        let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
+        let tls = tls_config.clone().map(|c| c.load()).transpose()?;
         let (env, internal_addr) =
-            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
+            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
+                .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -4523,6 +4567,7 @@ impl Node {
             console_listener,
             console_addr,
             advertise_host: addrs.advertise_host,
+            tls,
         })
     }
 
@@ -4541,8 +4586,14 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundControlNode> {
         let dir = data_dir.into();
+        // See `Node::bind`'s own doc for why the material is loaded once
+        // here and handed to both `ProdEnv::bind_with_tls` and this node's
+        // own listeners below.
+        let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
+        let tls = tls_config.clone().map(|c| c.load()).transpose()?;
         let (env, internal_addr) =
-            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
+            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
+                .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
@@ -4561,6 +4612,7 @@ impl Node {
             intra_listener,
             intra_addr,
             advertise_host: addrs.advertise_host,
+            tls,
         })
     }
 
@@ -4580,8 +4632,14 @@ impl Node {
         data_dir: impl Into<PathBuf>,
     ) -> std::io::Result<BoundDataNode> {
         let dir = data_dir.into();
+        // See `Node::bind`'s own doc for why the material is loaded once
+        // here and handed to both `ProdEnv::bind_with_tls` and this node's
+        // own listeners below.
+        let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
+        let tls = tls_config.clone().map(|c| c.load()).transpose()?;
         let (env, internal_addr) =
-            ProdEnv::bind(id.clone(), addrs.internal, dir.join("internal")).await?;
+            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
+                .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -4608,6 +4666,7 @@ impl Node {
             console_listener,
             console_addr,
             advertise_host: addrs.advertise_host,
+            tls,
         })
     }
 
@@ -4901,6 +4960,9 @@ pub struct BoundControlNode {
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
     advertise_host: Option<String>,
+    /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
+    /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
+    tls: Option<TlsMaterial>,
 }
 
 impl BoundControlNode {
@@ -5157,6 +5219,7 @@ impl BoundControlNode {
             // A control-only node never binds the dynamo listener (ADR
             // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
             None,
+            self.tls,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5283,6 +5346,9 @@ pub struct BoundDataNode {
     console_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
     advertise_host: Option<String>,
+    /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
+    /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
+    tls: Option<TlsMaterial>,
 }
 
 impl BoundDataNode {
@@ -5490,7 +5556,9 @@ impl BoundDataNode {
 
         let control = ControlHandle::Remote(RemoteControlClient::new(
             control_seeds.clone(),
-            AnimusdRelayClient,
+            AnimusdRelayClient {
+                tls: self.tls.clone(),
+            },
             CLIENT_TIMEOUT,
         ));
 
@@ -5597,6 +5665,7 @@ impl BoundDataNode {
             None,
             self.env.clone(),
             dynamo_auth,
+            self.tls,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -5755,6 +5824,7 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(dynamo::serve(
             self.dynamo_listener,
             ctx.clone(),
+            ctx.tls.as_ref().map(|m| m.server_acceptor.clone()),
         )));
 
         Ok(Node {
@@ -6780,6 +6850,20 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// "explicitly out of scope: rotation, dynamic credential API") — cheap
     /// to clone onto each connection's `ClientCtx`, never locked.
     pub(crate) dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
+    /// This node's TLS material (ADR 0064, S-01 commit 2) — `None` (every
+    /// pre-ADR-0064 deployment) means every listener/dialer this context
+    /// reaches stays plain TCP, byte-for-byte unchanged. `Some` is loaded
+    /// once at bind time (`Node::bind`/`bind_control`/`bind_data`) from
+    /// this node's own [`RoleAddrs::tls`] and carried here so every
+    /// connection's cloned `ClientCtx` can reach it: `Some(m).
+    /// server_acceptor` serves the `client`/`dynamo`/`admin`/`console`
+    /// ports (server-only TLS), `Some(m).acceptor` the `intra` port
+    /// (mutual), and `Some(m).connector` is what [`relay_request_with_
+    /// timeout`] (and every cross-node relay built on it — forwarding,
+    /// schema DDL, the growth/join control-mirror poll) dials the `intra`
+    /// port with — always mutual, matching that port's own acceptor.
+    /// Cheap to clone (`TlsMaterial`'s own fields are `Arc`-backed).
+    pub(crate) tls: Option<TlsMaterial>,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -7900,7 +7984,9 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     let remote = RemoteControlClient::with_mirror(
         seeds.clone(),
         ctx.remote_metadata.clone(),
-        AnimusdRelayClient,
+        AnimusdRelayClient {
+            tls: ctx.tls.clone(),
+        },
         CLIENT_TIMEOUT,
     );
     remote_metadata_watch_loop(remote, seeds).await
@@ -7937,12 +8023,14 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Stri
 
         let mut synced = false;
         for addr in candidates {
-            match relay_request_with_timeout(
-                addr,
-                &ClientRequest::WatchMetadata { last_seen },
-                WATCH_METADATA_CLIENT_TIMEOUT,
-            )
-            .await
+            match remote
+                .relay()
+                .relay(
+                    addr,
+                    &ClientRequest::WatchMetadata { last_seen },
+                    WATCH_METADATA_CLIENT_TIMEOUT,
+                )
+                .await
             {
                 ClientResponse::Status {
                     metadata,
@@ -8006,7 +8094,10 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Stri
                 intra_leader_hint,
                 watermark,
                 control_voters,
-            } = relay_request(addr.clone(), &ClientRequest::Status).await
+            } = remote
+                .relay()
+                .relay(addr.clone(), &ClientRequest::Status, CLIENT_TIMEOUT)
+                .await
             {
                 remote.observe(
                     metadata,
@@ -9021,12 +9112,41 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// [`handle_connection`] into [`handle_request`]'s one guard clause. Replaces
 /// the pre-ADR-0047 `serve_clients`/`handle_client` pair, which only ever
 /// served the client port.
-async fn serve_requests(listener_socket: TcpListener, ctx: ClientCtx, listener: ListenerKind) {
+/// `tls` (ADR 0064, S-01 commit 2) is the acceptor this particular
+/// instantiation should use — the two `spawn_common_tail` call sites pass
+/// different ones: `server_acceptor` for `ListenerKind::Client`,
+/// `acceptor` (mutual) for `ListenerKind::Intra` (see that function's own
+/// call sites for why). `None` (TLS unconfigured, the default) is plain
+/// TCP, byte-for-byte unchanged. A failed handshake is logged at `warn`
+/// with the peer's address and the connection dropped — the loop keeps
+/// serving every other connection, mirroring `animus_env::prod::
+/// spawn_accept`'s own contract.
+async fn serve_requests(
+    listener_socket: TcpListener,
+    ctx: ClientCtx,
+    listener: ListenerKind,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) {
     loop {
         match listener_socket.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer_addr)) => {
                 let ctx = ctx.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
+                    let stream = match tls {
+                        None => MaybeTlsStream::Plain(stream),
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    %peer_addr,
+                                    "client-protocol TLS handshake failed (dropping connection)"
+                                );
+                                return;
+                            }
+                        },
+                    };
                     if let Err(err) = handle_connection(stream, ctx, listener).await {
                         tracing::debug!(?err, "connection closed");
                     }
@@ -9040,8 +9160,8 @@ async fn serve_requests(listener_socket: TcpListener, ctx: ClientCtx, listener: 
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     ctx: ClientCtx,
     listener: ListenerKind,
 ) -> std::io::Result<()> {
@@ -9432,6 +9552,7 @@ pub async fn bind_cluster_with_advertise_host(
             intra: addr(),
             console: addr(),
             advertise_host: advertise_host.clone(),
+            tls: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -9909,6 +10030,7 @@ pub async fn start_split_cluster_with_growth(
             intra: ephemeral(),
             console: ephemeral(),
             advertise_host: None,
+            tls: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -9926,6 +10048,7 @@ pub async fn start_split_cluster_with_growth(
             intra: ephemeral(),
             console: ephemeral(),
             advertise_host: None,
+            tls: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -11413,8 +11536,12 @@ pub use animus_node::MAX_FRAME_LEN;
 /// of its own to reach through, but needs the exact same wire primitive every
 /// other cross-node relay in this crate uses — [`ClientCtx::relay`] is now a
 /// thin wrapper over this.
-pub(crate) async fn relay_request(addr: String, request: &ClientRequest) -> ClientResponse {
-    relay_request_with_timeout(addr, request, CLIENT_TIMEOUT).await
+pub(crate) async fn relay_request(
+    addr: String,
+    request: &ClientRequest,
+    tls: Option<&TlsMaterial>,
+) -> ClientResponse {
+    relay_request_with_timeout(addr, request, CLIENT_TIMEOUT, tls).await
 }
 
 /// Like [`relay_request`], but with an explicit transport timeout instead of
@@ -11434,13 +11561,36 @@ pub(crate) async fn relay_request(addr: String, request: &ClientRequest) -> Clie
 /// attempt outliving `timeout` (`Err(_)`, `tokio::time::error::Elapsed`)
 /// means nothing failed, there just wasn't an answer *yet* — the candidate
 /// may still be alive and simply slow.
+///
+/// **TLS (ADR 0064, S-01 commit 2)**: `tls` is this node's own loaded
+/// [`TlsMaterial`] (`ClientCtx::tls`/`AnimusdRelayClient`'s own copy),
+/// `None` when TLS is unconfigured (plain TCP, byte-for-byte unchanged).
+/// The `intra` port is **mutual** TLS (the same trust boundary as the
+/// internal Raft wire — see `ClientCtx::tls`'s own doc), so a relay dial
+/// presents this node's own certificate via `tls.connector`, deriving the
+/// `ServerName` to verify the peer against from exactly the address string
+/// dialed (`animus_env::tls::server_name_for`, the identical derivation
+/// `ProdEnv`'s own internal-wire dial path uses) — a peer's certificate SAN
+/// must cover whatever string `addr` names it by, matching that function's
+/// own documented requirement. A handshake failure surfaces as a plain
+/// connect failure, handled by the exact same fast-confirmed-dead path as
+/// any other dial failure below.
 async fn relay_request_with_timeout(
     addr: String,
     request: &ClientRequest,
     timeout: Duration,
+    tls: Option<&TlsMaterial>,
 ) -> ClientResponse {
     match tokio::time::timeout(timeout, async {
-        let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
+        let stream = TcpStream::connect(addr.as_str()).await.ok()?;
+        let mut stream = match tls {
+            None => MaybeTlsStream::Plain(stream),
+            Some(tls) => {
+                let server_name = animus_env::tls::server_name_for(&addr).ok()?;
+                let tls_stream = tls.connector.connect(server_name, stream).await.ok()?;
+                MaybeTlsStream::Tls(Box::new(tls_stream.into()))
+            }
+        };
         write_frame(&mut stream, request).await.ok()?;
         read_frame::<ClientResponse>(&mut stream).await.ok()?
     })
@@ -11507,14 +11657,27 @@ const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
 /// [`MAX_FRAME_LEN`] bound check, and the `serde_json` encode itself — moved
 /// to [`animus_node::codec::encode_client_frame`] (ADR 0061 rung C3a)**;
 /// this function keeps only the actual socket write, which needs a real
-/// `TcpStream` and so cannot move into `animus-node` (no `tokio`
+/// async stream and so cannot move into `animus-node` (no `tokio`
 /// dependency there at all).
+///
+/// **Generic over the stream type (ADR 0064, S-01 commit 2)**: `impl
+/// AsyncWrite + Unpin` rather than a concrete `TcpStream`, so the exact
+/// same code serves a plain connection or a [`MaybeTlsStream`] with zero
+/// duplication. Every existing call site (the whole pre-ADR-0064 test
+/// suite, which passes a concrete `&mut TcpStream`) keeps compiling
+/// unchanged. An `impl Trait` argument rather than a named type parameter,
+/// specifically so this stays turbofish-compatible wherever `T` itself is
+/// disambiguated that way — see [`read_frame`]'s own doc, where that
+/// matters more (many call sites write `read_frame::<SomeType>(..)`).
 ///
 /// # Errors
 /// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
 /// receiver would drop the connection anyway — failing at the sender names the
 /// culprit instead of surfacing as a mysterious peer hang-up).
-pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<()> {
+pub async fn write_frame<T: Serialize>(
+    stream: &mut (impl AsyncWrite + Unpin),
+    msg: &T,
+) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
     stream.write_all(&framed).await?;
     stream.flush().await?;
@@ -11527,14 +11690,25 @@ pub async fn write_frame<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::
 /// declared length, and the `serde_json` decode itself — moved to
 /// [`animus_node::codec::frame_payload_len`]/
 /// [`animus_node::codec::decode_client_frame`] (ADR 0061 rung C3a)**; this
-/// function keeps only the actual socket reads, which need a real
-/// `TcpStream`.
+/// function keeps only the actual socket reads, which need a real async
+/// stream.
+///
+/// **Generic over the stream type (ADR 0064, S-01 commit 2)** — an `impl
+/// AsyncRead + Unpin` argument rather than a named type parameter,
+/// specifically so `T`'s own turbofish (`read_frame::<ClientResponse>(..)`,
+/// used throughout the pre-ADR-0064 test suite) keeps meaning exactly what
+/// it always meant: a named second type parameter would make that same
+/// turbofish an arity error (Rust does not infer a trailing explicit type
+/// parameter left unspecified) — see [`write_frame`]'s own doc for the
+/// identical reasoning on the write side.
 ///
 /// # Errors
 /// Propagates read failures and decode errors; a declared length over
 /// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
 /// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
-pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<Option<T>> {
+pub async fn read_frame<T: DeserializeOwned>(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -11601,6 +11775,7 @@ mod confirm_futility_tests {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -11999,6 +12174,7 @@ mod forward_transport_failure_tests {
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         ClusterConfig {
@@ -12272,6 +12448,7 @@ mod forward_hop_timeout_tests {
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         ClusterConfig {
@@ -12964,6 +13141,7 @@ mod halted_shutdown_tests {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -13180,6 +13358,7 @@ mod issue_412_tests {
                 intra: addrs[4],
                 console: addrs[5],
                 advertise_host: None,
+                tls: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -13500,6 +13679,7 @@ mod simenv_client_ctx_tests {
             remote_metadata: Arc::new(Mutex::new(None)),
             control_storage: None,
             dynamo_auth: None,
+            tls: None,
         };
 
         (sim, ctx, control, kv)
@@ -13731,6 +13911,7 @@ mod issue_298_conflict_tests {
                 admin: addrs[3],
                 intra: addrs[4],
                 advertise_host: None,
+                tls: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

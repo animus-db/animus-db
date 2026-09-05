@@ -562,6 +562,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     traceparent: crate::otel::current_traceparent(),
                 },
                 hop_timeout,
+                self.tls.as_ref(),
             )
             .await;
             let ClientResponse::Error(e) = &resp else {
@@ -649,7 +650,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// [`control_handle::RemoteControlClient`], which has no `ClientCtx` of
     /// its own, can use the identical wire primitive).
     pub(crate) async fn relay(&self, addr: String, request: ClientRequest) -> ClientResponse {
-        relay_request(addr, &request).await
+        relay_request(addr, &request, self.tls.as_ref()).await
     }
 
     /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it

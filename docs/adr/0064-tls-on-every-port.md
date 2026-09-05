@@ -1,9 +1,11 @@
 # ADR 0064 — TLS on every port
 
-- **Status:** Proposed — commit 1 of 4 (`S-01`) implemented: mutual TLS on
-  the intra-node wire inside `ProdEnv`, config-gated, default off. Commits
-  2–4 (client/intra-`ClientRequest`/admin/console listeners in `animusd`,
-  operator cert-manager wiring, website/closing notes) are not yet built.
+- **Status:** Proposed — commits 1 and 2 of 4 (`S-01`) implemented: mutual
+  TLS on the intra-node wire inside `ProdEnv` (commit 1), and TLS on every
+  `animusd` listener and dialer — client, intra-`ClientRequest`, admin,
+  console — plus `animus-cli`'s client-protocol and admin dials (commit
+  2), both config-gated, default off. Commits 3–4 (operator cert-manager
+  wiring, website/closing notes) are not yet built.
 - **Date:** 2026-09-05
 - **Amends:** [ADR 0047](0047-intra-node-port.md) (port classes — TLS is
   orthogonal to the internal/intra/client/admin/console split that ADR
@@ -285,3 +287,107 @@ ADR doesn't start." This ADR is that milestone; commit 3 of this series
 adds the operator's cert-manager `Certificate`/`Issuer` wiring + volume
 mounts + `ClusterConfig` cert-path fields ADR 0060 deferred, once commits 1
 and 2 give the operator something to configure.
+
+## Amendment note (commit 2 landed, 2026-09-05)
+
+Commit 2 (S-01 step 2) lands Decision 1/2's actual mechanism in `animusd`
+and `animus-cli`, on top of commit 1's `animus-env` primitives, with no
+further design change — every decision above stands as written. As-built
+specifics worth recording:
+
+- **`TlsMaterial` grew a second acceptor.** `animus-env`'s `TlsMaterial`
+  (commit 1) now carries `server_acceptor: tokio_rustls::TlsAcceptor`
+  alongside the original `acceptor` (renamed in spirit, not in name — it
+  stays mutual) and `connector`: `TlsConfig::load()` builds both
+  `ServerConfig`s from the same cert/key (`with_client_cert_verifier` for
+  `acceptor`, `with_no_client_auth()` for `server_acceptor`), so a node's
+  own single `TlsConfig` never needs loading twice for the two modes.
+  `animus_env::tls::server_name_for` — `pub(crate)` in commit 1 — is now
+  `pub`, since `animusd`'s own relay dialers need the identical
+  `ServerName` derivation the internal wire already used.
+- **Config shape**: `RoleAddrs` (not `ClusterConfig`) gained `tls:
+  Option<config::TlsSection>` — **per-node**, unlike `dynamo_auth`
+  (cluster-wide), because TLS material is inherently per-node (each node
+  presents its own cert; only `ca_path` is conventionally shared).
+  `TlsSection` mirrors `animus_env::TlsConfig`'s three fields exactly and
+  converts to it via `to_tls_config()`. `ClusterConfig::validate_tls`
+  (called from `from_json`) enforces Decision 3's all-or-none rule across
+  every node's own `tls` presence — the check is necessarily whole-*file*,
+  not whole-*deployment*: a real multi-process deployment where each
+  process supplies its own `--tls-*` CLI flags (rather than baking every
+  node's section into one shared config file) is invisible to any single
+  process's own load-time check, since each process only ever sees its own
+  flag. That gap is documented, not closed, in `main.rs`'s own module doc
+  — the config-file route (every node's `tls` section baked in up front,
+  the shape a Kubernetes ConfigMap naturally wants for commit 3) sidesteps
+  it entirely by construction.
+- **CLI flags**: `--tls-cert PATH --tls-key PATH --tls-ca PATH`, all three
+  or none, on `--config`/`--node` (combined) and `data --config`/`data
+  --seed` — the same subset of entry points `--dynamo-auth` reaches on
+  purpose (not `join`/`control`, mirroring that flag's own non-acceptance
+  there; not `--cluster N`/`--cluster-control`/`--cluster-data`, which
+  hard-error on the flag instead of silently ignoring it — a deliberate
+  departure from the silent-gap precedent those dev-only paths otherwise
+  use for knobs like `--advertise-host`, since silently starting a
+  plaintext cluster an operator asked for TLS on is a materially worse
+  failure mode than an unsupported-combination error). `apply_tls_flag`
+  mirrors `apply_advertise_host_flag`'s per-node-entry shape (not
+  `apply_dynamo_auth_flag`'s cluster-wide one) for the same per-node-cert
+  reason as the config shape above.
+- **Per-port TLS mode, as built** (Decision 1/2, unchanged from the
+  original decision — recorded here as the concrete table):
+
+  | Port | Mode | Acceptor / dialer |
+  |------|------|--------------------|
+  | `internal` (raw Raft wire) | mutual | `ProdEnv::bind_with_tls` (commit 1) |
+  | `intra` (`ClientRequest` relay) | mutual | `TlsMaterial::acceptor` / `.connector` |
+  | `client` (`ClientRequest`, external) | server-only | `TlsMaterial::server_acceptor` |
+  | `dynamo` | server-only | `TlsMaterial::server_acceptor` |
+  | `admin` | server-only | `TlsMaterial::server_acceptor` |
+  | `console` | server-only | `TlsMaterial::server_acceptor` |
+
+- **One generic stream, not a fork.** `http.rs`'s response/request
+  helpers, `admin.rs`/`dynamo.rs`/`console.rs`'s `handle_conn`, and
+  `lib.rs`'s `handle_connection` are all generic over `S: AsyncRead +
+  AsyncWrite + Unpin` (or an `impl Trait` argument, for `write_frame`/
+  `read_frame` specifically — see their own doc for why a named type
+  parameter there would have broken every pre-existing `read_frame::
+  <SomeType>(..)` turbofish call site across the test suite: Rust does not
+  infer an unspecified *trailing* explicit type parameter, so `S` had to
+  be an anonymous `impl Trait` argument, not a second named parameter,
+  regardless of ordering). Each accept loop wraps a plain `TcpStream` in
+  `animus_env::MaybeTlsStream::Plain` when TLS is off and runs it through
+  the right acceptor when on; a failed handshake is logged at `warn` with
+  the peer's address and the connection dropped, mirroring
+  `animus_env::prod::spawn_accept`'s own contract — the listener keeps
+  serving.
+- **Dialers**: `ClientCtx` and `AnimusdRelayClient` (the latter no longer
+  zero-sized) each carry `Option<TlsMaterial>`; `relay_request`/
+  `relay_request_with_timeout` take it as a parameter and dial the `intra`
+  port through `TlsMaterial::connector` (always mutual — every relay this
+  crate makes targets `intra`, never `client`). `RemoteControlClient`
+  (`animus-node`) grew a `relay()` accessor so `animusd`'s
+  `remote_metadata_watch_loop` — which drives its own `WatchMetadata`/
+  `Status` round trips outside `metadata_fresh` — reaches the identical
+  relay path (and its TLS material) instead of re-dialing by hand.
+  `animus-cli` never joins the cluster and so never needs a client
+  certificate at all: `--tls-ca PATH` builds a server-only `rustls`
+  `ClientConfig` (no `with_client_auth_cert`), reused for both the
+  client-protocol dial and every `http_call` (admin) dial.
+- **What stays plain**: `cluster_bench` (the wire benchmark) is untouched
+  — a deliberate scope cut, not an oversight; benchmarking the TLS
+  handshake/record-layer cost is a follow-up if ever needed.
+  `animus-operator`'s admin client is commit 3's job.
+- **Tests**: `crates/animus-env/src/prod.rs`'s
+  `server_only_acceptor_accepts_a_client_with_no_certificate` (commit 1's
+  file, since `TlsMaterial::server_acceptor` is that crate's own type);
+  `crates/animusd/tests/support/mod.rs::tls_pki`/`bring_up_deadline_tls`
+  (a small independent copy of `animus-env`'s own `#[cfg(test)]`-private
+  PKI helper — see that function's own doc for why it isn't reused
+  directly); `crates/animusd/tests/tls_e2e.rs` (a real 3-node TLS cluster:
+  `CreateTable`/`PutItem`/`GetItem` across nodes over server-only TLS,
+  admin/console GET over TLS, a plain-TCP dial refused while the port
+  keeps serving, a different-CA client refused on the intra port, and the
+  mixed-config validation error); config round-trip + `validate_tls` unit
+  tests in `config.rs`; flag-parsing/conflict unit tests in `main.rs`; and
+  parser + connector-construction unit tests in `animus-cli`.

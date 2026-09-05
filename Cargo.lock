@@ -34,9 +34,13 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 name = "animus-cli"
 version = "0.0.0"
 dependencies = [
+ "animus-env",
  "animusd",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -235,10 +239,14 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

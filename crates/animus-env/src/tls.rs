@@ -79,12 +79,31 @@ pub struct TlsConfig {
 /// performs.
 #[derive(Clone)]
 pub struct TlsMaterial {
-    /// Wraps an inbound [`TcpStream`] as a TLS server, requiring (and
-    /// verifying) the peer's client certificate against the cluster CA.
+    /// Wraps an inbound [`TcpStream`] as a **mutual**-TLS server, requiring
+    /// (and verifying) the peer's client certificate against the cluster
+    /// CA. This is the internal wire's own acceptor (ADR 0064 commit 1) and
+    /// — since commit 2 — `animusd`'s `intra` (`ClientRequest`) port, the
+    /// other mutual-TLS-only port: a host without a cluster-CA-signed cert
+    /// cannot complete either handshake at all.
     pub acceptor: tokio_rustls::TlsAcceptor,
+    /// Wraps an inbound [`TcpStream`] as a **server-only** TLS server: it
+    /// presents this node's certificate but neither requires nor verifies
+    /// a peer client certificate (ADR 0064 commit 2, Decision 2). Built
+    /// from the same cert/key as [`acceptor`](Self::acceptor) — only the
+    /// client-auth requirement differs — for `animusd`'s `client`/`dynamo`/
+    /// `admin`/`console` ports, none of which has a peer cert to verify
+    /// against a CA at all (SigV4, ADR 0057, remains the client-identity
+    /// story on the `dynamo` port; TLS here buys confidentiality and
+    /// server authenticity, not caller identity).
+    pub server_acceptor: tokio_rustls::TlsAcceptor,
     /// Wraps an outbound [`TcpStream`] as a TLS client, presenting this
     /// node's own certificate and verifying the peer's server certificate
-    /// against the same CA.
+    /// against the same CA. Used for every **mutual**-TLS dial this node
+    /// makes (the internal wire, and — commit 2 — `animusd`'s own `intra`
+    /// relay dials); a dial to a server-only port needs no client
+    /// certificate of its own and so builds its own minimal `ClientConfig`
+    /// at the call site instead of using this connector (see `animusd`/
+    /// `animus-cli`'s own TLS plumbing).
     pub connector: tokio_rustls::TlsConnector,
 }
 
@@ -147,18 +166,22 @@ impl AsyncWrite for MaybeTlsStream {
 }
 
 impl TlsConfig {
-    /// Read this config's PEM files once and build the mutual-TLS
-    /// [`TlsMaterial`] the internal wire needs: a `ServerConfig` that
-    /// requires and verifies a peer's client certificate against `ca_path`,
-    /// and a `ClientConfig` that presents this node's own certificate and
-    /// verifies the peer's server certificate against the same CA.
+    /// Read this config's PEM files once and build the [`TlsMaterial`] a
+    /// node needs for **every** port it might bind (ADR 0064: one node
+    /// certificate serves all of them) — a mutual-TLS `ServerConfig`/
+    /// `ClientConfig` pair for the internal wire and (since commit 2)
+    /// `animusd`'s `intra` port, plus a **server-only** `ServerConfig`
+    /// (same cert/key, no client-cert requirement) for `animusd`'s
+    /// `client`/`dynamo`/`admin`/`console` ports.
     ///
     /// # Errors
-    /// Returns an error if `ca_path` is absent (mutual TLS has no meaning
-    /// without a trust anchor to verify the peer against — see this
-    /// module's doc for why the internal wire has no server-only mode), if
-    /// any PEM file cannot be read or contains no usable cert/key, or if
-    /// `rustls` rejects the resulting material (e.g. an unparseable key).
+    /// Returns an error if `ca_path` is absent — still required
+    /// unconditionally: even a node that only cares about its server-only
+    /// ports always has an internal Raft wire that needs mutual TLS the
+    /// moment `TlsConfig` is configured at all, so there is no legitimate
+    /// case with no CA to load — if any PEM file cannot be read or
+    /// contains no usable cert/key, or if `rustls` rejects the resulting
+    /// material (e.g. an unparseable key).
     pub fn load(&self) -> io::Result<TlsMaterial> {
         let Some(ca_path) = self.ca_path.as_deref() else {
             return Err(io::Error::new(
@@ -193,15 +216,30 @@ impl TlsConfig {
 
         let client_certs = load_certs(&self.cert_path)?;
         let client_key = load_private_key(&self.key_path)?;
-        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(to_io_error)?
             .with_root_certificates(root_cert_store(ca_path)?)
             .with_client_auth_cert(client_certs, client_key)
             .map_err(to_io_error)?;
 
+        // Server-only (ADR 0064 commit 2, Decision 2): the client/dynamo/
+        // admin/console ports' own acceptor — same cert/key as `acceptor`
+        // above, but `with_no_client_auth()` in place of
+        // `with_client_cert_verifier`, since none of those ports has a peer
+        // client certificate to verify against a CA at all.
+        let server_only_certs = load_certs(&self.cert_path)?;
+        let server_only_key = load_private_key(&self.key_path)?;
+        let server_only_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(to_io_error)?
+            .with_no_client_auth()
+            .with_single_cert(server_only_certs, server_only_key)
+            .map_err(to_io_error)?;
+
         Ok(TlsMaterial {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+            server_acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_only_config)),
             connector: tokio_rustls::TlsConnector::from(Arc::new(client_config)),
         })
     }
@@ -258,6 +296,13 @@ fn to_io_error<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string())
 }
 
+/// **`pub`, not `pub(crate)`, since ADR 0064 commit 2** (S-01 step 2): the
+/// internal wire (`prod.rs`) is no longer this function's only caller —
+/// `animusd`'s own dialers (the intra `ClientRequest` relay, mutual TLS
+/// just like the internal wire) must derive the exact same `ServerName`
+/// from the exact same peer-book string, so this is shared rather than
+/// duplicated.
+///
 /// Derive the [`ServerName`] a TLS client presents (and verifies the peer's
 /// certificate against) for one dial address, from exactly the string
 /// `ProdEnv`'s peer book holds for that peer (`host:port`, per the
@@ -267,7 +312,7 @@ fn to_io_error<E: std::fmt::Display>(err: E) -> io::Error {
 /// IpAddress`; anything else is treated as a DNS name. This must agree with
 /// how the peer's own certificate names itself: **a node's cert SAN must
 /// cover every string its peers might dial it by** (see this module's doc).
-pub(crate) fn server_name_for(addr: &str) -> io::Result<ServerName<'static>> {
+pub fn server_name_for(addr: &str) -> io::Result<ServerName<'static>> {
     let invalid = |host: &str| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

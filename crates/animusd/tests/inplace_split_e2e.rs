@@ -76,6 +76,7 @@ async fn bring_up_inplace(
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         let config = ClusterConfig {

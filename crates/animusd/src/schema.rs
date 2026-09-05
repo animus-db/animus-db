@@ -203,6 +203,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     addr,
                     &ClientRequest::ProposeSchema(command.clone()),
                     FORWARD_HOP_TIMEOUT,
+                    self.tls.as_ref(),
                 )
                 .await,
                 ClientResponse::Error(_)

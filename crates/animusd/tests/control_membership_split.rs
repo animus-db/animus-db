@@ -195,6 +195,7 @@ async fn join_control_nonvoter(
         intra: raw[4],
         console: raw[5],
         advertise_host: None,
+        tls: None,
     };
     for attempt in 0..16 {
         let bound = match animusd::Node::bind_control(

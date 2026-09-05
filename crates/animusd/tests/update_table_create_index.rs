@@ -190,6 +190,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         let config = animusd::ClusterConfig {

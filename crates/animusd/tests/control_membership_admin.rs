@@ -244,6 +244,7 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -320,6 +321,7 @@ async fn join_control_nonvoter(
             intra: raw[4],
             console: raw[5],
             advertise_host: None,
+            tls: None,
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),

@@ -1305,6 +1305,40 @@ precedence rule. Not accepted by `join`/`control` (a control-only node never
 binds the dynamo listener). Omitted (the default), auth stays disabled —
 byte-identical to pre-ADR-0057 behavior.
 
+**`--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit
+2)** — this **one process's own** TLS material: all three or none (the
+internal wire is always mutual TLS the moment TLS is configured at all, so
+there is never a legitimate case with a cert/key but no CA to verify peers
+against). Accepted by `run`'s shared flag parser for **`--config
+FILE --node I` only** (applied onto `config.nodes[index]` via
+`apply_tls_flag` — the same per-node-entry shape `--advertise-host` uses,
+**not** `--dynamo-auth`'s cluster-wide one, since TLS material is
+inherently per-node) and by `data`'s parser for **both** `data --config
+FILE --node I` (same per-node merge) and `data --seed ...` (no config file
+at all on that path — the flag sets `RoleAddrs::tls` directly, no conflict
+to check). Supplying a `tls` section both in the config file's own
+`nodes[index]` entry and via the flag is a hard startup error, the
+identical "specify it one way, not both" contract `--dynamo-auth`/
+`--advertise-host` already use. **Not accepted by `--cluster N`/
+`--cluster-control`/`--cluster-data`/`join`/`control`** — the two
+in-process dev-cluster modes have no per-node config entries to apply the
+flag to and **hard-error** rather than silently ignore it (a deliberate
+departure from those paths' usual silent-gap precedent for other flags —
+see `main.rs`'s own doc for why silently downgrading a requested-TLS
+cluster to plaintext is a worse failure mode than an explicit rejection);
+`join`/`control` simply mirror `--dynamo-auth`'s own non-acceptance there.
+A real multi-node deployment wanting TLS should bake every node's `tls`
+section into one shared config file up front (the shape a Kubernetes
+ConfigMap naturally wants, commit 3's target) rather than relying on each
+process's own `--tls-*` flags to agree — see `ClusterConfig::validate_tls`'s
+own doc for exactly why the flag route can't be cross-checked at any one
+process's own startup. Every port a node binds gets **mutual** TLS on
+`internal`/`intra`, **server-only** TLS on `client`/`dynamo`/`admin`/
+`console` (`Node::bind`/`bind_control`/`bind_data`, `TlsMaterial::
+acceptor` vs `server_acceptor`) — see this file's "TLS" section below for
+the full design. Omitted (the default), every listener/dialer stays plain
+TCP, byte-identical to before this ADR.
+
 **`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
 node's own stable dial name, when its bind address isn't itself something a
 peer can dial reliably (a Kubernetes pod's wildcard/pod-IP bind, whose IP
@@ -2857,6 +2891,109 @@ route below the edge through the same `ClientCtx` CP primitives.
   re-parents), so a forwarded write is one joined trace when export is enabled.
 - **`GET /metrics`** (ADR 0015) shares the DynamoDB listener; `ClientCtx::
   metrics_text` aggregates both role sinks (control + raftkv) live at request time.
+
+## TLS (ADR 0064, S-01 commit 2)
+
+Config-gated, default off — a node with no `tls` section anywhere behaves
+byte-for-byte as before this ADR. See `crates/animus-env/CLAUDE.md`'s own
+TLS entry for commit 1's `TlsConfig`/`TlsMaterial`/`MaybeTlsStream`
+primitives (this section only covers what this crate adds on top) and the
+ADR itself for the full design/rationale.
+
+- **Per-port mode**: `internal` (raw Raft wire, commit 1) and `intra`
+  (`ClientRequest` relay) are **mutual** TLS — every peer on those ports
+  presents a cert the cluster's own CA signed, closing the membership-
+  authentication gap ADR 0064 opens with. `client`/`dynamo`/`admin`/
+  `console` are **server-only** — a caller verifies the node, the node
+  neither requires nor verifies a caller cert (SigV4, ADR 0057, remains
+  the caller-identity story on `dynamo`).
+- **Config**: `RoleAddrs::tls: Option<config::TlsSection>` — **per-node**
+  (mirrors `advertise_host`'s shape, not `dynamo_auth`'s cluster-wide one):
+  each node presents its own cert, so there's no single cluster-wide field
+  to hold it. `TlsSection{cert_path, key_path, ca_path: Option<PathBuf>}`
+  mirrors `animus_env::TlsConfig` field-for-field and converts to it via
+  `to_tls_config()` — kept as an independent type (not a re-export) purely
+  so this crate's own config type doesn't have to assume `animus-env`'s
+  `prod` feature just to round-trip through `serde_json` (`animusd` itself
+  always enables that feature; see the type's own doc). `ClusterConfig::
+  validate_tls` (called from `from_json`) enforces ADR 0064 Decision 3's
+  all-or-none rule — every node's `tls` presence must agree across one
+  config **file**; it cannot (and doesn't try to) check across separate
+  processes' own `--tls-*` CLI flags — see the flag's own doc in "CLI
+  reference" above for that documented gap and why the config-file route
+  sidesteps it.
+- **Bind time**: `Node::bind`/`bind_control`/`bind_data` each call
+  `RoleAddrs::tls.map(TlsSection::to_tls_config)` once, hand it to
+  `ProdEnv::bind_with_tls` for the internal port (mutual, commit 1's own
+  mechanism), and separately call `TlsConfig::load()` for this node's own
+  `TlsMaterial` covering every other listener — two loads of the same PEM
+  files, a deliberate simplicity trade-off over threading a pre-loaded
+  `TlsMaterial` into `ProdEnv::bind_with_tls` (which takes a `TlsConfig`,
+  not a `TlsMaterial`, and changing that signature would touch commit 1's
+  already-shipped API for a startup-time cost that doesn't matter). The
+  resulting `TlsMaterial` is stored on `Bound{Node,ControlNode,DataNode}`
+  and threaded into `spawn_common_tail`'s trailing `tls` parameter, which
+  both stores it on the shared `ClientCtx` (`ClientCtx::tls`, cheap to
+  clone onto every connection — its own doc has the full per-port
+  breakdown of what each acceptor/the connector are for) and hands the
+  right acceptor to each listener it spawns
+  (`m.acceptor`/`m.server_acceptor` per the table above). The `dynamo`
+  listener (spawned outside `spawn_common_tail`, since a control-only node
+  has none) reads `ctx.tls.as_ref().map(|m| m.server_acceptor.clone())` at
+  its own call site instead of taking a separate parameter.
+- **One generic stream, not a fork**: `http.rs`'s helpers and every
+  listener's `handle_conn`/`handle_connection` are generic over `S:
+  AsyncRead + AsyncWrite + Unpin` (or, for `write_frame`/`read_frame`
+  specifically, an anonymous `impl AsyncRead`/`impl AsyncWrite` **argument**
+  rather than a named type parameter — seeing why matters: those two
+  functions are called via explicit turbofish all over the pre-existing
+  test suite (`read_frame::<ClientResponse>(..)`), and Rust does not infer
+  an *unspecified trailing* explicit type parameter regardless of its
+  position, so adding a second named parameter would have turned every one
+  of those call sites into an arity error; an `impl Trait` argument sidesteps
+  the whole problem since it never participates in turbofish at all).
+  Each accept loop wraps a plain `TcpStream` in `MaybeTlsStream::Plain`
+  when TLS is off, or runs it through the port's own acceptor when on; a
+  failed handshake is logged at `warn` with the peer's address and the
+  connection dropped — the loop keeps serving, mirroring `animus_env::
+  prod::spawn_accept`'s contract at every one of this crate's own
+  listeners.
+- **Dialers**: `ClientCtx::tls`/`AnimusdRelayClient::tls` (the latter no
+  longer zero-sized) carry `Option<TlsMaterial>`; `relay_request`/
+  `relay_request_with_timeout` (the free functions every cross-node relay
+  in this crate is built on — `ClientCtx::relay`, `forward_to_tablet_
+  leader`, `propose_schema`'s broadcast, `AnimusdRelayClient::relay`) take
+  it as an explicit parameter and dial through `TlsMaterial::connector`
+  (always mutual — every relay this crate makes targets the `intra` port,
+  never `client`), deriving the `ServerName` from the dialed address via
+  `animus_env::tls::server_name_for` (now `pub`, widened by this commit
+  specifically for this reuse). `remote_metadata_watch_loop` (a data-only
+  node's `WatchMetadata`/`Status` long-poll, which drives its own round
+  trips outside `RemoteControlClient::metadata_fresh`) reaches the
+  identical relay path via a new `RemoteControlClient::relay()` accessor
+  (`animus-node`) instead of re-dialing by hand — the one place this
+  commit widened `animus-node`'s own surface.
+- **What stays plain**: `cluster_bench` — a deliberate scope cut (see the
+  ADR's own testing-expectation note), not an oversight.
+- **Fixture + regression**: `tests/support/mod.rs::tls_pki`/
+  `bring_up_deadline_tls` (a small independent copy of `animus-env`'s own
+  `#[cfg(test)]`-private PKI helper — see that function's own doc for why
+  it isn't reused directly across the crate boundary) and
+  `tests/tls_e2e.rs` (a real 3-node combined cluster with TLS on every
+  port: `CreateTable`/`PutItem`/`GetItem` across different nodes over
+  server-only TLS on the dynamo port — `GetItem` deliberately uses
+  `ConsistentRead: true` so the assertion isn't racing ADR 0055's
+  eventually-consistent default against cross-replica propagation lag,
+  independent of anything TLS-related — admin/console `GET` over TLS, a
+  plain-TCP dial refused while the port keeps serving genuine TLS clients
+  afterward, a different-CA client refused on the `intra` port (asserted
+  by attempting a write/read after the handshake, not by asserting
+  `connect()` itself errors — TLS 1.3's client-side handshake future can
+  resolve `Ok` having only *sent* its own `Finished` flight, before ever
+  reading back the server's verdict on the client cert it just presented;
+  the rejection only surfaces on the next real I/O, the same reasoning
+  `animus_env::prod::tests::tls_peer_from_different_ca_is_refused` uses
+  one layer down), and the mixed-config `validate_tls` error.
 
 ## Gotchas
 

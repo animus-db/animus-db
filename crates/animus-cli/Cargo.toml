@@ -19,3 +19,15 @@ path = "src/main.rs"
 animusd.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+# TLS on the client-protocol and admin dials (ADR 0064, S-01 commit 2):
+# `--tls-ca PATH` verifies the node this CLI talks to (server-only TLS on
+# both ports it speaks — this CLI never presents a client certificate of
+# its own). `animus-env`'s `MaybeTlsStream`/`server_name_for` are reused
+# verbatim rather than reimplemented (`prod` feature: the only real-socket
+# TLS surface this crate needs). Same pinned `ring` feature set as every
+# other crate that touches TLS in this workspace (one crypto backend, ADR
+# 0064 Decision 5).
+animus-env = { workspace = true, features = ["prod"] }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

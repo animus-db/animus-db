@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use animusd::config::NodeRole;
+use animusd::config::{NodeRole, TlsSection};
 use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -143,6 +143,7 @@ fn single_node_config() -> ClusterConfig {
             intra: a[4],
             console: a[5],
             advertise_host: None,
+            tls: None,
         }],
         dynamo_auth: None,
         cluster_settings: None,
@@ -225,6 +226,7 @@ pub async fn bring_up_deadline(
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -252,6 +254,132 @@ pub async fn bring_up_deadline(
         assert!(
             tokio::time::Instant::now() < hard_deadline,
             "could not bring up the initial {n}-node cluster within {deadline:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+        attempt += 1;
+    }
+}
+
+// ---- TLS (ADR 0064, S-01 commit 2) ---------------------------------------
+//
+// A small, independent copy of `animus-env`'s own `prod::tests::{test_pki,
+// write_test_pki}` (real self-signed CA + per-node leaf certs via `rcgen`,
+// dev-dependency only) — that helper is `#[cfg(test)]`-private to
+// `animus-env`'s own crate, so it cannot be reused across the crate
+// boundary; this is the "small copy" the task's own contingency names.
+// Every leaf's SAN/CN is `"127.0.0.1"`, matching `animus_env::tls::
+// server_name_for`'s derivation for a loopback dial address on any port —
+// every fixture in this module binds nodes on `127.0.0.1`.
+
+/// Generate a self-signed test CA plus one leaf certificate per entry in
+/// `names` (order preserved), write every PEM to real files under a fresh
+/// temp dir, and return `(temp_dir, tls_sections)` — one [`TlsSection`] per
+/// name, each already pointing at that leaf's cert/key and the shared CA.
+/// The returned [`TempDir`] must outlive every node using these sections
+/// (they name real files on disk); callers keep it alive for the fixture's
+/// own lifetime.
+pub fn tls_pki(names: &[&str]) -> (TempDir, Vec<TlsSection>) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    let dir = tempfile::tempdir().expect("create tls pki temp dir");
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "animusd test CA");
+    let ca_key = KeyPair::generate().expect("generate ca key");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign ca");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("write ca.pem");
+
+    let sections = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut leaf_params =
+                CertificateParams::new(vec![(*name).to_string()]).expect("leaf params");
+            leaf_params
+                .distinguished_name
+                .push(DnType::CommonName, *name);
+            let leaf_key = KeyPair::generate().expect("generate leaf key");
+            let leaf_cert = leaf_params
+                .signed_by(&leaf_key, &ca_cert, &ca_key)
+                .expect("sign leaf with ca");
+
+            let cert_path = dir.path().join(format!("node{i}.cert.pem"));
+            let key_path = dir.path().join(format!("node{i}.key.pem"));
+            std::fs::write(&cert_path, leaf_cert.pem()).expect("write cert pem");
+            std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write key pem");
+
+            TlsSection {
+                cert_path,
+                key_path,
+                ca_path: Some(ca_path.clone()),
+            }
+        })
+        .collect();
+
+    (dir, sections)
+}
+
+/// Like [`bring_up_deadline`], but every node's [`RoleAddrs::tls`] is set
+/// from a freshly generated [`tls_pki`] — mutual TLS on `internal`/`intra`,
+/// server-only on `client`/`dynamo`/`admin`/`console` (every port a
+/// combined node binds). Returns the PKI's own [`TempDir`] alongside the
+/// usual `(nodes, config)` — callers must keep it alive for as long as the
+/// returned nodes run (their TLS material was loaded from these files at
+/// bind time, but a restart/rebind against the same config would need them
+/// again).
+pub async fn bring_up_deadline_tls(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+) -> (Vec<Node>, ClusterConfig, TempDir) {
+    let (pki_dir, sections) = tls_pki(&vec!["127.0.0.1"; n]);
+    let hard_deadline = tokio::time::Instant::now() + deadline;
+    let mut attempt: u64 = 0;
+    loop {
+        let addrs = free_addrs(n * 6);
+        let nodes_cfg: Vec<RoleAddrs> = (0..n)
+            .map(|i| RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: Some(sections[i].clone()),
+            })
+            .collect();
+        let config = ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node(&config, i, dir.join(format!("tls-core-{attempt}-{i}"))).await {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config, pki_dir);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        assert!(
+            tokio::time::Instant::now() < hard_deadline,
+            "could not bring up the initial {n}-node TLS cluster within {deadline:?}"
         );
         sleep(Duration::from_millis(50)).await;
         attempt += 1;
@@ -287,6 +415,7 @@ pub async fn grow_deadline(
                 intra: addrs[6 * i + 4],
                 console: addrs[6 * i + 5],
                 advertise_host: None,
+                tls: None,
             });
         }
         let expanded = ClusterConfig {
@@ -386,6 +515,7 @@ pub async fn join_fresh_deadline(
         intra: raw[4],
         console: raw[5],
         advertise_host: None,
+        tls: None,
     };
     loop {
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
@@ -437,6 +567,7 @@ pub async fn join_data_fresh_deadline(
             intra: raw[4],
             console: raw[5],
             advertise_host: None,
+            tls: None,
         };
         let node_dir = dir.join(format!("data-join-{index}-{attempt}"));
         match animusd::run_node_data_join(
@@ -493,6 +624,7 @@ pub async fn join_allocated_fresh_deadline(
             intra: raw[4],
             console: raw[5],
             advertise_host: None,
+            tls: None,
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
         match animusd::run_node_join(
@@ -542,6 +674,7 @@ pub async fn join_data_allocated_fresh_deadline(
             intra: raw[4],
             console: raw[5],
             advertise_host: None,
+            tls: None,
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
         match animusd::run_node_data_join(
@@ -602,6 +735,7 @@ pub async fn bring_up_split(
                     intra: addrs[6 * i + 4],
                     console: addrs[6 * i + 5],
                     advertise_host: None,
+                    tls: None,
                 }
             })
             .collect();
