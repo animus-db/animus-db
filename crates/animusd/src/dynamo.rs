@@ -609,13 +609,36 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             key_types,
             indexes,
             stream_view_type,
-        } => create_table(ctx, &table, &schema, &key_types, &indexes, stream_view_type).await,
+            throughput,
+        } => {
+            create_table(
+                ctx,
+                &table,
+                &schema,
+                &key_types,
+                &indexes,
+                stream_view_type,
+                throughput,
+            )
+            .await
+        }
         Operation::UpdateTable {
             table,
             stream,
             index_update,
             key_types,
-        } => update_table(ctx, &table, stream, index_update, &key_types).await,
+            throughput_update,
+        } => {
+            update_table(
+                ctx,
+                &table,
+                stream,
+                index_update,
+                &key_types,
+                throughput_update,
+            )
+            .await
+        }
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
         Operation::ListTables {
@@ -2339,6 +2362,7 @@ async fn create_table(
     key_types: &[(String, String)],
     indexes: &[animus_dynamo::SecondaryIndex],
     stream_view_type: Option<animus_control::StreamViewType>,
+    throughput: Option<animus_control::ProvisionedThroughput>,
 ) -> Result<String, WireError> {
     // Reject a name that collides with the control plane's reserved system
     // keyspace (ADR 0038) up front, client-side, with a clear message — the
@@ -2363,7 +2387,11 @@ async fn create_table(
     // v1: every wire-created table is served by the leaderful CP plane (ADR 0019),
     // the only data plane there is — the edge routes its reads/writes through
     // the CP primitives unconditionally.
-    let control_schema = schema_bridge::to_control(schema, key_types);
+    let mut control_schema = schema_bridge::to_control(schema, key_types);
+    // ADR 0065 §5(b): baked into the initial schema at create time — no
+    // separate `SetTableThroughput` proposal needed, since there is nothing
+    // to change in place yet.
+    control_schema.throughput = throughput;
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
         // Propose against this cluster's current leader (idempotent: the create is
@@ -2456,6 +2484,7 @@ async fn create_table(
         schema,
         indexes,
         stream_desc.as_ref(),
+        control_schema.throughput.as_ref(),
     ))
 }
 
@@ -2574,14 +2603,15 @@ async fn update_table(
     stream: Option<wire::StreamUpdate>,
     index_update: Option<wire::IndexUpdate>,
     key_types: &[(String, String)],
+    throughput_update: Option<Option<animus_control::ProvisionedThroughput>>,
 ) -> Result<String, WireError> {
     if !metadata_fresh(ctx).await.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
         )));
     }
-    match (stream, index_update) {
-        (Some(stream), None) => match stream {
+    match (stream, index_update, throughput_update) {
+        (Some(stream), None, None) => match stream {
             wire::StreamUpdate::Enable(view_type) => {
                 if metadata_fresh(ctx).await.table_stream(table).is_some() {
                     return Err(WireError::validation(format!(
@@ -2593,23 +2623,55 @@ async fn update_table(
             }
             wire::StreamUpdate::Disable => disable_stream(ctx, table).await?,
         },
-        (None, Some(update)) => match update {
+        (None, Some(update), None) => match update {
             wire::IndexUpdate::Create(index) => create_index(ctx, table, &index, key_types).await?,
             wire::IndexUpdate::Delete(index) => drop_index(ctx, table, &index).await?,
         },
+        (None, None, Some(spec)) => update_table_throughput(ctx, table, spec).await?,
         // Unreachable via the wire decoder (it always sets exactly one), but
         // handled explicitly rather than assumed — a future direct
         // `Operation` construction (e.g. a test) gets a clear error instead
         // of silently no-op-ing through to `describe_table`.
-        (None, None) | (Some(_), Some(_)) => {
+        _ => {
             return Err(WireError::validation(
-                "UpdateTable requires exactly one of a StreamSpecification or a \
-                 GlobalSecondaryIndexUpdates change",
+                "UpdateTable requires exactly one of a StreamSpecification, a \
+                 GlobalSecondaryIndexUpdates, or a BillingMode/ProvisionedThroughput change",
             ));
         }
     }
     let meta = metadata_fresh(ctx).await;
     describe_table(ctx, &meta, table)
+}
+
+/// `UpdateTable`'s `BillingMode`/`ProvisionedThroughput` change (ADR 0065
+/// §5(b)) — the same commit-wait shape [`update_time_to_live`] already uses,
+/// just against `MetaCommand::SetTableThroughput`. Unlike a stream's minted
+/// `label`, `ProvisionedThroughput` carries no identity, so re-asserting the
+/// same spec (or reverting to `PAY_PER_REQUEST`) both commit cleanly with no
+/// disable-first requirement — see that command's own doc.
+async fn update_table_throughput(
+    ctx: &ClientCtx,
+    table: &str,
+    spec: Option<animus_control::ProvisionedThroughput>,
+) -> Result<(), WireError> {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::SetTableThroughput {
+            table: table.to_owned(),
+            spec,
+        })
+        .await;
+        if metadata_fresh(ctx).await.table_throughput(table) == spec.as_ref() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "UpdateTable (ProvisionedThroughput) did not commit to the control plane in \
+                 time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
 }
 
 /// Add a new global secondary index to a (possibly populated) table (ADR
@@ -2958,6 +3020,7 @@ fn describe_table(_ctx: &ClientCtx, meta: &Metadata, table: &str) -> Result<Stri
         &index_statuses,
         stream_desc.as_ref(),
         table_status(meta, table),
+        meta.table_throughput(table),
     ))
 }
 
@@ -3005,6 +3068,7 @@ async fn delete_table(ctx: &ClientCtx, table: &str) -> Result<String, WireError>
         &indexes,
         &index_statuses,
         stream_desc.as_ref(),
+        meta.table_throughput(table),
     );
     ctx.drop_table(table.to_owned())
         .await

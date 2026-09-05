@@ -274,25 +274,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// unlike [`dynamo::kind_write_item_at_leader`](super::dynamo::
     /// kind_write_item_at_leader) there is no post-charge step here.
     ///
-    /// **Cheap early-return when nothing is configured**: one lock-free
-    /// atomic peek at `self.throttle_defaults.write_units()` before ever
-    /// touching `Metadata`, the bucket lock, or the `BTreeMap` — the ADR
-    /// 0049 fast arm's own throughput contract (`tests/batch_write.rs`).
-    /// **Known limitation, left for step 4**: this peek reads only the
-    /// cluster default, never a per-table override — the correct
-    /// trade-off today (`throttle_limits_for`'s per-table hook is a no-op
-    /// stub, so the two answers always agree), but step 4's real per-table
-    /// `TableSchema.throughput` will need this gate to fetch `Metadata`
-    /// whenever *any* table might carry an override, not only when the
-    /// cluster default is set.
+    /// **Step 4 (ADR 0065 §5(b)): fetches `Metadata` unconditionally**, since
+    /// a per-table `TableSchema.throughput` override (`throttle_limits_for`)
+    /// can throttle a table even when no cluster-wide default is configured
+    /// — the pre-step-4 "cheap lock-free peek before ever touching
+    /// `Metadata`" early return could only ever see the cluster-wide half of
+    /// ADR 0065 §5's two-layer configuration, so it is gone: a per-table
+    /// override with no cluster default set would otherwise silently never
+    /// throttle on this arm. `effective_metadata()` is the same cached,
+    /// no-network local clone `kind_write_item_at_leader`'s own write path
+    /// already pays per write for routing — this is not a new class of
+    /// cost, just no longer skippable on the fully-unthrottled default path.
     fn throttle_check_write_raw(&self, table: &str, writes: &[RawKindWrite]) -> Result<(), String> {
-        let Some(write_limit) = self.throttle_defaults.write_units() else {
-            return Ok(());
-        };
         let Some(first_key) = writes.first().map(|(_, k, _)| k.clone()) else {
             return Ok(());
         };
         let meta = self.effective_metadata();
+        let Some(write_limit) = self.throttle_limits_for(&meta, table).write_units else {
+            return Ok(());
+        };
         let Some(tablet) =
             crate::topology::tablet_for_key(meta.tablets_for_table(table), &first_key)
         else {

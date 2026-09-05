@@ -560,6 +560,12 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
         // W-09 (ADR 0034 amendment): the request-rate sibling.
         "auto_split_ops_rate_threshold": a.auto_split_ops_rate_threshold,
+        // ADR 0065 §5(a), W-08 step 4: the cluster-wide default throttle
+        // this node's `ClientCtx::throttle_defaults` was seeded with at
+        // start (config-resolved, not the current live value — a
+        // `POST /admin/throttle/defaults` override isn't reflected here).
+        "throttle_read_units": a.throttle_read_units,
+        "throttle_write_units": a.throttle_write_units,
         // U-06 (docs/roadmap.md): backup/segment store (redacted to kind +
         // root path, never credentials — see `StoreView`), the ADR 0048
         // quiescence threshold, ADR 0057 auth state (never the secret —
@@ -1500,6 +1506,10 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
         "throttle": throttle,
         "auto_split_bytes_threshold": ctx.admin.auto_split_bytes_threshold,
         "auto_split_ops_rate_threshold": ctx.admin.auto_split_ops_rate_threshold,
+        // ADR 0065 §5(a), W-08 step 4: the effective cluster-wide throttle
+        // default, alongside the per-tablet `throttle` array above.
+        "throttle_read_units": ctx.admin.throttle_read_units,
+        "throttle_write_units": ctx.admin.throttle_write_units,
     })
 }
 

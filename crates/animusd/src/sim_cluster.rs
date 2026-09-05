@@ -241,6 +241,22 @@ impl SimClusterHandle {
             .all(|ctx| ctx.effective_metadata().has_table_tablet(table))
     }
 
+    /// ADR 0065 §5(b): every node's own view of `table`'s per-table
+    /// `throughput` matches `spec` — the `SetTableThroughput` convergence
+    /// check [`SimCluster::set_table_throughput`] polls on, mirroring
+    /// [`all_have_table_tablet`]'s own shape.
+    fn all_have_table_throughput(
+        &self,
+        table: &str,
+        spec: Option<&animus_control::ProvisionedThroughput>,
+    ) -> bool {
+        self.ctxs
+            .lock()
+            .expect("ctxs poisoned")
+            .iter()
+            .all(|ctx| ctx.effective_metadata().table_throughput(table) == spec)
+    }
+
     fn is_leader_local(&self, node: u64, tablet: TabletId) -> bool {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize]
             .edge
@@ -480,6 +496,8 @@ impl SimCluster {
         for (i, id) in ids.iter().enumerate() {
             let admin = Arc::new(AdminInfo {
                 auto_split_ops_rate_threshold: None,
+                throttle_read_units: None,
+                throttle_write_units: None,
                 node_id: Some(id.clone()),
                 internal_addr: Some(placeholder_addr()),
                 client_addr: placeholder_addr(),
@@ -784,6 +802,33 @@ impl SimCluster {
         for node in 0..self.nodes as u64 {
             self.set_throttle_defaults(node, read_units, write_units);
         }
+    }
+
+    /// ADR 0065 §5(b), W-08 step 4: set (or clear, `spec: None`) `table`'s
+    /// own **per-table** provisioned throughput — `MetaCommand::
+    /// SetTableThroughput`, proposed on the control group's current leader
+    /// and converged-or-timeout polled across every node, the identical
+    /// shape [`SimCluster::create_table_with_replication`]'s own tail uses.
+    /// Overrides [`SimCluster::set_throttle_defaults_all`]'s cluster-wide
+    /// default for this table (ADR 0065 Decision 5(b)) — `ClientCtx::
+    /// throttle_limits_for` reads this back before falling through to it.
+    pub(crate) fn set_table_throughput(
+        &mut self,
+        table: &str,
+        spec: Option<animus_control::ProvisionedThroughput>,
+    ) {
+        let leader = self.control_leader_index();
+        let outcome = self.controls[leader].propose(MetaCommand::SetTableThroughput {
+            table: table.to_owned(),
+            spec,
+        });
+        assert!(
+            matches!(outcome, ProposeResult::Accepted { .. }),
+            "SetTableThroughput must be accepted by the current control leader (table={table})"
+        );
+        self.poll_until(Duration::from_secs(5), |c| {
+            c.shared.all_have_table_throughput(table, spec.as_ref())
+        });
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for

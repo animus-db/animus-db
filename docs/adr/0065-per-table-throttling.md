@@ -374,3 +374,31 @@ already has.
   clients expect. Dividing evenly across the table's own current tablet
   count (Decision 1) is deployment-shape-independent by construction and
   mirrors DynamoDB's own documented per-partition division.
+
+## 2026-09-05 amendment — W-08 step 4, as built
+
+All four steps landed as designed, with one naming deviation from Decision
+5(a)'s literal text: the cluster-wide default fields/flags are
+`ClusterSettings::{throttle_read_units, throttle_write_units}` /
+`--throttle-read-units`/`--throttle-write-units`, not
+`default_{read,write}_capacity_units` / `--default-*-capacity-units` as
+originally written — shorter, and consistent with this same field pair's
+name everywhere else in the implementation (`AdminInfo`, `ClientCtx::
+throttle_defaults`, `/admin/config`'s JSON keys, `ThrottleDefaults::new`).
+No behavioral difference from the ADR's own text: unset still means
+`PAY_PER_REQUEST` at both layers, a per-table `TableSchema.throughput`
+still overrides the cluster default entirely (no per-field merge), and the
+CLI-flag-and-config-file-both-set contract is the identical "one way, not
+both" hard error every other `ClusterSettings` field already has.
+
+Everything else matches Decision 5 as written: `TableSchema.throughput:
+Option<ProvisionedThroughput>`, `MetaCommand::SetTableThroughput{table,
+spec}` modeled on `SetTableTtl`, on the `is_relayable_command` allowlist;
+`CreateTable`/`UpdateTable` accept `BillingMode`/`ProvisionedThroughput`;
+`DescribeTable` reports `ProvisionedThroughputDescription`/
+`BillingModeSummary`. One decode-shape decision the ADR text didn't spell
+out: `UpdateTable`'s throughput change joins `GlobalSecondaryIndexUpdates`/
+`StreamSpecification` as a third, mutually-exclusive per-call change (Fork
+C, extended) — except a bare `BillingMode: "PAY_PER_REQUEST"` restatement
+alongside a real stream/index change, which stays tolerated as a no-op
+(the pre-ADR-0065 precedent for that exact shape, a common SDK/CLI habit).

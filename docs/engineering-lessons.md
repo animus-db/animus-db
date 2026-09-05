@@ -17778,3 +17778,64 @@ throughput) — the atomicity is not negotiable without undoing the reason
 the batching exists, and the right fix is usually "pick a different
 existing code path to test the finer-grained behavior," not "make this one
 path finer-grained."
+
+## A rate-change on a token bucket only ever governs refill for elapsed time AFTER the check that applies it — the very next check still pays the OLD rate (ADR 0065, W-08 step 4)
+
+`ThrottleBucket::set_rate` refills at `self.rate` (the OLD value) for
+whatever time has elapsed since the bucket's last touch, and only *then*
+reassigns `self.rate`/`self.capacity` to the new values — a deliberate
+design (a lowered budget must never retroactively grant burst it could not
+legally have earned). The consequence, easy to miss when writing a test
+for "raising a table's `ProvisionedThroughput` admits more": raising the
+rate does nothing to the bucket's *current* token count — there is no
+retroactive top-up — and the very first check-write/check-read call after
+the raise is the one that pays the reassignment, refilling at the OLD rate
+for the (possibly large) gap since the bucket was last touched, since the
+config-changing call itself (`UpdateTable`) never touches the bucket at
+all. Only the check AFTER that one sees real elapsed time refill at the
+NEW rate. A first draft of `update_table_raising_units_admits_more`
+(`tests/dynamo_throttling.rs`) raised the write units by six orders of
+magnitude, slept 50ms, and asserted the very next `PutItem` succeeded —
+and failed deterministically on every run, not flakily, because that
+single post-raise write was exactly the reassignment-paying call. The fix
+was a converged-or-timeout retry loop (root `CLAUDE.md`'s own testing
+discipline for an eventual property) rather than a one-shot assert after a
+fixed sleep of any length. **General form**: a token bucket (or any
+stateful rate limiter) whose "current rate" is a field mutated lazily on
+next use, not proactively on every rate change, needs at least two
+touches after a rate change before the new rate is genuinely reflected in
+admission decisions — write the test as a bounded retry, not a single
+post-change assertion, and don't assume "raise the rate enough and any gap
+will do."
+
+## A "skip the fetch when nothing is configured" fast path is only sound while there is exactly one configuration layer to check (ADR 0065, W-08 steps 3→4)
+
+Step 3's `write_path.rs`/`read_path.rs` throttle checks peeked
+`ClientCtx::throttle_defaults` (a lock-free atomic pair) *before* ever
+fetching `Metadata`, specifically to keep the overwhelmingly common
+"nothing configured" case at "one `Option` check, no lock, no `BTreeMap`
+lookup, no `Metadata` clone." That was correct when the cluster-wide
+default was the *only* place a limit could live. Step 4 added a second,
+independent configuration layer — a per-table `TableSchema.throughput`
+override, which by design can throttle a table even when the cluster-wide
+default is entirely unset (ADR 0065 §5(b): "a table with its own
+`throughput` set ignores `ClusterSettings`' default entirely") — and the
+old fast path could no longer see it: the peek only ever looked at the
+cluster-wide layer, so a per-table override with no cluster default
+configured would have been silently invisible to `write_path.rs`/
+`read_path.rs` (though not to `kind_write_item_at_leader`/
+`txn_stage_local`, which already had `Metadata` in hand for other reasons
+and so already called `throttle_limits_for` — the two-choke-point design
+this ADR's own Decision 2 calls out — meaning the gap was real but
+inconsistent between enforcement points, itself a second, harder-to-spot
+bug shape). The fix removes the peek entirely: `Metadata` is now fetched
+unconditionally before checking the effective limit, accepting the modest,
+already-paid-elsewhere cost of one cached local clone even on the fully
+unconfigured path. **General form**: a hot-path optimization that special-
+cases "nothing is configured" by checking only one of several possible
+configuration sources is a correctness bug waiting for the next
+configuration source to be added, not merely a missed optimization
+opportunity — when a second layer is added to a "check cheaply, else do
+the expensive thing" gate, re-examine every existing fast-path short
+circuit built against the single-layer assumption, not just the new code
+path being added.

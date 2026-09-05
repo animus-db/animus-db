@@ -2366,6 +2366,21 @@ pub(crate) struct AdminInfo {
     /// `None` on a control-only node (never runs `auto_split_loop`) or a
     /// role/deployment that didn't set the flag/config knob.
     pub(crate) auto_split_ops_rate_threshold: Option<u64>,
+    /// The `--throttle-read-units N` cluster-wide default (ADR 0065 §5(a),
+    /// W-08 step 4), if any — the effective cluster default this node's
+    /// `ClientCtx::throttle_defaults` was seeded with at start. Surfaced on
+    /// `/admin/config`/`/admin/metrics` beside
+    /// [`auto_split_ops_rate_threshold`](Self::auto_split_ops_rate_threshold).
+    /// `None` on a control-only node (never binds the dynamo listener, so
+    /// throttling doesn't apply there) or a role/deployment that didn't set
+    /// the flag/config knob — a live `POST /admin/throttle/defaults`
+    /// override is **not** reflected here (this is the config-resolved
+    /// value at start, not the current live value; `/admin/metrics`'s
+    /// `throttle` array is the live per-tablet view).
+    pub(crate) throttle_read_units: Option<u64>,
+    /// The write-capacity-units sibling of
+    /// [`throttle_read_units`](Self::throttle_read_units).
+    pub(crate) throttle_write_units: Option<u64>,
     /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
     /// root path — see [`StoreView`]. `None` on a control-only node: it
     /// never provisions one ([`BoundControlNode::start_control_with`] takes
@@ -2588,6 +2603,23 @@ fn console_ttl_summary(schema: &TableSchema) -> console::TtlSummary {
     }
 }
 
+/// A table's billing mode / provisioned-throughput configuration (ADR 0065
+/// §5(b)), console-shaped — the `set_ttl`/`console_ttl_summary` sibling
+/// above. **Only the table's own per-table override**, never the cluster
+/// default a `throughput: None` table might still fall back to at
+/// enforcement time (`ClientCtx::throttle_limits_for`) — this console has no
+/// `ClientCtx` in scope where `console_table_detail` is called from that
+/// isn't already threaded through, and the cluster default is already
+/// visible on `/admin/config`, so this stays a pure read of the replicated
+/// catalog like every other field on this page.
+fn console_throughput_summary(schema: &TableSchema) -> console::ThroughputSummary {
+    console::ThroughputSummary {
+        enabled: schema.throughput.is_some(),
+        read_units: schema.throughput.as_ref().map(|t| t.read_units),
+        write_units: schema.throughput.as_ref().map(|t| t.write_units),
+    }
+}
+
 /// An [`animus_control::IndexStatus`]'s DynamoDB wire label
 /// (`"CREATING"`/`"ACTIVE"`/`"DELETING"`) — `console.rs` never imports
 /// `IndexStatus` itself (see that module's doc), so this is where the
@@ -2766,6 +2798,7 @@ fn console_table_detail(
         lsis,
         stream: console_stream_summary(schema),
         ttl: console_ttl_summary(schema),
+        throughput: console_throughput_summary(schema),
         pitr: console_pitr_status(ctx, meta, table),
         backups: console_table_backups(meta, table),
     })
@@ -3652,6 +3685,14 @@ fn spawn_common_tail(
     // doc for why this static seed is load-bearing, not just an
     // optimization.
     let static_intra_route = intra_route.clone();
+    // ADR 0065 §5(a), W-08 step 4: seed this node's cluster-wide throttle
+    // defaults straight from `admin_info` — every caller already resolved
+    // and stamped them there for the `/admin/config` view, so this is the
+    // one place that reads them back out rather than threading a second,
+    // parallel pair of parameters through `spawn_common_tail` itself.
+    // Read before `admin_info` moves into `ctx.admin` below.
+    let throttle_read_units = admin_info.throttle_read_units;
+    let throttle_write_units = admin_info.throttle_write_units;
     let ctx = ClientCtx {
         control,
         edge,
@@ -3669,7 +3710,10 @@ fn spawn_common_tail(
         tls: tls.clone(),
         relay: AnimusdRelayClient { tls: tls.clone() },
         throttle: ThrottleTracker::new(),
-        throttle_defaults: Arc::new(ThrottleDefaults::default()),
+        throttle_defaults: Arc::new(ThrottleDefaults::new(
+            throttle_read_units,
+            throttle_write_units,
+        )),
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -3951,6 +3995,8 @@ impl BoundNode {
             None,
             BackupStoreConfig::default(),
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+            None,
+            None,
         )
         .await
     }
@@ -4000,6 +4046,16 @@ impl BoundNode {
     /// budget (`RestoreTableToPointInTime`'s own e2e coverage) calls
     /// [`run_node_with_streams_and_pitr_snapshot_cadence`] instead of
     /// waiting out six hours.
+    ///
+    /// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08
+    /// step 4) seed this node's `ClientCtx::throttle_defaults` — the
+    /// cluster-wide default a table without its own `ProvisionedThroughput`
+    /// falls back to. `--config FILE --node I`'s `cluster_settings.
+    /// throttle_{read,write}_units` / `--throttle-{read,write}-units N` CLI
+    /// flags and `--cluster N`'s identical flags both thread through here;
+    /// `None`/`None` (every caller that doesn't expose the knob yet) is
+    /// byte-identical to before this pair of parameters existed —
+    /// `PAY_PER_REQUEST`, no throttling.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4023,6 +4079,8 @@ impl BoundNode {
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
         pitr_snapshot_cadence: Duration,
+        throttle_read_units: Option<u64>,
+        throttle_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4082,6 +4140,8 @@ impl BoundNode {
             },
             auto_split_bytes_threshold,
             auto_split_ops_rate_threshold: auto_split_ops_rate,
+            throttle_read_units,
+            throttle_write_units,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             quiesce_after_ms: (!quiesce_after.is_zero())
@@ -5232,6 +5292,11 @@ impl BoundControlNode {
             // CP-data tablet to split) — see `auto_split_ops_rate_threshold`'s
             // own doc on `AdminInfo`.
             auto_split_ops_rate_threshold: None,
+            // A control-only node never binds the dynamo listener, so
+            // throttling doesn't apply there — see `throttle_read_units`'s
+            // own doc on `AdminInfo`.
+            throttle_read_units: None,
+            throttle_write_units: None,
             // A control-only node never provisions a backup/segment store,
             // never runs the tablet-host reconciler (nothing to quiesce),
             // and never binds the dynamo listener (so SigV4 enforcement
@@ -5625,6 +5690,8 @@ impl BoundDataNode {
             Duration::ZERO,
             None,
             BackupStoreConfig::default(),
+            None,
+            None,
         )
         .await
     }
@@ -5671,6 +5738,8 @@ impl BoundDataNode {
         quiesce_after: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
+        throttle_read_units: Option<u64>,
+        throttle_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -5716,6 +5785,8 @@ impl BoundDataNode {
             },
             auto_split_bytes_threshold,
             auto_split_ops_rate_threshold: auto_split_ops_rate,
+            throttle_read_units,
+            throttle_write_units,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             // S-06 wired `quiesce_after` through this data-only path (via
@@ -7392,6 +7463,18 @@ impl Default for ThrottleDefaults {
 }
 
 impl ThrottleDefaults {
+    /// Seed a fresh instance directly from already-resolved cluster-wide
+    /// defaults (ADR 0065 §5(a), W-08 step 4) — `--throttle-read-units`/
+    /// `--throttle-write-units` or a config file's `cluster_settings`
+    /// section, threaded through node start. `(None, None)` (the default at
+    /// every node shape unless an operator opts in at either layer) is
+    /// byte-identical to [`ThrottleDefaults::default`].
+    fn new(read_units: Option<u64>, write_units: Option<u64>) -> Self {
+        let d = Self::default();
+        d.set(read_units, write_units);
+        d
+    }
+
     fn read_units(&self) -> Option<u64> {
         match self.read_units.load(std::sync::atomic::Ordering::Relaxed) {
             THROTTLE_UNSET => None,
@@ -8025,21 +8108,26 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     }
 
     /// ADR 0065 §5(a): resolve `table`'s effective throttle limits — the
-    /// per-table override if one is configured, else the cluster default
+    /// per-table override if one is configured (`meta.table_throughput`,
+    /// ADR 0065 §5(b), W-08 step 4), else the cluster default
     /// (`self.throttle_defaults`), else unthrottled (`None`/`None` =
-    /// `PAY_PER_REQUEST`). Takes `meta`/`table` (rather than reading
-    /// `self.effective_metadata()` itself) so a caller that already has a
-    /// `Metadata` in hand for other reasons (`kind_write_item_at_leader`,
-    /// `txn_stage_local`) pays no extra fetch — the cheap common case (no
-    /// limit anywhere) costs exactly two lock-free atomic loads.
-    ///
-    /// **Step 4 hook**: `TableSchema` does not yet carry a `throughput`
-    /// field (that is roadmap W-08 step 4's own commit) — every table
-    /// falls through to the cluster default today. A future per-table
-    /// override reads `meta.schemas`/`table` here and takes priority over
-    /// `self.throttle_defaults` when set, per ADR 0065 Decision 5(b)
-    /// ("per-table settings override the cluster default").
-    pub(crate) fn throttle_limits_for(&self, _meta: &Metadata, _table: &str) -> ThrottleLimits {
+    /// `PAY_PER_REQUEST`). A table with its own `throughput` set ignores
+    /// `self.throttle_defaults` entirely, even if the table's own value is
+    /// `None` in one direction — there is no per-field merge between the two
+    /// layers (ADR 0065 §5(b): "a table with its own `throughput` set
+    /// ignores `ClusterSettings`' default entirely"). Takes `meta`/`table`
+    /// (rather than reading `self.effective_metadata()` itself) so a caller
+    /// that already has a `Metadata` in hand for other reasons
+    /// (`kind_write_item_at_leader`, `txn_stage_local`) pays no extra fetch
+    /// — the cheap common case (no limit anywhere) costs exactly two
+    /// lock-free atomic loads plus one `BTreeMap` lookup.
+    pub(crate) fn throttle_limits_for(&self, meta: &Metadata, table: &str) -> ThrottleLimits {
+        if let Some(spec) = meta.table_throughput(table) {
+            return ThrottleLimits {
+                read_units: Some(spec.read_units),
+                write_units: Some(spec.write_units),
+            };
+        }
         ThrottleLimits {
             read_units: self.throttle_defaults.read_units(),
             write_units: self.throttle_defaults.write_units(),
@@ -10730,6 +10818,8 @@ pub async fn start_cluster_with(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10764,6 +10854,8 @@ pub async fn start_cluster_with_auto_split_bytes(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10795,6 +10887,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10833,6 +10927,8 @@ pub async fn start_cluster_with_streams(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10869,6 +10965,8 @@ pub async fn start_cluster_with_growth(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10904,6 +11002,8 @@ pub async fn start_cluster_with_quiesce_after(
         quiesce_after,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -10928,6 +11028,13 @@ pub async fn start_cluster_with_quiesce_after(
 /// CLI flag threads through here; `BackupStoreConfig::Cluster` (every other
 /// wrapper above) is the default. Plumbing only (ADR 0059 Train 1 PR②).
 ///
+/// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
+/// 4) seed every node's cluster-wide throttle default — `--cluster N`'s
+/// `--throttle-read-units`/`--throttle-write-units N` CLI flags thread
+/// through here; `None`/`None` (every other wrapper above) is
+/// `PAY_PER_REQUEST`, byte-identical to before this pair of parameters
+/// existed.
+///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
@@ -10944,6 +11051,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -10958,6 +11067,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         quiesce_after,
         dynamo_auth,
         backup_store_config,
+        throttle_read_units,
+        throttle_write_units,
     )
     .await
 }
@@ -10976,6 +11087,8 @@ async fn start_cluster_inner(
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -11056,6 +11169,8 @@ async fn start_cluster_inner(
                 dynamo_auth.clone(),
                 backup_store_config.clone(),
                 pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+                throttle_read_units,
+                throttle_write_units,
             )
             .await?;
         nodes.push(node);
@@ -11320,6 +11435,8 @@ pub async fn start_split_cluster_with_growth(
                 Duration::ZERO,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
+                None,
+                None,
             )
             .await?,
         );
@@ -11455,6 +11572,8 @@ pub async fn run_node_with_streams_and_quiesce_after(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
     )
     .await
 }
@@ -11499,6 +11618,8 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
+        None,
+        None,
     )
     .await
 }
@@ -11544,6 +11665,8 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
     )
     .await
 }
@@ -11559,6 +11682,14 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// production defaults, same as [`run_node_with_streams_quiesce_and_backup_
 /// store`] — a caller needing those tunable too calls [`run_node_with_
 /// streams_quiesce_and_ttl_sweep_interval`] directly.
+///
+/// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
+/// 4): threaded straight to [`BoundNode::start_with_growth`]'s own knobs of
+/// the same name, the identical "call the innermost layer directly for a
+/// knob its wrappers don't expose" convention `auto_split_bytes` above
+/// already established — `main.rs`'s `run_single` is this pair's one real
+/// caller too. `None`/`None` (every other call site) is byte-identical to
+/// before this pair of parameters existed.
 ///
 /// # Errors
 /// As [`run_node_with`].
@@ -11577,6 +11708,8 @@ pub async fn run_node_with_cluster_settings(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     backup_store_config: BackupStoreConfig,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -11594,6 +11727,8 @@ pub async fn run_node_with_cluster_settings(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        throttle_read_units,
+        throttle_write_units,
     )
     .await
 }
@@ -11620,6 +11755,11 @@ pub async fn run_node_with_cluster_settings(
 /// knob its wrappers don't expose" convention `dynamo_auth`
 /// (`run_node_data`'s doc) already established.
 ///
+/// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
+/// 4): the cluster-wide throttle default this node's `ClientCtx` is seeded
+/// with — see [`run_node_with_cluster_settings`]'s own doc for the identical
+/// "call the innermost layer directly" reasoning.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -11639,6 +11779,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     ttl_sweep_interval: Duration,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -11710,6 +11852,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             dynamo_auth,
             backup_store_config,
             pitr_snapshot_cadence,
+            throttle_read_units,
+            throttle_write_units,
         )
         .await
 }
@@ -11747,6 +11891,8 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
     )
     .await
 }
@@ -11937,6 +12083,8 @@ pub async fn run_node_data(
         Duration::ZERO,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
+        None,
+        None,
     )
     .await
 }
@@ -11974,6 +12122,8 @@ pub async fn run_node_data_with_streams(
         Duration::ZERO,
         stream_seal_knobs,
         segment_store_config,
+        None,
+        None,
     )
     .await
 }
@@ -11995,6 +12145,13 @@ pub async fn run_node_data_with_streams(
 /// same one [`run_node_data_with_streams`] exposes); `animusd data --config`
 /// has no flag for it yet, so `main.rs` passes the default.
 ///
+/// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
+/// 4): `animusd data --config`'s only route to the cluster-wide throttle
+/// default — read straight off `config.cluster_settings` by `main.rs`'s
+/// `run_data_config` (no CLI flag of its own on the `data` subcommand yet,
+/// the identical gap `auto_split_bytes`/`quiesce_after` already document
+/// above).
+///
 /// # Errors
 /// As [`run_node_data`].
 #[allow(clippy::too_many_arguments)]
@@ -12009,6 +12166,8 @@ pub async fn run_node_data_with_cluster_settings(
     quiesce_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12101,6 +12260,8 @@ pub async fn run_node_data_with_cluster_settings(
             // CLI flag reaches `animusd data --config` yet, so this always
             // gets the default `Cluster` store.
             BackupStoreConfig::default(),
+            throttle_read_units,
+            throttle_write_units,
         )
         .await
 }
@@ -12676,6 +12837,8 @@ async fn finish_data_join(
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
+            None,
+            None,
         )
         .await
 }
@@ -14810,6 +14973,8 @@ mod simenv_client_ctx_tests {
             admin_addrs: vec![placeholder_addr()],
             auto_split_bytes_threshold: None,
             auto_split_ops_rate_threshold: None,
+            throttle_read_units: None,
+            throttle_write_units: None,
             // This harness never builds a real `DataRole`/dynamo listener
             // (`data: None` below) — see `AdminInfo`'s own field docs.
             backup_store: None,
@@ -15089,6 +15254,8 @@ mod two_node_relay_tests {
         let relay_a: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(1)));
         let admin_a = Arc::new(AdminInfo {
             auto_split_ops_rate_threshold: None,
+            throttle_read_units: None,
+            throttle_write_units: None,
             node_id: Some(nid(1)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -15144,6 +15311,8 @@ mod two_node_relay_tests {
         let relay_b: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(2)));
         let admin_b = Arc::new(AdminInfo {
             auto_split_ops_rate_threshold: None,
+            throttle_read_units: None,
+            throttle_write_units: None,
             node_id: Some(nid(2)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),

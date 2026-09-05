@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] # run node I as a control-only node (ADR 0035 PR3)
@@ -250,8 +250,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH]\n  \
@@ -380,6 +380,16 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
+    // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
+    // §5(a), W-08 step 4): the cluster-wide default read/write
+    // capacity-units budget applied to any table that has not set its own
+    // `ProvisionedThroughput` — seeds `ClientCtx::throttle_defaults` at node
+    // start. Absent means `PAY_PER_REQUEST` (no throttling) at this layer;
+    // an individual table's own `BillingMode`/`ProvisionedThroughput`
+    // (`CreateTable`/`UpdateTable`) still overrides it either way. No
+    // production-tuned default exists yet — pick a value per workload.
+    let mut throttle_read_units: Option<u64> = None;
+    let mut throttle_write_units: Option<u64> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
     // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
@@ -461,6 +471,12 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
+            "--throttle-read-units" => {
+                throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
+            }
+            "--throttle-write-units" => {
+                throttle_write_units = Some(parse_next(&mut it, "--throttle-write-units")?);
+            }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
             }
@@ -491,6 +507,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         stream_seal_bytes,
         stream_seal_age_secs,
         stream_retention_secs,
+        throttle_read_units,
+        throttle_write_units,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -587,6 +605,8 @@ async fn run(args: &[String]) -> Result<(), String> {
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
                 advertise_host,
+                throttle_read_units,
+                throttle_write_units,
             )
             .await
         }
@@ -902,6 +922,8 @@ fn resolve_cluster_settings(
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
+    merge_field!(throttle_read_units, "--throttle-read-units");
+    merge_field!(throttle_write_units, "--throttle-write-units");
     Ok(effective)
 }
 
@@ -998,6 +1020,8 @@ async fn run_single(
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
         backup_store_config,
+        settings.throttle_read_units,
+        settings.throttle_write_units,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -1020,6 +1044,16 @@ async fn run_single(
     }
     if let Some(rate) = settings.auto_split_ops_rate {
         println!("animusd: node {index} auto-split ALSO fires above {rate} write-ops/sec/tablet");
+    }
+    if let Some(units) = settings.throttle_read_units {
+        println!(
+            "animusd: node {index} cluster-wide default throttle at {units} read capacity units/table"
+        );
+    }
+    if let Some(units) = settings.throttle_write_units {
+        println!(
+            "animusd: node {index} cluster-wide default throttle at {units} write capacity units/table"
+        );
     }
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -1275,6 +1309,8 @@ async fn run_data_config(
         // Same documented gap as `--backup-store` (ADR 0059 §1): no
         // `--segment-store` flag reaches `animusd data --config` yet.
         animusd::SegmentStoreConfig::default(),
+        settings.throttle_read_units,
+        settings.throttle_write_units,
     )
     .await
     .map_err(|e| format!("failed to start data node {index}: {e}"))?;
@@ -1495,6 +1531,8 @@ async fn run_in_process_cluster(
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -1516,6 +1554,8 @@ async fn run_in_process_cluster(
         quiesce_after,
         dynamo_auth,
         backup_store_config,
+        throttle_read_units,
+        throttle_write_units,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -1533,6 +1573,12 @@ async fn run_in_process_cluster(
     }
     if let Some(rate) = auto_split_ops_rate {
         println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
+    }
+    if let Some(units) = throttle_read_units {
+        println!("animusd: cluster-wide default throttle at {units} read capacity units/table");
+    }
+    if let Some(units) = throttle_write_units {
+        println!("animusd: cluster-wide default throttle at {units} write capacity units/table");
     }
     // The in-process `--cluster N` dev convenience has no `--tls-*` knob of
     // its own — always plain HTTP.
@@ -1879,6 +1925,42 @@ mod tests {
             .expect_err("the same field set on both sides must be rejected");
         assert!(err.contains("auto_split_ops_rate"), "{err}");
         assert!(err.contains("--auto-split-ops-rate"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_throttle_read_units_on_both_sides_is_a_hard_error() {
+        // ADR 0065 §5(a), W-08 step 4: the same merge/conflict treatment as
+        // every other `cluster_settings` knob.
+        let config = animusd::config::ClusterSettings {
+            throttle_read_units: Some(100),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            throttle_read_units: Some(50),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("throttle_read_units"), "{err}");
+        assert!(err.contains("--throttle-read-units"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_throttle_write_units_on_both_sides_is_a_hard_error() {
+        let config = animusd::config::ClusterSettings {
+            throttle_write_units: Some(100),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            throttle_write_units: Some(50),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("throttle_write_units"), "{err}");
+        assert!(err.contains("--throttle-write-units"), "{err}");
         assert!(err.contains("one way, not both"), "{err}");
     }
 

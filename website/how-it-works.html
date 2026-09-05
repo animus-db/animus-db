@@ -105,7 +105,7 @@
       </div>
     </div>
     <p class="body-text">Tables of items addressed by a partition key and an optional sort key, with schemaless attributes — the model you already design for. <strong>Working today:</strong> <code>PutItem</code>, <code>GetItem</code>, <code>UpdateItem</code>, <code>DeleteItem</code> with condition and update expressions; <code>Query</code> and <code>Scan</code> with filters, pagination and index queries; the batch operations; transactions; secondary indexes added and dropped online with backfill; streams; TTL.</p>
-    <p class="body-text"><strong>Four differences worth knowing before you assume a drop-in:</strong> scans are ordered by token rather than partition-key value; there is no capacity metering, so no RCUs and no throttling responses; credentials are verified only when the opt-in SigV4 check is switched on — by default any caller that can reach the port is trusted; and the AWS-side integrations — Lambda triggers, DAX, CloudWatch — have no equivalent.</p>
+    <p class="body-text"><strong>Four differences worth knowing before you assume a drop-in:</strong> scans are ordered by token rather than partition-key value; provisioned throughput is enforced as real admission control (RCUs/WCUs, <code>ProvisionedThroughputExceededException</code> included) but there is no billing meter behind it — no invoice, no auto-scaling; credentials are verified only when the opt-in SigV4 check is switched on — by default any caller that can reach the port is trusted; and the AWS-side integrations — Lambda triggers, DAX, CloudWatch — have no equivalent.</p>
     <a class="ctalink" href="compatibility.html">Operation by operation, with notes →</a>
   </div>
 </section>

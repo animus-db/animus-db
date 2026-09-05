@@ -423,6 +423,38 @@ comment for its full type/method inventory.
   so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
   reached by the raw client protocol's plain writes, not ordinary
   `TransactWriteItems` contention).
+- **Per-table throttling's config surface (ADR 0065 §5(b), W-08 step 4)**:
+  `CreateTable` decodes `BillingMode` (`PROVISIONED`/`PAY_PER_REQUEST`,
+  default `PAY_PER_REQUEST` — this adapter's own default, not real
+  DynamoDB's legacy `PROVISIONED` one) and, when `PROVISIONED`, a required
+  `ProvisionedThroughput` (`decode_create_table_throughput` /
+  `decode_provisioned_throughput`, both units `>= 1` or a
+  `ValidationException`; `ProvisionedThroughput` alongside `PAY_PER_REQUEST`
+  is also rejected) into `Operation::CreateTable`'s new `throughput:
+  Option<animus_control::ProvisionedThroughput>` field. `UpdateTable` gained
+  a **third** mutually-exclusive change alongside a stream or index change
+  (`Operation::UpdateTable`'s new `throughput_update: Option<Option<..>>>` —
+  outer `Some` means this call touches throughput, inner `Some(spec)` =
+  `PROVISIONED`, inner `None` = `PAY_PER_REQUEST`): `decode_update_table`
+  routes to it only when neither an index nor a stream change is present in
+  the same call; `reject_billing_mode_combined_with_other_change` handles
+  the case where one *is* — a bare `BillingMode: "PAY_PER_REQUEST"`
+  restatement alongside a real stream/index change is still tolerated (the
+  pre-existing precedent, a common SDK/CLI habit), but `PROVISIONED` or a
+  bare `ProvisionedThroughput` combined with either is a genuine second
+  change, rejected. `UNSUPPORTED_UPDATE_TABLE_KEYS` no longer lists
+  `ProvisionedThroughput` — it is a modeled change now, not a blanket
+  rejection. `table_description_object` (shared by `CreateTable`/
+  `DescribeTable`/`UpdateTable`/`DeleteTable`'s response builders, all four
+  of which gained a `throughput: Option<&ProvisionedThroughput>` parameter)
+  renders `BillingModeSummary`/`ProvisionedThroughputDescription` —
+  `PAY_PER_REQUEST` reports `0`/`0` units + `NumberOfDecreasesToday: 0`,
+  matching real DynamoDB's own documented shape for that billing mode, never
+  omitting the keys. `animus_control::schema::ProvisionedThroughput { read_
+  units, write_units }` is the replicated type (`animus-control`'s own
+  entry has the full `TableSchema.throughput`/`MetaCommand::
+  SetTableThroughput` design) — this crate imports and re-uses it directly
+  rather than minting a wire-local duplicate.
 - **Per-table throttling's wire fidelity (ADR 0065, W-08 step 3)**: two new
   `WireError` constructors carry the AWS-faithful shapes for a throttle
   refusal — `WireError::provisioned_throughput_exceeded(message)` (a `400`,

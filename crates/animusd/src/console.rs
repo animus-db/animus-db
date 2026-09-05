@@ -40,7 +40,7 @@ pub(crate) use animus_node::console::{
     KeySummary, LsiDetail, PitrStatus, ProjectionSummary, QueryItemsRequest, ScanItemsRequest,
     SetStreamRequest, SetTtlRequest, ShardSummary, SortKeyQuery, StreamRecordsPage,
     StreamShardsPage, StreamShardsRequest, StreamSummary, TableDetail, TableSnapshotFn,
-    TableSummary, TtlSummary, WireItem,
+    TableSummary, ThroughputSummary, TtlSummary, WireItem,
 };
 
 use crate::http;

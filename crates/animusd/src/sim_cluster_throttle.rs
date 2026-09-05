@@ -153,3 +153,33 @@ fn read_admits_a_burst_then_refuses_then_recovers_after_a_full_refill() {
         .get(0, "t", "k", "", true)
         .expect("a read after a full refill window should succeed");
 }
+
+/// ADR 0065 §5(b), W-08 step 4: a table's own per-table `throughput`
+/// overrides the cluster-wide default entirely — a restrictive cluster
+/// default would throttle this write, but the table's own generous
+/// override wins, so it never does.
+#[test]
+fn per_table_throughput_override_wins_over_a_restrictive_cluster_default() {
+    let mut cluster = SimCluster::new(0x5448_524f_5734, 1, 1);
+    cluster.create_table("t");
+    // A tiny cluster-wide default that would refuse almost any write...
+    cluster.set_throttle_defaults_all(None, Some(1));
+    // ...but this table's own override is generous enough to admit every
+    // write in this test, proving the per-table spec takes priority rather
+    // than merging with (or falling back to) the cluster default.
+    cluster.set_table_throughput(
+        "t",
+        Some(animus_control::ProvisionedThroughput {
+            read_units: 1_000_000,
+            write_units: 1_000_000,
+        }),
+    );
+    let value = vec![0u8; 100 * 1024];
+    for i in 0..10 {
+        cluster
+            .put(0, "t", &format!("k{i}"), "", &value)
+            .unwrap_or_else(|e| {
+                panic!("put {i} unexpectedly refused despite a generous per-table override: {e}")
+            });
+    }
+}

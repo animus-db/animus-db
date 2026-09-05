@@ -2415,7 +2415,7 @@ through writes alone. When hot, splits via the identical
 `byte_weighted_median`/`trigger_split` path every other trigger uses. No
 production-tuned default exists — omitting the flag is a true no-op.
 
-**Per-table throttling (ADR 0065, W-08 step 2/3)**: `ThrottleTracker`
+**Per-table throttling (ADR 0065, W-08 — all four steps landed)**: `ThrottleTracker`
 (`lib.rs`, beside `ChangeRateTracker`/`RequestRateTracker`) is the
 admission-control sibling of the rate trackers above — a per-tablet token
 bucket in DynamoDB capacity units (`ThrottleBucket`: `tokens`/`rate`/
@@ -2428,14 +2428,14 @@ constructs `data: None`, and this ADR's own testing section needs a real
 `SimCluster`-driven virtual-clock corpus to exercise admission decisions, so
 a `DataRole`-gated tracker could never be reached by any of them.
 `ClientCtx::throttle_limits_for(meta, table) -> ThrottleLimits` resolves the
-effective `read_units`/`write_units` limits: the cluster-wide default
+effective `read_units`/`write_units` limits: `meta.table_throughput(table)`
+(the table's own replicated `TableSchema.throughput`, ADR 0065 §5(b)) when
+set — **no per-field merge**, a table with its own spec ignores the cluster
+default entirely, even in whichever direction (read/write) its own spec
+leaves `None`-equivalent — else the cluster-wide default
 (`ClientCtx::throttle_defaults`, a lock-free `AtomicU64`-backed pair —
 `None`/`None` means `PAY_PER_REQUEST`, the default, byte-for-byte unchanged
-from before this ADR) today; a per-table `TableSchema.throughput` override
-is roadmap W-08 step 4's own follow-up commit (the config surface:
-`ClusterSettings`/CLI/`CreateTable`'s `BillingMode`/`ProvisionedThroughput`/
-`MetaCommand::SetTableThroughput`), which this function already has a named
-hook for. A tablet's own per-tablet **share** is the table's limit divided
+from before this ADR). A tablet's own per-tablet **share** is the table's limit divided
 by its current tablet count (`meta.tablets_for_table(table).count()`,
 re-derived fresh on every check, never cached — a split re-divides the
 budget the instant the new tablet map commits) — the identical
@@ -2453,14 +2453,24 @@ metrics`'s `throttle` array (`ClientCtx::throttle_snapshot`) mirrors
 `request_rates`'s own shape, one entry per currently-tracked tablet (tokens,
 rate, throttled counts, read and write separately). When no limit is
 configured anywhere (the overwhelming common case), every enforcement point
-costs at most two lock-free atomic loads and an `Option` check — no
-`Mutex` lock, no `BTreeMap` lookup — verified by `tests/batch_write.rs`'s
-existing ADR 0049 fast-arm throughput assertion staying green unmodified.
+costs one `Metadata` fetch (`ClientCtx::effective_metadata`, a cached
+local clone — no network round trip, and the identical cost the surrounding
+write/read path already pays for routing) plus a `BTreeMap` lookup — the
+lock-free "skip the fetch entirely" fast path step 3 originally built for
+`write_path.rs`/`read_path.rs` is gone as of step 4, since a per-table
+override with no cluster default configured needs `Metadata` to see at all
+(the earlier "verified by `tests/batch_write.rs`'s throughput assertion"
+framing described the step-3 shape only). `kind_write_item_at_leader`/
+`txn_stage_local` were unaffected either way — both already had `Metadata`
+in hand for other reasons before ever checking throttle limits.
 
-**Enforcement points, as built (W-08 step 3)**: `write_path.rs`'s
+**Enforcement points, as built**: `write_path.rs`'s
 `cp_kind_write_raw` (the ADR 0049 fast marker arm, `throttle_check_write_raw`
-— a peek at `throttle_defaults.write_units()` before touching `Metadata` or
-the tracker at all, so the unconfigured case really is one `Option` check);
+— unconditionally fetches `Metadata` and calls `throttle_limits_for`, **not**
+a lock-free peek before touching `Metadata` the way step 3 originally built
+it: a per-table override can throttle even with no cluster-wide default
+configured, so the "nothing configured anywhere, skip the fetch" fast path
+step 3 had is gone — see this file's own engineering-lessons entry on this);
 `dynamo.rs`'s `kind_write_item_at_leader` (the evaluate-at-leader funnel —
 pre-charge before propose, a post-charge correction once the real
 `ConsumedCapacity` is known from the applied outcome); `read_path.rs`'s
@@ -2501,24 +2511,61 @@ catches a `ProvisionedThroughputExceededException` one request at a time.
 individually regardless of table shape, since a read never batches into one
 entry the way a marker write does.
 
-**The config-surface hook step 4 must replace**: `ClientCtx::
-set_throttle_defaults(&self, read_units: Option<u64>, write_units:
-Option<u64>)` (`lib.rs`, `pub(crate)`) — the smallest test-reachable
-mechanism for setting the cluster-wide default limits, reached today only
-via `POST /admin/throttle/defaults` (`admin.rs::action_set_throttle_
-defaults`, `ThrottleDefaultsReq { read_units: Option<u64>, write_units:
-Option<u64> }`) and `SimCluster::set_throttle_defaults`/
-`set_throttle_defaults_all` (`sim_cluster.rs`, test-only). Step 4 replaces
-this ad hoc admin action with the real config surface (`ClusterSettings`,
-CLI flags, `CreateTable`'s `BillingMode`/`ProvisionedThroughput`,
-`MetaCommand::SetTableThroughput`, a `TableSchema.throughput` field) and
-should also give `throttle_limits_for` a genuine per-table override — that
-function already reads the cluster-wide default only, with a named comment
-at the point a per-table lookup belongs. `throttle_check_write_raw`/
-`kind_write_item_at_leader`/the read-path checks/`txn_stage_local` should
-all need zero changes for step 4: each already calls `throttle_limits_for`
-once per operation and reacts only to its `read_units`/`write_units`
-output, never to how those numbers were sourced.
+**The config surface, in two layers (step 4, landed)**:
+
+- **(a) Cluster-wide default** (ADR 0065 §5(a)): `ClusterSettings`
+  (`config.rs`) gained `throttle_read_units`/`throttle_write_units`
+  (`Option<u64>`, `#[serde(default)]`, the same shape/per-role
+  applicability every other data-hosting knob there has). `main.rs`'s
+  `--throttle-read-units N`/`--throttle-write-units N` CLI flags thread
+  through `resolve_cluster_settings`'s identical "one way, not both"
+  conflict check and, from there, `run_node_with_cluster_settings`/
+  `run_node_data_with_cluster_settings`/`start_cluster_with_growth_and_
+  quiesce_after` (the exact `--auto-split-ops-rate`/W-09 layered-wrapper
+  precedent: widen the one real caller and the innermost layer that
+  actually builds `AdminInfo`, pass `None`/`None` through every other
+  wrapper). `AdminInfo` carries `throttle_read_units`/`throttle_write_units`
+  too, surfaced on `/admin/config` and `/admin/metrics` beside
+  `auto_split_ops_rate_threshold` — `spawn_common_tail` reads them back off
+  the already-built `admin_info` to seed `ThrottleDefaults::new(..)`, rather
+  than threading a second, parallel pair of parameters through that
+  function. `animus-operator`'s `desired::cluster_config::ClusterSettings`
+  mirrors the two fields for JSON shape parity (same as
+  `auto_split_ops_rate`'s own precedent) — no `AnimusClusterSpec` field
+  exposes either yet, so the operator never populates them.
+  `ClientCtx::set_throttle_defaults`/`POST /admin/throttle/defaults` remain:
+  a genuinely useful **live override** on top of the durable config, not
+  replaced by it.
+- **(b) Per-table** (ADR 0065 §5(b)): `animus_control::schema::
+  ProvisionedThroughput { read_units, write_units }` (modeled on `TtlSpec`,
+  no identity label) sits on a new `TableSchema.throughput: Option<..>`
+  field; `MetaCommand::SetTableThroughput { table, spec }` (modeled on
+  `SetTableTtl`'s idempotent-on-identical-value apply semantics) mutates it,
+  and is on `is_relayable_command`'s allowlist (`animus-node/src/wire.rs`)
+  and `mirror.rs`'s schema-catalog-class mirror bucket beside `SetTableTtl`.
+  `animus_dynamo::wire`: `CreateTable` decodes `BillingMode`
+  (`PROVISIONED`/`PAY_PER_REQUEST`, default `PAY_PER_REQUEST` — deliberately
+  **not** real DynamoDB's own legacy `PROVISIONED` default, matching this
+  adapter's pre-existing "never inspects `BillingMode`" behavior for the
+  unthrottled case) + `ProvisionedThroughput` (required, both units `>= 1`,
+  for `PROVISIONED`; rejected alongside `PAY_PER_REQUEST`); `UpdateTable`
+  accepts the identical pair as a *third* mutually-exclusive change
+  alongside a stream or index change (`reject_billing_mode_combined_with_
+  other_change` — a bare `BillingMode: PAY_PER_REQUEST` restatement
+  alongside a real stream/index change is still tolerated, the pre-existing
+  precedent; `PROVISIONED` or a bare `ProvisionedThroughput` combined with
+  either is rejected as "more than one change"). `CreateTable`/
+  `DescribeTable`/`UpdateTable`/`DeleteTable`'s shared
+  `table_description_object` renders `BillingModeSummary`/
+  `ProvisionedThroughputDescription` (`PAY_PER_REQUEST` reports 0/0 units +
+  `NumberOfDecreasesToday: 0`, matching real DynamoDB). `dynamo.rs`:
+  `create_table` bakes `throughput` into the schema it proposes (no separate
+  `SetTableThroughput` needed at create time); `update_table_throughput`
+  (mirroring `update_time_to_live`'s commit-wait shape) proposes
+  `SetTableThroughput` for an `UpdateTable` throughput change.
+  `console_table_detail`/`console.js`'s Settings tab render a read-only
+  "Capacity" fact strip (billing mode + units) — no console mutation route,
+  matching the PITR section's own read-only precedent.
 
 **Test coverage**: `sim_cluster_throttle.rs` (`#[cfg(test)] mod`, `cargo
 test -p animusd --lib sim_cluster_throttle`) is the `SimEnv`-driven,
@@ -2528,15 +2575,35 @@ route/propose/confirm and route/local-resolve loops, for both writes and
 eventual/linearizable reads — see that file's own module doc for why a
 per-op virtual-clock refill (`SimCluster`'s `OP_BUDGET`) means a throttle
 test's per-op cost must clear that refill by a wide margin, not just the
-nominal configured rate. `tests/dynamo_throttling.rs` is the real-thread,
-real-socket regression: single-item write/read throttling and recovery,
-`ProvisionedThroughputExceededException`'s wire shape, `BatchGetItem`'s
-`UnprocessedKeys`, `BatchWriteItem`'s `UnprocessedItems` (via a **streamed**
-table specifically, to get true per-item granularity rather than the
-marker fast-arm's per-tablet-group shape described above),
-`TransactWriteItems`' `ThrottlingError` cancellation reason, the
-`ThrottledWrites`/`ThrottledReads` metric counters, and an unthrottled
-table (the default) staying byte-for-byte unaffected.
+nominal configured rate; `SimCluster::set_table_throughput` (proposing
+`MetaCommand::SetTableThroughput` on the control leader and
+converged-or-timeout polling every node, the identical shape
+`create_table_with_replication`'s own tail uses) backs one dedicated
+per-table-override-wins-over-a-restrictive-cluster-default cell. `tests/
+dynamo_throttling.rs` is the real-thread, real-socket regression: single-item
+write/read throttling and recovery, `ProvisionedThroughputExceededException`'s
+wire shape, `BatchGetItem`'s `UnprocessedKeys`, `BatchWriteItem`'s
+`UnprocessedItems` (via a **streamed** table specifically, to get true
+per-item granularity rather than the marker fast-arm's per-tablet-group
+shape described above), `TransactWriteItems`' `ThrottlingError` cancellation
+reason, the `ThrottledWrites`/`ThrottledReads` metric counters, an
+unthrottled table (the default) staying byte-for-byte unaffected, and (step
+4's own section) `CreateTable`'s `BillingMode`/`ProvisionedThroughput`
+throttling with **no** admin call at all, `UpdateTable` to
+`PAY_PER_REQUEST` lifting a limit, `UpdateTable` raising units admitting
+more (a converged-or-timeout retry, not a one-shot assert — see this file's
+own engineering-lessons entry on why: `ThrottleBucket::set_rate` refills at
+the OLD rate through the moment of the change and only then raises the
+ceiling, so the very next check after a raise still pays that reassignment
+at the old rate; the NEW rate only governs refill starting from the
+*following* check), `DescribeTable`'s `BillingModeSummary`/
+`ProvisionedThroughputDescription`, `MetaCommand::SetTableThroughput`'s own
+follower-relay regression (`update_table_throughput_on_a_follower_is_
+relayed_to_the_leader`), and a cluster started with the `cluster_settings`
+config surface (`bring_up_with_throttle_defaults`, calling
+`run_node_with_cluster_settings` directly rather than `POST /admin/
+throttle/defaults`) throttling a table with no per-table setting while a
+table with its own higher override is not.
 
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own

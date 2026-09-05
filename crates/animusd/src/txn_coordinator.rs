@@ -71,7 +71,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // which `run_transact`'s own cancellation-reason mapping
                 // (site 3, `dynamo.rs`) turns into a `ThrottlingError`
                 // `CancellationReasons` entry at this action's own index.
-                if let Some(write_limit) = self.throttle_defaults.write_units()
+                // Step 4: `throttle_limits_for` resolves `table`'s own
+                // per-table override (if any) before falling back to the
+                // cluster default — `meta` is already in hand above.
+                if let Some(write_limit) = self.throttle_limits_for(&meta, table).write_units
                     && let Some(tablet) =
                         crate::topology::tablet_for_key(meta.tablets_for_table(table), &key)
                 {

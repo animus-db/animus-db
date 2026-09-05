@@ -201,6 +201,31 @@ pub struct PitrSpec {
     pub enabled_wall_ms: u64,
 }
 
+/// A table's replicated **provisioned throughput** configuration (ADR 0065
+/// §5(b)), when its `BillingMode` is `PROVISIONED`.
+///
+/// Modeled directly on [`TtlSpec`]'s shape: a plain value, no identity label
+/// (unlike [`StreamSpec`]'s minted `label` — there is nothing downstream
+/// that needs to distinguish "generations" of a table's throughput
+/// configuration), so `MetaCommand::SetTableThroughput`'s apply semantics
+/// mirror `MetaCommand::SetTableTtl`'s exactly: re-asserting an identical
+/// spec (including the `None` → `None` "already `PAY_PER_REQUEST`" case) is
+/// a no-op, and changing the units in place — or switching back to `None`
+/// (`PAY_PER_REQUEST`) — is applied with no disable-first step required.
+///
+/// The control plane records only this declaration; it neither meters nor
+/// bills anything (`docs/roadmap.md` §6's "W-08 gives throttling without a
+/// billing meter" framing) — the units exist purely to size
+/// `animusd`'s per-tablet token bucket (ADR 0065 Decision 1/4). A GSI shares
+/// its base table's budget (ADR 0065 §8) — there is no per-index throughput.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionedThroughput {
+    /// Declared read capacity units (DynamoDB `ReadCapacityUnits`).
+    pub read_units: u64,
+    /// Declared write capacity units (DynamoDB `WriteCapacityUnits`).
+    pub write_units: u64,
+}
+
 /// The lifecycle status of a secondary index (ADR 0045): whether it is still
 /// being backfilled, fully materialized and queryable, or being torn down.
 ///
@@ -356,6 +381,17 @@ pub struct TableSchema {
     /// through `MetaCommand::UpdateContinuousBackups` (so it replicates).
     #[serde(default)]
     pub pitr: Option<PitrSpec>,
+    /// This table's **provisioned throughput** configuration (ADR 0065
+    /// §5(b)), if `BillingMode` is `PROVISIONED`. `None` means
+    /// `PAY_PER_REQUEST` — the common case, and every schema persisted
+    /// before this field existed — `#[serde(default)]`, additive like
+    /// `stream`/`ttl`/`pitr`. Mutated only through `MetaCommand::
+    /// SetTableThroughput` (so it replicates); see [`ProvisionedThroughput`]
+    /// for what the control plane does and does not do with it. Sized to
+    /// `animusd`'s per-tablet throttle-bucket share (ADR 0065 Decision 1);
+    /// falls back to the cluster-wide default when `None` (ADR 0065 §5(a)).
+    #[serde(default)]
+    pub throughput: Option<ProvisionedThroughput>,
     /// This table's **resource tags** (`TagResource`/`UntagResource`/
     /// `ListTagsOfResource`, DynamoDB's own generic key-value tagging), if
     /// any. Empty (never `None`) for a table with no tags — unlike
@@ -408,6 +444,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            throughput: None,
             tags: BTreeMap::new(),
         }
     }
@@ -434,6 +471,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            throughput: None,
             tags: BTreeMap::new(),
         }
     }
@@ -456,6 +494,7 @@ impl TableSchema {
             stream: None,
             ttl: None,
             pitr: None,
+            throughput: None,
             tags: BTreeMap::new(),
         }
     }
