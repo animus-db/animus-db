@@ -3673,6 +3673,97 @@ rung's own smoke doesn't happen to call `propose_schema` at all, so it
 doesn't exercise that specific path, but nothing about the relay seam
 itself blocks a follow-on test that does.
 
+### `SimCluster`: the multi-node generalization (ADR 0061 rung D1)
+
+`sim_cluster.rs`'s `SimCluster` (declared `#[cfg(test)] mod sim_cluster;`
+from `lib.rs`, kept in its own file — unlike `simenv_client_ctx_tests`/
+`two_node_relay_tests` above — purely so `lib.rs` doesn't keep growing;
+same descendant-of-the-crate-root privacy property, so `ClientCtx`'s
+private fields are still reachable with no visibility widened) is what
+those two harnesses generalize to: an N-node cluster with a real
+**multi-voter** control `RaftNode<SimEnv>` quorum (every node id is a
+voter, `animus-control/tests/control_raft.rs::cluster`'s own shape — not
+`two_node_relay_tests`' single-voter/shared-`Arc` stand-in), a
+`SimRelayClient<SimEnv>` per node with rung C3d's generic relayed-request
+dispatcher installed, and a `ClientCtx<SimEnv, SimRelayClient<SimEnv>>`
+per node whose `client_route`/`intra_route` name every node id up front
+(the whole node set is known at construction, so no
+`route_sync_loop`/`intra_route_sync_loop` equivalent is needed).
+
+**Public surface**: `SimCluster::new(seed, nodes, replication)`;
+`create_table(table)` (this cluster's own default replication factor) /
+`create_table_with_replication(table, replication)`; `tablet_of(table)`;
+`put`/`get`/`delete`/`scan` (each takes a plain `u64` node index — see
+below — and issues the op from that node's own `ClientCtx`, returning
+`Result` rather than panicking, since several scenarios expect a failure);
+the fault surface `crash`/`restart`/`partition`/`heal_all`/`run_for`
+(mirroring `raftkv_linearizable.rs`'s own `Nemesis::apply` shape); and
+`leader_of(tablet) -> Option<NodeId>`/`leader_index_of(tablet) ->
+Option<u64>`/`metadata(node)`/`node_count()`/`seed()` for assertions.
+
+**A node is addressed by a plain `u64` index (`0..nodes`), never a
+`NodeId` directly** — `nid(n)` encodes as the literal string `"n{n}"`
+(`animus-env::nid`'s own implementation), so round-tripping a `NodeId`
+back through `.to_string().parse::<u64>()` to recover a usable index
+fails outright (found live building this rung's own tests — every
+`leader_of(..).to_string().parse()` call site had to become
+`leader_index_of(..)` instead, a plain accessor that never goes through
+`NodeId`'s own `Display` at all). `leader_of` still hands back a real
+`NodeId` (matching the ADR's own suggested signature, and useful for a
+caller comparing against `Metadata`), but every other method on this
+fixture takes and expects the plain index.
+
+**Design decisions** (see the ADR's own 2026-09-05 amendment for the full
+account, including what a follow-on corpus rung still needs):
+
+- **Tablets are hand-hosted, not reconciler-hosted** — `create_table`
+  proposes `CreateTableSchema`/`CreateTablet` directly on the control
+  group's current leader, then builds a `RaftKvNode<SimEnv, MemoryEngine>`
+  on each chosen replica node directly (mirroring `animus-test::
+  raftkv_linearizable`'s `Group::start`) and registers it into that node's
+  own `ClusterEdgeState` — `Metadata`'s tablet row and the edge
+  registration are built from the identical replica list in the same
+  call, so they can never disagree.
+- **DDL is the same control-plane-Raft bypass every `SimEnv` `ClientCtx`
+  fixture in this crate uses** — `ClientCtx::propose_schema`'s local-propose
+  fast path is still `ProdEnv`-locked (unchanged by rung C3d, which only
+  made its *relay* branches reachable). `SimCluster` never calls
+  `propose_schema` at all.
+- **`restart` is a true process restart on `MemoryEngine`** —
+  `Simulator::stop` then fresh `RaftNode::start`/`RaftKvNode::start_hosted`
+  calls on the same node id, each on a brand-new `MemoryEngine` (a
+  wipe-and-rejoin, recovering via peer catch-up/chunked `InstallSnapshot`
+  — never a WAL replay, since this tier has no durable engine). `crash`
+  (mute, tasks stay alive) is the separate, cheaper fault this restart is
+  not a substitute for.
+- **Always `start_hosted` with `stream = tablet.0`, never `start_scoped`**
+  — `create_table_with_replication` can host more than one table's tablet
+  on overlapping node sets (scenario 5 does exactly this), and
+  `start_scoped` pins every group to `PRIMARY_STREAM`, which would
+  cross-talk two tablets sharing node ids (the exact bug `animus-test/
+  CLAUDE.md`'s stream-corpus entry documents finding in its own harness).
+- **Every op takes a `u64` node index and issues from that node's own
+  `ClientCtx`**, so a non-hosting/non-leader node's op genuinely exercises
+  `forward_to_tablet_leader`/`cp_serve_forwarded` over the real
+  `SimRelayClient` wire, not merely a local call.
+
+**Five scenarios ship with it** (`sim_cluster::tests`, seed-parameterized):
+a leader write reading back consistent from every node including a
+forwarding non-leader (plus a `scan`/`delete` pass); a write from a node
+hosting no replica at all (RF < node count); crash-the-leader → write
+through a survivor → restart → converge (a converged-or-timeout retry
+loop, `poll_until_get_eq`, never a one-shot assert); a 1-node minority
+partitioned off cannot ack, the majority side still succeeds, and the
+minority catches up after `heal_all`; and a second `create_table` after
+the first, with both tables independently writable/readable.
+
+**Still `ProdEnv`-only, unchanged from every prior rung's findings**:
+`ClientCtx::propose_schema`'s local-propose fast path (above);
+`SegmentStoreHandle`/`BackupStoreHandle`'s `Cluster` variant (this fixture
+only ever uses the `Fs` placeholder — nothing it drives reads either
+field); and a `DataRole` (`data: None` on every node — no DynamoDB wire
+edge, no TTL reaper, no stream/backup loops).
+
 ## Tests
 
 `cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`

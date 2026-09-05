@@ -850,6 +850,168 @@ this list: ADR 0058 rung 4's remaining layer deletes it. Writing a corpus
 for code slated for removal would be waste — if that deletion slips, it gets
 covered then.
 
+#### 2026-09-05 amendment — D1 landed: `SimCluster`, hand-hosted, over a real multi-voter control quorum
+
+D1 is done: `animusd::sim_cluster::SimCluster` (`crates/animusd/src/
+sim_cluster.rs`, an in-crate `#[cfg(test)] mod` declared from `lib.rs` —
+kept in its own file rather than inline, unlike `simenv_client_ctx_tests`/
+`two_node_relay_tests`, purely so `lib.rs` doesn't keep growing, with no
+change to the "descendant of the crate root, private fields reachable"
+privacy property those two siblings rely on). One `Simulator`, `nodes`
+node ids, a real **multi-voter** control `RaftNode<SimEnv>` quorum (every
+node id is a voter — `animus-control/tests/control_raft.rs::cluster`'s own
+shape, generalizing `two_node_relay_tests`' single-voter/shared-`Arc`
+stand-in to N independent voters that actually replicate over the
+`Network` seam), a `SimRelayClient<SimEnv>` per node with the rung C3d
+generic relayed-request dispatcher installed, and a `ClientCtx<SimEnv,
+SimRelayClient<SimEnv>>` per node whose `client_route`/`intra_route` name
+every node id by `NodeId::to_string()` up front (rung C3d's address
+convention) — since this fixture's whole node set is known at
+construction, pre-populating once is sufficient; no
+`route_sync_loop`/`intra_route_sync_loop` equivalent was needed.
+
+**Design decisions, as scoped in the eighth 2026-08-28 amendment's own
+"what `SimCluster` will need its own answer to" note:**
+
+- **Tablets are hand-hosted, not reconciler-hosted.** `SimCluster::
+  create_table` proposes `CreateTableSchema`/`CreateTablet` directly on
+  the control group's current leader, then constructs a
+  `RaftKvNode<SimEnv, MemoryEngine>` on each chosen replica node directly
+  and registers it into that node's own `ClusterEdgeState` — mirroring
+  `animus-test::raftkv_linearizable`'s `Group::start`, not
+  `animus-cp-data::host::Reconciler`. `Metadata`'s tablet row and each
+  hosting node's edge registration are built from the exact same replica
+  list in the same call, so they can never disagree — the "as long as
+  `Metadata` and the edge agree" bar this ADR's own D1 rung description
+  set. A reconciler-hosted `SimCluster` (lifting `animus-cp-data/tests/
+  reconciler_corpus.rs`'s `Cluster`/`ClusterNode` shape) is a legitimate
+  future rung — it would additionally prove the reconciler's own
+  event-driven hosting loop, which this rung's client-path-focused brief
+  does not need — but is more machinery than D1 asked for.
+- **DDL stays a control-plane-Raft bypass, exactly like every other
+  `SimEnv` `ClientCtx` fixture in this crate.** `ClientCtx::propose_schema`'s
+  local-propose fast path is still `ProdEnv`-locked (the eighth amendment's
+  own finding, unchanged by C3d — C3d only made `propose_schema`'s *relay*
+  branches reachable, never its local fast path). `SimCluster` seeds every
+  table by proposing `CreateTableSchema`/`CreateTablet` directly on
+  whichever control `RaftNode` handle it holds for the current leader —
+  the identical bypass `simenv_client_ctx_tests`/`two_node_relay_tests`
+  use for their own single- and two-node setups, now against a genuine
+  multi-voter quorum. **What remains unexercised**: a `ProposeSchema`
+  **relayed** through `ClientCtx` to reach a multi-voter control leader —
+  this fixture never calls `ClientCtx::propose_schema` at all, so C3d's
+  relay branches for that specific command are still only proven by
+  `two_node_relay_tests`' own single-voter setup, not by a real
+  multi-voter quorum. A future rung wanting that proof needs either a
+  `SimCluster::propose_schema_via_client` entry point or to keep waiting on
+  a genuine `ClientCtx`-genericized DDL path (the pre-existing, larger,
+  separately-scoped blocker).
+- **Restart is a true process restart, on `MemoryEngine`.** `SimCluster::
+  restart` mirrors `raftkv_linearizable.rs`'s own `StopRestart` nemesis:
+  `Simulator::stop` (drops every task the node owns) followed by fresh
+  `RaftNode::start`/`RaftKvNode::start_hosted` calls on the same node id,
+  each on a brand-new `MemoryEngine`. Since this fixture only uses
+  `MemoryEngine` (matching every sibling `SimEnv` harness in this crate), a
+  restart is a wipe-and-rejoin, not a WAL replay — recovery is via
+  ordinary peer catch-up / chunked `InstallSnapshot` (the same mechanism
+  `animus-cp-data/tests/engine_wipe_needs_snapshot.rs` proves at the
+  primitive level). A durable (`LsmEngine`) `SimCluster` tier, proving the
+  WAL-replay recovery path this rung's restart does NOT exercise, is a
+  natural follow-on mirroring `raftkv_linearizable.rs`'s own two-tier
+  design, not built here.
+- **What is still `ProdEnv`-only**, unchanged from every prior rung's
+  findings: `ClientCtx::propose_schema`'s local-propose fast path (above);
+  `SegmentStoreHandle`/`BackupStoreHandle`'s `Cluster` variant (this
+  fixture only ever uses the `Fs` placeholder, like `simenv_client_ctx_
+  tests`/`two_node_relay_tests` — nothing this fixture drives reads either
+  field); and a `DataRole` (`data: None` on every node — no DynamoDB wire
+  edge, no TTL reaper, no stream/backup loops; this fixture drives the
+  plain `cp_kind_write_raw`/`cp_get`/`cp_scan` client-protocol methods
+  only, the same surface the eighth amendment's own harness proved
+  single-node).
+
+**The fault surface**: thin wrappers over `Simulator`, mirroring
+`raftkv_linearizable.rs`'s own `Nemesis::apply` — `crash`/`restart` (the
+distinction above)/`partition`/`heal_all`/`run_for`, plus `leader_of`/
+`leader_index_of`/`metadata`/`tablet_of` accessors for assertions. Five
+scenarios ship with it (`sim_cluster::tests`, a `#[cfg(test)] mod` nested
+inside `sim_cluster.rs`, each seed-parameterized): (1) 3 nodes, RF 3 — a
+write on the leader reads back, via a real `ConsistentRead: true`-
+equivalent (`consistent: true`) linearizable read, from every node
+including a non-leader that must forward over the real `SimRelayClient`
+wire (plus a `scan`/`delete` pass over the same write, proving those two
+methods too); (2) RF 2 of 3 — a write issued from the one node hosting no
+replica at all succeeds through the relay and is readable everywhere; (3)
+crash the tablet leader, hold the fault open for an election window,
+write through a surviving node, restart the crashed node, and confirm the
+whole group converges — a converged-or-timeout retry loop
+(`poll_until_get_eq`), never a one-shot assert; (4) a 1-node minority
+isolated from the other two cannot ack a write issued from it (a
+majority of 3 survives at 2), a write on the majority side succeeds, and
+the minority catches up after `heal_all`; (5) a second `create_table`
+works after the first, with both tables' schema/tablet visible on every
+node and both independently writable/readable (proving the two tablets'
+distinct `stream = tablet.0` Raft addressing, ADR 0026 Stage B, never
+cross-talks — the exact hazard `animus-test/CLAUDE.md`'s stream-corpus
+entry documents for `RaftKvNode::start_scoped`, which is why
+`SimCluster::create_table` always uses `start_hosted` with the tablet id
+as the stream instead).
+
+**Gates**: `cargo fmt --all`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, `cargo test -p animusd --lib` (128 passed,
+1 pre-existing ignored), `cargo test -p animus-node` (119 unit + 5 sim, all
+green — proof this rung touched nothing in that crate), `cargo test -p
+animus-control --test control_raft` (proof the multi-voter control quorum
+shape this rung leans on is unaffected), and — as the real-socket
+sanity check that production relay stayed untouched —
+`cargo test -p animusd --test control_only` and `--test schema_ddl_relay`
+(10 tests, all green).
+
+**What commit 3 (a cycles/durability corpus modelled on
+`raftkv_linearizable.rs`, gated by `ANIMUS_SIMCLUSTER_SEEDS`) needs that
+this rung does not supply**: `sim_cluster.rs` is `#[cfg(test)] mod
+sim_cluster;` — compiled only when building `animusd`'s own unit tests,
+and reachable from nowhere outside that build (not even `animusd`'s own
+`tests/*.rs` integration binaries, which are separate crates that link
+against the *library* target, not its `#[cfg(test)]` tree). A `tests/
+sim_cluster_corpus.rs` file modelled literally on `raftkv_linearizable.rs`
+therefore **cannot** `use animusd::sim_cluster::SimCluster` — that path
+does not exist outside `cfg(test)`. The corpus has to be a second in-crate
+`#[cfg(test)] mod` instead (e.g. `crates/animusd/src/
+sim_cluster_corpus.rs`, declared from `lib.rs` next to `sim_cluster`,
+`use super::sim_cluster::SimCluster;`), run via `cargo test -p animusd
+--lib` like every other in-crate harness in this file — not a `tests/*.rs`
+binary despite the naming precedent `raftkv_linearizable.rs` sets. Beyond
+that placement question, the corpus needs: (a) a way to record a
+`Recorder`/`History` of `put`/`get`/`delete` operations against
+`SimCluster` (the fixture's own `put`/`get`/`delete` return plain
+`Result`s today, with no invoke/ok/fail/info hook — the corpus will need
+to wrap each call, mirroring `raftkv_linearizable.rs`'s own `client_loop`);
+(b) `SimCluster::restart`/`crash` are today only ever called against a
+node this fixture itself tracks the tablet-hosting map for — a corpus
+driving concurrent client tasks that call `SimCluster` methods from
+`env.spawn_task`'d futures will need `SimCluster` (or a thin wrapper
+around it) to be safely shareable that way (today every method takes
+`&mut self`, fine for this rung's own sequential scenario scripts, but a
+concurrent-client corpus needs either an `Arc<Mutex<SimCluster>>` wrapper
+or a redesign of the mutable surface — `raftkv_linearizable.rs`'s own
+`Nodes<S> = Arc<Mutex<Vec<Arc<Node<S>>>>>` shape is the precedent to
+follow); and (c) `SimCluster::create_table`'s hand-hosted design means a
+corpus wanting to prove convergence *through* a reconfiguration (a replica
+moved, not just crashed/restarted in place) has no primitive to call —
+this rung's `restart` always reconstructs a tablet on the SAME node id
+with the SAME replica set, never a different one, so a "replica set
+change mid-corpus" scenario needs either a new `SimCluster::move_replica`
+method or the reconciler-hosted design point noted above.
+
+**No product bug found while building this rung** — every scenario proved
+correct on the first fully-wired attempt (the seed-round-trip failures hit
+along the way were fixture-construction mistakes: `nid`'s concrete
+`"n{n}"` string encoding being round-tripped through `NodeId::to_string()`
++ `.parse::<u64>()` instead of using the plain-index accessor this rung
+added specifically to avoid that fragility — `SimCluster::leader_index_of`
+alongside the spec-shaped `leader_of -> Option<NodeId>`).
+
 ### Phase E — the untested crates
 
 | Rung | Work |

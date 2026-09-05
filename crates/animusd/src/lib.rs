@@ -13974,6 +13974,19 @@ mod two_node_relay_tests {
     }
 }
 
+/// `SimCluster` (ADR 0061 rung D1, C-04 D1 step 2): the multi-node
+/// generalization of [`two_node_relay_tests`] above, plus a fault surface
+/// (crash/restart/partition/heal) and five scenarios. In its own file
+/// (`sim_cluster.rs`) rather than inline here, unlike its two siblings
+/// above — see that file's own module doc for the full design; it's kept
+/// out of `lib.rs` purely to keep this file from growing unboundedly, not
+/// for any different privacy reason (`#[cfg(test)] mod` still gives it the
+/// identical "descendant of the crate root, so `ClientCtx`'s private
+/// fields are reachable with no visibility widened" property this file's
+/// two in-line harnesses rely on).
+#[cfg(test)]
+mod sim_cluster;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
