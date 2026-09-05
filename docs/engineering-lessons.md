@@ -14157,6 +14157,36 @@ once to confirm the binary's test set actually matches the source before
 reading a "N passed" line as proof of anything; a stale binary reports
 green precisely because it silently tests less, never because it tests the
 same thing and fails to notice a problem.
+
+**2026-09-05 follow-up — mechanism confirmed, rule hardened to "never
+share a target dir across concurrently-active worktrees".** Two agents
+building the same workspace from two worktrees (`.claude/worktrees/s02`
+and `.claude/worktrees/w08b`) into one `CARGO_TARGET_DIR`, alternating,
+produced (a) a `cargo test --workspace` in the main checkout that failed
+with 59 "unresolved import `animus_control::Policy`" / "no variant named
+`PutCredential`" errors although the checked-out `meta.rs` plainly
+contained both — the `animus-control` rlib cargo linked against had been
+compiled from the *other* worktree, whose files lacked the credential
+catalog; (b) endless whole-tree rebuilds every time the trees swapped;
+(c) a target dir that grew from 17G to 26G and a `rust-lld` crash with
+"No space left on device". The mechanism: cargo identifies a workspace
+crate's artifacts by a hash of its **workspace-relative** path (so a
+target dir survives a workspace move), so two worktrees of the same repo
+write byte-identical artifact *names* into a shared target dir, and
+freshness is then judged by comparing source mtimes against the recorded
+artifact — a tree whose files are *older* than the other tree's build
+sees its neighbour's library as up to date and silently links against it.
+A "green" gate computed that way proves nothing about the tree it ran in.
+**Rule**: a shared target dir is only ever safe for *strictly serialized*
+use from *one* worktree at a time, with the workspace-crate artifacts (at
+minimum `target/debug/{incremental,deps,.fingerprint}` — in practice
+`rm -rf target/debug`, external deps rebuild in minutes) wiped whenever
+the tree changes; concurrently-active worktrees each need their own
+`CARGO_TARGET_DIR`, and if the disk allowance cannot hold two, the work
+is serialized, not shared. Briefing an agent "wait until no cargo
+process is running before each invocation" does **not** make sharing
+safe — it only removes the lock contention, not the staleness.
+
 ## A racing-proposers workload can't tell "won" from "lost" by presence alone — it has to confirm by content (`animus-control`'s `control_corpus.rs`, ADR 0061 rung B1 sibling)
 
 Building `control_corpus.rs` — a new seed-depth corpus for `animus-control`'s
