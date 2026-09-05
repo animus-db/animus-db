@@ -390,6 +390,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // production-tuned default exists yet — pick a value per workload.
     let mut throttle_read_units: Option<u64> = None;
     let mut throttle_write_units: Option<u64> = None;
+    // `--tablet-max-read-units N` / `--tablet-max-write-units N` (ADR 0067,
+    // W-08b): the per-tablet read/write capacity-units ceiling used to
+    // derive a provisioned table's minimum tablet count — DynamoDB's own
+    // partition ceilings. `None` (the flag omitted) resolves to
+    // `DEFAULT_TABLET_MAX_READ_UNITS`/`DEFAULT_TABLET_MAX_WRITE_UNITS`
+    // (3000/1000); an explicit `0` means "no ceiling in that dimension".
+    // Unlike `--throttle-read-units`/`--throttle-write-units`, this pair is
+    // **not** opt-in — it is always in effect (at its default) for a table
+    // with its own `ProvisionedThroughput`.
+    let mut tablet_max_read_units: Option<u64> = None;
+    let mut tablet_max_write_units: Option<u64> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
     // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
@@ -477,6 +488,12 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--throttle-write-units" => {
                 throttle_write_units = Some(parse_next(&mut it, "--throttle-write-units")?);
             }
+            "--tablet-max-read-units" => {
+                tablet_max_read_units = Some(parse_next(&mut it, "--tablet-max-read-units")?);
+            }
+            "--tablet-max-write-units" => {
+                tablet_max_write_units = Some(parse_next(&mut it, "--tablet-max-write-units")?);
+            }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
             }
@@ -509,6 +526,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         stream_retention_secs,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -607,6 +626,8 @@ async fn run(args: &[String]) -> Result<(), String> {
                 advertise_host,
                 throttle_read_units,
                 throttle_write_units,
+                tablet_max_read_units,
+                tablet_max_write_units,
             )
             .await
         }
@@ -924,6 +945,8 @@ fn resolve_cluster_settings(
     merge_field!(stream_retention_secs, "--stream-retention");
     merge_field!(throttle_read_units, "--throttle-read-units");
     merge_field!(throttle_write_units, "--throttle-write-units");
+    merge_field!(tablet_max_read_units, "--tablet-max-read-units");
+    merge_field!(tablet_max_write_units, "--tablet-max-write-units");
     Ok(effective)
 }
 
@@ -1022,6 +1045,8 @@ async fn run_single(
         backup_store_config,
         settings.throttle_read_units,
         settings.throttle_write_units,
+        settings.tablet_max_read_units,
+        settings.tablet_max_write_units,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -1311,6 +1336,8 @@ async fn run_data_config(
         animusd::SegmentStoreConfig::default(),
         settings.throttle_read_units,
         settings.throttle_write_units,
+        settings.tablet_max_read_units,
+        settings.tablet_max_write_units,
     )
     .await
     .map_err(|e| format!("failed to start data node {index}: {e}"))?;
@@ -1533,6 +1560,8 @@ async fn run_in_process_cluster(
     advertise_host: Option<String>,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -1556,6 +1585,8 @@ async fn run_in_process_cluster(
         backup_store_config,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;
@@ -1961,6 +1992,42 @@ mod tests {
             .expect_err("the same field set on both sides must be rejected");
         assert!(err.contains("throttle_write_units"), "{err}");
         assert!(err.contains("--throttle-write-units"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_tablet_max_read_units_on_both_sides_is_a_hard_error() {
+        // ADR 0067, W-08b: the same merge/conflict treatment as every other
+        // `cluster_settings` knob.
+        let config = animusd::config::ClusterSettings {
+            tablet_max_read_units: Some(100),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            tablet_max_read_units: Some(50),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("tablet_max_read_units"), "{err}");
+        assert!(err.contains("--tablet-max-read-units"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_tablet_max_write_units_on_both_sides_is_a_hard_error() {
+        let config = animusd::config::ClusterSettings {
+            tablet_max_write_units: Some(100),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            tablet_max_write_units: Some(50),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("tablet_max_write_units"), "{err}");
+        assert!(err.contains("--tablet-max-write-units"), "{err}");
         assert!(err.contains("one way, not both"), "{err}");
     }
 

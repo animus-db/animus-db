@@ -128,6 +128,16 @@ pub struct ClusterSettings {
     pub throttle_read_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle_write_units: Option<u64>,
+    /// ADR 0067 (W-08b): the per-tablet capacity ceilings a provisioned
+    /// table's minimum tablet count is derived against. Same precedent as
+    /// `throttle_read_units`/`throttle_write_units` — no `AnimusClusterSpec`
+    /// field exposes either of these yet, so this crate never populates
+    /// them; they stay `None`/absent from the emitted JSON like every other
+    /// CRD-unexposed knob in this mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tablet_max_read_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tablet_max_write_units: Option<u64>,
 }
 
 impl ClusterSettings {
@@ -483,6 +493,34 @@ mod tests {
                 .get("throttle_write_units")
                 .is_none(),
             "expected no throttle_write_units key, got {value}"
+        );
+    }
+
+    #[test]
+    fn cluster_settings_tablet_max_units_fields_are_never_populated_by_this_crate() {
+        // ADR 0067 (W-08b): same precedent as the throttle fields above — no
+        // `AnimusClusterSpec` field exposes either ceiling yet.
+        let mut s = spec(3);
+        s.auto_split_bytes = Some(1);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let settings = cfg
+            .cluster_settings
+            .clone()
+            .expect("auto_split_bytes alone is enough for the section to appear");
+        assert_eq!(settings.tablet_max_read_units, None);
+        assert_eq!(settings.tablet_max_write_units, None);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value["cluster_settings"]
+                .get("tablet_max_read_units")
+                .is_none(),
+            "expected no tablet_max_read_units key, got {value}"
+        );
+        assert!(
+            value["cluster_settings"]
+                .get("tablet_max_write_units")
+                .is_none(),
+            "expected no tablet_max_write_units key, got {value}"
         );
     }
 

@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
 mod index_drain;
+mod min_tablets;
 pub mod otel;
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -4017,6 +4018,8 @@ impl BoundNode {
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -4101,6 +4104,8 @@ impl BoundNode {
         pitr_snapshot_cadence: Duration,
         throttle_read_units: Option<u64>,
         throttle_write_units: Option<u64>,
+        tablet_max_read_units: Option<u64>,
+        tablet_max_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4627,7 +4632,12 @@ impl BoundNode {
         // Growth PR3 Fork F: `auto_split_change_rate` joins the same
         // any-trigger-fires gate, opt-in and streamed-tables-only. W-09:
         // `auto_split_ops_rate` joins it too, opt-in and applicable to any
-        // table (streamed or not).
+        // table (streamed or not). ADR 0067 (W-08b) groundwork: `AutoSplitThresholds`
+        // also carries the (always-resolved) per-tablet capacity ceilings —
+        // not yet read by the loop body, which still only implements the
+        // three triggers above; the fourth, throughput-derived-minimum-tablet-
+        // count trigger (and the unconditional spawn it needs) lands in a
+        // follow-up change.
         if auto_split_bytes_threshold.is_some()
             || auto_split_change_rate.is_some()
             || auto_split_ops_rate.is_some()
@@ -4638,6 +4648,12 @@ impl BoundNode {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
                     ops_rate: auto_split_ops_rate,
+                    tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings {
+                        max_read_units: tablet_max_read_units
+                            .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_READ_UNITS),
+                        max_write_units: tablet_max_write_units
+                            .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_WRITE_UNITS),
+                    },
                 },
             )));
         }
@@ -5317,6 +5333,10 @@ impl BoundControlNode {
             // own doc on `AdminInfo`.
             throttle_read_units: None,
             throttle_write_units: None,
+            // A control-only node never runs `auto_split_loop` either (see
+            // `auto_split_ops_rate_threshold` above) — these two report the
+            // production defaults purely for shape parity, never actually
+            // consulted on this role.
             // A control-only node never provisions a backup/segment store,
             // never runs the tablet-host reconciler (nothing to quiesce),
             // and never binds the dynamo listener (so SigV4 enforcement
@@ -5712,6 +5732,8 @@ impl BoundDataNode {
             BackupStoreConfig::default(),
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -5760,6 +5782,8 @@ impl BoundDataNode {
         backup_store_config: BackupStoreConfig,
         throttle_read_units: Option<u64>,
         throttle_write_units: Option<u64>,
+        tablet_max_read_units: Option<u64>,
+        tablet_max_write_units: Option<u64>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -6042,6 +6066,9 @@ impl BoundDataNode {
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
 
+        // ADR 0067 (W-08b) groundwork: see the combined-mode spawn site's
+        // identical comment above — the unconditional spawn lands in a
+        // follow-up change.
         if auto_split_bytes_threshold.is_some()
             || auto_split_change_rate.is_some()
             || auto_split_ops_rate.is_some()
@@ -6052,6 +6079,12 @@ impl BoundDataNode {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
                     ops_rate: auto_split_ops_rate,
+                    tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings {
+                        max_read_units: tablet_max_read_units
+                            .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_READ_UNITS),
+                        max_write_units: tablet_max_write_units
+                            .unwrap_or(min_tablets::DEFAULT_TABLET_MAX_WRITE_UNITS),
+                    },
                 },
             )));
         }
@@ -10131,6 +10164,23 @@ struct AutoSplitThresholds {
     /// hot-but-small tablet under heavy write load, with no byte/key-count
     /// signal ever crossing threshold, can now still split.
     ops_rate: Option<u64>,
+    /// ADR 0067 (W-08b): the per-tablet capacity ceilings a provisioned
+    /// table's minimum tablet count is derived against
+    /// (`min_tablets::min_tablets_for`). **Not opt-in** — unlike the three
+    /// fields above, this is always in effect (at its production default,
+    /// `min_tablets::TabletCapacityCeilings::default()`, when no CLI flag/
+    /// config field overrides it) for any table with its own
+    /// `ProvisionedThroughput`; a table with no `throughput` is never
+    /// touched by this trigger regardless.
+    ///
+    /// Groundwork commit: not yet read by `auto_split_loop`'s body — the
+    /// follow-up change that adds the fourth trigger arm removes this
+    /// `allow`.
+    #[allow(
+        dead_code,
+        reason = "read by auto_split_loop's fourth trigger arm in the next commit"
+    )]
+    tablet_capacity_ceilings: min_tablets::TabletCapacityCeilings,
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
@@ -10976,6 +11026,8 @@ pub async fn start_cluster_with(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11012,6 +11064,8 @@ pub async fn start_cluster_with_auto_split_bytes(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11043,6 +11097,8 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
         None,
         None,
     )
@@ -11085,6 +11141,8 @@ pub async fn start_cluster_with_streams(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11123,6 +11181,8 @@ pub async fn start_cluster_with_growth(
         BackupStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11158,6 +11218,8 @@ pub async fn start_cluster_with_quiesce_after(
         quiesce_after,
         None,
         BackupStoreConfig::default(),
+        None,
+        None,
         None,
         None,
     )
@@ -11209,6 +11271,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -11225,6 +11289,8 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         backup_store_config,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     )
     .await
 }
@@ -11245,6 +11311,8 @@ async fn start_cluster_inner(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -11327,6 +11395,8 @@ async fn start_cluster_inner(
                 pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
                 throttle_read_units,
                 throttle_write_units,
+                tablet_max_read_units,
+                tablet_max_write_units,
             )
             .await?;
         nodes.push(node);
@@ -11593,6 +11663,8 @@ pub async fn start_split_cluster_with_growth(
                 BackupStoreConfig::default(),
                 None,
                 None,
+                None,
+                None,
             )
             .await?,
         );
@@ -11730,6 +11802,8 @@ pub async fn run_node_with_streams_and_quiesce_after(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11774,6 +11848,8 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
+        None,
+        None,
         None,
         None,
     )
@@ -11823,6 +11899,8 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -11866,6 +11944,8 @@ pub async fn run_node_with_cluster_settings(
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -11885,6 +11965,8 @@ pub async fn run_node_with_cluster_settings(
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
         throttle_read_units,
         throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
     )
     .await
 }
@@ -11937,6 +12019,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     pitr_snapshot_cadence: Duration,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12010,6 +12094,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             pitr_snapshot_cadence,
             throttle_read_units,
             throttle_write_units,
+            tablet_max_read_units,
+            tablet_max_write_units,
         )
         .await
 }
@@ -12047,6 +12133,8 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
         None,
         None,
     )
@@ -12241,6 +12329,8 @@ pub async fn run_node_data(
         SegmentStoreConfig::default(),
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -12278,6 +12368,8 @@ pub async fn run_node_data_with_streams(
         Duration::ZERO,
         stream_seal_knobs,
         segment_store_config,
+        None,
+        None,
         None,
         None,
     )
@@ -12324,6 +12416,8 @@ pub async fn run_node_data_with_cluster_settings(
     segment_store_config: SegmentStoreConfig,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12418,6 +12512,8 @@ pub async fn run_node_data_with_cluster_settings(
             BackupStoreConfig::default(),
             throttle_read_units,
             throttle_write_units,
+            tablet_max_read_units,
+            tablet_max_write_units,
         )
         .await
 }
@@ -12993,6 +13089,8 @@ async fn finish_data_join(
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
+            None,
+            None,
             None,
             None,
         )
