@@ -1091,8 +1091,10 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
         // memtable — otherwise even the exact scan reads no blocks and the
         // meter below cannot tell the two paths apart.
         let (_, rk) = admin_get(a, "/admin/raftkv").await;
+        let mut tablets: Vec<u64> = Vec::new();
         for g in rk["groups"].as_array().cloned().unwrap_or_default() {
             let tablet = g["tablet"].as_u64().expect("group has a tablet id");
+            tablets.push(tablet);
             let (s, f) = admin(
                 a,
                 "POST",
@@ -1101,6 +1103,72 @@ async fn admin_raftkv_default_does_not_materialize_the_dataset() {
             )
             .await;
             assert_eq!(s, 200, "flush tablet {tablet}: {f}");
+        }
+
+        // Issue #587: wait for `big`'s own change-log housekeeping to drain
+        // on THIS node before metering. `bring_up`'s nodes run with
+        // quiescence disabled (`run_node`'s `quiesce_after: Duration::ZERO`
+        // default), so `change_consumer_loop` (`index_drain.rs`) never gets
+        // to skip a led group via `is_quiesced()` — it ticks every
+        // `INDEX_DRAIN_INTERVAL` regardless. Every one of the `N` seeded
+        // writes leaves an ADR 0049 change-log marker record with no
+        // stream/GSI/PITR to consume it, so this table's tablet takes the
+        // loop's mandatory idle fast path: as long as `KIND_CHANGE` bytes
+        // remain, each tick does a real `pending_changes` scan (real
+        // SSTable block reads once flushed) and trims a `TRIM_BATCH`-sized
+        // slice, in batches, until the backlog is fully drained — only then
+        // does the fast path's `bytes == 0` branch stop scanning for good.
+        // That scan has nothing to do with the routes under test, but it
+        // lands on the exact same node/counter this test meters, and under
+        // scheduling pressure a tick can fall inside one metered window and
+        // not the other, inflating `cheap` (or `exact`) independent of
+        // `/admin/raftkv`'s own cost — the actual cause of this test's
+        // one-off failure (issue #587), not a cross-node/process-wide
+        // counter (the ADR 0015 metrics sink is per-node, see
+        // `docs/engineering-lessons.md`).
+        //
+        // There is no single already-exposed "drain done" boolean here (the
+        // RaftCore-level `quiesced` diagnostic doesn't apply — it never
+        // fires at all with quiescence disabled), so the existing knob to
+        // poll instead is the exact view's own `key_count`/`byte_size`
+        // (`?exact=1`, ADR 0020): once the trim loop's batches stop landing,
+        // these stop changing. Require several consecutive identical reads
+        // (spaced past one `INDEX_DRAIN_INTERVAL`, so a batch's own
+        // busy/idle-throttled cadence can't look "stable" mid-drain) before
+        // treating the tablet as settled — a converged-or-timeout poll, not
+        // a fixed sleep, per this repo's own testing discipline.
+        const STABLE_READS_REQUIRED: usize = 5;
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut stable = 0usize;
+        let mut last: Option<(u64, u64)> = None;
+        loop {
+            let (_, rk) = admin_get(a, "/admin/raftkv?exact=1").await;
+            let groups = rk["groups"].as_array().cloned().unwrap_or_default();
+            let totals = tablets.iter().try_fold((0u64, 0u64), |(kc, bs), t| {
+                let g = groups.iter().find(|g| g["tablet"].as_u64() == Some(*t))?;
+                Some((kc + g["key_count"].as_u64()?, bs + g["byte_size"].as_u64()?))
+            });
+            match totals {
+                Some(cur) if last == Some(cur) => {
+                    stable += 1;
+                    if stable >= STABLE_READS_REQUIRED {
+                        break;
+                    }
+                }
+                Some(cur) => {
+                    last = Some(cur);
+                    stable = 1;
+                }
+                None => {
+                    stable = 0;
+                    last = None;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < settle_deadline,
+                "big's change-log housekeeping never settled before metering: {groups:?}"
+            );
+            sleep(Duration::from_millis(250)).await;
         }
 
         async fn block_reads(a: SocketAddr) -> u64 {
