@@ -1503,13 +1503,12 @@ async fn advance_backfill_cursor(
     cursor_key_bytes: Vec<u8>,
     prefix: &[u8],
 ) -> Result<(), String> {
-    let index = match group.put_kind_batch_conditioned(
+    let index = match group.put_kind_batch(
         vec![(
             KIND_CURSOR,
             cursor_key_bytes,
             Some(cursor::encode_backfill_cursor(prefix)),
         )],
-        Vec::new(),
         Vec::new(),
     ) {
         ProposeResult::Accepted { index, .. } => index,
@@ -1553,14 +1552,11 @@ pub(crate) async fn clear_backfill_cursor<E: Env>(
 ) -> Result<(), String> {
     let tag = backfill_tag(index);
     let cursor_key_bytes = cursor::cursor_key(&group.scope_range().start, &tag);
-    let propose_index = match group.put_kind_batch_conditioned(
-        vec![(KIND_CURSOR, cursor_key_bytes, None)],
-        Vec::new(),
-        Vec::new(),
-    ) {
-        ProposeResult::Accepted { index, .. } => index,
-        other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
-    };
+    let propose_index =
+        match group.put_kind_batch(vec![(KIND_CURSOR, cursor_key_bytes, None)], Vec::new()) {
+            ProposeResult::Accepted { index, .. } => index,
+            other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
+        };
     let deadline = tokio::time::Instant::now() + BACKFILL_SEED_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if group.engine_applied_index() >= propose_index {
@@ -1623,11 +1619,7 @@ async fn seed_change_log_record(
     if !fence.contains(&change_log_prefix) {
         return Err("backfill seed target outside this group's live range; retry".into());
     }
-    let index = match group.put_kind_batch_conditioned(
-        Vec::new(),
-        vec![(change_log_prefix, record)],
-        Vec::new(),
-    ) {
+    let index = match group.put_kind_batch(Vec::new(), vec![(change_log_prefix, record)]) {
         ProposeResult::Accepted { index, .. } => index,
         other => return Err(format!("backfill seed not accepted: {other:?}")),
     };

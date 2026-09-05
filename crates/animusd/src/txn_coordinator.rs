@@ -1352,8 +1352,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **`write_conditions`** (ADR 0018 §2 apply-time write-key conditions
     /// amendment) — `(table, key, expected)` own-key byte-level OCC
     /// conditions checked at *apply* time on the key's own tablet, upgrading
-    /// a write action's own condition from same-node-only protection
-    /// (`ctx.data().rmw_lock`) to full cross-node correctness: `key` MUST be
+    /// a write action's own condition from same-node-only protection (this
+    /// amendment predates ADR 0054; the `rmw_lock` it refers to is long
+    /// since deleted, step 4b) to full cross-node correctness: `key` MUST be
     /// one of `writes`' own keys (an `Err` otherwise) — a condition on a key
     /// this transaction does not write belongs in `preconditions` instead
     /// (see [`TxnWriteCondition`]'s doc for why mixing them up is exactly

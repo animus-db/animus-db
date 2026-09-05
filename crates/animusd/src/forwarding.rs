@@ -697,10 +697,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 // The identical confirm `cp_kind_write_raw`'s own Local arm
-                // runs — never a second implementation (`cp_kind_local`'s
-                // Some-base-write requirement wrongly refused a forwarded
-                // whole-partition raw DELETE, whose base write is a
-                // tombstone; see `cp_kind_raw_local`'s doc).
+                // runs — never a second implementation (the now-deleted
+                // `cp_kind_local`'s Some-base-write requirement wrongly
+                // refused a forwarded whole-partition raw DELETE, whose
+                // base write is a tombstone; see `cp_kind_raw_local`'s
+                // doc).
                 match Self::cp_kind_raw_local(&leader, writes, change_log).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
@@ -725,8 +726,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 let meta = self.effective_metadata();
-                match dynamo::kind_write_item_at_leader(
-                    self,
+                match dynamo::kind_write_item_at_leader::<E, R>(
                     &leader,
                     &meta,
                     &table,

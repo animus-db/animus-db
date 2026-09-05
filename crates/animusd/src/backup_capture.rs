@@ -384,13 +384,12 @@ async fn backup_capture_tick(ctx: &ClientCtx, group: &CpGroup, tablet: TabletId,
 /// tick either way (a spurious re-derivation of the same chunk is always
 /// safe — see the module doc).
 async fn propose_cursor(group: &CpGroup, cursor_key: &[u8], cur: &CaptureCursor) -> bool {
-    let index = match group.put_kind_batch_conditioned(
+    let index = match group.put_kind_batch(
         vec![(
             KIND_CURSOR,
             cursor_key.to_vec(),
             Some(encode_capture_cursor(cur)),
         )],
-        Vec::new(),
         Vec::new(),
     ) {
         ProposeResult::Accepted { index, .. } => index,

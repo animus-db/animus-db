@@ -636,32 +636,18 @@ pub enum KvCommand {
     /// Keys are logical (token-leading, ADR 0022) — the kind selects the scope,
     /// it is never part of the key.
     ///
-    /// **`conditions` (ADR 0046 "evaluate at leader" seatbelt, modeled on
-    /// [`TxnStage`](Self::TxnStage)'s own `conditions` field)**: `(key,
-    /// expected)` pairs — `expected: Some(bytes)` means `key`'s current
-    /// *committed* value (envelope-unwrapped, the same read discipline `Cas`/
-    /// `TxnStage` use) must equal `bytes` exactly; `None` means it must be
-    /// absent. Byte-level OCC, not a rich expression, exactly like
-    /// `TxnStage.conditions` — a caller (`animusd`'s leader-side write
-    /// evaluator) compiles its own richer condition against a pre-read down to
-    /// "the value must still be exactly what I read" before it ever reaches
-    /// here. Unlike `TxnStage`, a `KindBatch` condition failure has **no**
-    /// outcome-introspection channel — a condition-failed entry no-ops
-    /// silently, indistinguishable from a fence/seal miss, deliberately (the
-    /// existing generic-error/probe-poll-timeout contract every
-    /// `put_kind_batch_fenced` caller already has to handle) — so this field
-    /// is checked once, **before** the fence/seal gate rather than gated
-    /// behind it: there is no reporting-priority reason (no `StageOutcome`
-    /// analogue to disambiguate) to skip the read when the entry would fence
-    /// out anyway. This field has **no production caller as of this PR** —
-    /// it lands ahead of its first real use (`animusd`'s leader-side
-    /// evaluate-then-propose write path, ADR 0046 U3) as the seatbelt against
-    /// a concurrent `TxnStage`/`TxnResolve` commit landing between that
-    /// evaluator's own-key read and its own propose call: real today (every
-    /// `rmw_lock` use lives in edge handlers, never `txn_resolver_loop`) but
-    /// unreachable until a future transaction stack can target an
-    /// indexed/streamed table (transactions are rejected on those tables
-    /// today).
+    /// **The ADR 0046 "evaluate at leader" apply-time OCC seatbelt this
+    /// variant used to carry (`conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>`)
+    /// is deleted (ADR 0054 step 4b).** It existed to guard the window
+    /// between `animusd`'s leader-side write evaluator reading an item and
+    /// its own propose call — a window that no longer exists once every
+    /// producer evaluates inside apply instead (`KvCommand::KindEval` for
+    /// single-item writes since step 3, `KvCommand::TxnStage::pending` for
+    /// transactional ones since step 4a). Every remaining `KindBatch`
+    /// producer (the restore driver, index backfill, the TTL/backup-cursor
+    /// bookkeeping writers) commits precomputed bytes with no condition of
+    /// its own, so there is nothing left to guard. See ADR 0054's own
+    /// closing amendment for the full account.
     KindBatch {
         /// `(row kind, logical key, value)` — `None` writes a tombstone.
         writes: Vec<KindWrite>,
@@ -688,7 +674,6 @@ pub enum KvCommand {
         /// (`token || escape(pk)`), so the completed keys stay distinct for
         /// distinct items.
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
-        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         ts: HlcTimestamp,
     },
     /// **Self-contained evaluated write** (ADR 0054 step 2). Unlike
@@ -2735,27 +2720,14 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// the write it describes. Keys are **logical** and token-leading
     /// (ADR 0022); the kind selects the scope and is never part of the key.
     ///
-    /// Supplies no `conditions`; use
-    /// [`put_kind_batch_conditioned`](Self::put_kind_batch_conditioned) to
-    /// supply own-key OCC conditions.
+    /// **`put_kind_batch_conditioned`'s own-key OCC `conditions` parameter
+    /// was deleted along with `KvCommand::KindBatch.conditions` (ADR 0054
+    /// step 4b)** — see that field's own doc. This is now the only
+    /// `KindBatch` proposer.
     pub fn put_kind_batch(
         &self,
         writes: Vec<KindWrite>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> ProposeResult {
-        self.put_kind_batch_conditioned(writes, change_log, Vec::new())
-    }
-
-    /// As [`put_kind_batch`](Self::put_kind_batch), but may supply own-key OCC
-    /// `conditions`. See [`KvCommand::KindBatch`]'s doc for what `conditions`
-    /// means and why it is checked ahead of the seal gate; pass an empty `Vec`
-    /// for the pre-existing no-conditions behavior (every caller before this
-    /// field existed).
-    pub fn put_kind_batch_conditioned(
-        &self,
-        writes: Vec<KindWrite>,
-        change_log: Vec<(Vec<u8>, Vec<u8>)>,
-        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> ProposeResult {
         self.propose_ordered(|term| {
             let keys: Vec<&[u8]> = writes.iter().map(|(_, k, _)| k.as_slice()).collect();
@@ -2763,7 +2735,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             KvCommand::KindBatch {
                 writes,
                 change_log,
-                conditions,
                 ts,
             }
         })
@@ -6904,55 +6875,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             KvCommand::KindBatch {
                 writes,
                 change_log,
-                conditions,
                 ts,
             } => {
                 assert_ts_monotonic(max_applied_ts, ts);
-                // ADR 0046 "evaluate at leader" seatbelt: this entry's own-key
-                // `conditions` (see `KvCommand::KindBatch`'s doc) are checked
-                // against the KIND_BASE scope — the only scope a production
-                // caller ever conditions on — BEFORE the fence/seal gate
-                // below. This deliberately differs from `TxnStage`'s own
-                // `condition_failure`, which only evaluates once its entry is
-                // otherwise known to be in-fence (so `StageOutcome` can report
-                // the fence/seal reason ahead of a condition one): a
-                // `KindBatch` condition failure has no outcome-introspection
-                // channel at all — it no-ops silently, indistinguishable from
-                // a fence/seal miss either way — so there is no
-                // reporting-priority reason to gate the read behind the fence
-                // check here. Drain the pending run first (mirrors `Cas`'s and
-                // `TxnStage`'s own read-after-flush-pending discipline) so a
-                // condition observes every earlier committed write in this
-                // same apply pass.
-                // Which condition failed, for the recorded outcome.
-                let mut failed_condition: Option<Vec<u8>> = None;
-                let conditions_ok = if conditions.is_empty() {
-                    true
-                } else {
-                    flush_pending(storage, &mut pending, metrics, halted).await;
-                    let mut ok = true;
-                    for (key, expected) in &conditions {
-                        let raw = storage
-                            .get(&scope.physical(key))
-                            .await
-                            .expect("raftkv kind batch condition read");
-                        let matches = match raw.map(|vv| txn::decode_envelope(&vv.value)) {
-                            None => expected.is_none(),
-                            Some(txn::Envelope::Committed(v)) => Some(v) == *expected,
-                            // An unresolved intent makes "the current
-                            // committed value" ambiguous — never guess at a
-                            // match, mirroring `Cas`/`TxnStage`'s identical
-                            // discipline.
-                            Some(txn::Envelope::Intent { .. }) => false,
-                        };
-                        if !matches {
-                            ok = false;
-                            failed_condition = Some(key.clone());
-                            break;
-                        }
-                    }
-                    ok
-                };
+                // ADR 0054 step 4b: the ADR 0046 "evaluate at leader"
+                // apply-time OCC seatbelt (`conditions`) this arm used to
+                // check here, before the fence/seal gate below, is deleted
+                // along with the field — see `KvCommand::KindBatch`'s own
+                // doc. Every remaining producer commits precomputed bytes
+                // with no condition of its own.
                 // Gated as one unit, exactly like `Batch` — an index write that
                 // half-applied would leave an LSI row describing a base row
                 // that never landed, which is the one thing colocating them was
@@ -6988,16 +6919,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // proposer can tell "no-op'd" from "applied and then
                 // overwritten" instead of comparing the value back — the
                 // introspection channel `TxnStage` and `Cas` already have.
-                let outcome = match (&failed_condition, &sealed_key) {
-                    (Some(key), _) => KindBatchOutcome::ConditionFailed { key: key.clone() },
-                    (None, Some(key)) => KindBatchOutcome::Sealed { key: key.clone() },
-                    (None, None) => KindBatchOutcome::Applied,
+                let outcome = match &sealed_key {
+                    Some(key) => KindBatchOutcome::Sealed { key: key.clone() },
+                    None => KindBatchOutcome::Applied,
                 };
                 kind_outcomes
                     .lock()
                     .expect("kind batch outcomes poisoned")
                     .record(index, term, outcome);
-                if conditions_ok && sealed_key.is_none() {
+                if sealed_key.is_none() {
                     // ADR 0046 binding decision: the ONE shared
                     // materialization helper, also used by `TxnResolve`'s
                     // commit branch below — never a second copy of this
@@ -7018,8 +6948,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // Read the current item in COMMIT ORDER (ADR 0054's
                 // Decision section) — drain the pending run first so this
                 // read observes every earlier write in this same apply
-                // pass, mirroring `KindBatch`'s own `conditions` read and
-                // `Cas`'s identical read-after-flush discipline.
+                // pass, mirroring `Cas`'s identical read-after-flush
+                // discipline.
                 flush_pending(storage, &mut pending, metrics, halted).await;
                 let token = animus_tablet::partition_token(&animus_item::storage_key(&pk, None));
                 let base_key = {

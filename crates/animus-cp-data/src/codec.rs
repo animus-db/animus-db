@@ -198,7 +198,17 @@ const MAGIC: u8 = 0xCB;
 /// `None` as `null` and `Some(..)` as the object, so one blob covers both
 /// cases with no separate tag byte needed. Same house convention: a clean
 /// bump, no cross-version compatibility.
-const VERSION: u8 = 26;
+/// `27` (ADR 0054 step 4b): `KvCommand::KindBatch` lost its own-key
+/// `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` OCC seatbelt field (ADR
+/// 0046 PR1) — every production caller passed an empty `Vec` once step 3/4a
+/// moved every write producer onto apply-time evaluation, so the field
+/// carried no live signal left to check. Removed from both the encode and
+/// decode arms (tag `12`); `TxnStage`'s OWN separate `conditions` field
+/// (introduced alongside it in version `11`, apply-time write-key
+/// preconditions for a *transaction's* own-key writes) is untouched — the
+/// two were always independent fields on different variants that happened
+/// to share a name and a byte-level OCC shape, not one shared mechanism.
+const VERSION: u8 = 27;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -563,17 +573,11 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
         KvCommand::KindBatch {
             writes,
             change_log,
-            conditions,
             ts,
         } => {
             put_u8(out, 12);
             put_kind_writes(out, writes);
             put_change_logs(out, change_log);
-            out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
-            for (k, expected) in conditions {
-                put_bytes(out, k);
-                put_opt_bytes(out, expected);
-            }
             put_ts(out, *ts);
         }
         KvCommand::KindEval {
@@ -756,17 +760,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         12 => {
             let writes = read_kind_writes(c)?;
             let change_log = read_change_logs(c)?;
-            let n = c.u32()?;
-            // Capped pre-allocation against an untrusted wire count — see
-            // `read_kind_writes`'s comment for why.
-            let mut conditions = Vec::with_capacity(n.min(1 << 20) as usize);
-            for _ in 0..n {
-                conditions.push((c.bytes()?, c.opt_bytes()?));
-            }
             KvCommand::KindBatch {
                 writes,
                 change_log,
-                conditions,
                 ts: read_ts(c)?,
             }
         }
@@ -1284,10 +1280,10 @@ mod tests {
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
                 learners: Some([9].into_iter().map(nid).collect()),
             },
-            // ADR 0046 seatbelt (PR1): `KindBatch.conditions` — exercises a
-            // non-empty condition list alongside a tombstone write and a
-            // change-log record, so the round trip proves every field this PR
-            // touched, not just the new one in isolation.
+            // `KindBatch` (its own `conditions` OCC seatbelt deleted in ADR
+            // 0054 step 4b): exercises a tombstone write alongside a
+            // change-log record, so the round trip still proves every
+            // remaining field.
             LogEntry {
                 term: 3,
                 index: 18,
@@ -1297,10 +1293,6 @@ mod tests {
                         (crate::KIND_LSI, b"lsi-key".to_vec(), None), // a tombstone
                     ],
                     change_log: vec![(b"change-prefix".to_vec(), b"record".to_vec())],
-                    conditions: vec![
-                        (b"base-key".to_vec(), Some(b"old-v".to_vec())),
-                        (b"other-key".to_vec(), None), // must be absent
-                    ],
                     ts: ts(2, 6),
                 },
                 config: None,

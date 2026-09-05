@@ -157,13 +157,12 @@ fn consumer_bookkeeping_still_applies_after_a_fork() {
     let l = leader(&nodes, seed);
     fork_and_settle(&mut sim, &nodes, l, b"m", &test_children(), seed);
 
-    match nodes[l].put_kind_batch_conditioned(
+    match nodes[l].put_kind_batch(
         vec![(
             animus_cp_data::KIND_CURSOR,
             b"cursor-row".to_vec(),
             Some(b"wm".to_vec()),
         )],
-        Vec::new(),
         Vec::new(),
     ) {
         ProposeResult::Accepted { .. } => {}
@@ -313,9 +312,8 @@ fn pre_fork_base_write_lands_before_the_fork() {
     let (mut sim, nodes) = group(seed);
     sim.run_for(Duration::from_secs(2));
     let l = leader(&nodes, seed);
-    match nodes[l].put_kind_batch_conditioned(
+    match nodes[l].put_kind_batch(
         vec![(KIND_BASE, b"row".to_vec(), Some(b"v".to_vec()))],
-        Vec::new(),
         Vec::new(),
     ) {
         ProposeResult::Accepted { .. } => {}

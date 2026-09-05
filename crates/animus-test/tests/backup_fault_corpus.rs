@@ -294,13 +294,12 @@ fn backup_capture_tick(
     if rows.is_empty() {
         cur.phase += 1;
         cur.next_key = Vec::new();
-        let result = node.put_kind_batch_conditioned(
+        let result = node.put_kind_batch(
             vec![(
                 KIND_CURSOR,
                 cursor_key_bytes,
                 Some(encode_capture_cursor(&cur)),
             )],
-            Vec::new(),
             Vec::new(),
         );
         propose_confirmed(sim, node, seed, result);
@@ -337,13 +336,12 @@ fn backup_capture_tick(
             cur.next_key = Vec::new();
         }
     }
-    let result = node.put_kind_batch_conditioned(
+    let result = node.put_kind_batch(
         vec![(
             KIND_CURSOR,
             cursor_key_bytes,
             Some(encode_capture_cursor(&cur)),
         )],
-        Vec::new(),
         Vec::new(),
     );
     propose_confirmed(sim, node, seed, result);
