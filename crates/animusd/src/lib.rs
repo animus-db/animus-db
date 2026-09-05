@@ -83,6 +83,7 @@ use animus_node::host::RelayClient;
 // miss. Do not widen this back to `allow` to make a change compile — that
 // is the hole this rung closes.
 mod admin;
+mod authz;
 mod backup_capture;
 #[deny(clippy::disallowed_methods)]
 mod backup_completion;
@@ -3723,6 +3724,17 @@ fn spawn_common_tail(
             initial_any_table_throughput,
         )),
     };
+    // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
+    // credentials" fast path from whatever this node's control handle
+    // already has cached at construction time — best-effort (a genuinely
+    // fresh cluster's control Raft may not have caught up yet, in which
+    // case this correctly reads empty and self-corrects on the next
+    // `change_consumer_loop` tick or a `PutCredential` commit). Avoids a
+    // window, on a restarted node whose catalog already has rows, where
+    // the fast path would otherwise default `false` until the first
+    // periodic refresh.
+    ctx.edge
+        .set_has_catalog_credentials(!ctx.effective_metadata().credentials.is_empty());
 
     let mut tasks = Vec::with_capacity(5);
     // Route-sync loop (ADR 0032 PR1): keep `ctx.client_route` = the static seed
@@ -6124,6 +6136,25 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// handle(s) *this node* locally hosts for it (in practice at most one,
     /// since a node hosts at most one replica of a given tablet).
     raftkv: Arc<Mutex<BTreeMap<TabletId, Vec<CpGroup<E>>>>>,
+    /// Lock-free "does the replicated credential catalog hold any row at
+    /// all right now" fast path (ADR 0066 §1, S-02 step 3) — so the SigV4
+    /// gate (`dynamo.rs::handle_conn`) can skip `ctx.effective_metadata()`'s
+    /// deep `Metadata` clone entirely on a cluster with an empty catalog,
+    /// the common case today. Recomputed (never read as the sole source of
+    /// truth for a security decision — only as a cost-avoidance hint) at
+    /// three points: once at `ClientCtx` construction
+    /// (`spawn_common_tail`), on `index_drain::change_consumer_loop`'s own
+    /// per-tick `Metadata` refresh (a few seconds' staleness at worst), and
+    /// immediately after this node's own `PutCredential`/
+    /// `RotateCredential`/`RevokeCredential` admin command commits
+    /// (`admin.rs`, using the metadata its own commit-wait poll already
+    /// fetched — no extra clone). A stale `false` (a credential was just
+    /// added on another node and this flag hasn't caught up yet) costs at
+    /// most one extra `effective_metadata()` clone once the gate falls
+    /// through to the correct static-bootstrap-or-reject outcome — never a
+    /// security hole, since the gate still runs whenever `ctx.dynamo_auth`
+    /// is configured regardless of this flag.
+    has_catalog_credentials: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -6139,7 +6170,28 @@ impl<E: Env> ClusterEdgeState<E> {
             control: Arc::new(Mutex::new(Vec::new())),
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
+            has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The current best-effort answer to "does the replicated credential
+    /// catalog hold any row at all" — see [`has_catalog_credentials`](
+    /// Self::has_catalog_credentials)'s own field doc for the staleness
+    /// contract. `Relaxed` ordering: this is a cost-avoidance hint, not a
+    /// synchronization point — the gate re-derives the real answer from
+    /// `Metadata` itself whenever it takes the slow path.
+    pub(crate) fn has_catalog_credentials(&self) -> bool {
+        self.has_catalog_credentials
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Recompute the fast-path flag from a freshly-read `Metadata` — call
+    /// this wherever a caller already has one in hand (see the field's own
+    /// doc for the three call sites), never by fetching a fresh one just
+    /// for this.
+    pub(crate) fn set_has_catalog_credentials(&self, present: bool) {
+        self.has_catalog_credentials
+            .store(present, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Register a node's control handle for schema-proposal routing. Called once
@@ -7994,6 +8046,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return meta;
         }
         self.control.metadata_cached()
+    }
+
+    /// The lock-free "does the replicated credential catalog hold any row
+    /// at all" fast path (ADR 0066 §1, S-02 step 3) — see
+    /// `ClusterEdgeState::has_catalog_credentials`'s own doc for the full
+    /// staleness contract. `dynamo.rs::handle_conn` consults this before
+    /// ever calling [`effective_metadata`](Self::effective_metadata) for
+    /// the SigV4 gate, so an empty catalog costs nothing new per request.
+    pub(crate) fn has_catalog_credentials(&self) -> bool {
+        self.edge.has_catalog_credentials()
+    }
+
+    /// Recompute [`has_catalog_credentials`](Self::has_catalog_credentials)
+    /// from an already-fetched `meta` — call this wherever a caller already
+    /// has a fresh `Metadata` in hand (see the field's own doc for the
+    /// three call sites), never by fetching one just for this.
+    pub(crate) fn refresh_catalog_credentials_flag(&self, meta: &Metadata) {
+        self.edge
+            .set_has_catalog_credentials(!meta.credentials.is_empty());
     }
 
     /// This node's **read-your-writes** view of the control plane's replicated

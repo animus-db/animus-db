@@ -14157,6 +14157,36 @@ once to confirm the binary's test set actually matches the source before
 reading a "N passed" line as proof of anything; a stale binary reports
 green precisely because it silently tests less, never because it tests the
 same thing and fails to notice a problem.
+
+**2026-09-05 follow-up — mechanism confirmed, rule hardened to "never
+share a target dir across concurrently-active worktrees".** Two agents
+building the same workspace from two worktrees (`.claude/worktrees/s02`
+and `.claude/worktrees/w08b`) into one `CARGO_TARGET_DIR`, alternating,
+produced (a) a `cargo test --workspace` in the main checkout that failed
+with 59 "unresolved import `animus_control::Policy`" / "no variant named
+`PutCredential`" errors although the checked-out `meta.rs` plainly
+contained both — the `animus-control` rlib cargo linked against had been
+compiled from the *other* worktree, whose files lacked the credential
+catalog; (b) endless whole-tree rebuilds every time the trees swapped;
+(c) a target dir that grew from 17G to 26G and a `rust-lld` crash with
+"No space left on device". The mechanism: cargo identifies a workspace
+crate's artifacts by a hash of its **workspace-relative** path (so a
+target dir survives a workspace move), so two worktrees of the same repo
+write byte-identical artifact *names* into a shared target dir, and
+freshness is then judged by comparing source mtimes against the recorded
+artifact — a tree whose files are *older* than the other tree's build
+sees its neighbour's library as up to date and silently links against it.
+A "green" gate computed that way proves nothing about the tree it ran in.
+**Rule**: a shared target dir is only ever safe for *strictly serialized*
+use from *one* worktree at a time, with the workspace-crate artifacts (at
+minimum `target/debug/{incremental,deps,.fingerprint}` — in practice
+`rm -rf target/debug`, external deps rebuild in minutes) wiped whenever
+the tree changes; concurrently-active worktrees each need their own
+`CARGO_TARGET_DIR`, and if the disk allowance cannot hold two, the work
+is serialized, not shared. Briefing an agent "wait until no cargo
+process is running before each invocation" does **not** make sharing
+safe — it only removes the lock contention, not the staleness.
+
 ## A racing-proposers workload can't tell "won" from "lost" by presence alone — it has to confirm by content (`animus-control`'s `control_corpus.rs`, ADR 0061 rung B1 sibling)
 
 Building `control_corpus.rs` — a new seed-depth corpus for `animus-control`'s
@@ -17888,3 +17918,132 @@ generalizes past this specific ADR: any per-request hot-path check that
 degrades from "cheap local read" to "acquire a lock and clone a large
 structure" the moment a second configuration source is added is a
 candidate for this pattern, not just this one.
+
+## An idempotence check for a "move current state into history" command must compare against the row's post-apply effect, not re-derive the history entry from the row's own already-mutated fields (ADR 0066, `RotateCredential`)
+
+`MetaCommand::RotateCredential` (the credential catalog's rotation-grace
+primitive) moves a row's current `secret` into `previous` and installs a
+new current secret — the identical "no-op on an identical retried
+payload" idempotence every other catalog command in this state machine
+promises (`SetTableTtl`, `BeginBackup`, …). The first implementation's
+idempotence check computed `new_previous = PreviousSecret { secret:
+existing.secret.clone(), valid_until: now + grace_secs }` from `self`'s
+**current** row and compared it against what was already on file. That
+comparison is correct only for a command whose effect doesn't depend on
+what it itself already did — the moment a `RotateCredential` command is
+*replayed* against a row it already mutated, `existing.secret` is no
+longer the pre-rotation secret the retried command's own `new_previous`
+should be compared against: it's the post-rotation one. Concretely, replaying
+`Rotate{new_secret: "s1", grace_secs, now}` against a row where `secret`
+is already `"s1"` computes `new_previous.secret = "s1"` (today's current
+secret) instead of recognizing that the row's *actual* `previous.secret`
+(the real pre-rotation value, correctly preserved from the first apply) is
+what a genuine retry must leave untouched — the check's own freshly
+recomputed value disagreed with the already-correct stored one and the
+"identical repeat" test failed by re-rotating a second time, moving the
+already-rotated secret into `previous` a second time and silently losing
+the real original.
+
+Found immediately by the very idempotence unit test the ADR's own Testing
+section asked for (`rotate_credential_is_idempotent_on_identical_repeat`)
+— not by inspection. The fix inverts what the check compares: recognize a
+retry by three facts already sitting on the **existing, unmodified** row —
+its current secret already equals `new_secret`, its `updated_at` already
+equals this command's own `now`, and its `previous.valid_until` already
+equals what `(now, grace_secs)` would produce — and only build/install a
+*fresh* `PreviousSecret` (from `existing.secret` as it stands *before* this
+apply mutates anything) once that three-fact check has ruled out a retry.
+**General form**: an idempotence check for a command whose effect is
+defined in terms of "the current value becomes the new history entry"
+must never recompute what that history entry *would be* from the row's
+already-current-at-check-time fields and compare that recomputation
+against storage — on a genuine replay, "current" has already moved past
+what the original apply started from, so the recomputation silently
+describes a different (wrong) transition than the one already recorded.
+Detect a replay by facts that don't require re-deriving the transition at
+all (a target value already installed, a timestamp already stamped, a
+derived deadline already matching), then perform the real mutation from
+whatever `existing` looks like *at that point* — never build the
+would-be-new value first and use it as the idempotence oracle.
+
+## A commit-wait's convergence check pinned to a coarse-grained timestamp can spuriously match state from BEFORE the awaited command applied (ADR 0066, S-02 step 2 admin CRUD)
+
+`animusd::admin`'s `POST /admin/credentials`/`/rotate` handlers propose a
+`MetaCommand` and then poll `metadata_fresh()` in a loop, exactly like
+`dynamo.rs::update_time_to_live`'s own commit-wait shape — but the first
+cut's own convergence check compared `row.updated_at == now`, where `now`
+is the credential catalog's own epoch-**seconds** convention (ADR 0066,
+deliberately coarser than the millisecond `wall_ms` fields most of this
+codebase's commit-waits key on). Two of this test suite's own end-to-end
+tests immediately failed: a `Rotate` issued right after a `Put` — well
+within the same wall-clock second in a fast test run — computed a `now`
+identical to the `Put`'s own, so the very first iteration of the `Rotate`
+handler's poll loop read back the **pre-rotate** row (already satisfying
+`updated_at == now` purely by timestamp coincidence, before the just-issued
+`propose_schema` had any chance to actually commit) and returned it as if
+the rotation had already happened — a `rotation: null` response for a call
+that should have opened a grace window.
+
+This is the identical failure family `docs/adr/*`'s existing "a commit-wait
+must never pin a transient status value" lesson describes (see
+`crates/animusd/CLAUDE.md`'s `create_index` entry: never key a convergence
+check on a value the very state you're racing against can also produce) —
+but with a new trigger: **when a convergence check's own timestamp field has
+coarser granularity than the interval between commands that can share it,
+timestamp equality alone stops being a reliable "this specific command
+applied" signal**, even with no aggregator or concurrent writer involved at
+all — a single caller issuing two of its own commands back to back is
+enough. Fixed by comparing **content** instead: `action_put_credential`
+checks `row.secret == command_secret && row.policy == command_policy &&
+row.enabled == req.enabled`; `action_rotate_credential` checks `row.secret
+== command_new_secret` — the actual, unambiguous fact each command's own
+apply arm is defined to produce, which a pre-mutation row cannot already
+exhibit by coincidence regardless of clock resolution. **General form**:
+before keying a commit-wait's convergence check on any timestamp field,
+check whether two commands the same caller (or a legitimate concurrent one)
+can issue are ever proposed close enough together to land in the same tick
+of that field's own granularity — if so, compare the command's actual
+semantic effect instead, never a timestamp it happens to also carry.
+
+## A lock-free "is there anything to check" fast path belongs on the per-node shared handle, not the per-connection context struct (ADR 0066 §1, S-02 step 3)
+
+Wiring the SigV4 gate to consult the replicated credential catalog (ADR
+0066) needed a cost-avoidance guard: a cluster with SigV4 auth configured
+purely for its static bootstrap map (no catalog rows at all — every
+pre-ADR-0066 deployment) must not start paying `ClientCtx::
+effective_metadata()`'s deep `Metadata` clone on every gated DynamoDB
+request just because the gate now also has a catalog to check. The
+obvious place to cache "does the catalog have any rows" is a new field on
+`ClientCtx` itself, following this crate's own well-worn precedent for a
+config-derived per-request fact (`dynamo_auth`, `tls`, …) — but `ClientCtx`
+is `Clone`d onto every connection and constructed at ~18 literal
+`ClientCtx { .. }` sites across `src/`/`tests/` (the same
+`error[E0063]`-enumerated fan-out root `CLAUDE.md`'s port-addition entry
+describes), so a new mutable field there means auditing all 18 for how to
+seed and keep it live.
+
+`ClientCtx::edge: ClusterEdgeState<E>` already exists specifically to be
+the one per-node, `Arc`-internally-shared handle every cloned `ClientCtx`
+on that node points at — and it has exactly one constructor,
+`ClusterEdgeState::new()`, called from ~9 sites, every one of which already
+just wants "a fresh edge state," with no per-call-site knowledge the new
+field would need. Putting the `Arc<AtomicBool>` fast-path flag there
+instead — `has_catalog_credentials()`/`set_has_catalog_credentials()` — cut
+the fan-out from ~18 sites (each needing a real per-site decision: "what
+should this ClientCtx's own value even be?") to zero: every existing
+`ClusterEdgeState::new()` call already produces the correct default
+(`false`), and the three places that recompute it
+(`ClientCtx` construction, `index_drain::change_consumer_loop`'s own
+per-tick metadata refresh, and immediately after a `PutCredential`/
+`RevokeCredential` commit) call a two-line accessor method rather than
+touching a struct literal at all.
+
+**General form**: before adding a new field to a struct with many
+construction sites to buy a cheap fast-path check, look for an existing
+`Arc`-shared handle already threaded through every one of those sites for
+an unrelated reason (a routing table, a registry, an edge-state bundle) —
+if its own constructor count is much smaller than the struct's, the flag
+belongs there, not on the widely-constructed struct itself. This is the
+inverse of the port/field-addition lesson (where the fan-out is the point,
+because every site genuinely needs its own value) — the tell is whether
+every one of the many sites would just want the same default.

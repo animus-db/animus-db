@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use animus_control::{Metadata, Policy};
 use animus_dynamo::sigv4::{self, SigV4Error, SigV4Request};
 
 use crate::http::HttpRequest;
@@ -49,6 +50,124 @@ pub fn sigv4_gate(
         body: &request.body,
     };
     sigv4::verify(&sigv4_req, credentials, now_epoch_ms)
+}
+
+/// Which of a caller's candidate secrets actually verified (ADR 0066 §3) —
+/// carried back so the caller (`animusd::dynamo::handle_conn`) can bump
+/// `Metric::AuthRotatedSecretUsed` without re-deriving which candidate
+/// matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The static `--dynamo-auth`/`dynamo_auth` bootstrap map (ADR 0066
+    /// §4) — unrestricted, the pre-S-02 behaviour.
+    Bootstrap,
+    /// The replicated credential catalog's **current** secret for this id.
+    CatalogCurrent,
+    /// The replicated credential catalog's **previous** secret, still
+    /// valid inside a `RotateCredential` grace window (ADR 0066 §3 step 4).
+    CatalogPrevious,
+}
+
+/// The outcome of a successful [`merged_sigv4_gate`] call — enough for the
+/// caller to authorize a request's operation and record which credential
+/// source matched, and nothing else: **no secret**, ever.
+#[derive(Debug, Clone)]
+pub struct AuthOutcome {
+    /// The `Credential` scope's access key id, verbatim.
+    pub access_key_id: String,
+    /// The `Credential` scope's region, verbatim (ADR 0057 — never pinned;
+    /// carried through for `AccessDeniedException`'s synthesized table ARN,
+    /// ADR 0066 §5).
+    pub region: String,
+    /// Which credential matched.
+    pub source: CredentialSource,
+    /// This credential's authorization scope — `None` only for
+    /// [`CredentialSource::Bootstrap`] (unrestricted); `Some` for a catalog
+    /// match, carrying the row's own [`Policy`] (ADR 0066 §1/§5).
+    pub policy: Option<Policy>,
+}
+
+/// Verify `request`'s `Authorization` header against the **merged**
+/// credential source ADR 0066 §3/§4 defines: the replicated credential
+/// catalog first (`catalog.credential(id)` — every candidate secret in
+/// `Metadata::verify_secret_candidates`, current then previous-while-in-
+/// grace), falling back to the static bootstrap map only when `id` has **no
+/// row in the catalog at all** (a disabled or revoked-but-still-present row
+/// shadows the static entry too, per ADR 0066 §4's "the catalog always wins
+/// on a shared id" — it is never treated as absent for fallback purposes,
+/// only for the wire's own unrecognized-vs-disabled distinction).
+///
+/// `now_epoch_ms` is `env.wall_now()`'s own millisecond reading (ADR 0051);
+/// the catalog's own `now_secs` convention ([`Metadata::
+/// verify_secret_candidates`]'s doc) is derived from it internally, so the
+/// caller supplies exactly one clock read regardless of which path is
+/// taken.
+///
+/// # Errors
+/// See [`animus_dynamo::sigv4::verify`]'s own doc for the full check order.
+/// A catalog row present but disabled, or with no secret matching, never
+/// falls through to the static map — see the doc above.
+pub fn merged_sigv4_gate(
+    request: &HttpRequest,
+    catalog: &Metadata,
+    static_credentials: Option<&BTreeMap<String, String>>,
+    now_epoch_ms: u64,
+) -> Result<AuthOutcome, SigV4Error> {
+    let sigv4_req = SigV4Request {
+        method: &request.method,
+        path: &request.path,
+        query: &request.query,
+        headers: &request.headers,
+        body: &request.body,
+    };
+    let credential = sigv4::parse_credential(&sigv4_req)?;
+    let now_secs = now_epoch_ms / 1000;
+
+    if let Some(row) = catalog.credential(&credential.access_key_id) {
+        // A row exists — the catalog always wins on this id (ADR 0066 §4),
+        // so a disabled row is never treated as absent for fallback
+        // purposes, only for the wire's own unrecognized-vs-disabled
+        // distinction (ADR 0066 §3 step 2).
+        if !row.enabled {
+            return Err(SigV4Error::UnrecognizedClient);
+        }
+        let mut last_err = SigV4Error::SignatureMismatch;
+        for (idx, secret) in catalog
+            .verify_secret_candidates(&credential.access_key_id, now_secs)
+            .enumerate()
+        {
+            let candidate = BTreeMap::from([(
+                credential.access_key_id.clone(),
+                secret.as_str().to_string(),
+            )]);
+            match sigv4::verify(&sigv4_req, &candidate, now_epoch_ms) {
+                Ok(()) => {
+                    return Ok(AuthOutcome {
+                        access_key_id: credential.access_key_id.clone(),
+                        region: credential.region.clone(),
+                        source: if idx == 0 {
+                            CredentialSource::CatalogCurrent
+                        } else {
+                            CredentialSource::CatalogPrevious
+                        },
+                        policy: Some(row.policy.clone()),
+                    });
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        return Err(last_err);
+    }
+
+    let empty = BTreeMap::new();
+    let statics = static_credentials.unwrap_or(&empty);
+    sigv4::verify(&sigv4_req, statics, now_epoch_ms)?;
+    Ok(AuthOutcome {
+        access_key_id: credential.access_key_id,
+        region: credential.region,
+        source: CredentialSource::Bootstrap,
+        policy: None,
+    })
 }
 
 #[cfg(test)]
@@ -169,5 +288,92 @@ mod tests {
         let req = signed_request(AKID, SECRET);
         let now = SIGNED_AT + 5 * 60 * 1000;
         assert_eq!(sigv4_gate(&req, &credentials(), now), Ok(()));
+    }
+
+    // --- `merged_sigv4_gate` (ADR 0066 §3/§4) ------------------------------
+
+    fn row(
+        secret: &str,
+        previous: Option<(&str, u64)>,
+        enabled: bool,
+    ) -> animus_control::CredentialRow {
+        animus_control::CredentialRow {
+            secret: animus_control::SecretKey::new(secret),
+            previous: previous.map(|(s, valid_until)| animus_control::PreviousSecret {
+                secret: animus_control::SecretKey::new(s),
+                valid_until,
+            }),
+            policy: Policy::allow_all(),
+            enabled,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn now_secs() -> u64 {
+        SIGNED_AT / 1000
+    }
+
+    #[test]
+    fn merged_gate_matches_the_catalogs_current_secret() {
+        let mut meta = Metadata::default();
+        meta.credentials
+            .insert(AKID.to_string(), row(SECRET, None, true));
+        let req = signed_request(AKID, SECRET);
+        let outcome = merged_sigv4_gate(&req, &meta, None, SIGNED_AT).expect("verifies");
+        assert_eq!(outcome.source, CredentialSource::CatalogCurrent);
+        assert!(outcome.policy.is_some());
+    }
+
+    #[test]
+    fn merged_gate_matches_the_previous_secret_inside_the_grace_window() {
+        let mut meta = Metadata::default();
+        meta.credentials.insert(
+            AKID.to_string(),
+            row("new-secret", Some((SECRET, now_secs() + 60)), true),
+        );
+        let req = signed_request(AKID, SECRET);
+        let outcome = merged_sigv4_gate(&req, &meta, None, SIGNED_AT).expect("verifies");
+        assert_eq!(outcome.source, CredentialSource::CatalogPrevious);
+    }
+
+    #[test]
+    fn merged_gate_rejects_the_previous_secret_once_its_grace_window_closes() {
+        let mut meta = Metadata::default();
+        meta.credentials.insert(
+            AKID.to_string(),
+            row("new-secret", Some((SECRET, now_secs())), true),
+        );
+        let req = signed_request(AKID, SECRET);
+        let err = merged_sigv4_gate(&req, &meta, None, SIGNED_AT).unwrap_err();
+        assert_eq!(err, SigV4Error::SignatureMismatch);
+    }
+
+    #[test]
+    fn merged_gate_treats_a_disabled_row_as_unrecognized_never_falling_to_bootstrap() {
+        let mut meta = Metadata::default();
+        meta.credentials
+            .insert(AKID.to_string(), row(SECRET, None, false));
+        let req = signed_request(AKID, SECRET);
+        let err = merged_sigv4_gate(&req, &meta, Some(&credentials()), SIGNED_AT).unwrap_err();
+        assert_eq!(err, SigV4Error::UnrecognizedClient);
+    }
+
+    #[test]
+    fn merged_gate_falls_through_to_the_static_bootstrap_map_when_absent_from_the_catalog() {
+        let meta = Metadata::default();
+        let req = signed_request(AKID, SECRET);
+        let outcome =
+            merged_sigv4_gate(&req, &meta, Some(&credentials()), SIGNED_AT).expect("verifies");
+        assert_eq!(outcome.source, CredentialSource::Bootstrap);
+        assert!(outcome.policy.is_none());
+    }
+
+    #[test]
+    fn merged_gate_unknown_key_with_no_catalog_and_no_bootstrap_match_is_unrecognized() {
+        let meta = Metadata::default();
+        let req = signed_request("AKIDNOWHERE", SECRET);
+        let err = merged_sigv4_gate(&req, &meta, Some(&credentials()), SIGNED_AT).unwrap_err();
+        assert_eq!(err, SigV4Error::UnrecognizedClient);
     }
 }

@@ -612,6 +612,80 @@ per-tablet CP data plane (`animus-cp-data`).
   such fan-out (it is derived and stored only inside `Metadata::apply`'s own
   `BeginBackup`/`CompleteBackup` arms, never constructed by a caller).
 
+- **The replicated credential catalog (ADR 0066 §1/§2/§3, S-02 step 1):
+  `PutCredential`/`RotateCredential`/`RevokeCredential`.** `Metadata::
+  credentials: BTreeMap<AccessKeyId, CredentialRow>` (`AccessKeyId = String`,
+  a plain alias like `BackupId`/`RestoreId` — an access key id is not
+  secret) modelled directly on `BackupRow`'s own catalog-row shape
+  (`meta.rs`). `CredentialRow`'s `secret`/`previous.secret` fields are
+  `SecretKey`, a newtype whose `Debug` always renders `"SecretKey(REDACTED)"`
+  regardless of the actual value — never derive/hand-roll a `Debug` for any
+  future type that embeds one, and never `.as_str()` it into a log/panic
+  message. **`created_at`/`updated_at`/`PreviousSecret::valid_until` are
+  epoch SECONDS, not milliseconds** — a deliberate ADR 0066 convention for
+  this one catalog, unlike every other wall-clock field in this crate
+  (`BackupManifest::created_wall_ms`, `SealStreamShard::seal_wall_ms`, …),
+  which are epoch milliseconds straight off `env.wall_now()`; a proposer
+  (`animusd`) divides `wall_now()`'s milliseconds down to whole seconds
+  before building any of the three commands below — this state machine
+  itself reads no clock at all and performs no conversion. `Policy {
+  tables: TableMatch, ops: BTreeSet<OpClass> }` is one flat `(tables, ops)`
+  pair with no composition — deliberately not an authorization engine (ADR
+  0066's Context section draws this line explicitly); `Policy::allow_all()`
+  is the pre-S-02 "every class except `Admin`, every table" default a key
+  created with no explicit policy gets, and `Policy::allows(class, table:
+  Option<&str>)` is the one predicate both this crate's own tests and the
+  eventual dispatch-gate consumer (S-02 step 3) share — never re-derive its
+  logic at the call site.
+  - `PutCredential { id, secret, policy, enabled, now }` — create-or-replace
+    (unlike `BeginBackup`'s "already exists" rejection, a credential id has
+    no natural collision error). Replacing the secret is an **immediate
+    cutover**: `previous` is cleared, never preserved, the moment `secret`
+    itself actually changes; a policy/enabled-only `Put` (identical
+    `secret`) leaves `secret`/`previous` untouched. Idempotent on an
+    identical repeat, `now` included.
+  - `RotateCredential { id, new_secret, grace_secs, now }` — moves the
+    row's current `secret` into `previous` with `valid_until = now +
+    grace_secs`; a second `Rotate` inside an already-open grace window
+    **replaces** `previous` outright (never chains a third secret, mirroring
+    AWS IAM's own two-active-keys-per-user limit). Rejected against an
+    unknown id (unlike `Put`'s create-or-replace shape). **Idempotence
+    gotcha, closed already — read before touching this arm**: the
+    idempotence check must recognize a retry from facts already on the
+    **existing, unmutated** row (current secret already equals
+    `new_secret`, `updated_at` already equals `now`, `previous.valid_until`
+    already equals what `(now, grace_secs)` would produce) — it must
+    **not** recompute the would-be `PreviousSecret` from `existing.secret`
+    and compare that recomputation against storage, since on a genuine
+    replay `existing.secret` has already moved past the row's real
+    pre-rotation value, and comparing a wrong recomputation was a caught
+    (not shipped) bug; see `docs/engineering-lessons.md`'s matching entry
+    for the general form.
+  - `RevokeCredential { id }` — removes the row outright. Idempotent on an
+    already-absent id, mirroring every other catalog's "replayed
+    proposal" discipline; an in-flight request already past
+    `sigv4::verify` is unaffected.
+  - `Metadata::credential(id) -> Option<&CredentialRow>` and `Metadata::
+    verify_secret_candidates(id, now_secs) -> impl Iterator<Item =
+    &SecretKey>` are the read API S-02 step 3's dispatch gate calls: the
+    latter yields the current secret first, then the previous one too iff
+    a grace window is still open at `now_secs` (strict `<`, so the exact
+    boundary instant is already past), and yields nothing at all for an
+    absent **or disabled** id (a disabled row reads exactly like an
+    absent one, per ADR 0066 §3 step 2 — never let a caller distinguish
+    the two). All three commands join the usual gating match sites: `is_
+    relayable_command` (`animus-node/src/wire.rs`, schema-catalog class —
+    the admin API proposing one of these may land on any node), the
+    `mirror.rs` apply-derivation match (`Delete` for `RevokeCredential`,
+    `Put` for the other two, keyed under a new `syskv::EntityKind::
+    Credential`/`credential_key`), and `apply_put`/`apply_delete`'s own
+    exhaustive per-kind matches. `crates/animus-control/tests/
+    credentials_catalog.rs` is this catalog's own fixed-seed corpus
+    (modelled on `backup_catalog.rs`: replicate, survive a leader kill, a
+    real node restart, and seed-reproducibility) — no `ANIMUS_*_SEEDS`
+    depth knob, mirroring `backup_catalog.rs`'s own fixed-single-seed
+    shape rather than `animus-test`'s deeper corpora.
+
 - **The restore catalog (ADR 0059 §7, Train 2): `BeginRestore`/
   `CompleteRestore`/`FailRestore`.** `Metadata::restores: BTreeMap<RestoreId,
   RestoreRow>` (`RestoreId = String`, an opaque internally-minted identity —

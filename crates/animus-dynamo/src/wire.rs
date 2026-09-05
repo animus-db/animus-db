@@ -1303,6 +1303,24 @@ impl WireError {
         }
     }
 
+    /// A SigV4-authenticated caller's credential does not authorize the
+    /// operation it attempted (ADR 0066 §5 — the per-key allow list denied
+    /// it). Unlike ADR 0057's four SigV4 errors (which use the
+    /// `com.amazon.coral.service#…` auth-layer namespace), this is a
+    /// **service-layer** authorization failure, so it uses the ordinary
+    /// DynamoDB-namespace `__type` prefix [`WireError::to_json`] already
+    /// renders for every other error here — `animusd::authz` builds
+    /// `message` (never this crate, which has no `Policy`/access-key
+    /// concept).
+    #[must_use]
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self {
+            code: "AccessDeniedException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// A `TransactWriteItems`/`TransactGetItems` request was cancelled — a
     /// condition failure, a lost race against a concurrent write, or an
     /// internal 2PC abort (ADR 0018 §2/PR7). This is the DynamoDB exception

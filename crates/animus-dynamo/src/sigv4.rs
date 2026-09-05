@@ -197,6 +197,48 @@ impl std::fmt::Display for SigV4Error {
 
 impl std::error::Error for SigV4Error {}
 
+/// The `Authorization` header's own `Credential` scope, parsed but not yet
+/// checked against any credential store or clock (ADR 0066 §3) — the
+/// merged-catalog gate needs the access key id up front, to look up
+/// candidate secrets one at a time, before it can call [`verify`] at all;
+/// `region` rides along for the same reason `animusd`'s `AccessDeniedException`
+/// message synthesizes a table ARN from the caller's own credential scope
+/// (ADR 0066 §5) rather than inventing a region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCredential {
+    /// The `Credential` scope's access key id.
+    pub access_key_id: String,
+    /// The `Credential` scope's region component, taken verbatim (never
+    /// pinned — this codebase has no region concept, ADR 0057).
+    pub region: String,
+}
+
+/// Parse `req`'s `Authorization` header far enough to recover its
+/// `Credential` scope — exactly [`verify`]'s own step 1 structural check,
+/// stopping short of any credential-store lookup or crypto. Never touches
+/// `credentials` or a clock.
+///
+/// # Errors
+/// [`SigV4Error::MissingAuthenticationToken`] on every structural problem
+/// `verify`'s own step 1 already rejects (absent/unparseable `Authorization`,
+/// or a `SignedHeaders` member the request doesn't actually carry).
+pub fn parse_credential(req: &SigV4Request) -> Result<ParsedCredential, SigV4Error> {
+    let auth_header = req
+        .headers
+        .get("authorization")
+        .ok_or(SigV4Error::MissingAuthenticationToken)?;
+    let parsed = parse_authorization(auth_header)?;
+    for name in &parsed.signed_headers {
+        if req.headers.get(name).is_none() {
+            return Err(SigV4Error::MissingAuthenticationToken);
+        }
+    }
+    Ok(ParsedCredential {
+        access_key_id: parsed.access_key_id,
+        region: parsed.region,
+    })
+}
+
 /// Verify `req`'s `Authorization` header against `credentials`
 /// (access-key-id → secret-access-key) as of `now_epoch_ms`. See the module
 /// doc for the check order and each failure's classification.

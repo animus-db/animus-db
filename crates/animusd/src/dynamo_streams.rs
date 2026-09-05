@@ -42,6 +42,7 @@ use animus_dynamo::wire::WireError;
 use animus_tablet::TabletId;
 
 use crate::ClientCtx;
+use crate::authz::{self, Principal};
 use crate::dynamo::{internal, schema_for};
 
 /// `ListStreams`' default page size (real DynamoDB's own default).
@@ -55,10 +56,16 @@ const MAX_GET_RECORDS_LIMIT: usize = 1000;
 
 /// Decode + run a DynamoDB Streams operation from its `X-Amz-Target` value
 /// and JSON body, returning `(http status, json body)` — the Streams
-/// service's own [`crate::dynamo::execute`] sibling.
-pub(crate) async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+/// service's own [`crate::dynamo::execute_as`] sibling. `principal` is the
+/// caller's SigV4-resolved authorization scope (ADR 0066 §5).
+pub(crate) async fn execute_as(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
     match streams_wire::decode_request(target, body) {
-        Ok(op) => match run_operation(ctx, op).await {
+        Ok(op) => match run_operation(ctx, principal, op).await {
             Ok(body) => (200, body),
             Err(err) => (error_status(&err), err.to_json()),
         },
@@ -74,7 +81,70 @@ fn error_status(err: &WireError) -> u16 {
     }
 }
 
-async fn run_operation(ctx: &ClientCtx, op: StreamsOperation) -> Result<String, WireError> {
+/// ADR 0066 §1's mapping table names every DynamoDB Streams operation
+/// `OpClass::Streams` — there is no finer split within this service.
+const STREAMS_CLASS: animus_control::OpClass = animus_control::OpClass::Streams;
+
+/// The owning table for a `GetRecords` call's shard iterator, resolved the
+/// identical way [`get_records`] itself does (sealed catalog row first,
+/// else the tablet's own live `table` field) — needed up front so ADR 0066
+/// §5's allow-list check can run **before** any real work, mirroring every
+/// other operation's authorize-then-dispatch order. `None` when the
+/// iterator's own shard id doesn't resolve at all; `get_records` itself
+/// reports the honest `TrimmedDataAccessException` for that case, so this
+/// function never needs to invent an error of its own.
+fn stream_table_for_get_records(meta: &Metadata, shard_iterator: &str) -> Option<String> {
+    let (_, shard_id, _) = streams_wire::decode_iterator(shard_iterator).ok()?;
+    let (tablet_raw, epoch) = streams_wire::parse_shard_id(&shard_id)?;
+    let tablet = TabletId(tablet_raw);
+    if let Some(row) = meta.stream_shards.get(&(tablet, epoch)) {
+        return Some(row.table.clone());
+    }
+    meta.tablets.get(&tablet).and_then(|t| t.table.clone())
+}
+
+async fn run_operation(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    op: StreamsOperation,
+) -> Result<String, WireError> {
+    let meta = ctx.effective_metadata();
+    match &op {
+        StreamsOperation::ListStreams { table_name, .. } => match table_name {
+            Some(t) => authz::authorize(ctx, principal, "ListStreams", STREAMS_CLASS, Some(t))?,
+            None => authz::authorize_unscoped(ctx, principal, "ListStreams", STREAMS_CLASS)?,
+        },
+        StreamsOperation::DescribeStream { stream_arn, .. } => {
+            let table = streams_wire::parse_stream_arn(stream_arn).map(|(t, _)| t);
+            authz::authorize(
+                ctx,
+                principal,
+                "DescribeStream",
+                STREAMS_CLASS,
+                table.as_deref(),
+            )?;
+        }
+        StreamsOperation::GetShardIterator { stream_arn, .. } => {
+            let table = streams_wire::parse_stream_arn(stream_arn).map(|(t, _)| t);
+            authz::authorize(
+                ctx,
+                principal,
+                "GetShardIterator",
+                STREAMS_CLASS,
+                table.as_deref(),
+            )?;
+        }
+        StreamsOperation::GetRecords { shard_iterator, .. } => {
+            let table = stream_table_for_get_records(&meta, shard_iterator);
+            authz::authorize(
+                ctx,
+                principal,
+                "GetRecords",
+                STREAMS_CLASS,
+                table.as_deref(),
+            )?;
+        }
+    }
     match op {
         StreamsOperation::ListStreams {
             table_name,

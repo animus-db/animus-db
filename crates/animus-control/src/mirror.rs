@@ -530,6 +530,12 @@ pub fn apply_and_derive_mirror(
                 &meta.restores[restore_id],
             ));
         }
+        MetaCommand::PutCredential { id, .. } | MetaCommand::RotateCredential { id, .. } => {
+            writes.push(put_json(syskv::credential_key(id), &meta.credentials[id]));
+        }
+        MetaCommand::RevokeCredential { id } => {
+            writes.push(KeyWrite::Delete(syskv::credential_key(id)));
+        }
     }
     (outcome, writes)
 }
@@ -742,6 +748,12 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
             meta.pitr_base_backups.insert(backup_id);
         }
+        EntityKind::Credential => {
+            let access_key_id = String::from_utf8(id).expect("access key id is UTF-8");
+            let row: crate::meta::CredentialRow =
+                serde_json::from_slice(value).expect("mirrored credential value decodes");
+            meta.credentials.insert(access_key_id, row);
+        }
     }
 }
 
@@ -838,6 +850,12 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // (ADR 0059 §9).
             let backup_id = String::from_utf8(id).expect("backup id is UTF-8");
             meta.pitr_base_backups.remove(&backup_id);
+        }
+        EntityKind::Credential => {
+            // Reachable in practice — `RevokeCredential` tombstones a row
+            // outright (ADR 0066 §2).
+            let access_key_id = String::from_utf8(id).expect("access key id is UTF-8");
+            meta.credentials.remove(&access_key_id);
         }
     }
 }

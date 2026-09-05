@@ -341,6 +341,13 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
+        // ADR 0066 §1 (S-02 step 3): piggyback this loop's own per-tick
+        // `Metadata` refresh to keep the SigV4 gate's lock-free "any
+        // catalog credentials" fast path from drifting far behind reality —
+        // see `ClusterEdgeState::has_catalog_credentials`'s own doc for the
+        // full staleness contract (this is one of three refresh points, not
+        // the only one).
+        ctx.refresh_catalog_credentials_flag(&meta);
         // Bound the fallback map to tablets that still exist at all — a
         // cheap `BTreeMap` retain, never a data scan — so a tablet dropped
         // (or moved off this node permanently) doesn't leak an entry

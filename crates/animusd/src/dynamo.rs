@@ -188,16 +188,20 @@ use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
+use crate::authz::{self, Principal};
 use crate::http;
 use crate::write_path::KindEvalApplied;
 use crate::{ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
-/// the replicated catalog before giving up.
-const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// the replicated catalog before giving up. `pub(crate)` since `credentials.rs`
+/// (ADR 0066 §6) reuses the identical propose-then-commit-wait shape for
+/// `PutCredential`/`RotateCredential`/`RevokeCredential`.
+pub(crate) const SCHEMA_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often `CreateTable` re-checks (and re-proposes against the current leader)
-/// while waiting for the schema to commit.
-const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// while waiting for the schema to commit. `pub(crate)` — see
+/// [`SCHEMA_COMMIT_TIMEOUT`]'s own doc.
+pub(crate) const SCHEMA_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Max actions per `TransactWriteItems` request / keys per `TransactGetItems`
 /// request (ADR 0018 §2/PR7) — DynamoDB's own limit (1-100 items); we don't
@@ -407,10 +411,10 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             }
             continue;
         }
-        // SigV4 enforcement (ADR 0057): gates the item API AND Streams —
-        // everything else on this listener that reaches `dispatch`/
-        // `execute_routed` — but deliberately sits *here*, ahead of
-        // `dispatch`, rather than inside `execute_routed` itself: that
+        // SigV4 enforcement (ADR 0057, hardened by ADR 0066): gates the item
+        // API AND Streams — everything else on this listener that reaches
+        // `dispatch`/`execute_routed` — but deliberately sits *here*, ahead
+        // of `dispatch`, rather than inside `execute_routed` itself: that
         // function is also the admin dashboard's `POST /admin/data/dynamo`
         // proxy's single dispatch point (ADR 0021), which the ADR requires
         // to stay unauthenticated (a different, already-trusted-network
@@ -418,25 +422,55 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         // re-gate that admin surface too; gating in this listener's own
         // connection handler keeps the fork itself untouched and makes the
         // gate a property of *this* port, not of the shared dispatch
-        // function. `None` (auth disabled, the default) skips this
-        // entirely — zero cost, byte-identical to pre-ADR-0057 behavior.
-        if let Some(credentials) = &ctx.dynamo_auth {
-            // ADR 0061 rung C4b: the build-request/verify sequence itself is
-            // `animus_node::sigv4_gate` — pure, no socket, no clock. This
-            // connection handler now does only the one real-clock read the
-            // gate can't do itself (`animus-node` has no `Env` access at
-            // all) and the response-shaping on failure.
+        // function. Neither a static bootstrap map NOR any replicated
+        // catalog credential (the fast-path flag) means this block is
+        // skipped entirely — zero cost, byte-identical to pre-ADR-0057
+        // behavior.
+        let principal = if ctx.dynamo_auth.is_some() || ctx.has_catalog_credentials() {
+            // ADR 0066 §1 (S-02 step 3): only pay `effective_metadata()`'s
+            // deep `Metadata` clone when the fast-path flag says the
+            // catalog genuinely holds a row — an empty catalog (the common
+            // case, and every pre-ADR-0066 deployment) passes a cheap
+            // `Metadata::default()` instead, which `merged_sigv4_gate`
+            // reads as "no catalog row for this id," falling straight
+            // through to the static map exactly as before this ADR.
+            let catalog = if ctx.has_catalog_credentials() {
+                ctx.effective_metadata()
+            } else {
+                Metadata::default()
+            };
             let now_epoch_ms = ctx.env.wall_now().0;
-            if let Err(err) = animus_node::sigv4_gate(&request, credentials, now_epoch_ms) {
-                let body = sigv4_error_body(&err);
-                http::write_amz_json_response(&mut stream, 400, &body, keep_alive).await?;
-                if !keep_alive {
-                    return Ok(());
+            match animus_node::sigv4_gate::merged_sigv4_gate(
+                &request,
+                &catalog,
+                ctx.dynamo_auth.as_deref(),
+                now_epoch_ms,
+            ) {
+                Ok(outcome) => {
+                    if outcome.source == animus_node::sigv4_gate::CredentialSource::CatalogPrevious
+                    {
+                        ctx.data()
+                            .raftkv_metrics
+                            .incr(Metric::AuthRotatedSecretUsed);
+                    }
+                    Principal::from(outcome)
                 }
-                continue;
+                Err(err) => {
+                    if err == animus_dynamo::sigv4::SigV4Error::UnrecognizedClient {
+                        ctx.data().raftkv_metrics.incr(Metric::AuthUnknownKey);
+                    }
+                    let body = sigv4_error_body(&err);
+                    http::write_amz_json_response(&mut stream, 400, &body, keep_alive).await?;
+                    if !keep_alive {
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
-        }
-        let (status, body) = dispatch(&ctx, &request).await;
+        } else {
+            Principal::unrestricted()
+        };
+        let (status, body) = dispatch(&ctx, &request, &principal).await;
         http::write_amz_json_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
             // The client asked us to close (HTTP/1.0 default, or an explicit
@@ -475,37 +509,65 @@ fn sigv4_error_body(err: &animus_dynamo::sigv4::SigV4Error) -> String {
 ///
 /// **Same listener, two services (ADR 0042 §3's decided same-listener
 /// F-fork)**: a `DynamoDBStreams_20120810.*` target routes to
-/// `dynamo_streams::execute`; everything else (the `DynamoDB_20120810.*`
-/// item API this module owns) goes through [`execute`] unchanged. Delegates
-/// to [`execute_routed`], the fork's single implementation.
-async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
-    execute_routed(ctx, &request.target, &request.body).await
+/// `dynamo_streams::execute_as`; everything else (the `DynamoDB_20120810.*`
+/// item API this module owns) goes through [`execute_as`] unchanged.
+/// Delegates to [`execute_routed_as`], the fork's single implementation —
+/// `principal` is this connection's own SigV4-resolved [`Principal`] (ADR
+/// 0066 §5, `handle_conn`'s own gate).
+async fn dispatch(
+    ctx: &ClientCtx,
+    request: &http::HttpRequest,
+    principal: &Principal,
+) -> (u16, String) {
+    execute_routed_as(ctx, principal, &request.target, &request.body).await
+}
+
+/// [`execute_routed_as`], defaulted to [`Principal::unrestricted`] — every
+/// caller that runs a request with **no SigV4 gate in front of it at all**
+/// (the admin dashboard's `POST /admin/data/dynamo` proxy, ADR 0021; the
+/// animusd console; the internal admin seeder) calls this unchanged form,
+/// matching pre-S-02 behaviour exactly. The real DynamoDB wire edge
+/// (`dispatch`, above) is the only caller that resolves and passes a real
+/// [`Principal`].
+pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+    execute_routed_as(ctx, &Principal::unrestricted(), target, body).await
 }
 
 /// Route a fully-qualified `X-Amz-Target` to whichever of the two services on
 /// this listener owns it, and run it: a `DynamoDBStreams_20120810.*` target
-/// goes to [`crate::dynamo_streams::execute`] (the Streams read API, ADR 0042
-/// §3), everything else to [`execute`] (the `DynamoDB_20120810.*` item API).
-/// The **single** place this fork is expressed — shared by the real edge's
-/// [`dispatch`] and the admin dashboard's write/read proxy (`POST
-/// /admin/data/dynamo`, ADR 0021), so both resolve a target identically.
-pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+/// goes to [`crate::dynamo_streams::execute_as`] (the Streams read API, ADR
+/// 0042 §3), everything else to [`execute_as`] (the `DynamoDB_20120810.*`
+/// item API). The **single** place this fork is expressed — shared by the
+/// real edge's [`dispatch`] and the admin dashboard's write/read proxy
+/// (`POST /admin/data/dynamo`, ADR 0021), so both resolve a target
+/// identically.
+pub(crate) async fn execute_routed_as(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
     if target.starts_with(animus_dynamo::streams_wire::TARGET_PREFIX) {
-        crate::dynamo_streams::execute(ctx, target, body).await
+        crate::dynamo_streams::execute_as(ctx, principal, target, body).await
     } else {
-        execute(ctx, target, body).await
+        execute_as(ctx, principal, target, body).await
     }
 }
 
 /// Decode + run a DynamoDB **item-API** operation from its `X-Amz-Target`
 /// value and JSON body, returning `(http status, json body)`. Called directly
 /// only where the target is already known to be item-API (this module's
-/// `dispatch`, via [`execute_routed`]); everything else should go through
-/// [`execute_routed`] so a `DynamoDBStreams_20120810.*` target isn't handed to
-/// the wrong decoder.
-pub(crate) async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+/// `dispatch`, via [`execute_routed_as`]); everything else should go through
+/// [`execute_routed_as`] so a `DynamoDBStreams_20120810.*` target isn't
+/// handed to the wrong decoder.
+pub(crate) async fn execute_as(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    target: &str,
+    body: &[u8],
+) -> (u16, String) {
     match wire::decode_request(target, body) {
-        Ok(op) => match run_operation(ctx, op).await {
+        Ok(op) => match run_operation(ctx, principal, op).await {
             Ok(body) => (200, body),
             Err(err) => (error_status(&err), err.to_json()),
         },
@@ -585,7 +647,11 @@ fn reject_internal_table(table: &str, ddl: bool) -> Result<(), WireError> {
 }
 
 /// Execute a decoded operation against the data plane via the shared coordinator.
-async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireError> {
+async fn run_operation(
+    ctx: &ClientCtx,
+    principal: &Principal,
+    op: Operation,
+) -> Result<String, WireError> {
     // One metadata snapshot per request (see [`metadata`]): every schema lookup /
     // table-existence check below reads this consistent view instead of deep-
     // cloning the replicated metadata again. `CreateTable` is the exception — its
@@ -602,6 +668,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
     if let Some(table) = op.table() {
         reject_internal_table(table, is_ddl_mutation(&op))?;
     }
+    // ADR 0066 §5: the per-key allow-list gate. Single-table (and backup-id-
+    // keyed) operations are fully checked here, before dispatch; the four
+    // multi-table operations (`BatchGetItem`/`BatchWriteItem`/
+    // `TransactGetItems`/`TransactWriteItems`) are deliberately no-ops here
+    // and check each of their own tables inside their own handler, below,
+    // rejecting the whole request before any of it runs if any table is
+    // denied — see `authz::authorize_op`'s own doc.
+    authz::authorize_op(ctx, principal, &op, meta)?;
     match op {
         Operation::CreateTable {
             table,
@@ -817,6 +891,16 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             Ok(wire::get_item_response(item.as_ref(), charged.as_ref()))
         }
         Operation::BatchGetItem { requests } => {
+            // ADR 0066 §5: check every named table before reading any of
+            // them — a request spanning an allowed and a denied table is
+            // rejected whole.
+            authz::authorize_each_table(
+                ctx,
+                principal,
+                "BatchGetItem",
+                animus_control::OpClass::Read,
+                requests.iter().map(|r| r.table.as_str()),
+            )?;
             // Independent point reads, not a transaction: DynamoDB's
             // BatchGetItem gives no cross-item atomicity, so this reuses the
             // ordinary GetItem path per key rather than the quiescent
@@ -1013,6 +1097,17 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // tests::batch_write_on_a_streamed_table_emits_change_records`;
             // the general same-predicate lesson is in
             // `docs/engineering-lessons.md`.)
+            //
+            // ADR 0066 §5: check every named table before writing any of
+            // them — a request spanning an allowed and a denied table is
+            // rejected whole, writing nothing.
+            authz::authorize_each_table(
+                ctx,
+                principal,
+                "BatchWriteItem",
+                animus_control::OpClass::Write,
+                requests.keys().map(String::as_str),
+            )?;
             // ADR 0065 §6: a per-item (marker table) or per-tablet-group
             // (images-carrying table) throttle refusal is reported under
             // `UnprocessedItems`, never a whole-call error.
@@ -1100,9 +1195,9 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // here) so two transactions on this node can't interleave their
             // condition checks, but the lock is not what makes the *commit*
             // atomic.
-            run_transact(ctx, meta, &actions, token.as_deref()).await
+            run_transact(ctx, principal, meta, &actions, token.as_deref()).await
         }
-        Operation::TransactGetItems { gets } => run_transact_get(ctx, meta, &gets).await,
+        Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
         Operation::UpdateTimeToLive {
             table,
             attribute_name,
@@ -3382,6 +3477,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// cleanly — not because anything is held that must be dropped first.
 async fn run_transact(
     ctx: &ClientCtx,
+    principal: &Principal,
     meta: &Metadata,
     actions: &[TransactAction],
     token: Option<&str>,
@@ -3396,6 +3492,15 @@ async fn run_transact(
             "TransactWriteItems supports at most {MAX_TRANSACT_ITEMS} actions"
         )));
     }
+    // ADR 0066 §5: check every named table before staging any of them — a
+    // transaction spanning an allowed and a denied table is rejected whole.
+    authz::authorize_each_table(
+        ctx,
+        principal,
+        "TransactWriteItems",
+        animus_control::OpClass::Write,
+        actions.iter().map(TransactAction::table),
+    )?;
     // Cheap, pure validation up front (ADR 0018's 2026-08-24 amendment): every
     // action's table must not be the reserved internal table, and no two
     // actions may target the same item — both checked **before** the
@@ -4144,6 +4249,7 @@ async fn ensure_txn_idempotency_table(ctx: &ClientCtx) -> Result<(), WireError> 
 /// before it — see the ADR amendment for the exact before/after numbers).
 async fn run_transact_get(
     ctx: &ClientCtx,
+    principal: &Principal,
     meta: &Metadata,
     gets: &[TransactGet],
 ) -> Result<String, WireError> {
@@ -4157,6 +4263,14 @@ async fn run_transact_get(
             "TransactGetItems supports at most {MAX_TRANSACT_ITEMS} items"
         )));
     }
+    // ADR 0066 §5: check every named table before reading any of them.
+    authz::authorize_each_table(
+        ctx,
+        principal,
+        "TransactGetItems",
+        animus_control::OpClass::Read,
+        gets.iter().map(|g| g.table.as_str()),
+    )?;
 
     let mut keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(gets.len());
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();

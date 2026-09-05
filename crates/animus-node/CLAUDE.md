@@ -415,6 +415,28 @@ sub-rungs below shipped.
   `Authorization` rejected with the right `SigV4Error` variant, and clock
   skew rejected on both sides of the ±5 minute window plus accepted exactly
   at the boundary.
+
+  **`merged_sigv4_gate` (ADR 0066 §3/§4, S-02 step 3)** is this module's
+  second, now-primary entry point: `merged_sigv4_gate(request: &http::
+  HttpRequest, catalog: &animus_control::Metadata, static_credentials:
+  Option<&BTreeMap<String, String>>, now_epoch_ms: u64) -> Result<
+  AuthOutcome, SigV4Error>` — the replicated credential catalog first (a
+  row present for the caller's access key id, enabled or not, is
+  authoritative and shadows the static map entirely, per ADR 0066 §4's
+  "the catalog always wins on a shared id"), falling through to
+  `static_credentials` only when the catalog has **no row at all** for that
+  id. Tries each of `Metadata::verify_secret_candidates`' candidate secrets
+  in turn (current, then previous while its grace window is open) via a
+  one-entry credential map per attempt into the unchanged `sigv4::verify`
+  — this module still touches no canonicalization/HMAC/skew logic itself.
+  `AuthOutcome{access_key_id, region, source: CredentialSource, policy:
+  Option<animus_control::Policy>}` carries no secret; `region` (from
+  `sigv4::parse_credential`) exists purely so `animusd::authz` can build
+  `AccessDeniedException`'s synthesized table ARN without a second parse.
+  `sigv4_gate::tests` covers current/previous-in-grace/previous-past-grace
+  matches, a disabled row never falling through to the static map, the
+  static-bootstrap fallback on a genuinely absent row, and an unknown key
+  with neither source configured.
 - **`console`** (C4c) — `ConsoleBackend`, every request/response type, and
   `route` itself, moved nearly verbatim from `animusd::console` (that
   module was already at this rung's target shape: `route` took
@@ -484,6 +506,19 @@ sub-rungs below shipped.
   (checked *before* `dispatch` is ever reached, and reading
   `crate::dashboard`-owned `include_str!` constants no `AdminHost` method
   has a reason to carry).
+
+  **`AdminHost` gained four more methods post-rung, for ADR 0066 (S-02 step
+  2)**: `credentials_view`/`action_put_credential`/
+  `action_rotate_credential`/`action_revoke_credential`, backing
+  `GET /admin/credentials`/`POST /admin/credentials`/`/rotate`/`/revoke` —
+  added the same way and at the same granularity as every route above (one
+  method per route, returning the exact shape the route produces); `impl
+  AdminHost for ClientCtx` in `animusd::admin` delegates to that file's own
+  handler functions, which propose through the control plane and
+  commit-wait exactly like a DDL mutation (see that crate's own CLAUDE.md
+  entry). `admin::tests::FakeHost` and `dispatch`'s routing table both
+  needed the four new arms too — the trait has no default methods, so a
+  missing impl is a compile error here, not a silent gap.
 
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at

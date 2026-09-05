@@ -85,6 +85,7 @@ wal-segment <admin-addr> <seg> [tablet]
 key <admin-addr> <key> [tablet]
 storage-scan <admin-addr> [--tablet <id>] [--start <key>] [--limit <n>]
 system-table <admin-addr> [--kind <kind>] [--limit <n>] [--after <cursor>]
+credentials <admin-addr>
 ```
 
 - `peers`/`txns`/`backups`/`restores`/`control-members`/`storage-control`/
@@ -99,7 +100,46 @@ system-table <admin-addr> [--kind <kind>] [--limit <n>] [--after <cursor>]
   list) rather than the positional `[tablet]` idiom the single-param storage
   routes use — there's no one mandatory leading arg to anchor a trailing
   positional on when every param is optional and there's more than one of
-  them.
+  them. `credentials` (ADR 0066 §6, S-02 step 2) joins this flat-GET group
+  — `GET /admin/credentials`, listing ids/policies/enabled/rotation state,
+  **never secrets** (`animusd::admin::credential_row_redacted` is the one
+  place that redaction is decided; this CLI just prints the server's JSON
+  verbatim, so it's safe by construction, not by its own care).
+
+**`credentials-put`/`credentials-rotate`/`credentials-revoke`** (ADR 0066
+§1/§2/§6) are mutating, one-shot POSTs — `(method, path, body)` construction
+also lives in `admin_request`, unit-tested the same way:
+
+```
+credentials-put <admin-addr> <id> <secret> [--enabled true|false] \
+    [--policy-tables all|name1,name2|prefix:pfx1,pfx2] [--policy-ops read,write,ddl,streams,backup]
+credentials-rotate <admin-addr> <id> <new-secret> <grace-secs>
+credentials-revoke <admin-addr> <id>
+```
+
+- `credentials-put`'s secret travels only in the POST body (never a query
+  string/path segment, which could land in a proxy or access log) — see
+  `admin_request`'s own `credentials_put_never_echoes_the_secret_in_the_path`
+  regression. `--enabled` defaults `true`; omitting both `--policy-tables`
+  and `--policy-ops` omits the whole `policy` field, letting the server
+  default to `Policy::allow_all()` (every table, every class but `Admin`) —
+  giving only one of the two flags fills the other in with its own
+  `allow_all()`-shaped default (`build_policy_body`'s own doc has the exact
+  rule) rather than requiring both to be spelled out together.
+  `--policy-tables` is `all`, a bare comma-separated list of exact table
+  names, or `prefix:` followed by a comma-separated list of prefixes;
+  `--policy-ops` is a comma-separated list of
+  `read`/`write`/`ddl`/`streams`/`backup`/`admin` — these six strings (and
+  the `{"kind": "all"|"names"|"prefixes", ...}` shape `--policy-tables`
+  builds) are this CLI's own small, human-readable wire contract with
+  `animusd::admin`'s `policy_json`/`parse_policy` — **not**
+  `animus_control::Policy`'s own `#[derive(Serialize)]` JSON (externally-
+  tagged enum JSON is a worse shape to hand-build here), and this crate
+  has no `animus-control` dependency at all to construct that type
+  directly even if it wanted to. `credentials-rotate` is rejected
+  server-side (`404`) against an unknown id — there is nothing to rotate.
+  `credentials-revoke` is idempotent — revoking an already-absent id is
+  still a `200`.
 
 Mutating actions:
 

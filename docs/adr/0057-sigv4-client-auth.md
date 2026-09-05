@@ -234,3 +234,18 @@ console posture note above ("auth on the intra, admin, or console ports
 unaffected: ADR 0064 adds mutual TLS on the intra port and server-only TLS
 on the admin/console ports, none of which is an authentication scheme in
 the SigV4 sense.
+
+## Amendment (2026-09-05, ADR 0066)
+
+[ADR 0066](0066-sigv4-hardening.md) takes up the four items this ADR's
+Non-goals section and "Credentials in replicated `Metadata`" alternative
+explicitly deferred: credential rotation, replication of credentials
+through `Metadata`, a dynamic credential API, and per-key table/operation
+scoping. The static `dynamo_auth` config map described above does not go
+away — it becomes a **bootstrap** credential source, consulted only for an
+access key id absent from the new replicated catalog — but it is no longer
+the only, or the primary, credential store. The verifier this ADR built
+(`sigv4::verify`, the canonical-request/HMAC chain, the AWS-faithful error
+mapping) is reused **unchanged** by ADR 0066; only what secret(s) are tried
+against it, and what a successfully-verified caller is then allowed to do,
+changes.

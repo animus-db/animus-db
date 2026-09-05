@@ -152,7 +152,17 @@ comment for its full type/method inventory.
   AWS-faithful `com.amazon.coral.service#…` wire shape (ADR 0057's
   error-mapping table); the module doc comment documents and justifies the
   check order (structural → unknown key → skew → scope/signature compare)
-  the ADR leaves to the implementation. `canonical_request`/
+  the ADR leaves to the implementation. **`parse_credential(req) ->
+  Result<ParsedCredential, SigV4Error>` (ADR 0066 §3, S-02 step 3)** does
+  only `verify`'s own step-1 structural parse (`Authorization`'s
+  `Credential` scope: access key id + region), stopping short of any
+  credential-store lookup or crypto — added because `animus-node`'s
+  merged catalog-then-bootstrap gate (`sigv4_gate::merged_sigv4_gate`)
+  needs the access key id up front, to look up the replicated catalog's
+  candidate secrets one at a time, before it can call `verify` at all;
+  `region` rides along for `animusd::authz`'s `AccessDeniedException`
+  message, which synthesizes a table ARN from the caller's own credential
+  scope rather than inventing a region. `canonical_request`/
   `string_to_sign`/`sign` are exported (beyond what `verify` alone would
   need) specifically so the vendored test-vector suite below can assert
   each intermediate stage, and so a hand-rolled test signer (`animusd`,

@@ -19,9 +19,10 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0066** (0065 is
-[Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
-record — W-08 itself landed 2026-09-05 and is removed from this file, per
+The next free ADR number at the time of writing is **0067** (0066 is
+[SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's design of record —
+S-02 landed 2026-09-05; 0065 is [Per-table throttling](adr/0065-per-table-throttling.md),
+W-08's — W-08 landed 2026-09-05 too. Both roadmap sections are removed per
 this document's own maintenance rule above).
 
 ---
@@ -65,25 +66,6 @@ the still-true paragraph after the table.
 
 ## 2. Security, storage, and deployment
 
-### S-02 SigV4 hardening (ADR 0057 follow-on)
-
-- **Gap:** one static key map from config; no rotation, no replication,
-  no dynamic API, no per-table policy, no multi-tenancy.
-- **Plan:** `Credentials: BTreeMap<AccessKeyId, CredentialRow>` in
-  `Metadata`, mutated by new `MetaCommand`s (template: backup/PITR rows,
-  `meta.rs:326-421`); each row carries a minimal allow list
-  (`tables`, `ops`); dual-secret grace window for rotation; admin CRUD
-  route; static config becomes bootstrap merged at the `dynamo.rs` gate.
-- **Files:** `crates/animusd/src/config.rs:105-150`,
-  `crates/animus-dynamo/src/sigv4.rs` (unchanged verifier),
-  `crates/animus-control/src/meta.rs:1148`, `crates/animus-node/src/admin.rs`.
-- **Tests:** `sigv4_vectors_test.rs` untouched; a `credentials` corpus in
-  `animus-control` modelled on the backup-catalog one; `animusd` auth
-  integration test.
-- **ADR:** **yes** — materially changes ADR 0057's "not IAM" stance.
-- **PRs:** (1) replicated map + commands; (2) admin CRUD + rotation;
-  (3) allow-list enforcement at dispatch. **Size:** L.
-
 ### S-03 Encryption at rest
 
 - **Gap:** not mentioned anywhere in the docs.
@@ -99,8 +81,9 @@ the still-true paragraph after the table.
 - **PRs:** (1) key loading + `Disk` wrapper for WAL/engine; (2)
   `SegmentStore`; (3) operator key secret mount. **Size:** XL (interacts
   with the `Disk` seam's fsync/durability contract).
-- **Depends:** sequence after S-02 to avoid three crypto ADRs in review at
-  once.
+- **Depends:** was sequenced after S-02 specifically to avoid three crypto
+  ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
+  landed 2026-09-05, so this item is unblocked.
 
 ### S-04 S3 `SegmentStore` backend (ADR 0059 deferred)
 
@@ -315,7 +298,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
 | — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
 | 3 | U-05, U-07, U-08(ii) | U-05 after its members panel |
-| 4 | S-02 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064) |
+| 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 

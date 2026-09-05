@@ -68,6 +68,10 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/data/drop-table") => host.action_drop_table(body).await,
         ("POST", "/admin/data/seed") => host.action_data_seed(body).await,
         ("POST", "/admin/throttle/defaults") => host.action_set_throttle_defaults(body).await,
+        ("GET", "/admin/credentials") => (200, host.credentials_view().await),
+        ("POST", "/admin/credentials") => host.action_put_credential(body).await,
+        ("POST", "/admin/credentials/rotate") => host.action_rotate_credential(body).await,
+        ("POST", "/admin/credentials/revoke") => host.action_revoke_credential(body).await,
         // A known admin path with the wrong verb vs. an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => (
             404,
@@ -243,6 +247,19 @@ mod tests {
         async fn action_set_throttle_defaults(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
+        async fn credentials_view(&self) -> Value {
+            self.record()
+        }
+        async fn action_put_credential(&self, body: &[u8]) -> (u16, Value) {
+            assert_eq!(body, b"the-body");
+            (200, self.record())
+        }
+        async fn action_rotate_credential(&self, _body: &[u8]) -> (u16, Value) {
+            unreachable!()
+        }
+        async fn action_revoke_credential(&self, _body: &[u8]) -> (u16, Value) {
+            unreachable!()
+        }
     }
 
     #[test]
@@ -272,6 +289,29 @@ mod tests {
             b"the-body",
         ));
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn get_admin_credentials_routes_to_credentials_view() {
+        let host = FakeHost::new();
+        let (status, body) = block_on(dispatch(&host, "GET", "/admin/credentials", "", b""));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"marker\""));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn post_admin_credentials_routes_to_put_credential() {
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(
+            &host,
+            "POST",
+            "/admin/credentials",
+            "",
+            b"the-body",
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
