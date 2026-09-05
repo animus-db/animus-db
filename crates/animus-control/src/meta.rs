@@ -8,6 +8,7 @@
 //! Raft replica computes the identical accept/reject decision.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use animus_env::NodeId;
 #[cfg(test)]
@@ -430,6 +431,21 @@ pub struct Metadata {
     /// for the full incident.
     #[serde(default)]
     pub pitr_base_backups: BTreeSet<BackupId>,
+    /// The **replicated credential catalog** (ADR 0066 §1): every SigV4
+    /// credential ever `Put`, keyed by [`AccessKeyId`] — replicated exactly
+    /// like the schema catalog (ADR 0013) and the backup catalog (ADR
+    /// 0059), so every node (data-only nodes included, via their `Metadata`
+    /// mirror, ADR 0038) verifies a caller's signature locally, with no
+    /// round trip to a control-plane leader on the read path. Mutated only
+    /// through [`MetaCommand::PutCredential`] (create/redefine),
+    /// [`MetaCommand::RotateCredential`] (a dual-secret grace window), and
+    /// [`MetaCommand::RevokeCredential`] (removal). This catalog always
+    /// wins over the static `dynamo_auth`/`--dynamo-auth` bootstrap map on
+    /// a shared access key id (ADR 0066 §4) — the bootstrap map is
+    /// consulted only for an id absent here. `#[serde(default)]` keeps
+    /// pre-ADR-0066 snapshots loading (empty map).
+    #[serde(default)]
+    pub credentials: BTreeMap<AccessKeyId, CredentialRow>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -962,6 +978,208 @@ pub struct BackupRow {
     /// pre-existing snapshot/fixture that predates this field.
     #[serde(default)]
     pub total_bytes: u64,
+}
+
+/// A DynamoDB SigV4 access key id (ADR 0066) — the credential catalog's key,
+/// mirroring [`BackupId`]/`RestoreId`'s own "plain string alias" convention
+/// rather than a bespoke newtype: an access key id is not secret (it already
+/// travels in plaintext in every request's `Authorization` header), so there
+/// is nothing this type needs to hide the way [`SecretKey`] does.
+pub type AccessKeyId = String;
+
+/// A credential's secret value (ADR 0066) — held in reversible form because
+/// SigV4 verification is an HMAC computed from the raw secret bytes (ADR
+/// 0066 §7: "no hashing is possible" — unlike a password-hash-style
+/// authentication scheme, the verifier must hold the secret itself, not a
+/// digest of it). **Never printed**: `Debug` deliberately renders a fixed
+/// placeholder regardless of the actual value, so a `CredentialRow`/
+/// `MetaCommand::PutCredential`/`RotateCredential` appearing in a panic
+/// message, a log line, or a failed test assertion never leaks the secret —
+/// the same discipline ADR 0066 §6 requires of every admin GET response.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretKey(String);
+
+impl SecretKey {
+    /// Wrap a raw secret value.
+    #[must_use]
+    pub fn new(secret: impl Into<String>) -> Self {
+        SecretKey(secret.into())
+    }
+
+    /// The raw secret bytes — the one legitimate reason to look inside this
+    /// type: feeding `animus_dynamo::sigv4::verify` (ADR 0066 §3), which
+    /// this crate cannot depend on (dependency direction) but whose caller
+    /// (`animusd`, ADR 0066 §3's step 3/4) needs this accessor to try each
+    /// candidate secret in turn.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretKey(REDACTED)")
+    }
+}
+
+/// An outgoing secret still valid inside a rotation's grace window (ADR 0066
+/// §3) — [`MetaCommand::RotateCredential`]'s previous `secret`, kept
+/// alongside the deadline past which it is no longer tried.
+///
+/// **`valid_until` is epoch SECONDS**, not milliseconds — a deliberate ADR
+/// 0066 convention for this whole catalog (`CredentialRow::created_at`/
+/// `updated_at` follow suit), unlike most other wall-clock fields in this
+/// crate (e.g. `BackupManifest::created_wall_ms`), which are epoch
+/// milliseconds straight off `env.wall_now()`. The proposer divides
+/// `env.wall_now()`'s milliseconds down to whole seconds before building
+/// any command that sets this field; this pure state machine reads no
+/// clock at all and never performs that conversion itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousSecret {
+    /// The secret that was current immediately before the most recent
+    /// rotation.
+    pub secret: SecretKey,
+    /// The epoch-second deadline past which this secret is no longer tried
+    /// (ADR 0066 §3 step 4: `env.wall_now()` divided to seconds `<
+    /// valid_until`).
+    pub valid_until: u64,
+}
+
+/// Which tables a [`Policy`] applies to (ADR 0066 §1) — deliberately three
+/// flat shapes with no composition: a coarser mechanism than IAM's, sized to
+/// close exactly the gap S-02 names (ADR 0066's Context section) and no
+/// further.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableMatch {
+    /// Every table — the pre-S-02 behaviour: a key created with no explicit
+    /// policy gets this (see [`Policy::allow_all`]).
+    All,
+    /// Exactly these table names.
+    Names(BTreeSet<TableName>),
+    /// Any table whose name starts with one of these prefixes.
+    Prefixes(BTreeSet<String>),
+}
+
+impl TableMatch {
+    /// Whether `table` is matched.
+    #[must_use]
+    pub fn matches(&self, table: &str) -> bool {
+        match self {
+            TableMatch::All => true,
+            TableMatch::Names(names) => names.contains(table),
+            TableMatch::Prefixes(prefixes) => prefixes
+                .iter()
+                .any(|prefix| table.starts_with(prefix.as_str())),
+        }
+    }
+}
+
+/// A DynamoDB operation's coarse authorization class (ADR 0066 §1's mapping
+/// table) — every wire operation maps to exactly one class; a table-less
+/// operation (`ListTables`, `DescribeLimits`, `DescribeEndpoints`) needs no
+/// class or table check at all (see [`Policy::allows`]'s own doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OpClass {
+    /// `GetItem`, `BatchGetItem`, `Query`, `Scan`, `TransactGetItems`,
+    /// `DescribeTable`, `DescribeTimeToLive`, `ListTagsOfResource`, and
+    /// other `Describe*`/`List*` calls scoped to a table.
+    Read,
+    /// `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`,
+    /// `TransactWriteItems`.
+    Write,
+    /// `CreateTable`, `UpdateTable`, `DeleteTable`, `UpdateTimeToLive`,
+    /// `TagResource`, `UntagResource`, `UpdateContinuousBackups`.
+    Ddl,
+    /// `DescribeStream`, `GetShardIterator`, `GetRecords`, `ListStreams`.
+    Streams,
+    /// `CreateBackup`, `DescribeBackup`, `ListBackups`, `DeleteBackup`,
+    /// `RestoreTableFromBackup`, `RestoreTableToPointInTime`,
+    /// `DescribeContinuousBackups`.
+    Backup,
+    /// Reserved for a future admin-port authentication scheme (ADR 0066 §6,
+    /// `docs/roadmap.md` §6) — no wire route checks this today; the admin
+    /// port has no SigV4 gate at all.
+    Admin,
+}
+
+/// One credential's authorization scope (ADR 0066 §1) — a single flat
+/// `(tables, ops)` pair, evaluated once per request, with no composition and
+/// no `Deny` statements. **This is not an authorization engine** — see ADR
+/// 0066's Context section for the IAM-shaped boundary this deliberately
+/// does not cross.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// Which tables this credential may touch.
+    pub tables: TableMatch,
+    /// Which operation classes this credential may perform.
+    pub ops: BTreeSet<OpClass>,
+}
+
+impl Policy {
+    /// The pre-S-02 behaviour (ADR 0066 §1): every class except
+    /// [`OpClass::Admin`] (which no wire operation needs yet), every table
+    /// — what a key created with no explicit policy gets, so an existing
+    /// key that never set a policy changes nothing about what it can do.
+    #[must_use]
+    pub fn allow_all() -> Self {
+        Policy {
+            tables: TableMatch::All,
+            ops: BTreeSet::from([
+                OpClass::Read,
+                OpClass::Write,
+                OpClass::Ddl,
+                OpClass::Streams,
+                OpClass::Backup,
+            ]),
+        }
+    }
+
+    /// Whether this policy allows `class` against `table` (ADR 0066 §5). A
+    /// table-less operation (`table: None` — `ListTables`,
+    /// `DescribeLimits`, `DescribeEndpoints`) needs only an enabled key —
+    /// callers resolving one of those three should not call `allows` at
+    /// all in production, but this predicate still answers `true` for
+    /// `table: None` regardless of `class`/`ops`, matching the ADR's own
+    /// "needs no class or table check" phrasing rather than leaving the
+    /// case ill-defined.
+    #[must_use]
+    pub fn allows(&self, class: OpClass, table: Option<&str>) -> bool {
+        let Some(table) = table else {
+            return true;
+        };
+        self.ops.contains(&class) && self.tables.matches(table)
+    }
+}
+
+/// One replicated credential catalog row (`Metadata::credentials`, ADR 0066
+/// §1) — modelled directly on [`BackupRow`]'s own catalog-row shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialRow {
+    /// The current secret — tried first by `sigv4::verify` (ADR 0066 §3
+    /// step 3).
+    pub secret: SecretKey,
+    /// The outgoing secret from the most recent
+    /// [`MetaCommand::RotateCredential`], still valid until its own
+    /// `valid_until` — `None` outside a rotation's grace window, or if this
+    /// row has never rotated.
+    pub previous: Option<PreviousSecret>,
+    /// This credential's authorization scope (ADR 0066 §1/§5).
+    pub policy: Policy,
+    /// Whether this credential is usable at all. A disabled key reads as
+    /// absent to `sigv4::verify`'s caller (ADR 0066 §3 step 2) — the same
+    /// `UnrecognizedClientException` a nonexistent key id gets, so a
+    /// disabled key is never confirmable from the wire (AWS never confirms
+    /// whether a key id ever existed either).
+    pub enabled: bool,
+    /// Epoch **seconds** ([`PreviousSecret::valid_until`]'s own doc has the
+    /// full unit-convention note), supplied by the proposer and never read
+    /// from a clock during apply.
+    pub created_at: u64,
+    /// Epoch seconds of the most recent `PutCredential`/`RotateCredential`
+    /// that touched this row.
+    pub updated_at: u64,
 }
 
 /// A restore's opaque catalog identity (ADR 0059 §7, Train 2) — an
@@ -1965,6 +2183,69 @@ pub enum MetaCommand {
         restore_id: RestoreId,
         /// A human-readable failure reason.
         reason: String,
+    },
+    /// Create or redefine a credential (ADR 0066 §1/§2): mints a fresh
+    /// [`CredentialRow`] at `id`, or replaces an existing one — the
+    /// create-or-replace shape [`BeginBackup`](Self::BeginBackup)/
+    /// `CreateTableSchema` do *not* have, chosen deliberately since a
+    /// credential (unlike a backup/table) has no natural "already exists"
+    /// error to surface. Replacing the secret through `Put` is an
+    /// **immediate cutover, no grace window** — `Put` is the
+    /// create/redefine primitive, [`RotateCredential`](
+    /// Self::RotateCredential) is the only path that preserves the
+    /// outgoing secret. A `Put` that changes only `policy`/`enabled`
+    /// (`secret` identical to what's on file) leaves `secret`/`previous`
+    /// untouched. Idempotent: an identical repeat (same
+    /// `secret`/`policy`/`enabled`/`now`) is a `NoOp`.
+    PutCredential {
+        /// The credential's access key id.
+        id: AccessKeyId,
+        /// The credential's secret.
+        secret: SecretKey,
+        /// The credential's authorization scope.
+        policy: Policy,
+        /// Whether the credential is usable.
+        enabled: bool,
+        /// Stamped at PROPOSE time by the wire-serving node — **epoch
+        /// seconds** (this catalog's own convention, see
+        /// [`PreviousSecret::valid_until`]'s doc), derived from
+        /// `env.wall_now()` (ADR 0051's discipline; the pure state machine
+        /// has no clock).
+        now: u64,
+    },
+    /// Rotate a credential's secret (ADR 0066 §2/§3): moves the row's
+    /// current `secret` into `previous` with `valid_until = now +
+    /// grace_secs`, installs `new_secret` as the current secret. A second
+    /// `Rotate` inside an already-running grace window **replaces**
+    /// `previous` outright (does not chain a third secret) — at most two
+    /// secrets are ever valid for a given `id` at once, mirroring how AWS
+    /// IAM itself only ever allows two active access keys per user.
+    /// Rejected if `id` does not exist — unlike
+    /// [`PutCredential`](Self::PutCredential)'s create-or-replace shape,
+    /// there is nothing to rotate. Idempotent: a repeat with the identical
+    /// `new_secret`/`grace_secs`/`now` is a `NoOp`.
+    RotateCredential {
+        /// The credential's access key id.
+        id: AccessKeyId,
+        /// The new current secret.
+        new_secret: SecretKey,
+        /// How long (seconds) the outgoing secret stays valid.
+        grace_secs: u64,
+        /// Stamped at PROPOSE time, epoch seconds (see
+        /// [`PutCredential::now`](Self::PutCredential)'s own doc).
+        now: u64,
+    },
+    /// Revoke a credential outright (ADR 0066 §2): removes the row.
+    /// Idempotent: revoking an id that is already absent is a `NoOp`, not
+    /// an error — the same idempotence-on-repeat discipline every other
+    /// `MetaCommand` in this catalog follows for a replayed/retried
+    /// proposal. An in-flight request already past `sigv4::verify` is
+    /// unaffected (verification already happened); the next request
+    /// bearing this key id fails from `UnrecognizedClientException`
+    /// onward.
+    RevokeCredential {
+        /// The credential's access key id.
+        id: AccessKeyId,
     },
 }
 
@@ -3131,6 +3412,111 @@ impl Metadata {
                     }
                     RestoreStatus::Done => ApplyOutcome::Rejected("restore already completed"),
                 }
+            }
+            MetaCommand::PutCredential {
+                id,
+                secret,
+                policy,
+                enabled,
+                now,
+            } => {
+                let (created_at, previous) = match self.credentials.get(id) {
+                    Some(existing) => {
+                        let secret_unchanged = existing.secret == *secret;
+                        if secret_unchanged
+                            && existing.policy == *policy
+                            && existing.enabled == *enabled
+                            && existing.updated_at == *now
+                        {
+                            return ApplyOutcome::NoOp;
+                        }
+                        (
+                            existing.created_at,
+                            // `Put` is an immediate cutover, no grace
+                            // window: the outgoing secret is cleared
+                            // whenever the secret itself actually changes;
+                            // a policy/enabled-only `Put` leaves `previous`
+                            // untouched.
+                            if secret_unchanged {
+                                existing.previous.clone()
+                            } else {
+                                None
+                            },
+                        )
+                    }
+                    None => (*now, None),
+                };
+                self.credentials.insert(
+                    id.clone(),
+                    CredentialRow {
+                        secret: secret.clone(),
+                        previous,
+                        policy: policy.clone(),
+                        enabled: *enabled,
+                        created_at,
+                        updated_at: *now,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::RotateCredential {
+                id,
+                new_secret,
+                grace_secs,
+                now,
+            } => {
+                let Some(existing) = self.credentials.get(id) else {
+                    return ApplyOutcome::Rejected("no such credential");
+                };
+                let valid_until = now.saturating_add(*grace_secs);
+                // Idempotence check first, against the ROW AS IT STANDS —
+                // deliberately not "does `existing.previous.secret` equal
+                // what *this* rotate would have moved into it," since a
+                // retried apply of the identical command runs against
+                // state this same command already produced (the outgoing
+                // secret already moved into `previous` on the first
+                // apply). A retry is instead recognized by its *effect*
+                // already being on file: the current secret is already
+                // `new_secret`, this row was last touched at exactly
+                // `now`, and `previous`'s own `valid_until` already
+                // matches what this exact `(now, grace_secs)` pair would
+                // produce — three facts a genuinely different rotate
+                // proposal (even one that happens to share `new_secret`)
+                // essentially never reproduces together.
+                if existing.secret == *new_secret
+                    && existing.updated_at == *now
+                    && existing
+                        .previous
+                        .as_ref()
+                        .is_some_and(|p| p.valid_until == valid_until)
+                {
+                    return ApplyOutcome::NoOp;
+                }
+                let new_previous = PreviousSecret {
+                    secret: existing.secret.clone(),
+                    valid_until,
+                };
+                let created_at = existing.created_at;
+                let policy = existing.policy.clone();
+                let enabled = existing.enabled;
+                self.credentials.insert(
+                    id.clone(),
+                    CredentialRow {
+                        secret: new_secret.clone(),
+                        previous: Some(new_previous),
+                        policy,
+                        enabled,
+                        created_at,
+                        updated_at: *now,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::RevokeCredential { id } => {
+                if self.credentials.remove(id).is_none() {
+                    return ApplyOutcome::NoOp;
+                }
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableStream { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -4453,6 +4839,43 @@ impl Metadata {
             .iter()
             .filter_map(|(_, progress)| progress.map(|p| p.bytes))
             .sum()
+    }
+
+    /// A credential catalog row by access key id (ADR 0066 §1) — `None`
+    /// whether `id` was never `Put` or has since been revoked; the caller
+    /// (`animusd`'s SigV4 gate) falls back to the static `dynamo_auth`
+    /// bootstrap map on `None` (ADR 0066 §4).
+    #[must_use]
+    pub fn credential(&self, id: &str) -> Option<&CredentialRow> {
+        self.credentials.get(id)
+    }
+
+    /// The secret(s) a caller signing as `id` may currently authenticate
+    /// with (ADR 0066 §3 steps 1-4), in try-order: the row's current
+    /// `secret` first, then its `previous` secret too if a rotation grace
+    /// window is still open at `now_secs`. Empty if `id` is absent or the
+    /// row is `enabled: false` — a disabled row is treated exactly like an
+    /// absent one (ADR 0066 §3 step 2), never yielding either secret.
+    ///
+    /// `now_secs` is **epoch seconds**, matching
+    /// [`PreviousSecret::valid_until`]'s own unit convention — the caller
+    /// derives it from `env.wall_now()` (ADR 0051's calendar-time seam)
+    /// divided down from milliseconds; this pure state machine reads no
+    /// clock itself.
+    pub fn verify_secret_candidates(
+        &self,
+        id: &str,
+        now_secs: u64,
+    ) -> impl Iterator<Item = &SecretKey> {
+        let row = self.credentials.get(id).filter(|row| row.enabled);
+        let current = row.map(|row| &row.secret);
+        let previous = row.and_then(|row| {
+            row.previous
+                .as_ref()
+                .filter(|p| now_secs < p.valid_until)
+                .map(|p| &p.secret)
+        });
+        current.into_iter().chain(previous)
     }
 }
 
@@ -10397,5 +10820,348 @@ mod tests {
             m.stream_shard_parent_id(TabletId(6), 0),
             Some("shardId-3-0".to_owned())
         );
+    }
+
+    // --- ADR 0066: replicated credential catalog ---------------------
+
+    #[test]
+    fn policy_allows_all_tables() {
+        let policy = Policy {
+            tables: TableMatch::All,
+            ops: BTreeSet::from([OpClass::Read]),
+        };
+        assert!(policy.allows(OpClass::Read, Some("any-table")));
+        assert!(!policy.allows(OpClass::Write, Some("any-table")));
+        // Table-less operations need only an enabled key, regardless of
+        // `ops`/`tables` — see `Policy::allows`'s own doc.
+        assert!(policy.allows(OpClass::Write, None));
+    }
+
+    #[test]
+    fn policy_allows_names() {
+        let policy = Policy {
+            tables: TableMatch::Names(BTreeSet::from(["orders".to_owned()])),
+            ops: BTreeSet::from([OpClass::Read, OpClass::Write]),
+        };
+        assert!(policy.allows(OpClass::Read, Some("orders")));
+        assert!(!policy.allows(OpClass::Read, Some("customers")));
+        assert!(!policy.allows(OpClass::Ddl, Some("orders")));
+    }
+
+    #[test]
+    fn policy_allows_prefixes() {
+        let policy = Policy {
+            tables: TableMatch::Prefixes(BTreeSet::from(["tenant-a-".to_owned()])),
+            ops: BTreeSet::from([OpClass::Read]),
+        };
+        assert!(policy.allows(OpClass::Read, Some("tenant-a-orders")));
+        assert!(!policy.allows(OpClass::Read, Some("tenant-b-orders")));
+    }
+
+    #[test]
+    fn policy_allow_all_is_every_class_except_admin() {
+        let policy = Policy::allow_all();
+        assert_eq!(policy.tables, TableMatch::All);
+        for class in [
+            OpClass::Read,
+            OpClass::Write,
+            OpClass::Ddl,
+            OpClass::Streams,
+            OpClass::Backup,
+        ] {
+            assert!(policy.allows(class, Some("any-table")), "{class:?}");
+        }
+        assert!(!policy.ops.contains(&OpClass::Admin));
+    }
+
+    /// `PutCredential`: creates a fresh row, is idempotent on an identical
+    /// repeat (including `now`), and a policy/enabled-only change leaves
+    /// the secret untouched.
+    #[test]
+    fn put_credential_creates_and_is_idempotent() {
+        let mut m = Metadata::default();
+        let put = MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s3cr3t"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        };
+        assert_eq!(m.apply(&put), ApplyOutcome::Applied);
+        let created: CredentialRow = m.credential("AKID1").expect("just created").clone();
+        assert_eq!(created.secret, SecretKey::new("s3cr3t"));
+        assert_eq!(created.previous, None);
+        assert!(created.enabled);
+        assert_eq!(created.created_at, 1_000);
+        assert_eq!(created.updated_at, 1_000);
+
+        // Identical repeat (a retried, previously-accepted-unconfirmed
+        // propose) is a no-op — no compounding, and the row is unchanged.
+        assert_eq!(m.apply(&put), ApplyOutcome::NoOp);
+        assert_eq!(m.credential("AKID1"), Some(&created));
+
+        // A policy/enabled-only change (secret identical) leaves
+        // `created_at` and `previous` untouched, but bumps `updated_at`.
+        assert_eq!(
+            m.apply(&MetaCommand::PutCredential {
+                id: "AKID1".to_owned(),
+                secret: SecretKey::new("s3cr3t"),
+                policy: Policy {
+                    tables: TableMatch::Names(BTreeSet::from(["orders".to_owned()])),
+                    ops: BTreeSet::from([OpClass::Read]),
+                },
+                enabled: false,
+                now: 2_000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.credential("AKID1").expect("still present");
+        assert_eq!(row.secret, SecretKey::new("s3cr3t"));
+        assert!(!row.enabled);
+        assert_eq!(row.created_at, 1_000, "created_at is preserved");
+        assert_eq!(row.updated_at, 2_000);
+    }
+
+    /// `PutCredential` replacing the secret is an immediate cutover — no
+    /// grace window, `previous` cleared even if a rotation had one set.
+    #[test]
+    fn put_credential_replacing_secret_is_an_immediate_cutover() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("old"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        m.apply(&MetaCommand::RotateCredential {
+            id: "AKID1".to_owned(),
+            new_secret: SecretKey::new("mid"),
+            grace_secs: 3_600,
+            now: 1_100,
+        });
+        assert!(
+            m.credential("AKID1").expect("present").previous.is_some(),
+            "test setup: a grace window is open"
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::PutCredential {
+                id: "AKID1".to_owned(),
+                secret: SecretKey::new("fresh"),
+                policy: Policy::allow_all(),
+                enabled: true,
+                now: 1_200,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.credential("AKID1").expect("present");
+        assert_eq!(row.secret, SecretKey::new("fresh"));
+        assert_eq!(row.previous, None, "Put clears previous, no grace window");
+    }
+
+    /// `RotateCredential`: moves the current secret to `previous` with the
+    /// right `valid_until`, installs the new secret, and is rejected
+    /// against an unknown id.
+    #[test]
+    fn rotate_credential_moves_current_to_previous() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::RotateCredential {
+                id: "AKID1".to_owned(),
+                new_secret: SecretKey::new("new"),
+                grace_secs: 3_600,
+                now: 1_000,
+            }),
+            ApplyOutcome::Rejected("no such credential")
+        );
+
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("old"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RotateCredential {
+                id: "AKID1".to_owned(),
+                new_secret: SecretKey::new("new"),
+                grace_secs: 3_600,
+                now: 1_100,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.credential("AKID1").expect("present");
+        assert_eq!(row.secret, SecretKey::new("new"));
+        assert_eq!(
+            row.previous,
+            Some(PreviousSecret {
+                secret: SecretKey::new("old"),
+                valid_until: 1_100 + 3_600,
+            })
+        );
+        assert_eq!(row.updated_at, 1_100);
+    }
+
+    /// A second `RotateCredential` inside an already-running grace window
+    /// replaces `previous` outright rather than chaining a third secret —
+    /// at most two secrets are ever valid at once.
+    #[test]
+    fn rotate_credential_second_rotation_replaces_previous() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s0"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        m.apply(&MetaCommand::RotateCredential {
+            id: "AKID1".to_owned(),
+            new_secret: SecretKey::new("s1"),
+            grace_secs: 3_600,
+            now: 1_100,
+        });
+        m.apply(&MetaCommand::RotateCredential {
+            id: "AKID1".to_owned(),
+            new_secret: SecretKey::new("s2"),
+            grace_secs: 7_200,
+            now: 1_200,
+        });
+        let row = m.credential("AKID1").expect("present");
+        assert_eq!(row.secret, SecretKey::new("s2"));
+        assert_eq!(
+            row.previous,
+            Some(PreviousSecret {
+                secret: SecretKey::new("s1"),
+                valid_until: 1_200 + 7_200,
+            }),
+            "s0 is gone — only the immediately-outgoing secret is ever kept"
+        );
+    }
+
+    /// A repeated `RotateCredential` with identical `new_secret`/
+    /// `grace_secs`/`now` is idempotent — no double-rotation from a
+    /// retried propose.
+    #[test]
+    fn rotate_credential_is_idempotent_on_identical_repeat() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s0"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        let rotate = MetaCommand::RotateCredential {
+            id: "AKID1".to_owned(),
+            new_secret: SecretKey::new("s1"),
+            grace_secs: 3_600,
+            now: 1_100,
+        };
+        assert_eq!(m.apply(&rotate), ApplyOutcome::Applied);
+        assert_eq!(m.apply(&rotate), ApplyOutcome::NoOp);
+    }
+
+    /// `RevokeCredential`: removes the row, idempotent on an already-absent
+    /// id.
+    #[test]
+    fn revoke_credential_removes_row_and_is_idempotent() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::RevokeCredential {
+                id: "AKID1".to_owned(),
+            }),
+            ApplyOutcome::NoOp,
+            "revoking an unknown id is a no-op, not an error"
+        );
+
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s0"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RevokeCredential {
+                id: "AKID1".to_owned(),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.credential("AKID1"), None);
+        assert_eq!(
+            m.apply(&MetaCommand::RevokeCredential {
+                id: "AKID1".to_owned(),
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// `verify_secret_candidates`: current secret always first; the
+    /// previous secret joins only while its grace window is still open,
+    /// and never for a disabled or unknown id.
+    #[test]
+    fn verify_secret_candidates_grace_window_arithmetic() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.verify_secret_candidates("AKID1", 1_000).count(),
+            0,
+            "unknown id yields nothing"
+        );
+
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s0"),
+            policy: Policy::allow_all(),
+            enabled: true,
+            now: 1_000,
+        });
+        m.apply(&MetaCommand::RotateCredential {
+            id: "AKID1".to_owned(),
+            new_secret: SecretKey::new("s1"),
+            grace_secs: 100,
+            now: 1_000,
+        });
+        // Inside the window: both secrets, current first.
+        let candidates: Vec<&str> = m
+            .verify_secret_candidates("AKID1", 1_050)
+            .map(SecretKey::as_str)
+            .collect();
+        assert_eq!(candidates, vec!["s1", "s0"]);
+
+        // Exactly at the boundary: the check is `now_secs <
+        // valid_until`, so the instant itself is already past.
+        let candidates: Vec<&str> = m
+            .verify_secret_candidates("AKID1", 1_100)
+            .map(SecretKey::as_str)
+            .collect();
+        assert_eq!(candidates, vec!["s1"]);
+
+        // Well past the window: only the current secret.
+        let candidates: Vec<&str> = m
+            .verify_secret_candidates("AKID1", 5_000)
+            .map(SecretKey::as_str)
+            .collect();
+        assert_eq!(candidates, vec!["s1"]);
+
+        // A disabled row yields nothing at all, exactly like an unknown id.
+        m.apply(&MetaCommand::PutCredential {
+            id: "AKID1".to_owned(),
+            secret: SecretKey::new("s1"),
+            policy: Policy::allow_all(),
+            enabled: false,
+            now: 1_050,
+        });
+        assert_eq!(m.verify_secret_candidates("AKID1", 1_050).count(), 0);
+    }
+
+    #[test]
+    fn secret_key_debug_never_prints_the_secret() {
+        let secret = SecretKey::new("super-secret-value");
+        let rendered = format!("{secret:?}");
+        assert!(!rendered.contains("super-secret-value"));
+        assert_eq!(rendered, "SecretKey(REDACTED)");
     }
 }

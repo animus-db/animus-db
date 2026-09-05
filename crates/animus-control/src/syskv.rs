@@ -196,6 +196,14 @@ pub enum EntityKind {
     /// value is always empty (presence alone is the fact) — the identical
     /// convention [`IndexBackfill`](Self::IndexBackfill) uses.
     PitrBaseBackup,
+    /// A replicated credential catalog row (`Metadata::credentials`, ADR
+    /// 0066 §1), keyed by its `AccessKeyId` string ([`credential_key`]).
+    /// The value is the JSON-encoded `CredentialRow` — including the
+    /// secret, same convention as every other kind's JSON passthrough (see
+    /// `Metadata::credentials`'s own doc on where secrets live durably;
+    /// `animusd`'s admin/debug surface must never render this raw value
+    /// unredacted).
+    Credential,
 }
 
 impl EntityKind {
@@ -223,6 +231,7 @@ impl EntityKind {
             EntityKind::Restore => "restore",
             EntityKind::PitrSegment => "pitr_segment",
             EntityKind::PitrBaseBackup => "pitr_base_backup",
+            EntityKind::Credential => "credential",
         }
     }
 
@@ -251,6 +260,7 @@ impl EntityKind {
             b"restore" => EntityKind::Restore,
             b"pitr_segment" => EntityKind::PitrSegment,
             b"pitr_base_backup" => EntityKind::PitrBaseBackup,
+            b"credential" => EntityKind::Credential,
             _ => return None,
         })
     }
@@ -524,6 +534,12 @@ pub fn backup_key(backup_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn restore_key(restore_id: &str) -> Vec<u8> {
     entity_key(EntityKind::Restore, restore_id.as_bytes())
+}
+
+/// An access key id's key under [`EntityKind::Credential`] (ADR 0066 §1).
+#[must_use]
+pub fn credential_key(id: &str) -> Vec<u8> {
+    entity_key(EntityKind::Credential, id.as_bytes())
 }
 
 /// A `(backup_id, tablet)` pair's key under [`EntityKind::BackupProgress`]

@@ -42,10 +42,11 @@ pub mod syskv;
 pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{
-    ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow, BackupStatus,
-    BackupTabletProgress, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus,
-    PitrReplaySegmentRef, PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow, RestoreId,
-    RestoreRow, RestoreStatus, StreamShardRow,
+    AccessKeyId, ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow,
+    BackupStatus, BackupTabletProgress, CredentialRow, Member, MetaCommand, Metadata, NodeAddrs,
+    NodeStatus, OpClass, PitrReplaySegmentRef, PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow,
+    Policy, PreviousSecret, RestoreId, RestoreRow, RestoreStatus, SecretKey, StreamShardRow,
+    TableMatch,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{

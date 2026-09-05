@@ -911,7 +911,20 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // phase (a later rung), which is control-plane-leader-only and
         // proposes `CasTabletReplicas` directly off its own live
         // `RaftNode` handle, so it needs no relay path of its own.
-        | MetaCommand::MarkSplitPlacingDone { .. } => true,
+        | MetaCommand::MarkSplitPlacingDone { .. }
+        // Replicated credential catalog (ADR 0066 §1/§2): `PutCredential`/
+        // `RotateCredential`/`RevokeCredential` all originate from the
+        // admin API (`animusd::admin`, ADR 0066 §6), which may land on any
+        // node exactly like `CreateTable`/`UpdateTimeToLive` — schema-
+        // catalog class, same relay reason as `SetTableTtl`/`TagResource`
+        // above. Missing any of these three would be the exact bimodal
+        // per-process flake the root `CLAUDE.md` warns about: a
+        // `PUT /admin/credentials` that happens to land on a
+        // follower-connected node would hang for `SCHEMA_COMMIT_TIMEOUT`
+        // instead of relaying.
+        | MetaCommand::PutCredential { .. }
+        | MetaCommand::RotateCredential { .. }
+        | MetaCommand::RevokeCredential { .. } => true,
 
         // Online growth (ADR 0030): admin add-member registers a new raftkv
         // id as `Down` — see the doc above for why this is safe to relay
@@ -1381,6 +1394,22 @@ mod tests {
             MetaCommand::MarkSplitPlacingDone {
                 tablet: TabletId(2),
                 expected_epoch: Epoch::INITIAL,
+            },
+            MetaCommand::PutCredential {
+                id: "AKID1".to_string(),
+                secret: animus_control::SecretKey::new("s0"),
+                policy: animus_control::Policy::allow_all(),
+                enabled: true,
+                now: 0,
+            },
+            MetaCommand::RotateCredential {
+                id: "AKID1".to_string(),
+                new_secret: animus_control::SecretKey::new("s1"),
+                grace_secs: 3_600,
+                now: 0,
+            },
+            MetaCommand::RevokeCredential {
+                id: "AKID1".to_string(),
             },
         ];
         for cmd in &true_cases {
