@@ -238,7 +238,10 @@ async fn filter_narrows_a_base_query_instead_of_being_ignored() {
     let (status, body) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        // ConsistentRead: true (ADR 0055, #604): this test's subject is
+        // filter evaluation, not read consistency, and it asserts on the
+        // test's own just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}}}"#,
@@ -280,7 +283,10 @@ async fn a_filtered_page_returns_fewer_than_limit_and_still_carries_a_cursor() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        // ConsistentRead: true (ADR 0055, #604): this test's subject is
+        // filter/Limit interaction, not read consistency, and it asserts on
+        // the test's own just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"odd"}},
@@ -357,7 +363,11 @@ async fn a_filter_matching_nothing_still_reports_what_it_evaluated() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        // ConsistentRead: true (ADR 0055, #604): this test's subject is
+        // filter evaluation, not read consistency — right after setup()'s
+        // puts, a replica-local eventual read may not have applied the
+        // sixth row yet, which would silently under-report ScannedCount.
+        r#"{"TableName":"events","ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"neither"}}}"#,
@@ -432,7 +442,9 @@ async fn attribute_exists_works_as_a_query_filter() {
     let (status, present) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"attribute_exists(parity)",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
@@ -444,7 +456,9 @@ async fn attribute_exists_works_as_a_query_filter() {
     let (status, absent) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
             "KeyConditionExpression":"pk = :p",
             "FilterExpression":"attribute_not_exists(parity)",
             "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,

@@ -230,7 +230,11 @@ async fn count_select_returns_counts_without_items() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
+        // just-written rows, which the eventual wire default is not
+        // guaranteed to reflect yet.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
             "Select":"COUNT"}"#,
     )
@@ -258,7 +262,11 @@ async fn count_select_still_applies_the_filter() {
     let (status, body) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
+        // just-written rows, which the eventual wire default is not
+        // guaranteed to reflect yet.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}},
             "Select":"COUNT"}"#,
@@ -330,7 +338,10 @@ async fn count_select_applies_to_scan() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.Scan",
-        r#"{"TableName":"events","Select":"COUNT"}"#,
+        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
+        // just-written rows, which the eventual wire default is not
+        // guaranteed to reflect yet.
+        r#"{"TableName":"events","ConsistentRead":true,"Select":"COUNT"}"#,
     )
     .await;
     assert_eq!(status, 200, "COUNT scan failed: {body}");
@@ -353,7 +364,11 @@ async fn specific_attributes_returns_the_projection() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #603): the Limit:1 assertion needs
+        // to actually see one of the test's own just-written rows, which the
+        // eventual wire default is not guaranteed to reflect yet.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
             "ProjectionExpression":"sk","Select":"SPECIFIC_ATTRIBUTES","Limit":1}"#,
     )

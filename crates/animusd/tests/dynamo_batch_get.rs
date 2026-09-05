@@ -214,7 +214,10 @@ async fn a_missing_key_is_omitted_from_the_response() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.BatchGetItem",
-        r#"{"RequestItems":{"events":{"Keys":[
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written item, which the eventual wire default is not
+        // guaranteed to reflect yet.
+        r#"{"RequestItems":{"events":{"ConsistentRead":true,"Keys":[
             {"pk":{"S":"p1"},"sk":{"S":"a0"}},
             {"pk":{"S":"p1"},"sk":{"S":"nope"}}]}}}"#,
     )
@@ -236,7 +239,11 @@ async fn a_table_scoped_projection_applies_to_every_key() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.BatchGetItem",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written items, which the eventual wire default is not
+        // guaranteed to reflect yet.
         r#"{"RequestItems":{"events":{
+            "ConsistentRead":true,
             "Keys":[{"pk":{"S":"p1"},"sk":{"S":"a0"}},{"pk":{"S":"p1"},"sk":{"S":"a1"}}],
             "ProjectionExpression":"sk"}}}"#,
     )

@@ -160,7 +160,11 @@ async fn and_or_compose_over_the_wire() {
 
     async fn q(addr: SocketAddr, frag: &str) -> (u16, String) {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            // ConsistentRead: true (ADR 0055, #604): asserts on the test's
+            // own just-written rows, which the eventual wire default is not
+            // guaranteed to reflect yet.
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"{frag}",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},
                     ":even":{{"S":"even"}},":three":{{"N":"3"}},
@@ -205,7 +209,11 @@ async fn precedence_and_parentheses_change_the_answer() {
 
     async fn q(addr: SocketAddr, frag: &str) -> String {
         let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
+            // ConsistentRead: true (ADR 0055, #604): asserts on the test's
+            // own just-written rows, which the eventual wire default is not
+            // guaranteed to reflect yet.
+            r#"{{"TableName":"events","ConsistentRead":true,
+                 "KeyConditionExpression":"pk = :p",
                  "FilterExpression":"{frag}",
                  "ExpressionAttributeValues":{{":p":{{"S":"p1"}},
                     ":zero":{{"N":"0"}},":odd":{{"S":"odd"}},":five":{{"N":"5"}}}}}}"#
@@ -254,7 +262,11 @@ async fn between_composes_with_a_following_and() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows, which the eventual wire default is not
+        // guaranteed to reflect yet.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"seq BETWEEN :lo AND :hi AND parity = :even",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":lo":{"N":"1"},
                 ":hi":{"N":"4"},":even":{"S":"even"}}}"#,
