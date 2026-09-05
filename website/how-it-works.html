@@ -219,12 +219,13 @@
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
         <li>Upgrades — formats change between revisions, so upgrading means recreating the cluster</li>
-        <li>TLS — absent on every port; authentication — opt-in SigV4 on the client port only</li>
+        <li>Authentication beyond SigV4 — TLS (below) adds encryption and, on the internal ports, cluster-membership authentication, but caller identity on the client port is still just opt-in SigV4</li>
       </ul></div>
     </div>
+    <p class="body-text">TLS is available on every port — mutual on the Raft/intra-cluster ports, server-only on the client, admin and console ports — config-gated per cluster and <strong>off by default</strong>.</p>
     <div class="warnbox" style="max-width:860px">
-      <span class="label">Every port assumes a trusted network</span>
-      <p>Nothing speaks TLS today, and only the client DynamoDB port can verify a signature — opt-in, off by default. Don't put this on the public internet, and don't store data you can't recreate.</p>
+      <span class="label">Off by default, still just SigV4 for caller identity</span>
+      <p>A cluster with no TLS configured is exactly as before: plain TCP everywhere. Turn it on and the internal ports refuse a non-cluster-member outright; the client port still only verifies a signature — opt-in, off by default independently of TLS. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
     </div>
     <div class="ctalink-row">
       <a class="ctalink" href="install.html">Install it →</a>

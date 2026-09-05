@@ -576,8 +576,11 @@
       <h2>Known limits</h2>
       <p>Pre-alpha means real gaps. The ones most likely to matter:</p>
       <ul>
-        <li><strong>No TLS on any port</strong>, and no authentication beyond opt-in SigV4 on the
-          client DynamoDB port. Every other endpoint assumes a trusted network.</li>
+        <li><strong>TLS is available on every port but off by default</strong> — mutual on the
+          internal Raft/intra-cluster ports, server-only on the client, admin and console ports,
+          config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
+          exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
+          affected by TLS.</li>
         <li><strong>No format compatibility between revisions.</strong> Upgrading means recreating
           the cluster.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching

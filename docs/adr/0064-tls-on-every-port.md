@@ -1,13 +1,16 @@
 # ADR 0064 — TLS on every port
 
-- **Status:** Proposed — commits 1–3 of 4 (`S-01`) implemented: mutual
-  TLS on the intra-node wire inside `ProdEnv` (commit 1); TLS on every
-  `animusd` listener and dialer — client, intra-`ClientRequest`, admin,
-  console — plus `animus-cli`'s client-protocol and admin dials (commit
-  2); and the Kubernetes operator's cert-manager `Certificate`/`Secret`
-  wiring plus its admin client's TLS connector (commit 3) — all
-  config-gated, default off. Commit 4 (website/closing notes) is not yet
-  built.
+- **Status:** Accepted — all four commits of `S-01` landed: mutual TLS on
+  the intra-node wire inside `ProdEnv` (commit 1); TLS on every `animusd`
+  listener and dialer — client, intra-`ClientRequest`, admin, console —
+  plus `animus-cli`'s client-protocol and admin dials (commit 2); the
+  Kubernetes operator's cert-manager `Certificate`/`Secret` wiring plus its
+  admin client's TLS connector (commit 3); and the closing website/roadmap
+  update (commit 4, this amendment) — all config-gated, default off. See
+  Decision 6 for what remains explicitly out of scope (cert rotation
+  without a restart, SNI multi-tenancy, client certs on the client port, a
+  managed/rotated CA) — those are real, named follow-ups, not part of this
+  milestone.
 - **Date:** 2026-09-05
 - **Amends:** [ADR 0047](0047-intra-node-port.md) (port classes — TLS is
   orthogonal to the internal/intra/client/admin/console split that ADR
@@ -488,3 +491,52 @@ above. As-built specifics worth recording:
   as a sixth child for `certManager` and none for `secretName`; both/
   neither rejected with `TlsSpecInvalid`; the scale-down drain sequence
   reading a seeded `Secret`'s `ca.crt` and dialing `https://`).
+
+## Amendment note (commit 4 landed, closing, 2026-09-05)
+
+Commit 4 (S-01 step 4) is documentation-only — no further code, no design
+change to Decisions 1–7. It closes S-01 out: `docs/roadmap.md`'s S-01
+section is deleted (its own maintenance rule: a landed item is removed from
+the roadmap, not marked done in place — the decision record lives here and
+in the crate guides instead), `website/`'s three "no TLS"/"every port
+assumes a trusted network" statements (`index.html`, `architecture.html`,
+`how-it-works.html`, `docs.html`, `install.html`) are replaced with the
+accurate, as-built posture — TLS available and config-gated, off by
+default, mutual on the internal/intra ports and server-only on client/
+admin/console, SigV4 unaffected and still the only client-port caller-
+identity story — and `index.html`'s single "TLS + auth-beyond-SigV4"
+Planned pill is split: TLS moves to "Works today," a narrower
+"authentication beyond SigV4" pill stays Planned (that's S-02's own scope,
+untouched by this ADR — see its Amendment note above).
+
+**Summary of what the four commits actually built, end to end:**
+
+1. `animus-env`: `TlsConfig`/`TlsMaterial` (mutual `acceptor` + server-only
+   `server_acceptor` + `connector`, one `TlsConfig::load()`),
+   `MaybeTlsStream`, `tls::server_name_for` — mutual TLS on the raw
+   internal Raft wire inside `ProdEnv`, behind the `prod` feature.
+2. `animusd`/`animus-cli`: per-node `RoleAddrs.tls: Option<TlsSection>`,
+   `ClusterConfig::validate_tls`'s all-or-none rule, `--tls-cert/-key/-ca`
+   flags on the entry points that accept them, every listener
+   (`internal`/`intra` mutual, `client`/`dynamo`/`admin`/`console`
+   server-only) and every dialer (the intra relay client, `animus-cli`'s
+   client-protocol and admin dials) wired through `MaybeTlsStream`/
+   `TlsMaterial`.
+3. `animus-operator`: `AnimusClusterSpec.tls` (a pre-existing `Secret` or a
+   cert-manager `Certificate`, validated at reconcile time), the
+   `Certificate`/`StatefulSet`/`ClusterConfig` builders, and a TLS-capable
+   admin client for the scale-down drain sequence — the operator target
+   ADR 0060 deferred TLS to, closed.
+4. This documentation pass.
+
+**What is still, deliberately, not done** (Decision 6, restated for anyone
+landing on this ADR looking for a gap list): cert rotation without a
+process restart; SNI-based multi-tenancy; client certificates on the
+client port (mTLS-only client auth as a SigV4 alternative); a managed or
+auto-rotated CA (an operator — human or cert-manager — hands every node
+its already-issued cert/key/CA files; no CA-issuance logic lives in this
+codebase). Any of these is a new ADR's job, not a reopening of this one.
+`scripts/e2e-kind.sh`'s `E2E_TLS=1` path (commit 3) also remains
+unverified in any sandbox that cannot run `kind` at all — its first real
+verification is whenever CI's `e2e-kind-tls` job first runs green (or
+doesn't).

@@ -462,7 +462,8 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       <p>
         Set a region and placeholder credentials — the SDKs require them even though AnimusDB
         doesn't check them unless SigV4 verification is switched on — and use <code>http://</code>,
-        not <code>https://</code>. There is no TLS yet.
+        not <code>https://</code>, unless you've explicitly configured TLS on the DynamoDB port
+        (off by default — see the architecture page's ports section).
       </p>
 
       <h3>Something is wrong and it looks like a bug</h3>

@@ -517,8 +517,16 @@ default):
 
 The "Not in v1 (explicitly deferred)" list above named TLS outright: "on
 any port. No milestone in this codebase has added TLS anywhere yet; this
-ADR doesn't start." [ADR 0064](0064-tls-on-every-port.md) is that
-milestone; its commit 3 adds the cert-manager `Certificate`/`Issuer`
-wiring + volume mounts + `ClusterConfig` cert-path fields this ADR
-deferred, once ADR 0064's commits 1–2 give the operator TLS-capable
-`animusd` config to point cert-manager output at.
+ADR doesn't start." [ADR 0064](0064-tls-on-every-port.md) was that
+milestone, now landed in full (commit 3, 2026-09-05): `AnimusClusterSpec.
+tls` (a pre-existing `Secret` or a cert-manager `Certificate`/`Issuer`),
+the `StatefulSet` mount + `ClusterConfig` `tls` section this ADR deferred,
+and a TLS-capable admin client for the scale-down drain sequence — see
+ADR 0064's own commit-3 and closing amendment notes for the full as-built
+account. The Consequences section's "no new authentication anywhere"
+bullet below is accordingly narrowed the same way ADR 0047's own amendment
+narrows its "intra stays unauthenticated" line: TLS is opt-in and
+config-gated (a cluster with no `spec.tls` is unchanged), but a cluster
+that turns it on gets mutual cluster-membership authentication on the
+internal/intra ports and server-only TLS elsewhere — not a NetworkPolicy
+replacement, a second, independent layer underneath it.

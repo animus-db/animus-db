@@ -16457,3 +16457,62 @@ buffer's contents instead (`let _ = stream.read_to_end(&mut buf).await;`)
 response look like a failure. This is specific to a peer that closes
 without `close_notify`; a peer that shuts its TLS session down properly
 gives a real `Ok` and needs no such workaround.
+
+## Adding TLS to a `hyper-util` legacy `Client` some crates use needs a hand-written connector, not a shared `MaybeTlsStream` (ADR 0064, S-01 commit 3)
+
+`animus-operator`'s admin client (`hyper_util::client::legacy::Client`)
+needed the same "plain TCP or TLS" choice `animus-env`'s `MaybeTlsStream`
+and `animus-cli`'s connector already solved — but neither was reusable
+here, for two independent reasons, both worth knowing before reaching for
+`hyper-rustls` as the default fix: (1) this crate deliberately depends on
+neither `animus-env` nor `animus-cli` (a standing architectural boundary,
+not an oversight), and (2) even ignoring that, `hyper-util`'s legacy
+`Client<C, B>` wants its connector shaped as a `tower_service::
+Service<Uri>` returning something implementing `hyper::rt::{Read, Write}`
+plus `hyper_util::client::legacy::connect::Connection` — a materially
+different shape than an `AsyncRead + AsyncWrite` enum wrapped for direct
+`tokio::net` use. The orphan rule bites here too: `Connection` (a
+`hyper-util` trait) can't be implemented directly for `tokio_rustls::
+client::TlsStream<TcpStream>` (a foreign type from a different crate) —
+it needs a local newtype/enum wrapper, which is itself the same amount of
+code a `MaybeTlsStream`-shaped type would have needed anyway, just with a
+different trait to satisfy at the end. `hyper-rustls` would have solved
+this in one dependency, but this codebase already special-cases `rustls`
+usage per crate for good reasons (see this ADR's own "why `ring`, why not
+a shared abstraction" decisions) — check whether the existing pattern
+even applies before assuming a wrapper crate is the answer.
+
+**General form**: "we already solved this exact problem elsewhere" is not
+the same question as "can I reuse that solution here" — check the actual
+trait/type shape the new call site needs (a `tower_service::Service<Uri>`
+connector is not interchangeable with an `AsyncRead+AsyncWrite` wrapper,
+even though both exist to answer "plain or TLS?") before writing a
+duplicate, and don't be surprised when the duplicate is warranted by a
+real architectural boundary (a crate that must not depend on another)
+rather than an oversight.
+
+## `kube`'s `DynamicObject` is the right tool for a CRD-adjacent resource from an API group `k8s-openapi` doesn't ship (ADR 0064, S-01 commit 3)
+
+Building a `cert-manager.io/v1` `Certificate` from `animus-operator` hit
+the same problem any operator managing a non-core, non-`k8s-openapi`
+resource will hit: there is no typed Rust struct for it anywhere in the
+dependency graph, and vendoring cert-manager's own Rust types (if they
+even exist as a published crate) is a heavier dependency than the one
+object this operator ever creates warrants. `kube::core::DynamicObject`
+(`ApiResource::from_gvk` for the type descriptor, `.data(serde_json::
+json!({...}))` for the actual spec) is built exactly for this: a
+`serde_json::Value` payload plus enough metadata (`TypeMeta`/
+`ObjectMeta`) to round-trip through `kube::Api::namespaced_with` and
+server-side-apply like any typed object. The trade-off is real but
+narrow — no compile-time field checking on the `Certificate`'s own spec
+shape, same as this crate's pre-existing hand-maintained `animusd::config`
+mirror already accepts for a different reason (see this crate's own
+`CLAUDE.md`) — and it's the right one for a single, simple object rather
+than pulling in or hand-rolling a whole second CRD's typed bindings.
+
+**General form**: before reaching for a full typed-struct dependency (or
+writing one by hand) for a foreign CRD your own operator only ever
+creates/patches one shape of, check whether `kube::core::DynamicObject` +
+a `serde_json::json!` literal covers it — it usually does, and it keeps
+the dependency graph from growing for a resource you don't own the schema
+of anyway.

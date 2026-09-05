@@ -20,7 +20,8 @@ How to maintain this file:
   reviewable step stacks by default.
 
 The next free ADR number at the time of writing is **0065** (0064 is
-[TLS on every port](adr/0064-tls-on-every-port.md), S-01).
+[TLS on every port](adr/0064-tls-on-every-port.md), S-01 — landed in full
+2026-09-05, no longer carried as a section below).
 
 ---
 
@@ -125,28 +126,6 @@ the still-true paragraph after the table.
 
 ## 2. Security, storage, and deployment
 
-### S-01 TLS on every port
-
-- **Gap:** closed through commit 3 — client/intra: mutual on
-  `internal`/`intra`, server-only on `client`/`dynamo`/`admin`/`console`
-  (commits 1–2, [ADR 0064](adr/0064-tls-on-every-port.md)); the Kubernetes
-  operator's `spec.tls` (a pre-existing `Secret` or a cert-manager
-  `Certificate`) plus its admin client's TLS connector (commit 3) —
-  config-gated and default off throughout. Only commit 4 (ADR closing note
-  + website "Planned" pill removal) remains.
-- **Tests:** `prod::tests` loopback for intra (commit 1); a TLS variant of
-  each real-listener `animusd` test, `tests/tls_e2e.rs` (commit 2);
-  `animus-operator`'s `desired::certificate`/`cluster_config`/`statefulset`
-  builder tests + `controller::tests`' TLS cases, plus an unverified-in-
-  sandbox `E2E_TLS=1` `kind` e2e path (commit 3).
-- **ADR:** **yes, [0064](adr/0064-tls-on-every-port.md)** — crosses ADR
-  0047, 0057, 0060; commits 1–3 implemented, commit 4 (closing note) still
-  to come.
-- **PRs:** (1) intra/`ProdEnv` with file certs — **done**; (2)
-  client/admin/console listeners — **done**; (3) operator cert-manager
-  wiring — **done**; (4) ADR closing note + website "Planned" pill.
-  **Size:** L.
-
 ### S-02 SigV4 hardening (ADR 0057 follow-on)
 
 - **Gap:** one static key map from config; no rotation, no replication,
@@ -223,10 +202,11 @@ the still-true paragraph after the table.
   `drain_and_remove_node`; extend `scripts/e2e-kind.sh` with a
   control-grow step. Size L.
 - **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
-  S-01 commit 3 (ADR 0064) already gives this crate a cert-manager
-  `Certificate` builder and CRD shape (`spec.tls.certManager`) a webhook's
-  own cert-issuance could reuse the same pattern from; still sequenced
-  after S-01 closes (commit 4) rather than started early. Size L.
+  the prerequisite this used to be sequenced behind is done: TLS on every
+  port ([ADR 0064](adr/0064-tls-on-every-port.md)) shipped in full,
+  including this crate's own cert-manager `Certificate` builder and CRD
+  shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
+  directly. No longer blocked; open to pick up on its own schedule. Size L.
 - **ADR:** amend 0060 for a–c; d and e get their own section or a new
   number if the webhook design grows.
 
@@ -248,8 +228,9 @@ the still-true paragraph after the table.
   `animus-cp-data` apply-path sims; run C-04's `SimCluster` corpus first.
 - **ADR:** none new; flip 0054 to Accepted on landing.
 - **PRs:** (1) entry shape + apply-side single-item; (2) ADD/conditional
-  cutover; (3) remove `rmw_lock`. **Size:** L. Land in isolation from the
-  listener work in S-01.
+  cutover; (3) remove `rmw_lock`. **Size:** L. S-01 (the listener work
+  this used to be sequenced apart from) landed 2026-09-05 (ADR 0064) — no
+  ongoing overlap to avoid any more, but this item itself is still open.
 
 ### C-02 Heartbeat amortization (ADR 0044 phase 2)
 
@@ -370,8 +351,12 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 ## 5. Documentation
 
 D-01 (the stale-prose sweep) and S-07a landed 2026-09-02; waves 1 and 2
-landed 2026-09-04. What remains
-here: `website/index.html`'s "Planned" pills stay until S-01 lands.
+landed 2026-09-04; S-01's own website update (moving its "Planned" pill to
+"Works today" and correcting the "no TLS"/"trusted network" statements
+across `index.html`, `architecture.html`, `how-it-works.html`, `docs.html`,
+`install.html`) landed 2026-09-05 alongside ADR 0064's closing amendment.
+Nothing outstanding here at present — add a row when the next
+documentation-lagging-code gap turns up.
 
 ---
 
@@ -401,9 +386,9 @@ wave are independent and can run in parallel.
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
 | 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
-| 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
+| 4 | *S-01 landed 2026-09-05* (ADR 0064); C-01, S-02, W-08 remain | Highest blast radius |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
-| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |
+| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
