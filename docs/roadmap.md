@@ -19,9 +19,9 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0065** (0064 is
-[TLS on every port](adr/0064-tls-on-every-port.md), S-01 — landed in full
-2026-09-05, no longer carried as a section below).
+The next free ADR number at the time of writing is **0066** (0065 is
+[Per-table throttling](adr/0065-per-table-throttling.md), W-08 — the
+design of record for the section below; the implementation removes it).
 
 ---
 
