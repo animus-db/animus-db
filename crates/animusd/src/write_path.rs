@@ -10,6 +10,8 @@
 use std::time::Duration;
 
 use animus_control::{Metadata, ProposeResult};
+use animus_cp_data::{KindBatchOutcome, KindEvalOp};
+use animus_dynamo::{AttributeValue, ConditionExpression, Item};
 use animus_env::{Env, Nanos};
 use animus_node::host::RelayClient;
 
@@ -18,6 +20,52 @@ use crate::{
     ClientResponse, CpGroup, CpRoute, KindBatchSignal, KindWriteOp, KvPair, ProbeIdentity,
     ProbeWait, SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
 };
+
+/// The message [`ClientCtx::cp_kind_eval_local`] returns for a confirmed-
+/// but-payload-lost `KindEval` (ADR 0054 mechanism 3's own documented
+/// residual: the leader-local result slot ages out or this node's own
+/// registration never got recorded) when there is nothing safe to
+/// substitute — deliberately the SAME string [`ClientCtx::cp_kind_local`]'s
+/// `poll_probe`-driven confirm returns for an ordinary confirm timeout
+/// (`ProbeWait::TimedOut`), not a new one: both are the identical
+/// wire-visible shape — "the write may have happened, but this node cannot
+/// honestly report what changed" — and the caller-facing behavior (a
+/// terminal `InternalServerError`, no retry — this string does not carry
+/// the house `"; retry"` suffix) must match. See
+/// [`ClientCtx::cp_kind_eval_local`]'s own doc for the two cases that reach
+/// this vs. the safe best-effort re-read.
+const KIND_EVAL_CONFIRM_AMBIGUOUS: &str = "CP kind write did not commit in time";
+
+/// The confirmed, authoritative result of a [`KvCommand::KindEval`]
+/// (`animus_cp_data`) once [`ClientCtx::cp_kind_eval_local`]'s propose has
+/// resolved — the ADR 0054 step 3 analogue of the old `KindWriteOutcome`
+/// pair, but built from the APPLY-side decision rather than a leader-side
+/// evaluation. `dynamo::kind_write_item_at_leader` maps this straight into
+/// `dynamo::KindWriteOutcome`/a `WireError`; nothing else should construct
+/// or match on it.
+///
+/// [`KvCommand::KindEval`]: animus_cp_data::KvCommand::KindEval
+pub(crate) enum KindEvalApplied {
+    /// The write applied. `new: None` for a `Delete` op; `old: None` if the
+    /// item did not previously exist.
+    Ok {
+        old: Option<Item>,
+        new: Option<Item>,
+    },
+    /// The write's own `ConditionExpression` evaluated to `false` against
+    /// apply's fresh read — a genuine `ConditionalCheckFailedException`.
+    /// (Apply's identical outcome variant also covers an unresolved
+    /// foreign transaction intent on this key — see this crate's own
+    /// `KindEvalSeatbeltMismatch` doc and `kind_write_item_at_leader`'s
+    /// comment on the mapping call site for why that rare race is not, and
+    /// cannot cheaply be, told apart from a genuine condition failure at
+    /// this layer.)
+    ConditionFailed,
+    /// The evaluator itself rejected the write — a domain violation in the
+    /// client's own condition, or a malformed/oversized update — copied
+    /// verbatim from `animus_cp_data::KindBatchOutcome::Rejected`.
+    Rejected { code: String, message: String },
+}
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The evaluate-at-leader write primitive (ADR 0046 U3)** —
@@ -380,6 +428,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// not. The caller already knows this (`dynamo::
     /// kind_write_is_idempotent`, computed once per write); `poll_probe`
     /// never recomputes it.
+    ///
+    /// **No production caller as of ADR 0054 step 3.** `kind_write_item_at_
+    /// leader` — this function's one production caller — now proposes
+    /// `KvCommand::KindEval` via [`cp_kind_eval_local`](Self::
+    /// cp_kind_eval_local) instead, so the client's own `condition` is
+    /// evaluated fresh at apply rather than carried here as a byte-level
+    /// `conditions` seatbelt. This function stays for its own regression
+    /// coverage (`confirm_futility_tests::
+    /// a_condition_failed_kind_batch_fails_fast_with_a_retryable_error`,
+    /// issue #268 — the confirm-futility fast-fail on a raw `KindBatch`,
+    /// independent of ADR 0054) until step 4 deletes `rmw_lock`/the
+    /// `KindBatch.conditions` seatbelt outright and this function along
+    /// with them. The `cfg_attr` mirrors `local_scan_kind_bounded`'s own
+    /// precise, not blanket, dead-code allowance: only the non-`cfg(test)`
+    /// build (the `tests/` binaries and the release lib) sees it — `cargo
+    /// test -p animusd --lib`, which actually calls this, sees no
+    /// allowance at all.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn cp_kind_local(
         leader: &CpGroup<E>,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
@@ -432,6 +498,210 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .into(),
             ),
             ProbeWait::TimedOut => Err("CP kind write did not commit in time".into()),
+        }
+    }
+
+    /// Propose a self-contained **evaluated write** (ADR 0054 step 3 —
+    /// `KvCommand::KindEval`) and confirm it —
+    /// [`cp_kind_local`](Self::cp_kind_local)'s sibling for the cut-over
+    /// single-item write path. `dynamo::kind_write_item_at_leader` is the
+    /// one caller: it builds `schema`/`op`/`condition` from the client's
+    /// request and this node's own `Metadata` read, then hands the write
+    /// to apply rather than computing its own diff (the ADR 0054 fix).
+    ///
+    /// **Reuses `poll_probe`'s term-checked confirm channel**
+    /// (`classify_kind_batch_outcome`, the same identity-checked
+    /// `(index, term)` proof `cp_kind_local`'s own confirm uses) but
+    /// **not** its value-equality fallback: apply computes the written
+    /// bytes itself, so there is no leader-known `probe_val` to compare
+    /// against here — the confirm question is always "what did MY entry's
+    /// outcome say", never "does the key already hold bytes I predicted."
+    /// `NoOp` is read back into the specific `KindBatchOutcome` variant
+    /// (`ConditionFailed`/`Sealed`/`Rejected`) to decide the caller-visible
+    /// result — see [`kind_eval_noop`](Self::kind_eval_noop)'s own doc for
+    /// each mapping and why `ConditionFailed` and `Sealed` diverge (one is
+    /// definitive, one asks for a re-route).
+    ///
+    /// `base_key` is the item's own base-kind key
+    /// (`dynamo::item_key(pk, sk)`) — the caller already has it; recomputing
+    /// it here from a moved `pk`/`sk` would need borrowing both twice for
+    /// no benefit, since `RaftKvNode::propose_kind_eval` derives the
+    /// identical key internally from its own `pk`/`sk` arguments anyway
+    /// (this function's `base_key` is used only for the pre-propose range
+    /// check below, mirroring `cp_kind_local`'s own tripwire).
+    #[allow(clippy::too_many_arguments)] // one item write's full identity, mirrors cp_kind_local's sibling shape
+    pub(crate) async fn cp_kind_eval_local(
+        leader: &CpGroup<E>,
+        schema: animus_item::WriteSchema,
+        pk: AttributeValue,
+        sk: Option<AttributeValue>,
+        op: KindEvalOp,
+        condition: Option<ConditionExpression>,
+        ttl_expired: bool,
+        base_key: &[u8],
+        identity: ProbeIdentity,
+    ) -> Result<KindEvalApplied, String> {
+        decide::frozen_refusal(leader.is_frozen())?;
+        // Pre-propose range check — the identical routing-bug tripwire
+        // `cp_kind_local`/`cp_batch_propose` already carry (ADR 0050 Train
+        // B rung 7: ranges are immutable now, so this is belt-and-
+        // suspenders against a stale `cp_route` resolution, never a fence).
+        let fence = leader.scope_range();
+        if !fence.contains(base_key) {
+            return Err("kind write outside this group's live range; retry".into());
+        }
+        let (accepted_index, accepted_term) =
+            match leader.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired) {
+                ProposeResult::Accepted { index, term } => (index, term),
+                other => return Err(format!("kind eval not accepted: {other:?}")),
+            };
+        let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
+        loop {
+            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            let outcome = leader.kind_batch_outcome(accepted_index);
+            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+                KindBatchSignal::Confirm => {
+                    return Self::kind_eval_confirmed(
+                        leader,
+                        accepted_index,
+                        accepted_term,
+                        base_key,
+                        identity,
+                    )
+                    .await;
+                }
+                KindBatchSignal::NoOp => return Self::kind_eval_noop(outcome),
+                KindBatchSignal::Inconclusive => {}
+            }
+            if decide::confirm_wait_is_futile(
+                leader.engine_applied_index(),
+                leader.is_leader(),
+                accepted_index,
+            ) {
+                // Close the probe-vs-apply race exactly like `poll_probe`
+                // does: re-check once more before giving up.
+                let outcome = leader.kind_batch_outcome(accepted_index);
+                let effects_readable = leader.engine_applied_index() >= accepted_index;
+                match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable)
+                {
+                    KindBatchSignal::Confirm => {
+                        return Self::kind_eval_confirmed(
+                            leader,
+                            accepted_index,
+                            accepted_term,
+                            base_key,
+                            identity,
+                        )
+                        .await;
+                    }
+                    KindBatchSignal::NoOp => return Self::kind_eval_noop(outcome),
+                    KindBatchSignal::Inconclusive => {}
+                }
+                return Err(
+                    "CP kind write superseded before its effect appeared (leadership churn or \
+                     an apply-time no-op); retry"
+                        .into(),
+                );
+            }
+            if leader.env().now() >= deadline {
+                return Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into());
+            }
+            leader.env().sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
+    /// [`cp_kind_eval_local`](Self::cp_kind_eval_local)'s `Confirm` arm:
+    /// this proposer's own `(index, term)` entry provably applied. Reads
+    /// back the leader-local `old`/`new` payload
+    /// (`RaftKvNode::take_kind_eval_result`, ADR 0054 mechanism 3) — `Some`
+    /// on the ordinary path (this same node proposed and is still the one
+    /// polling), `None` only in the documented residual: the payload map's
+    /// bounded retention aged the slot out from under an unusually slow
+    /// confirm loop, or (impossible in practice given `propose_kind_eval`'s
+    /// own core-lock-held registration, but not provable never to regress)
+    /// this node's registration never landed.
+    ///
+    /// A lost payload for an **idempotent** write (`ProbeIdentity::
+    /// ValueProves` — Put/Delete/SET/REMOVE/a set union or difference) is
+    /// recoverable: any entry that landed these exact bytes is a
+    /// legitimate success no matter whose, so a plain re-read of the
+    /// CURRENT committed value stands in for `new` (the pre-image is
+    /// genuinely gone, and is never guessed at as `old` — a caller that
+    /// asked for it gets `None`, not a wrong answer). A lost payload for a
+    /// **non-idempotent** write (`RequiresOwnEntry` — a numeric `ADD`) is
+    /// NOT recoverable this way: the current value could already reflect a
+    /// later write, and reporting it as this entry's own `new` would be a
+    /// silent lie about which write produced it — so this returns the same
+    /// ambiguous, non-retried error [`cp_kind_local`](Self::cp_kind_local)
+    /// already returns for its own unconfirmable case
+    /// ([`KIND_EVAL_CONFIRM_AMBIGUOUS`]), never a new one. Either way the
+    /// write **did** apply — this is a reporting gap, not a correctness
+    /// one; see ADR 0054's own "Not removed, deliberately: Ambiguity"
+    /// consequence for why the ADR accepts this rather than inventing a
+    /// speculative recovery.
+    async fn kind_eval_confirmed(
+        leader: &CpGroup<E>,
+        index: u64,
+        term: u64,
+        base_key: &[u8],
+        identity: ProbeIdentity,
+    ) -> Result<KindEvalApplied, String> {
+        match leader.take_kind_eval_result(index, term) {
+            Some(result) => Ok(KindEvalApplied::Ok {
+                old: result.old,
+                new: result.new,
+            }),
+            None if identity == ProbeIdentity::ValueProves => {
+                let new = leader.local_get(base_key).await.and_then(|bytes| {
+                    animus_dynamo::wire::decode_stored_item(&bytes)
+                        .ok()
+                        .flatten()
+                });
+                Ok(KindEvalApplied::Ok { old: None, new })
+            }
+            None => Err(KIND_EVAL_CONFIRM_AMBIGUOUS.into()),
+        }
+    }
+
+    /// [`cp_kind_eval_local`](Self::cp_kind_eval_local)'s `NoOp` arm:
+    /// nothing landed at this index, so read back which of the three
+    /// no-op-shaped `KindBatchOutcome` variants it was.
+    ///
+    /// - `ConditionFailed` → `Ok(KindEvalApplied::ConditionFailed)`, a
+    ///   DEFINITIVE result (never retried here) — the client's own
+    ///   condition genuinely evaluated false against apply's fresh read.
+    ///   (This is also where an unresolved foreign transaction intent on
+    ///   this key lands, per apply's own documented foreign-intent
+    ///   discipline — an accepted, rare imprecision; see this function's
+    ///   own caller, `dynamo::kind_write_item_at_leader`, for the full
+    ///   account of why that is not disambiguated here.)
+    /// - `Rejected { code, message }` → `Ok(KindEvalApplied::Rejected)`,
+    ///   also definitive — a domain violation in the condition or a
+    ///   malformed/oversized update, copied verbatim.
+    /// - `Sealed` → `Err(..; retry)` — the tablet mid-split-cutover froze
+    ///   this write; unlike the two above, this is NOT a decision about
+    ///   the write's own content, so the caller must re-route (via
+    ///   `cp_kind_write_item`'s own retry loop) rather than treat it as a
+    ///   terminal answer, mirroring `cp_kind_local`'s identical `Sealed`
+    ///   handling one layer up (folded into its own generic `Superseded`
+    ///   message there, since that path never distinguishes the three).
+    /// - `Applied`/`None` never reach here — `classify_kind_batch_outcome`
+    ///   only ever returns `NoOp` for one of the three variants above.
+    fn kind_eval_noop(outcome: Option<(u64, KindBatchOutcome)>) -> Result<KindEvalApplied, String> {
+        match outcome.map(|(_, o)| o) {
+            Some(KindBatchOutcome::ConditionFailed { .. }) => Ok(KindEvalApplied::ConditionFailed),
+            Some(KindBatchOutcome::Rejected { code, message, .. }) => {
+                Ok(KindEvalApplied::Rejected { code, message })
+            }
+            Some(KindBatchOutcome::Sealed { .. }) => Err(
+                "CP kind write superseded before its effect appeared (tablet frozen for split \
+                 cutover); retry"
+                    .into(),
+            ),
+            other => unreachable!(
+                "classify_kind_batch_outcome only returns NoOp for ConditionFailed/Sealed/\
+                 Rejected, got {other:?}"
+            ),
         }
     }
 

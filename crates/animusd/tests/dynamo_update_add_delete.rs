@@ -234,34 +234,29 @@ async fn add_seeds_then_increments_a_counter() {
     }
 }
 
-/// **At-most-once per request.** This is the test that measured 431 before the
-/// write-path fixes, and 8-of-10 spurious retry responses after only the first
-/// of them.
+/// **At-most-once per request, and — since ADR 0054 step 3 landed — exactly
+/// once for every request, with zero refusals.** This is the test that
+/// measured 431 before the original write-path fixes, 8-of-10 spurious
+/// retry responses after only the first of them, and 2-of-10 refused under
+/// load even after that (the contended-`ADD` defect ADR 0054 exists to
+/// close).
 ///
 /// Deliberately not the retrying helper: a client retry of an `ADD` that
 /// applied double-counts on DynamoDB too, so the property under test is that
 /// the *service* counts each request exactly once and reports honestly.
 ///
-/// **Refusals under contention are expected here, and are not a bug.** The
-/// leader evaluates the increment, then proposes the computed value with an
-/// apply-time OCC seatbelt naming the bytes it read. Ten writers on one key
-/// all read the same before-image, so whichever entries apply after the first
-/// find the key changed, no-op whole, and are refused. `ADD` is not
-/// idempotent, so the service will not retry them on the client's behalf —
-/// that arbitrage belongs to the client.
-///
-/// So this asserts the two properties that hold whatever the contention,
-/// rather than a request count that happens to hold on an unloaded machine:
-/// the counter never exceeds the requests, and never falls below the
-/// acknowledgements. An earlier version asserted zero refusals and passed
-/// locally only because the writers were not truly overlapping; CI, under
-/// load, refused 2 of 10. Contention is not noise here — it is the common
-/// case, and the loaded run was the honest one.
-///
-/// The refusals go away when the write path stops computing values before the
-/// log and starts evaluating at apply, in commit order, where there is no
-/// stale before-image to invalidate. Until then they are correct behaviour and
-/// this test says so.
+/// **Refusals under contention are no longer expected, or acceptable.**
+/// Before ADR 0054, the leader evaluated the increment and proposed the
+/// computed value with an apply-time OCC seatbelt naming the bytes it read —
+/// ten writers on one key all read the same before-image, so whichever
+/// entries applied after the first found the key changed, no-op'd whole, and
+/// were refused. Since step 3, apply itself reads the current value **in
+/// commit order** and evaluates the `ADD` there — there is no stale
+/// before-image to invalidate, so every writer's increment lands. This test
+/// used to assert only the two properties that held whatever the contention
+/// (never over-counts, never under-counts an acknowledgement); it now
+/// asserts the stronger property those weaker ones were standing in for:
+/// `counter == WRITERS` and zero failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_increments_all_land_exactly_once() {
     const WRITERS: usize = 10;
@@ -288,12 +283,12 @@ async fn concurrent_increments_all_land_exactly_once() {
             failures.push(format!("{status}: {resp}"));
         }
     }
-    let acknowledged = WRITERS - failures.len();
+    assert!(
+        failures.is_empty(),
+        "ADR 0054 closes the contended-ADD refusal — every writer should \
+         land: {failures:?}"
+    );
 
-    // Read the counter *before* asserting, so a failure reports the number
-    // that distinguishes an honest refusal from a write that landed and was
-    // reported failed. Asserting first would panic while hiding exactly the
-    // diagnostic needed to tell those apart.
     let (status, got) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.GetItem",
@@ -309,20 +304,85 @@ async fn concurrent_increments_all_land_exactly_once() {
         .parse()
         .expect("hits parses");
 
-    // Never over-counts. This is the property that read 431.
-    assert!(
-        counter <= WRITERS,
-        "{WRITERS} increments must never leave more than {WRITERS}: got {counter} \
-         ({acknowledged} acknowledged)"
+    assert_eq!(
+        counter, WRITERS,
+        "every one of {WRITERS} increments must land exactly once with zero refusals"
     );
-    // Never under-counts an acknowledged write: a 200 means the increment
-    // landed, so the counter cannot sit below the number of them. This is the
-    // property a spurious success would break, and the one that would catch a
-    // regression of the confirm-poll bug.
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// The same contended-`ADD` property, but with a conditional `ADD` under
+/// the same concurrency (ADR 0054 step 3's own regression asks for this
+/// sibling): `attribute_exists(pk)` is genuinely true for every writer here
+/// (the item is seeded before the race starts), so the condition must never
+/// spuriously fail under contention either — the client's own
+/// `ConditionExpression` is now evaluated fresh, in commit order, at apply,
+/// exactly like the unconditional case above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_conditional_add_all_land_exactly_once() {
+    const WRITERS: usize = 10;
+    let (_dir, nodes, addrs) = setup().await;
+
+    // Seed the item first so `attribute_exists(pk)` is true for every racing
+    // writer — this test is about contention on the ADD itself, not about
+    // the condition legitimately failing.
+    let (status, _) = dynamo(
+        addrs[0],
+        "DynamoDB_20120810.PutItem",
+        r#"{"TableName":"events","Item":{"pk":{"S":"p2"},"sk":{"S":"a1"},"hits":{"N":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let mut handles = Vec::new();
+    for i in 0..WRITERS {
+        let addr = addrs[i % addrs.len()];
+        handles.push(tokio::spawn(async move {
+            dynamo(
+                addr,
+                "DynamoDB_20120810.UpdateItem",
+                r#"{"TableName":"events","Key":{"pk":{"S":"p2"},"sk":{"S":"a1"}},
+                    "UpdateExpression":"ADD hits :one",
+                    "ConditionExpression":"attribute_exists(pk)",
+                    "ExpressionAttributeValues":{":one":{"N":"1"}}}"#,
+            )
+            .await
+        }));
+    }
+    let mut failures = Vec::new();
+    for h in handles {
+        let (status, resp) = h.await.expect("task");
+        if status != 200 {
+            failures.push(format!("{status}: {resp}"));
+        }
+    }
     assert!(
-        counter >= acknowledged,
-        "{acknowledged} increment(s) were acknowledged but the counter is only \
-         {counter}: an acknowledged write did not land"
+        failures.is_empty(),
+        "a genuinely-true condition must never spuriously fail under \
+         contention: {failures:?}"
+    );
+
+    let (status, got) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"events","Key":{"pk":{"S":"p2"},"sk":{"S":"a1"}},
+            "ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{got}");
+    let parsed: serde_json::Value = serde_json::from_str(&got).expect("json");
+    let counter: usize = parsed["Item"]["hits"]["N"]
+        .as_str()
+        .expect("hits is a number attribute")
+        .parse()
+        .expect("hits parses");
+
+    assert_eq!(
+        counter, WRITERS,
+        "every one of {WRITERS} conditional increments must land exactly once with zero refusals"
     );
 
     for n in nodes {

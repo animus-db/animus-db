@@ -2637,6 +2637,41 @@ route below the edge through the same `ClientCtx` CP primitives.
   `docs/engineering-lessons.md`'s Testing section, 2026-08-22 entry), so it
   now uses `dynamo::rmw285_confirm_gate`, a `#[cfg(test)]`-only hook that
   holds that phase open for a fixed delay under the test's own control.
+
+  **ADR 0054 step 3 cut the write itself over to apply-time evaluation —
+  everything in this bullet above describes the pre-step-3 design, kept
+  here because step 4 (deleting `rmw_lock`/the seatbelt outright) hasn't
+  landed yet.** `kind_write_item_at_leader` no longer computes the write's
+  finished bytes at all: it builds the `WriteSchema` slice
+  (`write_schema_for`) and a `KindEvalOp` mirror of the client's operation,
+  then proposes a self-contained `KvCommand::KindEval`
+  (`ClientCtx::cp_kind_eval_local`, `write_path.rs` — `cp_kind_local`'s
+  sibling) and reads back the **apply-side** confirmed decision — apply
+  evaluates `condition`/`op` against the current committed value in commit
+  order, so two evaluators of one key no longer race a stale before-image
+  (the exact defect the `index_aware_write`→leader-evaluated fix above
+  never closed for concurrent evaluators of the identical key, only for
+  evaluators on different nodes). The read+evaluate this bullet describes
+  (`rmw_lock`, `cp_get_local_resolving`, the condition/op evaluation) is
+  **still performed**, but now purely as a double-check
+  (`predict_kind_eval_decision`/`report_kind_eval_seatbelt_mismatch`)
+  compared against apply's own outcome — never as the source of the
+  client-visible result, and never failing the request on a disagreement
+  (see `Metric::KindEvalSeatbeltMismatch`'s own doc in `animus-env` for the
+  two disagreement directions and which one is a bug). The `KindBatch.
+  conditions` OCC seatbelt this bullet describes is **no longer proposed
+  for a single-item write** — `KvCommand::KindEval` carries no byte-level
+  seatbelt at all, since apply's own fresh read already is the
+  authoritative current state. `TransactWriteItems`
+  (`eval_kind_txn_write`/`txn_stage_local`) is the one write path this step
+  did **not** move — it still evaluates at the leader and proposes
+  `KindBatch` with the OCC seatbelt exactly as this bullet describes; ADR
+  0054 step 4 moves it and deletes `rmw_lock`/the seatbelt/the mismatch
+  metric entirely. See ADR 0054's own step-3 as-built amendment for the
+  full design, the flipped `concurrent_increments_all_land_exactly_once`
+  regression (now zero refusals, not "2 of 10 is correct"), and the
+  before/after benchmark numbers.
+
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so

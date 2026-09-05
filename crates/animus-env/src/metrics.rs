@@ -643,12 +643,40 @@ pub enum Metric {
     /// rate under a hint-chasing forward means abandoned server-side work is
     /// piling up, not necessarily a client bug (see the issue #596 lesson).
     ClientRequestsAbandoned,
+    // --- ADR 0054 step 3: the KindEval seatbelt double-check ---
+    // Appended after the engine-loss-recovery variants above; every earlier
+    // variant's slot and the text-export order stay stable, so the snapshot
+    // remains byte-reproducible. Recorded by `animusd::dynamo::
+    // kind_write_item_at_leader` (ADR 0054 step 3): with evaluation moved to
+    // apply, this crate keeps a leader-side prediction (the same read +
+    // condition/update evaluation the OLD leader-evaluated design used) as a
+    // pure double-check against the now-authoritative apply-side decision —
+    // never as a gate on what the client sees.
+    /// The leader's predicted decision (applied / condition-failed /
+    /// rejected) for a `KindEval` write disagreed with the confirmed
+    /// apply-side `KindBatchOutcome` once the entry committed. **One
+    /// direction is expected, not a bug**: the leader
+    /// predicted `ConditionFailed`/`Rejected` from a before-image it read
+    /// before propose, and a concurrent write landed in the propose→apply
+    /// window such that apply's fresher read let the write actually apply —
+    /// exactly the contention ADR 0054 exists to absorb. **The other
+    /// direction is the one worth investigating**: apply rejected a write
+    /// the leader's own read predicted would succeed, which the ADR's
+    /// design says should not happen (apply's decision is authoritative by
+    /// construction, but a persistently nonzero rate in that direction
+    /// specifically points at a real evaluator divergence between the
+    /// leader-side and apply-side code paths). Never fails the request —
+    /// the apply-side outcome always wins; see `kind_write_item_at_leader`'s
+    /// own doc for the comparison and its `tracing::warn!` (which logs both
+    /// decisions, so the direction is recoverable from the log even though
+    /// this one counter does not split by direction).
+    KindEvalSeatbeltMismatch,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 83] = [
+    pub const ALL: [Metric; 84] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -732,6 +760,7 @@ impl Metric {
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
         Metric::ClientRequestsAbandoned,
+        Metric::KindEvalSeatbeltMismatch,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -822,6 +851,7 @@ impl Metric {
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
+            Metric::KindEvalSeatbeltMismatch => "kind_eval_seatbelt_mismatch",
         }
     }
 

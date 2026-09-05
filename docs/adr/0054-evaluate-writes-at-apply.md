@@ -191,3 +191,318 @@ producer and neither is touched.
 
 Each step is independently revertible, and only step 3 changes observable
 behaviour.
+
+## As-built amendment (2026-09-05, Sequencing step 1 — item model extracted)
+
+Step 1 landed: `AttributeValue`/`Item`/`TableSchema`, the key-encoding
+primitives (`escape`/`storage_key`/`numkey`), `ConditionExpression`/
+`SortKeyCondition` (`condition`), the `UpdateExpression` data model and its
+apply-time evaluator (`apply_update` and everything it calls), the
+stored-item codec, the item-size formula, and the GSI/LSI row/footprint/
+change-record derivation (`index`) moved into a new crate, `animus-item`,
+below both `animus-dynamo` and `animus-cp-data` — see
+`crates/animus-item/CLAUDE.md`. `animus-dynamo` re-exports all of it
+unchanged; every `animus_dynamo::X`/`animus_dynamo::wire::X` path a caller
+used before this step still resolves, and no test's assertion changed (a
+pure move, 324 tests before and after, redistributed rather than dropped).
+
+**What did not move, and why.** The `UpdateExpression`/`ConditionExpression`
+**string parser** — tokenizing a request's expression text and resolving its
+`#alias`/`:placeholder` references against `ExpressionAttributeNames`/
+`ExpressionAttributeValues` — stayed in `animus-dynamo::wire`. That is
+JSON/wire-decode work, not part of the pure item-mutation model: it needs
+`serde_json::Value`, which would have pulled wire-shaped decoding back into
+the crate this step exists to keep pure below the wire. Only the *data types*
+the parser produces (`PathSegment`/`UpdateOperand`/`UpdateExpr`/
+`UpdateAction`) and the *evaluator* that consumes them (`apply_update`)
+moved — exactly the boundary "evaluation moves below the wire adapter"
+describes. `animus-dynamo`'s `registry`/`schema` (the catalog bridge),
+`capacity` (`ConsumedCapacity` response shaping, though it now re-exports the
+item-size formula itself from `animus-item`), `sigv4`, `streams_wire`, and
+`ttl` are unaffected.
+
+`apply_update` still runs exactly where it always did — the tablet leader,
+under `rmw_lock`, via `kind_write_item_at_leader` — unchanged by this step;
+only *where the code lives* changed. Step 2 (adding the schema slice to
+`KindBatch` and the leader-local result payload) and step 3 (moving
+evaluation to apply for real) are still ahead; `animus-cp-data` does not yet
+depend on `animus-item`.
+
+Status stays **Proposed**: only step 3 changes observable behaviour, and it
+has not landed.
+
+## As-built amendment (2026-09-05, Sequencing step 2 — the self-contained
+entry, the apply-side evaluator, and the leader-local result payload landed,
+unwired)
+
+Step 2 landed, matching the ADR's own description almost exactly, with one
+deliberate deviation from its literal wording (carrying the operation in a
+*new* variant rather than adding fields to `KindBatch`) and one design
+decision the ADR left open (the outcome mapping for an evaluator-rejected
+write). `animus-cp-data` now depends on `animus-item` directly (`cargo tree
+-i animus-item` gains one new dependent; no `animus-env`/wire-crate
+duplication).
+
+**The schema slice (mechanism 1) — `animus_item::WriteSchema`.** A new
+`animus-item` module, `write_schema`, holds exactly the three lookups
+`kind_writes_for_item` used to perform against `Metadata`
+(`Metadata::table_indexes` filtered to `Local`, `schema_for`,
+`table_change_records_carry_images`), frozen into three fields: `key:
+TableSchema`, `lsis: Vec<LsiDef>` (name/sort-attribute/projection — no
+`hash_attribute`, since an LSI's is always the base table's own partition
+key), and `change_records_carry_images: bool`. **Deliberately no GSI list**:
+a write commits no GSI row directly (the asynchronous drain derives those
+later from the change-log record), so a GSI needs no entry in this slice at
+all — narrower than the ADR's own illustrative `gsis: Vec<GsiDef>` sketch,
+because tracing `kind_writes_for_item`'s actual reads found it never needed
+one. `Projection` is a small, pure, `animus-item`-local copy of
+`animus_control::schema::IndexProjection` (the identical "duplicate rather
+than invert the dependency" call the crate's own doc already makes for
+`animus-tablet`'s `escape`). `animusd::dynamo::write_schema_for(meta, table)`
+builds it, next to the pre-existing `schema_for`.
+
+**The pure evaluation core — `animus_item::derive_kind_writes`.** The whole
+body of `kind_writes_for_item` (the LSI diff loop, the change-record
+assembly) moved into this function verbatim — a byte-identical extraction,
+proven by every pre-existing `animusd` test that exercises indexes/streams
+staying green unmodified (`dynamo_indexes`, `dynamo_index_writes`,
+`dynamo_streams`, `dynamo_update_add_delete`) plus a new differential test
+in `animus-cp-data` comparing its output against a hand-built `KindBatch`.
+`kind_writes_for_item` is now a thin wrapper: build a `WriteSchema`, call
+`derive_kind_writes`, return its two fields as the pre-existing tuple. It
+takes `token_prefix`/`kind_base`/`kind_lsi` as plain parameters rather than
+computing or importing them, since `animus-item` still has no
+`animus-tablet` dependency (no token hashing) and sits below the crate that
+defines the `KIND_*` byte constants (`animus-cp-data`) — the caller supplies
+both.
+
+**The entry — a new variant, `KvCommand::KindEval`, not new fields on
+`KindBatch`.** The ADR's Sequencing text reads "add the schema slice to
+`KindBatch`"; building it, a `KindBatch` entry already carries the leader's
+*finished* writes/change-log and a byte-level OCC seatbelt — fields for an
+unevaluated *operation* plus a schema slice would sit unused beside them
+until step 3, and step 3 needs `KindBatch`'s existing bytes/semantics to
+keep working for every producer not yet cut over. A sibling variant keeps
+the two entry shapes independently revertible, exactly as the ADR's own
+"Each step is independently revertible" line asks for, and avoids growing
+`KindBatch`'s codec shape for fields step 3 would delete again once the
+cutover finishes. `KindEval` carries `schema: WriteSchema`, `pk:
+AttributeValue`, `sk: Option<AttributeValue>`, `op: KindEvalOp`
+(`Put(Item)`/`Delete`/`Update{key_item, actions}` — the wire-decode-free
+mirror of `animus-node`'s `KindWriteOp`), `condition:
+Option<ConditionExpression>` (the client's own rich expression, not a
+byte-level OCC pair — apply's own read already *is* current state, so no
+seatbelt is needed), `ttl_expired: bool`, and `ts: HlcTimestamp`. No
+`base_key`/token field: apply derives both from `pk`/`sk` via
+`animus_tablet::partition_token`, which `animus-cp-data` already depends on,
+removing a leader-computed value that could disagree with `pk` in principle.
+Codec version `25` (tag `16`): the four rich, evolving nested field types
+(`WriteSchema`, `AttributeValue`×2, `KindEvalOp`, `Option<ConditionExpression>`)
+each ride as one `serde_json`-encoded blob inside the binary envelope — the
+same convention `backup.rs`'s `BackupManifestObject` already uses for
+`TableSchema`'s own multi-field, evolving shape, rather than a hand-encoded
+field-by-field layout for four types that will keep growing fields.
+
+**Apply, in commit order.** `KvCommand::KindEval`'s apply arm: drain the
+pending run (so the read observes every earlier write this same apply pass
+committed, mirroring `KindBatch`'s own `conditions` read); compute the base
+key; check the seal/freeze gate first (`Sealed`, identical to `KindBatch`);
+read the current value, unwrap its envelope — an **unresolved intent from a
+concurrent transaction** is treated as `ConditionFailed` (ambiguous, never
+guessed at, mirroring `KindBatch.conditions`'/`Cas`'s identical foreign-
+intent discipline: the proposer's cue is "retry", the same as any other
+no-op); evaluate `condition` (`Ok(false)` → `ConditionFailed`; `Err` → see
+below); compute `new` via `op` (`Update`'s `apply_update` `Err` → see below);
+derive `writes`/`change_log` via `derive_kind_writes`; materialize via the
+one shared `materialize_derived` helper `KindBatch`'s own arm and
+`TxnResolve`'s commit branch already call — no third copy.
+
+**The outcome mapping — a new `KindBatchOutcome::Rejected { key, code,
+message }`, reusing the existing `KindBatchOutcomes` map rather than a
+`KindEval`-specific one.** The ADR left this open ("a new outcome variant
+`Rejected{code}` — decide and document"). Decided: `Rejected` is distinct
+from `ConditionFailed` because it carries genuinely different information a
+later wire-mapping step needs — a false `ConditionExpression` maps to
+`ConditionalCheckFailedException`, while a `ConditionExpression` that
+returns `Err` (a domain violation, e.g. `size()` on the wrong type) or an
+`apply_update` `Err` (a malformed update, a type mismatch, or the
+post-update item over the size cap) both map to `ValidationException` with a
+real message worth preserving. `code`/`message` copy `ConditionError`'s/
+`UpdateError`'s own fields verbatim — this crate stays protocol-agnostic and
+does not interpret them beyond copying them through. `code` is a `String`
+even though both source types currently only ever produce
+`"ValidationException"`, since nothing here assumes that stays true. The
+wire-level mapping to a real `WireError`/HTTP response is left entirely to
+step 3 — `animusd::classify_kind_batch_outcome`'s existing wildcard already
+treats an unrecognized `KindBatchOutcome` variant as `Inconclusive` (safe,
+since nothing produces `KindEval` yet), and step 3 should fold `Rejected`
+into the `NoOp` arm alongside `ConditionFailed`/`Sealed` when it wires a
+real producer.
+
+**The leader-local result payload (mechanism 3) — `KindEvalResult`/
+`KindEvalResults`, a *separate* structure from `KindBatchOutcomes`, exactly
+as the ADR specifies and for the reason it gives (memory on followers): a
+`KindEval` entry's `old`/`new` images are a normal by-product of every
+replica's own evaluation, but only the node that proposed a given entry ever
+wants them back. `RaftKvNode::propose_kind_eval` registers this node's
+interest in an accepted entry's index into a bounded `BTreeSet` **while
+still holding the same `core` mutex the apply task needs to lock before it
+can ever drain that entry** — a real ordering guarantee (not a hopeful
+race window) on every executor, `SimEnv`'s single-threaded cooperative
+scheduler and a genuine second OS thread under `ProdEnv` alike, since the
+apply task's `drain_apply` call cannot proceed until the registration's own
+critical section releases the lock. Apply's `KindEval` arm calls `fill`
+only when the entry actually applied (`Applied`, never on a rejection/no-op
+— there is no old/new pair worth keeping for those), consulting the
+`interested` set and promoting to a real, term-paired entry only on a hit.
+`RaftKvNode::take_kind_eval_result(index, term)` removes the slot on read
+(never a peek), mirroring `kind_batch_outcome`'s identical index-and-term
+identity discipline for the identical reason (an uncommitted entry's index
+can be reoccupied by a different command after a leadership change). Both
+`interested` and `results` are bounded by the same generous `RETAIN = 8192`
+`KindBatchOutcomes` already uses, for a slot nobody ever reads back.
+
+**Tests** (`animus-cp-data`, all `SimEnv`, seed-reproducible): a
+differential test comparing a `KindEval`'s own apply-derived rows (base,
+LSI, and the change record's *value*, ignoring its key's HLC suffix, which
+legitimately differs between two independent groups) against a `KindBatch`
+built by hand from the identical `derive_kind_writes` call; a false
+condition leaving every replica's row untouched; two `ADD` proposals issued
+back-to-back before either applies — the ADR's own motivating property —
+both landing with zero refusals (final value `+2`); the leader-local
+payload's three properties (the proposer sees it, a non-registered replica
+never does, a second read finds it gone); the frozen/sealed gate rejecting a
+`KindEval` exactly like a `KindBatch`; and a crash/restart replaying two
+`KindEval` entries to the identical committed state, including the correct
+final LSI row and the stale one's removal. `animus-item`'s own
+`write_schema` module carries the pure-function unit tests for
+`derive_kind_writes` itself (insert, LSI diff, unchanged-sort-attribute
+no-delete-reput, delete).
+
+**No producer proposes `KindEval` yet.** `kind_write_item_at_leader` still
+evaluates at the leader and proposes `KindBatch`, byte-identical to before
+this step. Step 3 (moving evaluation to apply for one operation end to end,
+behind the existing test suite, with the write-path benchmark run before and
+after) is still ahead — see that step's own handoff notes for what it needs
+from this one: `propose_kind_eval`'s exact signature, the `Rejected`
+outcome's `code`/`message` shape, and `classify_kind_batch_outcome`'s
+wildcard needing an explicit `Rejected` arm once a real caller exists.
+
+Status stays **Proposed**: only step 3 changes observable behaviour, and it
+has not landed.
+
+## As-built amendment (2026-09-05, Sequencing step 3 — the single-item write
+path cut over, seatbelt kept as a double-check)
+
+Step 3 landed: `kind_write_item_at_leader` (`crates/animusd/src/dynamo.rs`)
+no longer builds the write's finished bytes itself. For every `PutItem`/
+`DeleteItem`/`UpdateItem` it serves — every table, since ADR 0049 made the
+kind-write path universal, indexed/streamed/plain alike, conditional or
+not — it now builds the `WriteSchema` slice (`write_schema_for`, already
+landed in step 2) and a `KindEvalOp` mirror of the client's operation, and
+proposes a `KvCommand::KindEval` via a new sibling of `cp_kind_local`,
+`ClientCtx::cp_kind_eval_local` (`write_path.rs`). The wire-visible result —
+`Ok{old, new}` / `ConditionFailed` / a `ValidationException` — now comes
+from **apply's own confirmed decision**, read back via `classify_kind_batch_
+outcome` (reused verbatim, with the `Rejected` arm step 2 anticipated now
+wired in) and, on `Applied`, `RaftKvNode::take_kind_eval_result`. This is
+the ADR's whole point landing for real: apply evaluates the condition and
+the update against the current committed value **in commit order**, so two
+concurrent evaluators of one key no longer race a stale before-image.
+
+**The motivating regression is fixed, not just re-labeled.**
+`dynamo_update_add_delete.rs::concurrent_increments_all_land_exactly_once`
+(ten concurrent `ADD`s on one key) now asserts `counter == WRITERS` and zero
+refusals — the doc comment that used to explain why 2-of-10 refusals were
+*correct behaviour* now explains why they no longer happen. A sibling,
+`concurrent_conditional_add_all_land_exactly_once`, proves the same property
+for a **conditioned** `ADD` (`attribute_exists(pk)`, genuinely true for
+every racing writer) — the condition is now evaluated fresh at apply, so
+contention cannot make a genuinely-true condition spuriously fail either.
+
+**The seatbelt is kept, for this step only, as a double-check — not as a
+gate.** `kind_write_item_at_leader` still takes `ctx.data().rmw_lock`,
+reads its own `old` via `ClientCtx::cp_get_local_resolving`, and evaluates
+`condition`/`op` against it (`predict_kind_eval_decision`) — but that
+prediction is used **only** to compare against apply's confirmed outcome
+(`report_kind_eval_seatbelt_mismatch`) and never to decide what the client
+sees. A disagreement never fails the request (apply's decision is
+authoritative by construction) — it increments a new metric,
+`Metric::KindEvalSeatbeltMismatch` (`kind_eval_seatbelt_mismatch` on
+`/metrics`), and logs both decisions via `tracing::warn!`. The metric's own
+doc names the two possible directions explicitly: the leader predicting
+`ConditionFailed`/`Rejected` from a before-image a concurrent write
+supersedes before apply — reading fresher state — actually applies the
+write is **expected**, the contention this ADR exists to absorb; the
+reverse (apply rejecting a write the leader's own read predicted would
+succeed) is the direction worth investigating as a real evaluator
+divergence. A dedicated regression
+(`dynamo.rs::stream_write_path_tests::
+a_stale_leader_prediction_that_apply_supersedes_ticks_the_mismatch_metric_and_still_succeeds`)
+manufactures the expected direction deterministically (via the existing
+issue #285 `rmw285_confirm_gate` test hook) and asserts the request still
+succeeds — landing the write the leader's own stale read would have
+refused — while the counter ticks.
+
+**The lost-payload residual (mechanism 3) resolved.** If apply confirms
+`Applied` but this node's own leader-local `old`/`new` slot is gone
+(bounded retention aged it out under an unusually slow confirm, or
+leadership churned between accept and confirm), an idempotent write
+recovers with a best-effort re-read of the current value as `new` (`old`
+stays `None`, genuinely unrecoverable); a non-idempotent write (`ADD`)
+returns the identical ambiguous, non-retried error the pre-existing
+confirm-timeout path already used (`"CP kind write did not commit in
+time"`, reused verbatim rather than inventing a new one) — the ADR's own
+"Not removed, deliberately: Ambiguity" consequence, not a new gap.
+
+**Error mapping is byte-identical.** `KindBatchOutcome::Rejected{code,
+message}` maps back to `WireError::validation(message)` for
+`"ValidationException"` (the only code either `ConditionError`/
+`UpdateError` produce today) — the same mapping `From<ConditionError>`/
+`From<UpdateError>` already performed pre-cutover, so
+`dynamo_expression_surface.rs`'s `size_of_an_existing_number_attribute_is_a_
+validation_exception` and the rest of that suite needed no changes.
+
+**What did NOT move.** `eval_kind_txn_write`/`txn_stage_local`
+(`TransactWriteItems`' own evaluation) still evaluate at the leader and
+propose `KindBatch` — ADR 0054's Sequencing text moves them in step 4,
+alongside deleting `rmw_lock`, the `KindBatch.conditions` seatbelt, and this
+step's own mismatch metric. `BatchWriteItem`, the TTL reaper
+(`ttl_reaper.rs`), and the admin seeder (`admin::action_data_seed`) all
+route through `kind_write_item_at_leader`, so they cut over for free —
+`dynamo_ttl.rs`, `batch_write.rs`, `dynamo_batch_get.rs`, and
+`stream_write_path_tests::admin_seed_writes_through_the_kind_path_on_both_
+table_shapes` all stayed green unmodified. Forwarding needed no new
+`ClientRequest` variant: a forwarded write already lands on the leader's
+own node before `kind_write_item_at_leader` (and its `cp_kind_eval_local`
+propose) ever runs — `control_only.rs::
+mixed_cluster_put_via_control_node_forwards_to_data_node` is unmodified and
+green.
+
+**Benchmark gate (ADR 0049 §5's harness,
+`dynamo::stream_write_path_tests::bench_plain_table_put_wall_clock`,
+`#[ignore]`d — run with `cargo test -p animusd --lib bench_plain_table_put
+-- --ignored --nocapture`), 200 sequential `PutItem`s on a plain
+(unindexed, unstreamed) table, one node, 3 runs each, same host/session:**
+
+| Run | Parent (`6fb818b`, leader-evaluated) | This commit (apply-evaluated) |
+|-----|---------------------------------------|--------------------------------|
+| 1   | 3.13 ms/op                            | 3.15 ms/op                     |
+| 2   | 3.15 ms/op                            | 3.15 ms/op                     |
+| 3   | 3.27 ms/op                            | 3.26 ms/op                     |
+
+No measurable regression — the two medians (3.15 ms/op both) are identical
+within run-to-run noise. The ADR's own risk section named the apply
+task's now-serial per-item evaluation as "the main risk, to be measured
+rather than argued": for a plain table's unconditional `Put`, apply's own
+read-then-evaluate cost is the same single engine read
+`kind_write_item_at_leader`'s old leader-side read already paid — moving
+*where* that read happens does not add a second one, so the risk did not
+materialize for this workload. (The seatbelt double-check kept for this
+step *does* add a second, redundant read+evaluate on the leader — the very
+thing step 4 removes — so this number is a conservative upper bound on
+step 3's own overhead, not a preview of the post-step-4 steady state.)
+
+Status stays **Proposed**: step 4 (moving the remaining producers and
+deleting the seatbelt/`rmw_lock`/this step's own mismatch metric) is still
+ahead, and the ADR's Sequencing text reserves Accepted for after it lands.

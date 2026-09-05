@@ -50,6 +50,9 @@ use animus_control::persist_round::{
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
+// ADR 0054 step 2: the pure item model/evaluation crate below the wire
+// adapter — see `KvCommand::KindEval`'s own doc for how these are used.
+use animus_item::{AttributeValue, ConditionExpression, Item, UpdateAction, WriteSchema};
 use animus_storage::{MergeOp, StorageEngine, Version};
 use animus_tablet::{KeyRange, SplitChild};
 use futures::future::{Either, select};
@@ -371,6 +374,30 @@ pub const ALL_KINDS: [u8; 5] = [
 /// tuple.
 pub type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
 
+/// The write operation a [`KvCommand::KindEval`] entry evaluates at apply
+/// (ADR 0054 step 2) — the self-contained mirror of `animus-node`'s
+/// wire-level `KindWriteOp`, minus its wire-decode concerns: by the time
+/// this command exists, an `UpdateExpression`'s text has already been
+/// parsed into a `Vec<UpdateAction>` at the edge (parsing needs
+/// `ExpressionAttributeNames`/`Values`, genuine wire-decode work that stays
+/// above this crate — see `animus-item`'s own module doc for the same
+/// parser/evaluator boundary).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KindEvalOp {
+    /// Unconditionally replace the item (a `PutItem`, or a transactional
+    /// `Put`).
+    Put(Item),
+    /// Delete the item (a `DeleteItem`, or a transactional `Delete`).
+    Delete,
+    /// `UpdateItem`'s read-modify-write: `key_item` seeds a brand-new
+    /// item's key attributes when none exists yet, then `actions` folds via
+    /// [`animus_item::apply_update`].
+    Update {
+        key_item: Item,
+        actions: Vec<UpdateAction>,
+    },
+}
+
 /// The sibling scope set a tablet group owns, derived from its **parent**
 /// scope (this tablet's immutable declared range; F2b — no table prefix),
 /// indexed by kind selector. Each entry's physical prefix is its one kind
@@ -651,6 +678,84 @@ pub enum KvCommand {
         /// distinct items.
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        ts: HlcTimestamp,
+    },
+    /// **Self-contained evaluated write** (ADR 0054 step 2). Unlike
+    /// [`KindBatch`](Self::KindBatch), which carries the LEADER's
+    /// precomputed result bytes plus an apply-time OCC seatbelt against the
+    /// item having gone stale in the propose→apply window, this variant
+    /// carries the *operation* — apply reads the tablet's own current
+    /// committed item at this item's base key **in commit order** (the
+    /// position this entry's own log index fixes), evaluates `condition`
+    /// and `op` against exactly that state, derives the LSI rows and
+    /// change-log record (`animus_item::derive_kind_writes`), and writes —
+    /// all at one point in a total order, where no stale before-image can
+    /// exist. See ADR 0054's Decision section (mechanisms 1-3) for the full
+    /// design this variant implements.
+    ///
+    /// **`schema` is this write's frozen schema slice** (ADR 0054
+    /// mechanism 1) — built from the leader's own read of replicated
+    /// `Metadata` at PROPOSE time (`animusd::dynamo::write_schema_for`,
+    /// mirroring `schema_for`'s own read), never re-read at apply: apply
+    /// has no catalog access at all — see [`WriteSchema`]'s own doc for why
+    /// that is a structural boundary, not an omission (a live read here
+    /// would let two replicas of the same entry derive different index
+    /// rows against different catalog versions and diverge).
+    ///
+    /// `pk`/`sk` identify the item; apply derives its own base key and ADR
+    /// 0022 partition token from them (this crate depends on
+    /// `animus-tablet`, so there is no reason to also carry a
+    /// leader-computed token the way `KindBatch.writes`' keys do — deriving
+    /// it fresh on every replica costs nothing and removes a
+    /// leader-computed value that could disagree with `pk` in principle).
+    /// `condition` is the client's own richer `ConditionExpression`
+    /// (unlike `KindBatch.conditions`' byte-level OCC pairs — this variant
+    /// needs no seatbelt at all, since apply's own read already IS the
+    /// current state, not a leader's stale echo of it). `ttl_expired`
+    /// stamps the derived change record's own flag exactly like
+    /// `kind_writes_for_item`'s trailing parameter (ADR 0051 §7).
+    ///
+    /// **The apply-time outcome** (`KindBatchOutcome`, recorded in the same
+    /// bounded, replicated `KindBatchOutcomes` map every `KindBatch` uses —
+    /// see that type's own doc): `Applied` on success; `ConditionFailed`
+    /// when `condition` evaluates to `Ok(false)` (a routine
+    /// `ConditionalCheckFailedException`-shaped no-op) OR when the base key
+    /// currently holds an unresolved intent from a concurrent transaction
+    /// (ambiguous — never guess at "the current committed value", mirroring
+    /// `KindBatch.conditions`' and `Cas`'s identical discipline for a
+    /// foreign intent; the proposer's cue is the same as any other no-op:
+    /// retry); `Sealed` when the base key falls in a frozen split parent's
+    /// closed range, exactly like `KindBatch`; and the new
+    /// [`KindBatchOutcome::Rejected`] when `condition.evaluate` returns
+    /// `Err` (a domain-violation `ValidationException`, e.g. `size()` on
+    /// the wrong type — distinct from a false condition) or `op`'s own
+    /// `Update` folds via `animus_item::apply_update` and that returns
+    /// `Err` (a malformed update, a type mismatch, or the post-update item
+    /// exceeding the size cap — also `ValidationException`-shaped today).
+    /// Every replica computes the identical decision (no clock/RNG beyond
+    /// this entry's own `ts`, minted once at propose and carried in the
+    /// log like every other mutating variant's).
+    ///
+    /// **The result payload** (old/new image) is deliberately NOT part of
+    /// the outcome above — see [`RaftKvNode::propose_kind_eval`]'s own doc
+    /// for why it lives in a separate, leader-local, never-replicated slot
+    /// map instead (ADR 0054 mechanism 3: a follower never needs it, and
+    /// attaching it to the replicated outcome would grow every follower's
+    /// memory for a value nobody there reads).
+    ///
+    /// **UNWIRED as of this PR (ADR 0054's Sequencing step 2)**: no
+    /// producer proposes this variant yet — `kind_write_item_at_leader`
+    /// still evaluates at the leader and proposes `KindBatch`, unchanged.
+    /// This lands ahead of that cutover (step 3) so apply's evaluation, the
+    /// outcome mapping, and the leader-local result-slot plumbing are all
+    /// `SimEnv`-tested in isolation first, each independently revertible.
+    KindEval {
+        schema: WriteSchema,
+        pk: AttributeValue,
+        sk: Option<AttributeValue>,
+        op: KindEvalOp,
+        condition: Option<ConditionExpression>,
+        ttl_expired: bool,
         ts: HlcTimestamp,
     },
     /// **Split-build seed batch** (ADR 0050 Train B rung 4, fork F3): a chunk
@@ -1202,6 +1307,27 @@ pub enum KindBatchOutcome {
     /// child, not to retry here. Same term-independent soundness as
     /// `ConditionFailed`.
     Sealed { key: Vec<u8> },
+    /// **`KvCommand::KindEval`-only** (ADR 0054 step 2): the write was
+    /// rejected by the evaluator itself, distinct from an ordinary false
+    /// `ConditionExpression` — either the client's own condition evaluated
+    /// to `Err` (a domain violation, e.g. `size()` on the wrong type) or
+    /// `op`'s `Update` folded via `animus_item::apply_update` and that
+    /// returned `Err` (a malformed update, a type mismatch, or the
+    /// post-update item exceeding the size cap). `code`/`message` carry
+    /// `ConditionError`'s/`UpdateError`'s own fields verbatim — `code` is
+    /// always `"ValidationException"` today (both error types currently
+    /// only ever construct that one code), kept as an owned `String`
+    /// rather than assuming that stays true forever. The wire-level
+    /// mapping to a `WireError`/HTTP response is a later step's job (ADR
+    /// 0054 step 3) — this crate is protocol-agnostic and knows nothing of
+    /// DynamoDB exception names beyond copying them through verbatim.
+    /// Same term-independent soundness as `ConditionFailed`/`Sealed`: a
+    /// no-op is a no-op regardless of whose entry occupies the index.
+    Rejected {
+        key: Vec<u8>,
+        code: String,
+        message: String,
+    },
 }
 
 /// Per-`KindBatch` outcomes recorded at apply time, keyed by the entry's Raft
@@ -1232,6 +1358,101 @@ impl KindBatchOutcomes {
         if self.outcomes.len() > (Self::RETAIN as usize) * 2 {
             let cutoff = index.saturating_sub(Self::RETAIN);
             self.outcomes = self.outcomes.split_off(&cutoff);
+        }
+    }
+}
+
+/// The **leader-local** result payload of one `KvCommand::KindEval` entry
+/// (ADR 0054 mechanism 3): the item immediately before and after the write
+/// applied. Never replicated, never part of a snapshot image, never read by
+/// a follower — see [`RaftKvNode::propose_kind_eval`]'s own doc for the
+/// registration mechanism that fills this, and why it is a *separate*
+/// structure from the replicated [`KindBatchOutcome`] rather than a field
+/// added to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KindEvalResult {
+    /// The item immediately before this entry applied — `None` if it did
+    /// not exist.
+    pub old: Option<Item>,
+    /// The item immediately after this entry applied — `None` for a
+    /// delete.
+    pub new: Option<Item>,
+}
+
+/// The leader-local slot map [`KvCommand::KindEval`]'s apply arm fills
+/// (ADR 0054 mechanism 3) — deliberately **not** the same map as
+/// [`KindBatchOutcomes`], for a reason that is memory, not correctness: a
+/// `KindEval` entry applies on every replica of a group, and every replica
+/// derives the identical `old`/`new` images as a normal part of evaluating
+/// the write — but only the ONE node that proposed a given entry (if any;
+/// a `txn_resolver_loop`-style recovery push registers nothing) ever wants
+/// to read them back. Folding the payload into `KindBatchOutcomes` would
+/// make every follower's bounded-but-nonzero retention map carry full item
+/// images for entries it never asked about, for no reader — the exact
+/// "why the payload is not in the outcome map" the ADR names.
+///
+/// `interested` and `results` are deliberately two separate structures
+/// rather than one map with an `Option<KindEvalResult>` placeholder value:
+/// `register` (propose time) only ever needs to record "this index",
+/// `fill` (apply time) only ever needs to check membership and, on a hit,
+/// promote to a real entry — collapsing them would still work but would
+/// make `fill`'s "was this even registered" check indistinguishable from
+/// "registered but not yet filled" without an extra tri-state, which
+/// this shape never needs.
+#[derive(Default)]
+struct KindEvalResults {
+    /// Indices this node has asked to see the leader-local payload for.
+    /// Populated by [`register`](Self::register) at PROPOSE time — before
+    /// the entry is even visible to the apply task, see
+    /// [`RaftKvNode::propose_kind_eval`]'s own doc for why that ordering is
+    /// guaranteed rather than merely likely — consumed (removed) by
+    /// [`fill`](Self::fill) at APPLY time whether or not the index turns
+    /// out to actually be a `KindEval` entry when apply reaches it (a
+    /// leadership change can truncate and reoccupy an index with a
+    /// different command; nothing would ever call `fill` for it, so a
+    /// registration that never gets consumed is bounded by the same
+    /// `RETAIN` pruning `results` uses, below).
+    interested: BTreeSet<u64>,
+    /// The payload recorded for an index this node was interested in when
+    /// it applied, paired with the entry's own Raft term (the identical
+    /// index+term identity discipline [`KindBatchOutcomes`] uses) —
+    /// removed the moment [`take`](Self::take) reads it, so this map's
+    /// steady-state size tracks in-flight local proposals, never a fixed
+    /// retention window the way `KindBatchOutcomes` is bounded.
+    results: BTreeMap<u64, (u64, KindEvalResult)>,
+}
+
+impl KindEvalResults {
+    /// Same generous bound as [`KindBatchOutcomes::RETAIN`], for the
+    /// identical reason: a slot nobody ever reads back (a confirm loop that
+    /// gave up, or this node losing leadership before polling) must not
+    /// grow either map without bound.
+    const RETAIN: u64 = 8192;
+
+    fn register(&mut self, index: u64) {
+        self.interested.insert(index);
+        if self.interested.len() > (Self::RETAIN as usize) * 2 {
+            let cutoff = index.saturating_sub(Self::RETAIN);
+            self.interested = self.interested.split_off(&cutoff);
+        }
+    }
+
+    fn fill(&mut self, index: u64, term: u64, result: KindEvalResult) {
+        if self.interested.remove(&index) {
+            self.results.insert(index, (term, result));
+            if self.results.len() > (Self::RETAIN as usize) * 2 {
+                let cutoff = index.saturating_sub(Self::RETAIN);
+                self.results = self.results.split_off(&cutoff);
+            }
+        }
+    }
+
+    fn take(&mut self, index: u64, term: u64) -> Option<KindEvalResult> {
+        match self.results.get(&index) {
+            Some((recorded_term, _)) if *recorded_term == term => {
+                self.results.remove(&index).map(|(_, result)| result)
+            }
+            _ => None,
         }
     }
 }
@@ -1578,6 +1799,9 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     resolve: Arc<Mutex<ResolveOutcomes>>,
     /// Per-`KindBatch` apply-time outcomes — see [`KindBatchOutcomes`]'s doc.
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
+    /// Leader-local `KvCommand::KindEval` result payloads (ADR 0054
+    /// mechanism 3) — see [`KindEvalResults`]'s doc.
+    kind_eval_results: Arc<Mutex<KindEvalResults>>,
     /// Highest Raft log index the **apply task** has merged into the engine. The
     /// consensus loop advances the core's `last_applied` (its buffer cursor) as soon
     /// as entries are committed+durable, but the async apply task lags behind
@@ -1972,6 +2196,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let stage = Arc::new(Mutex::new(StageOutcomes::default()));
         let resolve = Arc::new(Mutex::new(ResolveOutcomes::default()));
         let kind_outcomes = Arc::new(Mutex::new(KindBatchOutcomes::default()));
+        let kind_eval_results = Arc::new(Mutex::new(KindEvalResults::default()));
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
@@ -2026,6 +2251,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stage: Arc::clone(&stage),
             resolve: Arc::clone(&resolve),
             kind_outcomes: Arc::clone(&kind_outcomes),
+            kind_eval_results: Arc::clone(&kind_eval_results),
             engine_applied: Arc::clone(&engine_applied),
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
@@ -2063,6 +2289,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             stage,
             resolve,
             kind_outcomes,
+            kind_eval_results,
             engine_applied,
             wal_lock,
             halted,
@@ -2584,8 +2811,97 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         })
     }
 
+    /// Propose a **self-contained evaluated write** (ADR 0054 step 2 — see
+    /// [`KvCommand::KindEval`]'s own doc for what apply evaluates and why).
+    /// Leader-only (else a leader hint), like every other propose method
+    /// here.
+    ///
+    /// **Registers this node's interest in the entry's leader-local result
+    /// payload** (ADR 0054 mechanism 3, [`KindEvalResults`]) the instant
+    /// the propose is accepted — under the SAME `core` lock the apply task
+    /// needs to hold before it can ever see this entry at all
+    /// (`apply_and_compact`'s own `core.lock().drain_apply()` call). That
+    /// shared lock is what makes the registration a guarantee rather than a
+    /// race: this method does not release `core` until *after* it has
+    /// recorded interest, so the apply task — on any executor, including a
+    /// genuine second OS thread under `ProdEnv` — cannot possibly have
+    /// already applied (and so already looked up) this index by the time
+    /// interest is registered. A caller that never asks for the payload
+    /// (a `txn_resolver_loop`-style recovery push would be one, though
+    /// none exists yet) simply never calls [`take_kind_eval_result`]
+    /// (Self::take_kind_eval_result) — the registered interest then ages
+    /// out with [`KindEvalResults::RETAIN`], exactly like an unread
+    /// `KindBatchOutcome`.
+    ///
+    /// **No production caller as of this PR** — see the variant's own
+    /// "UNWIRED" note.
+    pub fn propose_kind_eval(
+        &self,
+        schema: WriteSchema,
+        pk: AttributeValue,
+        sk: Option<AttributeValue>,
+        op: KindEvalOp,
+        condition: Option<ConditionExpression>,
+        ttl_expired: bool,
+    ) -> ProposeResult {
+        let mut core = self.lock();
+        let term = core.term();
+        let key = kind_eval_base_key(&pk, sk.as_ref());
+        let ts = self.mint_pushed(term, std::slice::from_ref(&key));
+        let command = KvCommand::KindEval {
+            schema,
+            pk,
+            sk,
+            op,
+            condition,
+            ttl_expired,
+            ts,
+        };
+        let result = record_propose(&self.metrics, core.propose(command));
+        if let ProposeResult::Accepted { index, .. } = result {
+            self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
+            // See `propose_ordered`'s identical note.
+            core.note_local_activity(self.env.now());
+            // Register interest BEFORE dropping `core` — see this method's
+            // own doc for why that ordering is what makes the registration
+            // race-free rather than merely usually-fine.
+            self.kind_eval_results
+                .lock()
+                .expect("kind eval results poisoned")
+                .register(index);
+        }
+        drop(core);
+        if matches!(result, ProposeResult::Accepted { .. }) {
+            self.propose_signal.notify();
+            // See `propose_ordered`'s identical note: a single-node group's
+            // `core.propose` can advance commit + apply inline.
+            self.apply_signal.notify();
+        }
+        result
+    }
+
+    /// Take back the leader-local result payload of the `KvCommand::
+    /// KindEval` entry committed at Raft log `index` (ADR 0054 mechanism
+    /// 3) — `Some` only if THIS node called [`propose_kind_eval`]
+    /// (Self::propose_kind_eval) for that exact entry (registering
+    /// interest) and apply has since reached it. `term` must be the term
+    /// the caller's own [`ProposeResult::Accepted`] returned — mirrors
+    /// [`kind_batch_outcome`](Self::kind_batch_outcome)'s identical
+    /// index-and-term identity discipline, for the identical reason (an
+    /// uncommitted entry's index can be reoccupied by a different command
+    /// after a leadership change). **Removes the slot on a hit** — a
+    /// confirm poll's own retry loop must call this at most once per
+    /// entry it actually intends to consume, never speculatively.
+    #[must_use]
+    pub fn take_kind_eval_result(&self, index: u64, term: u64) -> Option<KindEvalResult> {
+        self.kind_eval_results
+            .lock()
+            .expect("kind eval results poisoned")
+            .take(index, term)
+    }
+
     /// Propose a **split-build seed chunk** into this (child) group's log
-    /// (ADR 0050 Train B rung 4 — see [`KvCommand::SeedBatch`]'s doc for the
+    /// (ADR 0050 Train B rung 4 — see [`KvCommand::SeedBatch`]'s own doc for the
     /// full semantics: version-carrying merges, envelope bytes verbatim, no
     /// change-log emission). The entry's own `ts` is minted normally
     /// (`propose_ordered`), keeping the apply-time monotonicity assert
@@ -6113,6 +6429,116 @@ fn materialize_derived(
     }
 }
 
+/// The logical `KIND_BASE` key of one item, given its identity alone —
+/// `partition_token(escape(pk)) || escape(pk) || sk` (ADR 0022): the ADR
+/// 0022 partition token this crate derives (via `animus-tablet`, which
+/// `animus-item` deliberately does not depend on) prepended to
+/// `animus_item::storage_key`'s within-table key. Shared by
+/// [`RaftKvNode::propose_kind_eval`] (to mint this write's `ts` against the
+/// same key `mint_pushed`'s overlap check needs) and `KvCommand::
+/// KindEval`'s apply arm (to know which physical row to read/gate against).
+fn kind_eval_base_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
+    let mut key = animus_tablet::partition_token(&animus_item::storage_key(pk, None)).to_vec();
+    key.extend_from_slice(&animus_item::storage_key(pk, sk));
+    key
+}
+
+/// The outcome of [`evaluate_kind_eval`] — the pure decision half of
+/// [`KvCommand::KindEval`]'s apply arm, factored out so it is directly
+/// unit-testable with no engine/`Env` in sight (the arm itself owns
+/// everything I/O-shaped: the current-value read and the actual merge).
+#[derive(Debug, PartialEq, Eq)]
+enum KindEvalDecision {
+    /// The write evaluated cleanly: `writes`/`change_log` are exactly what
+    /// [`materialize_derived`] needs, and `old`/`new` are the leader-local
+    /// result payload (ADR 0054 mechanism 3).
+    Applied {
+        writes: Vec<KindWrite>,
+        change_log: (Vec<u8>, Vec<u8>),
+        old: Option<Item>,
+        new: Option<Item>,
+    },
+    /// `condition` evaluated to `Ok(false)` — an ordinary
+    /// `ConditionalCheckFailedException`-shaped no-op.
+    ConditionFailed,
+    /// `condition` evaluated to `Err` (a domain violation, e.g. `size()` on
+    /// the wrong type), or `op`'s `Update` folded via
+    /// [`animus_item::apply_update`] and that returned `Err` — see
+    /// [`KindBatchOutcome::Rejected`]'s own doc for the full account of
+    /// the two cases this covers.
+    Rejected { code: String, message: String },
+}
+
+/// The pure evaluation core of [`KvCommand::KindEval`]'s apply arm (ADR
+/// 0054 step 2): given the schema slice the entry carries, the item's
+/// identity, its OWN partition token (`token_prefix`), the current item
+/// read from the engine in commit order, the operation, and an optional
+/// client condition, decide what this write does. No I/O, no clock, no
+/// RNG — a pure function of its arguments, which is what makes every
+/// replica's decision identical by construction.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after, mirrors kind_writes_for_item
+fn evaluate_kind_eval(
+    schema: &WriteSchema,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    token_prefix: &[u8],
+    old: Option<Item>,
+    op: &KindEvalOp,
+    condition: Option<&ConditionExpression>,
+    ttl_expired: bool,
+) -> KindEvalDecision {
+    if let Some(cond) = condition {
+        match cond.evaluate(old.as_ref()) {
+            Ok(true) => {}
+            Ok(false) => return KindEvalDecision::ConditionFailed,
+            Err(e) => {
+                return KindEvalDecision::Rejected {
+                    code: "ValidationException".to_owned(),
+                    message: e.message,
+                };
+            }
+        }
+    }
+    let new = match op {
+        KindEvalOp::Put(item) => Some(item.clone()),
+        KindEvalOp::Delete => None,
+        KindEvalOp::Update { key_item, actions } => {
+            let base = old.clone().unwrap_or_else(|| key_item.clone());
+            match animus_item::apply_update(base, actions) {
+                Ok(item) => Some(item),
+                Err(e) => {
+                    return KindEvalDecision::Rejected {
+                        code: e.code.to_owned(),
+                        message: e.message,
+                    };
+                }
+            }
+        }
+    };
+    let base_value = match &new {
+        Some(item) => animus_item::encode_stored_item(item),
+        None => animus_item::encode_tombstone(),
+    };
+    let derived = animus_item::derive_kind_writes(
+        schema,
+        pk,
+        sk,
+        token_prefix,
+        base_value,
+        old.as_ref(),
+        new.as_ref(),
+        ttl_expired,
+        KIND_BASE,
+        KIND_LSI,
+    );
+    KindEvalDecision::Applied {
+        writes: derived.writes,
+        change_log: derived.change_log,
+        old,
+        new,
+    }
+}
+
 /// ADR 0046 A1: every kind-write key a [`txn::TxnWrite`] stages must lead
 /// with `base_key`'s own partition token (ADR 0022) — see the call sites'
 /// doc for why this is checked, not assumed. `base_key` shorter than a full
@@ -6278,6 +6704,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     stage: &Arc<Mutex<StageOutcomes>>,
     resolve: &Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: &Arc<Mutex<KindBatchOutcomes>>,
+    kind_eval_results: &Arc<Mutex<KindEvalResults>>,
     engine_applied: &AtomicU64,
     wal_lock: &AsyncMutex<()>,
     halted: &AtomicBool,
@@ -6619,6 +7046,120 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // loop.
                     materialize_derived(kind_scopes, &writes, &change_log, ts, &mut pending);
                 }
+            }
+            KvCommand::KindEval {
+                schema,
+                pk,
+                sk,
+                op,
+                condition,
+                ttl_expired,
+                ts,
+            } => {
+                assert_ts_monotonic(max_applied_ts, ts);
+                // Read the current item in COMMIT ORDER (ADR 0054's
+                // Decision section) — drain the pending run first so this
+                // read observes every earlier write in this same apply
+                // pass, mirroring `KindBatch`'s own `conditions` read and
+                // `Cas`'s identical read-after-flush discipline.
+                flush_pending(storage, &mut pending, metrics, halted).await;
+                let token = animus_tablet::partition_token(&animus_item::storage_key(&pk, None));
+                let base_key = {
+                    let mut key = token.to_vec();
+                    key.extend_from_slice(&animus_item::storage_key(&pk, sk.as_ref()));
+                    key
+                };
+                let outcome = if is_sealed(sealed, &base_key) {
+                    KindBatchOutcome::Sealed {
+                        key: base_key.clone(),
+                    }
+                } else {
+                    let raw = storage
+                        .get(&scope.physical(&base_key))
+                        .await
+                        .expect("raftkv kind eval read");
+                    match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                        // An unresolved intent from a concurrent transaction
+                        // makes "the current committed value" ambiguous —
+                        // never guess, mirroring `KindBatch.conditions`'
+                        // and `Cas`'s identical discipline for a foreign
+                        // intent. The proposer's cue is the same as any
+                        // other no-op: retry.
+                        Some(txn::Envelope::Intent { .. }) => KindBatchOutcome::ConditionFailed {
+                            key: base_key.clone(),
+                        },
+                        committed => {
+                            let old: Option<Item> = match committed {
+                                Some(txn::Envelope::Committed(bytes)) => {
+                                    animus_item::decode_stored_item(&bytes)
+                                        .expect("raftkv kind eval decode")
+                                }
+                                Some(txn::Envelope::Intent { .. }) => {
+                                    unreachable!("handled by the arm above")
+                                }
+                                None => None,
+                            };
+                            match evaluate_kind_eval(
+                                &schema,
+                                &pk,
+                                sk.as_ref(),
+                                &token,
+                                old,
+                                &op,
+                                condition.as_ref(),
+                                ttl_expired,
+                            ) {
+                                KindEvalDecision::ConditionFailed => {
+                                    KindBatchOutcome::ConditionFailed {
+                                        key: base_key.clone(),
+                                    }
+                                }
+                                KindEvalDecision::Rejected { code, message } => {
+                                    KindBatchOutcome::Rejected {
+                                        key: base_key.clone(),
+                                        code,
+                                        message,
+                                    }
+                                }
+                                KindEvalDecision::Applied {
+                                    writes,
+                                    change_log,
+                                    old,
+                                    new,
+                                } => {
+                                    // ADR 0046 binding decision, reused
+                                    // verbatim: the ONE shared
+                                    // materialization helper `KindBatch`'s
+                                    // own arm above and `TxnResolve`'s
+                                    // commit branch below also call.
+                                    materialize_derived(
+                                        kind_scopes,
+                                        &writes,
+                                        std::slice::from_ref(&change_log),
+                                        ts,
+                                        &mut pending,
+                                    );
+                                    // Leader-local result payload (ADR 0054
+                                    // mechanism 3) — a no-op unless this
+                                    // node itself registered interest in
+                                    // this exact index at propose time (see
+                                    // `RaftKvNode::propose_kind_eval`'s
+                                    // doc); a follower that never proposed
+                                    // this entry never fills anything here.
+                                    kind_eval_results
+                                        .lock()
+                                        .expect("kind eval results poisoned")
+                                        .fill(index, term, KindEvalResult { old, new });
+                                    KindBatchOutcome::Applied
+                                }
+                            }
+                        }
+                    }
+                };
+                kind_outcomes
+                    .lock()
+                    .expect("kind batch outcomes poisoned")
+                    .record(index, term, outcome);
             }
             KvCommand::Delete { key, ts } => {
                 assert_ts_monotonic(max_applied_ts, ts);
@@ -8170,6 +8711,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     stage: Arc<Mutex<StageOutcomes>>,
     resolve: Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
+    kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -8243,6 +8785,7 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         KvCommand::Put { ts, .. }
         | KvCommand::Batch { ts, .. }
         | KvCommand::KindBatch { ts, .. }
+        | KvCommand::KindEval { ts, .. }
         | KvCommand::SeedBatch { ts, .. }
         | KvCommand::Delete { ts, .. }
         | KvCommand::Cas { ts, .. }
@@ -8309,6 +8852,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stage,
         resolve,
         kind_outcomes,
+        kind_eval_results,
         engine_applied,
         wal_lock,
         halted,
@@ -8474,6 +9018,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         stage,
         resolve,
         kind_outcomes,
+        kind_eval_results,
         Arc::clone(&engine_applied),
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
@@ -8955,6 +9500,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     stage: Arc<Mutex<StageOutcomes>>,
     resolve: Arc<Mutex<ResolveOutcomes>>,
     kind_outcomes: Arc<Mutex<KindBatchOutcomes>>,
+    kind_eval_results: Arc<Mutex<KindEvalResults>>,
     engine_applied: Arc<AtomicU64>,
     wal_lock: Arc<AsyncMutex<()>>,
     halted: Arc<AtomicBool>,
@@ -9004,6 +9550,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &stage,
             &resolve,
             &kind_outcomes,
+            &kind_eval_results,
             &engine_applied,
             &wal_lock,
             &halted,
