@@ -23,15 +23,20 @@ the production implementation; the deterministic implementation lives in
   and exposes `metrics_text()` (ADR 0015). Also `FsSegmentStore` (below),
   the single-directory `SegmentStore` impl, since it does the same real
   `tokio::fs` I/O `ProdEnv` does.
-- **`prod.rs` is gated behind a default-off `prod` Cargo feature (ADR 0061
-  rung C0)**, added specifically so `ProdEnv`/`FsSegmentStore` can be made
-  compiler-unreachable from a crate's manifest, not just avoided by
-  convention — the prerequisite for the `animus-node` carve-out (ADR 0061
-  Phase C) to be an enforced boundary. `pub mod prod;` and
-  `pub use prod::{FsSegmentStore, ProdEnv};` in `lib.rs` both carry
+- `tls.rs` — `TlsConfig`/`TlsMaterial`/`MaybeTlsStream` (ADR 0064, S-01):
+  the intra-node wire's TLS material and transport wrapper. See "TLS on the
+  intra-node wire" below.
+- **`prod.rs`/`tls.rs` are gated behind a default-off `prod` Cargo feature
+  (ADR 0061 rung C0)**, added specifically so `ProdEnv`/`FsSegmentStore`
+  can be made compiler-unreachable from a crate's manifest, not just
+  avoided by convention — the prerequisite for the `animus-node` carve-out
+  (ADR 0061 Phase C) to be an enforced boundary. `pub mod prod;`/`pub mod
+  tls;` and `pub use prod::{FsSegmentStore, ProdEnv};`/`pub use
+  tls::{MaybeTlsStream, TlsConfig, TlsMaterial};` in `lib.rs` all carry
   `#[cfg(feature = "prod")]`. The trait definitions, `NodeId`, and
-  `metrics.rs` need none of `prod.rs`'s dependencies and are never gated.
-  **Only `tokio`, `rand`, and `tracing` are `prod.rs`-only** and became
+  `metrics.rs` need none of this and are never gated.
+  **Only `tokio`, `rand`, `tracing`, `rustls`, `tokio-rustls`,
+  `rustls-pemfile`, and `rustls-pki-types` are `prod`-only** and became
   `optional = true` dependencies pulled in by the feature
   (`async-trait`/`serde`/`thiserror` back the trait definitions and `NodeId`
   themselves, so they stay unconditional). Every current consumer that
@@ -375,6 +380,78 @@ the production implementation; the deterministic implementation lives in
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.
 
+- **TLS on the intra-node wire (ADR 0064, S-01 step 1) — `tls.rs`, config-gated,
+  default off, byte-for-byte unchanged when unconfigured.** `TlsConfig
+  {cert_path, key_path, ca_path: Option<PathBuf>}` names three PEM files —
+  file-based like `--dynamo-auth`, no inline PEM in config/CLI. `TlsConfig::
+  load()` reads them once and builds `TlsMaterial{acceptor, connector}` —
+  today, **always mutual TLS**: a `ServerConfig` requiring and verifying a
+  peer's client cert against `ca_path`, and a `ClientConfig` presenting this
+  node's own cert and verifying the peer's against the same CA. `ca_path` is
+  `Option` only because a future server-only mode (the client/admin/console
+  ports, commit 2) has no peer cert to verify; `load()` errors if it's
+  `None` today, since the internal wire has no server-only mode. Crypto
+  provider is pinned to `ring` (`rustls::crypto::ring::default_provider()`)
+  — the same provider already in the graph via `kube`'s `rustls-tls`
+  feature, so the workspace carries one crypto backend, not two.
+  - **`MaybeTlsStream { Plain(TcpStream), Tls(Box<tokio_rustls::
+    TlsStream<TcpStream>>) }`** is the transport wrapper every accept/dial
+    path in `prod.rs` moves through, implementing `AsyncRead + AsyncWrite`
+    by delegating to whichever variant is live. `tokio_rustls::TlsStream<T>`
+    already unifies the client- and server-initiated cases, so this enum
+    needs no third variant. Boxed only on the `Tls` arm (a plain `TcpStream`
+    needs no heap allocation at all); chosen over a `Box<dyn ..>` for the
+    whole enum because this sits on the hot path every frame — every Raft
+    heartbeat included — moves through, and over a Cargo feature because a
+    feature would bifurcate this crate's own build for what is a runtime
+    config choice, not a compile-time one. Lives in `animus-env` (not
+    `prod.rs`'s own concern folded away) specifically so `animusd` can reuse
+    it verbatim for its own client/intra/admin/console listeners in commit 2.
+  - **`ProdEnv::bind` is untouched — it now just calls the new, general
+    `ProdEnv::bind_with_tls(node_id, listen, data_dir, tls: Option<
+    TlsConfig>)` with `None`.** Every one of this workspace's ~25+ existing
+    `ProdEnv::bind` call sites (across `animusd`, `animus-control`,
+    `animus-cp-data`, `animus-storage`) keeps compiling and behaving
+    identically with zero changes — only a caller that actually wants TLS
+    reaches for `bind_with_tls` instead. `Inner` gained one field
+    (`tls: Option<TlsMaterial>`, shared across the env's clones) and the
+    pooled-connection map's value type changed from `Option<TcpStream>` to
+    `Option<MaybeTlsStream>` — an internal representation change, invisible
+    at every call site.
+  - **Accept-side**: `spawn_accept` takes `Option<TlsMaterial>`; when set,
+    every accepted socket runs through `TlsMaterial::acceptor.accept(..)`
+    before a single frame is read. **A failed handshake — a plain-TCP dial
+    into a TLS listener, or a peer presenting a cert from a different CA —
+    is logged at `warn` with the peer's address and the connection is
+    simply dropped**, handled exactly like a failed `accept()` itself (see
+    `spawn_accept`'s own doc on why a failed accept never stops the loop):
+    no panic, and the listener keeps serving every other genuine peer.
+  - **Dial-side**: `connect_maybe_tls` (replacing the bare `connect_nodelay`
+    at the top of the pooled-send path) runs the outbound handshake through
+    `TlsMaterial::connector` when configured, presenting this node's cert
+    and verifying the peer's. A handshake failure surfaces as a plain
+    `io::Error` — `send_frame_pooled`'s existing reconnect-once-then-
+    surface path handles it with zero special-casing, the same as any other
+    dial failure.
+  - **Certificate SAN requirement**: a node's cert must carry a Subject
+    Alternative Name for every string a peer might dial it by — its bind
+    address's IP, and, if registered by hostname (a Kubernetes pod's stable
+    DNS name, ADR 0060's advertise/dial split), that DNS name too.
+    `server_name_for(addr)` derives the `ServerName` the handshake verifies
+    against from exactly the string `ProdEnv`'s peer book holds (a numeric
+    address becomes `ServerName::IpAddress`, anything else a DNS name) — a
+    cert missing the SAN the caller actually dials by fails the handshake,
+    a deployment/cert-issuance concern this module's doc records rather
+    than papering over.
+  - **The test PKI helper** (`prod::tests::test_pki`/`write_test_pki`) —
+    `rcgen` (dev-dependency only, never shipped) generates a self-signed CA
+    plus one leaf cert per name, each leaf's SAN/CN set to that exact
+    string (e.g. `"127.0.0.1"`, matching what `server_name_for` derives
+    from a loopback dial address on any port); `write_test_pki` writes the
+    PEMs to real files under a temp dir and returns one `TlsConfig` per
+    leaf, so the tests exercise the real file-path `load()` path, not
+    in-memory PEM strings.
+
 ## Tests
 
 The seam is exercised end-to-end through `animus-sim` (`cargo test -p
@@ -402,3 +479,19 @@ sibling behind; a path-traversal/absolute/empty id is rejected by every
 method (`put`/`get`/`delete`), never resolved outside `root`; and `list`
 recurses every nested level, filters by prefix, and hides a crash-orphaned
 `.tmp` file from the result.
+
+**TLS (ADR 0064)**, also `prod::tests`, also real loopback sockets, no
+mocking of `rustls` itself: `tls_bound_pair_frames_flow_both_ways` (a real
+mutual-TLS handshake, frames flow both ways); `tls_peer_from_different_ca_
+is_refused` (two independent CAs — a peer never sees a frame from a sender
+whose cert its own `ClientConfig` doesn't trust, and neither side panics);
+`tls_listener_rejects_plain_dial_and_keeps_serving_tls_peers` (a raw,
+non-TLS `TcpStream` dial into a TLS listener fails the handshake cleanly,
+and the listener keeps serving genuine TLS peers right after); and
+`tls_send_reconnects_after_peer_restart` (the TLS counterpart to
+`send_reconnects_after_peer_restart` — a torn-down-and-rebound peer's new
+TLS material is picked up by the pooled sender's reconnect-once path).
+`tls::tests` covers `server_name_for`'s IP-vs-DNS-name derivation
+directly. Every plain-TCP test above this section is unmodified by ADR
+0064 and stays green under the same `cargo test -p animus-env --features
+prod` run.
