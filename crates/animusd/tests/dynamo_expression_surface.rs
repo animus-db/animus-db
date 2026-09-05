@@ -5,10 +5,14 @@
 //! `attribute_not_exists` and `a = :v` — so every comparison, range,
 //! membership test and function was a `ValidationException`.
 //!
-//! The property worth pinning is that **numbers compare numerically**. The
-//! adapter's key encoding orders numbers lexicographically (a documented
-//! simplification for *key* ordering), and inheriting that here would make
-//! `price > :p` quietly wrong for ordinary data — 9 would outrank 10.
+//! The property worth pinning is that **numbers compare numerically**. This
+//! is evaluated over decimal text (`condition::compare_numeric`), not the
+//! adapter's order-preserving key encoding (ADR 0063) — a filter is handed
+//! already-typed `AttributeValue`s, not raw stored bytes, so there is no
+//! encoding to inherit either way; the point of this suite is to pin the
+//! *numeric* comparison down regardless, since a byte-text compare here
+//! would make `price > :p` quietly wrong for ordinary data — 9 would
+//! outrank 10.
 
 use std::net::SocketAddr;
 use std::time::Duration;

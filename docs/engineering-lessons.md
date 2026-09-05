@@ -4008,6 +4008,96 @@ debugging anything that feels like it might have happened before.
   `ClusterApi`/`AdminOps`) — matching it costs one small dependency and one
   boxed allocation per call, never on a hot path for a controller
   reconcile loop.
+- **A DynamoDB Streams record's `Keys` is reconstructed from its own
+  `NewImage`/`OldImage` (`streams_wire::keys_from_images`), never decoded
+  from `ChangeRecord.base_sk`** — found while writing W-03 step 4's stream
+  regression for ADR 0063's `N` key encoding. It is tempting to assume a
+  stream-record-keys test exercises `numkey::decode` the same way
+  `SortKeyCondition::matches_raw` does, since both ultimately answer "what
+  was this row's sort key" — but `base_sk` is only ever used to *position*
+  the record in its shard/sequence, and the value shown to a consumer comes
+  straight from the item text the write path already stored in the image. A
+  regression here (`dynamo_streams.rs::
+  stream_keys_carry_n_sort_key_values_across_mixed_magnitudes_and_signs`)
+  is real coverage — a break in `base_sk`'s own byte shape can still surface
+  as a missing/misordered record, since the change-log storage key is
+  `partition_prefix || base_sk || hlc` — but it is not equivalent to a
+  `numkey::decode` unit test, and a doc comment should say so explicitly
+  rather than let a reader assume the wire round-trip proves more than it
+  does.
+- **A test asserting that a transient intermediate state occurred must read
+  it from a history the system records itself, never from an external poll
+  — the intermediate's DURATION is an implementation artifact that load can
+  shrink below any sampling interval (2026-09-05, issue #596,
+  `split_placing_two_replica_diff_e2e.rs`).** `reconfigure_step`'s
+  learner-phased sequencing only guarantees a two-of-three-replica-diff swap
+  *reaches* the over-replicated 5-voter intermediate (add both learners,
+  promote both, only then remove the two stale voters) — it says nothing
+  about how long that intermediate survives before the next reconciler tick
+  removes an extra. This test proved the intermediate occurred by sampling
+  `/admin/raftkv` externally every 200ms and asserting on the observed max
+  voter count; on a 2-core-pinned run under background load it failed about
+  1 in 3, because consecutive reconciler ticks can legitimately remove both
+  extras faster than a 200ms poll can land a sample in between — the bug
+  was in the TEST's assumption that a poll interval bounds a mechanism's own
+  timing, not in `reconfigure_step`. Fixed by giving `RaftKvNode` its own
+  durable, in-process `voter_history()` (a small bounded ring, recorded once
+  per consensus-loop iteration, the same "recompute live, same lock
+  acquisition" cadence `state_machine_behind`/the quiesce veto already use)
+  and asserting on that instead — nothing external has to catch the
+  transient state while it's happening, because the node already recorded
+  it durably for the length of its own uptime. The general rule: **when a
+  test needs to prove a system passed through a specific transient state,
+  and the system doesn't already expose a history of the states it visited,
+  add that history as a first-class (if minimal) accessor rather than
+  tightening a poll interval or widening a flaky window** — a poll can only
+  ever prove "the state existed for at least the sampling interval," which
+  is exactly the property this kind of mechanism does not promise. **Even a
+  system-recorded history is only as fine-grained as its own recording
+  cadence**: the `ProdEnv` e2e sibling records once per consensus-loop
+  iteration, and a CPU-starved follower's `handle_append_entries` can adopt
+  two config-change entries in a single batch (the leader only needs a
+  majority of the OTHER voters to commit the first before proposing the
+  second), so that one replica's own history can skip an intermediate step
+  it never got a scheduling chance to observe between the two — the e2e
+  test asserts the floor/ceiling/5-voter-presence on that replica but keeps
+  the exact `[3,4,5,4,3]` sequence assertion only in the `SimEnv` regression
+  (`voter_history_reconfigure_diff.rs`), which has no such starvation.
+
+  **A second, orthogonal wrinkle found building the fix, worth its own
+  callout**: naively taking the union of every currently-hosting replica's
+  own `voter_history()` and asserting it never drops below the floor
+  (`RF`) is unsound, because a replica that bootstraps into an
+  ALREADY-LED group as a quiet non-voter (`host::Reconciler::host`'s
+  `initial_formation: false` branch, `crates/animus-cp-data/src/host.rs`)
+  seeds its OWN local `RaftCore` from `Metadata`'s CURRENT `t.replicas`
+  **minus itself** — pure scaffolding so it knows initial peer addresses
+  before it has ever heard from the real leader, never a value any quorum
+  agreed on. Since `Metadata::tablets[..].replicas` already reflects the
+  DIRECTED-PLACING final target the instant `split_placing` computes it
+  (ADR 0062 §3) — well before the live Raft swap catches up to it — a
+  replica bootstrapping through this path can record a transient,
+  structurally-nonsensical FIRST entry that excludes itself and is smaller
+  than any value the group's real quorum ever adopted (observed live:
+  `["m1", "n0"]`, two entries, on a replica whose real join sequence was
+  the same clean 3→4→5→4→3 every other replica saw). It self-corrects the
+  moment real sync begins. **The fix is not to touch the recording
+  mechanism** (it is faithfully recording exactly what `core.config()`
+  said, which is the contract) **but to filter each replica's OWN history
+  to start from its first entry that actually includes itself** before
+  computing anything across replicas — no real committed configuration
+  ever excludes a member that hasn't joined yet, and Raft's one-member-at-
+  a-time discipline means a later legitimate "no longer includes me" entry
+  (this replica's own eventual removal) can only ever follow a genuine
+  self-inclusive one, never precede it, so the filter cannot hide a real
+  regression. General form: when unioning several independent observers'
+  own histories of "what changed," a bootstrap/join artifact specific to
+  one observer's own start-up path can look identical to a real value in
+  isolation — the same "does this observer's own reported value make sense
+  FROM ITS OWN vantage point" question (here: can a replica meaningfully
+  report a configuration that doesn't include itself, this early?) that
+  catches a stale/duplicate signal elsewhere in this log applies to a
+  freshly-added observer's very first report too.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -9205,6 +9295,40 @@ debugging anything that feels like it might have happened before.
   recomputation, `AppendEntriesResp::needs_snapshot`, and
   `snapshot_served_through`) and `animus-cp-data/CLAUDE.md`'s matching
   entry.
+
+- **A state that must never be observable in an intermediate, half-formed
+  shape has to be minted by ONE replicated command, not a mint-then-tag
+  pair — even when the gap between the two commits is expected to be small
+  in practice (issue #593, ADR 0059 §9).** `pitr_snapshot_loop` used to
+  propose `MetaCommand::BeginBackup` to mint a PITR base snapshot's row,
+  then — only once it observed that row exist — a separate
+  `MetaCommand::MarkBackupPitrBase` to tag it. The ADR's own text called
+  the gap between the two commits "a vanishingly brief window," a
+  self-healing sweep's worth of accepted residual, not a defended
+  two-phase-commit property. It was not vanishing: any consumer filtering
+  PITR base snapshots out of a user-visible view by consulting
+  `Metadata::pitr_base_backups` (`ListBackups`'s default `USER` filter, the
+  console's per-table backups projection) could observe the row as an
+  ordinary untagged `Creating` backup for the real committed window between
+  the two proposals — reproduced end to end by a test polling fast enough
+  (`console_table_config::table_detail_shows_pitr_status_and_backups`).
+  Fixed by folding the tag into the minting command itself (`BeginBackup`
+  gained a `pitr_base: bool` field, applied atomically with the row in the
+  same `Metadata::apply` arm) and deleting the side-tag command outright —
+  along with its self-healing sweep, which no longer has anything to heal.
+  **The general rule**: prefer widening the minting command's own signature
+  (a bool/enum field, `error[E0063]`-enumerated across every existing
+  construction site — the same compiler-driven fan-out `BackupRow::
+  backup_name`'s own addition to `BeginBackup` already went through, Train 1
+  PR④) over a second side-tag command, even when the side-tag avoids
+  touching more call sites at the point it's added. A documented "brief
+  window" plus a self-healing sweep is itself a signal the two-command
+  design's gap was already known to be real, not merely theoretical — that
+  combination is worth treating as a standing invitation to fold the tag
+  into the mint instead, the next time a similar shape is proposed. See
+  `docs/adr/0059-backup-restore.md`'s 2026-09-04 as-built amendment for the
+  full incident and `animus-control::meta::tests::
+  begin_backup_pitr_base_tags_atomically_with_the_mint` for the regression.
 
 ### Parallel-agent orchestration
 - **A gate command piped into `tail`/`tee` without `pipefail` reports the
@@ -15037,6 +15161,29 @@ assumption is an unrelated pre-existing bug, out of scope for a
 test-surface-porting layer with no production-code changes); the
 NOTE left in `apply_engine.rs` at both split call sites points here.
 
+**Fixed for issue #539**: both `BeginSplitInPlace`/`CutoverSplit` rounds in
+`cache_matches_engine_through_a_mixed_scenario_and_a_restart` now read each
+tablet's `expected_epoch` fresh off `metadata()` immediately before
+proposing (the same just-in-time pattern `animusd::ClientCtx::trigger_
+split`'s confirm loop uses) instead of a hardcoded `Epoch::INITIAL`, and
+every step now carries a positive assertion of the command's actual
+effect (state/epoch/intent after `BeginSplitInPlace`; parent-gone +
+children-Active + `split_lineage` after `CutoverSplit`; catalog-row-present/
+expired/removed for `SealStreamShard`/`ExpireStreamShards`; empty
+`tablets_for_table` after `DropTableTablets`) — a full audit of every
+epoch-CAS'd or otherwise legitimately-no-op-capable command in this
+scenario, not just the split. **One thing the epoch fix alone didn't
+uncover, worth generalizing**: `BeginSplitInPlace`'s apply arm evaluates
+its epoch-CAS *before* its F11 token-alignment seatbelt, so the original
+stale-epoch proposal's rejection reason ("epoch mismatch") was correct but
+incomplete — it silently hid a SECOND, independent defect in the same
+scenario (a 1-byte, non-token-aligned split key on a table that already
+had a stream enabled) that only surfaced once the epoch was fixed and the
+apply arm actually reached the next guard. A chain of sequential guard
+checks in one apply arm means fixing whichever one your rejection message
+names does not prove the command now succeeds — only a positive
+post-propose assertion (not just "no longer rejected for reason X") does.
+
 ## Diagnose "my predicate never turns true" by instrumenting the state it READS, not its own bookkeeping (issues #532/#537)
 
 A learner catch-up predicate (`RaftCore::learner_caught_up`, keyed on
@@ -16516,3 +16663,941 @@ creates/patches one shape of, check whether `kube::core::DynamicObject` +
 a `serde_json::json!` literal covers it — it usually does, and it keeps
 the dependency graph from growing for a resource you don't own the schema
 of anyway.
+## A "no stray terminator byte" invariant test must be scoped to the digit-run, not the whole encoding (W-03 step 2, `numkey.rs`)
+
+Building `animus_dynamo::numkey` (an order-preserving codec for DynamoDB
+`N` — sign class byte, then a fixed-width 2-byte offset-binary exponent
+field, then a digit run terminated by `0x00`, everything after byte 0
+bitwise-inverted for negatives), the first draft of a "the terminator byte
+is the only `0x00` in the encoding" unit test scanned the *entire* output
+including the exponent field. It failed immediately on `encode("0.5")`:
+that value's exponent is `0`, which biases to `1024` (`0x0400`) — a
+perfectly valid 2-byte field whose low byte legitimately is `0x00`. The
+claim "no stray terminator byte" is only true of the **digit-run region**
+(bytes are `1..=10`, so `0x00` can only be the terminator there by
+construction); a fixed-width binary field elsewhere in the layout has no
+such constraint and will contain every byte value across a large enough
+sample, `0x00` included.
+
+**Fixed** by rewriting the test to slice off the known-width exponent
+field first (`&encoded[3..]`) and only assert the "0x00 appears exactly
+once, at the end" claim over that remaining digit-run slice — the region
+the invariant actually describes.
+
+**General form**: when writing a "this reserved/terminator byte value
+appears nowhere else in the encoding" test for a multi-field binary
+layout, scope the scan to the specific field the invariant is *about*
+(here: a variable-length, digit-constrained run), never the whole record —
+a fixed-width field with no value constraint of its own (an exponent, a
+length prefix, a checksum) is a false positive waiting to happen the
+moment a real test input's field value happens to contain that byte. Pick
+a test sample specifically to exercise the "reserved value at exponent
+zero" boundary (`exp = 0` here) rather than only obviously-nonzero cases —
+that's exactly the input that caught this.
+
+## Reusing an order-erasing test helper to rewrite an order-sensitive test produces a silently vacuous assertion (W-03 step 3, `dynamo_query_range.rs`)
+
+Wiring `numkey` into `AttributeValue::key_bytes` (ADR 0063) flipped a test
+that used to pin the *old*, wrong byte-text order for an `N` sort key
+(`scan_index_forward_is_still_byte_order_not_numeric_order_for_n`) into one
+asserting the *correct* numeric order
+(`scan_index_forward_orders_n_sort_keys_numerically`). The fixture file
+already had an `sk_values(body) -> Vec<String>` helper used by every other
+test in the file — but its own doc comment said why: it ends with
+`out.sort()` and is documented "order-independent, so callers assert
+membership, not position." The first draft of the rewritten ordering test
+called `sk_values` anyway (it was the only extractor in scope, and its name
+looked right), asserting `sk_values(&asc) == vec![...expected numeric
+order...]`. That assertion would have passed **unconditionally** — sorting
+the extracted strings erases the exact property (result *order*) the test
+exists to check, so a regression back to byte-text order, or any other
+ordering bug entirely, would never fail it. Caught before commit only by
+rereading the helper's own doc comment, not by the test failing (it didn't
+— it can't).
+
+**Fixed** by adding a second, order-preserving helper (`sk_order`, the
+first-appearance-order extraction `sk_values` already did internally before
+its own final `.sort()`) and using that for the position-sensitive
+assertions, keeping `sk_values` for the file's other, genuinely
+membership-only assertions.
+
+**General form**: when a fixture file's existing helper is documented as
+order-erasing (a trailing `.sort()`, a `BTreeSet`/`HashSet` collect, a
+membership-only comparison), that documentation is not incidental — it is
+recording a *narrower contract than the function's name suggests*, and
+reusing it for a differently-shaped assertion (position/order rather than
+membership) produces a test that type-checks, reads naturally, and can
+never fail regardless of the code under test. Before reusing any helper to
+assert an order-sensitive property, re-read its own doc/implementation for
+exactly this kind of narrowing, and prefer writing a fresh order-preserving
+extractor (as this fix did) over trusting that a same-shaped helper already
+in scope must mean what its name implies.
+
+## A client-side fix that widens how many hops a caller tries can silently multiply the server-side work abandoned callers leave behind (issue #596)
+
+`serve_requests`/`handle_connection` (`animusd/src/lib.rs`) spawn one
+untracked, fire-and-forget task per accepted connection on both client-
+protocol listeners (ADR 0047); before this issue's fix, that task always
+ran `handle_request(..)` to completion regardless of whether anything was
+still listening for the reply. A forwarded write's server-side confirm
+loop (`poll_probe`, `write_path.rs`) can legitimately run for up to
+`CLIENT_TIMEOUT` (10s) waiting for a propose to commit — and issue #585's
+own fix (merged as #586) *correctly* widened `forward_to_tablet_leader`'s
+hint-chasing retry so a client keeps trying other candidates instead of
+giving up on the first slow hop, each attempt bounded by its own
+`FORWARD_HOP_TIMEOUT` (2s). The two changes compose badly: a caller that
+gives up on one hop after 2s and moves to the next leaves the *first*
+hop's server-side handler running its own full 10s confirm-wait with
+nobody listening — and a chase that tries several candidates per request
+multiplies these abandoned, periodically-waking tasks. On a CPU-constrained
+host (a 2-vCPU CI runner), enough of these piling up is real, measurable
+scheduler pressure — and it surfaced not as a resource-exhaustion symptom
+but as an apparently unrelated **Raft liveness failure** (issue #596's own
+symptom: an intermittent leaderless window), because the abandoned tasks
+were competing for the same runtime threads a leader election needed to
+make progress on schedule.
+
+**The general lesson: a correct fix to a *client's* retry/timeout budget
+does not, by itself, bound the *server's* corresponding work — that
+requires an independent decision about whether the receiving side's
+handler lifetime is tied to the caller's continued interest at all.**
+Widening how many hops or attempts a caller makes (more retries, shorter
+per-attempt timeouts, more candidates tried) is invisible to the receiving
+side unless the receiving side is specifically designed to notice the
+caller went away. Before landing a client-side retry-budget change, audit
+the receiving side's task lifetime too: does an abandoned attempt keep
+consuming resources (threads, memory, open connections, in-flight Raft
+proposals) after the caller has moved on, and if so, does anything bound
+how many such abandoned attempts can accumulate concurrently?
+
+**Fix**: `handle_connection` now splits the accepted socket
+(`TcpStream::into_split`) and races each request's handler against a
+`peer_closed` future reading the connection's read half, via `tokio::
+select!`; the peer-closed branch drops the handler future and exits the
+connection's task, incrementing a new `client_requests_abandoned` metric
+(ADR 0015). This is safe because every CP mutation the client-protocol
+listeners can reach already has to tolerate a mid-flight *process crash*
+(the standing "accepted-unconfirmed" discipline — `ProposeResult::
+Accepted` means appended to the local Raft log, never committed, and
+every proposer already distinguishes never-accepted from
+accepted-unconfirmed), so dropping the handler future at any await point
+is no worse than the crash the design already handles; see
+`crates/animusd/CLAUDE.md`'s "`handle_connection` cancels an in-flight
+request" entry for the full per-request-family audit. This closes the
+amplifier, not the root cause of #585/#586's own scenario (a genuinely
+slow-but-live leader still gets its full budget from whichever candidate
+the caller is *currently* waiting on) — it only stops paying for the hops
+the caller has already abandoned.
+
+## A generated CRD YAML has no CI check tying it to its source struct — it silently drifts, and a deleted CLI flag stays hand-emitted until someone notices (issue #590)
+
+`animus-operator`'s `deploy/operator/crd.yaml` is generated output
+(`cargo run -p animus-operator -- crd`, `kube::CustomResourceExt::crd()`
+serialized via `serde_yaml`) from `AnimusClusterSpec` in
+`crates/animus-operator/src/crd.rs`. Nothing in CI regenerates it or diffs
+it against the struct — no test, no workflow step — so the committed file
+can go stale in two independent ways at once, discovered only when someone
+happens to regenerate it for an unrelated change:
+
+1. **Doc-comment drift**: `quiesce_after_secs`/`auto_split_bytes`'s Rust
+   doc comments had already been rewritten for S-06 (moved from a CLI flag
+   to the generated `cluster.json`'s `cluster_settings` section), but the
+   checked-in `crd.yaml`'s `description:` fields for those properties still
+   quoted the old, pre-S-06 text — found only while regenerating the file
+   for this issue's unrelated `splitMode` removal.
+2. **A field that outlived what it plumbed to**: `animusd`'s `--split-mode`
+   flag and the copy-based split workflow it selected were deleted outright
+   2026-09-01 (ADR 0058's rung 4 layer), but `AnimusClusterSpec.split_mode`
+   and `entrypoint_script`'s conditional `--split-mode {mode}` emission
+   were not removed in the same change — a separate crate, a separate PR,
+   no compiler link between "this flag no longer exists" and "this operator
+   field still emits it." Any `AnimusCluster` spec that set `splitMode`
+   would fail at pod startup (`animusd` rejecting an unknown argument) with
+   no test catching it, since the existing unit test
+   (`entrypoint_omits_split_mode_on_data_branch_only`) asserted the flag
+   *was* emitted on the combined branch — it was pinning the bug, not
+   guarding against it.
+
+**General form**: when a CLI's accepted-flags surface changes (a flag
+deleted, renamed, or newly subcommand-restricted), grep every *generator*
+of invocations of that CLI — not just other Rust crates that call into a
+shared library — for the literal flag string: shell-script templates,
+generated YAML/JSON, docs that list "flags this component passes through."
+A hand-rolled arg parser (no `clap` derive, so no shared type to break the
+build) makes this doubly silent: removing a match arm compiles cleanly
+everywhere else. The regression test this issue added
+(`entrypoint_flags_are_all_accepted_by_animusd`) generalizes past this one
+flag: it tokenizes the generated script for every `--xxx`-shaped token and
+checks it against an explicit allowlist transcribed from the target
+binary's actual arg-parsing `match` arms (not its doc comments, which is
+exactly what had gone stale) — any future flag deletion/addition on either
+side now fails this test immediately instead of waiting for a live
+pod-startup failure.
+
+## A converged-or-timeout budget fix applied to one test doesn't fix its sibling that shares the same relay shape (issue #591, following #281/PR #301)
+
+`data_only.rs`'s `schema_ddl_via_a_data_node_relays_and_commits` and
+`control_only.rs`'s `mixed_cluster_put_via_control_node_forwards_to_data_node`
+both drive a data-only-shaped node's `ProposeSchema` through the identical
+mechanism: `ClientCtx::propose_schema`'s ADR 0030 broadcast fallback,
+capped per candidate at `FORWARD_HOP_TIMEOUT` since issue #585. Issue #281
+diagnosed the `data_only.rs` copy's 20s retry budget as too thin — a single
+`call()` there chases up to 4 other known intra addresses, so one *whole*
+attempt can legitimately cost 4 * `FORWARD_HOP_TIMEOUT` = 8s, leaving a 20s
+budget barely 2-3 worst-case attempts of headroom, not real margin under a
+starved runner. PR #301 fixed it there (20s → 60s, plus the outer wrapper
+90s → 150s) but touched only `data_only.rs` — it never occurred to grep for
+the same shape in `control_only.rs`'s own mixed-cluster test, which drives
+the exact same `propose_schema` broadcast path (just 3 candidates instead
+of 4, so if anything *thinner* margin proportionally: 20s / 6s worst-case
+≈ 3.3 attempts vs. the fixed test's 60s / 8s ≈ 7.5). It surfaced
+independently, months later, as the same `Elapsed(())` panic under heavy
+host load (issue #591), passing on every retry — the signature of a rare
+tail-latency flake, not a deterministic bug, so a 10-run repro attempt
+under artificial `yes`-loop CPU contention (4 cores, 4 loops) did not
+reproduce it; the arithmetic argument (not a live repro) is what carries
+the diagnosis here, exactly as it did for #281.
+
+**General rule**: when a converged-or-timeout budget fix lands because one
+test's retry attempt rides a network-hop timeout (`FORWARD_HOP_TIMEOUT`,
+`CLIENT_TIMEOUT`, or any per-hop cap), grep every other test that drives
+the *same underlying relay function* — not just tests with a similar name
+or in the same file — before considering the fix complete. `propose_schema`
+had exactly two real-node callers issuing it against a data-only-shaped
+node (`data_only.rs` and `control_only.rs`); fixing one and shipping is an
+incomplete fix, not a smaller one. (`crates/animusd/tests/control_only.rs`,
+`crates/animusd/tests/data_only.rs`.)
+
+**This is a budget-arithmetic alignment with an already-accepted fix, not a
+timeout widened to hide an unexplained failure** — worth being explicit
+about given this repo's standing "a flaky test is a bug, never fixed with a
+wider timeout" rule (root `CLAUDE.md`): the old 20s budget covered only
+~3 worst-case attempts (3 candidates x `FORWARD_HOP_TIMEOUT` each), which
+PR #301 already established, for the identical mechanism, as *not* a real
+margin — the fix here is computing the same arithmetic for this test's own
+candidate count and matching the sibling's already-reviewed number, not
+picking a bigger number to make a flake go away unexamined.
+
+**The actual structural fix, if this shape needs revisiting again**: the
+broadcast fallback tries each candidate *serially*, so its worst case is
+N x `FORWARD_HOP_TIMEOUT` and grows with cluster size — a concurrent,
+first-success-wins broadcast (fire all known candidates at once, take
+whichever answers first, cancel the rest) would bound the worst case to
+one hop's `FORWARD_HOP_TIMEOUT` regardless of N, removing the multiplier
+this budget calculation depends on entirely rather than just re-deriving
+it correctly. Not done here because the current fix (matching the #301
+precedent) is minimal and the serial chase is otherwise working as
+designed (ADR 0030's "best-effort, first connectable candidate resolves
+the real leader" contract) — but it's the right next step if a *third*
+`propose_schema` broadcast caller surfaces the same flake, or if the
+control-group size ever grows enough that N x `FORWARD_HOP_TIMEOUT` alone
+threatens `CLIENT_TIMEOUT`-scale budgets again.
+
+## A retry's own justification must survive the same kernel-semantics scrutiny as the bug it claims to fix (issue #592, closed without a code fix)
+
+Issue #592 reported `crates/animusd/tests/index_backfill.rs` panicking
+`connect: Connection refused` against a `bring_up`-issued address on PR
+#586's CI run (job 101112281267, "prod-liveness-animusd (1/4)" —
+confirmed by pulling the real job log via `mcp__github__get_job_logs`,
+not just the issue's own paraphrase). A first pass at a fix added
+`support::connect_retry` — a bounded 5s retry on `ErrorKind::
+ConnectionRefused`, modeled on `restart_same_addrs`'s existing rebind
+retry — reasoning the failure was the same "port-TOCTOU/listener-not-
+yet-accepting" family that helper already documents.
+
+**That reasoning does not survive scrutiny, and the fix was reverted.**
+`TcpListener::bind` (what `Node::bind`/every `Bound*Node::start_*` calls,
+`crates/animusd/src/lib.rs:4483-4610`) performs a synchronous OS-level
+`bind()`+`listen()` before the `.await` ever resolves — by the time
+`run_node`'s `?` lets a listener field be assigned, the kernel's own SYN
+backlog is already authoritative and completes a handshake **without
+userspace scheduling being involved at all**. Once `listen()` has
+returned, a later `connect()` to that same live socket cannot legitimately
+observe `ECONNREFUSED` from scheduler delay, however severe — that error
+means nothing was bound at that address at that instant, not "accept
+hasn't run yet" (a full backlog drops SYNs, which surfaces as a
+**timeout**, never a refusal). Since every one of `bring_up`'s nodes
+already returned `Ok` — meaning every one of its five listeners
+individually completed `bind()+listen()` — before the test's first
+`call()` ever dials one, and since every dial here is same-process
+loopback (all "nodes" in this fixture are `Node` structs inside the one
+test process, not separate OS processes) with no way for another process
+to silently evict an already-open listening fd, no scheduler-timing story
+closes the gap.
+
+**Investigation, in order:**
+1. Reread every step between `free_addrs`'s probe-release and the test's
+   own `client = config.nodes[leader].intra` dial — `bring_up`'s
+   per-attempt retry (`crates/animusd/tests/index_backfill.rs`, the
+   `'attempts` loop) discards a **whole** attempt's nodes/config on any
+   node's `run_node` failure and starts the next attempt with entirely
+   fresh addresses, so a stale/mismatched address from a failed earlier
+   attempt cannot leak into the returned `(nodes, config)` — confirmed by
+   reading the loop, not assumed.
+2. Instrumented a scratch copy of `connect_retry` (dumping `ss -ltnp` on
+   first refusal) and `bring_up`/the test body (printing every node's
+   configured vs. actually-bound address, and live leader status) — never
+   observed a mismatch across every run that did complete, including the
+   one run (immediately after a cold, disk-heavy compile) that reproduced
+   a 5-second sustained refusal locally.
+3. That one local repro turned out to have an unrelated, confirmed cause:
+   this session's sandbox was, at the time, sharing one `$CARGO_TARGET_DIR`
+   across multiple concurrently-building agent worktrees — Cargo omits a
+   path dependency's location from its artifact hash, so their builds were
+   overwriting each other's rlibs. A binary linked from a partially
+   clobbered rlib is exactly the kind of "the process is running but not
+   behaving as its own source implies" state that would explain a
+   synchronously-bound listener never actually working — once builds moved
+   to a private `CARGO_TARGET_DIR`, the exact same test could not be
+   reproduced again in over 35 runs, including several under deliberately
+   added CPU load.
+4. Pulled the real failing CI job's log (`mcp__github__get_job_logs`, not
+   just `gh api`'s redirect to blob storage, which this sandbox's proxy
+   blocks) rather than trusting the issue's paraphrase. Two findings that
+   change the shape of the theory: **the job runs under `cargo-nextest`**
+   (a separate OS process per test — `index_backfill.rs`'s three tests
+   never ran concurrently with each other in that CI run, ruling out the
+   in-file sibling-test port race the original doc comment speculated
+   about), and the failing test's own total runtime was **3.34s with no
+   retry logic at all yet** — a fast, clean `bring_up`, then one single
+   refused connect on the very first attempt, not a sustained multi-second
+   outage. No `Too many open files`/OOM/disk-space signal appears anywhere
+   in that job's log; the only other failure in the same shard was the
+   already separately root-caused `split_placing_two_replica_diff_e2e`
+   (issue #585's own lineage).
+
+**Outcome**: `connect_retry` was removed rather than kept — a retry whose
+own justification cannot survive "what would have to be true for this
+error to occur" is exactly the "wider timeout papering over an
+unroot-caused flake" the green invariant (`CLAUDE.md` Session operating
+mode item 4) forbids, even though it happened to make the local repro go
+away (for an unrelated reason — see point 3). The three call sites reverted
+to a bare `TcpStream::connect(addr).await`, with one durable improvement
+kept: the panic message now names the address (`"connect to {addr} failed:
+{e}"`) instead of a bare `.expect("connect")`, so a **future** occurrence
+is immediately actionable without needing a special debugging session to
+even know which of a multi-node cluster's addresses failed. Issue #592
+stays open with this write-up rather than being closed as fixed — the true
+mechanism behind the original one-shot CI refusal remains unconfirmed;
+the strongest lead is that CI's own build/cache pipeline could suffer an
+analogous corruption to point 3 above, but that is not established, only
+plausible.
+
+**General form**: when a retry (or any other "paper over the symptom"
+fix) is proposed for a fault, ask what would have to be true at the OS/
+runtime level for that fault to occur — a socket/lock/file-handle API's
+real semantics often rule out entire classes of "just scheduling delay"
+explanations outright, and a fix whose only support is "it looks like the
+timing-window family we've seen before" needs that support checked before
+being trusted, not after it ships. A single local reproduction is also
+not enough corroboration for a specific mechanism on its own if the
+reproduction environment has an independent, unrelated defect (here: a
+shared build cache across concurrent agents) capable of producing the
+identical symptom for a completely different reason — isolate the
+environment first, then judge whether the original theory still
+reproduces.
+
+## "Both windows are the same shape, so background noise cancels out" assumes a steady-state source — a one-time-drain source doesn't average out (issue #587)
+
+`admin_endpoint.rs::admin_raftkv_default_does_not_materialize_the_dataset`
+meters `storage_sstable_block_reads` around two equal-sized polling windows
+(`?exact=1` vs. the default view) to prove the default view doesn't scan
+the dataset, on the documented assumption that "whatever background work
+the node's own loops do lands in both [windows] and cancels out of the
+comparison." **The counter itself is not the hole** — ADR 0015's sink is
+one `Arc<MetricSink>` per `ProdEnv` instance (one per node in a process,
+confirmed by inspection: `ProdEnv::bind` mints a fresh `MetricsHandle::
+recording()` per call, and `ClientCtx::metrics_text`/`_json` sum only the
+calling node's own control/raftkv sinks, deduping when they're the same
+sink) — see this file's existing "per-instance observability seam" entries
+above; a process hosting several nodes in-test never lets one node's
+`/admin/metrics` see another's counters. **The real gap is a same-node
+background loop whose activity is bounded and front-loaded, not a
+steady-state rate.** `animusd::index_drain::change_consumer_loop` ticks
+every `INDEX_DRAIN_INTERVAL` on whichever node currently *leads* a hosted
+tablet; for a table with no GSI/stream/PITR, every write still leaves an
+ADR 0049 change-log marker record, and the loop's idle fast path does a
+real `pending_changes` scan (genuine SSTable block reads once flushed)
+each tick until that one, finite backlog is fully trimmed (`TRIM_BATCH`-
+sized batches) — after which the tick goes cheap forever. That's a burst
+that happens *once*, whenever it happens to land in wall-clock time, not a
+rate that spreads itself evenly across two equal-duration windows measured
+back to back — if the burst is still draining when the first window starts,
+it inflates that window specifically; if it finishes just before the
+second, it inflates that one instead. Two equal-shaped windows only cancel
+out a genuinely steady background rate, never a one-shot bounded drain.
+**Fix**: wait for the drain to finish before sampling the baseline, not
+after — and don't reach for the obvious-looking "wait for `quiesced`"
+signal without first confirming quiescence is actually *enabled* for the
+bring-up under test (`animusd::run_node`'s default is `quiesce_after:
+Duration::ZERO`, i.e. off — `RaftCore::quiesce_entry_ok` then always
+returns `false` and a wait on it hangs to the deadline every time this
+node happens to lead the tablet). Even with quiescence enabled, a
+*follower's* own `quiesced` flag is a one-shot broadcast-acceptance
+(`RaftCore::handle_quiesce`) that can legitimately never fire for an
+ordinary live follower — waiting on it uniformly (leader or not) hangs on
+every run where the metered node isn't the leader. The robust signal here
+is the exact view's own `key_count`/`byte_size` (already exposed, ADR
+0020) settling across several consecutive reads spaced past one drain
+interval — a converged-or-timeout poll on a value the property itself is
+about, not a proxy that may not even be wired up for this bring-up.
+**General form**: before trusting "both windows are shaped the same, so
+whatever noise exists cancels out" for a real-time-metered assertion, ask
+whether every noise source is a steady rate — a bursty, self-terminating
+background loop (a drain, a one-time backfill, a compaction triggered by a
+setup step) needs to be waited past, not symmetrized around. (2026-09-04,
+`crates/animusd/tests/admin_endpoint.rs`, `crates/animusd/src/
+index_drain.rs::change_consumer_loop`.)
+
+## A readiness/liveness signal read straight off a consensus-internal "I currently believe I have a leader" flag inherits that flag's hair-trigger semantics (issue #595)
+
+`animusd::admin::health()` — `/admin/health`, the Kubernetes readiness
+probe (ADR 0060) — used to be exactly `RaftCore::leader().is_some()`.
+`leader_id` is cleared by `start_pre_vote` the instant a follower's OWN
+election timer lapses (ADR 0009 pre-vote), before any pre-vote round is
+even answered — correct for consensus (pre-vote must not trust a stale
+belief when deciding whether to grant a vote or pick a relay target: a
+briefly-stalled node could otherwise disrupt a healthy leader), but it
+means *any* boolean consumer of `leader()` inherits a false-negative window
+on **every** transient one-sided delay of one election timeout (150ms
+default) or more — a single scheduling stall on a pod, a GC pause, one
+dropped heartbeat — even while the real cluster leader is fully healthy and
+heartbeating every other replica the whole time. Reproduced directly at the
+`RaftCore` level: partition a follower from an otherwise-healthy leader
+(the leader keeps its majority via the other follower and never steps
+down, term unchanged) and the partitioned follower's own `leader()` is
+`None` within one election timeout, recovering only on the next heartbeat
+after healing.
+
+**The general lesson: safety and operability are different jobs, and a
+consensus core's internal belief is tuned for the former.** A pure
+`RaftCore`/state-machine's own "do I currently trust a leader" flag is
+deliberately hair-triggered — it has to be, to keep a stalled node from
+disrupting a healthy cluster. A health/readiness probe wants the opposite
+property: "has this replica had genuine leader contact recently enough
+that treating it as healthy is still honest" — which needs its own
+hysteresis, entirely separate from and never read by the safety-critical
+decision. Fixed by adding a second, purely observational field
+(`RaftCore::last_leader_contact: Option<(NodeId, Nanos)>`) set only at a
+genuine leader contact (`handle_append_entries`/`handle_install_snapshot`'s
+valid-leader-for-this-term path, or `become_leader` recording itself) and
+cleared only on a real higher-term step-down (never by `start_pre_vote`/
+`start_election`'s own local-timeout-driven clear of `leader_id`, which
+carries no evidence the leader actually failed) — `leader_within(now,
+max_age)` reads it with a caller-chosen grace window, documented in the
+field's own doc comment as **never** to be read by any election/pre-vote/
+safety/replication decision. `admin::health()` is the sole consumer,
+gating on `3 × election_timeout()` — enough slack for a couple of missed
+heartbeats, still tight enough that a genuinely leaderless node degrades to
+`503` in about a second rather than tens of seconds.
+
+**A narrower, related lesson this fix had to get right**: not every
+consumer of a stale-tolerant leader belief should get the hysteresis.
+`ClientCtx::propose_schema`'s leader-hop uses the full `CLIENT_TIMEOUT`
+(10s) for that one hop, with a `FORWARD_HOP_TIMEOUT`-capped (2s, issue
+#585) broadcast fallback if it's wrong — handing it a possibly-stale
+`leader_within` belief instead of the immediately-self-correcting raw one
+would risk spending that whole hop budget on a node that isn't actually
+reachable as leader, worse under `dynamo.rs`'s 5s `SCHEMA_COMMIT_TIMEOUT`
+than falling through to the broadcast promptly. Only the *operational*
+consumer (a probe that degrades gracefully and gets retried by its own
+caller regardless) benefits from hysteresis; a *correctness-path* consumer
+that pays a real timeout cost for guessing wrong should keep reading the
+raw, self-correcting belief. When adding a hysteresis-bearing accessor
+alongside a raw one, audit every existing caller of the raw accessor before
+assuming the new one is strictly better — it usually isn't, for a caller
+that already has its own bounded-cost fallback.
+
+Regression: `animus-control/tests/leader_within_hysteresis.rs` (a one-sided
+partition inside the grace, then held past it, across 12 seeds — proving
+both the false-negative survival and the false-positive bound). See ADR
+0020's 2026-09-04 amendment and ADR 0009/0012 for the full mechanism.
+
+## A `StatefulSet`'s aggregate `N/N ready` count is not proof that the ONE pod a port-forward is about to hit is itself ready right now (issue #595, `scripts/e2e-kind.sh`)
+
+`scripts/e2e-kind.sh` waited for `readyReplicas == 3`, then immediately
+`kubectl port-forward svc/{name}-dynamo`'d and issued `CreateTable` — and
+flaked twice (identical signature, unrelated commits) with the port-
+forwarded pod having dropped `Ready: False` again within the few seconds
+between the aggregate count check and the actual wire call, because a
+Service's own `Endpoints`/port-forward target is resolved to exactly ONE
+specific pod, while the count the script polled is a fleet-wide aggregate
+that says nothing about *that one pod's* state a moment later. The general
+form: **when a script or test is about to talk to one specific replica out
+of a fleet, the readiness precondition it waits on must be that replica's
+own, checked through the same path the real traffic will take — never a
+fleet-wide count used as a proxy for one member's state.** Fixed by
+resolving the actual backing pod off the Service's `Endpoints` first, then
+port-forwarding that pod directly (not the Service) so the readiness check
+and the real wire calls are provably the same connection target, and
+polling that one pod's own `/admin/health` before ever issuing the real
+call.
+
+A second, independent lesson from the same investigation: the underlying
+flake this exposed (a follower's `/admin/health` flipping to `503` on a
+transient one-sided delay, ADR 0020's 2026-09-04 amendment) was real and
+worth fixing at the source — but the script-side hardening above is still
+correct and worth keeping alongside that fix, not instead of it. A
+one-shot call immediately following a bootstrap/scale/rollout event is
+exactly the "eventual property" shape this repo's own testing rule already
+names (converged-or-timeout, never a fixed-deadline one-shot assert) — the
+first write after a cluster comes up is not different in kind from a read
+right after a leader kill, and both need the same treatment. When adding
+such a retry, scope it to the exact narrow, named failure the investigation
+found (here: a specific 500 message) rather than a blanket retry-on-any-
+error, and verify the retried operation's own idempotency contract first
+(`CreateTable`'s pre-existing duplicate-name check made a retry landing on
+an already-committed table safe to treat as success) — a blanket retry
+without that check can silently paper over a genuinely different failure
+or double-apply a non-idempotent operation.
+
+## A request/reply relay's receive loop is not optional for the client half either — only for the server half (ADR 0061 rung C3d, `SimRelayClient`)
+
+Building `animus_node::sim_relay::SimRelayClient` (a `Network`-backed
+`RelayClient` implementor, modeled on `animus_cp_data::
+cluster_segment_store`'s own `req_id`/`Pending`-slot correlation) first
+shipped with `serve(handler)` as the thing that spawns the one
+`RELAY_STREAM` receive loop, documented as "a node that never calls this
+can still make outbound `relay()` calls; it just never answers one." That
+sentence is only half right, and the wrong half hid a real bug: **the
+identical receive loop is what demultiplexes an inbound *request* from an
+inbound *reply* on that same stream** (single-consumer, ADR 0026, so both
+directions share one inbox). A node that never calls `serve` never starts
+that loop at all — so a reply to its *own* outbound `relay()` call, sitting
+in its inbox, is never read out and stashed into its `Pending` map either.
+The first four-test suite (round trip, timeout, late-reply-not-matched,
+concurrent requests) had three of four fail with `None` — not a wrong
+answer, no answer ever arrived — because only the *server* side (`relay_a`)
+called `serve`; the *client* side (`relay_b`) never did, on the (false)
+assumption that "client-only" needs no receive loop.
+
+Root cause, stated generally: whenever one wire carries both a call's
+outbound leg and its own inbound reply (true of any request/reply protocol
+riding a single-consumer channel, not just this one), the receive loop that
+demultiplexes them is not a "server-only" concern — every participant that
+ever *originates* a call needs it running too, regardless of whether it
+ever *answers* one. Naming the loop-starter the same thing as "start
+answering" (this code's first-draft `serve`) actively invites the wrong
+mental model. Fixed by separating the two lifecycles: the constructor
+(`SimRelayClient::new`) now spawns the receive loop unconditionally (every
+node that exists needs it, the same way every node needs a socket bound
+before it can either send or receive on a real one), and `serve` was
+narrowed to *only* install a handler into an already-running loop's shared
+`Arc<Mutex<Option<Handler>>>` — a node that never calls `serve` still
+receives its own replies correctly; it just answers an inbound request with
+a fixed "no handler installed" error instead of ever hanging.
+
+**General form**: when designing (or reviewing) a request/reply layer over
+a shared duplex channel, ask "does the client half need the same receive
+loop the server half needs?" before assuming the answer is obviously yes —
+it's easy to reason about the server's own inbox and forget that a client
+awaiting a reply is *also* a reader of that same inbox, just for a
+different message shape. A test that drives a fixture built the "server
+only starts the loop" way will show every symptom of a missing reply
+(`None`, or a timeout that only ever fires) with no compiler error and no
+panic — the loop-driven poll below simply times out silently — so this
+class of bug is functional-tests-only to catch, never a build-time one.
+
+## A helper's own opaque id encoding must not be round-tripped through `Display`/`FromStr` when a plain accessor already avoids it (ADR 0061 rung D1, `SimCluster`)
+
+Building `SimCluster` (a multi-node `SimEnv` fixture over `ClientCtx<SimEnv,
+SimRelayClient<SimEnv>>`, ADR 0061 rung D1), `leader_of(tablet)` was written
+to return `Option<NodeId>` (matching the rung's own suggested signature),
+and several early test call sites then did the obvious-looking thing to get
+back a plain node index for every *other* method on the fixture (`put`/
+`get`/`crash`/`restart`, all of which take a `u64` index): `leader_of(t)
+.expect(..).to_string().parse::<u64>().expect(..)`. Every one of those
+calls panicked with `ParseIntError`. `animus_env::nid(n)` encodes a node id
+as the literal string `"n{n}"` (`NodeId::new_unchecked(format!("n{n}"))`),
+not the bare decimal `n` — a `Display`-then-`parse::<u64>` round trip is
+therefore not the inverse of `nid` at all, it's parsing a string that
+starts with a letter as an integer.
+
+The fix wasn't to fix the parsing (strip the leading `n` and parse the
+rest) — that would work, but it permanently couples every caller of this
+fixture to `nid`'s own concrete string format, which is `animus-env`'s
+private implementation choice, not part of any contract `SimCluster`
+should be re-exposing. Instead, `leader_of` grew a sibling,
+`leader_index_of(tablet) -> Option<u64>`, which is the *same* internal
+`replicas.iter().copied().find(..)` search `leader_of` already runs — it
+simply returns the `u64` it already has in hand, before wrapping it in
+`nid(..)` for `leader_of`'s own return, instead of throwing that plain
+index away and asking a caller to reconstruct it by parsing a string that
+was never designed to be parsed back.
+
+**General form**: when a type's own id encoding is a deliberately opaque
+implementation detail (a struct wrapping a `String`, an internal counter
+formatted for a wire, a hash), never let API design push a caller toward
+`Display`-then-`FromStr` as an implicit "get the underlying value back"
+idiom — that only works when the type's author *intended* the string
+representation to be the canonical roundtrip encoding, and nothing marks
+that intent at the call site (the code compiles and looks correct; it
+simply panics or silently misparses at runtime, exactly the "no compiler
+error, only a runtime symptom" class of bug the sibling `SimRelayClient`
+receive-loop entry above also describes). If a caller plausibly needs the
+value in another shape, expose an accessor that returns that shape
+directly from wherever the value is already in hand — never make the
+caller reconstruct it by parsing the type's own display format.
+
+## `block_on`ing a `SimEnv`-driven future is only sound when nothing inside it needs the simulator's own clock to advance (ADR 0061 rung D1 step 3, `sim_cluster_corpus`)
+
+Building the `SimCluster` cycles/durability corpus's `delete` probe
+(`run_delete_probe`, `crates/animusd/src/sim_cluster_corpus.rs`), the
+first draft drove `SimClusterHandle::put`/`get`/`delete` — each an `async
+fn` that internally calls `ClientCtx::cp_kind_write_raw`/`cp_get` — via a
+bare `futures::executor::block_on`, mirroring a pattern that already
+works elsewhere in this exact corpus family: `raftkv_linearizable.rs`'s
+own `final_state` does `block_on(node.local_get(&key_bytes(key)))`
+directly, with no `Simulator::run_for` anywhere near it, and that has
+always been fine. The difference wasn't visible from the call site's
+shape — both are `block_on(some_async_fn(..))` — and cost a fully hung
+`cargo test` run (it never returned) before it was found.
+
+The reason one is sound and the other isn't: `RaftKvNode::local_get` is a
+pure local-engine read — it resolves on its very first `poll`, so
+`block_on`'s busy-poll loop returns on the first iteration regardless of
+whether anything is advancing `SimEnv`'s virtual clock. `ClientCtx::
+cp_kind_write_raw`/`cp_get`, by contrast, internally `.await` real
+`env.sleep(..)`-paced route/confirm-poll loops (`cp_route`'s own
+`CLIENT_TIMEOUT` deadline, the exponential confirm-poll backoff) — a
+`sleep` future only resolves when `SimEnv`'s cooperative executor
+(`Simulator::run_for`/`run_until`) steps virtual time past its deadline
+and wakes it. `block_on` on a plain thread never does that; it just polls
+the same still-`Pending` future forever. Nothing panics, nothing errors,
+nothing times out — the process simply never returns, which under `cargo
+test` looks identical to "still compiling" until someone kills it.
+
+**Fix**: drive the op the way every other synchronous (non-spawned-task)
+caller in this fixture already does — `SimCluster`'s own `put`/`get`/
+`delete`/`scan` (`&mut self`, spawn the future via `env.spawn_task` onto
+the target node's own env, then `Simulator::run_for` a bounded budget,
+then read the result back out of a shared slot — `spawn_and_capture`).
+`run_delete_probe` now takes `&mut SimCluster` and calls those instead of
+`SimClusterHandle` + `block_on`. A client task spawned via `env.spawn_task`
+that itself `.await`s a `SimClusterHandle` op directly is a *third*, also
+sound, shape — the corpus's own outer scenario runner is what drives
+`Simulator::run_for` in that case, exactly once, covering every
+concurrently spawned task's needs at once.
+
+**General form**: before reaching for `futures::executor::block_on` (or
+any other real-thread blocking primitive) against a `SimEnv`-backed
+future, ask whether anything inside that future's own call chain
+`.await`s `env.sleep()`/a network round trip/anything else gated on the
+simulator's virtual clock. If yes, `block_on` alone is unsound — the
+future needs either `spawn_task` + a concurrently-running `Simulator::
+run_for`/`run_until` (this fixture's own `spawn_and_capture` idiom), or to
+be `.await`ed from inside a future that is *itself* being driven by one.
+If the answer is "no, it's a pure synchronous computation with no real
+wait," `block_on` alone (as `raftkv_linearizable.rs`'s own `final_state`
+already does) is fine — but that soundness rests entirely on the callee's
+own implementation staying that way, so a doc comment at the call site
+naming the assumption (as this fixture's own `run_delete_probe`/
+`final_state` docs now do) is worth writing down rather than trusting
+memory the next time either function's own internals change.
+
+## Extracting a pure crate below a wire adapter: split parser from evaluator, not by file (ADR 0054 step 1, C-01)
+
+Moving `animus-dynamo`'s item model into a new crate below it (`animus-item`)
+so a future protocol-agnostic apply path could depend on it without pulling
+in the wire adapter looked at first like a file-level move: `condition.rs`,
+`index.rs`, and `numkey.rs` were already fully pure (no `serde_json::Value`
+anywhere) and moved wholesale, tests included. `wire.rs`'s
+`UpdateExpression` machinery did not split that cleanly, because it is two
+things wearing one name: a **tokenizer/parser** that turns request JSON
+(`ExpressionAttributeNames`/`Values`, both `serde_json::Value`-shaped) into
+`Vec<UpdateAction>`, and an **evaluator** (`apply_update` and everything it
+calls) that folds those already-resolved actions against an `Item`. Only the
+evaluator half is genuinely part of the pure item-mutation model; the parser
+half is JSON/wire-decode work that has no business in a crate meant to sit
+below the wire adapter, even though both halves reference the exact same
+`UpdateAction`/`PathSegment` types. The fix was to move the **data types**
+(needed by both halves) and the **evaluator** together, and leave the
+**parser** in `wire.rs`, importing the types back across the new crate
+boundary. The general rule: when a "this whole module needs to move below
+crate X" instinct meets a module that decodes wire-format input into a
+value and also *evaluates* that value, check whether the decode step reaches
+for a wire-specific type (`serde_json::Value`, a JSON `Map`, an HTTP header)
+that the evaluator itself never touches — if so, the boundary is inside the
+file, at the parse/evaluate seam, not at the file's edges.
+
+**A second reusable trick for this kind of move**: a large single-file test
+module (this one had 247 `#[test]` functions in one `mod tests` block) can be
+split into individually-relocatable chunks *without* a real Rust parser by
+exploiting `cargo fmt`'s own indentation invariant — every top-level item
+inside `mod tests { .. }` is indented exactly 4 spaces, so its own closing
+brace is a line that is *exactly* `"    }"`, regardless of what braces or
+JSON-string-literal punctuation appear inside the item's body (those are all
+indented deeper). A small script walking line-by-line, treating each run
+from one non-blank line up to the next bare `"    }"` line as one item, gave
+a correct decomposition of the whole test module into individually
+classifiable chunks (by keyword: does this chunk call `decode_request`/
+`Operation::` → stays; does it only touch `apply_update`/`UpdateAction`
+construction → moves) — verified by reconstructing the total test count
+(324 before, 324 after, exactly redistributed) rather than trusting the
+classifier's keyword list alone. This is much faster and less error-prone
+than hand-copying dozens of test functions, and generalizes to any
+similarly-large rustfmt'd test module that needs splitting by content rather
+than by file.
+
+**A third pattern, for keeping "no behaviour change" honest across a crate
+boundary that also needs a different error type**: when a moved function
+used to return the enclosing crate's own error type (here, `WireError`, with
+a `code`/`message` shape client-visible error handling depends on) but the
+new crate cannot depend on that type, give the new crate its own minimal
+error type with the **same field shape** (`UpdateError { code, message }`,
+mirroring the existing `ConditionError` precedent in the same codebase)
+rather than collapsing to a bare `String`. Every test that used to assert
+`err.code == "ValidationException"` then keeps working unchanged after the
+move, and the original crate's wrapper becomes a one-line `From` impl
+instead of a place where message text has to be retyped and could silently
+drift.
+
+## A leader-local side channel that apply fills needs a registration step that is provably ordered before apply, not merely likely to be (ADR 0054 step 2, `KindEvalResults`)
+
+Building the leader-local result payload for `KvCommand::KindEval`
+(`animus-cp-data`), the first draft registered "this node wants entry N's
+payload" in a bounded map **after** `propose_ordered`-style code returned
+`ProposeResult::Accepted`, using the freshly-known `index`. That is exactly
+the natural place to put it, and it is unsound in general: the apply task is
+a *separate*, independently-scheduled consumer of the same `core`'s
+committed effects, and under `ProdEnv` it can run on a different OS thread.
+Nothing stops it from draining and applying the just-appended entry — and
+therefore looking up (and finding nothing in) the interest set — in the gap
+between "propose returns" and "the next line registers interest," so a
+registration written this way is a race that usually wins, not a guarantee.
+
+The fix costs nothing extra: `propose_ordered`'s own shape already holds a
+`core: MutexGuard` across "build the command, call `core.propose`, note the
+accepted result" — and the apply task cannot drain a freshly-committed
+effect without first acquiring that *same* lock (`apply_and_compact`'s
+`core.lock().drain_apply()`). Moving the registration step **inside** that
+still-held critical section, before `drop(core)`, converts "usually before"
+into "provably before, on every executor" for free — the apply side is
+*structurally* unable to observe the entry until the registration's own
+lock release happens, no timing assumption required. `RaftKvNode::
+propose_kind_eval` does this: `self.kind_eval_results.lock()...register(index)`
+runs one statement before the `drop(core)` that ends the section
+`propose_ordered` itself already delimits.
+
+The general form: whenever a proposer wants to leave a note for its own
+entry's future apply to find, ask whether apply's own path to that entry
+shares a lock with the proposer's own critical section — if it does (as it
+almost always will for anything routed through `propose_ordered`'s shape),
+writing the note inside that section is free correctness a "make it happen
+right after accept" version of the same code would only get by luck. The
+inverse mistake — registering the note in a *different*, unrelated lock, or
+after the shared lock has already been released — reintroduces exactly the
+race this pattern exists to close, and a `SimEnv`-only test suite cannot
+catch it: `SimEnv`'s single-threaded cooperative scheduler never actually
+interleaves the two sides at the vulnerable instant (there is no `.await`
+between "propose returns" and "the next synchronous statement runs"), so
+the bug is invisible in the deterministic corpus and would only show up as
+an intermittent `ProdEnv` flake under real concurrent load — the same
+"`SimEnv` proves logic and ordering, not real-thread liveness" class of gap
+the root `CLAUDE.md` already names for locks/wakers/group commit, extended
+here to "a side-channel handoff between two lock users" as a new instance
+of the same family.
+
+## A leader-side "seatbelt double-check" kept alongside an apply-evaluated write must predict the client's own decision, not replicate the byte-level mechanism it replaces — superseded, moved to the archive
+
+The mechanism this entry described
+(`predict_kind_eval_decision`/`report_kind_eval_seatbelt_mismatch`,
+`Metric::KindEvalSeatbeltMismatch`, `rmw285_confirm_gate`) was deleted whole by
+ADR 0054 step 4b — see `docs/engineering-lessons-archive.md`'s matching entry
+for the full account. The lesson still generalizes: a legacy double-check kept
+alongside a cutover must predict the SAME decision the new path makes, not
+replicate the old mechanism's own byte-level signal.
+
+## When a staged intermediate value can be re-observed as "current state," evaluate-at-apply must recognize its own prior output, not just its own prior input (ADR 0054 step 4a, `TxnStage::pending`)
+
+Moving `TransactWriteItems`' own evaluation into `KvCommand::TxnStage`'s
+apply arm (mirroring step 3's `KvCommand::KindEval`) looked like a pure
+copy of that arm's own "read the current value, evaluate, derive" shape —
+until tracing what "the current value" can mean for a *staged* write, not a
+directly-committed one. A `KindEval` write commits straight to the base
+kind scope; nothing else in the system can make its own key look like "my
+own prior output" before the entry itself even applies. A `TxnStage` write
+instead merges a **provisional intent** onto the same physical key — and
+that intent's own bytes *are* this entry's own already-computed new value,
+sitting right where "the current committed value" would be read from on
+any later re-processing of the identical log entry (an ordinary crash
+restart with no intervening compaction routinely does this — see this
+repo's own "engine_applied vs last_applied" note: the persisted applied
+watermark advances only at compaction/install, not on every commit, so an
+uncompacted restart replays the whole WAL against an already-intact
+engine). A naive port of `KindEval`'s read-then-evaluate shape would read
+that intent as if it were the pre-stage baseline and re-run `op` against
+it — for a non-idempotent update (`ADD`), silently doubling the effect on
+every restart that happens to replay the entry, with no error and no
+visible symptom short of a wrong final number.
+
+**The generalizable shape**: whenever moving evaluation into apply for a
+producer that stages its result as an intermediate/held state (an intent,
+a pending record, any "provisional" envelope a later step commits) rather
+than writing the final value directly, check whether that intermediate
+state can ever be the thing "read current state" reads back — and if it
+can, the apply arm needs an explicit identity check (here: "does the key's
+current envelope belong to *this exact* transaction already?") that
+short-circuits evaluation and reuses the already-computed result verbatim,
+rather than trusting a single "read → evaluate → write" shape to be safe
+just because it was safe for a producer that commits directly. The fix
+does not need a new mechanism — the already-computed value is *right
+there* in the intent's own envelope, decoded by the same read that would
+otherwise misinterpret it — but the bug is invisible to a differential
+test built the `KindEval` way (propose once, compare to a hand-evaluated
+`KindBatch`): the failure only appears if the *same log entry* is
+processed a second time against a state its own first processing already
+changed, which requires a same-engine restart/replay scenario specifically
+(`tests/txn_kind_writes.rs::
+pending_add_stage_survives_a_same_engine_restart_without_double_applying`),
+not the "propose twice with two different entries" shape most concurrency
+tests reach for.
+
+## A crate-wide `disallowed_methods` lint exemption hides a real determinism violation from every enforcement layer, not just from review (W-09, ADR 0034 amendment)
+
+Building `RequestRateTracker` (the W-09 write-rate auto-split signal)
+alongside its existing sibling `ChangeRateTracker` (`crates/animusd/src/
+lib.rs`) surfaced that the sibling had been calling `tokio::time::
+Instant::now()` directly since it was added (ADR 0042 §14, growth PR3) —
+a plain violation of the root `CLAUDE.md`'s "no wall clock, use `env.now()`"
+determinism rule (ADR 0003). Nothing caught it: `animusd`'s package-level
+`[lints.clippy]` override turns off `disallowed_methods` for the whole
+crate (`crates/animusd/CLAUDE.md`'s own documented ADR 0061 rung B5
+carve-out, covering `lib.rs` itself among the files still under the
+package-level allow), so `cargo clippy --workspace -- -D warnings` — the
+gate this repo actually runs — was silent about it. The only two things
+that could have caught it were a human specifically checking this one call
+site during original review, or the narrower `#[deny(clippy::
+disallowed_methods)]` ADR 0061 Phase C's closing rung put on five
+`E: Env`-generic client-path modules (`schema`/`read_path`/`write_path`/
+`txn_coordinator`/`forwarding`) — and `ChangeRateTracker` lives in `lib.rs`
+itself, outside that narrower deny's scope.
+
+The violation was latent, not inert: `ChangeRateTracker::observe` read the
+wall clock to compute an EWMA smoothing interval, which under `SimEnv`
+(any future test that tried to drive it deterministically) would have
+produced a real, non-reproducible time reading spliced into an otherwise
+seed-pure computation — exactly the failure mode the determinism rule
+exists to prevent, just never yet exercised because nothing had tried to
+unit-test this tracker under `SimEnv` before this task needed to.
+
+**Fixed as a pure refactor** (`RateSample`/`RateSample::advance`, the
+shared EWMA core both trackers now use): `observe` takes the caller's own
+`env.now(): Nanos` reading as an explicit parameter instead of reading a
+clock internally. Every real call site already had a `ClientCtx`/`CpGroup`
+handle in scope to read `now` from (`index_drain.rs`'s `seal_tick`,
+`dynamo.rs`'s `kind_write_item_at_leader`), so this needed no new
+plumbing — only the tracker's own two-line clock read moved to its caller.
+Both trackers then got a `SimEnv`-driven unit test (`rate_tracker_tests`,
+`lib.rs`) proving the EWMA converges toward a sustained rate and decays
+once observations slow or stop, entirely over virtual time.
+
+**General form**: a crate-wide (or even five-module-wide) lint exemption is
+a documented, deliberate debt — not a blanket license to stop looking. A
+type living inside the exempted surface that reads a raw clock/spawns a raw
+task/etc. is invisible to `cargo clippy -D warnings` by construction, so
+the only remaining check is a human noticing during review, or — as
+happened here — a later change that needs the same shape and, in building
+it correctly, finds the older sibling wasn't. When extending or mirroring
+an existing type inside a lint-exempted module, always check whether the
+existing one already violates the rule the exemption is hiding, and fix
+both together if the fix is a pure refactor with no behavior change — the
+same "in scope because the two must share one shape anyway" reasoning that
+applies to any other shared-code touch.
+
+## Merging a TLS-wrapping branch onto a #596-era generic-stream refactor: `TcpStream::peek` has no substitute on a generic/TLS stream — a zero-length read doesn't work either (merging S-01 onto main)
+
+Merging `claude/s01-tls` (ADR 0064, TLS on every port) onto a `main` that
+had, in the meantime, generalized the client-protocol connection handler
+to race the request handler against peer abandonment (issue #596,
+`peer_closed`/`handle_connection`) found a real integration gap between
+two independently-reasonable designs: #596's `peer_closed` used
+`OwnedReadHalf::peek` (a raw-socket, non-consuming primitive) to detect a
+dropped peer without stealing bytes a pipelined next frame might have
+already sent; S-01 wraps that same connection in `MaybeTlsStream`, whose
+`Tls` variant is `tokio_rustls::TlsStream` — no such peek exists once the
+bytes on the wire are TLS records, and there is no way to "peek behind"
+the encryption at the raw socket without duplicating rustls's own framing
+logic. A tempting shortcut — read into a zero-length buffer instead — is a
+dead end: most `AsyncRead` implementations, `TcpStream` included, special
+case an empty destination buffer and return immediately without ever
+polling the underlying transport, so it can never actually observe EOF or
+wait for anything; it would busy-loop, not detect a close.
+
+**Fixed** with a small purpose-built wrapper (`Rewindable<R>`, `lib.rs`):
+an `AsyncRead` adapter holding one optional stashed byte. `peer_closed`
+does a real one-byte read (which genuinely waits on the transport and
+distinguishes "closed" from "nothing yet", exactly like `peek` did); if a
+byte comes back, `Rewindable` stores it and the very next real read
+(`read_frame`, the following loop iteration) drains the stash first — from
+every caller's point of view this is byte-for-byte identical to a
+non-consuming peek, whether the underlying transport is a plain
+`TcpStream` or a `MaybeTlsStream::Tls`. `handle_connection` moved from a
+generic `<S: AsyncRead + AsyncWrite + Unpin>` (S-01's own shape, which
+never needed to split the stream) to a concrete `MaybeTlsStream` parameter
+using `tokio::io::split` (the generic splitter, not `TcpStream::
+into_split`) — the two designs turned out not to compose by simple
+substitution; reconciling them needed a new primitive, not just picking a
+side. **General form**: when two branches each generalize the same
+function along a different axis (one over the stream *type*, ADR 0064; one
+over the stream *usage pattern* — split + race, issue #596), check whether
+a primitive one side depends on (`peek`) survives the other side's
+generalization before assuming the two diffs will merge cleanly — a
+socket-specific capability is exactly the kind of thing a "make it generic"
+refactor silently drops.
+
+## A relayed-request indirection added on two branches under confusingly similar names leaves a stale free function as silent dead code (merging S-01 onto ADR 0061 rung C3d)
+
+`main` grew a `ClientCtx.relay: R` field (ADR 0061 rung C3d) so every
+cross-node relay call in `forwarding.rs`/`read_path.rs`/`schema.rs` goes
+through `self.relay.relay(..)` instead of the free `relay_request`/
+`relay_request_with_timeout` functions directly. Independently, `S-01`'s
+own TLS commit had threaded a `tls: Option<&TlsMaterial>` parameter through
+those same two free functions and every one of their call sites. Reconciling
+the two (per this repo's own review guidance: the TLS dial belongs in
+`AnimusdRelayClient` — the one `RelayClient` implementor — not at each
+generic call site) meant moving `self.tls.as_ref()` off every call site and
+into `AnimusdRelayClient::relay`'s own body, which already called
+`relay_request_with_timeout` directly. That left the *other*, timeout-less
+wrapper — `relay_request(addr, request, tls) { relay_request_with_timeout(
+addr, request, CLIENT_TIMEOUT, tls) }` — with zero remaining callers
+anywhere in the crate, `pub(crate)` and therefore invisible to any
+downstream crate's own dead-code lint, and *already* dead on the
+pre-merge `S-01` branch tip itself (confirmed by grepping that commit's
+own tree) — an unrelated, same-shaped `RemoteControlClient::relay()`
+accessor S-01 had added for `remote_metadata_watch_loop` (a method on a
+*different* type, coincidentally named identically to the field this
+merge introduced) had already made it redundant, and nothing had rebuilt
+that one file with `-D warnings` since. Caught only by an actual `cargo
+check -p animusd --lib` after resolving the textual conflicts, not by
+inspection: `cargo build`/`cargo test` don't run the same dead-code
+diagnostics the moment a function keeps at least one internal caller from
+before the refactor, and a purely textual merge can leave a fully
+well-typed function with nothing left calling it. **General form**: after
+resolving a conflict that redirects a call site from one relay/dispatch
+primitive to another, grep every other call site of the primitive being
+abandoned before assuming it still earns its keep — a same-named-but-
+unrelated indirection on the other side of the merge can make a function
+look load-bearing right up until the compiler's own unused-function
+warning says otherwise.
+
+## A moving `origin/main` mid-merge is cheaper to handle by re-merging from scratch than by stacking two merge commits
+
+While resolving this same TLS-branch merge, `origin/main` advanced again
+(one more PR merged) partway through conflict resolution, before the
+in-progress merge had been committed. Since nothing had been committed
+yet, `git merge --abort` followed by a fresh `git merge origin/main`
+against the new tip was cheaper and safer than committing the
+already-resolved merge and layering a second merge commit on top: most of
+the conflicts reappeared byte-for-byte identical (the append-only docs,
+the same relay/TLS call sites) and were fixed by reapplying the same
+edits, while the handful of genuinely new conflicts the second PR
+introduced (a new `--auto-split-ops-rate` CLI usage line, a new wave-table
+row) were then resolved once, in their final form, rather than resolved
+once and then re-touched again in a follow-up merge commit. **General
+form**: if `origin/main` moves while a merge's conflicts are still being
+resolved and nothing has been committed, prefer aborting and re-merging
+against the new tip over finishing the stale merge and chaining a second
+one — a single merge commit against the true current tip is both the
+cleaner history and, in practice, less total conflict-resolution work than
+two.

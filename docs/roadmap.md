@@ -40,35 +40,6 @@ the still-true paragraph after the table.
 
 ## 1. Wire surface (DynamoDB API)
 
-### W-03 Order-preserving encoding for `N` sort keys
-
-- **Gap:** `AttributeValue::key_bytes()` writes `N` as raw decimal text, so
-  Query ordering across magnitudes and signs is bytewise, not numeric.
-  Range predicates are correct; `ScanIndexForward` order is not.
-- **Plan:** canonical sign + exponent + digit-run encoding with inversion
-  for negatives, applied at the single choke point `key_bytes()` and
-  mirrored byte-for-byte in `animus-tablet`'s escape/token primitives;
-  `matches_raw` must decode the new encoding instead of UTF-8 text.
-- **Reuse:** `condition.rs`'s `decimal_parts`/`add_digits`/`sub_digits`
-  for canonicalisation.
-- **Files:** `crates/animus-dynamo/src/lib.rs:84-97`;
-  `crates/animus-tablet/src/lib.rs:44,134`; `index.rs:140-249` (GSI/LSI
-  row keys); `condition.rs:118-131`.
-- **Tests:** new differential proptest against `bigdecimal` next to
-  `condition.rs`'s `decimal_differential_tests`; rewrite
-  `matches_raw_reinterprets_bytes_by_the_conditions_own_declared_type`
-  (`condition.rs:870`); explicit regressions for GSI, LSI, streams, and
-  backup/restore reading the same bytes.
-- **ADR:** **yes, 0063** — amends ADR 0022/0023's key layout, which those
-  ADRs mark "do not change without a data migration". No back-compat is
-  owed (root `CLAUDE.md`), but the decision is recorded.
-- **PRs:** (1) ADR; (2) encode/decode + proptest, unwired; (3) wire
-  `key_bytes` + `animus-tablet` mirror + `matches_raw`; (4) index, stream,
-  backup regressions.
-- **Size:** L (small algorithm, large blast radius).
-- **Depends:** W-05 landed 2026-09-04; `schema.rs`'s bridge now carries
-  index key attribute types, so this can start at any time.
-
 ### W-07 PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`)
 
 - **Gap:** absent. Deliberately sized honestly: a new parser, a new error
@@ -107,20 +78,9 @@ the still-true paragraph after the table.
   coordinated, interaction with transaction atomicity.
 - **PRs:** (1) ADR; (2) bucket + tracker; (3) enforcement + error mapping;
   (4) config surface. **Size:** L.
-- **Depends:** W-09 first (shares the per-tablet tracker).
-
-### W-09 Hot-but-small auto-split signal (ADR 0034 deferred item)
-
-- **Gap:** the byte trigger cannot see a small tablet under heavy load.
-  ADR 0034 says no per-tablet rate signal exists. **Partly stale:**
-  `ChangeRateTracker` exists but is fed only from `KIND_CHANGE` bytes, so
-  only streamed/indexed tables get a rate.
-- **Plan:** sibling `RequestRateTracker` (ops/sec) observed unconditionally
-  from `kind_write_item_at_leader`; new `auto_split_loop` gate
-  (`lib.rs:8485-8520`) and `--auto-split-ops-rate` knob.
-- **ADR:** amendment note closing ADR 0034's deferred bullet.
-- **PRs:** one. **Size:** M. **Depends:** none (S-06 landed 2026-09-04: a new knob
-  goes in `cluster_settings`).
+- **Depends:** none — W-09 landed 2026-09-05, so `RequestRateTracker`
+  (`crates/animusd/src/lib.rs`) already exists as the per-tablet tracker
+  shape to copy.
 
 ---
 
@@ -214,24 +174,6 @@ the still-true paragraph after the table.
 
 ## 3. Core design items still proposed
 
-### C-01 Evaluate writes at apply (ADR 0054)
-
-- **Gap:** `rmw_lock` and evaluate-at-leader remain
-  (`dynamo.rs:3154,5760`, `txn_coordinator.rs:57`, `lib.rs:6218`);
-  contention-induced write refusals persist.
-- **Plan:** follow ADR 0054's Decision and Sequencing sections: a
-  self-contained entry evaluated in the `KindBatch` apply arm of
-  `animus-cp-data`, results returned via a leader-local payload; keep the
-  leader seatbelt as a double-check for one PR; then remove `rmw_lock` and
-  the OCC precondition machinery.
-- **Tests:** flip the concurrent-increment regression ADR 0054 cites;
-  `animus-cp-data` apply-path sims; run C-04's `SimCluster` corpus first.
-- **ADR:** none new; flip 0054 to Accepted on landing.
-- **PRs:** (1) entry shape + apply-side single-item; (2) ADD/conditional
-  cutover; (3) remove `rmw_lock`. **Size:** L. S-01 (the listener work
-  this used to be sequenced apart from) landed 2026-09-05 (ADR 0064) — no
-  ongoing overlap to avoid any more, but this item itself is still open.
-
 ### C-02 Heartbeat amortization (ADR 0044 phase 2)
 
 - **Plan:** a per-node-pair heartbeat batcher below each `RaftCore` tick
@@ -251,11 +193,14 @@ the still-true paragraph after the table.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
-- **D1:** a `SimCluster` fixture over `ClientCtx<SimEnv>`
-  (`lib.rs:6275`, already generic), reusing the existing multi-node
-  `SimEnv` setup from `animus-control`/`animus-cp-data` tests and the B1
-  seed harness in `animus-test`; then a first cycles/durability corpus.
-  Size M. Land before C-01.
+- **D1 landed 2026-09-05** (`SimCluster`, a multi-node `ClientCtx<SimEnv,
+  SimRelayClient<SimEnv>>` fixture with a real fault surface, plus
+  `sim_cluster_corpus`, its first cycles/durability corpus over
+  `animus-test`'s `check_cycles`/`check_durability`/`check_convergence`
+  oracle, depth knob `ANIMUS_SIMCLUSTER_SEEDS`; ADR 0061's 2026-09-05
+  amendments). D2-D4 remain open (an end-to-end DynamoDB-wire corpus, the
+  `animusd` integration-suite migration, and deterministic coverage for
+  auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). E2 (`animus-cli` coverage) stays folded into
@@ -385,8 +330,10 @@ wave are independent and can run in parallel.
 |---|---|---|
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
-| 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
-| 4 | *S-01 landed 2026-09-05* (ADR 0064); C-01, S-02, W-08 remain | Highest blast radius |
+| 2.5 | *landed 2026-09-05* (C-04 D1) | No cross-deps; run before C-01 |
+| — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3; W-08 now depends on nothing |
+| 3 | U-05, U-07, U-08(ii) | U-05 after its members panel |
+| 4 | S-02, W-08 | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 

@@ -193,11 +193,28 @@ async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name(
 
     // Node 0's own self-registered address book names `localhost`, not its
     // literal `127.0.0.1` bind address, for every port it advertises.
-    let meta = nodes[0].metadata();
-    let addrs0 = meta
-        .node_addrs
-        .get(&animusd::config::node_id(0))
-        .expect("node 0 self-registered its own NodeAddrs");
+    // `await_bootstrap` only proves a control leader and non-empty
+    // membership; `RegisterNodeAddrs` is a separate replicated command
+    // that commits after that, so a one-shot read here can race it on a
+    // loaded runner (CI run 33948959240, 0.27s) — poll to convergence
+    // instead, the same converged-or-timeout shape `await_bootstrap`
+    // itself uses (the #421 class: a converged-or-timeout poll can still
+    // race when the condition it polls is weaker than the assertion that
+    // follows it).
+    let addrs0 = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(addrs) = nodes[0]
+                .metadata()
+                .node_addrs
+                .get(&animusd::config::node_id(0))
+            {
+                return addrs.clone();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("node 0 self-registered its own NodeAddrs");
     let expected_intra = format!("localhost:{}", config.nodes[0].intra.port());
     let expected_client = format!("localhost:{}", config.nodes[0].client.port());
     assert_eq!(
@@ -264,12 +281,18 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
     await_bootstrap(&nodes).await;
 
     let node1_id = animusd::config::node_id(1);
-    let before = nodes[0]
-        .metadata()
-        .node_addrs
-        .get(&node1_id)
-        .cloned()
-        .expect("node 1 self-registered before the restart");
+    // Same race as above: `await_bootstrap` only proves membership, not
+    // that `RegisterNodeAddrs` has committed yet — poll for it.
+    let before = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(addrs) = nodes[0].metadata().node_addrs.get(&node1_id) {
+                return addrs.clone();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("node 1 self-registered before the restart");
 
     // Shut node 1 down, freeing its ports, then rebind the identical port
     // numbers on 127.0.0.2 instead of 127.0.0.1 — same id, same
@@ -407,6 +430,25 @@ async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
     })
     .await
     .expect("all 3 nodes must converge on the full membership set");
+
+    // Membership convergence above proves `members`, not that every node's
+    // own `RegisterNodeAddrs` has committed yet — poll for all `n` entries
+    // before reading them (same race as the two tests above).
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if (0..n).all(|i| {
+                nodes[0]
+                    .metadata()
+                    .node_addrs
+                    .contains_key(&animusd::config::node_id(i))
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every node must have self-registered its own NodeAddrs");
 
     for i in 0..n {
         let addrs = nodes[0]

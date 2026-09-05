@@ -131,7 +131,10 @@ async fn create_table_query_and_conditional_writes() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"u1"}}}"#,
     )
     .await;
@@ -146,7 +149,10 @@ async fn create_table_query_and_conditional_writes() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk = :s",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND sk = :s",
             "ExpressionAttributeValues":{":p":{"S":"u1"},":s":{"S":"b"}}}"#,
     )
     .await;
@@ -157,7 +163,10 @@ async fn create_table_query_and_conditional_writes() {
     let (status, body) = dynamo(
         addr1,
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND sk BETWEEN :lo AND :hi",
             "ExpressionAttributeValues":{":p":{"S":"u1"},":lo":{"S":"a"},":hi":{"S":"b"}}}"#,
     )
     .await;

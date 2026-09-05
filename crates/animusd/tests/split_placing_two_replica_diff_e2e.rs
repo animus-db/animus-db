@@ -22,6 +22,27 @@
 //! `SimEnv` side of the same investigation (many more seeds, several
 //! harness shapes) and this repo's engineering-lessons entry for the full
 //! writeup and the likely explanation for the original finding.
+//!
+//! **Issue #596**: proving the 5-voter intermediate genuinely occurred used
+//! to rest on sampling `/admin/raftkv` externally every 200ms and asserting
+//! on the observed max — flaky under load (~1 in 3 on a 2-core-pinned,
+//! contended run), because the intermediate's own *duration* was never a
+//! property this crate promises, only that it is logically reached; a fast
+//! enough pair of consecutive reconciler ticks can remove both extras
+//! between two samples. The 200ms poll below is now a diagnostic print
+//! only — the real proof reads `RaftKvNode::voter_history()`
+//! (`animus-cp-data`, via the `/admin/raftkv` `voter_history` field it
+//! exposes) after convergence: a durable, in-process record of every
+//! distinct voter configuration each replica has actually adopted, so
+//! nothing external has to catch the transient state while it's happening.
+//! The retained replica's own history is checked for the floor/ceiling and
+//! the 5-voter intermediate, but not the exact `[3,4,5,4,3]` sequence a
+//! `SimEnv` run can assert — under real timing a starved replica's own
+//! `handle_append_entries` can adopt two config entries in one batch and
+//! skip an intermediate its own consensus loop never got a chance to
+//! observe, which the union check (unaffected, since some OTHER replica is
+//! never starved on the same batch) already covers. See
+//! `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -341,6 +362,54 @@ async fn live_voters_leader(nodes: &[Node], tablet: u64) -> Option<(Vec<String>,
     any.map(|v| (v, leader))
 }
 
+/// Every node's own recorded `RaftKvNode::voter_history()` for `tablet`
+/// (issue #596), keyed by that node's own id — `/admin/raftkv`'s
+/// `voter_history` field, sorted node-id-wise within each entry so two
+/// equal configurations compare equal regardless of adoption-order
+/// artifacts in how the wire happened to list them. A node not currently
+/// hosting `tablet` at all (an ex-replica already torn down, or one that
+/// never hosted it) is simply absent from the map — the caller decides
+/// whether that's expected.
+async fn voter_history_of(nodes: &[Node], tablet: u64) -> BTreeMap<String, Vec<Vec<String>>> {
+    let mut out = BTreeMap::new();
+    for n in nodes {
+        let (_, body) = admin(n.admin_addr(), "GET", "/admin/raftkv", None).await;
+        let Some(groups) = body["groups"].as_array() else {
+            continue;
+        };
+        for g in groups {
+            if g["tablet"].as_u64() != Some(tablet) {
+                continue;
+            }
+            let Some(node_id) = g["node"].as_str() else {
+                continue;
+            };
+            let history: Vec<Vec<String>> = g["voter_history"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            let mut voters: Vec<String> = entry
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            voters.sort();
+                            voters
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert(node_id.to_string(), history);
+        }
+    }
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
     timeout(Duration::from_secs(150), async {
@@ -407,7 +476,20 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
 
         // Poll every 200ms, recording the live voter set for BOTH children,
         // looking for genuine growth-then-shrink oscillation, up to a
-        // generous 90s budget.
+        // generous 90s budget. "Converged" requires `SETTLE_SAMPLES`
+        // CONSECUTIVE matches against `want_target`, not a single momentary
+        // one: a bare one-shot match can fire while the control plane's own
+        // reconcile/rebalance loop is still nudging the tablet further (the
+        // production `split_placing_completion.rs` loop has the identical
+        // `SPLIT_PLACING_DONE_SETTLE` discipline for exactly this reason —
+        // see its own doc). Found live building this test's own
+        // `voter_history`-based assertions: a bare momentary match let the
+        // test proceed to read `voter_history` while the group was still
+        // being reconfigured further (once observed continuing on, well
+        // past `want_target`, toward something close to the ORIGINAL
+        // replicas again) — a real gap in this test's own "converged"
+        // definition, not a mechanism bug, and orthogonal to issue #596.
+        const SETTLE_SAMPLES: usize = 3;
         let mut trace_left: Vec<(u128, usize, Vec<String>, Option<String>)> = Vec::new();
         let mut trace_right: Vec<(u128, usize, Vec<String>, Option<String>)> = Vec::new();
         let start = tokio::time::Instant::now();
@@ -421,9 +503,13 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
             if let Some((v, l)) = live_voters_leader(&nodes, right).await {
                 trace_right.push((t, v.len(), v, l));
             }
-            let l_ok = trace_left.last().map(|(_, _, v, _)| v) == Some(&want_target);
-            let r_ok = trace_right.last().map(|(_, _, v, _)| v) == Some(&want_target);
-            if l_ok && r_ok {
+            let settled = |trace: &[(u128, usize, Vec<String>, Option<String>)]| {
+                trace.len() >= SETTLE_SAMPLES
+                    && trace[trace.len() - SETTLE_SAMPLES..]
+                        .iter()
+                        .all(|(_, _, v, _)| v == &want_target)
+            };
+            if settled(&trace_left) && settled(&trace_right) {
                 converged = true;
                 break;
             }
@@ -451,17 +537,157 @@ async fn two_of_three_replica_diff_placing_target_converges_end_to_end() {
             trace_left.iter().map(|(_, n, _, _)| *n).collect::<Vec<_>>(),
             trace_right.iter().map(|(_, n, _, _)| *n).collect::<Vec<_>>(),
         );
-        // This must have genuinely passed through the over-replicated
-        // 5-voter intermediate the issue names — otherwise this is only
-        // proving the strictly easier single-diff case under a different
-        // harness.
+        // Diagnostic only (issue #596) — the 200ms sampled poll above can
+        // race a fast-enough pair of consecutive reconciler ticks and miss
+        // the transient 5-voter intermediate even when it genuinely
+        // occurred, so a low number here proves nothing either way. The
+        // real proof is `voter_history` below.
         let max_left = trace_left.iter().map(|(_, n, _, _)| *n).max().unwrap_or(0);
         let max_right = trace_right.iter().map(|(_, n, _, _)| *n).max().unwrap_or(0);
-        assert!(
-            max_left >= 5 && max_right >= 5,
-            "expected to observe the transient 5-voter intermediate on both children \
-             (max seen: left={max_left}, right={max_right})"
+        eprintln!(
+            "diagnostic only, not asserted (issue #596): 200ms-sampled max voters seen \
+             left={max_left} right={max_right}"
         );
+
+        // The real proof (issue #596): `RaftKvNode::voter_history()`, read
+        // via `/admin/raftkv` from every node still up, is a durable
+        // in-process record of every distinct configuration each replica
+        // actually adopted — nothing external has to catch the transient
+        // state while it's happening.
+        //
+        // "n0" is present in both the parent's inherited replicas
+        // (`n0,n1,n2`, ADR 0062's fork-first inheritance) and `want_target`
+        // (`m0,m1,n0`) by this test's own construction, for BOTH children —
+        // it is the one replica retained throughout the whole swap on
+        // either side, so its own history is the one record that saw every
+        // step from a single fixed vantage point.
+        const RETAINED: &str = "n0";
+        for (child, label) in [(left, "left"), (right, "right")] {
+            let by_node = voter_history_of(&nodes, child).await;
+            eprintln!("=== {label} child {child} voter_history by node ===");
+            for (node_id, history) in &by_node {
+                eprintln!("  {node_id}: {history:?}");
+            }
+
+            // (a)+(b): the UNION of every currently-hosting node's own
+            // history must show the over-replicated intermediate was
+            // reached and never show fewer than the 3-voter floor either
+            // side of the swap.
+            //
+            // One real, pre-existing (and orthogonal to issue #596) wrinkle
+            // found running this: `host::Reconciler::host`'s bootstrap for a
+            // replica joining an ALREADY-LED group (`initial_formation:
+            // false`) seeds that replica's OWN local `RaftCore` from
+            // `Metadata`'s CURRENT `t.replicas` **minus itself**
+            // (`crates/animus-cp-data/src/host.rs`'s `let config = ...
+            // else { others }`) — pure scaffolding to know initial peer
+            // addresses before this replica has ever heard from the real
+            // leader, not a value any quorum ever agreed on. Since
+            // `Metadata::tablets[..].replicas` already reflects the
+            // DIRECTED-PLACING final target the instant `split_placing`
+            // computes it (ADR 0062 §3) — well before the live Raft swap
+            // catches up — a replica bootstrapping through this path (a
+            // genuinely new joiner, or an original replica that fell behind
+            // enough to learn of the child via `Metadata` rather than
+            // directly witnessing the fork) can record a transient,
+            // structurally-nonsensical FIRST entry that excludes itself and
+            // is smaller than any real committed configuration ever was
+            // (observed live: `["m1", "n0"]`, 2 entries, on a node whose
+            // real join sequence was 3→4→5→4→3 like every other replica's).
+            // It self-corrects the moment real sync begins. A node's own
+            // reported history is only meaningful from the first entry that
+            // actually includes itself onward — no real committed config
+            // ever excludes a member that hasn't joined it yet, and Raft's
+            // one-member-at-a-time discipline means a later legitimate
+            // "config no longer includes me" entry (this replica's own
+            // eventual removal) can only ever follow a genuine
+            // self-inclusive one, never precede it — so trimming this
+            // leading run cannot hide a real regression.
+            let mut union: Vec<Vec<String>> = Vec::new();
+            for (node_id, history) in &by_node {
+                let trusted_from = history.iter().position(|e| e.iter().any(|v| v == node_id));
+                let Some(start) = trusted_from else {
+                    // This node's own history never once included itself —
+                    // it never actually became real (or the group was torn
+                    // down on it before real sync); nothing it recorded is
+                    // trustworthy either way.
+                    continue;
+                };
+                for entry in &history[start..] {
+                    if !union.contains(entry) {
+                        union.push(entry.clone());
+                    }
+                }
+            }
+            let union_counts: Vec<usize> = union.iter().map(Vec::len).collect();
+            assert!(
+                union_counts.contains(&5),
+                "{label} child {child}: voter_history union across every hosting node never \
+                 recorded the transient 5-voter intermediate: {union_counts:?} (union: {union:?})"
+            );
+            assert!(
+                union_counts.iter().all(|&c| c >= 3),
+                "{label} child {child}: voter_history union dropped below the 3-voter floor: \
+                 {union_counts:?} (union: {union:?})"
+            );
+
+            // (c): the retained replica's own history, read from a single
+            // fixed vantage point, corroborates (a)+(b) end to end rather
+            // than only across the union. **Not** the exact `[3,4,5,4,3]`
+            // sequence here, deliberately: under real `ProdEnv` timing a
+            // CPU-starved n0 can have its `handle_append_entries` adopt TWO
+            // config-change entries in one batch (the leader only needs a
+            // majority of the OTHER voters to commit the first one before
+            // proposing the second — n0 itself is never on the critical
+            // path for either commit), recording 3→5 directly and skipping
+            // the 4-voter step this replica's own consensus loop simply
+            // never got a chance to observe between the two. That is a
+            // sampling gap in THIS replica's own once-per-iteration
+            // recording, not a reversion or an under-replication — (a)+(b)
+            // above (the union across every hosting replica, at least one
+            // of which is never starved on the same batch) already prove
+            // the property line 458 existed for: the swap genuinely reached
+            // 5 and never dropped below the 3-voter floor. The `SimEnv`
+            // regression (`voter_history_reconfigure_diff.rs`,
+            // `animus-cp-data`) has no such starvation and keeps the exact
+            // sequence assertion.
+            let retained_history = by_node.get(RETAINED).unwrap_or_else(|| {
+                panic!(
+                    "{label} child {child}: expected {RETAINED} (retained throughout by this \
+                     test's own construction) to still be hosting it — nodes seen: {:?}",
+                    by_node.keys().collect::<Vec<_>>()
+                )
+            });
+            let retained_counts: Vec<usize> = retained_history.iter().map(Vec::len).collect();
+            assert_eq!(
+                retained_counts.first(),
+                Some(&3),
+                "{label} child {child}: {RETAINED}'s own voter_history did not start at the \
+                 3-voter floor (full history: {retained_history:?})"
+            );
+            assert_eq!(
+                retained_counts.last(),
+                Some(&3),
+                "{label} child {child}: {RETAINED}'s own voter_history did not end at the \
+                 3-voter floor (full history: {retained_history:?})"
+            );
+            assert!(
+                retained_counts.contains(&5),
+                "{label} child {child}: {RETAINED}'s own voter_history never recorded the \
+                 transient 5-voter intermediate (full history: {retained_history:?})"
+            );
+            assert!(
+                retained_counts.iter().all(|&c| c >= 3),
+                "{label} child {child}: {RETAINED}'s own voter_history dropped below the \
+                 3-voter floor (full history: {retained_history:?})"
+            );
+            assert_eq!(
+                retained_history.last(),
+                Some(&want_target),
+                "{label} child {child}: {RETAINED}'s own voter_history did not end on the \
+                 directed-Placing target (full history: {retained_history:?})"
+            );
+        }
 
         for node in &nodes {
             node.shutdown_graceful().await;

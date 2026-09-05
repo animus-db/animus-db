@@ -18,7 +18,7 @@ use animus_tablet::TabletId;
 use async_trait::async_trait;
 
 use crate::dynamo::{self, KindWriteOutcome};
-use crate::{ClientCtx, KindWriteOp};
+use crate::{AnimusdRelayClient, ClientCtx, KindWriteOp};
 
 impl ControlLeaderHost<ProdEnv> for ClientCtx {
     fn control_leader(&self) -> Option<RaftNode<ProdEnv>> {
@@ -115,7 +115,7 @@ impl TtlScanHost for ClientCtx {
             animus_dynamo::Comparator::Eq,
             expected,
         );
-        match dynamo::kind_write_item_at_leader(
+        match dynamo::kind_write_item_at_leader::<ProdEnv, AnimusdRelayClient>(
             self,
             &group,
             &meta,

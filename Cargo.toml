@@ -23,6 +23,7 @@ animus-control = { path = "crates/animus-control" }
 animus-tablet = { path = "crates/animus-tablet" }
 animus-placement = { path = "crates/animus-placement" }
 animus-cp-data = { path = "crates/animus-cp-data" }
+animus-item = { path = "crates/animus-item" }
 animus-dynamo = { path = "crates/animus-dynamo" }
 animus-test = { path = "crates/animus-test" }
 animus-node = { path = "crates/animus-node" }

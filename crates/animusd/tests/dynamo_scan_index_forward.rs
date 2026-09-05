@@ -248,6 +248,96 @@ fn sk_order(body: &str) -> Vec<String> {
     order
 }
 
+/// Stand up a 3-node cluster with one table (`readings`, composite key
+/// `pk`/`sk`, `sk` declared `N`) carrying a composite GSI (`by-device-value`,
+/// hash `device`, sort `value`, `N`) and a composite LSI (`by-alt`, alt-sort
+/// `alt`, `N`) — the identical fixture shape `dynamo_query_range.rs::setup`
+/// uses, reproduced here (rather than shared) since that file's `setup` also
+/// seeds a *different* value set into a *different* table name and this
+/// suite's own `sk_order`/helpers are file-local. Every item in partition
+/// `pk = "p1"` carries the same numeric text in `sk`/`value`/`alt`, mixed
+/// digit counts, negatives, and a decimal — the exact shape a byte-text
+/// compare gets wrong (ADR 0063).
+async fn setup_n_sort_keys() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addrs: Vec<SocketAddr> = nodes.iter().map(Node::dynamo_addr).collect();
+
+    let (status, body) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"device","AttributeType":"S"},{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"value","AttributeType":"N"},{"AttributeName":"alt","AttributeType":"N"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-device-value",
+                 "KeySchema":[{"AttributeName":"device","KeyType":"HASH"},
+                              {"AttributeName":"value","KeyType":"RANGE"}],
+                 "Projection":{"ProjectionType":"ALL"}}],
+            "LocalSecondaryIndexes":[
+                {"IndexName":"by-alt",
+                 "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                              {"AttributeName":"alt","KeyType":"RANGE"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    for sk in ["-10", "-5", "0", "2", "10", "100", "0.5"] {
+        let (status, body) = dynamo_retry(
+            addrs[0],
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"readings","Item":{{
+                    "pk":{{"S":"p1"}},"sk":{{"N":"{sk}"}},
+                    "device":{{"S":"d1"}},"value":{{"N":"{sk}"}},
+                    "alt":{{"N":"{sk}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem(sk={sk}) failed: {body}");
+    }
+    (dir, nodes, addrs)
+}
+
+/// The `field`'s `N` values in a response body, in **first-appearance
+/// order** — the position-aware form an ordering assertion needs (mirroring
+/// `sk_order` above, and `dynamo_query_range.rs`'s identical `sk_order` vs.
+/// `sk_values` split: do NOT sort this, or an ordering assertion built on it
+/// becomes vacuous).
+fn n_order(body: &str, field: &str) -> Vec<String> {
+    let marker = format!("\"{field}\":{{\"N\":\"");
+    let mut out = Vec::new();
+    // Stop at `LastEvaluatedKey` for the same reason `sk_order` does.
+    let mut rest = body
+        .find("\"LastEvaluatedKey\":")
+        .map_or(body, |at| &body[..at]);
+    while let Some(at) = rest.find(&marker) {
+        let after = &rest[at + marker.len()..];
+        let endq = after.find('"').expect("closing quote");
+        out.push(after[..endq].to_string());
+        rest = &after[endq..];
+    }
+    out
+}
+
+/// [`n_order`], numerically sorted — the order-**independent** form for a
+/// membership assertion (a range predicate's result *set*), never for an
+/// ordering assertion.
+fn n_values_numeric_sorted(body: &str, field: &str) -> Vec<String> {
+    let mut out = n_order(body, field);
+    out.sort_by(|a, b| {
+        a.parse::<f64>()
+            .unwrap()
+            .partial_cmp(&b.parse::<f64>().unwrap())
+            .unwrap()
+    });
+    out
+}
+
 /// `ScanIndexForward: false` returns the partition highest-sort-key first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn descending_query_returns_the_partition_in_reverse_sort_order() {
@@ -303,7 +393,10 @@ async fn a_descending_limit_keeps_the_highest_rows() {
     let (status, body) = dynamo_retry(
         addrs[2],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
             "ScanIndexForward":false,"Limit":2}"#,
     )
@@ -437,7 +530,10 @@ async fn descending_composes_with_a_filter() {
     let (status, body) = dynamo_retry(
         addrs[0],
         "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
+        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
+        // just-written rows.
+        r#"{"TableName":"events","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
             "FilterExpression":"parity = :v",
             "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}},
             "ScanIndexForward":false,"Limit":2}"#,
@@ -451,6 +547,190 @@ async fn descending_composes_with_a_filter() {
         extract_last_evaluated_key(&body).is_some(),
         "short descending filtered page still carries a cursor: {body}"
     );
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// **GSI `ScanIndexForward` is numeric order for an `N` sort key (ADR
+/// 0063)**: the GSI row's own sort component (`index::gsi_row_key`) goes
+/// through the same order-preserving `numkey` codec as the base table, and
+/// its recovered sort segment (`index::parse_gsi_row_key`) is what
+/// `matches_raw` filters against — so both the returned *order* and a range
+/// `KeyConditionExpression`'s returned *set* must be numerically correct
+/// across mixed digit counts, negatives, and a decimal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gsi_scan_index_forward_orders_n_sort_keys_numerically() {
+    let (_dir, nodes, addrs) = setup_n_sort_keys().await;
+
+    let asc = await_gsi_query(
+        addrs[1],
+        r#"{"TableName":"readings","IndexName":"by-device-value","ScanIndexForward":true,
+            "KeyConditionExpression":"device = :d",
+            "ExpressionAttributeValues":{":d":{"S":"d1"}}}"#,
+        |b| n_order(b, "value").len() == 7,
+    )
+    .await;
+    assert_eq!(
+        n_order(&asc, "value"),
+        vec!["-10", "-5", "0", "0.5", "2", "10", "100"],
+        "GSI ScanIndexForward:true ascending numeric order: {asc}"
+    );
+
+    let desc = await_gsi_query(
+        addrs[2],
+        r#"{"TableName":"readings","IndexName":"by-device-value","ScanIndexForward":false,
+            "KeyConditionExpression":"device = :d",
+            "ExpressionAttributeValues":{":d":{"S":"d1"}}}"#,
+        |b| n_order(b, "value").len() == 7,
+    )
+    .await;
+    assert_eq!(
+        n_order(&desc, "value"),
+        vec!["100", "10", "2", "0.5", "0", "-5", "-10"],
+        "GSI ScanIndexForward:false descending numeric order: {desc}"
+    );
+
+    // BETWEEN -5 AND 2: -5, 0, 0.5, 2 — not -10, 10, or 100.
+    let between = await_gsi_query(
+        addrs[0],
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":lo":{"N":"-5"},":hi":{"N":"2"}}}"#,
+        |b| n_order(b, "value").len() == 4,
+    )
+    .await;
+    assert_eq!(
+        n_values_numeric_sorted(&between, "value"),
+        vec!["-5", "0", "0.5", "2"],
+        "GSI value BETWEEN -5 AND 2: {between}"
+    );
+
+    // `<` 0: -10, -5 only — a byte-text compare would wrongly admit "0.5".
+    let lt = await_gsi_query(
+        addrs[1],
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value < :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"0"}}}"#,
+        |b| n_order(b, "value").len() == 2,
+    )
+    .await;
+    assert_eq!(
+        n_values_numeric_sorted(&lt, "value"),
+        vec!["-10", "-5"],
+        "GSI value < 0: {lt}"
+    );
+
+    // `>=` 10: 10, 100 — a byte-text compare would wrongly exclude "100"
+    // (since `"100" < "10"` lexicographically is false but the multi-digit
+    // shape is exactly what a naive compare gets wrong elsewhere in range
+    // 1..=99) or admit "2".
+    let ge = await_gsi_query(
+        addrs[2],
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value >= :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"10"}}}"#,
+        |b| n_order(b, "value").len() == 2,
+    )
+    .await;
+    assert_eq!(
+        n_values_numeric_sorted(&ge, "value"),
+        vec!["10", "100"],
+        "GSI value >= 10: {ge}"
+    );
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// **LSI `ScanIndexForward` is numeric order for an `N` alt-sort key (ADR
+/// 0063)** — the LSI's own twin of the GSI test above
+/// (`index::lsi_row_key`/`parse_lsi_row_key`), strongly consistent so no
+/// polling is needed (mirrors `descending_applies_to_an_lsi_query`'s own
+/// rationale).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lsi_scan_index_forward_orders_n_sort_keys_numerically() {
+    let (_dir, nodes, addrs) = setup_n_sort_keys().await;
+
+    let (status, asc) = dynamo_retry(
+        addrs[1],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
+            "ScanIndexForward":true,
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "ascending LSI query failed: {asc}");
+    assert_eq!(
+        n_order(&asc, "alt"),
+        vec!["-10", "-5", "0", "0.5", "2", "10", "100"],
+        "LSI ScanIndexForward:true ascending numeric order: {asc}"
+    );
+
+    let (status, desc) = dynamo_retry(
+        addrs[2],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
+            "ScanIndexForward":false,
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "descending LSI query failed: {desc}");
+    assert_eq!(
+        n_order(&desc, "alt"),
+        vec!["100", "10", "2", "0.5", "0", "-5", "-10"],
+        "LSI ScanIndexForward:false descending numeric order: {desc}"
+    );
+
+    // BETWEEN, <, >= against the LSI's own `N` alt-sort attribute.
+    let (status, body) = dynamo_retry(
+        addrs[0],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND alt BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues":{":p":{"S":"p1"},":lo":{"N":"-5"},":hi":{"N":"2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "LSI BETWEEN failed: {body}");
+    assert_eq!(
+        n_values_numeric_sorted(&body, "alt"),
+        vec!["-5", "0", "0.5", "2"],
+        "LSI alt BETWEEN -5 AND 2: {body}"
+    );
+
+    let (status, body) = dynamo_retry(
+        addrs[1],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND alt < :v",
+            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"N":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "LSI < failed: {body}");
+    assert_eq!(
+        n_values_numeric_sorted(&body, "alt"),
+        vec!["-10", "-5"],
+        "LSI alt < 0: {body}"
+    );
+
+    let (status, body) = dynamo_retry(
+        addrs[2],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p AND alt >= :v",
+            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"N":"10"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "LSI >= failed: {body}");
+    assert_eq!(
+        n_values_numeric_sorted(&body, "alt"),
+        vec!["10", "100"],
+        "LSI alt >= 10: {body}"
+    );
+
     for n in nodes {
         n.shutdown_graceful().await;
     }

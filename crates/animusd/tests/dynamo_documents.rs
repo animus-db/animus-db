@@ -95,6 +95,23 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
+/// `dynamo`, retried on a retryable `500 InternalServerError` for up to 20s —
+/// a read is trivially idempotent, and so is every write this test issues
+/// (`PutItem`/`DeleteItem` on a fixed key). See `dynamo_index_scan.rs`'s
+/// identical helper for the full rationale (the CP data plane's transient
+/// "not the leader here"/leadership-churn refusal surfaces as a clean
+/// `500`).
+async fn dynamo_retry(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, resp) = dynamo(addr, target, body).await;
+        if status != 500 || tokio::time::Instant::now() >= deadline {
+            return (status, resp);
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn document_set_types_projection_and_return_values() {
     let dir = support::panic_safe_tempdir();
@@ -338,4 +355,129 @@ async fn multiple_gsis_composite_gsi_and_lsi() {
     .await;
     assert_eq!(status, 400, "expected rejection: {body}");
     assert!(body.contains("ValidationException"), "got: {body}");
+}
+
+/// **An `N` partition key routes and reads correctly (ADR 0063)**: the
+/// canonicalized `numkey` bytes, not the raw decimal text, feed
+/// `partition_token` (`escape(pk.key_bytes())` at the `animusd` edge, ADR
+/// 0022/0023) — a table's hash-key partitioning must still work for a
+/// numeric partition key across mixed digit counts, a negative value, and an
+/// exponent-notation literal (`1e2`) that canonicalizes to the same bytes a
+/// plain `100` spelling would. Every read below targets a different node
+/// than the one the item was written on, so a wrong-partition write would
+/// show up as a genuine miss, not a same-process echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n_partition_key_routes_and_reads_correctly() {
+    let dir = support::panic_safe_tempdir();
+    let bound = bind_cluster(3, "127.0.0.1".parse().unwrap(), dir.path())
+        .await
+        .unwrap();
+    let nodes = start_cluster(bound).await.unwrap();
+    await_bootstrap(&nodes).await;
+    let addr0 = nodes[0].dynamo_addr();
+    let addr1 = nodes[1].dynamo_addr();
+
+    let (status, body) = dynamo_retry(
+        addr0,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"sensors","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"N"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    // Mixed digit counts, a negative, and an exponent-notation spelling of
+    // 100 — distinct from every other value here once canonicalized.
+    let ids = ["1", "10", "2", "-3", "1e2"];
+    for id in ids {
+        let (status, body) = dynamo_retry(
+            addr0,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"sensors","Item":{{"id":{{"N":"{id}"}},"tag":{{"S":"t-{id}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem(id={id}) failed: {body}");
+    }
+
+    // GetItem round-trips each value from the OTHER node.
+    for id in ids {
+        let (status, body) = dynamo_retry(
+            addr1,
+            "DynamoDB_20120810.GetItem",
+            &format!(
+                r#"{{"TableName":"sensors","Key":{{"id":{{"N":"{id}"}}}},"ConsistentRead":true}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "GetItem(id={id}) failed: {body}");
+        assert!(
+            body.contains(&format!(r#""id":{{"N":"{id}"}}"#)),
+            "GetItem(id={id}) missing its own key: {body}"
+        );
+        assert!(
+            body.contains(&format!(r#""tag":{{"S":"t-{id}"}}"#)),
+            "GetItem(id={id}) missing its own value: {body}"
+        );
+    }
+
+    // Query by an exact partition value (a hash-only table's `Query` is a
+    // one-row lookup through the native scan path, not `GetItem`'s path).
+    let (status, body) = dynamo_retry(
+        addr1,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"sensors","ConsistentRead":true,
+            "KeyConditionExpression":"id = :v",
+            "ExpressionAttributeValues":{":v":{"N":"-3"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "Query failed: {body}");
+    assert!(body.contains("\"Count\":1"), "{body}");
+    assert!(body.contains(r#""tag":{"S":"t--3"}"#), "{body}");
+
+    // Scan returns exactly the five distinct rows — `1e2` colliding with a
+    // separately-written `100` would show up here as a missing/duplicate
+    // row, so this also proves no such collision happened.
+    let (status, body) = dynamo_retry(
+        addr0,
+        "DynamoDB_20120810.Scan",
+        r#"{"TableName":"sensors","ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "Scan failed: {body}");
+    assert!(body.contains("\"Count\":5"), "{body}");
+
+    // BatchGetItem recovers a subset by their N partition keys.
+    let (status, body) = dynamo_retry(
+        addr1,
+        "DynamoDB_20120810.BatchGetItem",
+        r#"{"RequestItems":{"sensors":{"Keys":[{"id":{"N":"1"}},{"id":{"N":"1e2"}}]}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "BatchGetItem failed: {body}");
+    assert!(body.contains(r#""tag":{"S":"t-1"}"#), "{body}");
+    assert!(body.contains(r#""tag":{"S":"t-1e2"}"#), "{body}");
+    assert!(!body.contains("\"t-10\""), "unexpected id=10 row: {body}");
+
+    // DeleteItem on one, then confirm it is really gone.
+    let (status, _) = dynamo_retry(
+        addr0,
+        "DynamoDB_20120810.DeleteItem",
+        r#"{"TableName":"sensors","Key":{"id":{"N":"2"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = dynamo_retry(
+        addr1,
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"sensors","Key":{"id":{"N":"2"}},"ConsistentRead":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "GetItem after delete failed: {body}");
+    assert_eq!(body, "{}", "id=2 must be gone: {body}");
+
+    for n in nodes {
+        n.shutdown_graceful().await;
+    }
 }

@@ -651,13 +651,13 @@ per-tablet CP data plane (`animus-cp-data`).
   terminal).
 
 - **PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups`/
-  `SealPitrSegment`/`ExpirePitrSegments`/`MarkBackupPitrBase`.** A fifth
-  consumer's own catalog, deliberately mirroring the backup/stream ones'
-  conventions rather than inventing new shapes: `TableSchema.pitr:
-  Option<PitrSpec>` (generation + enable wall-clock, the `SetTableStream`/
-  `SetTableTtl` schema-catalog class) toggled by `UpdateContinuousBackups`,
-  which mints a fresh `generation` from `Metadata::pitr_generation`'s own
-  never-rewound per-table counter (reusing `EntityKind::Counter` with a
+  `SealPitrSegment`/`ExpirePitrSegments`.** A fifth consumer's own catalog,
+  deliberately mirroring the backup/stream ones' conventions rather than
+  inventing new shapes: `TableSchema.pitr: Option<PitrSpec>` (generation +
+  enable wall-clock, the `SetTableStream`/`SetTableTtl` schema-catalog
+  class) toggled by `UpdateContinuousBackups`, which mints a fresh
+  `generation` from `Metadata::pitr_generation`'s own never-rewound
+  per-table counter (reusing `EntityKind::Counter` with a
   `"pitr_gen:{table}"`-prefixed name rather than a new entity kind).
   `Metadata::pitr_segments: BTreeMap<(TabletId, u64), PitrSegmentRow>`
   mirrors `stream_shards` exactly (same tuple-key JSON codec workaround,
@@ -665,17 +665,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `ExpirePitrSegments` shape, same epoch-derivation-guard obligation on the
   caller) but is a fully separate collection — a table's stream and its
   PITR coverage never share a row or gate each other. **`Metadata::
-  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow`/`BeginBackup`
-  field**: tags an already-`BeginBackup`'d row as a PITR base snapshot
-  without widening `MetaCommand::BeginBackup`'s own signature (which would
-  have touched every one of its ~30 existing construction sites) — see
-  `MetaCommand::MarkBackupPitrBase`'s own doc and the ADR's Train 3 PR①
-  as-built amendment for the self-healing-tag residual this trades for.
-  PITR segments/generation floor deliberately **survive**
-  `DropTableSchema`/`DropTableTablets`, the identical ADR 0024 carve-out
-  `backups` already gets — never gated on the source table's schema still
-  existing, an explicit override of the streams drop-table retention-zero
-  rule (ADR 0059 §9/§10).
+  pitr_base_backups: BTreeSet<BackupId>`, not a `BackupRow` field**: tags a
+  `BeginBackup`'d row as a PITR base snapshot via that same command's own
+  `pitr_base: bool` flag, applied **atomically with the mint, in the same
+  apply** (issue #593, fixed 2026-09-04) — `Metadata::apply`'s `BeginBackup`
+  arm inserts into `pitr_base_backups` itself when the flag is set, so
+  there is no committed state in which a PITR base snapshot exists
+  untagged. **This was originally a separate side-tag command,
+  `MetaCommand::MarkBackupPitrBase`, proposed only once `pitr_janitor::
+  pitr_snapshot_loop` (`animusd`) observed its own `BeginBackup` row exist**
+  — a real committed window (not merely theoretical) in which the row was
+  an ordinary untagged `Creating` backup, closed by folding the tag into
+  `BeginBackup` itself and deleting `MarkBackupPitrBase` outright (no
+  self-healing sweep needed either, since there is nothing left for one to
+  heal). See the ADR's 2026-09-04 as-built amendment for the full incident
+  and `meta::tests::begin_backup_pitr_base_tags_atomically_with_the_mint`
+  for the regression. PITR segments/generation floor deliberately
+  **survive** `DropTableSchema`/`DropTableTablets`, the identical ADR 0024
+  carve-out `backups` already gets — never gated on the source table's
+  schema still existing, an explicit override of the streams drop-table
+  retention-zero rule (ADR 0059 §9/§10).
 
   **`RestoreTableToPointInTime` (ADR 0059 §10, Train 3 PR②) reuses the
   restore catalog above rather than inventing a second one**:
@@ -807,6 +816,26 @@ per-tablet CP data plane (`animus-cp-data`).
   `election_timeout()` (read-only) survives — `transfer_leadership` arms its
   deadline from it, and it now also backs the driver's own abort-observability
   log (see the "Leadership transfer" entry below).
+
+  **`leader()`'s own hair-trigger clear on this timeout is exactly right for
+  consensus and exactly wrong for an operational health/readiness probe
+  (issue #595) — see `RaftCore::leader_within`'s own doc and ADR 0020's
+  2026-09-04 amendment for the full account.** `RaftCore::
+  last_leader_contact: Option<(NodeId, Nanos)>` is a second, purely
+  observational field: set only at a genuine leader contact
+  (`handle_append_entries`/`handle_install_snapshot`'s valid-leader-for-
+  this-term path, `become_leader` recording itself) and cleared only on a
+  real higher-term step-down — **never** by `start_pre_vote`/
+  `start_election`'s own `leader_id = None`, which is this node's own local
+  suspicion with no evidence the leader actually failed. `leader_within
+  (now, max_age)` (and `RaftNode`/`ControlHandle`'s thin wrappers, the
+  latter's `Remote` variant falling back to `leader()` since the wire
+  carries no contact timestamp yet) reads it against a caller-chosen grace
+  window; `animusd::admin::health` is the one production consumer, gated at
+  `3 × election_timeout()`. **Must never be read by any election/pre-vote/
+  safety/replication decision** — `leader()` itself is completely
+  unchanged and still backs every one of those. Regression:
+  `tests/leader_within_hysteresis.rs`.
 
 - **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
   gains a per-member `role`: alongside the existing voter `config`, a

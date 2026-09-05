@@ -161,7 +161,6 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   |---|---|---|
   | `--dir` | yes | yes |
   | `--ephemeral` | yes | yes |
-  | `--split-mode` | yes | **no** |
   | `--dynamo-auth` | yes | yes |
 
   **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
@@ -181,16 +180,20 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   reconciled (`resolve_cluster_settings` in `animusd`'s own `main.rs`); do
   not reintroduce it as a flag without removing it from the emitted
   section, or vice versa.
-  **`--split-mode` is a separate, pre-existing concern this table does not
-  resolve**: `crates/animusd/src/main.rs`'s own module doc states the flag
-  and the copy-based split workflow it selected were deleted outright
-  (2026-09-01, ADR 0058's rung 4 layer) — `main.rs`'s real CLI parser no
-  longer appears to accept `--split-mode` at all, on *any* subcommand, which
-  would make `entrypoint_script`'s still-conditional emission of it a live
-  pod-startup failure for any `AnimusClusterSpec.splitMode` value. This was
-  not fixed here (out of scope for S-06, and a pre-existing bug gets its own
-  PR with its own regression test per the root `CLAUDE.md`'s conventions) —
-  re-verify against `main.rs` before relying on the "yes" in this table.
+  **`--split-mode` no longer exists (fixed, #590)**: `crates/animusd/src/
+  main.rs`'s own module doc states the flag and the copy-based split
+  workflow it selected were deleted outright (2026-09-01, ADR 0058's rung 4
+  layer) — `main.rs`'s CLI parser rejects `--split-mode` as unknown on
+  every subcommand. `entrypoint_script` used to emit it unconditionally on
+  the combined branch whenever `AnimusClusterSpec.split_mode` was set,
+  which made any cluster spec setting `splitMode` fail at pod startup;
+  `split_mode` has been removed from `AnimusClusterSpec` entirely (there is
+  no back-compat promise in this repo, ADR 0060/root `CLAUDE.md`), so
+  there is no flag left to conditionally emit. See
+  `entrypoint_flags_are_all_accepted_by_animusd` in `desired::
+  cluster_config`'s tests for the regression coverage (every `--flag`
+  token the script emits is checked against an explicit allowlist of what
+  `main.rs` actually accepts).
 - **`control_nodes_changed` reads the *previous* `ConfigMap`'s own applied
   `cluster.json` back to detect an immutable-field change**, rather than a
   status annotation the controller would have to remember to write and keep
@@ -344,12 +347,15 @@ it, applies the CRD and an `AnimusCluster`, runs the controller **out of
 cluster** (`cargo run -p animus-operator -- run` against the kind
 kubeconfig — in-cluster deployment of the operator's own image, per
 `deploy/operator/deployment.yaml`, is exercised in production, not by this
-smoke), waits for the `StatefulSet` to reach 3/3 ready, exercises the real
-DynamoDB wire through a `kubectl port-forward` (`CreateTable`/`PutItem`/
-`GetItem`, asserting the item round-trips), scales to 4 nodes and confirms
-the item still reads back, then deletes the `AnimusCluster` and confirms
-every owned child is garbage-collected. Local invocation (mirrors the
-script's own header comment):
+smoke), waits for the `StatefulSet` to reach 3/3 ready, resolves which specific
+pod `svc/{name}-dynamo` currently routes to (via that Service's own
+`Endpoints`) and port-forwards that POD directly on both its dynamo and
+admin ports (issue #595 — see below), waits for that same pod's own `GET
+/admin/health` to report `200`, then exercises the real DynamoDB wire
+(`CreateTable`/`PutItem`/`GetItem`, asserting the item round-trips), scales
+to 4 nodes and confirms the item still reads back, then deletes the
+`AnimusCluster` and confirms every owned child is garbage-collected. Local
+invocation (mirrors the script's own header comment):
 
 ```sh
 docker build -t animusd:e2e --build-arg BASE_REGISTRY=mirror.gcr.io/library \
@@ -363,6 +369,24 @@ TLS-intercepting egress proxy that can't reach Docker Hub's blob CDN (see
 the Dockerfile's own header) — CI and an ordinary developer machine just
 run `docker build -t animusd:e2e .` with `KIND_NODE_IMAGE` unset (kind
 picks its own pinned default).
+
+**Two script-side hardenings for a flake this smoke hit twice with the
+identical signature (issue #595)**, on top of the actual root-cause fix
+(ADR 0020's 2026-09-04 amendment; `animus-control`/`animusd::admin` — a
+follower's `/admin/health` used to read the raw, pre-vote-hair-triggered
+`leader_id` belief instead of a hysteresis-gated one): (1) the script no
+longer trusts the `StatefulSet`'s aggregate `3/3 ready` count as proof that
+the ONE pod it is about to port-forward is itself, right now, ready —
+it resolves that specific pod off `svc/{name}-dynamo`'s own `Endpoints`
+and polls that pod's own `/admin/health` before issuing any DynamoDB call
+against it; (2) the first `CreateTable` (the call this issue's two failing
+runs both died on) is now a bounded converged-or-timeout retry scoped
+narrowly to the one transient 500 ("did not commit to the control plane in
+time") this issue is about — `CreateTable` is idempotent server-side, so a
+retry that lands on an already-committed table is treated as success
+(`ResourceInUseException`), and every other error class still fails the
+run immediately, on the first attempt, unchanged. See the script's own
+header comment for the two failing run links and the full reasoning.
 
 **`E2E_TLS=1` (ADR 0064 commit 3, CI's own `e2e-kind-tls` job) runs the same
 smoke over TLS**: installs cert-manager (pinned version), creates a

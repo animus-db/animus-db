@@ -23,7 +23,9 @@ use tokio::time::{sleep, timeout};
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to {addr} failed: {e}"));
     animusd::write_frame(&mut stream, &req).await.expect("send");
     read_frame(&mut stream)
         .await
@@ -381,7 +383,9 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
 /// for the one TTL regression below, so it isn't worth sharing via
 /// `support`).
 async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect to dynamo at {addr} failed: {e}"));
     let request = format!(
         "POST / HTTP/1.1\r\n\
          Host: animus\r\n\

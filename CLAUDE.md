@@ -97,6 +97,7 @@ the relevant one before working in a crate:
 | `animus-tablet` | [crates/animus-tablet/CLAUDE.md](crates/animus-tablet/CLAUDE.md) |
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
 | `animus-cp-data` | [crates/animus-cp-data/CLAUDE.md](crates/animus-cp-data/CLAUDE.md) |
+| `animus-item` | [crates/animus-item/CLAUDE.md](crates/animus-item/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
@@ -153,6 +154,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_PITR_SEEDS=K` | 1 | PITR sealing fault-injection corpus depth (`animus-test`, ADR 0059 Train 3) |
 | `ANIMUS_LSM_CRASH_SEEDS=K` | 1 | `LsmEngine` crash-safety corpus depth (`animus-storage`, `tests/lsm_crash.rs`) |
 | `ANIMUS_LSM_DISK_FAULT_SEEDS=K` | 1 | `LsmEngine` `DiskConfig` fault-injection corpus depth (`animus-storage`, `tests/lsm_disk_faults.rs`) |
+| `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
@@ -332,9 +334,19 @@ truth; this map is just for navigation.
   trait; `MemoryEngine` (deterministic, for sim) and a custom on-disk
   `LsmEngine<E>` (WAL/SSTable/leveled compaction, all I/O via the `Env` disk seam
   so its crash recovery is sim-tested).
+- **Item model** — `animus-item` (ADR 0054 step 1). The pure DynamoDB item
+  model — `AttributeValue`/`Item`/`TableSchema`, key encoding, `condition`
+  and `index` (GSI/LSI row derivation), the `UpdateExpression` data model and
+  its apply-time evaluator, the stored-item codec — extracted from
+  `animus-dynamo` to sit **below both** it and `animus-cp-data`, since the
+  latter is a protocol-agnostic KV state machine that cannot depend on a wire
+  crate; `animus-dynamo` re-exports everything unchanged. No `animus-env`
+  dependency, by design — see `crates/animus-item/CLAUDE.md`.
 - **Wire adapter** — `animus-dynamo` (ADR 0006; a CQL adapter, `animus-cql`,
   also shipped for a time but was dropped, ADR 0053 — v1 is DynamoDB-only).
-  DynamoDB JSON/HTTP, served by `animusd`, routed through the **CP data
+  **Its pure item model now lives in `animus-item`, below it** (ADR 0054 step
+  1), re-exported unchanged. DynamoDB JSON/HTTP, served by `animusd`, routed
+  through the **CP data
   plane** (v1, ADR 0019); consumes the replicated schema catalog (ADR 0013)
   and builds ADR 0022 token-prefixed keys. **`ConsistentRead` selects a real
   read path** (ADR 0055): `true` is the linearizable ReadIndex read, `false`

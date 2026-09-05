@@ -68,6 +68,15 @@ animus-cp-data.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true
 animus-dynamo.workspace = true
+# ADR 0054 step 2: `WriteSchema`/`derive_kind_writes` — `kind_writes_for_
+# item`'s thin-wrapper body (`dynamo.rs`) builds the same frozen schema
+# slice `animus-cp-data`'s own `KvCommand::KindEval` will carry once a
+# producer exists (ADR 0054 step 3). `animus-dynamo` already re-exports the
+# core item-model types (`Item`/`AttributeValue`/`TableSchema`/…) this crate
+# uses without a direct dependency; this one is kept direct instead, since
+# it is specifically apply-evaluator machinery a wire-protocol consumer of
+# `animus-dynamo` has no reason to see re-exported.
+animus-item.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -123,6 +132,14 @@ animus-tablet.workspace = true
 # dependency already enables `prod` unconditionally, since `animusd` is the
 # one crate that genuinely constructs a `ProdEnv`).
 animus-sim.workspace = true
+# ADR 0061 rung D1 (C-04 D1 step 3): the SimCluster cycles/durability corpus
+# (`sim_cluster_corpus.rs`) reuses `animus-test`'s `Recorder`/`History`
+# model and `check_cycles`/`check_durability`/`check_convergence` checkers,
+# mirroring every other fault-injection corpus in the workspace
+# (`animus-test`/`animus-cp-data`/`animus-control` each already take this
+# as a dev-dependency; no cycle — `animus-test`'s own `Cargo.toml` does not
+# depend on `animusd`).
+animus-test.workspace = true
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
     "gen-tonic-messages",
     "trace",

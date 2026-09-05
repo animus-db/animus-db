@@ -126,8 +126,8 @@ use animus_cp_data::{
     TxnOutcome, TxnRecordView,
 };
 use animus_env::{
-    Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, NodeId, ProdEnv,
-    TlsMaterial,
+    Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
+    ProdEnv, TlsMaterial,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -159,6 +159,12 @@ type KvPair = (Vec<u8>, Vec<u8>);
 /// `txn_stage_participant`'s own `writes` shape exactly, so it rides through
 /// with zero conversion.
 type TxnWrite = animus_cp_data::TxnWrite;
+/// A [`TxnWrite`] awaiting apply-time evaluation (ADR 0054 step 4a) — a
+/// direct alias of `animus_cp_data::PendingTxnWrite`, mirroring `TxnWrite`'s
+/// own alias just above. Built by `ClientCtx::txn_stage_local` from each
+/// `PendingKindWrite` the coordinator/edge hands it, never evaluated here —
+/// see `TxnWrite::pending`'s own doc (`animus-cp-data`) for the full design.
+type PendingTxnWrite = animus_cp_data::PendingTxnWrite;
 /// A stage's own-key conditions, scoped to one (table, tablet) group — the
 /// `animus_cp_data::KvCommand::TxnStage`-shaped `(key, expected)` list
 /// [`ClientCtx::cp_txn`]/`txn_prepare`/`txn_prepare_pushing` pass through to
@@ -560,17 +566,18 @@ impl<E: Env> CpGroup<E> {
 
     /// As [`put`](Self::put), but for a **multi-kind atomic batch** — base
     /// row, LSI rows, footprint and optional change-log records as one Raft
-    /// entry (ADR 0041 §3/§4). See
-    /// [`RaftKvNode::put_kind_batch_conditioned`].
-    fn put_kind_batch_conditioned(
+    /// entry (ADR 0041 §3/§4). Its own-key `conditions` OCC seatbelt (ADR
+    /// 0046 PR1) was deleted in ADR 0054 step 4b — every producer now
+    /// evaluates at apply, so nothing ever populated it beyond an empty
+    /// `Vec`. See [`RaftKvNode::put_kind_batch`].
+    fn put_kind_batch(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
-        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
-            CpGroup::Mem(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
+            CpGroup::Lsm(n) => n.put_kind_batch(writes, change_log),
+            CpGroup::Mem(n) => n.put_kind_batch(writes, change_log),
         }
     }
 
@@ -979,6 +986,39 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Propose a **self-contained evaluated write** (ADR 0054 step 3 —
+    /// [`ClientCtx::cp_kind_eval_local`]'s own doc has the cutover). See
+    /// [`RaftKvNode::propose_kind_eval`].
+    pub(crate) fn propose_kind_eval(
+        &self,
+        schema: animus_item::WriteSchema,
+        pk: animus_dynamo::AttributeValue,
+        sk: Option<animus_dynamo::AttributeValue>,
+        op: animus_cp_data::KindEvalOp,
+        condition: Option<animus_dynamo::ConditionExpression>,
+        ttl_expired: bool,
+    ) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired),
+            CpGroup::Mem(n) => n.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired),
+        }
+    }
+
+    /// Take back the leader-local `old`/`new` payload of a confirmed
+    /// `KindEval` entry (ADR 0054 mechanism 3) — `Some` only on the node
+    /// that proposed it, and only once. See
+    /// [`RaftKvNode::take_kind_eval_result`].
+    pub(crate) fn take_kind_eval_result(
+        &self,
+        index: u64,
+        term: u64,
+    ) -> Option<animus_cp_data::KindEvalResult> {
+        match self {
+            CpGroup::Lsm(n) => n.take_kind_eval_result(index, term),
+            CpGroup::Mem(n) => n.take_kind_eval_result(index, term),
+        }
+    }
+
     /// Propose a split-build seed chunk into this (child) group's own log
     /// (ADR 0050 Train B rung 4). See [`RaftKvNode::propose_seed_batch`].
     pub(crate) fn propose_seed_batch(
@@ -1186,6 +1226,11 @@ impl<E: Env> CpGroup<E> {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
+                    voter_history: self
+                        .voter_history()
+                        .into_iter()
+                        .map(|(_, voters)| voters.into_iter().map(|id| id.to_string()).collect())
+                        .collect(),
                 }
             };
         }
@@ -1558,6 +1603,20 @@ impl<E: Env> CpGroup<E> {
             CpGroup::Mem(n) => n.config(),
         }
     }
+
+    /// Every distinct voter configuration this replica has adopted, in
+    /// adoption order (issue #596) — a pure diagnostic, never a wake. See
+    /// [`RaftKvNode::voter_history`]'s doc for why this exists:
+    /// `/admin/raftkv`'s own `voter_history` field (below) is what lets a
+    /// test — or an operator — prove a transient over-replicated
+    /// intermediate genuinely occurred without racing an external poll
+    /// against how fast the reconciler happens to converge past it.
+    fn voter_history(&self) -> Vec<(Nanos, BTreeSet<NodeId>)> {
+        match self {
+            CpGroup::Lsm(n) => n.voter_history(),
+            CpGroup::Mem(n) => n.voter_history(),
+        }
+    }
 }
 
 /// How a CP op originating on this node reaches the group leader
@@ -1714,9 +1773,21 @@ fn classify_kind_batch_outcome(
         Some((term, KindBatchOutcome::Applied)) if term == accepted_term && effects_readable => {
             KindBatchSignal::Confirm
         }
-        Some((_, KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. })) => {
-            KindBatchSignal::NoOp
-        }
+        // `Rejected` (ADR 0054 step 2, `KvCommand::KindEval`-only) joins
+        // `ConditionFailed`/`Sealed` here for the identical reason: a
+        // rejected entry wrote nothing, so it is a no-op regardless of
+        // whose entry occupies the index — no term check needed, same as
+        // its two siblings. Before step 3 wired a real `KindEval` producer
+        // this arm was unreachable (nothing produced the variant), so the
+        // wildcard below silently treated it as `Inconclusive` — harmless
+        // then, wrong now that `cp_kind_eval_local` depends on it being
+        // classified as a definitive no-op.
+        Some((
+            _,
+            KindBatchOutcome::ConditionFailed { .. }
+            | KindBatchOutcome::Sealed { .. }
+            | KindBatchOutcome::Rejected { .. },
+        )) => KindBatchSignal::NoOp,
         _ => KindBatchSignal::Inconclusive,
     }
 }
@@ -1827,6 +1898,36 @@ mod kind_batch_signal_tests {
             classify_kind_batch_outcome(None, ACCEPTED_TERM, true),
             KindBatchSignal::Inconclusive
         );
+    }
+
+    /// **ADR 0054 step 3**: `Rejected` (`KvCommand::KindEval`-only) is a
+    /// no-op at any term too — same reasoning as `ConditionFailed`/
+    /// `Sealed` above, added when a real `KindEval` producer first made
+    /// this arm reachable.
+    #[test]
+    fn rejected_is_a_no_op_at_any_term() {
+        for term in [
+            ACCEPTED_TERM,
+            ACCEPTED_TERM + 1,
+            ACCEPTED_TERM.saturating_sub(1),
+        ] {
+            assert_eq!(
+                classify_kind_batch_outcome(
+                    Some((
+                        term,
+                        KindBatchOutcome::Rejected {
+                            key: b"k".to_vec(),
+                            code: "ValidationException".into(),
+                            message: "bad update".into(),
+                        }
+                    )),
+                    ACCEPTED_TERM,
+                    true,
+                ),
+                KindBatchSignal::NoOp,
+                "Rejected at term {term}"
+            );
+        }
     }
 }
 
@@ -2246,6 +2347,13 @@ pub(crate) struct AdminInfo {
     /// tablet as "over threshold, about to split" without hardcoding the
     /// value.
     pub(crate) auto_split_bytes_threshold: Option<u64>,
+    /// The `--auto-split-ops-rate RATE` threshold (W-09, ADR 0034
+    /// amendment), if any — the request-rate sibling of
+    /// [`auto_split_bytes_threshold`](Self::auto_split_bytes_threshold),
+    /// surfaced on `/admin/config` and `/admin/metrics` the same way.
+    /// `None` on a control-only node (never runs `auto_split_loop`) or a
+    /// role/deployment that didn't set the flag/config knob.
+    pub(crate) auto_split_ops_rate_threshold: Option<u64>,
     /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
     /// root path — see [`StoreView`]. `None` on a control-only node: it
     /// never provisions one ([`BoundControlNode::start_control_with`] takes
@@ -3547,6 +3655,7 @@ fn spawn_common_tail(
         control_storage,
         dynamo_auth,
         tls: tls.clone(),
+        relay: AnimusdRelayClient { tls: tls.clone() },
     };
 
     let mut tasks = Vec::with_capacity(5);
@@ -3822,6 +3931,7 @@ impl BoundNode {
             segment_store_config,
             stream_retention,
             None,
+            None,
             Duration::ZERO,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
@@ -3893,6 +4003,7 @@ impl BoundNode {
         segment_store_config: SegmentStoreConfig,
         stream_retention: Duration,
         auto_split_change_rate: Option<u64>,
+        auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
@@ -3956,6 +4067,7 @@ impl BoundNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            auto_split_ops_rate_threshold: auto_split_ops_rate,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             quiesce_after_ms: (!quiesce_after.is_zero())
@@ -4104,11 +4216,11 @@ impl BoundNode {
             &backup_store_config,
         );
         let data_role = DataRole {
-            rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            request_rates: RequestRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -4416,16 +4528,22 @@ impl BoundNode {
         )));
 
         // Auto-split loop (Phase 2.4 / ADR 0034), opt-in: a node splits a tablet
-        // it leads once it exceeds **either** configured threshold (it checks
+        // it leads once it exceeds **any** configured threshold (it checks
         // leadership per tablet, so running it on every node is harmless).
         // Growth PR3 Fork F: `auto_split_change_rate` joins the same
-        // either-triggers-fires gate, opt-in and streamed-tables-only.
-        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
+        // any-trigger-fires gate, opt-in and streamed-tables-only. W-09:
+        // `auto_split_ops_rate` joins it too, opt-in and applicable to any
+        // table (streamed or not).
+        if auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+            || auto_split_ops_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
+                    ops_rate: auto_split_ops_rate,
                 },
             )));
         }
@@ -4503,9 +4621,9 @@ pub struct Node {
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
-    /// `ClientCtx`-scoped `pub(crate)` primitive (e.g.
-    /// [`dynamo::kind_write_item_at_leader`]) directly — sharing this node's
-    /// real `rmw_lock`/routing/edge state, not a hand-rolled stand-in — the
+    /// `ClientCtx`-scoped `pub(crate)` primitive (e.g. `admin::
+    /// system_table`) directly via [`Node::ctx_for_test`] — sharing this
+    /// node's real routing/edge state, not a hand-rolled stand-in — the
     /// same reason `confirm_futility_tests` already reaches into `node.edge`.
     /// `#[cfg(test)]`-only: no production cost, and no confusion with the
     /// single source of truth for a live connection's own `ClientCtx`
@@ -5096,6 +5214,10 @@ impl BoundControlNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold: None,
+            // A control-only node never runs `auto_split_loop` at all (no
+            // CP-data tablet to split) — see `auto_split_ops_rate_threshold`'s
+            // own doc on `AdminInfo`.
+            auto_split_ops_rate_threshold: None,
             // A control-only node never provisions a backup/segment store,
             // never runs the tablet-host reconciler (nothing to quiesce),
             // and never binds the dynamo listener (so SigV4 enforcement
@@ -5485,6 +5607,7 @@ impl BoundDataNode {
             stream_seal_knobs,
             segment_store_config,
             None,
+            None,
             Duration::ZERO,
             None,
             BackupStoreConfig::default(),
@@ -5530,6 +5653,7 @@ impl BoundDataNode {
         stream_seal_knobs: StreamSealKnobs,
         segment_store_config: SegmentStoreConfig,
         auto_split_change_rate: Option<u64>,
+        auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
@@ -5577,6 +5701,7 @@ impl BoundDataNode {
                 cluster_admin_addrs
             },
             auto_split_bytes_threshold,
+            auto_split_ops_rate_threshold: auto_split_ops_rate,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             // S-06 wired `quiesce_after` through this data-only path (via
@@ -5631,11 +5756,11 @@ impl BoundDataNode {
             &backup_store_config,
         );
         let data_role = DataRole {
-            rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
+            request_rates: RequestRateTracker::default(),
         };
         let (ctx, mut tasks) = spawn_common_tail(
             control,
@@ -5812,12 +5937,16 @@ impl BoundDataNode {
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
 
-        if auto_split_bytes_threshold.is_some() || auto_split_change_rate.is_some() {
+        if auto_split_bytes_threshold.is_some()
+            || auto_split_change_rate.is_some()
+            || auto_split_ops_rate.is_some()
+        {
             tasks.push(tokio::spawn(auto_split_loop(
                 ctx.clone(),
                 AutoSplitThresholds {
                     bytes: auto_split_bytes_threshold,
                     change_rate: auto_split_change_rate,
+                    ops_rate: auto_split_ops_rate,
                 },
             )));
         }
@@ -6574,6 +6703,63 @@ fn build_backup_store(
     }
 }
 
+/// A per-tablet EWMA-smoothed rate sample — the shared storage shape behind
+/// both [`ChangeRateTracker`] and [`RequestRateTracker`] (W-09, ADR 0034
+/// amendment). A "rate" here is always derived the same way regardless of
+/// what is being counted: keep the last **total** observed value (a
+/// monotonically non-decreasing counter — bytes for the change tracker, a
+/// per-tablet op count for the request tracker) and the [`Nanos`] instant it
+/// was observed at, so the next observation's `(new_total - last_total) /
+/// elapsed` gives an instantaneous rate that [`RateSample::advance`] folds
+/// into a smoothed EWMA.
+#[derive(Clone, Copy)]
+struct RateSample {
+    rate: f64,
+    last_value: u64,
+    last_at: Nanos,
+}
+
+impl RateSample {
+    /// Fold one more observation (`value_now`, the counter's new total, at
+    /// `now`) into `prev`'s smoothed rate, returning the freshly-updated
+    /// sample. `prev: None` means "never observed before" — the rate starts
+    /// at `0.0` (there is no prior instant to compute an elapsed-time delta
+    /// against). `alpha` is the EWMA smoothing factor: closer to 1.0 tracks
+    /// the latest observation more closely (noisier); closer to 0.0 smooths
+    /// harder (slower to react).
+    fn advance(prev: Option<RateSample>, value_now: u64, now: Nanos, alpha: f64) -> RateSample {
+        let rate = match prev {
+            None => 0.0,
+            Some(p) => {
+                let elapsed = now.duration_since(p.last_at).as_secs_f64();
+                if elapsed <= 0.0 {
+                    p.rate
+                } else {
+                    let instantaneous = value_now.saturating_sub(p.last_value) as f64 / elapsed;
+                    alpha * instantaneous + (1.0 - alpha) * p.rate
+                }
+            }
+        };
+        RateSample {
+            rate,
+            last_value: value_now,
+            last_at: now,
+        }
+    }
+}
+
+/// The EWMA smoothing factor both [`ChangeRateTracker::observe`] and
+/// [`RequestRateTracker::observe`] use — see [`RateSample::advance`]'s own
+/// doc for what "closer to 1.0/0.0" means. Chosen to settle within a handful
+/// of ticks (the change tracker's own `INDEX_DRAIN_INTERVAL`, ~1s; the
+/// request tracker's own per-write ticks) without being so reactive that a
+/// single tick dominates the reading. Shared by both trackers rather than
+/// each having its own constant — nothing about the smoothing behavior a
+/// maintainer would want differs between "bytes/sec" and "ops/sec"; a future
+/// caller that genuinely needs a different responsiveness for one of them
+/// can split this back into two constants at that point.
+const RATE_EWMA_ALPHA: f64 = 0.3;
+
 /// Growth PR3 Fork F (ADR 0042 §14): a per-node, per-tablet estimate of a
 /// streamed tablet's own change-append rate (bytes/sec of `KIND_CHANGE`
 /// growth) — derived entirely from data `index_drain::seal_tick` already
@@ -6587,62 +6773,47 @@ fn build_backup_store(
 /// tracker exists to close, per the growth plan's Fork F).
 ///
 /// A simple EWMA over each tick's own instantaneous bytes-delta ÷ elapsed
-/// (`ALPHA`), so one noisy tick doesn't whipsaw the signal; floored at zero
-/// (a seal + the hot-trim arm's later reclaim can shrink the hot scope
-/// between ticks, which is not a *negative* append rate — just this tick's
-/// own contribution being nothing). Surfaced read-only via
-/// `/admin/metrics`'s `stream_change_rates` array (`admin::metrics_view`)
-/// and consumed by the opt-in `--auto-split-change-rate` trigger
-/// (`auto_split_loop`, streamed tables only). A plain `std::sync::Mutex` is
-/// fine: every access is a quick lock/mutate/drop with no `.await` held
-/// across it, the same discipline `ClientCtx::metrics_history` already
-/// uses.
+/// ([`RateSample::advance`]/[`RATE_EWMA_ALPHA`]), so one noisy tick doesn't
+/// whipsaw the signal; floored at zero (a seal + the hot-trim arm's later
+/// reclaim can shrink the hot scope between ticks, which is not a *negative*
+/// append rate — just this tick's own contribution being nothing). Surfaced
+/// read-only via `/admin/metrics`'s `stream_change_rates` array
+/// (`admin::metrics_view`) and consumed by the opt-in
+/// `--auto-split-change-rate` trigger (`auto_split_loop`, streamed tables
+/// only). A plain `std::sync::Mutex` is fine: every access is a quick
+/// lock/mutate/drop with no `.await` held across it, the same discipline
+/// `ClientCtx::metrics_history` already uses.
+///
+/// **Clocked by the `Env` seam ([`Nanos`]), not `tokio::time::Instant::now()`
+/// (fixed alongside [`RequestRateTracker`]'s addition, W-09)** — this tracker
+/// used to read the wall clock directly, a determinism-rule violation (root
+/// `CLAUDE.md`'s "no wall clock" rule) the workspace's `disallowed_methods`
+/// lint does not catch here: `lib.rs` sits under `animusd`'s package-level
+/// lint exemption (this crate's own `CLAUDE.md`), so nothing short of a
+/// human catching it during a change that happened to look here would ever
+/// flag it. `observe` now takes `now: Nanos` — the caller's own `ctx.env.
+/// now()` reading — rather than this type holding an `E: Env` clone itself;
+/// both `ChangeRateTracker` and `RequestRateTracker` are plain `#[derive(
+/// Clone, Default)]` structs with no generic parameter at all, so they need
+/// no `E` threaded through their own construction (`DataRole`'s literal
+/// sites stay a one-line `ChangeRateTracker::default()`/`RequestRateTracker::
+/// default()`), and every call site already has a `ClientCtx`/`CpGroup`
+/// handle in scope to read `now` from immediately before calling `observe`.
 #[derive(Clone, Default)]
 pub(crate) struct ChangeRateTracker {
     inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
 }
 
-#[derive(Clone, Copy)]
-struct RateSample {
-    bytes_per_sec: f64,
-    last_bytes: u64,
-    last_at: tokio::time::Instant,
-}
-
-/// The EWMA smoothing factor for [`ChangeRateTracker::observe`] — closer to
-/// 1.0 tracks the latest tick more closely (noisier); closer to 0.0 smooths
-/// harder (slower to react). Chosen to settle within a handful of
-/// `INDEX_DRAIN_INTERVAL` ticks (~1s) without being so reactive that a
-/// single large write's own tick dominates the reading.
-const CHANGE_RATE_EWMA_ALPHA: f64 = 0.3;
-
 impl ChangeRateTracker {
-    /// Record this tick's own `KIND_CHANGE` byte level for `tablet` and
-    /// return the freshly-updated smoothed rate (bytes/sec).
-    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64) -> f64 {
-        let now = tokio::time::Instant::now();
+    /// Record this tick's own `KIND_CHANGE` byte level for `tablet`, as
+    /// observed at `now` ([`Env::now`], never a wall clock), and return the
+    /// freshly-updated smoothed rate (bytes/sec).
+    pub(crate) fn observe(&self, tablet: TabletId, bytes_now: u64, now: Nanos) -> f64 {
         let mut inner = self.inner.lock().expect("change-rate tracker lock");
-        let rate = match inner.get(&tablet) {
-            None => 0.0,
-            Some(prev) => {
-                let elapsed = now.saturating_duration_since(prev.last_at).as_secs_f64();
-                if elapsed <= 0.0 {
-                    prev.bytes_per_sec
-                } else {
-                    let instantaneous = bytes_now.saturating_sub(prev.last_bytes) as f64 / elapsed;
-                    CHANGE_RATE_EWMA_ALPHA * instantaneous
-                        + (1.0 - CHANGE_RATE_EWMA_ALPHA) * prev.bytes_per_sec
-                }
-            }
-        };
-        inner.insert(
-            tablet,
-            RateSample {
-                bytes_per_sec: rate,
-                last_bytes: bytes_now,
-                last_at: now,
-            },
-        );
+        let sample =
+            RateSample::advance(inner.get(&tablet).copied(), bytes_now, now, RATE_EWMA_ALPHA);
+        let rate = sample.rate;
+        inner.insert(tablet, sample);
         rate
     }
 
@@ -6654,7 +6825,7 @@ impl ChangeRateTracker {
             .lock()
             .expect("change-rate tracker lock")
             .get(&tablet)
-            .map_or(0.0, |s| s.bytes_per_sec)
+            .map_or(0.0, |s| s.rate)
     }
 
     /// Every currently-tracked tablet's own smoothed rate, in tablet-id
@@ -6664,7 +6835,7 @@ impl ChangeRateTracker {
             .lock()
             .expect("change-rate tracker lock")
             .iter()
-            .map(|(&t, s)| (t, s.bytes_per_sec))
+            .map(|(&t, s)| (t, s.rate))
             .collect()
     }
 
@@ -6680,6 +6851,240 @@ impl ChangeRateTracker {
     }
 }
 
+/// W-09 (ADR 0034's deferred bullet, closed): a per-node, per-tablet
+/// estimate of a tablet's own leader-side **write** request rate (ops/sec),
+/// the request-rate sibling of [`ChangeRateTracker`]'s byte-rate signal —
+/// same [`RateSample`] EWMA shape ([`RATE_EWMA_ALPHA`]), just counting a
+/// tick per successful write instead of a byte level.
+///
+/// **Writes only, never reads — by design, mirroring `ChangeRateTracker`'s
+/// own byte-rate precedent.** Observed at **two** choke points, together
+/// covering every leader-side non-transactional write: `dynamo::
+/// kind_write_item_at_leader` (the ADR 0046 U3 evaluate-at-leader funnel —
+/// a condition, an old-image echo, or an images-carrying table) and
+/// `dynamo::fast_marker_write` (the ADR 0049 fast arm — an unconditioned
+/// `Put`/`Delete` on a plain, unindexed/unstreamed table, which never
+/// reaches the funnel at all). Missing either one would leave the signal
+/// blind to a real write shape — the fast arm in particular is the *common*
+/// case for a plain table, and a plain table under heavy unconditioned
+/// write load is exactly the hot-but-small-tablet failure mode this tracker
+/// exists to catch. Both observation points mean this tracker only ever
+/// sees a tablet's own **leader**. Folding reads in would be unsound, not
+/// just incomplete: since ADR 0055 an
+/// eventually-consistent read (the DynamoDB wire default) is served from
+/// *any* replica's own applied state and never reaches the leader at all —
+/// counting reads here would silently undercount a hot-but-eventual-read
+/// tablet by however many replicas share the load, a bias with no honest
+/// fix short of a second, cluster-wide aggregation this signal deliberately
+/// stays simple enough to avoid. A tablet whose *writes* are the hot path
+/// (the failure mode this tracker exists to catch — a small, low-byte
+/// tablet under a heavy `PutItem`/`UpdateItem`/`DeleteItem` burst that never
+/// crosses a byte or key-count threshold) is exactly what a write-rate
+/// signal answers soundly; a strong (`ConsistentRead: true`) read *does*
+/// reach the leader but is deliberately still excluded, for the same
+/// "writes are the sound first cut" reasoning — a future revision that
+/// wants read pressure factored in would need its own, separately-reasoned
+/// signal, not a silent extension of this one.
+///
+/// Read via [`ClientCtx::request_rates`] (`/admin/metrics`'s `request_rates`
+/// array) and consumed by the opt-in `--auto-split-ops-rate` trigger
+/// (`auto_split_loop`) — unlike [`ChangeRateTracker`], this applies to
+/// **every** table, not just streamed ones: nothing about counting writes
+/// requires a change log, so a plain table's hot-but-small tablet is exactly
+/// as visible here as a streamed one's.
+#[derive(Clone, Default)]
+pub(crate) struct RequestRateTracker {
+    inner: Arc<Mutex<BTreeMap<TabletId, RateSample>>>,
+}
+
+impl RequestRateTracker {
+    /// Record one successful write for `tablet`, observed at `now`
+    /// ([`Env::now`]), and return the freshly-updated smoothed rate
+    /// (ops/sec). Unlike [`ChangeRateTracker::observe`] there is no
+    /// externally-supplied level to report — each call is itself one more
+    /// unit of the counter, so this tracker keeps its own running op count
+    /// internally (`RateSample::last_value`) and advances it by exactly one
+    /// per observation.
+    pub(crate) fn observe(&self, tablet: TabletId, now: Nanos) -> f64 {
+        let mut inner = self.inner.lock().expect("request-rate tracker lock");
+        let prev = inner.get(&tablet).copied();
+        let value_now = prev.map_or(1, |p| p.last_value.saturating_add(1));
+        let sample = RateSample::advance(prev, value_now, now, RATE_EWMA_ALPHA);
+        let rate = sample.rate;
+        inner.insert(tablet, sample);
+        rate
+    }
+
+    /// The current smoothed write-rate for `tablet` (ops/sec), or `0.0` if
+    /// never observed (no successful write has gone through this node's own
+    /// `kind_write_item_at_leader` for this tablet).
+    pub(crate) fn get(&self, tablet: TabletId) -> f64 {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .get(&tablet)
+            .map_or(0.0, |s| s.rate)
+    }
+
+    /// Every currently-tracked tablet's own smoothed write-rate, in
+    /// tablet-id order — for `/admin/metrics`'s `request_rates` array.
+    pub(crate) fn snapshot(&self) -> Vec<(TabletId, f64)> {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .iter()
+            .map(|(&t, s)| (t, s.rate))
+            .collect()
+    }
+
+    /// Drop every tracked tablet no longer present in `meta` — see
+    /// [`ChangeRateTracker::retain_existing`]'s identical doc.
+    pub(crate) fn retain_existing(&self, meta: &Metadata) {
+        self.inner
+            .lock()
+            .expect("request-rate tracker lock")
+            .retain(|t, _| meta.tablets.contains_key(t));
+    }
+}
+
+/// `SimEnv`-driven, virtual-time-only coverage of both rate trackers (W-09)
+/// — no real sleep anywhere, `Simulator::run_for` advances the clock a
+/// caller reads back via `env.now()` and hands to `observe`. Proves the
+/// EWMA both converges toward a sustained rate and decays once observations
+/// slow down or stop growing, for each tracker independently (they share
+/// [`RateSample::advance`], but each has its own call shape worth its own
+/// regression: `ChangeRateTracker::observe` takes an externally-supplied
+/// level, `RequestRateTracker::observe` takes none at all).
+#[cfg(test)]
+mod rate_tracker_tests {
+    use std::time::Duration;
+
+    use animus_control::Metadata;
+    use animus_env::{Clock, nid};
+    use animus_sim::Simulator;
+    use animus_tablet::TabletId;
+
+    use super::{ChangeRateTracker, RequestRateTracker};
+
+    const TABLET: TabletId = TabletId(1);
+
+    #[test]
+    fn change_rate_tracker_converges_toward_a_sustained_byte_growth_rate() {
+        let mut sim = Simulator::new(0x5241_5445);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+        // Never observed yet: reads as 0.0, not a panic/default-surprise.
+        assert_eq!(tracker.get(TABLET), 0.0);
+
+        // 20 ticks of exactly 100 bytes/sec, one second apart — the EWMA
+        // should climb toward (and stay close to) 100.0 well within that
+        // many ticks (alpha = 0.3 settles in a handful, per its own doc).
+        let mut bytes = 0u64;
+        let mut rate = 0.0;
+        for _ in 0..20 {
+            sim.run_for(Duration::from_secs(1));
+            bytes += 100;
+            rate = tracker.observe(TABLET, bytes, env.now());
+        }
+        assert!(
+            (95.0..=105.0).contains(&rate),
+            "expected the smoothed rate to converge near 100.0 bytes/sec, got {rate}"
+        );
+        assert_eq!(tracker.snapshot(), vec![(TABLET, rate)]);
+    }
+
+    #[test]
+    fn change_rate_tracker_decays_once_growth_stops() {
+        let mut sim = Simulator::new(0x5241_5446);
+        let env = sim.env(nid(0));
+        let tracker = ChangeRateTracker::default();
+
+        let mut bytes = 0u64;
+        let mut hot_rate = 0.0;
+        for _ in 0..20 {
+            sim.run_for(Duration::from_secs(1));
+            bytes += 100;
+            hot_rate = tracker.observe(TABLET, bytes, env.now());
+        }
+        assert!(hot_rate > 50.0, "expected a hot rate first, got {hot_rate}");
+
+        // The change log drains to zero (a seal + trim, per this tracker's
+        // own doc) and stays there for a while: the same `bytes` level
+        // observed again after a long idle gap is a zero-delta tick, which
+        // should pull the smoothed rate down, not leave it pinned hot.
+        sim.run_for(Duration::from_secs(30));
+        let cooled_rate = tracker.observe(TABLET, bytes, env.now());
+        assert!(
+            cooled_rate < hot_rate,
+            "expected the rate to decay after a zero-growth tick: hot={hot_rate}, cooled={cooled_rate}"
+        );
+    }
+
+    #[test]
+    fn request_rate_tracker_converges_toward_a_sustained_write_rate() {
+        let mut sim = Simulator::new(0x5241_5447);
+        let env = sim.env(nid(0));
+        let tracker = RequestRateTracker::default();
+        assert_eq!(tracker.get(TABLET), 0.0);
+
+        // One write every 100ms — a steady 10 ops/sec — for 5 virtual
+        // seconds' worth of ticks.
+        let mut rate = 0.0;
+        for _ in 0..50 {
+            sim.run_for(Duration::from_millis(100));
+            rate = tracker.observe(TABLET, env.now());
+        }
+        assert!(
+            (8.0..=12.0).contains(&rate),
+            "expected the smoothed rate to converge near 10.0 ops/sec, got {rate}"
+        );
+        assert_eq!(tracker.snapshot(), vec![(TABLET, rate)]);
+    }
+
+    #[test]
+    fn request_rate_tracker_decays_once_writes_slow_down() {
+        let mut sim = Simulator::new(0x5241_5448);
+        let env = sim.env(nid(0));
+        let tracker = RequestRateTracker::default();
+
+        let mut hot_rate = 0.0;
+        for _ in 0..50 {
+            sim.run_for(Duration::from_millis(100));
+            hot_rate = tracker.observe(TABLET, env.now());
+        }
+        assert!(hot_rate > 5.0, "expected a hot rate first, got {hot_rate}");
+
+        // A single write after a long idle gap has a tiny instantaneous
+        // rate (1 / a large elapsed), which should pull the smoothed rate
+        // down sharply rather than leave it pinned hot.
+        sim.run_for(Duration::from_secs(30));
+        let cooled_rate = tracker.observe(TABLET, env.now());
+        assert!(
+            cooled_rate < hot_rate,
+            "expected the rate to decay after a slow tick: hot={hot_rate}, cooled={cooled_rate}"
+        );
+    }
+
+    #[test]
+    fn both_trackers_retain_existing_bounds_the_map_to_live_tablets() {
+        let sim = Simulator::new(0x5241_5449);
+        let env = sim.env(nid(0));
+        let change = ChangeRateTracker::default();
+        let request = RequestRateTracker::default();
+        change.observe(TABLET, 100, env.now());
+        request.observe(TABLET, env.now());
+        assert_eq!(change.snapshot().len(), 1);
+        assert_eq!(request.snapshot().len(), 1);
+
+        // An empty `Metadata` (no tablets at all) drops every tracked entry.
+        let meta = Metadata::default();
+        change.retain_existing(&meta);
+        request.retain_existing(&meta);
+        assert!(change.snapshot().is_empty());
+        assert!(request.snapshot().is_empty());
+    }
+}
+
 /// This node's data-plane fields (ADR 0035 PR3) — present in [`ClientCtx`]
 /// iff this node runs the data role (`NodeRole::Data`/`Both`); `None` on a
 /// control-only node, which never hosts a tablet and never runs the CP/
@@ -6689,11 +7094,6 @@ impl ChangeRateTracker {
 /// re-derived from whether several unrelated fields all happen to be `Some`.
 #[derive(Clone)]
 struct DataRole {
-    /// Serializes a node's read-modify-writes so a DynamoDB RMW (linearizable
-    /// CP read → CP write) is atomic *per node*. Cross-node atomicity (a CAS on the
-    /// CP group) is later v1 work. Accessed only from the dynamo wire edge,
-    /// whose listener is never bound on a control-only node.
-    pub(crate) rmw_lock: Arc<tokio::sync::Mutex<()>>,
     /// The raftkv-role env's recording metrics sink (the CP group records here).
     /// Aggregated into the `/metrics` export (ADR 0015) alongside the control
     /// sink, which every node has.
@@ -6711,6 +7111,13 @@ struct DataRole {
     /// rate` trigger (`auto_split_loop`). See [`ChangeRateTracker`]'s own
     /// doc for the full design.
     pub(crate) change_rates: ChangeRateTracker,
+    /// W-09 (ADR 0034 amendment): this node's own per-tablet **write**
+    /// request-rate estimates, observed by `dynamo::kind_write_item_at_
+    /// leader` and read by `/admin/metrics` and the opt-in
+    /// `--auto-split-ops-rate` trigger (`auto_split_loop`). See
+    /// [`RequestRateTracker`]'s own doc for the full design, including why
+    /// it counts writes only.
+    pub(crate) request_rates: RequestRateTracker,
 }
 
 /// Shared context for the client request server and the DynamoDB endpoint:
@@ -6858,12 +7265,37 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// connection's cloned `ClientCtx` can reach it: `Some(m).
     /// server_acceptor` serves the `client`/`dynamo`/`admin`/`console`
     /// ports (server-only TLS), `Some(m).acceptor` the `intra` port
-    /// (mutual), and `Some(m).connector` is what [`relay_request_with_
-    /// timeout`] (and every cross-node relay built on it — forwarding,
-    /// schema DDL, the growth/join control-mirror poll) dials the `intra`
-    /// port with — always mutual, matching that port's own acceptor.
-    /// Cheap to clone (`TlsMaterial`'s own fields are `Arc`-backed).
+    /// (mutual), and `Some(m).connector` is what every cross-node relay
+    /// dials the `intra` port with — always mutual, matching that port's
+    /// own acceptor. Since ADR 0061 rung C3d (below) the actual dial lives
+    /// in [`AnimusdRelayClient::relay`] (this node's own [`self.relay`]
+    /// implementor), not at any call site here — `self.tls` is cloned once
+    /// into that implementor at construction (`AnimusdRelayClient { tls:
+    /// .. }`) so a call site never needs to pass it explicitly. Cheap to
+    /// clone (`TlsMaterial`'s own fields are `Arc`-backed).
     pub(crate) tls: Option<TlsMaterial>,
+    /// This node's own outbound [`RelayClient`] (ADR 0061 rung C3d) — the
+    /// cross-node relay primitive every CP forward
+    /// ([`forwarding::ClientCtx::forward_to_tablet_leader`], the plain
+    /// [`forwarding::ClientCtx::relay`] wrapper, the eventual-read one-hop
+    /// relay in `read_path.rs`) and `schema.rs`'s `propose_schema`
+    /// broadcast fallback now go through, instead of calling the free
+    /// [`relay_request`]/[`relay_request_with_timeout`] functions directly
+    /// (as they all did before this rung — those two functions are
+    /// unchanged and still exist, now called from exactly one place each:
+    /// `AnimusdRelayClient::relay` and `remote_metadata_watch_loop`).
+    /// Production's is [`AnimusdRelayClient`] — a zero-sized wrapper over
+    /// the identical unchanged `relay_request_with_timeout`, so production
+    /// behavior is byte-for-byte the same as before this field existed. A
+    /// sim-only `animus_node::sim_relay::SimRelayClient<E>` is the second
+    /// implementor this seam exists for — it is what actually lets a
+    /// multi-node cluster talk inside `SimEnv` (Phase D's `SimCluster`).
+    /// Distinct from `self.control`'s own relay use ([`GenericControlHandle
+    /// <E, R>`]'s `Remote` arm, rung C3c): that one is scoped to
+    /// `RemoteControlClient::metadata_fresh`'s single `Status` fetch and
+    /// lives inside the control handle itself; this field is every *other*
+    /// relay call `ClientCtx`'s own methods make directly.
+    relay: R,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -7058,6 +7490,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         self.data
             .as_ref()
             .map(|d| d.change_rates.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// W-09 (ADR 0034 amendment): every currently-tracked tablet's own
+    /// smoothed **write** request-rate (ops/sec), for `/admin/metrics`'s
+    /// `request_rates` array — empty on a control-only node, mirroring
+    /// [`stream_change_rates`](Self::stream_change_rates)'s identical shape.
+    pub(crate) fn request_rates(&self) -> Vec<(TabletId, f64)> {
+        self.data
+            .as_ref()
+            .map(|d| d.request_rates.snapshot())
             .unwrap_or_default()
     }
 
@@ -8845,17 +9288,20 @@ const AUTO_SPLIT_COOLDOWN: Duration = Duration::from_secs(15);
 /// table's real bytes-per-entry below this.
 const AUTO_SPLIT_EST_ENTRY_BYTES: u64 = 32;
 
-/// The auto-split trigger's configured thresholds (ADR 0034). Either, both, or
-/// neither field may be `Some`; `auto_split_loop` is only spawned when at
-/// least one is (see [`BoundNode::start_with`]'s doc). When both are set,
-/// **either** exceeding its threshold fires a split — bytes and change-rate
+/// The auto-split trigger's configured thresholds (ADR 0034; W-09's
+/// `ops_rate` amendment). Any subset of the three fields may be `Some`;
+/// `auto_split_loop` is only spawned when at least one is (see
+/// [`BoundNode::start_with`]'s doc). When more than one is set, **any**
+/// exceeding its threshold fires a split — bytes, change-rate, and ops-rate
 /// are different failure modes (snapshot/compaction/replica-move/recovery
 /// cost scales with bytes; change-rate catches a high-churn, small-footprint
-/// streamed table bytes alone can't see, ADR 0042 §14 Fork F), so neither
-/// trigger alone dominates the other. **The former key-count trigger
-/// (`--auto-split K`) was removed** — bytes and change-rate cover its use
-/// cases with no key-count-specific failure mode left to justify a third
-/// independent knob; see the root `CLAUDE.md`'s auto-split entry.
+/// *streamed* table bytes alone can't see, ADR 0042 §14 Fork F; ops-rate
+/// catches the same shape on **any** table — streamed or not — under a
+/// heavy write burst, W-09), so no trigger alone dominates the others.
+/// **The former key-count trigger (`--auto-split K`) was removed** — bytes,
+/// change-rate, and ops-rate cover its use cases with no key-count-specific
+/// failure mode left to justify a fourth independent knob; see the root
+/// `CLAUDE.md`'s auto-split entry.
 #[derive(Clone, Copy, Debug)]
 struct AutoSplitThresholds {
     /// `--auto-split-bytes B` (ADR 0034): split once a led tablet's
@@ -8870,6 +9316,16 @@ struct AutoSplitThresholds {
     /// tablet in the first place (`index_drain::seal_tick` only runs its
     /// seal arm, which feeds the tracker, when `stream_enabled`).
     change_rate: Option<u64>,
+    /// `--auto-split-ops-rate RATE` (W-09, ADR 0034 amendment): split once a
+    /// led tablet's own smoothed **write** request rate
+    /// ([`RequestRateTracker`], ops/sec) exceeds `RATE`. Absent by default
+    /// (opt-in, no surprise splits). Unlike `change_rate`, this applies to
+    /// **any** table — the tracker feeding it observes every successful
+    /// leader-side write regardless of whether the table is streamed. This
+    /// is the signal that closes ADR 0034's own deferred bullet: a
+    /// hot-but-small tablet under heavy write load, with no byte/key-count
+    /// signal ever crossing threshold, can now still split.
+    ops_rate: Option<u64>,
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
@@ -8998,7 +9454,15 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let change_rate_hot = thresholds
                 .change_rate
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
-            if !byte_hot && !change_rate_hot && !due_confirm {
+            // W-09 (ADR 0034 amendment): the opt-in ops-rate trigger —
+            // exactly the same cheap-read shape as `change_rate_hot` above,
+            // just backed by [`RequestRateTracker`] instead of
+            // [`ChangeRateTracker`]. Reads as `0.0` (never hot) for a tablet
+            // this node has never led a successful write for.
+            let ops_rate_hot = thresholds
+                .ops_rate
+                .is_some_and(|t| ctx.data().request_rates.get(tablet) > t as f64);
+            if !byte_hot && !change_rate_hot && !ops_rate_hot && !due_confirm {
                 continue;
             }
             // Materialize once: the authoritative byte total and (if over
@@ -9018,14 +9482,20 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             let over_change_rate_threshold = thresholds
                 .change_rate
                 .is_some_and(|t| ctx.data().change_rates.get(tablet) > t as f64);
+            // W-09: re-read the same way, for the same reason.
+            let over_ops_rate_threshold = thresholds
+                .ops_rate
+                .is_some_and(|t| ctx.data().request_rates.get(tablet) > t as f64);
             // Need at least 2 distinct keys for any split to have an interior
             // point (`SplitTablet` requires `start < at < end`).
-            if key_count < 2 || (!over_byte_threshold && !over_change_rate_threshold) {
+            if key_count < 2
+                || (!over_byte_threshold && !over_change_rate_threshold && !over_ops_rate_threshold)
+            {
                 continue;
             }
             // Always byte-weighted (ADR 0034): a skewed value-size
             // distribution still bisects the tablet's *bytes* roughly
-            // evenly, whether the byte or the change-rate trigger fired.
+            // evenly, whichever trigger fired.
             let split_key = decide::byte_weighted_median(&pairs);
             // F11 (ADR 0042 §14, Fork D): the token-alignment rounding itself
             // now lives inside `ClientCtx::trigger_split` — the one choke
@@ -9160,12 +9630,111 @@ async fn serve_requests(
     }
 }
 
-async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+/// A thin [`AsyncRead`] wrapper that can un-consume exactly one byte —
+/// [`peer_closed`]'s stand-in for `TcpStream::peek` (issue #596's own
+/// mechanism), which has no equivalent on a generic (and in particular a
+/// TLS) stream: "peek" is a raw-socket primitive with no meaning once the
+/// bytes on the wire are an encrypted TLS record rather than the
+/// application's own framing (ADR 0064, S-01 commit 2 — this connection may
+/// now be a [`MaybeTlsStream::Tls`]). A real single-byte read genuinely
+/// waits on the transport and distinguishes "closed" from "nothing yet"
+/// exactly like `peek` did; the difference is that a plain read *consumes*
+/// what it sees, so [`peer_closed`] stashes that one byte here instead of
+/// discarding it, and the very next real read (`read_frame`, on the next
+/// loop iteration of [`handle_connection`]) drains the stash first — from
+/// every caller's point of view this is byte-for-byte the same as a
+/// non-consuming peek. (A **zero-length** read was considered and rejected:
+/// most `AsyncRead` implementations, `TcpStream` included, special-case an
+/// empty destination buffer and return immediately without ever polling the
+/// underlying transport, so it can never actually observe EOF or wait on
+/// anything — it would busy-loop rather than detect a close.)
+struct Rewindable<R> {
+    inner: R,
+    pending: Option<u8>,
+}
+
+impl<R> Rewindable<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: None,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Rewindable<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(b) = self.pending.take() {
+            buf.put_slice(&[b]);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// Wait for the peer to close (or error on) its connection while we are not
+/// otherwise reading from it (issue #596) — **without disturbing any bytes
+/// it has already written**.
+///
+/// Reads one byte off `read_half` (a [`Rewindable`] — see its own doc for
+/// why this stands in for `TcpStream::peek` once TLS is in the picture,
+/// ADR 0064). An `Ok(0)` read is a clean EOF and an `Err` is a transport
+/// error; either means the peer is definitely gone, so this resolves. An
+/// `Ok(1)` means the peer is alive and has simply written more bytes before
+/// reading this request's reply — a pipelined next frame, which the client
+/// protocol this seam serves (`ClientRequest`/`ClientResponse`, ADR 0047's
+/// two listeners) does not forbid even though no client in this repo
+/// happens to do it today. That is not abandonment, so this future must not
+/// resolve on it: stashing the byte in `read_half.pending` and consuming it
+/// here (a plain `read` with nowhere to put the byte back, in an earlier
+/// version of this function before `Rewindable` existed) would otherwise
+/// silently eat the start of the next frame and the enclosing `select!` in
+/// [`handle_connection`] would drop the *current* response on the floor
+/// even though the peer was still there waiting for it. Instead it stashes
+/// the byte and parks forever via [`std::future::pending`] — registers no
+/// waker, costs nothing to hold — so the `select!` falls through to the
+/// handler's own completion, and the next loop iteration's `read_frame`
+/// drains the stash, then the rest of the pipelined frame, the normal way.
+/// Never loops on the read itself to wait out the close either: that would
+/// busy-spin the task for as long as the connection stays open.
+///
+/// Never returns `Err` to its caller — a read error IS the signal this
+/// function exists to produce, not a failure of the function itself.
+async fn peer_closed(read_half: &mut Rewindable<tokio::io::ReadHalf<MaybeTlsStream>>) {
+    let mut scratch = [0u8; 1];
+    match read_half.read(&mut scratch).await {
+        Ok(0) | Err(_) => {}
+        Ok(_) => {
+            read_half.pending = Some(scratch[0]);
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn handle_connection(
+    stream: MaybeTlsStream,
     ctx: ClientCtx,
     listener: ListenerKind,
 ) -> std::io::Result<()> {
-    while let Some(request) = read_frame::<ClientRequest>(&mut stream).await? {
+    // Split so the read half can be raced against the in-flight handler
+    // (issue #596) while the write half stays free for the eventual reply —
+    // `read_frame`/`write_frame` are generic over `AsyncRead`/`AsyncWrite`
+    // precisely so the two owned halves work here without their own
+    // special-cased framing. `TcpStream::into_split` isn't available here —
+    // `stream` may be a TLS-wrapped `MaybeTlsStream::Tls` (ADR 0064, S-01
+    // commit 2) — so this uses `tokio::io::split`, the generic splitter
+    // that works identically for either `MaybeTlsStream` variant; the read
+    // half is further wrapped in [`Rewindable`] for [`peer_closed`]'s sake.
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut read_half = Rewindable::new(read_half);
+    loop {
+        let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
+            return Ok(());
+        };
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
         // handling ends up forwarding to another node (`cp_forward`), and what
@@ -9179,12 +9748,31 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         {
             otel::set_parent_traceparent(&span, tp);
         }
-        let response = handle_request(&ctx, request, listener)
-            .instrument(span)
-            .await;
-        write_frame(&mut stream, &response).await?;
+        // Cancel an abandoned request server-side (issue #596): a forwarded
+        // hop's own confirm-wait can run for up to `CLIENT_TIMEOUT` — with
+        // nobody listening once the caller has given up (a forwarder's own
+        // `FORWARD_HOP_TIMEOUT`, or a plain client disconnect). Racing the
+        // handler against `peer_closed` lets this connection's task exit as
+        // soon as the peer is gone rather than run the handler to its full
+        // budget regardless. `biased` orders the response arm first so a
+        // handler that finishes at the same poll as the peer-close read
+        // still gets its reply written — the peer-closed arm only wins when
+        // the handler has genuinely not finished. See this crate's
+        // `CLAUDE.md` fire-and-forget-connection entry and the #596 PR
+        // description for the per-request-family cancellation-safety
+        // argument for why dropping the handler future here, at any await
+        // point, is no worse than the process crashing at that same point
+        // (which every request family already tolerates).
+        let response = tokio::select! {
+            biased;
+            response = handle_request(&ctx, request, listener).instrument(span) => response,
+            () = peer_closed(&mut read_half) => {
+                ctx.env.metrics().incr(Metric::ClientRequestsAbandoned);
+                return Ok(());
+            }
+        };
+        write_frame(&mut write_half, &response).await?;
     }
-    Ok(())
 }
 
 /// A short, closed label for `ClientRequest`'s variant — the `client_request`
@@ -9248,13 +9836,17 @@ async fn handle_request(
         // `remote_metadata_sync_loop`'s own polling: its seeds are always the
         // pre-growth control nodes (genuine voters, where this is a plain
         // passthrough), so no mirror ever feeds another mirror.
-        ClientRequest::Status => ClientResponse::Status {
-            metadata: ctx.effective_metadata(),
-            leader_hint: ctx.control_leader_hint(),
-            intra_leader_hint: ctx.intra_control_leader_hint(),
-            watermark: ctx.control.metadata_watch().latest(),
-            control_voters: ctx.control.config().unwrap_or_default(),
-        },
+        //
+        // This arm, `Forwarded` and `ProposeSchema` below all delegate to
+        // `forwarding::handle_relayed_request` (ADR 0061 rung C3d) — the
+        // `E: Env`/`R: RelayClient`-generic dispatcher a sim-only
+        // `SimRelayClient`'s serve loop also calls. A pure refactor: each
+        // arm's body was moved there verbatim, so this is the exact same
+        // code running, not a second, independently-maintained copy — see
+        // that function's own doc for why only these three arms qualify.
+        req @ (ClientRequest::Status
+        | ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)) => forwarding::handle_relayed_request(ctx, req).await,
         // All data ops route to the leaderful CP per-tablet Raft group (ADR 0017
         // #3a), scoped to the named table (ADR 0023). `table` is a required field
         // on the request type, so there is no unscoped data op to reject here.
@@ -9334,27 +9926,6 @@ async fn handle_request(
         // Admin: split a CP tablet — a single atomic control-plane command.
         ClientRequest::SplitTablet { tablet, split_key } => {
             ctx.trigger_split(TabletId(tablet), split_key).await
-        }
-        // A CP op forwarded from another node (cross-process routing, ADR 0017
-        // #3b): serve locally iff we are the leader; never re-forward. The
-        // enclosing `client_request` span (in `handle_connection`) was already
-        // re-parented onto the originating node's trace (ADR 0027) before this
-        // request reached here.
-        ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
-        // A metadata command relayed to the control leader (A2 schema DDL, or a
-        // Phase 2.3a CP-address registration). Gate to the relayable set, then
-        // propose iff we are the leader (no re-relay — bounded one hop; the
-        // relayer retries with fresh routing).
-        ClientRequest::ProposeSchema(command) => {
-            if !is_relayable_command(&command) {
-                ClientResponse::Error("command not allowed over the relay path".into())
-            } else {
-                // Propose on the control leader (locally if we are it, else relay
-                // toward it). The caller confirms the commit via replicated
-                // `Metadata`. Cannot loop: a relay only targets a known leader.
-                ctx.propose_schema(&command).await;
-                ClientResponse::PutOk
-            }
         }
         // Join discovery (ADR 0032 PR2): any node answers from its own
         // knowledge — no forwarding, no leader resolution needed.
@@ -9586,6 +10157,7 @@ pub async fn start_cluster_with(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9619,6 +10191,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9648,6 +10221,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
         None,
         Duration::ZERO,
         None,
@@ -9686,6 +10260,7 @@ pub async fn start_cluster_with_streams(
         segment_store_config,
         stream_retention,
         None,
+        None,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9710,6 +10285,7 @@ pub async fn start_cluster_with_growth(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -9720,6 +10296,7 @@ pub async fn start_cluster_with_growth(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        auto_split_ops_rate,
         Duration::ZERO,
         None,
         BackupStoreConfig::default(),
@@ -9753,6 +10330,7 @@ pub async fn start_cluster_with_quiesce_after(
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        None,
         None,
         quiesce_after,
         None,
@@ -9793,6 +10371,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
@@ -9806,6 +10385,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        auto_split_ops_rate,
         quiesce_after,
         dynamo_auth,
         backup_store_config,
@@ -9823,6 +10403,7 @@ async fn start_cluster_inner(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
@@ -9895,6 +10476,7 @@ async fn start_cluster_inner(
                 segment_store_config.clone(),
                 stream_retention,
                 auto_split_change_rate,
+                auto_split_ops_rate,
                 quiesce_after,
                 // `--cluster N` has no ttl-sweep-interval knob of its own
                 // yet (mirrors `stream_retention`'s own layered-stack
@@ -9990,6 +10572,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
         orphan_sweep_after,
         None,
         None,
+        None,
     )
     .await
 }
@@ -10012,6 +10595,7 @@ pub async fn start_split_cluster_with_growth(
     auto_split_bytes_threshold: Option<u64>,
     orphan_sweep_after: Duration,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
 ) -> std::io::Result<Vec<Node>> {
     let dir = dir.into();
@@ -10159,6 +10743,7 @@ pub async fn start_split_cluster_with_growth(
                 StreamSealKnobs::default(),
                 SegmentStoreConfig::default(),
                 auto_split_change_rate,
+                auto_split_ops_rate,
                 // `--quiesce-after` doesn't thread through the
                 // `--cluster-control`/`--cluster-data` dev path yet — the
                 // same documented gap `run`'s own module doc names (S-06
@@ -10297,6 +10882,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
         quiesce_after,
         None,
         None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10338,6 +10924,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        None,
         None,
         None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
@@ -10384,6 +10971,7 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         quiesce_after,
         None,
         None,
+        None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10418,6 +11006,7 @@ pub async fn run_node_with_cluster_settings(
     quiesce_after: Duration,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     backup_store_config: BackupStoreConfig,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
@@ -10432,6 +11021,7 @@ pub async fn run_node_with_cluster_settings(
         quiesce_after,
         auto_split_bytes,
         auto_split_change_rate,
+        auto_split_ops_rate,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
@@ -10476,6 +11066,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     quiesce_after: Duration,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     ttl_sweep_interval: Duration,
     backup_store_config: BackupStoreConfig,
     pitr_snapshot_cadence: Duration,
@@ -10544,6 +11135,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             segment_store_config,
             stream_retention,
             auto_split_change_rate,
+            auto_split_ops_rate,
             quiesce_after,
             ttl_sweep_interval,
             dynamo_auth,
@@ -10580,6 +11172,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        None,
         None,
         None,
         ttl_sweep_interval,
@@ -10771,6 +11364,7 @@ pub async fn run_node_data(
         backend,
         None,
         None,
+        None,
         Duration::ZERO,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
@@ -10807,6 +11401,7 @@ pub async fn run_node_data_with_streams(
         backend,
         None,
         None,
+        None,
         Duration::ZERO,
         stream_seal_knobs,
         segment_store_config,
@@ -10841,6 +11436,7 @@ pub async fn run_node_data_with_cluster_settings(
     backend: StorageBackend,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
@@ -10929,6 +11525,7 @@ pub async fn run_node_data_with_cluster_settings(
             stream_seal_knobs,
             segment_store_config,
             auto_split_change_rate,
+            auto_split_ops_rate,
             quiesce_after,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
@@ -11051,7 +11648,7 @@ async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<Clien
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
             write_frame(&mut stream, request).await.ok()?;
-            read_frame::<ClientResponse>(&mut stream).await.ok()?
+            read_frame::<ClientResponse, _>(&mut stream).await.ok()?
         })
         .await;
         if let Ok(Some(resp)) = reply
@@ -11501,6 +12098,7 @@ async fn finish_data_join(
             StreamSealKnobs::default(),
             SegmentStoreConfig::default(),
             None,
+            None,
             // `--quiesce-after` doesn't reach a seed/join startup yet — the
             // same documented gap `animusd`'s own module doc names for
             // `join`/`data --seed` (S-06 scoped only the three real
@@ -11529,23 +12127,8 @@ async fn finish_data_join(
 /// connection closes) before any allocation, never a panic or an OOM.
 pub use animus_node::MAX_FRAME_LEN;
 
-/// Send `request` to a peer node's client API over a fresh connection and
-/// return its reply (or a [`ClientResponse::Error`] on any transport
-/// failure). Free function, not a [`ClientCtx`] method (ADR 0035 PR4): the
-/// data-only node's [`control_handle::RemoteControlClient`] has no `ClientCtx`
-/// of its own to reach through, but needs the exact same wire primitive every
-/// other cross-node relay in this crate uses — [`ClientCtx::relay`] is now a
-/// thin wrapper over this.
-pub(crate) async fn relay_request(
-    addr: String,
-    request: &ClientRequest,
-    tls: Option<&TlsMaterial>,
-) -> ClientResponse {
-    relay_request_with_timeout(addr, request, CLIENT_TIMEOUT, tls).await
-}
-
-/// Like [`relay_request`], but with an explicit transport timeout instead of
-/// the default [`CLIENT_TIMEOUT`] (ADR 0035 PR5) — needed by
+/// Send `request` to a peer node's client API over a fresh connection, with
+/// an explicit transport timeout (ADR 0035 PR5) — needed by
 /// [`remote_metadata_watch_loop`], whose long-poll request's own
 /// [`WATCH_METADATA_CLIENT_TIMEOUT`] must exceed the serving node's
 /// [`WATCH_METADATA_SERVER_TIMEOUT`] bound by a comfortable margin; reusing
@@ -11592,7 +12175,7 @@ async fn relay_request_with_timeout(
             }
         };
         write_frame(&mut stream, request).await.ok()?;
-        read_frame::<ClientResponse>(&mut stream).await.ok()?
+        read_frame::<ClientResponse, _>(&mut stream).await.ok()?
     })
     .await
     {
@@ -11674,8 +12257,15 @@ const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
 /// Propagates write failures; rejects a frame over [`MAX_FRAME_LEN`] (the
 /// receiver would drop the connection anyway — failing at the sender names the
 /// culprit instead of surfacing as a mysterious peer hang-up).
-pub async fn write_frame<T: Serialize>(
-    stream: &mut (impl AsyncWrite + Unpin),
+///
+/// **Generic over `AsyncWrite + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. This is what lets
+/// [`handle_connection`] write the reply on a socket's split write half
+/// (a [`tokio::io::WriteHalf`], possibly TLS-wrapped since ADR 0064, S-01
+/// commit 2) after racing the read half against peer-close.
+pub async fn write_frame<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
     msg: &T,
 ) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
@@ -11706,8 +12296,12 @@ pub async fn write_frame<T: Serialize>(
 /// Propagates read failures and decode errors; a declared length over
 /// [`MAX_FRAME_LEN`] is an `InvalidData` error **before any allocation** (the
 /// length prefix is untrusted — see [`MAX_FRAME_LEN`]).
-pub async fn read_frame<T: DeserializeOwned>(
-    stream: &mut (impl AsyncRead + Unpin),
+///
+/// **Generic over `AsyncRead + Unpin` (issue #596), not just `TcpStream`**:
+/// every existing caller passes `&mut TcpStream`, which already implements
+/// both bounds, so no call site changes. See [`write_frame`]'s matching note.
+pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
 ) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
@@ -11743,13 +12337,17 @@ pub async fn read_frame<T: DeserializeOwned>(
 mod confirm_futility_tests {
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tokio::time::{sleep, timeout};
 
+    use animus_cp_data::KindEvalOp;
+    use animus_dynamo::{AttributeValue, ConditionExpression};
     use animus_env::ProdEnv;
+    use animus_item::{Item, TableSchema, WriteSchema};
 
     use crate::config::NodeRole;
+    use crate::write_path::KindEvalApplied;
     use crate::{
         AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
         ProbeIdentity, RoleAddrs, read_frame, run_node, write_frame,
@@ -11836,18 +12434,26 @@ mod confirm_futility_tests {
         );
     }
 
-    /// **The futility early-exit (issue #268).** A `KindBatch` whose own-key
-    /// condition fails applies as a silent no-op (`KindBatch.conditions`,
-    /// `animus-cp-data`) — the probed effect never appears even though the
-    /// accepted entry committed and applied fine. Pre-fix, `cp_kind_local`'s
-    /// confirm loop polled value equality for the whole `CLIENT_TIMEOUT`
-    /// (10s) before erring — the exact per-attempt burn that let brief
-    /// leadership churn on a starved CI runner stack two 10s stalls into one
-    /// 25s client budget (the cp_txn.rs seed-put flake). Post-fix the loop
-    /// notices `engine_applied_index()` passed the accepted entry without
-    /// its effect and errs immediately, in the house retryable shape.
+    /// **The futility early-exit (issue #268), retargeted for ADR 0054 step
+    /// 4b.** A `KindBatch`'s own-key `conditions` OCC seatbelt (the
+    /// mechanism this test originally exercised) is deleted — every
+    /// producer evaluates at apply now — so the scenario is rebuilt on the
+    /// mechanism that replaced it: a `KvCommand::KindEval` whose own
+    /// `ConditionExpression` evaluates to `false` against apply's fresh
+    /// read. Unlike the old `cp_kind_local` path (whose confirm loop only
+    /// ever polled raw value equality and had to notice a no-op the slow
+    /// way, via `engine_applied_index()` outrunning the accepted entry),
+    /// `cp_kind_eval_local`'s confirm loop consults the replicated
+    /// `KindBatchOutcome` map directly — a `ConditionFailed` outcome is a
+    /// fast, positive `Ok(KindEvalApplied::ConditionFailed)`, not a slow
+    /// `Err`. What this test still proves, byte for byte the same as
+    /// before: the confirm loop notices the no-op almost immediately
+    /// instead of polling out the whole `CLIENT_TIMEOUT` (10s) — the exact
+    /// per-attempt burn that used to let brief leadership churn on a
+    /// starved CI runner stack two 10s stalls into one 25s client budget
+    /// (the cp_txn.rs seed-put flake).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_condition_failed_kind_batch_fails_fast_with_a_retryable_error() {
+    async fn a_condition_failed_kind_eval_fails_fast_and_does_not_apply() {
         let dir = tempfile::tempdir().unwrap();
         let (node, config) = single_node(dir.path()).await;
         let client = config.nodes[0].client;
@@ -11867,263 +12473,92 @@ mod confirm_futility_tests {
             .expect("this node hosts the tablet");
         assert!(group.is_leader(), "single-voter group leads locally");
 
-        // A batch guarded by a condition that cannot hold (the key was never
-        // written): accepted + applied as a no-op, effect never appears.
+        // A minimal, self-contained schema — no catalog registration is
+        // needed (or reached): the condition fails before any index/LSI
+        // derivation is ever attempted.
+        let schema = WriteSchema {
+            key: TableSchema::simple("pk"),
+            lsis: Vec::new(),
+            change_records_carry_images: false,
+        };
+        let pk = AttributeValue::S("cf-target".to_owned());
+        let base_key = crate::dynamo::item_key(&pk, None);
+
+        // A condition that cannot hold (the item was never written):
+        // accepted + applied as a fast, confirmed no-op.
         let started = tokio::time::Instant::now();
-        // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local`
+        // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
         // takes no `self`/`R`-typed argument, so nothing here pins down `R`
         // for the now-generic `ClientCtx<E, R>` path.
-        let err = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
+        let result = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_eval_local(
             &group,
-            vec![(
-                animus_cp_data::KIND_BASE,
-                b"cf-target".to_vec(),
-                Some(b"must-not-land".to_vec()),
-            )],
-            Vec::new(),
-            vec![(b"cf-guard".to_vec(), Some(b"wrong-expected".to_vec()))],
+            schema.clone(),
+            pk.clone(),
+            None,
+            KindEvalOp::Put(Item::from([("pk".to_owned(), pk.clone())])),
+            Some(ConditionExpression::AttributeExists("pk".to_owned())),
+            false,
+            &base_key,
             // A Put-shaped kind write (never an `ADD`) — idempotent.
             ProbeIdentity::ValueProves,
         )
         .await
-        .expect_err("a condition-failed kind batch must not confirm");
+        .expect("a condition-failed KindEval still confirms — as a no-op, not an error");
         let elapsed = started.elapsed();
 
         assert!(
-            err.ends_with("; retry"),
-            "the failure must carry the house retryable shape so caller loops re-route: {err}"
+            matches!(result, KindEvalApplied::ConditionFailed),
+            "the write must be reported as a condition failure, not applied"
         );
         assert!(
             elapsed < Duration::from_secs(5),
-            "a provably-futile confirm wait must end fast (pre-fix: polled out the whole \
-             10s CLIENT_TIMEOUT): took {elapsed:?}"
+            "a provably-futile confirm wait must end fast (the pre-ADR-0054 `cp_kind_local` \
+             path polled out the whole 10s CLIENT_TIMEOUT before noticing): took {elapsed:?}"
+        );
+        assert_eq!(
+            group
+                .local_get_kind(animus_cp_data::KIND_BASE, &base_key)
+                .await,
+            None,
+            "the condition-failed write must never have applied"
         );
 
         // The early exit fired on the no-op, not on a broken group: an
-        // ordinary unconditioned write through the same path still confirms.
-        ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
+        // ordinary unconditioned write through the same path still confirms
+        // and applies.
+        let after_pk = AttributeValue::S("cf-after".to_owned());
+        let after_key = crate::dynamo::item_key(&after_pk, None);
+        let after_result = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_eval_local(
             &group,
-            vec![(
-                animus_cp_data::KIND_BASE,
-                b"cf-after".to_vec(),
-                Some(b"lands".to_vec()),
-            )],
-            Vec::new(),
-            Vec::new(),
+            schema,
+            after_pk.clone(),
+            None,
+            KindEvalOp::Put(Item::from([("pk".to_owned(), after_pk)])),
+            None,
+            false,
+            &after_key,
             ProbeIdentity::ValueProves,
         )
         .await
         .expect("an ordinary write after the futile one still confirms");
+        assert!(matches!(after_result, KindEvalApplied::Ok { .. }));
 
         node.shutdown();
     }
 
-    /// Regression for issue #285: `dynamo::kind_write_item_at_leader` used to
-    /// hold `ctx.data().rmw_lock` across the whole `cp_kind_local` propose+
-    /// confirm-poll, not just its own read+evaluate — so one item's slow
-    /// confirm (apply backlog stretches this even with the #268 fast-fail
-    /// above) stalled *every other* evaluated write on the node behind it,
-    /// including a write to a completely unrelated tablet.
-    ///
-    /// A `ConditionExpression` failure can't reproduce this: it returns
-    /// (`ConditionFailed`) before `cp_kind_local` is ever called, so the
-    /// lock is released at the same point regardless of the fix — the bug
-    /// is specifically about the propose+confirm phase, which a failed
-    /// eval-time condition never reaches.
-    ///
-    /// **Why this doesn't race a real apply backlog.** An earlier version of
-    /// this test built the "slow propose+confirm" scenario for real, with a
-    /// concurrent filler flood against the write's own tablet running for a
-    /// fixed wall-clock window, hoping the flood's own commits would grow
-    /// the tablet's apply backlog faster than the target write's confirm
-    /// could drain it. That is a real race, not a guarantee: on a CPU-
-    /// starved runner the flood is starved right along with everything
-    /// else, so it can fail to build any backlog at all — observed in CI on
-    /// commit `97289e2`, where two parallel runs of the identical code came
-    /// back one green and one red, the red one logging `DIAG: unrelated
-    /// write (group B) took 103.937566ms` with the "slow" write having
-    /// *already finished*. This test now uses
-    /// `dynamo::rmw285_confirm_gate` (see its own doc) to hold write A's
-    /// propose+confirm phase open for a fixed, generous delay under this
-    /// test's own control instead of hoping a flood wins a scheduling race
-    /// — the in-flight window this regresses against no longer depends on
-    /// how contended the machine happens to be.
-    ///
-    /// A second, wholly unrelated tablet (its own independent Raft group and
-    /// apply pipeline) then proves the point: pre-fix, a write to it queues
-    /// behind the node-wide lock held for write A's entire gated
-    /// read+propose+confirm; post-fix the lock is released the moment
-    /// write A's read+evaluate finishes, so the second write is unaffected
-    /// by write A's still-ongoing (artificially held-open) confirm phase.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let (node, _config) = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-
-        ctx.provision_tablet("rmw_285_a")
-            .await
-            .expect("provisioning table A");
-        ctx.provision_tablet("rmw_285_b")
-            .await
-            .expect("provisioning table B");
-        let meta = node.metadata();
-        let tablet_a = *meta
-            .tablets_for_table("rmw_285_a")
-            .next()
-            .expect("table A has a tablet")
-            .0;
-        let tablet_b = *meta
-            .tablets_for_table("rmw_285_b")
-            .next()
-            .expect("table B has a tablet")
-            .0;
-        let group_a = node
-            .edge
-            .local_cp(tablet_a)
-            .expect("this node hosts table A's tablet");
-        let group_b = node
-            .edge
-            .local_cp(tablet_b)
-            .expect("this node hosts table B's tablet");
-        // `provision_tablet` alone does not wait for the group to actually
-        // elect (its own doc: an ordinary caller's routed op does that via
-        // `cp_route`) — poll rather than assert immediately.
-        for group in [&group_a, &group_b] {
-            timeout(Duration::from_secs(10), async {
-                while !group.is_leader() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("tablet group did not elect a local leader in time");
-        }
-
-        // Arm write A's propose+confirm phase to hold open for a fixed
-        // delay once it releases `rmw_lock` (see `dynamo::
-        // rmw285_confirm_gate`'s doc for why this replaced a real,
-        // load-sensitive filler flood). `GATE_DELAY` only needs to
-        // comfortably outlast an ordinary unrelated write's own
-        // read+evaluate+propose+confirm — including under real contention:
-        // CI observed 104ms for that under load (commit `97289e2`), so this
-        // leaves roughly a 20x margin, not a hand-tuned near-miss.
-        const GATE_DELAY: Duration = Duration::from_secs(2);
-        crate::dynamo::rmw285_confirm_gate::arm("rmw_285_a", GATE_DELAY);
-
-        let mut item_a = animus_dynamo::Item::new();
-        item_a.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("slow-item".to_string()),
-        );
-        let pk_a = animus_dynamo::AttributeValue::S("slow-item".to_string());
-        let slow = tokio::spawn({
-            let ctx = ctx.clone();
-            let group_a = group_a.clone();
-            let meta = meta.clone();
-            async move {
-                crate::dynamo::kind_write_item_at_leader(
-                    &ctx,
-                    &group_a,
-                    &meta,
-                    "rmw_285_a",
-                    &pk_a,
-                    None,
-                    crate::KindWriteOp::Put(item_a),
-                    None,
-                    false,
-                )
-                .await
-            }
-        });
-
-        // Cosmetic pacing only (not load-bearing): give write A's task a
-        // moment to actually start running before write B is spawned, so
-        // the two don't merely race to get scheduled at all. The gate above
-        // is what actually makes write A's in-flight window deterministic.
-        sleep(Duration::from_millis(10)).await;
-
-        let mut item_b = animus_dynamo::Item::new();
-        item_b.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("unrelated-item".to_string()),
-        );
-        let pk_b = animus_dynamo::AttributeValue::S("unrelated-item".to_string());
-        let started = Instant::now();
-        let outcome = timeout(
-            Duration::from_secs(60),
-            crate::dynamo::kind_write_item_at_leader(
-                &ctx,
-                &group_b,
-                &meta,
-                "rmw_285_b",
-                &pk_b,
-                None,
-                crate::KindWriteOp::Put(item_b),
-                None,
-                false,
-            ),
-        )
-        .await
-        .expect("the unrelated write must not need the outer 60s safety timeout")
-        .expect("the unrelated write must itself succeed");
-        let elapsed = started.elapsed();
-        eprintln!("DIAG: unrelated write (group B) took {elapsed:?}");
-        assert!(
-            matches!(outcome, crate::dynamo::KindWriteOutcome::Ok { .. }),
-            "the unrelated write must actually land, not just return some outcome"
-        );
-
-        // What this actually proves, and what it does not. Pre-fix,
-        // `rmw_lock` is one node-wide lock held across write A's whole
-        // call, so write B cannot even *start* its own read until write A's
-        // ENTIRE call (read+evaluate+propose+confirm) returns and drops the
-        // guard — under that code, write B could never observe write A as
-        // still in flight. Post-fix, write A drops the lock the moment its
-        // own read+evaluate finishes, then (via the gate armed above) sits
-        // in its propose+confirm phase for a fixed `GATE_DELAY` before ever
-        // proposing — so write B, unblocked as soon as the lock frees,
-        // reliably finishes and returns while write A is still gated.
-        //
-        // This is *not* a hard ordering guarantee in the way the assertion
-        // below reads on its own: it holds because `GATE_DELAY` was chosen
-        // to comfortably outlast write B's own real duration (see that
-        // constant's doc), not because the two are ordered by construction.
-        // A version of write B slow enough to exceed `GATE_DELAY` — which
-        // the `elapsed` check right below also guards against — could in
-        // principle still invert it. What *is* load-independent is the
-        // mechanism: write A's in-flight window no longer depends on a
-        // flood winning a real-time race to build apply backlog, only on
-        // write B finishing inside a fixed, generous budget.
-        assert!(
-            !slow.is_finished(),
-            "the gated write (group A) must still be in flight when the unrelated write \
-             (group B) returns — pre-fix, the unrelated write cannot even start until the \
-             gated write's ENTIRE call (including its confirm-poll) has already returned and \
-             released the node-wide rmw_lock, so it could never observe this"
-        );
-        // The load-bearing margin for the assertion above: write B must
-        // finish well inside `GATE_DELAY`, not just inside some loose
-        // hang-guard ceiling — a regression that re-widens `rmw_lock`'s
-        // scope would force write B to wait out (most of) `GATE_DELAY`
-        // itself, which this catches even if `slow.is_finished()` above
-        // somehow didn't.
-        assert!(
-            elapsed < GATE_DELAY / 2,
-            "the unrelated write took implausibly long relative to GATE_DELAY={GATE_DELAY:?} — \
-             either implausible CI noise, or rmw_lock's scope regressed to cover write A's \
-             gated propose/confirm phase again: {elapsed:?}"
-        );
-
-        let slow_started = Instant::now();
-        slow.await
-            .expect("slow task panicked")
-            .expect("the gated write must itself eventually succeed too");
-        eprintln!(
-            "DIAG: slow task (group A) finished {:?} after the unrelated write returned",
-            slow_started.elapsed()
-        );
-        node.shutdown();
-    }
+    // Issue #285's own regression,
+    // `an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_
+    // confirm_wait`, is retired (ADR 0054 step 4b): it proved
+    // `kind_write_item_at_leader` released `rmw_lock` before its own
+    // propose+confirm phase rather than holding it across the whole call —
+    // a real property when the lock existed. `rmw_lock` itself is deleted
+    // now (no producer evaluates at the leader any more, ADR 0054 steps
+    // 3/4a), so there is no lock left whose scope this test could still be
+    // regressing against; every write-write pair on two different tablets
+    // is now unconditionally independent by construction (no shared
+    // node-wide state between them at all), not merely lock-scoped
+    // correctly. `dynamo::rmw285_confirm_gate`, this test's own fault
+    // injector, is retired with it — it had no other caller.
 }
 
 /// Issue #316 regression: `ClientCtx::forward_to_tablet_leader` must chase
@@ -13099,6 +13534,339 @@ mod forward_hop_timeout_tests {
     }
 }
 
+/// Regression for issue #596: [`handle_connection`] cancels an in-flight
+/// request server-side once the peer's connection closes, instead of
+/// running the handler to its full budget (`CLIENT_TIMEOUT`, 10s) with
+/// nobody listening. In-crate (not `tests/`) for the same reason
+/// `forward_hop_timeout_tests`/`halted_shutdown_tests` are: it needs
+/// `node.edge.local_cp` (private) to find the tablet's own CP leader so it
+/// can deliberately strand it without a commit quorum, and `node.test_ctx`
+/// (`#[cfg(test)]`-only) to read the leader's own live metrics sink
+/// directly rather than scraping `/metrics` over another socket.
+#[cfg(test)]
+mod client_cancellation_tests {
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use animus_env::{Env, Metric};
+    use animus_tablet::TabletId;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{sleep, timeout};
+
+    use crate::config::NodeRole;
+    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+
+    // Hand-rolled fixture helpers, duplicated from the sibling in-crate test
+    // modules above rather than shared (see this crate's own `CLAUDE.md`,
+    // "Every in-crate bring-up retries the port-TOCTOU race").
+    fn free_addrs(count: usize) -> Vec<SocketAddr> {
+        let ls: Vec<std::net::TcpListener> = (0..count)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        ls.iter().map(|l| l.local_addr().unwrap()).collect()
+    }
+
+    fn cluster_config(n: usize) -> ClusterConfig {
+        let addrs = free_addrs(n * 6);
+        let nodes = (0..n)
+            .map(|i| RoleAddrs {
+                id: crate::config::node_id(i),
+                role: NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        ClusterConfig {
+            nodes,
+            dynamo_auth: None,
+            cluster_settings: None,
+        }
+    }
+
+    async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
+        for attempt in 0..16 {
+            let config = cluster_config(n);
+            let mut nodes = Vec::new();
+            let mut failed = false;
+            for i in 0..n {
+                match run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
+                    Ok(node) => nodes.push(node),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed {
+                return nodes;
+            }
+            for node in &nodes {
+                node.shutdown();
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    }
+
+    async fn await_bootstrap(nodes: &[Node]) {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes.iter().any(Node::is_control_leader)
+                    && nodes.iter().all(|n| !n.metadata().members.is_empty())
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not bootstrap in 20s");
+    }
+
+    async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+        timeout(Duration::from_secs(40), async {
+            loop {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                crate::write_frame(
+                    &mut stream,
+                    &ClientRequest::Put {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        table: table.to_string(),
+                    },
+                )
+                .await
+                .expect("send");
+                match crate::read_frame(&mut stream)
+                    .await
+                    .expect("read")
+                    .expect("a reply")
+                {
+                    ClientResponse::PutOk => return,
+                    ClientResponse::Error(_) => sleep(Duration::from_millis(100)).await,
+                    other => panic!("unexpected put response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("seed put did not succeed in 40s");
+    }
+
+    /// Bring up a 3-node RF-3 cluster, seed one tablet, kill every replica
+    /// except its own leader (so a *new* write on that leader can never
+    /// reach commit quorum and blocks server-side for the full
+    /// `CLIENT_TIMEOUT`), send a write directly to the stranded leader, and
+    /// abandon the connection ~100ms later — well before that leader could
+    /// possibly answer on its own. Asserts the `client_requests_abandoned`
+    /// counter increments on the leader far inside `CLIENT_TIMEOUT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoning_a_connection_cancels_its_stuck_write_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nodes = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        put_until_ok(nodes[0].client_addr(), "cancel596", b"seed", b"v").await;
+        let tablet: TabletId = *nodes[0]
+            .metadata()
+            .tablets_for_table("cancel596")
+            .next()
+            .expect("seed put provisioned a tablet")
+            .0;
+
+        // RF is an eventual property (`provision_tablet` seeds a best-effort
+        // initial set, `reconcile_placement` grows it) -- poll to
+        // convergence rather than asserting the first read, exactly like
+        // `forward_hop_timeout_tests` does for the identical reason.
+        let rf_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let replicas = nodes[0]
+                .metadata()
+                .tablets
+                .get(&tablet)
+                .expect("tablet exists")
+                .replicas
+                .clone();
+            if replicas.len() == 3 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < rf_deadline,
+                "RF did not converge to 3 replicas: {replicas:?}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // Find which of the 3 nodes actually leads this tablet's own CP
+        // group (never assumed to be the control leader or node 0).
+        let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let leader_idx = loop {
+            if let Some(idx) = nodes.iter().position(|n| {
+                n.edge
+                    .local_cp(tablet)
+                    .is_some_and(|group| group.is_leader())
+            }) {
+                break idx;
+            }
+            assert!(
+                tokio::time::Instant::now() < leader_deadline,
+                "no node ever became this tablet's CP leader"
+            );
+            sleep(Duration::from_millis(50)).await;
+        };
+
+        // Strand the leader: kill the other two replicas so a *new*
+        // propose on the leader is durably appended locally (`Accepted`)
+        // but can never reach the 2-of-3 commit quorum it needs -- exactly
+        // the "accepted-unconfirmed, polling until CLIENT_TIMEOUT" shape
+        // `poll_probe` exists to wait out. A Raft leader does not
+        // unilaterally step down just because it cannot reach followers
+        // (nothing left alive can out-campaign it), so it keeps believing
+        // it leads for the rest of this test.
+        for (i, node) in nodes.iter().enumerate() {
+            if i != leader_idx {
+                node.shutdown();
+            }
+        }
+
+        let leader_addr = nodes[leader_idx].client_addr();
+        let before = nodes[leader_idx]
+            .test_ctx
+            .env
+            .metrics()
+            .get(Metric::ClientRequestsAbandoned);
+
+        // Send a write for a NEW key in the same (single-tablet) table
+        // straight to the now-quorum-less leader, then abandon the
+        // connection ~100ms later -- long before the leader could ever
+        // finish on its own (its only path to finishing without our help
+        // is CLIENT_TIMEOUT, 10s away).
+        let mut stream = tokio::net::TcpStream::connect(leader_addr)
+            .await
+            .expect("connect to stranded leader");
+        crate::write_frame(
+            &mut stream,
+            &ClientRequest::Put {
+                key: b"stuck-key".to_vec(),
+                value: b"v2".to_vec(),
+                table: "cancel596".to_string(),
+            },
+        )
+        .await
+        .expect("send put to stranded leader");
+        sleep(Duration::from_millis(100)).await;
+        // Abandon the connection without ever reading a reply -- exactly
+        // the scenario this mechanism exists for (a forwarder's own
+        // `FORWARD_HOP_TIMEOUT`, or a plain client disconnect).
+        stream.shutdown().await.ok();
+        drop(stream);
+
+        // 5s, not the naive "should be near-instant": this whole process can
+        // be starved of CPU for a while on a loaded, build-contended sandbox
+        // (several other agents' `cargo` invocations sharing the same 4
+        // cores), and a stall on this SAME runtime can just as easily delay
+        // this polling loop's own ticks as it delays the server's read().
+        // The bound only has to stay comfortably under the 10s
+        // `CLIENT_TIMEOUT` the stuck write would otherwise burn in full --
+        // it does not have to be tight. Mirrors `forward_hop_timeout_tests`'
+        // own generous multi-second bounds for the identical "prove this
+        // finished the fast way, not the slow way" shape under load.
+        let started = tokio::time::Instant::now();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let after = nodes[leader_idx]
+                    .test_ctx
+                    .env
+                    .metrics()
+                    .get(Metric::ClientRequestsAbandoned);
+                if after > before {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "client_requests_abandoned did not increment within 5s of the peer closing its \
+             connection -- the stuck write's handler was not cancelled",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "cancellation took {elapsed:?}, nowhere near the 10s CLIENT_TIMEOUT it must avoid \
+             paying"
+        );
+
+        nodes[leader_idx].shutdown();
+        // Only the surviving (leader) node needs a graceful wait; the other
+        // two were already hard-killed above to strand it.
+        nodes.truncate(0);
+    }
+
+    /// Regression for `peer_closed`'s own peek-vs-read distinction: a client
+    /// that pipelines a second request ahead of reading the first reply
+    /// must not be treated as having abandoned the first one. Nothing in
+    /// this repo's own clients pipelines today, but the wire protocol
+    /// itself never forbids it, and an earlier version of `peer_closed`
+    /// used a plain `read` that consumed the pipelined frame's first byte
+    /// and dropped the still-wanted first response on the floor. Writes two
+    /// `Status` requests back to back on one connection with no read in
+    /// between, then asserts both replies come back in order and
+    /// `client_requests_abandoned` never moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_requests_are_not_mistaken_for_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let nodes = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let before = nodes[0]
+            .test_ctx
+            .env
+            .metrics()
+            .get(Metric::ClientRequestsAbandoned);
+
+        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        // Both requests go out before either reply is read -- the exact
+        // shape `peer_closed`'s peek must tolerate.
+        crate::write_frame(&mut stream, &ClientRequest::Status)
+            .await
+            .expect("send first status request");
+        crate::write_frame(&mut stream, &ClientRequest::Status)
+            .await
+            .expect("send second, pipelined status request");
+
+        for which in ["first", "second"] {
+            match timeout(Duration::from_secs(5), crate::read_frame(&mut stream))
+                .await
+                .unwrap_or_else(|_| panic!("{which} reply did not arrive within 5s"))
+                .expect("read")
+                .unwrap_or_else(|| panic!("connection closed before the {which} reply"))
+            {
+                ClientResponse::Status { .. } => {}
+                other => panic!("unexpected {which} response: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            nodes[0]
+                .test_ctx
+                .env
+                .metrics()
+                .get(Metric::ClientRequestsAbandoned),
+            before,
+            "a pipelined second request must never be counted as an abandoned connection"
+        );
+    }
+}
+
 /// Regression for issues #282/#279's fix: bare [`Node::shutdown`] and
 /// [`Node`]'s `Drop` impl both latch every hosted CP group's `halted` flag —
 /// see each's own doc for the full rationale. This module needs
@@ -13317,187 +14085,13 @@ mod status_wire_compat_tests {
     }
 }
 
-/// Issue #412 regression: a leader-side old-image read failure with the
-/// house `"; retry"` shape (a leader-moved/no-longer-leader condition) must
-/// never surface as a terminal error while retries remain, for either the
-/// ordinary evaluate-at-leader write path (`dynamo::
-/// kind_write_item_at_leader` via `ClientCtx::cp_kind_write_item`) or its
-/// transactional twin (`dynamo::eval_kind_txn_write` via `ClientCtx::
-/// txn_prepare_pushing`). Uses `dynamo::leader_read_failure_gate` to inject
-/// the failure deterministically rather than orchestrating a real
-/// leadership change — same idiom as `dynamo::rmw285_confirm_gate`.
-#[cfg(test)]
-mod issue_412_tests {
-    use std::net::SocketAddr;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use tokio::time::{sleep, timeout};
-
-    use crate::config::NodeRole;
-    use crate::dynamo::{self, leader_read_failure_gate};
-    use crate::{ClientCtx, ClusterConfig, KindWriteOp, Node, RoleAddrs, run_node};
-
-    fn free_addrs(count: usize) -> Vec<SocketAddr> {
-        let ls: Vec<std::net::TcpListener> = (0..count)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        ls.iter().map(|l| l.local_addr().unwrap()).collect()
-    }
-
-    fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
-        ClusterConfig {
-            nodes: vec![RoleAddrs {
-                id: crate::config::node_id(0),
-                role: NodeRole::Both,
-                internal: addrs[0],
-                client: addrs[1],
-                dynamo: addrs[2],
-                admin: addrs[3],
-                intra: addrs[4],
-                console: addrs[5],
-                advertise_host: None,
-                tls: None,
-            }],
-            dynamo_auth: None,
-            cluster_settings: None,
-        }
-    }
-
-    /// Same bounded fresh-config retry every in-crate bring-up in this
-    /// crate uses (`docs/engineering-lessons.md`) against the port-TOCTOU
-    /// race under `cargo test --workspace` contention.
-    async fn single_node(dir: &Path) -> Node {
-        let mut last_err = None;
-        for attempt in 0..16 {
-            let config = single_node_config();
-            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
-                Ok(node) => return node,
-                Err(e) => {
-                    last_err = Some(e);
-                    sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-        panic!(
-            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
-        );
-    }
-
-    /// Provisions `table`'s first tablet and waits for its single-voter
-    /// group to actually elect locally — `provision_tablet` alone does not
-    /// wait for that (`confirm_futility_tests`'s identical polling doc).
-    async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
-        ctx.provision_tablet(table)
-            .await
-            .expect("provisioning table");
-        let tablet = *node
-            .metadata()
-            .tablets_for_table(table)
-            .next()
-            .expect("provisioning created a tablet")
-            .0;
-        let group = node
-            .edge
-            .local_cp(tablet)
-            .expect("this single node hosts the tablet");
-        timeout(Duration::from_secs(10), async {
-            while !group.is_leader() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("tablet group did not elect a local leader in time");
-    }
-
-    /// The ordinary (non-transactional) evaluate-at-leader write path
-    /// retries a leader-moved-shaped read failure to success —
-    /// `ClientCtx::cp_kind_write_item`'s issue #288 retry loop already
-    /// re-resolves routing on this exact `"; retry"` shape (confirming this
-    /// half of #412 was already sound; the txn-side twin below is the
-    /// actual fix).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn kind_write_item_retries_a_leader_moved_read_failure_to_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-        provision_and_await_leader(&node, &ctx, "issue412_plain").await;
-        let meta = node.metadata();
-
-        leader_read_failure_gate::arm("issue412_plain", 2);
-
-        let mut item = animus_dynamo::Item::new();
-        item.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("k1".to_string()),
-        );
-        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
-        let outcome = ctx
-            .cp_kind_write_item(
-                &meta,
-                "issue412_plain",
-                &pk,
-                None,
-                KindWriteOp::Put(item),
-                None,
-            )
-            .await
-            .expect(
-                "a retryable leader-moved read failure must be retried to success, \
-                 never surfaced as a terminal error",
-            );
-        assert!(matches!(outcome, dynamo::KindWriteOutcome::Ok { .. }));
-
-        node.shutdown();
-    }
-
-    /// Issue #412's actual fix: the transactional stage-time evaluator
-    /// (`dynamo::eval_kind_txn_write`, reached via `TransactWriteItems`)
-    /// hits the identical leader-moved read failure — pre-fix, it escaped
-    /// `ClientCtx::txn_prepare_pushing`'s bounded retry loop via `?` on the
-    /// very first attempt and would have surfaced as a terminal whole-txn
-    /// cancel. Calls `txn_prepare_pushing` directly (the function whose
-    /// retry loop this fixes) with a single anchor-only pending kind write,
-    /// so a failure here can only mean that loop itself didn't retry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn txn_prepare_pushing_retries_a_leader_moved_read_failure_to_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-        provision_and_await_leader(&node, &ctx, "issue412_txn").await;
-
-        leader_read_failure_gate::arm("issue412_txn", 2);
-
-        let mut item = animus_dynamo::Item::new();
-        item.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("k1".to_string()),
-        );
-        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
-        let pending = crate::PendingKindWrite {
-            pk,
-            sk: None,
-            op: KindWriteOp::Put(item),
-            condition: None,
-        };
-        ctx.txn_prepare_pushing(
-            "issue412_txn",
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![pending],
-        )
-        .await
-        .expect(
-            "a retryable leader-moved read failure inside the stage-time evaluator must be \
-             retried to success, never a terminal whole-txn cancel",
-        );
-
-        node.shutdown();
-    }
-}
+// Issue #412 regression module retired (ADR 0054 step 4b): its fault
+// injector, `dynamo::leader_read_failure_gate`, targeted a leader-side
+// old-image read that no longer exists anywhere in the write path (see
+// `kind_write_item_at_leader`'s own doc). Its plain-write test
+// (`kind_write_item_retries_a_leader_moved_read_failure_to_success`) and
+// its already-retired (ADR 0054 step 4a) transactional twin both proved
+// properties about a read this ADR's whole point was to delete.
 
 /// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): a
 /// `SimEnv`-driven harness that constructs a real `ClientCtx<SimEnv, _>` —
@@ -13564,9 +14158,10 @@ mod simenv_client_ctx_tests {
     use super::*;
 
     /// This harness is single-node: the one tablet it hosts is always led
-    /// locally, so nothing here ever needs to relay to another node. A real
-    /// `Network`-backed `RelayClient` (ADR 0061's deferred C3d) is Phase
-    /// D's job, not this rung's — see `crates/animusd/CLAUDE.md`.
+    /// locally, so nothing here ever needs to relay to another node — see
+    /// `two_node_relay_tests` below (ADR 0061 rung C3d, landed) for a real
+    /// `Network`-backed relay between two `SimEnv` node ids, using
+    /// `animus_node::SimRelayClient` instead of this stand-in.
     #[derive(Clone, Copy, Debug, Default)]
     struct NeverRelay;
 
@@ -13645,6 +14240,7 @@ mod simenv_client_ctx_tests {
             peers: BTreeMap::new(),
             admin_addrs: vec![placeholder_addr()],
             auto_split_bytes_threshold: None,
+            auto_split_ops_rate_threshold: None,
             // This harness never builds a real `DataRole`/dynamo listener
             // (`data: None` below) — see `AdminInfo`'s own field docs.
             backup_store: None,
@@ -13680,6 +14276,7 @@ mod simenv_client_ctx_tests {
             control_storage: None,
             dynamo_auth: None,
             tls: None,
+            relay: NeverRelay,
         };
 
         (sim, ctx, control, kv)
@@ -13747,7 +14344,7 @@ mod simenv_client_ctx_tests {
         let (mut sim, ctx, _control, _kv) = single_node_ctx(seed);
         sim.run_for(Duration::from_millis(200));
 
-        let read_result = spawn_and_capture(&mut sim, &ctx, {
+        let read_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             async move {
                 ctx.cp_get("nonexistent-table", b"whatever".to_vec(), false)
@@ -13769,13 +14366,16 @@ mod simenv_client_ctx_tests {
     /// single local write/read (`CLIENT_TIMEOUT` itself is 10s; every call
     /// here is local-only, so it either confirms within a handful of the
     /// exponential-backoff confirm-poll ticks or it never will).
-    fn spawn_and_capture<T, F>(sim: &mut Simulator, ctx: &SimClientCtx, fut: F) -> Option<T>
+    /// Spawns onto `env` (not tied to any one `ClientCtx<E, R>` binding, so
+    /// this same helper backs both the single-node `NeverRelay` fixture and
+    /// the two-node `SimRelayClient` one below).
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
         let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
-        let env = ctx.env.clone();
+        let env = env.clone();
         let out = slot.clone();
         env.spawn_task(async move {
             let result = fut.await;
@@ -13815,7 +14415,7 @@ mod simenv_client_ctx_tests {
         // confirm-poll backoff (`CP_CONFIRM_POLL_INIT`/`_MAX`) under a
         // virtual clock, spawned so the sim's own executor can actually
         // drive any `env.sleep()` inside it forward.
-        let write_result = spawn_and_capture(&mut sim, &ctx, {
+        let write_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
             let key = key.clone();
@@ -13834,7 +14434,7 @@ mod simenv_client_ctx_tests {
         // The read: `ClientCtx::cp_get` — the exact method
         // `handle_request`'s `ClientRequest::Get` arm calls, exercising the
         // production route -> local-resolve loop.
-        let read_result = spawn_and_capture(&mut sim, &ctx, {
+        let read_result = spawn_and_capture(&mut sim, &ctx.env, {
             let ctx = ctx.clone();
             let table = table.to_owned();
             let key = key.clone();
@@ -13847,6 +14447,332 @@ mod simenv_client_ctx_tests {
         );
     }
 }
+
+/// Two-node `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` smoke (ADR 0061
+/// rung C3d, the third 2026-08-28 amendment's own closing rung) — the
+/// end-to-end proof that threading `R: RelayClient` through
+/// `forward_to_tablet_leader`/`cp_serve_forwarded` (this rung's Deliverable
+/// B) actually lets two nodes talk inside one `SimEnv` run, not merely that
+/// each compiles generically. Node B (no local tablet replica) forwards a
+/// `cp_kind_write_raw`/`cp_get` round trip to node A's own locally-led
+/// tablet through a real [`animus_node::SimRelayClient`] — the same
+/// production `ClientCtx` methods [`simenv_client_ctx_tests`] above drives
+/// single-node, now genuinely crossing a (simulated) network hop. This is
+/// what commit 2 (ADR 0061 rung D1's `SimCluster`) generalises to N nodes.
+#[cfg(test)]
+mod two_node_relay_tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, StorageScope};
+    use animus_env::{EnvExt, nid};
+    use animus_node::SimRelayClient;
+    use animus_sim::{SimEnv, Simulator};
+
+    use super::*;
+
+    type TwoNodeClientCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
+    fn placeholder_addr() -> SocketAddr {
+        "127.0.0.1:1".parse().expect("valid placeholder addr")
+    }
+
+    /// A one-voter control `RaftNode<SimEnv>` (node 0, shared — `Arc`-backed
+    /// clones, per `RaftNode`'s own doc — by both nodes' `ClientCtx`, so
+    /// both observe the identical replicated `Metadata` with no propagation
+    /// delay, exactly like two real `Local` control voters would once
+    /// caught up) plus a one-voter CP data-plane `RaftKvNode<SimEnv,
+    /// MemoryEngine>` (tablet 1, a whole-ring range) hosted **only** on
+    /// node A (id `n1`) — node B (id `n2`) has an empty
+    /// `ClusterEdgeState` and so structurally cannot serve the tablet
+    /// locally, forcing every CP op it originates through
+    /// `forward_to_tablet_leader`'s relay path. `data: None` on both, for
+    /// the identical reason `single_node_ctx`'s own doc gives (neither
+    /// `cp_kind_write_raw` nor `cp_get`/`cp_serve_forwarded`'s `KindWrite`/
+    /// `Get` arms ever read `self.data()`).
+    #[allow(clippy::too_many_lines)] // one wiring function for a two-node fixture — see its own doc for why it isn't split further
+    fn two_node_ctx(
+        seed: u64,
+    ) -> (
+        Simulator,
+        TwoNodeClientCtx,
+        TwoNodeClientCtx,
+        RaftNode<SimEnv>,
+    ) {
+        let sim = Simulator::new(seed);
+        let control: RaftNode<SimEnv> =
+            RaftNode::start(sim.env(nid(0)), vec![nid(0)], MemoryEngine::new());
+        let tablet = TabletId(1);
+        let kv: RaftKvNode<SimEnv, MemoryEngine> = RaftKvNode::start_scoped(
+            sim.env(nid(1)),
+            vec![nid(1)],
+            MemoryEngine::new(),
+            StorageScope::new(KeyRange::whole()),
+        );
+
+        // Node A (`n1`) hosts the tablet locally.
+        let edge_a = ClusterEdgeState::<SimEnv>::new();
+        edge_a.register_raftkv(tablet, CpGroup::Mem(kv.clone()));
+        let relay_a: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(1)));
+        let admin_a = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
+            node_id: Some(nid(1)),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: vec![nid(0)],
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+        let ctx_a: TwoNodeClientCtx = ClientCtx {
+            control: GenericControlHandle::Local(control.clone()),
+            edge: edge_a,
+            env: sim.env(nid(1)),
+            data: None,
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
+            // Node A never forwards outward in this test — empty routes.
+            client_route: Arc::new(Mutex::new(BTreeMap::new())),
+            intra_route: Arc::new(Mutex::new(BTreeMap::new())),
+            admin: admin_a,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            tls: None,
+            relay: relay_a.clone(),
+        };
+
+        // Node A answers relayed requests through the generic dispatcher
+        // (ADR 0061 rung C3d Deliverable A) closed over its own `ctx_a`.
+        let ctx_a_for_server = ctx_a.clone();
+        relay_a.serve(move |req| {
+            let ctx_a = ctx_a_for_server.clone();
+            async move { forwarding::handle_relayed_request(&ctx_a, req).await }
+        });
+
+        // Node B (`n2`) hosts nothing locally — every CP op it originates
+        // must forward. Its `intra_route` names node A's own address under
+        // `SimRelayClient`'s addr convention (module doc: `addr ==
+        // NodeId::to_string()`), mirroring how a real `SimCluster` (ADR
+        // 0061 rung D1) would populate this same map.
+        let edge_b = ClusterEdgeState::<SimEnv>::new();
+        let relay_b: SimRelayClient<SimEnv> = SimRelayClient::new(sim.env(nid(2)));
+        let admin_b = Arc::new(AdminInfo {
+            auto_split_ops_rate_threshold: None,
+            node_id: Some(nid(2)),
+            internal_addr: Some(placeholder_addr()),
+            client_addr: placeholder_addr(),
+            dynamo_addr: None,
+            admin_addr: placeholder_addr(),
+            role: "combined",
+            control_ids: vec![nid(0)],
+            peers: BTreeMap::new(),
+            admin_addrs: vec![placeholder_addr()],
+            auto_split_bytes_threshold: None,
+            backup_store: None,
+            segment_store: None,
+            quiesce_after_ms: None,
+            auth_enabled: None,
+            auth_access_key_ids: None,
+            otlp_endpoint: None,
+        });
+        let mut intra_route_b = BTreeMap::new();
+        intra_route_b.insert(nid(1), nid(1).to_string());
+        let ctx_b: TwoNodeClientCtx = ClientCtx {
+            control: GenericControlHandle::Local(control.clone()),
+            edge: edge_b,
+            env: sim.env(nid(2)),
+            data: None,
+            segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
+            backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
+            client_route: Arc::new(Mutex::new(BTreeMap::new())),
+            intra_route: Arc::new(Mutex::new(intra_route_b)),
+            admin: admin_b,
+            metrics_history: Arc::new(Mutex::new(VecDeque::new())),
+            remote_metadata: Arc::new(Mutex::new(None)),
+            control_storage: None,
+            dynamo_auth: None,
+            tls: None,
+            relay: relay_b,
+        };
+
+        (sim, ctx_a, ctx_b, control)
+    }
+
+    fn spawn_and_capture<T, F>(sim: &mut Simulator, env: &SimEnv, fut: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let env = env.clone();
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        sim.run_for(Duration::from_secs(2));
+        slot.lock().expect("result slot poisoned").take()
+    }
+
+    #[test]
+    fn node_b_forwards_a_write_and_a_read_to_node_as_tablet_leader_through_the_sim_relay() {
+        run(0x5C3D_0001);
+    }
+
+    #[test]
+    fn node_b_forwards_a_write_and_a_read_to_node_as_tablet_leader_through_the_sim_relay_seed2() {
+        run(0x5C3D_0002);
+    }
+
+    /// Replay proof (repo convention): `ANIMUS_SEED=<seed> cargo test -p
+    /// animusd --lib replays_two_node_relay_from_an_explicit_env_seed`.
+    #[test]
+    fn replays_two_node_relay_from_an_explicit_env_seed() {
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5C3D_0003);
+        run(seed);
+    }
+
+    fn run(seed: u64) {
+        let (mut sim, ctx_a, ctx_b, control) = two_node_ctx(seed);
+        sim.run_for(Duration::from_millis(500));
+
+        let table = "orders";
+        let tablet = TabletId(1);
+        // Seed schema/tablet directly on the control `RaftNode` — the same
+        // `propose_schema`-bypass every `SimEnv` `ClientCtx` fixture in
+        // this crate uses (see `simenv_client_ctx_tests::seed_schema`'s own
+        // doc for exactly why). `control` is shared between `ctx_a`/`ctx_b`
+        // (both `ControlHandle::Local`, same underlying `RaftNode`), so
+        // both observe the commit immediately.
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTableSchema {
+                table: table.to_owned(),
+                schema: TableSchema::simple("pk", ColumnType::String),
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            control.propose(MetaCommand::CreateTablet {
+                tablet,
+                table: Some(table.to_owned()),
+                range: KeyRange::whole(),
+                // Node A's own `RaftKvNode` was started with `vec![nid(1)]`
+                // (`two_node_ctx`) — this must match for `ctx_b`'s
+                // `resolve_cp_route` fallback to name node A as the forward
+                // target at all.
+                replicas: vec![nid(1)],
+            }),
+            ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_millis(200));
+        assert!(
+            ctx_b.effective_metadata().has_table_tablet(table),
+            "node B's own control read must see the seeded schema/tablet (seed={seed})"
+        );
+
+        let key = b"item-1".to_vec();
+        let value = b"hello from node B, relayed to node A".to_vec();
+
+        // The write: `ClientCtx::cp_kind_write_raw` called on node B, which
+        // has no local replica of `tablet` — `cp_route` resolves to
+        // `CpRoute::Forward`, and `cp_forward`/`forward_to_tablet_leader`
+        // carry it to node A over the real `SimRelayClient` wire, where
+        // `forwarding::handle_relayed_request`'s `Forwarded` arm serves it
+        // via `cp_serve_forwarded` against the real local `kv` leader.
+        let write_result = spawn_and_capture(&mut sim, &ctx_b.env, {
+            let ctx_b = ctx_b.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            let value = value.clone();
+            async move {
+                ctx_b
+                    .cp_kind_write_raw(&table, vec![(KIND_BASE, key, Some(value))], Vec::new())
+                    .await
+            }
+        });
+        assert_eq!(
+            write_result,
+            Some(Ok(())),
+            "the forwarded write must land through the real relay wire (seed={seed})"
+        );
+
+        // The read: `ClientCtx::cp_get`, also called on node B — same
+        // forward-to-leader path, this time carrying `ClientRequest::Get`.
+        let read_result = spawn_and_capture(&mut sim, &ctx_b.env, {
+            let ctx_b = ctx_b.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            async move { ctx_b.cp_get(&table, key, false).await }
+        });
+        assert_eq!(
+            read_result,
+            Some(ClientResponse::Value(Some(value))),
+            "the forwarded read must observe the earlier forwarded write (seed={seed})"
+        );
+
+        // Confirm node A's own local engine actually holds it too — a
+        // direct (never-forwarded, since A leads the tablet itself)
+        // `cp_get` on `ctx_a`, proving the forward genuinely landed on
+        // node A's own engine rather than merely round-tripping through
+        // the relay wire's own bookkeeping.
+        let local_read = spawn_and_capture(&mut sim, &ctx_a.env, {
+            let ctx_a = ctx_a.clone();
+            let table = table.to_owned();
+            let key = key.clone();
+            async move { ctx_a.cp_get(&table, key, false).await }
+        });
+        assert_eq!(
+            local_read,
+            Some(ClientResponse::Value(Some(
+                b"hello from node B, relayed to node A".to_vec()
+            ))),
+            "node A's own local engine must hold the value the forward delivered (seed={seed})"
+        );
+    }
+}
+
+/// `SimCluster` (ADR 0061 rung D1, C-04 D1 step 2): the multi-node
+/// generalization of [`two_node_relay_tests`] above, plus a fault surface
+/// (crash/restart/partition/heal) and five scenarios. In its own file
+/// (`sim_cluster.rs`) rather than inline here, unlike its two siblings
+/// above — see that file's own module doc for the full design; it's kept
+/// out of `lib.rs` purely to keep this file from growing unboundedly, not
+/// for any different privacy reason (`#[cfg(test)] mod` still gives it the
+/// identical "descendant of the crate root, so `ClientCtx`'s private
+/// fields are reachable with no visibility widened" property this file's
+/// two in-line harnesses rely on).
+#[cfg(test)]
+mod sim_cluster;
+
+/// The first cycles/durability corpus over [`sim_cluster`] (ADR 0061 rung
+/// D1, C-04 D1 step 3): a list-append `Recorder` over `SimClusterHandle::
+/// put`/`get`/`delete`, checked with `animus_test::check::{check_cycles,
+/// check_durability, check_convergence}`, run via `cargo test -p animusd
+/// --lib sim_cluster_corpus`. See that module's own doc for the cell list,
+/// the oracle, and the `ANIMUS_SIMCLUSTER_SEEDS` depth knob. Declared here
+/// (not from inside `sim_cluster`) as its own sibling `#[cfg(test)] mod`
+/// for the identical reason `sim_cluster` itself is its own file rather
+/// than inline in this one — both are descendants of this crate root, so
+/// `ClientCtx`'s (and `SimCluster`/`SimClusterHandle`'s own `pub(crate)`)
+/// private fields stay reachable with no further visibility widened.
+#[cfg(test)]
+mod sim_cluster_corpus;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

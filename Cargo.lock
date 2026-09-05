@@ -67,6 +67,7 @@ version = "0.0.0"
 dependencies = [
  "animus-control",
  "animus-env",
+ "animus-item",
  "animus-placement",
  "animus-sim",
  "animus-storage",
@@ -86,11 +87,10 @@ name = "animus-dynamo"
 version = "0.0.0"
 dependencies = [
  "animus-control",
+ "animus-item",
  "animus-storage",
- "bigdecimal",
  "futures",
  "hmac",
- "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -112,6 +112,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "animus-item"
+version = "0.0.0"
+dependencies = [
+ "bigdecimal",
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -231,10 +241,12 @@ dependencies = [
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
+ "animus-item",
  "animus-node",
  "animus-sim",
  "animus-storage",
  "animus-tablet",
+ "animus-test",
  "async-trait",
  "futures",
  "opentelemetry",

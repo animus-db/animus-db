@@ -335,6 +335,33 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
     // `intent_spans` — confirms both keys are named (the anchor's own,
     // plus the declared-but-unstaged participant's), matching what the
     // fixed coordinator now sends.
+    //
+    // **A `null` `intent_spans` is a legitimate, expected transient here —
+    // never the final answer.** `admin::PendingTxnView`'s own doc (and
+    // `CpGroup::txn_view` in `lib.rs`) spells out why: a group's `pending`
+    // list (this loop's `pending` array) is a cheap in-memory
+    // `pending_txns()` snapshot with no read barrier, populated on EVERY
+    // replica the instant it locally applies the anchor's `TxnStage` entry
+    // — but `intent_spans` is filled in by a SEPARATE, ReadIndex-barrier-
+    // gated `txn_record_view` call that only the tablet's current Raft
+    // leader can ever serve (`RaftKvNode::read_barrier` returns `false`
+    // immediately on a non-leader — see `animus-cp-data/src/lib.rs`'s
+    // `read_barrier`/`txn_record_view`). So a poll that happens to land on
+    // a follower (or lands on the leader before its own post-election read
+    // barrier has cleared — e.g. right after the deterministic
+    // campaign-at-fork election ADR 0058 Train 2 rung 4 triggers) sees the
+    // record as genuinely pending with `intent_spans: null`, correctly:
+    // that node just can't answer yet, not "the spans are empty". The
+    // original one-shot version of this loop returned on the very first
+    // sighting regardless, folding `null` and `[]` into the same
+    // `unwrap_or_default()` — a real, if rare, race (CI run 33930598796
+    // failed this way in 1.56s). The record's own creating Raft entry
+    // always writes the complete `intent_spans` atomically in the same
+    // apply that inserts the `pending` tracker entry (`KvCommand::
+    // TxnStage`'s `is_anchor` arm merges `participant_spans` into `spans`
+    // *before* proposing — see that arm's doc), so once ANY node serves a
+    // non-null answer it is always the final, fully-populated one; keep
+    // polling on `null` instead of treating it as a final empty answer.
     let pending_spans: Vec<String> = timeout(Duration::from_secs(10), async {
         loop {
             for &addr in &admin_addrs {
@@ -348,24 +375,29 @@ async fn anchor_only_stage_with_a_declared_but_unstaged_participant_recovers_to_
                     if let Some(p) = pending
                         .iter()
                         .find(|p| p["txn_id"].as_str() == Some(expected_txn_id.as_str()))
+                        && let Some(arr) = p["intent_spans"].as_array()
                     {
-                        let spans: Vec<String> = p["intent_spans"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        // Non-null: this node actually served the barrier-gated
+                        // read, so this is the record's real, final spans list.
+                        let spans: Vec<String> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect();
                         return spans;
                     }
+                    // Found `pending` but `intent_spans` is `null` (not served
+                    // by this node yet), or not found here at all: keep polling
+                    // rather than treating either as the final answer.
                 }
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("/admin/txns never showed the pending transaction within 10s");
+    .expect(
+        "/admin/txns never showed the pending transaction with a served (non-null) \
+         intent_spans within 10s",
+    );
 
     assert_eq!(
         pending_spans.len(),

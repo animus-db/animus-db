@@ -336,6 +336,136 @@ async fn restore_serves_exactly_the_backup_time_rows_with_a_queryable_gsi() {
     node.shutdown_graceful().await;
 }
 
+/// The `field`'s `N` values out of a `Query` response's `Items` array, in
+/// **result order** — the position-aware form an ordering assertion needs
+/// (do not sort this, or the assertion becomes vacuous — see
+/// `dynamo_query_range.rs`'s `sk_order` vs. `sk_values` and
+/// `docs/engineering-lessons.md`).
+fn n_field_order(body: &str, field: &str) -> Vec<String> {
+    json(body)["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items array in: {body}"))
+        .iter()
+        .map(|item| {
+            item[field]["N"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no N-typed `{field}` in item: {item}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Restore preserves the ADR 0063 order-preserving `N` key encoding for
+/// both a base sort key and a GSI sort key: after `CreateBackup` →
+/// `RestoreTableFromBackup`, the restored table's `Query` order is still
+/// DynamoDB numeric order (not the byte-ordered-text order a raw capture
+/// would produce if backup/restore ever re-derived keys from text instead
+/// of copying the stored bytes verbatim), a negative-sort-key item is still
+/// reachable by `GetItem`, and the backfilled GSI's own `N` sort order is
+/// numeric too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_preserves_numeric_n_key_order_for_sort_key_and_gsi() {
+    let dir = support::panic_safe_tempdir();
+    let (node, config) = support::start_single_node(dir.path(), StorageBackend::default()).await;
+    let addr = config.nodes[0].dynamo;
+    await_bootstrap(&node).await;
+
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.CreateTable",
+        r#"{"TableName":"readings","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"N"},{"AttributeName":"status","AttributeType":"S"},{"AttributeName":"mag","AttributeType":"N"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-status",
+                 "KeySchema":[{"AttributeName":"status","KeyType":"HASH"},
+                              {"AttributeName":"mag","KeyType":"RANGE"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable failed: {body}");
+
+    // Mixed magnitude and a negative value, across both the base sort key
+    // and the GSI's own N sort key (kept equal per row so one fixture
+    // serves both assertions).
+    let sks = ["-50", "-1", "0", "3", "25", "400"];
+    for sk in sks {
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            &format!(
+                r#"{{"TableName":"readings","Item":{{"pk":{{"S":"p1"}},"sk":{{"N":"{sk}"}},
+                    "status":{{"S":"active"}},"mag":{{"N":"{sk}"}}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "PutItem(sk={sk}) failed: {body}");
+    }
+
+    let backup_arn = create_available_backup(addr, "readings", "nightly-n").await;
+
+    let (status, body) = restore_table(addr, &backup_arn, "readings_restored").await;
+    assert_eq!(status, 200, "RestoreTableFromBackup failed: {body}");
+    await_table_active(addr, "readings_restored").await;
+
+    // The restored table's own base-table Query ascending order must still
+    // be numeric, not byte-text order.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings_restored","ConsistentRead":true,
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "Query failed: {body}");
+    assert_eq!(
+        n_field_order(&body, "sk"),
+        vec!["-50", "-1", "0", "3", "25", "400"],
+        "restored table's ascending Query order must stay numeric: {body}"
+    );
+
+    // GetItem of the negative-sort-key item.
+    let (status, body) = dynamo(
+        addr,
+        "DynamoDB_20120810.GetItem",
+        r#"{"TableName":"readings_restored","ConsistentRead":true,
+            "Key":{"pk":{"S":"p1"},"sk":{"N":"-50"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "GetItem failed: {body}");
+    assert_eq!(json(&body)["Item"]["sk"]["N"], "-50", "body: {body}");
+
+    // The GSI's own N sort order (`mag`) is numeric too, once its backfill
+    // (ADR 0059 §8) converges.
+    let query_body = r#"{"TableName":"readings_restored","IndexName":"by-status",
+        "KeyConditionExpression":"status = :s",
+        "ExpressionAttributeValues":{":s":{"S":"active"}}}"#;
+    let gsi_body = timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(addr, "DynamoDB_20120810.Query", query_body).await;
+            if status == 200 && n_field_order(&body, "mag").len() == sks.len() {
+                return body;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "restored table's GSI did not converge to {} rows in 20s",
+            sks.len()
+        )
+    });
+    assert_eq!(
+        n_field_order(&gsi_body, "mag"),
+        vec!["-50", "-1", "0", "3", "25", "400"],
+        "restored GSI ascending order must stay numeric: {gsi_body}"
+    );
+
+    node.shutdown_graceful().await;
+}
+
 /// Restore works from a backup whose source table has since been dropped
 /// (ADR 0059's own "restore a table dropped days ago" case) — the
 /// manifest's own captured schema/data, never a live lookup of the (now

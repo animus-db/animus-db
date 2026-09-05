@@ -282,12 +282,13 @@ async fn await_next_pitr_seal(node: &Node, table: &str, since_count: usize) -> (
 async fn await_pitr_base_snapshot(node: &Node, table: &str) {
     timeout(Duration::from_secs(20), async {
         loop {
-            // `MarkBackupPitrBase` tags a base's row while it is still
-            // `Creating` (ADR 0059 Train 3 PR① amendment: the tag lands
-            // "immediately after its own `BeginBackup` is observed to
-            // land") — `RestoreTableToPointInTime`'s own base-selection
+            // `BeginBackup`'s own `pitr_base` flag tags a base's row
+            // atomically with the mint, while it is still `Creating`
+            // (issue #593 — replacing a former two-command mint-then-tag
+            // sequence) — `RestoreTableToPointInTime`'s own base-selection
             // only ever considers an `Available` row, so this must wait
-            // for that, not merely for the tag to exist.
+            // for that, not merely for the tag to exist (which, since the
+            // fix, is true from the row's very first commit onward).
             if node
                 .metadata()
                 .pitr_base_backups_for_table(table)

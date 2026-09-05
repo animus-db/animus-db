@@ -311,7 +311,7 @@ Spec (initial surface):
 | `resources?` | Pod resource requests/limits, passed through verbatim. |
 | `basePort` | Port-stride base (default `14000`, matching `animusd`'s own default). |
 | `clientService.type` | `ClusterIP` \| `LoadBalancer` \| `NodePort` — how the DynamoDB-only client Service is exposed. |
-| `quiesceAfterSecs?`, `splitMode?`, `autoSplitBytes?` | Passthrough tuning, mapped straight onto the matching `animusd` flags. |
+| `quiesceAfterSecs?`, `autoSplitBytes?` | Passthrough tuning, mapped straight onto the matching `animusd` flags. |
 | `dynamoAuthSecretName?` | A `Secret` name mounted into every pod and wired to `--dynamo-auth` (ADR 0057). |
 
 Status: `observedGeneration`, `readyNodes`, `phase`, `conditions` — the
@@ -464,6 +464,20 @@ generates `--config FILE --node I` invocations exclusively (Bootstrap,
 above), so this gap does not block v1 of the operator; it would need
 closing first if a future operator version ever needed those knobs on a
 `control`/`data`-subcommand-launched pod specifically.
+
+**(2026-09-04 as-built note, #590)**: `--split-mode` itself no longer
+exists — it and the copy-based split workflow it selected were deleted
+outright from `animusd` (2026-09-01, ADR 0058's rung 4 layer), so the
+paragraph above's mention of it is historical only (it was accurate when
+this ADR was written, 2026-08-27, before that deletion). The CRD's
+`AnimusClusterSpec.splitMode`/`spec.splitMode` field described in this
+ADR's own spec table above has been removed to match — it had no
+surviving flag to plumb into, and its presence made every `entrypoint.sh`
+invocation with `splitMode` set a live pod-startup failure (`animusd`
+rejects the unknown flag). `quiesceAfterSecs`/`autoSplitBytes` are
+unaffected by this note; their own flag-vs-config-section story is
+covered by S-06 (`crates/animus-operator/CLAUDE.md`'s CLI-flag-support
+table), not restated here.
 
 ## Consequences
 

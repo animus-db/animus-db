@@ -35,7 +35,7 @@
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
 //! - `GET  /admin/backups`             — the replicated backup catalog: id, name, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — the DynamoDB wire surface, `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`, is Train 1 PR④, `animusd::dynamo`)
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
-//! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
+//! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
@@ -135,6 +135,17 @@ pub(crate) struct CpRaftView {
     /// specifically to surface that the feature is working, the operator's
     /// own diagnostic.
     pub(crate) quiesced: bool,
+    /// Every distinct voter configuration this replica has adopted, in
+    /// adoption order (issue #596) — each entry the sorted `String` node ids
+    /// of one voter set, oldest first, dropping the timestamp `RaftKvNode::
+    /// voter_history` also carries (not wire-facing here; the ordering alone
+    /// is what a caller needs). A pure diagnostic like `quiesced` above:
+    /// building this view never wakes a quiesced group. Exists so a caller
+    /// (a test, or an operator) can prove a transient over-replicated
+    /// intermediate genuinely occurred without racing an external poll
+    /// against how fast the reconciler happens to converge past it — see
+    /// `RaftKvNode::voter_history`'s doc for the full incident this closes.
+    pub(crate) voter_history: Vec<Vec<String>>,
 }
 
 /// One entry of a group's `pending: BTreeMap<TxnId, (record_key, created_ts)>`
@@ -544,6 +555,8 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
+        // W-09 (ADR 0034 amendment): the request-rate sibling.
+        "auto_split_ops_rate_threshold": a.auto_split_ops_rate_threshold,
         // U-06 (docs/roadmap.md): backup/segment store (redacted to kind +
         // root path, never credentials — see `StoreView`), the ADR 0048
         // quiescence threshold, ADR 0057 auth state (never the secret —
@@ -1446,7 +1459,26 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
         .into_iter()
         .map(|(tablet, bytes_per_sec)| json!({"tablet": tablet.0, "bytes_per_sec": bytes_per_sec}))
         .collect();
-    json!({ "counters": counters, "is_leader": is_leader, "stream_change_rates": stream_change_rates })
+    // W-09 (ADR 0034 amendment): the request-rate sibling of
+    // `stream_change_rates` above — this node's own per-tablet **write**
+    // rate estimates (ops/sec), the signal that catches a hot-but-small
+    // tablet neither the byte nor the (streamed-only) change-rate trigger
+    // can see. Empty on a control-only node. The two configured thresholds
+    // ride alongside so an operator/dashboard doesn't have to fetch
+    // `/admin/config` separately to know what "hot" means here.
+    let request_rates: Vec<Value> = ctx
+        .request_rates()
+        .into_iter()
+        .map(|(tablet, ops_per_sec)| json!({"tablet": tablet.0, "ops_per_sec": ops_per_sec}))
+        .collect();
+    json!({
+        "counters": counters,
+        "is_leader": is_leader,
+        "stream_change_rates": stream_change_rates,
+        "request_rates": request_rates,
+        "auto_split_bytes_threshold": ctx.admin.auto_split_bytes_threshold,
+        "auto_split_ops_rate_threshold": ctx.admin.auto_split_ops_rate_threshold,
+    })
 }
 
 /// This node's metrics-history ring buffer (ADR 0020), backing the Overview
@@ -1457,19 +1489,53 @@ fn metrics_history_view(ctx: &ClientCtx) -> Value {
     json!({ "samples": ctx.metrics_history() })
 }
 
+/// How many of the control plane's own election timeouts a `leader_within`
+/// read (issue #595) tolerates with no fresh contact before `/admin/health`
+/// gives up on "recently had a leader" and degrades to 503.
+///
+/// Sized in election timeouts, not a flat duration, because the failure
+/// mode this exists to survive is itself measured in election timeouts:
+/// `RaftCore::start_pre_vote` clears the raw `leader_id` belief
+/// (`RaftCore::leader`) the instant a node's OWN election timer lapses —
+/// one missed heartbeat window is enough, even though the real leader may
+/// be, and usually is, fully healthy. `3×` gives a couple of heartbeat
+/// misses' worth of slack (a single scheduling stall, a slow GC pause, one
+/// dropped UDP-equivalent heartbeat) before treating the node as genuinely
+/// leaderless — small enough that a truly leaderless node (a real outage,
+/// a stuck election) still flips to `503` within roughly one second at the
+/// default 150ms election base, not tens of seconds.
+const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
+
 fn health(ctx: &ClientCtx) -> (u16, Value) {
     let r = &ctx.control;
+    // The raw, pre-vote-driven consensus belief (see `RaftCore::leader`'s
+    // own doc) — kept in the body, unchanged, as an honest diagnostic:
+    // `control_leader_known` still means exactly what it always has.
     let leader_known = r.leader().is_some();
+    // Issue #595: the READINESS signal instead uses `leader_within`'s
+    // hysteresis, so a follower whose own election timer merely lapsed
+    // (no evidence the real leader is unhealthy) does not flip this node's
+    // Kubernetes readiness probe (ADR 0060) to not-ready on every transient
+    // one-sided delay of one election timeout or more. A genuinely
+    // leaderless node still degrades to 503, just after
+    // `HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS` election timeouts of no
+    // fresh contact rather than after exactly one. See
+    // `docs/engineering-lessons.md`'s matching entry and ADR 0012/0060 for
+    // the full account.
+    let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+    let leader_recent = r.leader_within(health_grace).is_some();
     let hosts_cp = !ctx.edge.hosted_groups().is_empty();
     let body = json!({
-        "ok": leader_known,
+        "ok": leader_recent,
         "control_leader_known": leader_known,
+        "control_leader_recent": leader_recent,
         "is_control_leader": r.is_leader(),
         "hosts_cp": hosts_cp,
     });
-    // 503 until the control plane has a leader (the readiness signal); 200 once
-    // it does (whether this node leads or follows).
-    (if leader_known { 200 } else { 503 }, body)
+    // 503 until the control plane has had a RECENT leader (the readiness
+    // signal, hysteresis-gated per issue #595); 200 once it does (whether
+    // this node leads or follows).
+    (if leader_recent { 200 } else { 503 }, body)
 }
 
 // ---- operator actions ---------------------------------------------------
@@ -2286,6 +2352,13 @@ fn parse_token_base64(s: &str) -> Option<Vec<u8>> {
 /// or one shorter than the token width — is shown as text unchanged. Inverse of
 /// [`parse_key_display`], so a token-prefixed key shown in the browse view
 /// round-trips back through the key inspector.
+///
+/// **An `N` sort key's remainder is no longer readable decimal text (ADR
+/// 0063)** — `numkey`'s order-preserving encoding is binary, so it renders
+/// through the same lossy-UTF-8 fallback as any other binary key bytes
+/// (replacement characters, not the original digits). This is unchanged
+/// display behavior for *this* function (it never special-cased `N`), just a
+/// new case that now hits the binary path instead of showing clean text.
 pub(crate) fn key_display(bytes: &[u8]) -> String {
     let printable = |b: &u8| (0x20..0x7f).contains(b);
     if bytes.len() < TOKEN_BYTES || bytes[..TOKEN_BYTES].iter().all(printable) {

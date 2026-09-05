@@ -12,7 +12,11 @@
 //! these narrow the *scan range* itself — the partition's whole contiguous
 //! keyspace is still scanned; each is a **filter** applied to the rows that
 //! scan returns (`SortKeyCondition::matches`/`matches_raw`), the identical
-//! mechanism `BETWEEN` always used.
+//! mechanism `BETWEEN` always used. Since ADR 0063 the stored scan order
+//! itself is also numeric for an `N` sort key (`AttributeValue::key_bytes`'s
+//! [`numkey`](crate::numkey) encoding), so `ScanIndexForward` is faithful too
+//! — this module's own job is unchanged either way: a filter, not a range
+//! bound.
 //!
 //! ## Condition expressions
 //!
@@ -64,18 +68,15 @@ impl SortKeyCondition {
     /// Whether an item's sort-key value satisfies this condition.
     ///
     /// `N` values compare **numerically** (via [`compare_numeric`], through
-    /// [`sort_key_cmp`]), not by their raw text bytes: a number sort key is
-    /// stored as decimal text (`storage_key`'s documented simplification), so
-    /// a byte compare would put `"9"` after `"15"` and make
-    /// `sk BETWEEN 5 AND 15` wrongly exclude `sk = 9`. This is exactly the
-    /// key-ordering-vs-filter split [`compare_values`]'s doc comment already
-    /// draws: the scan *range* still walks the engine's byte-ordered keyspace
-    /// (unaffected — it can only widen, never narrow, since it stays keyed on
-    /// `key_bytes`), but this in-memory filter over the rows that range
-    /// returns must agree with DynamoDB's actual numeric semantics. `S`/`B`
-    /// are unaffected: their `key_bytes` already sorts the way DynamoDB
-    /// compares them, and this keeps using it (also making every comparator
-    /// consistent with `Between` rather than diverging on `N` alone).
+    /// [`sort_key_cmp`]), not by their raw stored bytes — even though, since
+    /// ADR 0063, a stored `N` key's bytes ([`AttributeValue::key_bytes`], the
+    /// [`numkey`](crate::numkey) codec) already sort in numeric order too.
+    /// This method still compares the decimal text directly rather than
+    /// going through the byte encoding, since it's handed a typed
+    /// `AttributeValue` already. `S`/`B` are unaffected: their `key_bytes`
+    /// already sorts the way DynamoDB compares them, and this keeps using it
+    /// (also making every comparator consistent with `Between` rather than
+    /// diverging on `N` alone).
     ///
     /// A caller holding only a sort key's **raw stored bytes** (off an engine
     /// scan, with no type tag) must use [`Self::matches_raw`] instead — see
@@ -102,27 +103,27 @@ impl SortKeyCondition {
     /// prefix) satisfy this condition.
     ///
     /// A raw sort-key byte string is exactly [`AttributeValue::key_bytes`]'s
-    /// encoding (`storage_key`'s doc) — for `N` that is decimal *text*, not a
-    /// numeric-order-preserving layout. A caller with only those bytes has no
-    /// type tag to hand [`Self::matches`] directly; wrapping them as an
-    /// opaque [`AttributeValue::B`] would compare by raw bytes even against
-    /// an `N` operand (`sort_key_cmp`'s numeric arm only fires when **both**
-    /// sides are literally the `N` variant), silently reproducing the exact
-    /// byte-vs-numeric bug `matches` exists to fix (issue #373) — every
-    /// production call site used to do exactly that. This reinterprets the
-    /// raw bytes as the type this condition's own operand(s) declare (a real
-    /// sort key's condition operands are always one consistent declared
-    /// type) before delegating to [`Self::matches`], so a caller never has to
-    /// reason about the distinction itself.
+    /// encoding (`storage_key`'s doc) — for `N` that is the order-preserving
+    /// [`numkey`](crate::numkey) layout (ADR 0063), not decimal text. A
+    /// caller with only those bytes has no type tag to hand [`Self::matches`]
+    /// directly; wrapping them as an opaque [`AttributeValue::B`] would
+    /// compare by raw bytes even against an `N` operand (`sort_key_cmp`'s
+    /// numeric arm only fires when **both** sides are literally the `N`
+    /// variant) — every production call site used to do exactly that before
+    /// `matches_raw` existed (issue #373). This reinterprets the raw bytes as
+    /// the type this condition's own operand(s) declare (a real sort key's
+    /// condition operands are always one consistent declared type) before
+    /// delegating to [`Self::matches`], so a caller never has to reason about
+    /// the distinction itself.
     #[must_use]
     pub fn matches_raw(&self, raw_sort_bytes: &[u8]) -> bool {
         let value = if self.is_numeric() {
-            match std::str::from_utf8(raw_sort_bytes) {
-                Ok(text) => AttributeValue::N(text.to_owned()),
-                // Not valid UTF-8 text, so it cannot be the decimal text an
-                // `N` is stored as — fall back to a raw compare rather than
-                // panicking on data that disagrees with the condition's type.
-                Err(_) => AttributeValue::B(raw_sort_bytes.to_vec()),
+            match crate::numkey::decode(raw_sort_bytes) {
+                Some(text) => AttributeValue::N(text),
+                // Not a well-formed `numkey` encoding — fall back to a raw
+                // compare rather than panicking on data that disagrees with
+                // the condition's declared type.
+                None => AttributeValue::B(raw_sort_bytes.to_vec()),
             }
         } else {
             AttributeValue::B(raw_sort_bytes.to_vec())
@@ -220,12 +221,13 @@ impl Comparator {
 /// Order two `AttributeValue`s the way DynamoDB compares them, or `None` when
 /// they are not mutually comparable.
 ///
-/// Numbers compare **numerically**, not by their textual bytes. That differs
-/// deliberately from [`AttributeValue::key_bytes`], whose lexicographic
-/// number ordering is a documented simplification of *key* ordering: a key's
-/// order has to agree with how rows are stored, while a filter is evaluated
-/// in memory over an item and has no such constraint. Comparing `"10"` and
-/// `"9"` as text would make `price > :p` quietly wrong for ordinary data.
+/// Numbers compare **numerically**, via [`compare_numeric`] over their
+/// decimal text, not by their textual bytes — comparing `"10"` and `"9"` as
+/// text would make `price > :p` quietly wrong. This stays a text/bignum
+/// compare rather than routing through [`AttributeValue::key_bytes`]'s
+/// [`numkey`](crate::numkey) encoding (ADR 0063) — this function is handed
+/// already-typed `AttributeValue`s (never raw stored bytes), so there is no
+/// encode/decode round trip to save by doing so.
 ///
 /// Strings compare by UTF-8 bytes and binary by unsigned bytes, both matching
 /// DynamoDB. Every other type — and every cross-type pair — is incomparable.
@@ -889,18 +891,25 @@ mod tests {
     /// compare for `N` sort keys, even after `matches` itself was fixed.
     #[test]
     fn matches_raw_reinterprets_bytes_by_the_conditions_own_declared_type() {
+        let numkey = |v: &str| crate::numkey::encode(v).unwrap();
+
         let between = SortKeyCondition::Between(n("5"), n("15"));
-        // "9" is only 1 byte vs "15"'s 2 — a raw `B` compare would place it
-        // outside the range exactly like the original issue #373 bug.
-        assert!(between.matches_raw(b"9"));
-        assert!(between.matches_raw(b"5"));
-        assert!(between.matches_raw(b"15"));
-        assert!(!between.matches_raw(b"16"));
-        assert!(!between.matches_raw(b"4"));
+        // "9"'s numkey encoding is shorter than "15"'s raw text ever was —
+        // this is the encoded-bytes analogue of the original issue #373
+        // scenario (a raw `B` compare over the *old* raw-text encoding would
+        // have placed "9" outside the range).
+        assert!(between.matches_raw(&numkey("9")));
+        assert!(between.matches_raw(&numkey("5")));
+        assert!(between.matches_raw(&numkey("15")));
+        assert!(!between.matches_raw(&numkey("16")));
+        assert!(!between.matches_raw(&numkey("4")));
 
         let gt = SortKeyCondition::Compare(Comparator::Gt, n("9"));
-        assert!(gt.matches_raw(b"15"), "15 > 9 numerically, not by bytes");
-        assert!(!gt.matches_raw(b"2"));
+        assert!(
+            gt.matches_raw(&numkey("15")),
+            "15 > 9 numerically, not by bytes"
+        );
+        assert!(!gt.matches_raw(&numkey("2")));
 
         // S/B sort keys are unaffected — raw bytes already sort the way
         // DynamoDB compares them, so matches_raw and matches agree exactly.

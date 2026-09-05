@@ -174,7 +174,41 @@ const MAGIC: u8 = 0xCB;
 /// `serde_json` path, per this crate's own doc: "a field added to the
 /// shared `LogEntry`/`RaftMsg` types needs an explicit encode/decode arm
 /// here too").
-const VERSION: u8 = 24;
+/// `25` (ADR 0054 step 2): new `KvCommand::KindEval` (tag 16) — the
+/// self-contained evaluated write apply evaluates in commit order (see the
+/// variant's own doc). Its rich, evolving nested types (`WriteSchema`,
+/// `AttributeValue`/`Option<AttributeValue>`, `KindEvalOp`,
+/// `Option<ConditionExpression>`) are each `serde_json`-encoded into one
+/// `put_bytes`-framed blob apiece rather than hand-encoded field-by-field —
+/// the same "JSON inside the binary envelope" convention `backup.rs`'s
+/// `BackupManifestObject` already uses for `TableSchema`'s own
+/// multi-field, evolving shape, for the identical reason: this is a
+/// low-frequency, deeply-nested payload (unlike the hot per-key
+/// `Vec<u8>`s every other variant's fields already are), so a field added
+/// to any of these four types needs no codec change here at all. `ts`
+/// stays the standard trailing fixed-width encoding. Same house
+/// convention otherwise: a clean bump, no cross-version compatibility.
+/// `26` (ADR 0054 step 4a): `TxnStage.writes`' element (`txn::TxnWrite`)
+/// gained `pending: Option<txn::PendingTxnWrite>` — a write awaiting
+/// apply-time evaluation (see that field's own doc). Encoded as one
+/// `put_json`-framed blob covering the whole `Option` (the same "JSON
+/// inside the binary envelope" convention version `25` established,
+/// since `PendingTxnWrite` nests the identical rich, evolving types
+/// `KvCommand::KindEval` already JSON-encodes) — `serde_json` renders
+/// `None` as `null` and `Some(..)` as the object, so one blob covers both
+/// cases with no separate tag byte needed. Same house convention: a clean
+/// bump, no cross-version compatibility.
+/// `27` (ADR 0054 step 4b): `KvCommand::KindBatch` lost its own-key
+/// `conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>` OCC seatbelt field (ADR
+/// 0046 PR1) — every production caller passed an empty `Vec` once step 3/4a
+/// moved every write producer onto apply-time evaluation, so the field
+/// carried no live signal left to check. Removed from both the encode and
+/// decode arms (tag `12`); `TxnStage`'s OWN separate `conditions` field
+/// (introduced alongside it in version `11`, apply-time write-key
+/// preconditions for a *transaction's* own-key writes) is untouched — the
+/// two were always independent fields on different variants that happened
+/// to share a name and a byte-level OCC shape, not one shared mechanism.
+const VERSION: u8 = 27;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -197,6 +231,17 @@ fn put_bool(out: &mut Vec<u8>, v: bool) {
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_be_bytes());
     out.extend_from_slice(b);
+}
+
+/// `serde_json`-encode `value` into one `put_bytes`-framed blob (version
+/// `25` — see the const's own doc for why this crate's deeply-nested,
+/// evolving `KvCommand::KindEval` field types use JSON-inside-the-envelope
+/// rather than a hand-rolled field-by-field encoding).
+fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) {
+    put_bytes(
+        out,
+        &serde_json::to_vec(value).expect("KindEval field serializes"),
+    );
 }
 
 fn put_opt_bytes(out: &mut Vec<u8>, b: &Option<Vec<u8>>) {
@@ -289,6 +334,18 @@ impl<'a> Cursor<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
+    }
+
+    /// Read one [`put_json`]-framed blob back — the decode dual of every
+    /// `KvCommand::KindEval` field that rides as `serde_json` inside the
+    /// binary envelope. Safe against an untrusted length the same way
+    /// [`Cursor::bytes`] already is: `bytes()` bounds-checks the frame
+    /// against the remaining buffer BEFORE this ever allocates, so a
+    /// corrupted length here still yields a loud `Err`, never an
+    /// allocator abort.
+    fn json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, DecodeError> {
+        let raw = self.bytes()?;
+        serde_json::from_slice(&raw).map_err(|e| format!("KindEval field decode: {e}"))
     }
 
     fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
@@ -516,17 +573,29 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
         KvCommand::KindBatch {
             writes,
             change_log,
-            conditions,
             ts,
         } => {
             put_u8(out, 12);
             put_kind_writes(out, writes);
             put_change_logs(out, change_log);
-            out.extend_from_slice(&(conditions.len() as u32).to_be_bytes());
-            for (k, expected) in conditions {
-                put_bytes(out, k);
-                put_opt_bytes(out, expected);
-            }
+            put_ts(out, *ts);
+        }
+        KvCommand::KindEval {
+            schema,
+            pk,
+            sk,
+            op,
+            condition,
+            ttl_expired,
+            ts,
+        } => {
+            put_u8(out, 16);
+            put_json(out, schema);
+            put_json(out, pk);
+            put_json(out, sk);
+            put_json(out, op);
+            put_json(out, condition);
+            put_bool(out, *ttl_expired);
             put_ts(out, *ts);
         }
         KvCommand::SeedBatch { rows, ts } => {
@@ -610,6 +679,9 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 // Version 18: the stage marker shares change_log's own
                 // tagged-Option `(prefix, record)` encoding.
                 put_change_log(out, &w.stage_marker);
+                // Version 26: `Option<txn::PendingTxnWrite>` as one JSON
+                // blob (see the `VERSION` const's own doc).
+                put_json(out, &w.pending);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
             for (table, span) in spans {
@@ -688,17 +760,9 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
         12 => {
             let writes = read_kind_writes(c)?;
             let change_log = read_change_logs(c)?;
-            let n = c.u32()?;
-            // Capped pre-allocation against an untrusted wire count — see
-            // `read_kind_writes`'s comment for why.
-            let mut conditions = Vec::with_capacity(n.min(1 << 20) as usize);
-            for _ in 0..n {
-                conditions.push((c.bytes()?, c.opt_bytes()?));
-            }
             KvCommand::KindBatch {
                 writes,
                 change_log,
-                conditions,
                 ts: read_ts(c)?,
             }
         }
@@ -754,12 +818,14 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 let kind_writes = read_kind_writes(c)?;
                 let change_log = read_change_log(c)?;
                 let stage_marker = read_change_log(c)?;
+                let pending = c.json()?;
                 writes.push(TxnWrite {
                     key,
                     value,
                     kind_writes,
                     change_log,
                     stage_marker,
+                    pending,
                 });
             }
             let n = c.u32()?;
@@ -817,6 +883,15 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 ts: read_ts(c)?,
             }
         }
+        16 => KvCommand::KindEval {
+            schema: c.json()?,
+            pk: c.json()?,
+            sk: c.json()?,
+            op: c.json()?,
+            condition: c.json()?,
+            ttl_expired: c.bool()?,
+            ts: read_ts(c)?,
+        },
         13 => {
             let n = c.u32()?;
             // Capped pre-allocation against an untrusted wire count — see
@@ -1205,10 +1280,10 @@ mod tests {
                 config: Some([1, 2, 3].into_iter().map(nid).collect()),
                 learners: Some([9].into_iter().map(nid).collect()),
             },
-            // ADR 0046 seatbelt (PR1): `KindBatch.conditions` — exercises a
-            // non-empty condition list alongside a tombstone write and a
-            // change-log record, so the round trip proves every field this PR
-            // touched, not just the new one in isolation.
+            // `KindBatch` (its own `conditions` OCC seatbelt deleted in ADR
+            // 0054 step 4b): exercises a tombstone write alongside a
+            // change-log record, so the round trip still proves every
+            // remaining field.
             LogEntry {
                 term: 3,
                 index: 18,
@@ -1218,10 +1293,6 @@ mod tests {
                         (crate::KIND_LSI, b"lsi-key".to_vec(), None), // a tombstone
                     ],
                     change_log: vec![(b"change-prefix".to_vec(), b"record".to_vec())],
-                    conditions: vec![
-                        (b"base-key".to_vec(), Some(b"old-v".to_vec())),
-                        (b"other-key".to_vec(), None), // must be absent
-                    ],
                     ts: ts(2, 6),
                 },
                 config: None,
@@ -1309,8 +1380,35 @@ mod tests {
                                 b"k1-change-prefix".to_vec(),
                                 b"stage-marker".to_vec(),
                             )),
+                            // Version 26 (ADR 0054 step 4a): no apply-time
+                            // evaluation for this write — the sibling write
+                            // just below exercises the `Some` case.
+                            pending: None,
                         },
-                        TxnWrite::plain(b"k2".to_vec(), None), // a staged delete
+                        // Version 26 (ADR 0054 step 4a): a write awaiting
+                        // apply-time evaluation — exercises every
+                        // `PendingTxnWrite` field (the identical
+                        // `serde_json`-blob types `KindEval` above already
+                        // exercises, now nested one level deeper inside the
+                        // `Option` the JSON blob covers).
+                        TxnWrite::pending_eval(
+                            b"k2".to_vec(),
+                            None,
+                            crate::PendingTxnWrite {
+                                schema: animus_item::WriteSchema {
+                                    key: animus_item::TableSchema::simple("pk"),
+                                    lsis: Vec::new(),
+                                    change_records_carry_images: false,
+                                },
+                                pk: animus_item::AttributeValue::S("bob".to_owned()),
+                                sk: None,
+                                op: crate::KindEvalOp::Delete,
+                                condition: Some(animus_item::ConditionExpression::AttributeExists(
+                                    "pk".to_owned(),
+                                )),
+                                ttl_expired: false,
+                            },
+                        ),
                     ],
                     spans: vec![(
                         "orders".to_string(),
@@ -1409,6 +1507,44 @@ mod tests {
                         },
                     ],
                     ts: ts(10, 0),
+                },
+                config: None,
+                learners: None,
+            },
+            // ADR 0054 step 2 (version 25): the self-contained evaluated
+            // write — exercises every one of its four `serde_json`-blob
+            // fields (`schema`/`pk`/`sk`/`op`/`condition`) at once.
+            LogEntry {
+                term: 8,
+                index: 30,
+                command: KvCommand::KindEval {
+                    schema: animus_item::WriteSchema {
+                        key: animus_item::TableSchema::composite("pk", "sk"),
+                        lsis: vec![animus_item::LsiDef {
+                            name: "byAge".to_owned(),
+                            sort_attribute: "age".to_owned(),
+                            projection: animus_item::Projection::KeysOnly,
+                        }],
+                        change_records_carry_images: true,
+                    },
+                    pk: animus_item::AttributeValue::S("alice".to_owned()),
+                    sk: Some(animus_item::AttributeValue::N("42".to_owned())),
+                    op: crate::KindEvalOp::Update {
+                        key_item: [(
+                            "pk".to_owned(),
+                            animus_item::AttributeValue::S("alice".to_owned()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        actions: vec![animus_item::UpdateAction::Remove(vec![
+                            animus_item::PathSegment::Field("stale".to_owned()),
+                        ])],
+                    },
+                    condition: Some(animus_item::ConditionExpression::AttributeExists(
+                        "pk".to_owned(),
+                    )),
+                    ttl_expired: true,
+                    ts: ts(11, 0),
                 },
                 config: None,
                 learners: None,

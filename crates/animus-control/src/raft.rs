@@ -489,6 +489,55 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // cannot lose an entry a client already observed (ADR 0009).
     durable_index: u64,
     leader_id: Option<NodeId>,
+    // Issue #595: an OBSERVATIONAL record of the last genuine leader contact
+    // this replica has seen, deliberately decoupled from `leader_id`'s own
+    // pre-vote-driven lifecycle. `leader_id` is cleared the instant this
+    // node's own election timer lapses (`start_pre_vote`) or it starts a
+    // real election (`start_election`) — correct for consensus (a stale
+    // belief must never be trusted for granting votes or serving as a relay
+    // target), but it gives a *health/readiness* reader a false-negative
+    // window on every transient one-sided delay >= one election timeout,
+    // even while the real leader is fully healthy and heartbeating every
+    // other replica the whole time (see `leader_within`'s doc, and the
+    // engineering-lessons.md entry this issue produced).
+    //
+    // Set (never read) here in the sync core, at the points where
+    // `leader_id` is set (or reaffirmed) from a GENUINE leader contact: a
+    // valid `AppendEntries`/`InstallSnapshot` from the current term's
+    // leader (`handle_append_entries`, `handle_install_snapshot`), this
+    // node itself becoming leader (`become_leader`, which records itself),
+    // and — the one point that is a REFRESH, not a first-set — every
+    // routine heartbeat broadcast a leader sends (`tick`'s `Role::Leader`
+    // arm): without this fourth point, a long-lived, perfectly healthy
+    // leader's own belief in itself would stay pinned at the timestamp of
+    // its original election forever, and it would spuriously fail its own
+    // `leader_within` check (hence its own `/admin/health`) a few election
+    // timeouts after winning, despite having led continuously and
+    // healthily for as long as it has (confirmed live: `tests/
+    // admin_endpoint.rs::admin_interface_surfaces_state_and_actions`,
+    // whose `/admin/health` check runs ~10s after election with no
+    // intervening `MetaCommand`, found this gap the first time this field
+    // was built).
+    //
+    // Cleared ONLY on a real higher-term step-down — the two places this
+    // core learns, from a peer, that its current term (and whatever leader
+    // it associated with that term) is now stale: the generic higher-term
+    // guard in `handle` and `handle_pre_vote_resp`'s own higher-term-reject
+    // branch (a `PreCandidate` learns of a newer term without going through
+    // `handle`'s generic dispatch). In both cases a *provably newer* term
+    // exists elsewhere, so the old leader really is obsolete — clearing
+    // here is honest, not hair-triggered. It is deliberately NOT cleared by
+    // `start_pre_vote`/`start_election`'s own `leader_id = None`: those fire
+    // on this node's own local election-timer suspicion, with no evidence
+    // the old leader actually failed (that is exactly the false-negative
+    // window this field exists to survive).
+    //
+    // MUST NEVER be read by any election/pre-vote/safety/replication
+    // decision — it exists solely for `leader_within`, an observational
+    // accessor for an operational readiness probe (`animusd::admin::
+    // health`). Consensus continues to consult `leader_id`/`election_
+    // deadline` exclusively, unchanged.
+    last_leader_contact: Option<(NodeId, Nanos)>,
 
     // Pre-candidate state: nodes that have granted the current pre-vote round.
     // Rebuilt each `start_pre_vote`; only read while `role == PreCandidate`.
@@ -786,6 +835,7 @@ where
             last_applied: 0,
             durable_index: 0,
             leader_id: None,
+            last_leader_contact: None,
             pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
@@ -1091,8 +1141,45 @@ where
     }
 
     /// Best-known leader id.
+    ///
+    /// **This is `leader_id`, the raw consensus-internal belief** — it is
+    /// cleared the instant this node's own election timer lapses
+    /// (`start_pre_vote`) or it starts campaigning (`start_election`), which
+    /// is exactly right for consensus (a stale belief must never be trusted
+    /// for granting votes or picking a relay target) but gives an
+    /// operational reader (a readiness/health probe) a false-negative
+    /// window on every transient one-sided delay of one election timeout or
+    /// more, even while the real leader stays fully healthy the whole time
+    /// (issue #595). **A health/readiness consumer should call
+    /// [`leader_within`](Self::leader_within) instead** — see its own doc.
     pub fn leader(&self) -> Option<NodeId> {
         self.leader_id.clone()
+    }
+
+    /// A hysteresis-bearing alternative to [`leader`](Self::leader) for an
+    /// **operational** reader (issue #595) — never for consensus, pre-vote,
+    /// election, or replication logic, which must keep consulting
+    /// `leader_id`/`election_deadline` exclusively.
+    ///
+    /// Returns the last leader this node had a GENUINE contact with
+    /// (`last_leader_contact`), as long as that contact is no older than
+    /// `max_age`; `None` once it is stale or if there has never been one.
+    /// This survives exactly the false-negative window `leader()` cannot: a
+    /// follower whose own election timer lapsed (clearing `leader_id`)
+    /// because it stopped hearing from an otherwise-healthy leader still
+    /// reports that leader here, right up until `max_age` genuinely
+    /// elapses since the last real `AppendEntries`/`InstallSnapshot` (or,
+    /// for this node itself, the moment it became leader). A caller that
+    /// wants "believe it for roughly N election timeouts past the last
+    /// heartbeat" passes `max_age` sized accordingly (`animusd::admin::
+    /// health`'s `HEALTH_LEADER_GRACE` is the reference use).
+    pub fn leader_within(&self, now: Nanos, max_age: Duration) -> Option<NodeId> {
+        let (id, seen_at) = self.last_leader_contact.as_ref()?;
+        if now.duration_since(*seen_at) <= max_age {
+            Some(id.clone())
+        } else {
+            None
+        }
     }
 
     /// Highest committed log index.
@@ -1781,6 +1868,18 @@ where
                         return self.broadcast_quiesce();
                     }
                     self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
+                    // Issue #595: a routine heartbeat broadcast is this
+                    // leader's own proof-of-life to itself, refreshed every
+                    // `heartbeat_interval` (50ms) for as long as it leads —
+                    // without this, `last_leader_contact` would stay
+                    // pinned at the ORIGINAL `become_leader` timestamp
+                    // forever, and a long-lived, perfectly healthy leader
+                    // would spuriously fail its own `leader_within` check
+                    // (and thus its own `/admin/health`) a few election
+                    // timeouts after it won, despite having led
+                    // continuously and healthily the entire time. See
+                    // `last_leader_contact`'s own doc.
+                    self.last_leader_contact = Some((self.id.clone(), now));
                     // Heartbeat cadence (write-rate-independent) is one of
                     // the bounded retries a genuinely stuck snapshot chunk
                     // gets — always allowed (`SnapshotResend::Always`).
@@ -1844,6 +1943,13 @@ where
             self.voted_for = None;
             self.role = Role::Follower;
             self.leader_id = None;
+            // Issue #595: a provably newer term exists elsewhere, so
+            // whatever leader this node associated with its OLD term is
+            // genuinely stale — unlike `start_pre_vote`/`start_election`'s
+            // own `leader_id = None` (mere local suspicion, no evidence the
+            // leader actually failed), clearing the observational contact
+            // record here is honest. See `last_leader_contact`'s own doc.
+            self.last_leader_contact = None;
             // A stale transfer from a leadership stint that just ended has no
             // meaning as a follower (`propose`/`change_membership`/
             // `broadcast_append` all gate on `role == Leader` first, so a stale
@@ -2090,6 +2196,9 @@ where
             self.voted_for = None;
             self.role = Role::Follower;
             self.leader_id = None;
+            // Issue #595: same reasoning as `handle`'s own generic
+            // higher-term step-down — see `last_leader_contact`'s doc.
+            self.last_leader_contact = None;
             self.pre_votes.clear();
             self.reset_election_timer(now, entropy);
         }
@@ -2178,6 +2287,9 @@ where
         // Valid leader for our term: become/stay follower and defer the timeout.
         self.role = Role::Follower;
         self.leader_id = Some(leader.clone());
+        // Issue #595: a genuine leader contact — see `last_leader_contact`'s
+        // own doc for why this is recorded separately from `leader_id`.
+        self.last_leader_contact = Some((leader.clone(), now));
         self.reset_election_timer(now, entropy);
 
         // The leader's prev is behind our snapshot: those entries are already in
@@ -2379,6 +2491,9 @@ where
         }
         self.role = Role::Follower;
         self.leader_id = Some(leader.clone());
+        // Issue #595: a genuine leader contact — see `last_leader_contact`'s
+        // own doc for why this is recorded separately from `leader_id`.
+        self.last_leader_contact = Some((leader.clone(), now));
         self.reset_election_timer(now, entropy);
 
         // Already at least this far along: drop any partial transfer and just
@@ -2780,6 +2895,9 @@ where
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id.clone());
+        // Issue #595: this node itself just won an election — record itself
+        // as the genuine contact (see `last_leader_contact`'s own doc).
+        self.last_leader_contact = Some((self.id.clone(), now));
         // A fresh leadership stint always starts un-quiesced (ADR 0044 phase-1
         // PR3) with its idle clock starting now — even if this same node was
         // quiesced as a follower a moment ago (its own `quiesced` from

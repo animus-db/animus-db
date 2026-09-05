@@ -216,9 +216,10 @@ impl TlsSection {
 ///   the control-plane **leader** (the segment janitor's own gate) — a
 ///   data-only node's `ControlHandle` is always `Remote`, so it never runs
 ///   that loop and ignores the field too.
-/// - The other five fields (`auto_split_bytes`, `auto_split_change_rate`,
-///   `quiesce_after_secs`, `stream_seal_bytes`, `stream_seal_age_secs`)
-///   apply to any data-hosting node (combined or data-only).
+/// - The other six fields (`auto_split_bytes`, `auto_split_change_rate`,
+///   `auto_split_ops_rate`, `quiesce_after_secs`, `stream_seal_bytes`,
+///   `stream_seal_age_secs`) apply to any data-hosting node (combined or
+///   data-only).
 ///
 /// A CLI flag naming the same knob **and** a config file's `cluster_
 /// settings` section setting it is a hard startup error, checked field by
@@ -237,6 +238,12 @@ pub struct ClusterSettings {
     /// also triggers an auto-split.
     #[serde(default)]
     pub auto_split_change_rate: Option<u64>,
+    /// `--auto-split-ops-rate RATE` (W-09, ADR 0034 amendment): a led
+    /// tablet's own smoothed **write** request rate (ops/sec) threshold
+    /// that also triggers an auto-split — unlike `auto_split_change_rate`,
+    /// this applies to any table, not just a streamed one.
+    #[serde(default)]
+    pub auto_split_ops_rate: Option<u64>,
     /// `--orphan-sweep-after SECS` (ADR 0040 PR6): the control-plane
     /// leader's own never-activated-registration reclaim grace period; `0`
     /// disables the sweep.
@@ -704,6 +711,7 @@ mod tests {
         cfg.cluster_settings = Some(ClusterSettings {
             auto_split_bytes: Some(1_000_000),
             auto_split_change_rate: Some(500),
+            auto_split_ops_rate: Some(200),
             orphan_sweep_after_secs: Some(120),
             quiesce_after_secs: Some(10),
             stream_seal_bytes: Some(4_194_304),
@@ -735,6 +743,7 @@ mod tests {
         assert_eq!(settings.stream_seal_age_secs, None);
         assert_eq!(settings.stream_retention_secs, None);
         assert_eq!(settings.auto_split_change_rate, None);
+        assert_eq!(settings.auto_split_ops_rate, None);
     }
 
     // --- `tls` (ADR 0064, S-01 commit 2) ----------------------------------

@@ -73,7 +73,8 @@ symbol, don't scroll. It also holds
 in-crate `#[cfg(test)] mod`s that need private handles the `tests/` tree
 can't reach — e.g. `confirm_futility_tests`
 (issue #268 — the confirm-loop fast-fail regression, needing a raw
-`CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_local`; `split_fence_tests`
+`CpGroup` + the `pub(crate)` `ClientCtx::cp_kind_eval_local` (retargeted
+from the now-deleted `cp_kind_local`, ADR 0054 step 4b); `split_fence_tests`
 and `hot_read_latch_tests` were deleted with their fence/latch subjects in
 the ADR 0050 Train B rung-7 sweep). `kind_batch_signal_tests` is the newest
 of these, but for a different reason than the others — it needs no bring-up
@@ -607,19 +608,22 @@ reusing the captured config is the point of the test.
 - **`pitr_janitor.rs`** (ADR 0059 §9, Train 3) — PITR's two control-plane-
   leader-only background loops, mirroring `segment_janitor.rs`/
   `backup_janitor.rs`'s own shape: `pitr_snapshot_loop` (periodic
-  internally-triggered `BeginBackup` for a PITR-enabled table, reusing
-  Train 1's capture driver/aggregator completely unmodified, then tagging
-  the row via `MetaCommand::MarkBackupPitrBase` with a self-healing sweep
-  for a dropped tag ack) and `pitr_janitor_loop` (two-phase mark/reclaim
-  over `Metadata::pitr_segments`, subject to the identical epoch-derivation
-  guard `segment_janitor.rs` established for streams, plus a base-snapshot
-  keep-anchor mark step that leaves the actual reclaim to the *existing*
-  `backup_janitor_loop`, which already reclaims any `Expired`/`Failed`
-  `BackupRow` regardless of a PITR tag). `DEFAULT_PITR_RETENTION`
-  (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h) are hardcoded production
-  defaults — no CLI knob yet, the identical documented gap `ttl_reaper.rs`'s
-  own sweep interval has. The module's own doc has the full design
-  including the self-healing-tag residual. **The retention loop's own
+  internally-triggered `BeginBackup { pitr_base: true, .. }` for a
+  PITR-enabled table, reusing Train 1's capture driver/aggregator
+  completely unmodified — the `pitr_base` flag tags the row **atomically
+  with the mint**, in the same apply, since issue #593's fix; there is no
+  longer a separate tagging proposal or a self-healing sweep, both deleted
+  along with `MetaCommand::MarkBackupPitrBase`) and `pitr_janitor_loop`
+  (two-phase mark/reclaim over `Metadata::pitr_segments`, subject to the
+  identical epoch-derivation guard `segment_janitor.rs` established for
+  streams, plus a base-snapshot keep-anchor mark step that leaves the
+  actual reclaim to the *existing* `backup_janitor_loop`, which already
+  reclaims any `Expired`/`Failed` `BackupRow` regardless of a PITR tag).
+  `DEFAULT_PITR_RETENTION` (35 days)/`DEFAULT_PITR_SNAPSHOT_CADENCE` (6h)
+  are hardcoded production defaults — no CLI knob yet, the identical
+  documented gap `ttl_reaper.rs`'s own sweep interval has. The module's own
+  doc has the full design, including the incident the atomic-tag fix
+  closed. **The retention loop's own
   control-only-leader scope gap is closed (W-10)**: `pitr_janitor_loop`'s
   segment-object reclaim now has a real `BackupStoreHandle`
   (`ClientCtx::backup_store`) on every node shape. `pitr_snapshot_loop`'s
@@ -662,8 +666,9 @@ reusing the captured config is the point of the test.
   voters) reclaims stream segments correctly with no data-role node ever
   needing to take the lead. `segment_store`/`backup_store` moved off
   `DataRole` onto `ClientCtx` itself for this — `DataRole` now holds only
-  genuinely data-role-specific fields (`rmw_lock`, `raftkv_metrics`,
-  `base_id`, `stream_seal_knobs`, `change_rates`); `ClientCtx::data()`
+  genuinely data-role-specific fields (`raftkv_metrics`, `base_id`,
+  `stream_seal_knobs`, `change_rates` — `rmw_lock` itself was later
+  deleted outright, ADR 0054 step 4b); `ClientCtx::data()`
   (panicking) survives for those, but `data_opt()` (the non-panicking
   accessor this module used to be the sole caller of) was deleted as dead
   code. Regression: `tests/stream_janitor.rs::
@@ -918,6 +923,29 @@ reusing the captured config is the point of the test.
   would still be caught. `tests/dashboard_endpoint.rs::
   dashboard_role_gating_split_deployment` covers the control-vs-data
   null/present split.
+
+  **`GET /admin/health` — the Kubernetes readiness probe (ADR 0060) — reads
+  a HYSTERESIS-gated leader belief, not the raw one (issue #595, ADR 0020's
+  2026-09-04 amendment).** `ctx.control.leader().is_some()` (the raw
+  consensus belief, `RaftCore::leader_id`) is cleared the instant a
+  follower's own election timer lapses (ADR 0009 pre-vote) — correct for
+  consensus, but it gave this probe a false-negative window on every
+  transient one-sided delay of one election timeout or more, even with a
+  fully healthy cluster leader. `health()` now gates `200`/`503` on
+  `ctx.control.leader_within(HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS ×
+  ctx.control.election_timeout())` (3 election timeouts, ~450ms at the
+  default 150ms base) instead — see `animus_node::control_handle::
+  ControlHandle::leader_within`/`animus_control::RaftCore::leader_within`'s
+  own docs for the mechanism (an observational `last_leader_contact`
+  timestamp, never read by any consensus decision). The JSON body's
+  `control_leader_known` still reports the raw flag unchanged;
+  `control_leader_recent` is the new hysteresis-gated one, and `ok`/the
+  HTTP status now track the latter. Regression: `animus-control/tests/
+  leader_within_hysteresis.rs` (the mechanism, at the `RaftCore` level) —
+  `admin_endpoint.rs`'s own `/admin/health` assertions are unchanged
+  (`ok == true`/`200` still holds on a healthy converged cluster). See
+  `docs/engineering-lessons.md`'s matching entry for the general lesson.
+
 - **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
   0061 rung C4a): `read_http_request` does only `stream.read()`, handing
   every parsing decision (header-block framing, `Content-Length`
@@ -1468,21 +1496,34 @@ streams-enabled variant walking a `GetRecords` iterator from the parent's
 own shard 0 across the fork to both children's own shard 0s with no loss
 or duplication.
 
-`--auto-split-bytes B` (byte size) and `--auto-split-change-rate RATE`
+`--auto-split-bytes B` (byte size), `--auto-split-change-rate RATE`
 (streamed tables only, ADR 0042 §14 Fork F — bytes/sec of a tablet's own
-`KIND_CHANGE` growth, `/admin/metrics`'s `stream_change_rates`) are
-independent OR-gated triggers — either, both, or neither. (**The former
-key-count trigger, `--auto-split K`, was removed** — see the root
-`CLAUDE.md`'s auto-split entry.) `--auto-split-change-rate` closes the gap
-bytes structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034),
-so a high-churn, small-footprint streamed table never crosses a byte
-threshold regardless of write rate. No production-tuned default exists yet
-— omitting the flag disables the trigger entirely (zero behavior change);
-an operator must pick `RATE` for their own workload. Both flags are
-`--cluster N`/`--cluster-control`+`--cluster-data` dev-cluster-only (not
-reachable from `--config/--node`'s real per-process deployment — auto-split
-has never been reachable from a real per-process deployment, so this scope
-is unchanged by the key-count trigger's removal). **`--node I` is gone from
+`KIND_CHANGE` growth, `/admin/metrics`'s `stream_change_rates`), and
+`--auto-split-ops-rate RATE` (W-09, ADR 0034 amendment — any table, ops/sec
+of a tablet's own leader-side write rate, `/admin/metrics`'s
+`request_rates`) are independent OR-gated triggers — any subset of them,
+including none. (**The former key-count trigger, `--auto-split K`, was
+removed** — see the root `CLAUDE.md`'s auto-split entry.)
+`--auto-split-change-rate` closes the gap bytes structurally can't:
+`CpGroup::approx_bytes` is base-scoped (ADR 0034), so a high-churn,
+small-footprint streamed table never crosses a byte threshold regardless of
+write rate — but only for a *streamed* table. `--auto-split-ops-rate`
+closes the identical gap for **any** table (streamed or not): a tablet's
+`RequestRateTracker` estimate is fed from every successful leader-side
+write, not from the change log, so a plain table under heavy write load is
+visible to it too. Neither
+change-rate nor ops-rate has a production-tuned default — omitting a flag
+disables that trigger entirely (zero behavior change); an operator must
+pick its own `RATE` per workload. **All three flags reach every real
+deployment shape, not just `--cluster N`/`--cluster-control`+
+`--cluster-data`'s dev-cluster mode** — `--config`/`--node` and `animusd
+data --config` reach them via a config file's `cluster_settings.
+auto_split_{bytes,change_rate,ops_rate}` section instead of a CLI flag
+(S-06, `config.rs`'s own module-map entry has the full mechanism and the
+"CLI flag and config field both set is a hard error" contract);
+`--cluster-control`/`--cluster-data` and the standalone `control`/`join`
+subcommands have no route to that config-file section, a documented gap
+S-06 itself names. **`--node I` is gone from
 `join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
@@ -1556,7 +1597,11 @@ marker per mutation, full-raw-key-as-prefix; `Put`/`PutBatch` auto-provision
 like the old `cp_put` did, `Delete` deliberately never does).
 
 **`poll_probe` is the shared durable-before-ack confirm wait behind
-`cp_kind_local`/`cp_batch_local`** — it prefers `animus-cp-data`'s
+`cp_batch_local`** (its other caller, the now-deleted `cp_kind_local`,
+went with ADR 0054 step 4b; `cp_kind_eval_local`'s own confirm loop
+consults `classify_kind_batch_outcome` directly rather than going through
+`poll_probe` at all — see that method's own doc) — it prefers
+`animus-cp-data`'s
 per-`KindBatch` apply-time outcome (`RaftKvNode::kind_batch_outcome`) over a
 raw value re-read, since value equality alone can't distinguish "my entry
 no-op'd" from "my entry applied and a concurrent write then overwrote it"
@@ -1586,22 +1631,29 @@ used to fall back to plain value equality — "does the key already hold the
 bytes I proposed?" — at both sites in its loop, unconditionally. That fallback
 proves the bytes are *visible*, never that *this proposer's entry* put them
 there, and for a **non-idempotent** write (a numeric `ADD`) that distinction
-is load-bearing, not academic: `kind_write_item_at_leader` reads `old` under
-`ctx.data().rmw_lock`, which is released *before* proposing (issue #285), so
-two concurrent evaluators of the same key can read the identical stale `old`
+was load-bearing, not academic — this bug was found on the pre-ADR-0054
+leader-evaluated design, where `kind_write_item_at_leader` read `old` under
+`ctx.data().rmw_lock` (released *before* proposing, issue #285), so two
+concurrent evaluators of the same key could read the identical stale `old`
 and compute byte-identical `new` (a pure function of `(cur, delta)`) —
-nothing downstream disambiguates them. Each proposes an entry carrying those
+nothing downstream disambiguated them. Each proposed an entry carrying those
 same bytes guarded by an own-key OCC seatbelt keyed to that same stale `old`;
-the first to apply wins the seatbelt and writes the bytes, every later one
-legitimately `ConditionFailed`s. In the window after the winner's bytes are
-visible and before a *loser* entry's own outcome is recorded, the old
+the first to apply won the seatbelt and wrote the bytes, every later one
+legitimately `ConditionFailed`ed. In the window after the winner's bytes were
+visible and before a *loser* entry's own outcome was recorded, the old
 ungated fallback matched on value alone and returned `Confirmed` for the
 loser — acking an increment that never applied. Fixed by threading
 `ProbeIdentity` (`ValueProves`/`RequiresOwnEntry`) down from whichever caller
-already knows `dynamo::kind_write_is_idempotent`'s answer
-(`kind_write_item_at_leader` for `cp_kind_local`; `cp_batch_local` hardcodes
-`ValueProves` since the raw `Batch` command only ever carries Put semantics,
-never `ADD`) — `poll_probe` never recomputes idempotency itself. A
+already knows `dynamo::kind_write_is_idempotent`'s answer; `cp_batch_local`
+hardcodes `ValueProves` since the raw `Batch` command only ever carries Put
+semantics, never `ADD` — `poll_probe` never recomputes idempotency itself.
+**`ProbeIdentity` outlived the mechanism it was built for**: ADR 0054
+deleted `cp_kind_local`/`rmw_lock` and the leader-side read entirely, but
+the same enum now gates `cp_kind_eval_local`'s own, analogous lost-payload
+recovery (`kind_eval_confirmed`, `write_path.rs`) — whether a best-effort
+re-read can stand in for a leader-local `old`/`new` slot that aged out from
+under an unusually slow confirm; `kind_write_item_at_leader` still passes
+the identical `kind_write_is_idempotent`-derived identity into that call. A
 non-idempotent write's `Inconclusive` branch now never consults `local_get`
 at all, at either site; it keeps polling `classify_kind_batch_outcome` for
 its own (index, term) until that resolves or the deadline ends the wait in
@@ -1798,10 +1850,16 @@ chase recovers via a live replica in a few seconds rather than dead-ending
 near the full `CLIENT_TIMEOUT`. See `docs/engineering-lessons.md`'s
 matching Testing entry for the general lesson (a hint-chasing forward's
 per-candidate timeout must be a bounded slice of the overall deadline,
-never the whole remaining budget) and why no `SimEnv` shape can reach this
-mechanism today (the cross-node relay is a free function hardcoded to a
-real `TcpStream`, not routed through `E: Env`'s `Network` seam or the `R:
-RelayClient` capability trait).
+never the whole remaining budget). **This specific test still can't move
+to `SimEnv`** even though `forward_to_tablet_leader` itself is now relay-
+generic (ADR 0061 rung C3d) — what it actually proves is
+`AnimusdRelayClient`'s own real-transport timeout behavior
+(`relay_request_with_timeout`'s `RELAY_HOP_TIMEOUT`/
+`RELAY_TRANSPORT_FAILURE` split against a real, deliberately-stalling
+`TcpListener` stub), which has no `SimEnv` analogue to test against —
+`SimRelayClient`'s own timeout races `env.sleep()` against a `Pending`
+poll, a different mechanism with its own coverage (`animus_node::
+sim_relay::tests`), not a second implementation of this one.
 
 **The hop cap above regressed the property it was supposed to leave
 intact — a genuinely slow-but-LIVE leader must still be waited out (issue
@@ -2130,11 +2188,16 @@ no longer rejects it. `TxnTableWrite` carries either an already-known
 kind-write-path table's write: the item identity + op + condition, no
 coordinator-computed diff). `ClientCtx::txn_stage_local` — the ONE place a
 stage actually executes on the leader's own node, shared by `txn_prepare`'s
-own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — evaluates
-every `pending_kind_writes` entry there (`dynamo::eval_kind_txn_write`,
-mirroring `kind_write_item_at_leader`'s own U3 shape) under the identical
-`ctx.data().rmw_lock`, merging the result into `writes` immediately before
-staging; a mandatory own-key OCC condition rides alongside (Fork C1). For a
+own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — turns every
+`pending_kind_writes` entry into a self-contained `TxnWrite::pending`
+payload there, with no read/evaluation at all (ADR 0054 step 4a,
+2026-09-05): `KvCommand::TxnStage`'s own apply arm evaluates every
+pending write itself, in commit order, reusing the identical evaluator
+`KvCommand::KindEval` uses. `dynamo::eval_kind_txn_write` — the original
+leader-side evaluator this producer called under `ctx.data().rmw_lock`
+before that step, plus the mandatory own-key OCC condition (ADR 0046
+Fork C1) it used to build alongside — is deleted outright; see ADR 0054's
+step 4a as-built amendment for the full design. For a
 transaction touching any kind-write-path table, `cp_txn`'s post-commit
 resolve is **awaited under a short bounded budget**
 (`TXN_RESOLVE_ALL_AWAIT_BUDGET`) and parallelized across participants
@@ -2236,6 +2299,16 @@ handler's `select! { changed(..), sleep(8s) }` always falls through to the
 timeout arm and replies with stale-but-plausible cached data up to 8s late.
 A fixed-sleep assertion right after a test's node-kill can be outrun by
 this; poll to convergence instead (see the engineering-lessons log).
+**This specific scenario is unchanged by the issue #596 cancellation**
+(see the "`handle_connection` cancels an in-flight request" entry in the
+module map above): #596 detects the *caller's* socket closing, and here
+nothing closes it — the server process being killed doesn't touch the
+already-open TCP connection or the untracked handler task sitting on it,
+so the zombie still runs its full `WATCH_METADATA_SERVER_TIMEOUT`. What
+#596 *does* fix is the more common case where the caller itself gives up
+on the connection (a client-side timeout tearing down the socket, or a
+plain disconnect) — that zombie now exits as soon as the close is
+observed instead of running the full server-side budget regardless.
 
 **`WatchMetadata`'s reply is incremental (ADR 0038).** After the long-poll
 resolves, `ClientCtx::watch_metadata` tries the serving node's own
@@ -2290,9 +2363,10 @@ test module — see `animus-node/CLAUDE.md`) — which scans every achievable
 key-boundary cut for the one closest to half the bytes, not a single
 accumulate-and-threshold pass (subtly wrong when one key dominates; see the
 root log). **The former key-count trigger (`--auto-split K`) and its plain
-positional-median split point were removed** — bytes (and, for streamed
-tables, change-rate below) cover every use case key count did, with no
-key-count-specific failure mode left to justify a third independent knob;
+positional-median split point were removed** — bytes (plus, for streamed
+tables, change-rate, and for any table, ops-rate — both below) cover every
+use case key count did, with no key-count-specific failure mode left to
+justify a fourth independent knob;
 `CpGroup::approx_key_count` itself is unchanged and still backs `/admin/
 raftkv`'s informational `key_count` display. **Tablets are split-only
 (ADR 0044)** — there is no merge, automatic or operator-driven, to trigger;
@@ -2314,6 +2388,32 @@ bytes/sec estimate — no new scan. Read via `ClientCtx::stream_change_rates`
 the identical `byte_weighted_median`/`trigger_split` path every other
 trigger uses, so F11/Fork E apply automatically. No production-tuned
 default exists — omitting the flag is a true no-op.
+
+**Request-rate trigger (opt-in, W-09, ADR 0034's own deferred bullet,
+closed)**: `--auto-split-ops-rate RATE` joins the same any-fires gate
+above, applicable to **any** table — unlike change-rate, this one needs no
+change log, so it isn't streamed-tables-only. `RequestRateTracker`
+(`lib.rs`, sharing `ChangeRateTracker`'s own `RateSample` EWMA shape) is
+observed at **two** choke points together covering every leader-side
+non-transactional write: `dynamo::kind_write_item_at_leader` (the ADR 0046
+U3 evaluate-at-leader funnel — a condition, an old-image echo, or an
+images-carrying table) and `dynamo::fast_marker_write` (the ADR 0049 fast
+arm — an unconditioned `Put`/`Delete` on a plain, unindexed/unstreamed
+table, which never reaches the funnel at all). Missing either one leaves
+the signal blind to a real write shape; the fast arm in particular is the
+*common* case for an ordinary plain-table write, so it is not optional.
+Each successful write ticks the tablet's own tracker once, converting
+inter-write timing into a smoothed ops/sec estimate — no separate counter
+plumbing. Read via `ClientCtx::request_rates` (`/admin/metrics`'s
+`request_rates` array) and `RequestRateTracker::get` (the trigger check
+itself). **Writes only, never reads** — an eventually-consistent read (ADR
+0055's wire default) is served from any replica and never reaches the
+leader at all, so folding reads in would silently undercount a tablet whose
+hot path is reads spread across replicas; a hot-but-small tablet under
+heavy write load — the exact gap ADR 0034 deferred — is fully visible
+through writes alone. When hot, splits via the identical
+`byte_weighted_median`/`trigger_split` path every other trigger uses. No
+production-tuned default exists — omitting the flag is a true no-op.
 
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own
@@ -2590,45 +2690,64 @@ route below the edge through the same `ClientCtx` CP primitives.
   bookkeeping, never index entries (there is no in-memory index at all). An
   indexed/streamed table's `PutItem`/`DeleteItem`/`UpdateItem` commits the
   base row, its **LSI rows** and a **change-log record** as one
-  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — but the *diff*
-  is now evaluated **at the tablet's own leader**, not at the receiving edge
-  node: `ClientCtx::cp_kind_write_item` routes a `ClientRequest::
-  KindWriteItem { table, pk, sk, op: KindWriteOp, condition }` to the leader
-  (in-process if local, one forwarded hop via `cp_serve_forwarded` if not),
-  and `dynamo::kind_write_item_at_leader` — the only caller of
-  `kind_writes_for_item` — reads its own `old` image, evaluates `condition`,
-  computes `new` from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the
-  last folding `UpdateItem`'s base-value RMW into the same mechanism), then
-  proposes. **This is the ADR 0046 ("the tablet log model", draft PR #222)
-  U3 fix**: `index_aware_write`'s prior edge-evaluated design (now deleted)
-  read/diffed under a **node-local** `ctx.data().rmw_lock`, so two edge
-  nodes writing the same item never contended on the same lock and could
-  both diff against the same stale `old` — the loser's stale LSI row
-  orphaned forever (nothing reconciles it; only the GSI drain self-heals).
-  Locking `rmw_lock` **at the leader** instead serializes every write of one
-  item regardless of which edge node received it, since every write now
-  funnels through the same function on the same node. A `KindBatch.
-  conditions` OCC seatbelt (PR1, `animus-cp-data`) closes the one residual
-  the lock alone can't: a `txn_resolver_loop` recovery push never takes
-  `rmw_lock` — real now that `TransactWriteItems` participates on these
-  tables too (see below). **`rmw_lock` is scoped to read+evaluate only
-  (issue #285)** — `kind_write_item_at_leader` drops it before proposing,
-  mirroring `txn_stage_local`'s identical scoping just below; it used to
-  span the whole `cp_kind_local` propose+confirm-poll too, so one item's
-  slow confirm (apply backlog) stalled every *other* evaluated write on the
-  node behind it, not just racing writers of the same item — the seatbelt
-  above is what actually keeps concurrent writers of one item safe, and it
-  already has to work lock-free for the `txn_resolver_loop` case, so the
-  lock never needed the wider span for correctness. The regression test for
-  this (`confirm_futility_tests::an_unrelated_evaluated_write_is_not_
-  stalled_behind_another_writes_confirm_wait`) needs write A's propose+
-  confirm phase to reliably still be running when an unrelated write
-  returns — racing a real apply backlog against real time to manufacture
-  that was itself load-sensitive (a starved flood can fail to build any
-  backlog, so the "slow" write finishes first; see
-  `docs/engineering-lessons.md`'s Testing section, 2026-08-22 entry), so it
-  now uses `dynamo::rmw285_confirm_gate`, a `#[cfg(test)]`-only hook that
-  holds that phase open for a fixed delay under the test's own control.
+  `KvCommand::KindBatch` Raft entry (`kind_writes_for_item`) — with the
+  *diff* evaluated **inside `KvCommand::KindEval`'s own apply arm, in
+  commit order** (ADR 0054, Accepted): `ClientCtx::cp_kind_write_item`
+  routes a `ClientRequest::KindWriteItem { table, pk, sk, op: KindWriteOp,
+  condition }` to the item's tablet leader (in-process if local, one
+  forwarded hop via `cp_serve_forwarded` if not), and
+  `dynamo::kind_write_item_at_leader` builds the `WriteSchema` slice
+  (`write_schema_for`) and a `KindEvalOp` mirror of the client's operation,
+  proposes a self-contained `KvCommand::KindEval`
+  (`ClientCtx::cp_kind_eval_local`, `write_path.rs`), and reads back the
+  **apply-side** confirmed decision. Apply itself — not the leader — reads
+  the item's current committed value, evaluates `condition`, computes `new`
+  from `op` (`Put`/`Delete`/`Update{key_item, actions}`, the last folding
+  `UpdateItem`'s base-value RMW into the same mechanism), and derives the
+  LSI diff and change record (`kind_writes_for_item`'s own logic, now
+  called from apply rather than the leader), all against **the same fresh
+  read that decides the write**, so no before-image can ever go stale
+  between being read and being applied.
+
+  **This closes the propose→apply staleness window two earlier designs each
+  left open, one after the other** — see ADR 0054 for the full account of
+  both and why each was a real, measured defect, not a theoretical one:
+  the original edge-evaluated design (`index_aware_write`, deleted by ADR
+  0046) diffed under a node-local lock two different edge nodes never
+  shared, so two nodes writing the same item could both diff against the
+  same stale `old`; the leader-evaluated design that replaced it (ADR 0046
+  U3) closed that by serializing every write of one item on its own
+  tablet's leader, but still computed the finished bytes **before** the
+  log, guarded only by a byte-level OCC seatbelt
+  (`KvCommand::KindBatch.conditions`) that made a losing write a hard
+  refusal rather than a race the leader could resolve — measured at 2 of
+  10 concurrent `ADD`s refused under a starved apply task (ADR 0054's own
+  Context section). **Neither `rmw_lock`, the OCC seatbelt, nor a
+  leader-side read of any kind survive in this path today** (ADR 0054 step
+  4b, 2026-09-05) — `KvCommand::KindEval` carries no byte-level seatbelt at
+  all, since apply's own fresh read already is the authoritative current
+  state, and `DataRole` no longer has an `rmw_lock` field for anything to
+  take. See ADR 0054's Decision/Sequencing sections and its closing
+  amendment for the full design, every deleted mechanism (`predict_kind_
+  eval_decision`, `Metric::KindEvalSeatbeltMismatch`, `cp_kind_local`, and
+  more), and the `concurrent_increments_all_land_exactly_once`/
+  `concurrent_conditional_add_all_land_exactly_once` regressions
+  (`dynamo_update_add_delete.rs`) that prove zero refusals under contention.
+
+  **`TransactWriteItems` evaluates the identical way (ADR 0054 step 4a)** —
+  `ClientCtx::txn_stage_local` builds a self-contained `TxnWrite::pending`
+  payload (the schema slice, `pk`/`sk`/`op`/`condition`, no `ts` — the
+  enclosing stage entry supplies one) and appends it unevaluated, with no
+  read or lock of its own; `KvCommand::TxnStage`'s own apply arm evaluates
+  every pending write in commit order, reusing the identical
+  `evaluate_kind_eval` core `KvCommand::KindEval` uses — no second
+  evaluator, and no mandatory own-key OCC `conditions` entry for these
+  writes either, for the identical reason the single-item path needs none.
+  See ADR 0054's step-4a amendment for the full design, including the
+  same-txn WAL-replay discipline a non-idempotent `ADD` needs when a
+  transaction's own already-staged intent can be re-observed as "current
+  state" on an ordinary crash restart.
+
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now
   route through this same leader funnel (constant-true gate, below), so
@@ -3296,7 +3415,16 @@ ADR itself for the full design/rationale.
   reconfigure_multi_replica_diff.rs`, and `docs/engineering-lessons.md`.
   This loop's own convergence predicate reaches `done` for a
   multi-replica-difference target exactly like a one-replica one; no
-  known gap remains.
+  known gap remains. **Issue #596**: that e2e test's own assertion that the
+  swap passes through the transient 5-voter intermediate used to sample
+  `/admin/raftkv` externally every 200ms and assert on the observed max —
+  flaky under load (a fast-enough pair of consecutive reconciler ticks can
+  remove both extras between two samples), since the intermediate's own
+  *duration* was never a guarantee, only that it is logically reached. Fixed
+  by reading `RaftKvNode::voter_history()` (`animus-cp-data`) — a durable
+  in-process record of every distinct voter configuration adopted, not an
+  external poll — instead; see that crate's `CLAUDE.md` for the mechanism
+  and `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
   **Issue #528 (this loop's own predicate never firing under sustained
   load) was root-caused and fixed entirely in `animus-control` — this
@@ -3372,13 +3500,78 @@ ADR itself for the full design/rationale.
   hint-field-conflation finding that shaped this split, and the standing
   rule in `docs/engineering-lessons.md` (machine relay →
   `intra_leader_hint`; anything a human reads → `leader_hint`).
+- **`handle_connection` cancels an in-flight request when the peer closes the
+  connection (issue #596), on both listeners.** `serve_requests` still
+  spawns one untracked, fire-and-forget task per accepted connection (see
+  the `WatchMetadata` gotcha below for what that still doesn't fix), but
+  the per-connection loop itself no longer runs a request to completion
+  with nobody listening: `handle_connection` splits the socket
+  (`TcpStream::into_split`) once, then races `handle_request(..)` against a
+  `peer_closed(&mut read_half)` future in a `tokio::select! { biased; .. }`
+  — `biased` so a response that finishes at the same poll as the
+  peer-close observation still gets written; the peer-closed arm only wins
+  when the handler has genuinely not finished. `peer_closed` **peeks**
+  (`OwnedReadHalf::peek`, which never consumes what it sees) rather than
+  reading, and resolves on a clean EOF (`Ok(0)`) or a transport error —
+  either means the peer is definitely gone. An `Ok(n)` with `n > 0` means
+  the peer is alive and has simply written ahead of reading this request's
+  reply — a pipelined next frame, which this protocol doesn't forbid even
+  though no client in this repo happens to do it today — and that is not
+  abandonment: an earlier version of this function used a plain `read`
+  here, which consumed that byte and silently ate the start of the next
+  frame while dropping the *current* response on the floor even though the
+  peer was still waiting for it. On `Ok(n > 0)` the future instead parks
+  forever via `std::future::pending` (registers no waker, cheap to hold),
+  so `select!` falls through to the handler's own completion and the next
+  loop iteration's `read_frame` consumes the pipelined frame the normal
+  way — never loop-and-`peek` to wait out the close either, that would
+  busy-spin the task. On the peer-closed branch the in-flight response
+  future is simply dropped and the connection loop returns, incrementing
+  the `client_requests_abandoned` metric (ADR 0015, `/admin/metrics`) as
+  the observable signal.
+  `read_frame`/`write_frame` are generic over `AsyncRead`/`AsyncWrite` +
+  `Unpin` (not hardcoded to `&mut TcpStream`) precisely so the split
+  `OwnedReadHalf`/`OwnedWriteHalf` halves work here with no change to any
+  other caller's framing.
+  **Why dropping the handler future here is safe, not just convenient**:
+  every CP mutation on the client path (`schema`/`read_path`/`write_path`/
+  `txn_coordinator`/`forwarding`) already has to tolerate a mid-flight
+  **process crash** — `ProposeResult::Accepted` means "appended to the
+  local Raft log", never "committed", and every proposer already
+  distinguishes never-accepted from accepted-unconfirmed (see the root
+  `CLAUDE.md`'s durable-before-visible entry) — so an entry this node
+  already proposed keeps living in the Raft log regardless of whether
+  anything is still awaiting `poll_probe`'s confirm loop; dropping that
+  await is equivalent to the process crashing right after the propose
+  call, a case the whole design already has to handle. The one lock these
+  modules hold across an await, `ctx.data().rmw_lock`
+  (`kind_write_item_at_leader`'s/`txn_stage_local`'s read+evaluate scope,
+  narrowed off the propose+confirm path since issue #285), is a
+  `tokio::sync::Mutex` — its guard releases on drop exactly like an
+  ordinary panic unwind, never poisoning, so a cancelled holder leaves the
+  lock exactly as available as a crashed one would. `watch_metadata`'s own
+  long-poll is a pure read with no lock at all, so cancelling it is
+  strictly safe too — and is, incidentally, a genuine improvement for that
+  path's own stale-reply gotcha below, whenever the *client's* own
+  connection (not the whole server process) is what goes away. No admin/
+  dashboard/DynamoDB-wire handler is reachable through this code path —
+  those are separate HTTP listeners, out of scope for this mechanism.
+  Regression: `client_cancellation_tests` (in-crate, grep
+  `client_requests_abandoned`) — one test drives a request that blocks
+  server-side for the write path's full confirm budget, closes the client
+  socket shortly after sending, and asserts the metric increments well
+  inside that budget; a second sends two cheap requests back to back on
+  one connection with no read in between (a pipelined client) and asserts
+  both responses come back in order and the metric stays at zero — the
+  regression for `peer_closed`'s own peek-not-read distinction above.
 - **`ClusterEdgeState` is scoped to one NODE** (ADR 0031 PR2), created fresh per
   node — even in `--cluster N`, which previously shared one instance across the
   cluster and masked cross-process bugs. Holds this node's own control handle, its
   hosted CP group handles (keyed by tablet), and the DynamoDB `SchemaRegistry`.
   No process-global (`OnceLock`) mutable state.
 - **`ClientCtx.data: Option<DataRole>`** groups the data-role-only fields
-  (`rmw_lock`, `raftkv_metrics`, `base_id`). `ClientCtx::data()` **panics** if
+  (`raftkv_metrics`, `base_id` — `rmw_lock` was deleted, ADR 0054 step
+  4b). `ClientCtx::data()` **panics** if
   absent — safe only from paths that structurally can't run on a control-only node
   (the dynamo edge, `auto_split_loop`). `resolve_cp_route` must never panic — it
   matches `self.data.as_ref()` directly (control-only node ⇒ zero local replicas).
@@ -3575,6 +3768,18 @@ ADR itself for the full design/rationale.
   metering `storage_sstable_block_reads` rather than wall clock. Any new
   O(dataset) admin read needs the same question asked of it (ADR 0020's
   2026-08-19 amendment).
+- **`CpRaftView.voter_history` (issue #596)** — every distinct voter
+  configuration this replica's group has adopted, in adoption order, each
+  entry a sorted `Vec<String>` of node ids (`CpGroup::voter_history()`
+  forwarding to `RaftKvNode::voter_history()`, see `animus-cp-data/
+  CLAUDE.md`'s matching entry for the recording mechanism). A pure
+  diagnostic like `quiesced`/`learners` above — building this view never
+  wakes a quiesced group, and it costs nothing extra to poll since the
+  underlying ring is already maintained per consensus-loop iteration
+  regardless of who reads it. Exists so a caller doesn't have to reconstruct
+  a transient intermediate configuration from an external poll that can
+  race a fast reconciler shut — see `split_placing_two_replica_diff_e2e.rs`'s
+  own entry below for the incident this closes.
 - **CP writes need no client-assigned version — but the MVCC version is a
   packed HLC commit timestamp, NOT the Raft log index (stale text corrected
   2026-08-19).** ADR 0018 §2/PR2 (2026-08-11) retired the interim
@@ -3761,6 +3966,214 @@ genericization this rung did not attempt.
   gate 2 command from the disk-discipline section above, unlike `cargo
   build -p animusd --all-targets`, which is exactly what fills the disk.
 
+### C3d landed: `two_node_relay_tests`, a real two-node relay smoke (ADR 0061)
+
+The blocker this section's own "What it cannot drive" list did **not**
+name — because it wasn't a gap in this harness, it was simply the next
+rung — is closed: `ClientCtx<E, R>` now carries a `relay: R` field, and
+`forward_to_tablet_leader`/`ClientCtx::relay`/`read_path.rs`'s
+`relay_stale_read`/`schema.rs`'s `propose_schema` broadcast fallback all
+call `self.relay.relay(..)` instead of the free `relay_request`/
+`relay_request_with_timeout` functions directly. `animus_node::
+sim_relay::SimRelayClient<E: Env>` is the sim-only, `Network`-backed
+implementor this buys — see that module's own doc (`animus-node/
+CLAUDE.md`'s own entry, and ADR 0061's 2026-09-04 amendment) for the
+stream allocation, the `addr == NodeId::to_string()` convention, and the
+`req_id`-correlated wire shape.
+
+`lib.rs`'s `two_node_relay_tests` (a sibling `#[cfg(test)] mod` to
+`simenv_client_ctx_tests`, same in-crate-for-private-handles reason) is
+the proof this actually works end to end: two `ClientCtx<SimEnv,
+SimRelayClient<SimEnv>>`s on two distinct `SimEnv` node ids, sharing one
+control `RaftNode<SimEnv>` (`Arc`-backed clones, so both see the identical
+replicated `Metadata` with no propagation delay) but each with its own
+`ClusterEdgeState` — node A hosts the sole tablet replica, node B hosts
+none. Node B's `cp_kind_write_raw`/`cp_get` calls resolve `CpRoute::
+Forward` and carry the request to node A over a real `SimRelayClient`
+wire; node A's own relay server (`relay_a.serve(..)`, closed over a clone
+of `ctx_a`) answers through `forwarding::handle_relayed_request` — the
+same `E`/`R`-generic dispatcher production's own `handle_request`
+delegates its `Status`/`Forwarded`/`ProposeSchema` arms to. A third,
+direct `cp_get` on `ctx_a` confirms the write landed on node A's own
+engine, not merely echoed back through the relay's own bookkeeping.
+
+**What this still does not drive, unchanged from the blocker above**:
+`ClientCtx::propose_schema`'s *local-propose fast path* is still
+`ProdEnv`-locked (`ClusterEdgeState::control`'s own concrete typing) —
+`two_node_relay_tests` seeds schema the same way `simenv_client_ctx_tests`
+does, proposing directly on the shared control `RaftNode`. What changed is
+that `propose_schema`'s *relay* branches are now genuinely reachable
+(under `SimEnv` they're the only branches that can ever fire, since the
+fast path's own field structurally can't hold a `SimEnv` handle) — this
+rung's own smoke doesn't happen to call `propose_schema` at all, so it
+doesn't exercise that specific path, but nothing about the relay seam
+itself blocks a follow-on test that does.
+
+### `SimCluster`: the multi-node generalization (ADR 0061 rung D1)
+
+`sim_cluster.rs`'s `SimCluster` (declared `#[cfg(test)] mod sim_cluster;`
+from `lib.rs`, kept in its own file — unlike `simenv_client_ctx_tests`/
+`two_node_relay_tests` above — purely so `lib.rs` doesn't keep growing;
+same descendant-of-the-crate-root privacy property, so `ClientCtx`'s
+private fields are still reachable with no visibility widened) is what
+those two harnesses generalize to: an N-node cluster with a real
+**multi-voter** control `RaftNode<SimEnv>` quorum (every node id is a
+voter, `animus-control/tests/control_raft.rs::cluster`'s own shape — not
+`two_node_relay_tests`' single-voter/shared-`Arc` stand-in), a
+`SimRelayClient<SimEnv>` per node with rung C3d's generic relayed-request
+dispatcher installed, and a `ClientCtx<SimEnv, SimRelayClient<SimEnv>>`
+per node whose `client_route`/`intra_route` name every node id up front
+(the whole node set is known at construction, so no
+`route_sync_loop`/`intra_route_sync_loop` equivalent is needed).
+
+**Public surface**: `SimCluster::new(seed, nodes, replication)`;
+`create_table(table)` (this cluster's own default replication factor) /
+`create_table_with_replication(table, replication)`; `tablet_of(table)`;
+`put`/`get`/`delete`/`scan` (each takes a plain `u64` node index — see
+below — and issues the op from that node's own `ClientCtx`, returning
+`Result` rather than panicking, since several scenarios expect a failure);
+the fault surface `crash`/`restart`/`partition`/`heal_all`/`run_for`
+(mirroring `raftkv_linearizable.rs`'s own `Nemesis::apply` shape); and
+`leader_of(tablet) -> Option<NodeId>`/`leader_index_of(tablet) ->
+Option<u64>`/`metadata(node)`/`node_count()`/`seed()` for assertions.
+
+**A node is addressed by a plain `u64` index (`0..nodes`), never a
+`NodeId` directly** — `nid(n)` encodes as the literal string `"n{n}"`
+(`animus-env::nid`'s own implementation), so round-tripping a `NodeId`
+back through `.to_string().parse::<u64>()` to recover a usable index
+fails outright (found live building this rung's own tests — every
+`leader_of(..).to_string().parse()` call site had to become
+`leader_index_of(..)` instead, a plain accessor that never goes through
+`NodeId`'s own `Display` at all). `leader_of` still hands back a real
+`NodeId` (matching the ADR's own suggested signature, and useful for a
+caller comparing against `Metadata`), but every other method on this
+fixture takes and expects the plain index.
+
+**Design decisions** (see the ADR's own 2026-09-05 amendment for the full
+account, including what a follow-on corpus rung still needs):
+
+- **Tablets are hand-hosted, not reconciler-hosted** — `create_table`
+  proposes `CreateTableSchema`/`CreateTablet` directly on the control
+  group's current leader, then builds a `RaftKvNode<SimEnv, MemoryEngine>`
+  on each chosen replica node directly (mirroring `animus-test::
+  raftkv_linearizable`'s `Group::start`) and registers it into that node's
+  own `ClusterEdgeState` — `Metadata`'s tablet row and the edge
+  registration are built from the identical replica list in the same
+  call, so they can never disagree.
+- **DDL is the same control-plane-Raft bypass every `SimEnv` `ClientCtx`
+  fixture in this crate uses** — `ClientCtx::propose_schema`'s local-propose
+  fast path is still `ProdEnv`-locked (unchanged by rung C3d, which only
+  made its *relay* branches reachable). `SimCluster` never calls
+  `propose_schema` at all.
+- **`restart` is a true process restart on `MemoryEngine`** —
+  `Simulator::stop` then fresh `RaftNode::start`/`RaftKvNode::start_hosted`
+  calls on the same node id, each on a brand-new `MemoryEngine` (a
+  wipe-and-rejoin, recovering via peer catch-up/chunked `InstallSnapshot`
+  — never a WAL replay, since this tier has no durable engine). `crash`
+  (mute, tasks stay alive) is the separate, cheaper fault this restart is
+  not a substitute for.
+- **Always `start_hosted` with `stream = tablet.0`, never `start_scoped`**
+  — `create_table_with_replication` can host more than one table's tablet
+  on overlapping node sets (scenario 5 does exactly this), and
+  `start_scoped` pins every group to `PRIMARY_STREAM`, which would
+  cross-talk two tablets sharing node ids (the exact bug `animus-test/
+  CLAUDE.md`'s stream-corpus entry documents finding in its own harness).
+- **Every op takes a `u64` node index and issues from that node's own
+  `ClientCtx`**, so a non-hosting/non-leader node's op genuinely exercises
+  `forward_to_tablet_leader`/`cp_serve_forwarded` over the real
+  `SimRelayClient` wire, not merely a local call.
+
+**Five scenarios ship with it** (`sim_cluster::tests`, seed-parameterized):
+a leader write reading back consistent from every node including a
+forwarding non-leader (plus a `scan`/`delete` pass); a write from a node
+hosting no replica at all (RF < node count); crash-the-leader → write
+through a survivor → restart → converge (a converged-or-timeout retry
+loop, `poll_until_get_eq`, never a one-shot assert); a 1-node minority
+partitioned off cannot ack, the majority side still succeeds, and the
+minority catches up after `heal_all`; and a second `create_table` after
+the first, with both tables independently writable/readable.
+
+**Still `ProdEnv`-only, unchanged from every prior rung's findings**:
+`ClientCtx::propose_schema`'s local-propose fast path (above);
+`SegmentStoreHandle`/`BackupStoreHandle`'s `Cluster` variant (this fixture
+only ever uses the `Fs` placeholder — nothing it drives reads either
+field); and a `DataRole` (`data: None` on every node — no DynamoDB wire
+edge, no TTL reaper, no stream/backup loops).
+
+### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
+
+`crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod
+sim_cluster_corpus;` from `lib.rs`, a sibling of `sim_cluster` for the
+identical reason — same descendant-of-the-crate-root privacy property, no
+visibility widened) is the first cycles/durability corpus over the
+fixture above: a list-append `Recorder`/`History` model over
+`SimClusterHandle::put`/`get` (see that type's own doc in `sim_cluster.rs`
+for why it, not `SimCluster` itself, is what a concurrently spawned client
+task calls), checked with `animus_test::check::{check_cycles,
+check_durability, check_convergence}` — the identical oracle
+`raftkv_linearizable.rs` (`animus-test`) uses. Run via `cargo test -p
+animusd --lib sim_cluster_corpus`; depth knob `ANIMUS_SIMCLUSTER_SEEDS`
+(default 1 = 8 frozen cells, ~14s; held at 25 in the nightly
+`corpus-deep.yml` tier).
+
+**`SimClusterHandle` (ADR 0061 rung D1 step 3) is what made a concurrent
+workload possible at all** — `SimCluster` itself is `&mut self`
+everywhere (every fault-injection method, and even its own `put`/`get`/
+`delete`/`scan`, drives the simulator internally), which is fine for one
+op at a time from a test's own thread but not for several overlapping
+client tasks. The handle is `Clone`-able and holds only the two fields a
+client-issued op ever reads/writes (`ctxs`, `tablets`) behind their own
+`Mutex`es — never the whole fixture behind one coarse lock, which would
+have serialized every concurrent op behind whichever one is currently
+mid-`.await`. Its `put`/`get`/`delete`/`scan` are plain `&self` async
+methods with **no internal simulator driving** of their own: `ClientCtx::
+cp_kind_write_raw`/`cp_get`/`cp_scan` are already `CLIENT_TIMEOUT`-bounded
+internally, so a client task spawned via `env.spawn_task` can `.await` one
+directly while this corpus's own runner drives `Simulator::run_for`
+exactly once per scenario — the identical `client_loop`/`Group::apply`
+split `raftkv_linearizable.rs` uses, generalized to a whole cluster.
+`SimCluster`'s own driver methods (`crash`/`restart`/`partition`/
+`heal_all`/`run_for`, plus DDL) stay `&mut self`, since `Simulator` itself
+isn't safely shareable that way and nothing but the driver ever needs it.
+
+**Cells**: `baseline` (no faults), `leader_crash`, `follower_crash`,
+`stop_restart` (a true process restart, not a mute), `leader_partition`
+(isolate the tablet leader from the whole cluster), `split_brain`
+(partition the whole cluster into two non-empty halves, not keyed to
+wherever the leader lands), `forward_heavy` (RF 2 of 4 nodes — most ops
+route through a node hosting no local replica), and `two_tables` (two
+independently-provisioned tables, ops interleaved by the same client
+tasks — see the module doc's own `Key`-space note for how two tables'
+key ranges stay disjoint without a `Mop`/`History` model change). Every
+op's issuing node is drawn fresh from the scenario's own seed each round
+(`env.gen_below(node_count)`), so `forward_heavy` routinely forwards.
+
+**`delete` is exercised but deliberately never fed into `check_cycles`**
+— the shared `Mop`/`History` model is list-append-only (every observed
+read must be a prefix of its key's one recovered order), an invariant a
+tombstoning delete cannot satisfy without manufacturing a false-positive
+divergence. `run_delete_probe` instead does a direct put→get(present)→
+delete→get(absent) round trip from every node in the cluster in turn,
+post-heal — proving a forwarded delete too, not just a forwarded put/get.
+
+**A hang found and fixed while building this**: `run_delete_probe`'s
+first draft called `SimClusterHandle::put`/`get`/`delete` via a bare
+`futures::executor::block_on`, mirroring `raftkv_linearizable.rs`'s own
+`final_state`'s `block_on(node.local_get(..))` — sound there because
+`local_get` is a pure local read with no internal wait. `SimClusterHandle`'s
+ops, unlike `local_get`, internally `.await` real `env.sleep()`-paced
+poll loops; `block_on`ing one directly with nothing advancing `SimEnv`'s
+virtual clock hangs forever. Fixed by driving the probe through
+`SimCluster`'s own synchronous `put`/`get`/`delete` (which spawn +
+`run_for` internally) instead. See `docs/engineering-lessons.md` and ADR
+0061's 2026-09-05 (2) amendment for the general rule.
+
+**Non-vacuity teeth**: `ok_writes > 0` every cell; `forward_heavy`
+additionally asserts a write from a non-hosting node succeeded (tracked
+per-issuing-node); `delete_probe.is_ok()` every cell. Shrink wiring
+(`ANIMUS_SHRINK=1`, `sim_cluster_shrink_replay`) mirrors
+`raftkv_linearizable.rs`'s own exactly. No product bug found.
+
 ## Tests
 
 `cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`
@@ -3772,7 +4185,8 @@ incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
 (`confirm_futility_tests`) live in `lib.rs` itself
 because they need private handles (a raw `CpGroup`/the `pub(crate)`
-`ClientCtx::cp_kind_local`) that no external `tests/` file can reach;
+`ClientCtx::cp_kind_eval_local`, retargeted from the now-deleted
+`cp_kind_local`, ADR 0054 step 4b) that no external `tests/` file can reach;
 `index_drain.rs`'s own `gsi_drain_cursor_tests` is a third (run via `cargo
 test -p animusd --lib`, not the `tests/` tree) — the ADR 0042 §7/§8
 cursor-based drain + trim janitor regressions, needing `CpGroup`'s private

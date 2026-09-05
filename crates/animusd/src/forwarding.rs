@@ -17,7 +17,7 @@ use crate::{
     CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute, FORWARD_ELECTION_BACKOFF,
     FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL,
     STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo,
-    index_drain, median_split_key, relay_request, relay_request_with_timeout, topology,
+    index_drain, median_split_key, topology,
 };
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -395,7 +395,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// but reachable" one.** The fix above only helps when the guessed
     /// candidate is alive and answers with a proper refusal — it did
     /// nothing when the candidate itself was a node that had since
-    /// crashed/been killed: [`relay_request_with_timeout`] folds every
+    /// crashed/been killed: `relay_request_with_timeout` (production's underlying
+    /// transport, reached via `self.relay` since this rung) folds every
     /// transport-level failure into one plain-text sentinel
     /// ([`RELAY_TRANSPORT_FAILURE`]), which doesn't parse as a "not the
     /// leader here" refusal, so the pre-fix chase gave up on the very
@@ -414,7 +415,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// just an outright-dead one.** The fix above only helps once a
     /// transport failure has actually happened; each hop's own transport
     /// timeout used to be `remaining` — the *entire* time left before
-    /// `deadline` — handed whole to [`relay_request_with_timeout`]. A
+    /// `deadline` — handed whole to the relay call (`self.relay.relay`). A
     /// candidate that accepts the TCP connection but is merely slow (a
     /// loaded sandbox, a starved disk) or simply never answers isn't a
     /// transport failure at all until its own timeout fires — so it could
@@ -555,16 +556,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             } else {
                 remaining.min(FORWARD_HOP_TIMEOUT)
             };
-            let resp = relay_request_with_timeout(
-                next.clone(),
-                &ClientRequest::Forwarded {
-                    request: Box::new(request.clone()),
-                    traceparent: crate::otel::current_traceparent(),
-                },
-                hop_timeout,
-                self.tls.as_ref(),
-            )
-            .await;
+            let resp = self
+                .relay
+                .relay(
+                    next.clone(),
+                    &ClientRequest::Forwarded {
+                        request: Box::new(request.clone()),
+                        traceparent: crate::otel::current_traceparent(),
+                    },
+                    hop_timeout,
+                )
+                .await;
             let ClientResponse::Error(e) = &resp else {
                 return resp;
             };
@@ -643,14 +645,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
-    /// Send `request` to a peer node's client API over a fresh connection and
-    /// return its reply (or an error on any transport failure). The cross-node
-    /// relay primitive for CP forwarding (A1) and schema-DDL relay (A2). Thin
-    /// wrapper over the free [`relay_request`] (ADR 0035 PR4 — extracted so
-    /// [`control_handle::RemoteControlClient`], which has no `ClientCtx` of
-    /// its own, can use the identical wire primitive).
+    /// Send `request` to a peer node's client API and return its reply (or
+    /// an error on any transport failure), at this crate's own
+    /// [`CLIENT_TIMEOUT`]. The cross-node relay primitive for CP forwarding
+    /// (A1) and schema-DDL relay (A2). Thin wrapper over
+    /// `self.relay: R` (ADR 0061 rung C3d/C5 step 3a follow-up) — production
+    /// goes through [`AnimusdRelayClient`], an unchanged wrapper over the
+    /// free [`relay_request_with_timeout`] (still a fresh `TcpStream` dial),
+    /// so this method's own production behavior is byte-for-byte what it
+    /// was before this field existed. `animus_node::control_handle::
+    /// RemoteControlClient`, which has no `ClientCtx` of its own, holds and
+    /// calls the identical `R: RelayClient` directly rather than through
+    /// this method (ADR 0061 rung C3c) — the two never share this one call
+    /// site, only the same underlying trait/implementor.
     pub(crate) async fn relay(&self, addr: String, request: ClientRequest) -> ClientResponse {
-        relay_request(addr, &request, self.tls.as_ref()).await
+        self.relay.relay(addr, &request, CLIENT_TIMEOUT).await
     }
 
     /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it
@@ -698,10 +707,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 // The identical confirm `cp_kind_write_raw`'s own Local arm
-                // runs — never a second implementation (`cp_kind_local`'s
-                // Some-base-write requirement wrongly refused a forwarded
-                // whole-partition raw DELETE, whose base write is a
-                // tombstone; see `cp_kind_raw_local`'s doc).
+                // runs — never a second implementation (the now-deleted
+                // `cp_kind_local`'s Some-base-write requirement wrongly
+                // refused a forwarded whole-partition raw DELETE, whose
+                // base write is a tombstone; see `cp_kind_raw_local`'s
+                // doc).
                 match Self::cp_kind_raw_local(&leader, writes, change_log).await {
                     Ok(()) => ClientResponse::PutOk,
                     Err(e) => ClientResponse::Error(e),
@@ -726,7 +736,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     return self.not_leader_refusal(tablet);
                 };
                 let meta = self.effective_metadata();
-                match dynamo::kind_write_item_at_leader(
+                match dynamo::kind_write_item_at_leader::<E, R>(
                     self,
                     &leader,
                     &meta,
@@ -1271,5 +1281,74 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 ClientResponse::Error("unexpected forwarded request".into())
             }
         }
+    }
+}
+
+/// Dispatch a [`ClientRequest`] arriving over a **sim-only relay**
+/// (`animus_node::sim_relay::SimRelayClient`, ADR 0061 rung C3d) — the
+/// `E: Env`/`R: RelayClient`-generic sibling of production's concrete
+/// `handle_request` (`lib.rs`, hardcoded to `ClientCtx<ProdEnv,
+/// AnimusdRelayClient>`, since it also does the listener-kind/`Surface`
+/// gating a bare TCP connection needs and reaches `dynamo.rs`'s still-
+/// `ProdEnv`-only handlers for `Put`/`PutBatch`/`Get`/`Scan`/`Delete`).
+///
+/// **Covers exactly the relay traffic this rung's threading actually
+/// produces**, not `ClientRequest`'s full surface — the three variants a
+/// `ClientCtx<E, R>` method calls `self.relay`/`R::relay` with today:
+///
+/// - [`ClientRequest::Forwarded`] — what [`ClientCtx::forward_to_tablet_leader`]
+///   (this file) and `read_path.rs`'s `relay_stale_read` send. Delegates to
+///   [`ClientCtx::cp_serve_forwarded`] (this file) — the identical dispatch
+///   production's own `handle_request`'s `Forwarded` arm calls.
+/// - [`ClientRequest::ProposeSchema`] — what `schema.rs`'s `propose_schema`
+///   sends (both its single-hint relay and its ADR 0030 growth-node
+///   broadcast fallback). Gates on [`is_relayable_command`] and proposes
+///   via [`ClientCtx::propose_schema`] on success, exactly mirroring
+///   production's own arm.
+/// - [`ClientRequest::Status`] — what `animus_node::control_handle::
+///   RemoteControlClient::metadata_fresh` sends through this same `R`.
+///   Answers with the identical `ClientResponse::Status` shape production's
+///   own `handle_request` builds.
+///
+/// Every other variant returns a plain [`ClientResponse::Error`] — this is
+/// deliberately **not** an attempt to cover `ClientRequest`'s whole surface
+/// under `SimEnv` (the plain `Put`/`Get`/etc. client-facing ops never reach
+/// a node-to-node relay at all; they're served directly by whichever
+/// `ClientCtx` method the caller invokes), so leaving them unhandled here is
+/// not a gap this rung owes a fix for — `SimCluster` (ADR 0061 rung D1) can
+/// widen this dispatcher's coverage when a corpus scenario actually needs to
+/// relay a variant not listed above.
+///
+/// **Production's `handle_request` delegates the first three arms
+/// (`Status`/`Forwarded`/`ProposeSchema`) to this exact function** (`lib.rs`)
+/// — a pure refactor (byte-identical behavior, since those three arms'
+/// bodies are copied here verbatim) that leaves exactly one dispatch table
+/// for the relayed set instead of two independently-maintained copies.
+/// Every other `handle_request` arm (the plain client-facing ops, `SplitTablet`,
+/// `JoinInfo`, `WatchMetadata`, `Txn`, and the internal-only tablet-addressed
+/// RPCs) stays exactly where it was — none of those are part of the relayed
+/// set this rung threads through `R`.
+pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    req: ClientRequest,
+) -> ClientResponse {
+    match req {
+        ClientRequest::Status => ClientResponse::Status {
+            metadata: ctx.effective_metadata(),
+            leader_hint: ctx.control_leader_hint(),
+            intra_leader_hint: ctx.intra_control_leader_hint(),
+            watermark: ctx.control.metadata_watch().latest(),
+            control_voters: ctx.control.config().unwrap_or_default(),
+        },
+        ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
+        ClientRequest::ProposeSchema(command) => {
+            if !crate::is_relayable_command(&command) {
+                ClientResponse::Error("command not allowed over the relay path".into())
+            } else {
+                ctx.propose_schema(&command).await;
+                ClientResponse::PutOk
+            }
+        }
+        _ => ClientResponse::Error("not relayable under sim".into()),
     }
 }

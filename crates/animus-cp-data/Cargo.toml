@@ -25,6 +25,14 @@ animus-env.workspace = true
 animus-control.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true
+# ADR 0054 step 2: the pure item-model/evaluation crate below the wire
+# adapter — `WriteSchema`/`derive_kind_writes` (the schema slice and the
+# pure LSI/change-record derivation a `KvCommand::KindEval` entry evaluates
+# at apply) and the `AttributeValue`/`Item`/`ConditionExpression`/
+# `UpdateAction` types that command's fields are typed over. No wire crate
+# involved — see `animus-item`'s own doc for why it sits below both this
+# crate and `animus-dynamo`.
+animus-item.workspace = true
 # ClusterSegmentStore's K-replica placement selection (ADR 0043 §A7b) reuses
 # this crate's existing policy engine rather than a bespoke one — was a
 # dev-only test dependency until now.

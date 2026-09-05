@@ -265,6 +265,57 @@ which meters the LSM's own `storage_sstable_block_reads` rather than wall
 clock (10 default polls over 2,000 flushed rows: **0 block reads**; 10
 `?exact=1` polls: 550).
 
+## Amendment (2026-09-04, issue #595) — `/admin/health` needs hysteresis, not the raw pre-vote belief
+
+`health()`'s readiness signal (the Kubernetes readiness probe, ADR 0060) used
+to be exactly `RaftCore::leader().is_some()` — `leader_id`, the control
+plane's own consensus-internal belief. ADR 0009's pre-vote mechanism
+(`start_pre_vote`) clears that belief the instant a follower's own election
+timer lapses, before any pre-vote round is even answered: correct for
+consensus (a stale belief must never be trusted for granting a vote), but it
+gives `/admin/health` a false-negative window on **every** transient
+one-sided delay of one election timeout (150ms default) or more — a single
+scheduling stall on a pod, a GC pause, one dropped heartbeat — even while the
+real cluster leader is fully healthy and heartbeating every other replica
+the whole time. A liveness/readiness signal must not inherit a safety
+mechanism's hair-trigger semantics.
+
+**Fix**: `animus-control::RaftCore` gains an observational
+`last_leader_contact: Option<(NodeId, Nanos)>`, set only at a genuine leader
+contact (a valid `AppendEntries`/`InstallSnapshot` from the current term's
+leader, or this node itself becoming leader) and cleared only on a real
+higher-term step-down (never by `start_pre_vote`/`start_election`'s own
+local-suspicion clear of `leader_id`) — see that field's own doc comment in
+`raft.rs` for the full reasoning. `RaftCore::leader_within(now, max_age)` /
+`RaftNode::leader_within(max_age)` / `ControlHandle::leader_within(max_age)`
+read it with a caller-supplied grace window; `leader()` itself is untouched
+and still backs every consensus-facing consumer.
+
+`admin::health()` now gates `200`/`503` on `leader_within(HEALTH_LEADER_
+GRACE_ELECTION_TIMEOUTS × election_timeout())` (3 election timeouts, ~450ms
+at the default base) instead of the raw `leader()`. The JSON body keeps
+`control_leader_known` reporting the raw flag unchanged, and adds
+`control_leader_recent` for the hysteresis-gated one — `ok` and the HTTP
+status now track `control_leader_recent`. A genuinely leaderless node still
+degrades to `503`, just after the grace rather than after the very first
+missed heartbeat — this is hysteresis, not a permanent trust, and the
+regression proves both halves (survives a one-sided delay inside the grace;
+still degrades once the delay genuinely outlasts it).
+
+**Deliberately unchanged**: `ClientCtx::propose_schema`'s leader-hop
+decision. Its `leader()` read uses the full `CLIENT_TIMEOUT` (10s) for that
+hop, while its broadcast fallback is capped per-hop at `FORWARD_HOP_TIMEOUT`
+(2s, issue #585's fix) — handing it a possibly-stale `leader_within` belief
+instead would risk spending the hop budget on a node that is not actually
+reachable as leader, which is worse under `dynamo.rs`'s 5s
+`SCHEMA_COMMIT_TIMEOUT` than falling through to the broadcast promptly. Only
+the operational readiness probe gets the hysteresis; every leader-selection
+consumer keeps reading the raw, immediately-corrected belief.
+
+Regression: `animus-control/tests/leader_within_hysteresis.rs` (a one-sided
+partition inside the grace, then held past it, across 12 seeds). See
+`docs/engineering-lessons.md`'s matching entry for the general lesson.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

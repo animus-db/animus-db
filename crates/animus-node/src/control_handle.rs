@@ -543,10 +543,53 @@ impl<E: Env, R: RelayClient> ControlHandle<E, R> {
     /// The current leader's id, if this handle knows one. For `Remote`, the
     /// id half of the [leader hint](RemoteControlClient) — see that type's
     /// doc.
+    ///
+    /// **This is the raw consensus belief** (`RaftCore::leader_id` for
+    /// `Local`) — an operational (health/readiness) reader should call
+    /// [`leader_within`](Self::leader_within) instead (issue #595): see
+    /// `RaftCore::leader`'s own doc for why this one has a false-negative
+    /// window on a transient one-sided delay.
     pub fn leader(&self) -> Option<NodeId> {
         match self {
             Self::Local(raft) => raft.leader(),
             Self::Remote(remote) => remote.leader(),
+        }
+    }
+
+    /// Hysteresis-bearing leader read for an operational reader (issue
+    /// #595) — see `RaftCore::leader_within`'s own doc for the full
+    /// contract and rationale.
+    ///
+    /// `Local` delegates straight to `RaftNode::leader_within`, which has a
+    /// real `last_leader_contact` timestamp to consult. **`Remote` has no
+    /// local `RaftCore` and the wire carries no contact timestamp today**
+    /// (`Status`/`WatchMetadata` echo `leader_hint`, not a contact age) —
+    /// so for now it simply falls back to [`leader`](Self::leader), meaning
+    /// the hysteresis this method exists to provide is **`Local`-only**.
+    /// This is an honest degrade, not a bug: a data-only node's own
+    /// `/admin/health` was never gated on a local Raft belief to begin with
+    /// (`ControlHandle::is_leader` is already always `false` for `Remote`),
+    /// and widening the wire to carry a contact age is a separate, later
+    /// change if a data-only node's health probe is ever found to need the
+    /// same false-negative-window protection.
+    pub fn leader_within(&self, max_age: Duration) -> Option<NodeId> {
+        match self {
+            Self::Local(raft) => raft.leader_within(max_age),
+            Self::Remote(remote) => remote.leader(),
+        }
+    }
+
+    /// This handle's election-timeout base, for sizing a `leader_within`
+    /// grace window (e.g. `animusd::admin::health`'s `HEALTH_LEADER_GRACE`).
+    /// `Remote` has no local `RaftCore` at all, so it answers the same
+    /// compile-time default every `RaftCore` is constructed with
+    /// (`Duration::from_millis(150)`, `RaftCore::new`) — the control
+    /// deployment's own real value, which is never independently
+    /// configurable per ADR 0009's "no `set_election_timeout`" note.
+    pub fn election_timeout(&self) -> Duration {
+        match self {
+            Self::Local(raft) => raft.election_timeout(),
+            Self::Remote(_) => Duration::from_millis(150),
         }
     }
 

@@ -17,6 +17,29 @@
 #
 # Assumes: docker, kind, kubectl on PATH, and a docker daemon reachable.
 #
+# Issue #595: this smoke flaked twice with the identical signature — the
+# first `CreateTable` (issued once, immediately after the statefulset
+# reported 3/3 ready) failing with a 500 whose message is "CreateTable did
+# not commit to the control plane in time (no leader reachable?)", the
+# diagnostics dump showing one of the three pods `Ready: False` at that
+# instant even though every pod had been ready moments earlier:
+#   - run 10, https://github.com/animus-db/animus-db/actions/runs/33802730477
+#     (main @ ec940df, 2026-09-03, the #573 merge) — pod e2e-1 not ready.
+#   - run 13, https://github.com/animus-db/animus-db/actions/runs/33907718968
+#     (PR #594 @ 1673f25, 2026-09-04) — pod e2e-0 not ready.
+# The root cause (an ADR 0009 pre-vote follower's own `leader_id` clearing
+# on a transient one-sided delay, which `/admin/health`'s readiness probe
+# read raw) is fixed at the source in `animus-control`/`animusd::admin`
+# (see ADR 0020's 2026-09-04 amendment and `docs/engineering-lessons.md`).
+# This script carries two independent, complementary hardenings on top of
+# that fix, per the issue's own "Ask" (root-cause the leader loss, AND
+# treat the first post-bootstrap write as an eventual property): (1) an
+# explicit readiness wait on the SAME pod the DynamoDB wire calls will hit,
+# not just the statefulset's aggregate 3/3 count, before ever calling
+# `CreateTable`; (2) a bounded converged-or-timeout retry of `CreateTable`
+# itself, scoped narrowly to the one transient 500 this issue is about —
+# every other error class still fails the run immediately, unchanged.
+#
 # Env overrides:
 #   KIND_NODE_IMAGE  - `kind create cluster --image` value. Unset (CI default)
 #                       lets kind pick its own pinned node image; locally,
@@ -58,6 +81,11 @@ NAMESPACE="animus-e2e"
 AC_NAME="e2e"
 DYNAMO_LOCAL_PORT="18100"
 DYNAMO_REMOTE_PORT="14002" # base_port(14000) + PORT_DYNAMO(2), the CRD's own default base port.
+ADMIN_LOCAL_PORT="18101"
+ADMIN_REMOTE_PORT="14003" # base_port(14000) + PORT_ADMIN(3) — same numeric port on every
+                           # pod (crates/animus-operator/src/desired/cluster_config.rs's own
+                           # doc: unlike the local-dev `--cluster N` port stride, a k8s pod
+                           # gets its own IP, so every pod binds the identical six ports).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/animus-e2e-kind.XXXXXX")"
@@ -66,12 +94,22 @@ OPERATOR_LOG="${WORKDIR}/operator.log"
 PORT_FORWARD_LOG="${WORKDIR}/port-forward.log"
 MANIFEST_FILE="${WORKDIR}/animuscluster.yaml"
 CA_FILE="${WORKDIR}/ca.crt"
-# Every `curl` hitting the dynamo port, plain or TLS — kept as arrays so
-# "no extra args" (plain path) and "--cacert ... --resolve ..." (TLS path)
-# compose the same call sites without a second, near-duplicate function.
+# Every `curl` hitting the dynamo OR the admin port, plain or TLS — kept as
+# arrays so "no extra args" (plain path) and "--cacert ... --resolve ..."
+# (TLS path) compose the same call sites without a second, near-duplicate
+# function. `spec.tls` turns TLS on for every port this cluster binds, not
+# just dynamo (ADR 0064) — the admin-port readiness probes below
+# (`admin_port_forward_ready`/`admin_health_ready`) need the identical
+# treatment, or they'd TLS-handshake-fail against a server-only-TLS admin
+# port under `E2E_TLS=1`. `ADMIN_HOST` reuses the same hostname as
+# `DYNAMO_HOST` (a name already covered by the issued cert's SAN list,
+# `desired::certificate::dns_names`) — SAN coverage doesn't depend on which
+# port that name is dialed on, only `--resolve` naming a different port.
 DYNAMO_SCHEME="http"
+ADMIN_SCHEME="http"
 CURL_TLS_ARGS=()
 DYNAMO_HOST="127.0.0.1"
+ADMIN_HOST="127.0.0.1"
 
 OPERATOR_PID=""
 PORT_FORWARD_PID=""
@@ -198,6 +236,15 @@ sts_gone() {
     ! kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" >/dev/null 2>&1
 }
 
+dynamo_endpoint_pod() {
+    kubectl get endpoints "${AC_NAME}-dynamo" -n "$NAMESPACE" \
+        -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || true
+}
+
+has_dynamo_endpoint() {
+    [ -n "$(dynamo_endpoint_pod)" ]
+}
+
 port_forward_ready() {
     # Any real HTTP response (even a 4xx from an unrecognized bare GET)
     # proves the forwarded port is accepting and relaying connections;
@@ -210,6 +257,27 @@ port_forward_ready() {
     curl -sS -o /dev/null -m 2 "${CURL_TLS_ARGS[@]}" \
         "${DYNAMO_SCHEME}://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ]
+}
+
+admin_port_forward_ready() {
+    local rc=0
+    curl -sS -o /dev/null -m 2 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ]
+}
+
+# Issue #595: the actual precondition `CreateTable` needs is not "the
+# statefulset reported 3/3 ready a moment ago" (a point-in-time count that
+# says nothing about the SPECIFIC pod the port-forward below will send the
+# wire call to) — it is "that specific pod's own `/admin/health` is 200
+# right now". Polled through the same pod-direct port-forward the dynamo
+# call itself uses (see the "port-forward the serving pod directly" phase),
+# so this checks the exact precondition, not a proxy for it.
+admin_health_ready() {
+    local code
+    code="$(curl -sS -o /dev/null -m 2 -w '%{http_code}' "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/health" 2>/dev/null)" || code=""
+    [ "$code" = "200" ]
 }
 
 dynamo_call() {
@@ -340,24 +408,92 @@ if [ "$E2E_TLS" = "1" ]; then
     # 127.0.0.1:${DYNAMO_LOCAL_PORT}, this only changes what curl verifies
     # the presented certificate against.
     DYNAMO_SCHEME="https"
+    ADMIN_SCHEME="https"
     DYNAMO_HOST="${AC_NAME}-dynamo.${NAMESPACE}.svc.cluster.local"
-    CURL_TLS_ARGS=(--cacert "$CA_FILE" --resolve "${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}:127.0.0.1")
-    log "TLS e2e path: curl will dial https://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT} (--cacert ${CA_FILE})"
+    ADMIN_HOST="$DYNAMO_HOST"
+    CURL_TLS_ARGS=(
+        --cacert "$CA_FILE"
+        --resolve "${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT}:127.0.0.1"
+        --resolve "${ADMIN_HOST}:${ADMIN_LOCAL_PORT}:127.0.0.1"
+    )
+    log "TLS e2e path: curl will dial https://${DYNAMO_HOST}:${DYNAMO_LOCAL_PORT} (dynamo) and https://${ADMIN_HOST}:${ADMIN_LOCAL_PORT} (admin) (--cacert ${CA_FILE})"
 fi
 
-phase "port-forward dynamo service"
-kubectl port-forward "svc/${AC_NAME}-dynamo" -n "$NAMESPACE" \
-    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" >"$PORT_FORWARD_LOG" 2>&1 &
+phase "resolve which pod svc/${AC_NAME}-dynamo currently routes to"
+# `kubectl port-forward svc/...` resolves to exactly one backing pod for the
+# life of the forward — read that same resolution off the Service's own
+# Endpoints so the readiness check below and the actual wire calls are
+# guaranteed to hit the SAME pod, not merely "a" ready pod (issue #595: a
+# statefulset-wide 3/3 count says nothing about this one pod's own current
+# state a few seconds later).
+wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint
+DYNAMO_POD="$(dynamo_endpoint_pod)"
+[ -n "$DYNAMO_POD" ] || fail "could not resolve a pod backing svc/${AC_NAME}-dynamo"
+log "svc/${AC_NAME}-dynamo currently routes to pod ${DYNAMO_POD}"
+
+phase "port-forward that pod directly (dynamo + admin)"
+# Forwarding the POD (not the Service) on both its dynamo and admin ports in
+# one call is what lets the readiness check below and every subsequent
+# dynamo_call in this script provably hit the identical pod — every pod
+# binds the same numeric ports in the Kubernetes deployment shape (no
+# per-pod port striping, unlike the local-dev `--cluster N` shape), so this
+# is a straight substitution of `pod/${DYNAMO_POD}` for `svc/${AC_NAME}-dynamo`.
+kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
+    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
+    >"$PORT_FORWARD_LOG" 2>&1 &
 PORT_FORWARD_PID=$!
-wait_for "port-forward listening" 30 1 -- port_forward_ready
+wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready
+wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready
+
+phase "wait for that pod's own readiness (GET /admin/health == 200)"
+# Issue #595: the precondition the original one-shot CreateTable actually
+# needed — this SPECIFIC pod (the one the dynamo wire calls below will hit)
+# reports itself ready, not merely "the statefulset was 3/3 a moment ago".
+# `/admin/health` itself now has hysteresis over a follower's own transient
+# pre-vote `leader_id` clear (ADR 0020's 2026-09-04 amendment) — this wait
+# is a second, independent line of defense on top of that root-cause fix,
+# not a replacement for it.
+wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
 phase "exercise DynamoDB wire: CreateTable"
-RESULT="$(dynamo_call "DynamoDB_20120810.CreateTable" \
-    '{"TableName":"E2EItems","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}')"
-STATUS="$(dynamo_status "$RESULT")"
-BODY="$(dynamo_body "$RESULT")"
-[ "$STATUS" = "200" ] || fail "CreateTable failed: status=${STATUS} body=${BODY}"
-log "CreateTable ok"
+# Issue #595: a bounded converged-or-timeout retry, scoped narrowly to the
+# one transient failure this issue is about (the control-plane commit-wait
+# timing out right after bootstrap) — CreateTable is idempotent server-side
+# (dynamo.rs's pre-check, ~2301-2333: a repeated CreateTable for a
+# now-existing table returns the AWS-shaped ResourceInUseException, which
+# this loop treats as success), so retrying is safe. Every OTHER error
+# class (a validation failure, a genuinely reserved/duplicate name from a
+# prior *different* run, ...) still fails the whole script immediately, on
+# the very first attempt, exactly as before.
+CREATE_TABLE_RETRYABLE="did not commit to the control plane in time"
+CREATE_TABLE_TIMEOUT=60
+CREATE_TABLE_INTERVAL=3
+waited=0
+while true; do
+    RESULT="$(dynamo_call "DynamoDB_20120810.CreateTable" \
+        '{"TableName":"E2EItems","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}')"
+    STATUS="$(dynamo_status "$RESULT")"
+    BODY="$(dynamo_body "$RESULT")"
+    if [ "$STATUS" = "200" ]; then
+        log "CreateTable ok"
+        break
+    fi
+    if [ "$STATUS" = "400" ] && grep -q "ResourceInUseException" <<<"$BODY"; then
+        log "CreateTable: the table already exists (a prior attempt's propose \
+committed even though that attempt's own commit-wait timed out) — idempotent, treating as success"
+        break
+    fi
+    if [ "$STATUS" = "500" ] && grep -qF "$CREATE_TABLE_RETRYABLE" <<<"$BODY"; then
+        if [ "$waited" -ge "$CREATE_TABLE_TIMEOUT" ]; then
+            fail "CreateTable kept timing out waiting on the control plane after ${waited}s: status=${STATUS} body=${BODY}"
+        fi
+        log "CreateTable: control-plane commit-wait timed out at ${waited}s — retrying (issue #595)"
+        sleep "$CREATE_TABLE_INTERVAL"
+        waited=$((waited + CREATE_TABLE_INTERVAL))
+        continue
+    fi
+    fail "CreateTable failed: status=${STATUS} body=${BODY}"
+done
 
 phase "exercise DynamoDB wire: PutItem"
 RESULT="$(dynamo_call "DynamoDB_20120810.PutItem" \

@@ -1,7 +1,8 @@
 //! End-to-end tests for `KeyConditionExpression` sort-key **range**
 //! comparators (`<`, `<=`, `>`, `>=`, issue #373) over real DynamoDB
 //! JSON/HTTP — base table, GSI, and LSI, plus the type-mismatch validation
-//! and the documented `ScanIndexForward` ordering caveat. Mirrors
+//! and `ScanIndexForward`'s numeric ordering for `N` sort keys (ADR 0063).
+//! Mirrors
 //! `dynamo_predicate_bugs.rs`/`dynamo_documents.rs`: a 3-node in-process
 //! cluster driven by the actual DynamoDB JSON protocol over hand-written
 //! HTTP/1.1. Real time/sockets, so it polls with generous timeouts.
@@ -174,10 +175,9 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
     (dir, nodes, addrs)
 }
 
-/// The set of `sk` values a body contains, read back off `"sk":{"N":"..."}`
-/// — order-independent, so callers assert membership, not position (the
-/// `ScanIndexForward` test below asserts position separately).
-fn sk_values(body: &str) -> Vec<String> {
+/// The `sk` values a body contains, read back off `"sk":{"N":"..."}`, in
+/// **first-appearance order** — the raw material both helpers below build on.
+fn sk_order(body: &str) -> Vec<String> {
     let marker = "\"N\":\"";
     let mut out = Vec::new();
     let mut rest = body;
@@ -188,6 +188,14 @@ fn sk_values(body: &str) -> Vec<String> {
         out.push(tail[n_at..n_at + end].to_string());
         rest = &tail[n_at + end..];
     }
+    out
+}
+
+/// The set of `sk` values a body contains — order-independent, so callers
+/// assert membership, not position (`sk_order` above is the position-aware
+/// form, used by `scan_index_forward_orders_n_sort_keys_numerically`).
+fn sk_values(body: &str) -> Vec<String> {
+    let mut out = sk_order(body);
     out.sort();
     out
 }
@@ -332,19 +340,22 @@ async fn lsi_range_queries_over_mixed_digit_count_n_sort_keys() {
     }
 }
 
-/// **Documents the `ScanIndexForward` ordering caveat** the
-/// `animus-dynamo/CLAUDE.md` note now states explicitly: fixing the *filter*
-/// for `N` (this issue) did **not** fix result *ordering*. `ScanIndexForward`
-/// still walks the raw byte-ordered storage scan, which sorts `N` as decimal
-/// **text** — so `"10"` sorts before `"2"` (`'1' < '2'`), even though `10 >
-/// 2` numerically. This is a deliberately separate partition (`pk = "ord"`)
-/// with just those two values, so the ordering assertion below isn't
-/// entangled with the membership assertions the other tests already cover.
+/// **`ScanIndexForward` is numeric order for an `N` sort key (ADR 0063)**:
+/// the stored key encodes `N` through the order-preserving `numkey` codec
+/// (`AttributeValue::key_bytes`), so a `Query`'s returned order agrees with
+/// DynamoDB's own numeric ordering across mixed digit counts, negatives, and
+/// decimals — not the byte-ordered-text order the old, unfixed encoding
+/// produced. This is a deliberately separate partition (`pk = "ord"`), so
+/// the ordering assertions below aren't entangled with the membership
+/// assertions the other tests already cover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_index_forward_is_still_byte_order_not_numeric_order_for_n() {
+async fn scan_index_forward_orders_n_sort_keys_numerically() {
     let (_dir, nodes, addrs) = setup().await;
 
-    for sk in ["2", "10"] {
+    // Mixed digit counts, negatives, and a decimal — every shape a raw
+    // byte-text compare would have gotten wrong.
+    let values = ["-10", "-5", "0", "2", "10", "100", "2.5"];
+    for sk in values {
         let (status, body) = dynamo_retry(
             addrs[0],
             "DynamoDB_20120810.PutItem",
@@ -356,7 +367,7 @@ async fn scan_index_forward_is_still_byte_order_not_numeric_order_for_n() {
         assert_eq!(status, 200, "PutItem(sk={sk}) failed: {body}");
     }
 
-    let (status, body) = dynamo_retry(
+    let (status, asc) = dynamo_retry(
         addrs[1],
         "DynamoDB_20120810.Query",
         r#"{"TableName":"readings","ConsistentRead":true,"ScanIndexForward":true,
@@ -364,25 +375,26 @@ async fn scan_index_forward_is_still_byte_order_not_numeric_order_for_n() {
             "ExpressionAttributeValues":{":p":{"S":"ord"}}}"#,
     )
     .await;
-    assert_eq!(status, 200, "query failed: {body}");
+    assert_eq!(status, 200, "ascending query failed: {asc}");
+    assert_eq!(
+        sk_order(&asc),
+        vec!["-10", "-5", "0", "2", "2.5", "10", "100"],
+        "ScanIndexForward:true returns ascending numeric order: {asc}"
+    );
 
-    // Both rows are present (the *filter*/scan-range side is unaffected by
-    // this caveat — it can only widen a range, never narrow it).
-    let pos_2 = body.find(r#""sk":{"N":"2"}"#).expect("sk=2 present");
-    let pos_10 = body.find(r#""sk":{"N":"10"}"#).expect("sk=10 present");
-    // But the *order* is still lexicographic-by-text, not numeric: with
-    // `ScanIndexForward: true` (ascending), "10" comes first because '1' <
-    // '2' as a byte, even though 10 > 2 as a number. A truly numeric
-    // ascending order would put "2" first — this assertion is intentionally
-    // the *unfaithful* order, to pin down the documented gap rather than
-    // hide it. (Fixing this needs an order-preserving numeric key encoding,
-    // a real wire-format change tracked as future ADR work, not a filter fix.)
-    assert!(
-        pos_10 < pos_2,
-        "ScanIndexForward:true still returns byte order (\"10\" before \"2\"), \
-         not numeric order — if this now fails, the ordering caveat has been \
-         fixed and the CLAUDE.md note (and this test) should be updated \
-         together: {body}"
+    let (status, desc) = dynamo_retry(
+        addrs[2],
+        "DynamoDB_20120810.Query",
+        r#"{"TableName":"readings","ConsistentRead":true,"ScanIndexForward":false,
+            "KeyConditionExpression":"pk = :p",
+            "ExpressionAttributeValues":{":p":{"S":"ord"}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "descending query failed: {desc}");
+    assert_eq!(
+        sk_order(&desc),
+        vec!["100", "10", "2.5", "2", "0", "-5", "-10"],
+        "ScanIndexForward:false returns descending numeric order: {desc}"
     );
 
     for n in nodes {
