@@ -90,10 +90,9 @@ fn freeze_rejects_every_later_mutation_and_reads_keep_serving() {
         other => panic!("post-freeze put not appended: {other:?} (seed={seed})"),
     }
     // Kind batch (base + a change record): no-op.
-    match nodes[l].put_kind_batch_conditioned(
+    match nodes[l].put_kind_batch(
         vec![(KIND_BASE, b"kpost".to_vec(), Some(b"kv".to_vec()))],
         vec![(b"kpost".to_vec(), b"rec".to_vec())],
-        Vec::new(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("post-freeze kind batch not appended: {other:?} (seed={seed})"),
@@ -174,26 +173,24 @@ fn consumer_bookkeeping_still_applies_on_a_frozen_group() {
     freeze_and_settle(&mut sim, &nodes, l, seed);
 
     // A cursor-kind write (the GSI drain's own bookkeeping shape).
-    match nodes[l].put_kind_batch_conditioned(
+    match nodes[l].put_kind_batch(
         vec![(
             animus_cp_data::KIND_CURSOR,
             b"cursor-row".to_vec(),
             Some(b"wm".to_vec()),
         )],
         Vec::new(),
-        Vec::new(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("cursor write not appended: {other:?} (seed={seed})"),
     }
     // A change-log-only batch (the backfill seeder's synthetic record).
-    match nodes[l].put_kind_batch_conditioned(
+    match nodes[l].put_kind_batch(
         Vec::new(),
         vec![(
             b"\x00\x00\x00\x00\x00\x00\x00\x02pk".to_vec(),
             b"rec".to_vec(),
         )],
-        Vec::new(),
     ) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("record-only write not appended: {other:?} (seed={seed})"),

@@ -17203,48 +17203,57 @@ the root `CLAUDE.md` already names for locks/wakers/group commit, extended
 here to "a side-channel handoff between two lock users" as a new instance
 of the same family.
 
-## A leader-side "seatbelt double-check" kept alongside an apply-evaluated write must predict the client's own decision, not replicate the byte-level mechanism it replaces (ADR 0054 step 3)
+## A leader-side "seatbelt double-check" kept alongside an apply-evaluated write must predict the client's own decision, not replicate the byte-level mechanism it replaces — superseded, moved to the archive
 
-Cutting `kind_write_item_at_leader` over to `KvCommand::KindEval` (ADR 0054
-step 3), the task brief for the kept seatbelt double-check assumed the
-classic "two concurrent `ADD`s, one refused" scenario would be the thing the
-mismatch metric catches. Tracing the actual code paths found this is not so:
-the *old* seatbelt was a byte-level OCC check (`KindBatch.conditions =
-vec![(base_key, raw_old)]`, comparing the leader's exact read bytes against
-whatever is committed at apply) with no relationship to the client's own
-`ConditionExpression` — a plain, unconditional `ADD` has no condition to
-evaluate at all, so a leader-side prediction built from `condition.evaluate`
-can *only* ever answer `Applied` for it, never `ConditionFailed`. Reproducing
-the old byte-level seatbelt's staleness signal was not what was asked for,
-and would have required inspecting engine state at apply time from the
-leader side, which nothing exposes. The seatbelt double-check that actually
-matters — and that the metric's own doc had to be worded around — is
-narrower: it predicts what the SAME evaluation logic (`condition.evaluate` +
-`apply_update`) would decide from the leader's own resolved read, and
-compares that prediction against apply's confirmed decision. That only ever
-disagrees for a **conditioned** write, and only because the value legitimately
-changed between the leader's read and apply's own fresher one — which is
-symmetric in principle (a leader's stale read can go stale in either
-direction) but the task's intended semantics single out one direction as
-"expected" (leader too pessimistic, apply succeeds) and the other as
-"worth investigating" (leader too optimistic, apply rejects). Both directions
-are mechanically ordinary races, not distinguishable by looking at a single
-disagreement in isolation; the asymmetry is a policy call about which
-direction, if it dominated the counter's rate over time, would suggest a
-real evaluator divergence between the leader-side and apply-side code paths
-(which *are* meant to agree) rather than ordinary timing — worth recording
-in a comment precisely because nothing in the mechanism itself enforces it.
+The mechanism this entry described
+(`predict_kind_eval_decision`/`report_kind_eval_seatbelt_mismatch`,
+`Metric::KindEvalSeatbeltMismatch`, `rmw285_confirm_gate`) was deleted whole by
+ADR 0054 step 4b — see `docs/engineering-lessons-archive.md`'s matching entry
+for the full account. The lesson still generalizes: a legacy double-check kept
+alongside a cutover must predict the SAME decision the new path makes, not
+replicate the old mechanism's own byte-level signal.
 
-**Testing implication**: a regression that manufactures a specific
-disagreement direction needs a *conditioned* write and a genuine timing race
-between two writes to the same key, not just concurrent unconditional ones —
-the existing `rmw285_confirm_gate` test hook (issue #285, already `#[cfg(test)]`
-in `dynamo.rs`) that delays a write's own post-rmw_lock phase is exactly the
-tool for this: arm it, let the gated write's leader-side read observe a
-before-image its own `ConditionExpression` would reject, land a second,
-ungated write in the gap that makes the condition become true, then let the
-first write's entry apply against the now-favorable state. This is a cheap,
-deterministic way to prove a "kept old evaluator vs. new evaluator" double
-check both fires correctly and never fails the request — worth reusing for
-any future ADR 0054-style migration that keeps a comparison-only legacy
-evaluator alongside a cut-over one.
+## When a staged intermediate value can be re-observed as "current state," evaluate-at-apply must recognize its own prior output, not just its own prior input (ADR 0054 step 4a, `TxnStage::pending`)
+
+Moving `TransactWriteItems`' own evaluation into `KvCommand::TxnStage`'s
+apply arm (mirroring step 3's `KvCommand::KindEval`) looked like a pure
+copy of that arm's own "read the current value, evaluate, derive" shape —
+until tracing what "the current value" can mean for a *staged* write, not a
+directly-committed one. A `KindEval` write commits straight to the base
+kind scope; nothing else in the system can make its own key look like "my
+own prior output" before the entry itself even applies. A `TxnStage` write
+instead merges a **provisional intent** onto the same physical key — and
+that intent's own bytes *are* this entry's own already-computed new value,
+sitting right where "the current committed value" would be read from on
+any later re-processing of the identical log entry (an ordinary crash
+restart with no intervening compaction routinely does this — see this
+repo's own "engine_applied vs last_applied" note: the persisted applied
+watermark advances only at compaction/install, not on every commit, so an
+uncompacted restart replays the whole WAL against an already-intact
+engine). A naive port of `KindEval`'s read-then-evaluate shape would read
+that intent as if it were the pre-stage baseline and re-run `op` against
+it — for a non-idempotent update (`ADD`), silently doubling the effect on
+every restart that happens to replay the entry, with no error and no
+visible symptom short of a wrong final number.
+
+**The generalizable shape**: whenever moving evaluation into apply for a
+producer that stages its result as an intermediate/held state (an intent,
+a pending record, any "provisional" envelope a later step commits) rather
+than writing the final value directly, check whether that intermediate
+state can ever be the thing "read current state" reads back — and if it
+can, the apply arm needs an explicit identity check (here: "does the key's
+current envelope belong to *this exact* transaction already?") that
+short-circuits evaluation and reuses the already-computed result verbatim,
+rather than trusting a single "read → evaluate → write" shape to be safe
+just because it was safe for a producer that commits directly. The fix
+does not need a new mechanism — the already-computed value is *right
+there* in the intent's own envelope, decoded by the same read that would
+otherwise misinterpret it — but the bug is invisible to a differential
+test built the `KindEval` way (propose once, compare to a hand-evaluated
+`KindBatch`): the failure only appears if the *same log entry* is
+processed a second time against a state its own first processing already
+changed, which requires a same-engine restart/replay scenario specifically
+(`tests/txn_kind_writes.rs::
+pending_add_stage_survives_a_same_engine_restart_without_double_applying`),
+not the "propose twice with two different entries" shape most concurrency
+tests reach for.

@@ -146,10 +146,9 @@ fn elect(sim: &mut Simulator, group: &Group, live: &[usize], seed: u64) -> usize
 }
 
 fn propose_write(group: &Group, leader: usize, item_key: &[u8], record: &[u8]) -> u64 {
-    match group.nodes[leader].put_kind_batch_conditioned(
+    match group.nodes[leader].put_kind_batch(
         vec![(KIND_BASE, item_key.to_vec(), Some(record.to_vec()))],
         vec![(item_key.to_vec(), record.to_vec())],
-        Vec::new(),
     ) {
         animus_control::ProposeResult::Accepted { index, .. } => index,
         other => panic!("leader rejected a write: {other:?}"),
@@ -253,6 +252,7 @@ fn write_txn_and_journal(
         kind_writes: Vec::new(),
         change_log: Some((item_key.to_vec(), payload.to_vec())),
         stage_marker: None,
+        pending: None,
     };
     let n = node.clone();
     let (txn_id, record_key, outcome) = drive(sim, &env, async move {

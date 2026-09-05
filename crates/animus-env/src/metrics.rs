@@ -670,13 +670,12 @@ pub enum Metric {
     /// own doc for the comparison and its `tracing::warn!` (which logs both
     /// decisions, so the direction is recoverable from the log even though
     /// this one counter does not split by direction).
-    KindEvalSeatbeltMismatch,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 84] = [
+    pub const ALL: [Metric; 83] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -760,7 +759,6 @@ impl Metric {
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
         Metric::ClientRequestsAbandoned,
-        Metric::KindEvalSeatbeltMismatch,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -851,7 +849,6 @@ impl Metric {
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
-            Metric::KindEvalSeatbeltMismatch => "kind_eval_seatbelt_mismatch",
         }
     }
 

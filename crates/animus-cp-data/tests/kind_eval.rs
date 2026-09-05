@@ -1,10 +1,11 @@
-//! `KvCommand::KindEval` (ADR 0054 step 2): the self-contained evaluated
-//! write — apply reads the current committed item, evaluates the condition
-//! and the operation, and derives the index rows/change record, all in one
-//! place, in commit order. Unwired as of this PR (no `animusd` producer
-//! exists yet) — every scenario here drives [`RaftKvNode::propose_kind_eval`]
-//! directly, the same way `tests/kind_batch.rs`/`tests/kind_batch_conditions.rs`
-//! drive `put_kind_batch`/`put_kind_batch_conditioned`.
+//! `KvCommand::KindEval` (ADR 0054 step 2, wired into `animusd` at step 3):
+//! the self-contained evaluated write — apply reads the current committed
+//! item, evaluates the condition and the operation, and derives the index
+//! rows/change record, all in one place, in commit order. Every scenario
+//! here drives [`RaftKvNode::propose_kind_eval`] directly, the same way
+//! `tests/kind_batch.rs` drives `put_kind_batch` (its own former
+//! `conditions` OCC seatbelt, `put_kind_batch_conditioned`, was deleted at
+//! step 4b — `KindEval`'s apply-time read replaced the need for it).
 //!
 //! Harness style borrowed wholesale from `tests/kind_batch.rs` (the
 //! `group`/`leader`/`logical`/`stored` helpers).

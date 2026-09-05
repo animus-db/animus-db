@@ -156,6 +156,12 @@ type KvPair = (Vec<u8>, Vec<u8>);
 /// `txn_stage_participant`'s own `writes` shape exactly, so it rides through
 /// with zero conversion.
 type TxnWrite = animus_cp_data::TxnWrite;
+/// A [`TxnWrite`] awaiting apply-time evaluation (ADR 0054 step 4a) — a
+/// direct alias of `animus_cp_data::PendingTxnWrite`, mirroring `TxnWrite`'s
+/// own alias just above. Built by `ClientCtx::txn_stage_local` from each
+/// `PendingKindWrite` the coordinator/edge hands it, never evaluated here —
+/// see `TxnWrite::pending`'s own doc (`animus-cp-data`) for the full design.
+type PendingTxnWrite = animus_cp_data::PendingTxnWrite;
 /// A stage's own-key conditions, scoped to one (table, tablet) group — the
 /// `animus_cp_data::KvCommand::TxnStage`-shaped `(key, expected)` list
 /// [`ClientCtx::cp_txn`]/`txn_prepare`/`txn_prepare_pushing` pass through to
@@ -557,17 +563,18 @@ impl<E: Env> CpGroup<E> {
 
     /// As [`put`](Self::put), but for a **multi-kind atomic batch** — base
     /// row, LSI rows, footprint and optional change-log records as one Raft
-    /// entry (ADR 0041 §3/§4). See
-    /// [`RaftKvNode::put_kind_batch_conditioned`].
-    fn put_kind_batch_conditioned(
+    /// entry (ADR 0041 §3/§4). Its own-key `conditions` OCC seatbelt (ADR
+    /// 0046 PR1) was deleted in ADR 0054 step 4b — every producer now
+    /// evaluates at apply, so nothing ever populated it beyond an empty
+    /// `Vec`. See [`RaftKvNode::put_kind_batch`].
+    fn put_kind_batch(
         &self,
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
-        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> ProposeResult {
         match self {
-            CpGroup::Lsm(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
-            CpGroup::Mem(n) => n.put_kind_batch_conditioned(writes, change_log, conditions),
+            CpGroup::Lsm(n) => n.put_kind_batch(writes, change_log),
+            CpGroup::Mem(n) => n.put_kind_batch(writes, change_log),
         }
     }
 
@@ -4167,7 +4174,6 @@ impl BoundNode {
             &backup_store_config,
         );
         let data_role = DataRole {
-            rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
@@ -4564,9 +4570,9 @@ pub struct Node {
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
-    /// `ClientCtx`-scoped `pub(crate)` primitive (e.g.
-    /// [`dynamo::kind_write_item_at_leader`]) directly — sharing this node's
-    /// real `rmw_lock`/routing/edge state, not a hand-rolled stand-in — the
+    /// `ClientCtx`-scoped `pub(crate)` primitive (e.g. `admin::
+    /// system_table`) directly via [`Node::ctx_for_test`] — sharing this
+    /// node's real routing/edge state, not a hand-rolled stand-in — the
     /// same reason `confirm_futility_tests` already reaches into `node.edge`.
     /// `#[cfg(test)]`-only: no production cost, and no confusion with the
     /// single source of truth for a live connection's own `ClientCtx`
@@ -5658,7 +5664,6 @@ impl BoundDataNode {
             &backup_store_config,
         );
         let data_role = DataRole {
-            rmw_lock: Arc::new(tokio::sync::Mutex::new(())),
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
@@ -6714,11 +6719,6 @@ impl ChangeRateTracker {
 /// re-derived from whether several unrelated fields all happen to be `Some`.
 #[derive(Clone)]
 struct DataRole {
-    /// Serializes a node's read-modify-writes so a DynamoDB RMW (linearizable
-    /// CP read → CP write) is atomic *per node*. Cross-node atomicity (a CAS on the
-    /// CP group) is later v1 work. Accessed only from the dynamo wire edge,
-    /// whose listener is never bound on a control-only node.
-    pub(crate) rmw_lock: Arc<tokio::sync::Mutex<()>>,
     /// The raftkv-role env's recording metrics sink (the CP group records here).
     /// Aggregated into the `/metrics` export (ADR 0015) alongside the control
     /// sink, which every node has.
@@ -11746,13 +11746,17 @@ pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
 mod confirm_futility_tests {
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tokio::time::{sleep, timeout};
 
+    use animus_cp_data::KindEvalOp;
+    use animus_dynamo::{AttributeValue, ConditionExpression};
     use animus_env::ProdEnv;
+    use animus_item::{Item, TableSchema, WriteSchema};
 
     use crate::config::NodeRole;
+    use crate::write_path::KindEvalApplied;
     use crate::{
         AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
         ProbeIdentity, RoleAddrs, read_frame, run_node, write_frame,
@@ -11838,18 +11842,26 @@ mod confirm_futility_tests {
         );
     }
 
-    /// **The futility early-exit (issue #268).** A `KindBatch` whose own-key
-    /// condition fails applies as a silent no-op (`KindBatch.conditions`,
-    /// `animus-cp-data`) — the probed effect never appears even though the
-    /// accepted entry committed and applied fine. Pre-fix, `cp_kind_local`'s
-    /// confirm loop polled value equality for the whole `CLIENT_TIMEOUT`
-    /// (10s) before erring — the exact per-attempt burn that let brief
-    /// leadership churn on a starved CI runner stack two 10s stalls into one
-    /// 25s client budget (the cp_txn.rs seed-put flake). Post-fix the loop
-    /// notices `engine_applied_index()` passed the accepted entry without
-    /// its effect and errs immediately, in the house retryable shape.
+    /// **The futility early-exit (issue #268), retargeted for ADR 0054 step
+    /// 4b.** A `KindBatch`'s own-key `conditions` OCC seatbelt (the
+    /// mechanism this test originally exercised) is deleted — every
+    /// producer evaluates at apply now — so the scenario is rebuilt on the
+    /// mechanism that replaced it: a `KvCommand::KindEval` whose own
+    /// `ConditionExpression` evaluates to `false` against apply's fresh
+    /// read. Unlike the old `cp_kind_local` path (whose confirm loop only
+    /// ever polled raw value equality and had to notice a no-op the slow
+    /// way, via `engine_applied_index()` outrunning the accepted entry),
+    /// `cp_kind_eval_local`'s confirm loop consults the replicated
+    /// `KindBatchOutcome` map directly — a `ConditionFailed` outcome is a
+    /// fast, positive `Ok(KindEvalApplied::ConditionFailed)`, not a slow
+    /// `Err`. What this test still proves, byte for byte the same as
+    /// before: the confirm loop notices the no-op almost immediately
+    /// instead of polling out the whole `CLIENT_TIMEOUT` (10s) — the exact
+    /// per-attempt burn that used to let brief leadership churn on a
+    /// starved CI runner stack two 10s stalls into one 25s client budget
+    /// (the cp_txn.rs seed-put flake).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_condition_failed_kind_batch_fails_fast_with_a_retryable_error() {
+    async fn a_condition_failed_kind_eval_fails_fast_and_does_not_apply() {
         let dir = tempfile::tempdir().unwrap();
         let (node, config) = single_node(dir.path()).await;
         let client = config.nodes[0].client;
@@ -11869,263 +11881,92 @@ mod confirm_futility_tests {
             .expect("this node hosts the tablet");
         assert!(group.is_leader(), "single-voter group leads locally");
 
-        // A batch guarded by a condition that cannot hold (the key was never
-        // written): accepted + applied as a no-op, effect never appears.
+        // A minimal, self-contained schema — no catalog registration is
+        // needed (or reached): the condition fails before any index/LSI
+        // derivation is ever attempted.
+        let schema = WriteSchema {
+            key: TableSchema::simple("pk"),
+            lsis: Vec::new(),
+            change_records_carry_images: false,
+        };
+        let pk = AttributeValue::S("cf-target".to_owned());
+        let base_key = crate::dynamo::item_key(&pk, None);
+
+        // A condition that cannot hold (the item was never written):
+        // accepted + applied as a fast, confirmed no-op.
         let started = tokio::time::Instant::now();
-        // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local`
+        // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
         // takes no `self`/`R`-typed argument, so nothing here pins down `R`
         // for the now-generic `ClientCtx<E, R>` path.
-        let err = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
+        let result = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_eval_local(
             &group,
-            vec![(
-                animus_cp_data::KIND_BASE,
-                b"cf-target".to_vec(),
-                Some(b"must-not-land".to_vec()),
-            )],
-            Vec::new(),
-            vec![(b"cf-guard".to_vec(), Some(b"wrong-expected".to_vec()))],
+            schema.clone(),
+            pk.clone(),
+            None,
+            KindEvalOp::Put(Item::from([("pk".to_owned(), pk.clone())])),
+            Some(ConditionExpression::AttributeExists("pk".to_owned())),
+            false,
+            &base_key,
             // A Put-shaped kind write (never an `ADD`) — idempotent.
             ProbeIdentity::ValueProves,
         )
         .await
-        .expect_err("a condition-failed kind batch must not confirm");
+        .expect("a condition-failed KindEval still confirms — as a no-op, not an error");
         let elapsed = started.elapsed();
 
         assert!(
-            err.ends_with("; retry"),
-            "the failure must carry the house retryable shape so caller loops re-route: {err}"
+            matches!(result, KindEvalApplied::ConditionFailed),
+            "the write must be reported as a condition failure, not applied"
         );
         assert!(
             elapsed < Duration::from_secs(5),
-            "a provably-futile confirm wait must end fast (pre-fix: polled out the whole \
-             10s CLIENT_TIMEOUT): took {elapsed:?}"
+            "a provably-futile confirm wait must end fast (the pre-ADR-0054 `cp_kind_local` \
+             path polled out the whole 10s CLIENT_TIMEOUT before noticing): took {elapsed:?}"
+        );
+        assert_eq!(
+            group
+                .local_get_kind(animus_cp_data::KIND_BASE, &base_key)
+                .await,
+            None,
+            "the condition-failed write must never have applied"
         );
 
         // The early exit fired on the no-op, not on a broken group: an
-        // ordinary unconditioned write through the same path still confirms.
-        ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_local(
+        // ordinary unconditioned write through the same path still confirms
+        // and applies.
+        let after_pk = AttributeValue::S("cf-after".to_owned());
+        let after_key = crate::dynamo::item_key(&after_pk, None);
+        let after_result = ClientCtx::<ProdEnv, AnimusdRelayClient>::cp_kind_eval_local(
             &group,
-            vec![(
-                animus_cp_data::KIND_BASE,
-                b"cf-after".to_vec(),
-                Some(b"lands".to_vec()),
-            )],
-            Vec::new(),
-            Vec::new(),
+            schema,
+            after_pk.clone(),
+            None,
+            KindEvalOp::Put(Item::from([("pk".to_owned(), after_pk)])),
+            None,
+            false,
+            &after_key,
             ProbeIdentity::ValueProves,
         )
         .await
         .expect("an ordinary write after the futile one still confirms");
+        assert!(matches!(after_result, KindEvalApplied::Ok { .. }));
 
         node.shutdown();
     }
 
-    /// Regression for issue #285: `dynamo::kind_write_item_at_leader` used to
-    /// hold `ctx.data().rmw_lock` across the whole `cp_kind_local` propose+
-    /// confirm-poll, not just its own read+evaluate — so one item's slow
-    /// confirm (apply backlog stretches this even with the #268 fast-fail
-    /// above) stalled *every other* evaluated write on the node behind it,
-    /// including a write to a completely unrelated tablet.
-    ///
-    /// A `ConditionExpression` failure can't reproduce this: it returns
-    /// (`ConditionFailed`) before `cp_kind_local` is ever called, so the
-    /// lock is released at the same point regardless of the fix — the bug
-    /// is specifically about the propose+confirm phase, which a failed
-    /// eval-time condition never reaches.
-    ///
-    /// **Why this doesn't race a real apply backlog.** An earlier version of
-    /// this test built the "slow propose+confirm" scenario for real, with a
-    /// concurrent filler flood against the write's own tablet running for a
-    /// fixed wall-clock window, hoping the flood's own commits would grow
-    /// the tablet's apply backlog faster than the target write's confirm
-    /// could drain it. That is a real race, not a guarantee: on a CPU-
-    /// starved runner the flood is starved right along with everything
-    /// else, so it can fail to build any backlog at all — observed in CI on
-    /// commit `97289e2`, where two parallel runs of the identical code came
-    /// back one green and one red, the red one logging `DIAG: unrelated
-    /// write (group B) took 103.937566ms` with the "slow" write having
-    /// *already finished*. This test now uses
-    /// `dynamo::rmw285_confirm_gate` (see its own doc) to hold write A's
-    /// propose+confirm phase open for a fixed, generous delay under this
-    /// test's own control instead of hoping a flood wins a scheduling race
-    /// — the in-flight window this regresses against no longer depends on
-    /// how contended the machine happens to be.
-    ///
-    /// A second, wholly unrelated tablet (its own independent Raft group and
-    /// apply pipeline) then proves the point: pre-fix, a write to it queues
-    /// behind the node-wide lock held for write A's entire gated
-    /// read+propose+confirm; post-fix the lock is released the moment
-    /// write A's read+evaluate finishes, so the second write is unaffected
-    /// by write A's still-ongoing (artificially held-open) confirm phase.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let (node, _config) = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-
-        ctx.provision_tablet("rmw_285_a")
-            .await
-            .expect("provisioning table A");
-        ctx.provision_tablet("rmw_285_b")
-            .await
-            .expect("provisioning table B");
-        let meta = node.metadata();
-        let tablet_a = *meta
-            .tablets_for_table("rmw_285_a")
-            .next()
-            .expect("table A has a tablet")
-            .0;
-        let tablet_b = *meta
-            .tablets_for_table("rmw_285_b")
-            .next()
-            .expect("table B has a tablet")
-            .0;
-        let group_a = node
-            .edge
-            .local_cp(tablet_a)
-            .expect("this node hosts table A's tablet");
-        let group_b = node
-            .edge
-            .local_cp(tablet_b)
-            .expect("this node hosts table B's tablet");
-        // `provision_tablet` alone does not wait for the group to actually
-        // elect (its own doc: an ordinary caller's routed op does that via
-        // `cp_route`) — poll rather than assert immediately.
-        for group in [&group_a, &group_b] {
-            timeout(Duration::from_secs(10), async {
-                while !group.is_leader() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("tablet group did not elect a local leader in time");
-        }
-
-        // Arm write A's propose+confirm phase to hold open for a fixed
-        // delay once it releases `rmw_lock` (see `dynamo::
-        // rmw285_confirm_gate`'s doc for why this replaced a real,
-        // load-sensitive filler flood). `GATE_DELAY` only needs to
-        // comfortably outlast an ordinary unrelated write's own
-        // read+evaluate+propose+confirm — including under real contention:
-        // CI observed 104ms for that under load (commit `97289e2`), so this
-        // leaves roughly a 20x margin, not a hand-tuned near-miss.
-        const GATE_DELAY: Duration = Duration::from_secs(2);
-        crate::dynamo::rmw285_confirm_gate::arm("rmw_285_a", GATE_DELAY);
-
-        let mut item_a = animus_dynamo::Item::new();
-        item_a.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("slow-item".to_string()),
-        );
-        let pk_a = animus_dynamo::AttributeValue::S("slow-item".to_string());
-        let slow = tokio::spawn({
-            let ctx = ctx.clone();
-            let group_a = group_a.clone();
-            let meta = meta.clone();
-            async move {
-                crate::dynamo::kind_write_item_at_leader(
-                    &ctx,
-                    &group_a,
-                    &meta,
-                    "rmw_285_a",
-                    &pk_a,
-                    None,
-                    crate::KindWriteOp::Put(item_a),
-                    None,
-                    false,
-                )
-                .await
-            }
-        });
-
-        // Cosmetic pacing only (not load-bearing): give write A's task a
-        // moment to actually start running before write B is spawned, so
-        // the two don't merely race to get scheduled at all. The gate above
-        // is what actually makes write A's in-flight window deterministic.
-        sleep(Duration::from_millis(10)).await;
-
-        let mut item_b = animus_dynamo::Item::new();
-        item_b.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("unrelated-item".to_string()),
-        );
-        let pk_b = animus_dynamo::AttributeValue::S("unrelated-item".to_string());
-        let started = Instant::now();
-        let outcome = timeout(
-            Duration::from_secs(60),
-            crate::dynamo::kind_write_item_at_leader(
-                &ctx,
-                &group_b,
-                &meta,
-                "rmw_285_b",
-                &pk_b,
-                None,
-                crate::KindWriteOp::Put(item_b),
-                None,
-                false,
-            ),
-        )
-        .await
-        .expect("the unrelated write must not need the outer 60s safety timeout")
-        .expect("the unrelated write must itself succeed");
-        let elapsed = started.elapsed();
-        eprintln!("DIAG: unrelated write (group B) took {elapsed:?}");
-        assert!(
-            matches!(outcome, crate::dynamo::KindWriteOutcome::Ok { .. }),
-            "the unrelated write must actually land, not just return some outcome"
-        );
-
-        // What this actually proves, and what it does not. Pre-fix,
-        // `rmw_lock` is one node-wide lock held across write A's whole
-        // call, so write B cannot even *start* its own read until write A's
-        // ENTIRE call (read+evaluate+propose+confirm) returns and drops the
-        // guard — under that code, write B could never observe write A as
-        // still in flight. Post-fix, write A drops the lock the moment its
-        // own read+evaluate finishes, then (via the gate armed above) sits
-        // in its propose+confirm phase for a fixed `GATE_DELAY` before ever
-        // proposing — so write B, unblocked as soon as the lock frees,
-        // reliably finishes and returns while write A is still gated.
-        //
-        // This is *not* a hard ordering guarantee in the way the assertion
-        // below reads on its own: it holds because `GATE_DELAY` was chosen
-        // to comfortably outlast write B's own real duration (see that
-        // constant's doc), not because the two are ordered by construction.
-        // A version of write B slow enough to exceed `GATE_DELAY` — which
-        // the `elapsed` check right below also guards against — could in
-        // principle still invert it. What *is* load-independent is the
-        // mechanism: write A's in-flight window no longer depends on a
-        // flood winning a real-time race to build apply backlog, only on
-        // write B finishing inside a fixed, generous budget.
-        assert!(
-            !slow.is_finished(),
-            "the gated write (group A) must still be in flight when the unrelated write \
-             (group B) returns — pre-fix, the unrelated write cannot even start until the \
-             gated write's ENTIRE call (including its confirm-poll) has already returned and \
-             released the node-wide rmw_lock, so it could never observe this"
-        );
-        // The load-bearing margin for the assertion above: write B must
-        // finish well inside `GATE_DELAY`, not just inside some loose
-        // hang-guard ceiling — a regression that re-widens `rmw_lock`'s
-        // scope would force write B to wait out (most of) `GATE_DELAY`
-        // itself, which this catches even if `slow.is_finished()` above
-        // somehow didn't.
-        assert!(
-            elapsed < GATE_DELAY / 2,
-            "the unrelated write took implausibly long relative to GATE_DELAY={GATE_DELAY:?} — \
-             either implausible CI noise, or rmw_lock's scope regressed to cover write A's \
-             gated propose/confirm phase again: {elapsed:?}"
-        );
-
-        let slow_started = Instant::now();
-        slow.await
-            .expect("slow task panicked")
-            .expect("the gated write must itself eventually succeed too");
-        eprintln!(
-            "DIAG: slow task (group A) finished {:?} after the unrelated write returned",
-            slow_started.elapsed()
-        );
-        node.shutdown();
-    }
+    // Issue #285's own regression,
+    // `an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_
+    // confirm_wait`, is retired (ADR 0054 step 4b): it proved
+    // `kind_write_item_at_leader` released `rmw_lock` before its own
+    // propose+confirm phase rather than holding it across the whole call —
+    // a real property when the lock existed. `rmw_lock` itself is deleted
+    // now (no producer evaluates at the leader any more, ADR 0054 steps
+    // 3/4a), so there is no lock left whose scope this test could still be
+    // regressing against; every write-write pair on two different tablets
+    // is now unconditionally independent by construction (no shared
+    // node-wide state between them at all), not merely lock-scoped
+    // correctly. `dynamo::rmw285_confirm_gate`, this test's own fault
+    // injector, is retired with it — it had no other caller.
 }
 
 /// Issue #316 regression: `ClientCtx::forward_to_tablet_leader` must chase
@@ -13648,186 +13489,13 @@ mod status_wire_compat_tests {
     }
 }
 
-/// Issue #412 regression: a leader-side old-image read failure with the
-/// house `"; retry"` shape (a leader-moved/no-longer-leader condition) must
-/// never surface as a terminal error while retries remain, for either the
-/// ordinary evaluate-at-leader write path (`dynamo::
-/// kind_write_item_at_leader` via `ClientCtx::cp_kind_write_item`) or its
-/// transactional twin (`dynamo::eval_kind_txn_write` via `ClientCtx::
-/// txn_prepare_pushing`). Uses `dynamo::leader_read_failure_gate` to inject
-/// the failure deterministically rather than orchestrating a real
-/// leadership change — same idiom as `dynamo::rmw285_confirm_gate`.
-#[cfg(test)]
-mod issue_412_tests {
-    use std::net::SocketAddr;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use tokio::time::{sleep, timeout};
-
-    use crate::config::NodeRole;
-    use crate::dynamo::{self, leader_read_failure_gate};
-    use crate::{ClientCtx, ClusterConfig, KindWriteOp, Node, RoleAddrs, run_node};
-
-    fn free_addrs(count: usize) -> Vec<SocketAddr> {
-        let ls: Vec<std::net::TcpListener> = (0..count)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        ls.iter().map(|l| l.local_addr().unwrap()).collect()
-    }
-
-    fn single_node_config() -> ClusterConfig {
-        let addrs = free_addrs(6);
-        ClusterConfig {
-            nodes: vec![RoleAddrs {
-                id: crate::config::node_id(0),
-                role: NodeRole::Both,
-                internal: addrs[0],
-                client: addrs[1],
-                dynamo: addrs[2],
-                admin: addrs[3],
-                intra: addrs[4],
-                console: addrs[5],
-                advertise_host: None,
-            }],
-            dynamo_auth: None,
-            cluster_settings: None,
-        }
-    }
-
-    /// Same bounded fresh-config retry every in-crate bring-up in this
-    /// crate uses (`docs/engineering-lessons.md`) against the port-TOCTOU
-    /// race under `cargo test --workspace` contention.
-    async fn single_node(dir: &Path) -> Node {
-        let mut last_err = None;
-        for attempt in 0..16 {
-            let config = single_node_config();
-            match run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
-                Ok(node) => return node,
-                Err(e) => {
-                    last_err = Some(e);
-                    sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-        panic!(
-            "could not bring up single node after retries (ports kept getting stolen): {last_err:?}"
-        );
-    }
-
-    /// Provisions `table`'s first tablet and waits for its single-voter
-    /// group to actually elect locally — `provision_tablet` alone does not
-    /// wait for that (`confirm_futility_tests`'s identical polling doc).
-    async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
-        ctx.provision_tablet(table)
-            .await
-            .expect("provisioning table");
-        let tablet = *node
-            .metadata()
-            .tablets_for_table(table)
-            .next()
-            .expect("provisioning created a tablet")
-            .0;
-        let group = node
-            .edge
-            .local_cp(tablet)
-            .expect("this single node hosts the tablet");
-        timeout(Duration::from_secs(10), async {
-            while !group.is_leader() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("tablet group did not elect a local leader in time");
-    }
-
-    /// The ordinary (non-transactional) evaluate-at-leader write path
-    /// retries a leader-moved-shaped read failure to success —
-    /// `ClientCtx::cp_kind_write_item`'s issue #288 retry loop already
-    /// re-resolves routing on this exact `"; retry"` shape (confirming this
-    /// half of #412 was already sound; the txn-side twin below is the
-    /// actual fix).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn kind_write_item_retries_a_leader_moved_read_failure_to_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-        provision_and_await_leader(&node, &ctx, "issue412_plain").await;
-        let meta = node.metadata();
-
-        leader_read_failure_gate::arm("issue412_plain", 2);
-
-        let mut item = animus_dynamo::Item::new();
-        item.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("k1".to_string()),
-        );
-        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
-        let outcome = ctx
-            .cp_kind_write_item(
-                &meta,
-                "issue412_plain",
-                &pk,
-                None,
-                KindWriteOp::Put(item),
-                None,
-            )
-            .await
-            .expect(
-                "a retryable leader-moved read failure must be retried to success, \
-                 never surfaced as a terminal error",
-            );
-        assert!(matches!(outcome, dynamo::KindWriteOutcome::Ok { .. }));
-
-        node.shutdown();
-    }
-
-    /// Issue #412's actual fix: the transactional stage-time evaluator
-    /// (`dynamo::eval_kind_txn_write`, reached via `TransactWriteItems`)
-    /// hits the identical leader-moved read failure — pre-fix, it escaped
-    /// `ClientCtx::txn_prepare_pushing`'s bounded retry loop via `?` on the
-    /// very first attempt and would have surfaced as a terminal whole-txn
-    /// cancel. Calls `txn_prepare_pushing` directly (the function whose
-    /// retry loop this fixes) with a single anchor-only pending kind write,
-    /// so a failure here can only mean that loop itself didn't retry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn txn_prepare_pushing_retries_a_leader_moved_read_failure_to_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-        provision_and_await_leader(&node, &ctx, "issue412_txn").await;
-
-        leader_read_failure_gate::arm("issue412_txn", 2);
-
-        let mut item = animus_dynamo::Item::new();
-        item.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("k1".to_string()),
-        );
-        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
-        let pending = crate::PendingKindWrite {
-            pk,
-            sk: None,
-            op: KindWriteOp::Put(item),
-            condition: None,
-        };
-        ctx.txn_prepare_pushing(
-            "issue412_txn",
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![pending],
-        )
-        .await
-        .expect(
-            "a retryable leader-moved read failure inside the stage-time evaluator must be \
-             retried to success, never a terminal whole-txn cancel",
-        );
-
-        node.shutdown();
-    }
-}
+// Issue #412 regression module retired (ADR 0054 step 4b): its fault
+// injector, `dynamo::leader_read_failure_gate`, targeted a leader-side
+// old-image read that no longer exists anywhere in the write path (see
+// `kind_write_item_at_leader`'s own doc). Its plain-write test
+// (`kind_write_item_retries_a_leader_moved_read_failure_to_success`) and
+// its already-retired (ADR 0054 step 4a) transactional twin both proved
+// properties about a read this ADR's whole point was to delete.
 
 /// ADR 0061 Phase C's closing rung (the seventh 2026-08-28 amendment): a
 /// `SimEnv`-driven harness that constructs a real `ClientCtx<SimEnv, _>` —

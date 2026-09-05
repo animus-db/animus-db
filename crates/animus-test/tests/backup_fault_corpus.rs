@@ -294,13 +294,12 @@ fn backup_capture_tick(
     if rows.is_empty() {
         cur.phase += 1;
         cur.next_key = Vec::new();
-        let result = node.put_kind_batch_conditioned(
+        let result = node.put_kind_batch(
             vec![(
                 KIND_CURSOR,
                 cursor_key_bytes,
                 Some(encode_capture_cursor(&cur)),
             )],
-            Vec::new(),
             Vec::new(),
         );
         propose_confirmed(sim, node, seed, result);
@@ -337,13 +336,12 @@ fn backup_capture_tick(
             cur.next_key = Vec::new();
         }
     }
-    let result = node.put_kind_batch_conditioned(
+    let result = node.put_kind_batch(
         vec![(
             KIND_CURSOR,
             cursor_key_bytes,
             Some(encode_capture_cursor(&cur)),
         )],
-        Vec::new(),
         Vec::new(),
     );
     propose_confirmed(sim, node, seed, result);
@@ -868,6 +866,7 @@ fn scenario_single_tablet_backup_converges_under_concurrent_writes(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();
@@ -1248,6 +1247,7 @@ fn scenario_restore_round_trip_matches_model_at_capture_cut_version(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();
@@ -1866,6 +1866,7 @@ fn scenario_chaotic_network_capture_converges(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();

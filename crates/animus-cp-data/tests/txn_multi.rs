@@ -795,6 +795,7 @@ fn kind_bearing_participant_materializes_its_lsi_row_and_change_record_at_resolv
         )],
         change_log: Some((kb_change_prefix.clone(), b"account-change".to_vec())),
         stage_marker: None,
+        pending: None,
     };
     let stage_ts = stage_participant_kind(
         &mut sim,

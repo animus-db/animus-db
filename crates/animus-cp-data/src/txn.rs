@@ -121,9 +121,11 @@
 //! guards against.
 
 use animus_env::NodeId;
+use animus_item::{AttributeValue, ConditionExpression, WriteSchema};
 use animus_tablet::{KeyRange, TOKEN_BYTES};
 use serde::{Deserialize, Serialize};
 
+use crate::KindEvalOp;
 use crate::hlc::HlcTimestamp;
 
 /// The second byte of a txn record key's lead pair (see the module doc's
@@ -255,6 +257,23 @@ pub enum StageOutcome {
     /// already decided by a concurrent recovery push before this genuine
     /// stage arrived (see `KvCommand::TxnStage`'s resurrection-guard doc).
     Fenced,
+    /// **ADR 0054 step 4a**: a [`TxnWrite::pending`] write's own apply-time
+    /// evaluation was rejected — `condition.evaluate` returned `Err` (a
+    /// domain violation, e.g. `size()` on the wrong type) or `op`'s
+    /// `Update` folded via `animus_item::apply_update` and that returned
+    /// `Err` (a malformed update, a type mismatch, or the post-update item
+    /// over the size cap) — the [`KindBatchOutcome::Rejected`](crate::
+    /// KindBatchOutcome::Rejected) sibling for a staged write, distinct
+    /// from [`ConditionFailed`](Self::ConditionFailed) because `code`/
+    /// `message` carry genuinely different information a caller needs
+    /// (`ConditionFailed` is a routine `ConditionalCheckFailedException`;
+    /// this is a `ValidationException`-shaped failure). `key` is the
+    /// rejected write's own base key.
+    Rejected {
+        key: Vec<u8>,
+        code: String,
+        message: String,
+    },
 }
 
 /// The result of one **apply-time `TxnResolve`** attempt (ADR 0018 §2
@@ -387,6 +406,54 @@ pub struct TxnWrite {
     /// `None` (fresh-clusters; the binary codec bumps its version anyway).
     #[serde(default)]
     pub stage_marker: Option<(Vec<u8>, Vec<u8>)>,
+    /// **Apply-time evaluation (ADR 0054 step 4a).** When `Some`,
+    /// `value`/`kind_writes`/`change_log` above are ignored at propose time
+    /// (left at their zero values by every producer) and computed instead
+    /// by `KvCommand::TxnStage`'s own apply arm — reading the item's
+    /// current committed value **in commit order**, evaluating
+    /// `condition`/`op` fresh against exactly that state, and deriving the
+    /// index rows/change record via the same `animus_item::
+    /// derive_kind_writes`/[`crate::evaluate_kind_eval`] core
+    /// `KvCommand::KindEval` already uses — never a second copy. This is
+    /// what closes the propose→apply staleness window for a transactional
+    /// write the exact way ADR 0054 already closed it for the ordinary
+    /// write path: the value this write's own condition/update evaluates
+    /// against is read at the moment it is decided, not echoed from a
+    /// leader-side pre-read that may have gone stale by the time this
+    /// entry commits.
+    ///
+    /// **No apply-time OCC seatbelt is carried alongside this** (unlike
+    /// the pre-4a design's mandatory own-key `conditions` entry, ADR 0046
+    /// Fork C1) — apply's own read already IS the current committed state,
+    /// so there is nothing left for a seatbelt to guard against. A
+    /// same-txn WAL replay of this exact stage is handled by reusing the
+    /// intent's own already-computed payload rather than re-evaluating
+    /// against it (re-evaluating would double-apply a non-idempotent
+    /// update like `ADD` against its own prior result) — see the apply
+    /// arm's own doc.
+    ///
+    /// `stage_marker` above is unaffected: it is a pure function of `pk`/
+    /// `sk` alone (an image-less dirty-key marker, ADR 0049 §3), so it
+    /// carries no state that could go stale and is still built once, at
+    /// propose time, regardless of whether this field is set.
+    #[serde(default)]
+    pub pending: Option<PendingTxnWrite>,
+}
+
+/// A [`TxnWrite`] awaiting **apply-time evaluation** — the `TxnStage`
+/// sibling of `KvCommand::KindEval`'s own self-contained payload, carrying
+/// the identical fields minus `ts` (this write's enclosing `TxnStage` entry
+/// already carries one, shared by every write staged in it). See
+/// [`TxnWrite::pending`]'s doc for the full design and
+/// `KvCommand::KindEval`'s doc for what each field means.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTxnWrite {
+    pub schema: WriteSchema,
+    pub pk: AttributeValue,
+    pub sk: Option<AttributeValue>,
+    pub op: KindEvalOp,
+    pub condition: Option<ConditionExpression>,
+    pub ttl_expired: bool,
 }
 
 impl TxnWrite {
@@ -401,6 +468,27 @@ impl TxnWrite {
             kind_writes: Vec::new(),
             change_log: None,
             stage_marker: None,
+            pending: None,
+        }
+    }
+
+    /// A write whose base value/kind-writes/change-log are computed at
+    /// **apply**, not here — see [`Self::pending`]'s doc. `stage_marker` is
+    /// still built by the caller (it depends only on `pk`/`sk`, never on
+    /// state that could go stale).
+    #[must_use]
+    pub fn pending_eval(
+        key: Vec<u8>,
+        stage_marker: Option<(Vec<u8>, Vec<u8>)>,
+        pending: PendingTxnWrite,
+    ) -> Self {
+        TxnWrite {
+            key,
+            value: None,
+            kind_writes: Vec::new(),
+            change_log: None,
+            stage_marker,
+            pending: Some(pending),
         }
     }
 }
