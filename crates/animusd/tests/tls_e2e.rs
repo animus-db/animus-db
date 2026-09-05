@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use animusd::ClusterConfig;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -27,7 +29,7 @@ mod support;
 /// Decision 2).
 fn server_only_connector(ca_path: &Path) -> tokio_rustls::TlsConnector {
     let bytes = std::fs::read(ca_path).expect("read ca.pem");
-    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
+    let certs = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse ca certs");
     let mut root_store = rustls::RootCertStore::empty();
@@ -53,7 +55,7 @@ fn mutual_connector(
     own_key_path: &Path,
 ) -> tokio_rustls::TlsConnector {
     let ca_bytes = std::fs::read(trust_ca_path).expect("read ca.pem");
-    let ca_certs = rustls_pemfile::certs(&mut ca_bytes.as_slice())
+    let ca_certs = CertificateDer::pem_slice_iter(&ca_bytes)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse ca certs");
     let mut root_store = rustls::RootCertStore::empty();
@@ -61,13 +63,11 @@ fn mutual_connector(
         root_store.add(cert).expect("add ca cert");
     }
     let own_cert_bytes = std::fs::read(own_cert_path).expect("read own cert");
-    let own_certs = rustls_pemfile::certs(&mut own_cert_bytes.as_slice())
+    let own_certs = CertificateDer::pem_slice_iter(&own_cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse own certs");
     let own_key_bytes = std::fs::read(own_key_path).expect("read own key");
-    let own_key = rustls_pemfile::private_key(&mut own_key_bytes.as_slice())
-        .expect("parse own key")
-        .expect("own key present");
+    let own_key = PrivateKeyDer::from_pem_slice(&own_key_bytes).expect("own key present");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

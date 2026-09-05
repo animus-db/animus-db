@@ -1245,6 +1245,7 @@ impl Env for ProdEnv {
 mod tests {
     use super::*;
     use crate::{Disk, SegmentStore};
+    use rustls_pki_types::pem::PemObject;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A unique temp directory for one test (no extra deps): the system temp dir
@@ -2221,7 +2222,7 @@ mod tests {
             (ca_bytes, ())
         };
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca_pem.as_slice())
+        for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&ca_pem)
             .collect::<Result<Vec<_>, _>>()
             .expect("parse ca certs")
         {

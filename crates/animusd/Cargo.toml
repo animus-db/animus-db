@@ -118,7 +118,7 @@ rcgen = "0.13"
 # `animusd`'s own production TLS material always goes through `animus-env`
 # (already a normal dependency).
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 # For the reconfigure-loop test (#3), which drives the replicated tablet map
 # directly: `CasTabletReplicas` needs `TabletId` + `Epoch`.
 animus-tablet.workspace = true

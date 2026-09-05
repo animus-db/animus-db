@@ -36,7 +36,7 @@ the production implementation; the deterministic implementation lives in
   `#[cfg(feature = "prod")]`. The trait definitions, `NodeId`, and
   `metrics.rs` need none of this and are never gated.
   **Only `tokio`, `rand`, `tracing`, `rustls`, `tokio-rustls`,
-  `rustls-pemfile`, and `rustls-pki-types` are `prod`-only** and became
+  and `rustls-pki-types` are `prod`-only** and became
   `optional = true` dependencies pulled in by the feature
   (`async-trait`/`serde`/`thiserror` back the trait definitions and `NodeId`
   themselves, so they stay unconditional). Every current consumer that

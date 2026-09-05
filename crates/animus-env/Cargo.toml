@@ -27,7 +27,6 @@ prod = [
     "dep:tracing",
     "dep:rustls",
     "dep:tokio-rustls",
-    "dep:rustls-pemfile",
     "dep:rustls-pki-types",
 ]
 
@@ -49,7 +48,6 @@ tracing = { workspace = true, optional = true }
 # this list — `TlsConfig`/`MaybeTlsStream` live in `prod.rs`.
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]

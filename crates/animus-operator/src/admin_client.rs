@@ -33,6 +33,7 @@ use hyper::{Request, Response, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls_pki_types::pem::PemObject;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -150,8 +151,7 @@ impl Service<Uri> for AdminConnector {
 /// `kube::Client`, which happens before any admin call this connector
 /// serves).
 fn build_tls_connector(ca_pem: &[u8]) -> Result<tokio_rustls::TlsConnector, AdminError> {
-    let mut reader = ca_pem;
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| AdminError::Tls(format!("parsing CA PEM: {e}")))?;
     if certs.is_empty() {

@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use animus_env::MaybeTlsStream;
 use animusd::{ClientRequest, ClientResponse, read_frame, write_frame};
+use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -98,7 +99,7 @@ fn extract_tls_ca(args: &mut Vec<String>) -> Result<Option<String>, String> {
 /// `rustls` rejects the resulting root store.
 fn build_tls_connector(ca_path: &str) -> Result<tokio_rustls::TlsConnector, String> {
     let bytes = std::fs::read(ca_path).map_err(|e| format!("reading --tls-ca {ca_path}: {e}"))?;
-    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("parsing --tls-ca {ca_path}: {e}"))?;
     let mut root_store = rustls::RootCertStore::empty();

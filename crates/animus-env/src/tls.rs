@@ -42,6 +42,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -62,10 +63,11 @@ use tokio::net::TcpStream;
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// PEM file: this node's own certificate (leaf, optionally followed by
-    /// intermediates — the full chain `rustls_pemfile::certs` finds).
+    /// intermediates — the full chain `CertificateDer::pem_slice_iter`
+    /// finds).
     pub cert_path: PathBuf,
     /// PEM file: this node's private key (PKCS#8, PKCS#1, or SEC1 — whatever
-    /// `rustls_pemfile::private_key` recognizes).
+    /// `PrivateKeyDer::from_pem_slice` recognizes).
     pub key_path: PathBuf,
     /// PEM file: the cluster CA certificate(s) trusted for both verifying an
     /// inbound peer's client cert and this node's own outbound dials.
@@ -262,11 +264,11 @@ fn root_cert_store(ca_path: &Path) -> io::Result<rustls::RootCertStore> {
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
     let bytes = std::fs::read(path)
         .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", path.display())))?;
-    let certs = rustls_pemfile::certs(&mut bytes.as_slice())
+    let certs = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             io::Error::new(
-                e.kind(),
+                io::ErrorKind::InvalidData,
                 format!("parsing certs in {}: {e}", path.display()),
             )
         })?;
@@ -282,14 +284,16 @@ fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
 fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
     let bytes = std::fs::read(path)
         .map_err(|e| io::Error::new(e.kind(), format!("reading {}: {e}", path.display())))?;
-    rustls_pemfile::private_key(&mut bytes.as_slice())
-        .map_err(|e| io::Error::new(e.kind(), format!("parsing key in {}: {e}", path.display())))?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("no private key found in {}", path.display()),
-            )
-        })
+    PrivateKeyDer::from_pem_slice(&bytes).map_err(|e| match e {
+        rustls_pki_types::pem::Error::NoItemsFound => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no private key found in {}", path.display()),
+        ),
+        e => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parsing key in {}: {e}", path.display()),
+        ),
+    })
 }
 
 fn to_io_error<E: std::fmt::Display>(err: E) -> io::Error {

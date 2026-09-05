@@ -54,7 +54,6 @@ http = "1.5.0"
 # not depend on `animus-env`/`animus-cli`, so it builds its own small
 # equivalent rather than reusing theirs — see `admin_client.rs`'s own doc).
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 # `tower_service::Service<Uri>` is the trait a custom hyper-util client
 # connector implements (`admin_client.rs::AdminConnector`) — already in the

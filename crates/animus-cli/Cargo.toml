@@ -30,4 +30,4 @@ serde_json.workspace = true
 animus-env = { workspace = true, features = ["prod"] }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
