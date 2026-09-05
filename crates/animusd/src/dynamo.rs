@@ -188,6 +188,7 @@ use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http;
+use crate::write_path::KindEvalApplied;
 use crate::{ClientCtx, CpGroup, KindWriteOp, ProbeIdentity, ReadConsistency, SnapshotRead};
 
 /// How long `CreateTable` waits for its `CreateTableSchema` proposal to commit in
@@ -5816,82 +5817,77 @@ pub(crate) mod leader_read_failure_gate {
     }
 }
 
-/// **The evaluate-at-leader write path (ADR 0046 U3)** for `PutItem`/
-/// `DeleteItem`/`UpdateItem` on an indexed or streamed table — replaces
-/// `index_aware_write`'s edge-evaluated design, which had a real cross-node
-/// race: two edge nodes writing the same item never contended on the same
-/// **node-local** `ctx.data().rmw_lock`, so both could read → diff against
-/// the same stale `old` and the loser's stale LSI row orphaned forever
-/// (nothing reconciles a stale LSI row; only the GSI drain self-heals — see
-/// [`kind_writes_for_item`]'s doc for why an LSI can even ride this
-/// entry). Change-record `OLD_IMAGE` fidelity had the identical staleness.
+/// **The evaluate-AT-APPLY write path (ADR 0054 step 3)** for `PutItem`/
+/// `DeleteItem`/`UpdateItem` on every table (indexed, streamed, or plain —
+/// ADR 0049 made the kind-write path universal) — cuts the single-item
+/// write path over from evaluating at this node (the ADR 0046 U3 design
+/// this function used to implement, replacing `index_aware_write` before
+/// it) to evaluating inside `KvCommand::KindEval`'s apply arm
+/// (`animus-cp-data`), in commit order, where no stale before-image can
+/// exist. See ADR 0054's Context section for the contended-`ADD` defect
+/// this closes (CI measured 2 of 10 concurrent increments refused) and why
+/// holding `rmw_lock` longer, retrying a proven no-op, or a leader-side
+/// overlay all fail to fix it.
+///
+/// **What still runs here, and why (the kept seatbelt, this PR only).**
+/// This function still takes `ctx.data().rmw_lock`, reads its own `old` via
+/// `ClientCtx::cp_get_local_resolving`, and evaluates `condition`/`op`
+/// against it — but the result of that evaluation ([`predict_kind_eval_
+/// decision`]) is now used ONLY to double-check the apply-side outcome
+/// below, never to decide what the client sees. Deliberately not removed
+/// yet: ADR 0054's Sequencing text asks for step 3 to land "behind the
+/// existing test suite," and comparing the two evaluators' decisions on
+/// every real write is the cheapest way to gain confidence that the newly
+/// wired apply-side evaluator agrees with the one it replaces before the
+/// old one (and `rmw_lock`) are deleted in step 4. See
+/// [`report_kind_eval_seatbelt_mismatch`] for the comparison and
+/// `Metric::KindEvalSeatbeltMismatch`'s own doc for which disagreement
+/// direction is expected (contention) vs. which is a bug.
+///
+/// **The actual write.** Builds the `WriteSchema` slice apply needs
+/// (`write_schema_for`, exactly what `kind_writes_for_item` itself now
+/// delegates to) and the wire-decode-free `KindEvalOp` mirror of `op`, then
+/// proposes via `ClientCtx::cp_kind_eval_local` and waits for apply's own
+/// confirmed decision (`write_path::KindEvalApplied`). A `ConditionFailed`
+/// there is the client's own condition genuinely evaluating false against
+/// apply's FRESH read (never a staleness artifact — that hazard is exactly
+/// what moving evaluation into apply removes); a `Rejected` is a domain
+/// violation (`condition.evaluate` returning `Err`, e.g. `size()` on the
+/// wrong type) or a malformed/oversized update, mapped back to the
+/// identical `WireError` the old leader-side evaluator produced for the
+/// same failure ([`rejected_wire_error`]) so wire-visible errors are
+/// byte-identical to before this step.
+///
+/// **The lost-payload residual (ADR 0054 mechanism 3).** If apply confirms
+/// `Applied` but this node's own leader-local `old`/`new` slot is gone
+/// (leadership churned between accept and confirm, or the bounded
+/// retention map aged it out under an unusually slow confirm), an
+/// idempotent write (`Put`/`Delete`/`SET`/`REMOVE`/a set union or
+/// difference) recovers with a best-effort re-read of the current value as
+/// `new` (`old` stays `None` — the true pre-image is genuinely gone, never
+/// guessed at); a non-idempotent write (`ADD`) instead returns the same
+/// ambiguous, non-retried error the pre-ADR-0054 path already returned for
+/// its own unconfirmable case — see `ClientCtx::kind_eval_confirmed`
+/// (`write_path.rs`) for the full account. The write **did** apply
+/// either way; this is a reporting gap the ADR names explicitly ("Not
+/// removed, deliberately: Ambiguity"), never a lost or double-applied
+/// write.
+///
+/// **What did NOT move in this step.** `eval_kind_txn_write`/
+/// `txn_stage_local` (`TransactWriteItems`' own evaluation) stay on the
+/// leader-evaluated `KindBatch` path — ADR 0054's Sequencing text moves
+/// them in step 4, alongside deleting `rmw_lock`/the seatbelt entirely.
+/// `BatchWriteItem`, the TTL reaper, and the admin seeder all route
+/// through this same function, so they cut over with it for free.
 ///
 /// This function always runs **on the tablet's own leader** — called
-/// in-process by `ClientCtx::cp_kind_write_item`'s `Local` branch (this
-/// node hosts the leader) or by `ClientCtx::cp_serve_forwarded`'s
-/// `KindWriteItem` arm (a forwarded hop already landed on the leader's own
-/// node). Every write of this item, from whichever edge node received the
-/// client request, therefore reaches this same function on this same node —
-/// which is what makes locking `ctx.data().rmw_lock` **here**, instead of at
-/// the edge, actually serialize concurrent writes of one item rather than
-/// merely of one item *observed by one node*.
+/// in-process by `ClientCtx::cp_kind_write_item`'s `Local` branch, or by
+/// `ClientCtx::cp_serve_forwarded`'s `KindWriteItem` arm on a forwarded
+/// hop — unchanged from before this step; `ClientCtx::cp_kind_eval_local`
+/// needs no new `ClientRequest` variant, since the forwarded hop already
+/// lands on the leader's own node before this function (and its propose)
+/// ever runs.
 ///
-/// Reads its own `old` via `ClientCtx::cp_get_local_resolving` (the
-/// identical primitive `cp_serve_forwarded`'s own `Get` arm uses) rather
-/// than trusting anything the caller computed, evaluates `condition`
-/// against it (a mismatch short-circuits to `ConditionFailed` before any
-/// diff is ever computed — no read-modify-write hazard to consider, since
-/// nothing has been written yet), computes `new` from `op` (an `Update`
-/// applies `actions` to `old` — or `key_item` on an upsert-from-absent,
-/// matching `UpdateItem`'s existing upsert contract), then defers to
-/// [`kind_writes_for_item`] for the actual LSI/change-log diff — unchanged
-/// logic, just moved onto the leader. A `None` result (this item's table
-/// lost its last index/stream in the gap between routing and evaluation)
-/// falls back to a plain leader-local write, mirroring
-/// `index_aware_write`'s own `None` fallback exactly; that fallback carries
-/// no OCC seatbelt (`cp_put_local`'s plain `Put` has no `conditions`
-/// mechanism) — the identical, already-documented gap plain (unindexed,
-/// unstreamed) tables have always had (ADR 0046 §2's named follow-up),
-/// unaffected by this change either way.
-///
-/// **The OCC seatbelt** (ADR 0046, the PR1 `KindBatch.conditions` field):
-/// the `KindBatch` proposed below carries `conditions: vec![(base_key,
-/// raw_old)]` — the exact raw bytes this function's own read just observed,
-/// compared byte-for-byte at apply. `rmw_lock` above already serializes
-/// every write of this item that goes through *this* function, but a
-/// `txn_resolver_loop` recovery push resolving a transaction's intent on
-/// this same key never takes that lock — **live, not hypothetical, since
-/// the `TxnStage` kind-writes stack (ADR 0046 A1/U3, 2026-08-16) let
-/// `TransactWriteItems` participate on indexed/streamed tables**: an
-/// unresolved intent on the base key fails this condition outright (never
-/// a guessed match), so a diff computed against a pre-stage read can never
-/// land astride the stage→resolve window and orphan an LSI row (issue
-/// #266's verified interleaving — pinned by `animus-cp-data`'s
-/// `txn_kind_writes.rs::a_conditioned_kind_batch_racing_the_stage_resolve_
-/// window_never_orphans_an_lsi_row` and this crate's
-/// `dynamo_index_writes.rs` cross-node mixed hammer). A failed seatbelt
-/// no-ops the whole `KindBatch` silently, indistinguishable from a fence
-/// miss — `ClientCtx::cp_kind_local`'s own probe-poll times out with the
-/// same generic error every other silent no-op produces (deliberately no
-/// new outcome channel here either, matching `KvCommand::KindBatch`'s own
-/// documented choice).
-///
-/// **`rmw_lock` is scoped to read + evaluate only (issue #285)** — it is
-/// dropped before `cp_kind_local`'s propose/confirm-poll runs, mirroring
-/// `ClientCtx::txn_stage_local`'s identical scoping. Holding it across the
-/// confirm-poll used to serialize *every* evaluated write on this node
-/// behind whichever one's confirm happened to be slow (apply backlog can
-/// stretch that wait to seconds even with the #268 fast-fail), for no
-/// correctness benefit: the OCC seatbelt above is what actually keeps two
-/// racing evaluators of the same item safe, and it already has to work
-/// lock-free (`txn_resolver_loop` never takes this lock either). Narrowing
-/// the scope trades a few more retried OCC misses under genuine same-key
-/// contention for not stalling unrelated items' writes. Regression-tested
-/// by `animusd`'s `confirm_futility_tests::
-/// an_unrelated_evaluated_write_is_not_stalled_behind_another_writes_confirm_wait`
-/// — see [`rmw285_confirm_gate`] for how that test holds this function's
-/// own propose/confirm phase open deterministically rather than racing a
-/// real apply backlog to build in time.
 /// `ttl_expired` (ADR 0051 §7): `true` only for the TTL reaper's own delete
 /// — stamps the resulting change record's `userIdentity` as the service
 /// principal (see [`kind_writes_for_item`]'s doc) instead of leaving it a
@@ -5909,21 +5905,15 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     ttl_expired: bool,
 ) -> Result<KindWriteOutcome, WireError> {
     let base_key = item_key(pk, sk);
-    // `rmw_lock` is scoped to read + evaluate only (issue #285) — it must
-    // NOT still be held across the `cp_kind_local` propose/confirm-poll
-    // below, which can run for a while under apply backlog even with the
-    // #268 `confirm_wait_is_futile` fast-fail. Correctness does not depend
-    // on this lock: the apply-time OCC seatbelt (`seatbelt`, built from
-    // this block's own `raw_old` and checked byte-for-byte against the
-    // actual committed value on every replica) is what actually makes two
-    // racing evaluators of the same item safe, exactly as it already must
-    // for `txn_resolver_loop`'s recovery pushes, which never take this lock
-    // at all. This lock is only a same-node collision-rate optimization —
-    // narrowing its scope trades a few more retried OCC misses under real
-    // contention for not stalling every *other* item's write behind one
-    // slow confirm-poll. See `ClientCtx::txn_stage_local` for the identical
-    // scoping this mirrors.
-    let (old, new, writes, change_log, seatbelt) = {
+    // The seatbelt double-check (ADR 0054 step 3, kept for THIS PR only —
+    // see this function's own doc): read + evaluate exactly as the
+    // pre-cutover leader-evaluated design did, but only to predict a
+    // decision to compare against the now-authoritative apply-side outcome
+    // below. `rmw_lock`'s scope is unchanged from issue #285 (read +
+    // evaluate only, released before propose/confirm) — nothing about that
+    // scoping needed to change just because its result is no longer the
+    // one thing deciding the client's answer.
+    let predicted = {
         let _rmw = ctx.data().rmw_lock.lock().await;
         #[cfg(test)]
         if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
@@ -5937,68 +5927,171 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
             Some(bytes) => wire::decode_stored_item(bytes)?,
             None => None,
         };
-        if let Some(cond) = condition
-            && !cond.evaluate(old.as_ref())?
-        {
-            return Ok(KindWriteOutcome::ConditionFailed);
-        }
-        let new = match &op {
-            KindWriteOp::Put(item) => Some(item.clone()),
-            KindWriteOp::Delete => None,
-            KindWriteOp::Update { key_item, actions } => {
-                let base = old.clone().unwrap_or_else(|| key_item.clone());
-                // A typed ADD/DELETE mismatch is a ValidationException, not a
-                // silently skipped action — it propagates from the leader that
-                // evaluated it back to the requesting edge.
-                Some(wire::apply_update(base, actions)?)
-            }
-        };
-        let value = match &new {
-            Some(item) => wire::encode_stored_item(item),
-            None => wire::encode_tombstone(),
-        };
-        let (writes, change_log) = kind_writes_for_item(
-            meta,
-            table,
-            pk,
-            sk,
-            &base_key,
-            value.clone(),
-            old.as_ref(),
-            new.as_ref(),
-            ttl_expired,
-        );
-        let seatbelt = vec![(base_key, raw_old)];
-        (old, new, writes, change_log, seatbelt)
+        predict_kind_eval_decision(old.as_ref(), &op, condition)
         // `_rmw` drops here — released before the propose/confirm below.
     };
     #[cfg(test)]
     rmw285_confirm_gate::wait_if_armed(table).await;
-    // `identity` (issue #469): whether `poll_probe`'s value-equality
-    // fallback may run for this write. A numeric `ADD` is not idempotent —
-    // two evaluators reading the same stale `old` under this function's own
-    // released-before-propose lock (issue #285, above) compute
-    // byte-identical `new`, so bytes landing at `base_key` prove nothing
-    // about which entry put them there. See `ProbeIdentity`'s doc for the
-    // full hazard.
+    // `identity` (issue #469): whether `cp_kind_eval_local`'s lost-payload
+    // recovery may re-read the current value as a best-effort `new`. A
+    // numeric `ADD` is not idempotent, so a re-read can't be trusted to
+    // reflect THIS entry's own effect. See `ProbeIdentity`'s doc for the
+    // full hazard (originally written for `poll_probe`'s identical gate,
+    // reused verbatim here).
     let identity = if kind_write_is_idempotent(&op) {
         ProbeIdentity::ValueProves
     } else {
         ProbeIdentity::RequiresOwnEntry
     };
-    // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_local` takes no
-    // `self`/`R`-typed argument, so nothing here pins down `R` for the
-    // now-generic `ClientCtx<E, R>` path — both `E`/`R` are already this
-    // function's own generic parameters.
-    ClientCtx::<E, R>::cp_kind_local(leader, writes, vec![change_log], seatbelt, identity)
-        .await
-        .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
-    let collection_bytes = collection_bytes_at_leader(leader).await;
-    Ok(KindWriteOutcome::Ok {
-        old,
-        new,
-        collection_bytes,
-    })
+    let schema = write_schema_for(meta, table);
+    let eval_op = match op {
+        KindWriteOp::Put(item) => animus_cp_data::KindEvalOp::Put(item),
+        KindWriteOp::Delete => animus_cp_data::KindEvalOp::Delete,
+        KindWriteOp::Update { key_item, actions } => {
+            animus_cp_data::KindEvalOp::Update { key_item, actions }
+        }
+    };
+    // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
+    // takes no `self`/`R`-typed argument, so nothing here pins down `R` for
+    // the now-generic `ClientCtx<E, R>` path — both `E`/`R` are already
+    // this function's own generic parameters.
+    let result = ClientCtx::<E, R>::cp_kind_eval_local(
+        leader,
+        schema,
+        pk.clone(),
+        sk.cloned(),
+        eval_op,
+        condition.cloned(),
+        ttl_expired,
+        &base_key,
+        identity,
+    )
+    .await
+    .map_err(|e| internal(&format!("index-maintaining write failed: {e}")))?;
+
+    report_kind_eval_seatbelt_mismatch(ctx, table, predicted, &result);
+
+    match result {
+        KindEvalApplied::Ok { old, new } => {
+            let collection_bytes = collection_bytes_at_leader(leader).await;
+            Ok(KindWriteOutcome::Ok {
+                old,
+                new,
+                collection_bytes,
+            })
+        }
+        KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+        KindEvalApplied::Rejected { code, message } => Err(rejected_wire_error(&code, message)),
+    }
+}
+
+/// The leader's seatbelt-double-check decision category (ADR 0054 step 3)
+/// — deliberately narrower than either `KindEvalDecision`
+/// (`animus-cp-data`, apply-side) or `KindEvalApplied` (`write_path`,
+/// confirmed-outcome-side): this function's only job is comparison, so it
+/// drops every payload (`old`/`new`/`message`) neither side of the compare
+/// needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictedKindDecision {
+    Applied,
+    ConditionFailed,
+    Rejected,
+}
+
+impl From<&KindEvalApplied> for PredictedKindDecision {
+    fn from(result: &KindEvalApplied) -> Self {
+        match result {
+            KindEvalApplied::Ok { .. } => Self::Applied,
+            KindEvalApplied::ConditionFailed => Self::ConditionFailed,
+            KindEvalApplied::Rejected { .. } => Self::Rejected,
+        }
+    }
+}
+
+/// The leader-side half of the ADR 0054 step 3 seatbelt double-check:
+/// reproduces exactly what the pre-cutover leader-evaluated design would
+/// have decided from this same resolved read — evaluate `condition`
+/// (`Ok(true)` continues, `Ok(false)` is `ConditionFailed`, `Err` is
+/// `Rejected` — a domain violation, e.g. `size()` on the wrong type),
+/// then, if a condition passed or none was given, evaluate `op` (`Put`/
+/// `Delete` always succeed; `Update` folds `actions` via `wire::
+/// apply_update`, `Err` is `Rejected` — a malformed update or an
+/// over-the-cap result). Used ONLY by [`report_kind_eval_seatbelt_
+/// mismatch`] for comparison — see [`kind_write_item_at_leader`]'s own doc
+/// for why this prediction never gates the client-visible result anymore.
+fn predict_kind_eval_decision(
+    old: Option<&Item>,
+    op: &KindWriteOp,
+    condition: Option<&ConditionExpression>,
+) -> PredictedKindDecision {
+    if let Some(cond) = condition {
+        match cond.evaluate(old) {
+            Ok(true) => {}
+            Ok(false) => return PredictedKindDecision::ConditionFailed,
+            Err(_) => return PredictedKindDecision::Rejected,
+        }
+    }
+    match op {
+        KindWriteOp::Put(_) | KindWriteOp::Delete => PredictedKindDecision::Applied,
+        KindWriteOp::Update { key_item, actions } => {
+            let base = old.cloned().unwrap_or_else(|| key_item.clone());
+            match wire::apply_update(base, actions) {
+                Ok(_) => PredictedKindDecision::Applied,
+                Err(_) => PredictedKindDecision::Rejected,
+            }
+        }
+    }
+}
+
+/// The other half of the ADR 0054 step 3 seatbelt double-check: compare
+/// the leader's before-propose `predicted` decision against apply's own
+/// confirmed `actual` outcome, and on disagreement record `Metric::
+/// KindEvalSeatbeltMismatch` + `tracing::warn!` with both — **never** fail
+/// or alter the request either way, since the apply-side decision is
+/// authoritative by construction (ADR 0054's whole point). See that
+/// metric's own doc for which of the two possible disagreement directions
+/// is expected (benign contention) and which is worth investigating (a
+/// real evaluator divergence).
+fn report_kind_eval_seatbelt_mismatch<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    predicted: PredictedKindDecision,
+    actual: &KindEvalApplied,
+) {
+    let actual = PredictedKindDecision::from(actual);
+    if actual != predicted {
+        ctx.data()
+            .raftkv_metrics
+            .incr(Metric::KindEvalSeatbeltMismatch);
+        tracing::warn!(
+            table = %table,
+            predicted = ?predicted,
+            actual = ?actual,
+            "KindEval seatbelt mismatch: the leader's before-propose prediction disagreed with \
+             the confirmed apply-side outcome — expected when the leader predicted \
+             ConditionFailed/Rejected from a stale before-image and apply, reading fresher \
+             state, actually applied the write; the reverse (apply rejecting what the leader \
+             predicted would apply) is the direction worth investigating as a possible bug",
+        );
+    }
+}
+
+/// Map an evaluator-produced `KindBatchOutcome::Rejected { code, message }`
+/// (ADR 0054 step 2/3) to the identical `WireError` the leader-side
+/// evaluator produced for the same failure before this step —
+/// `ConditionError`/`UpdateError` (`animus-item`) both only ever construct
+/// `"ValidationException"` today, the same code `WireError::validation`
+/// (née `From<ConditionError>`/`From<UpdateError>`) always used, so this is
+/// byte-identical to the pre-step-3 mapping. `code` rides as an owned
+/// `String` on the animus-cp-data side precisely so a future evaluator
+/// error class isn't assumed to stay `"ValidationException"` forever —
+/// an unrecognized code here (nothing produces one today) falls back to
+/// `internal` rather than silently losing the message.
+fn rejected_wire_error(code: &str, message: String) -> WireError {
+    match code {
+        "ValidationException" => WireError::validation(message),
+        other => internal(&format!("{other}: {message}")),
+    }
 }
 
 /// Test-only synchronization hook for the issue #285 regression
@@ -7840,6 +7933,111 @@ mod stream_write_path_tests {
             5,
             "every change record must survive — the streamed table's \
              expected \"copier\" tag has no cursor row yet"
+        );
+    }
+
+    /// **ADR 0054 step 3's seatbelt double-check.** Manufactures the
+    /// "expected" disagreement direction `Metric::KindEvalSeatbeltMismatch`'s
+    /// own doc names — the leader predicts `ConditionFailed` from a
+    /// before-image a concurrent write supersedes before this write's own
+    /// entry reaches apply, so apply (reading fresher state) actually
+    /// applies it — and asserts the request still **succeeds** (the
+    /// apply-side decision is authoritative; a mismatch never fails the
+    /// request) while the metric ticks.
+    ///
+    /// Deterministic via `rmw285_confirm_gate` (issue #285's own test
+    /// hook): arms a delay between this write's rmw-lock release (where the
+    /// leader-side prediction is taken, against `hits: 10`) and its
+    /// propose. While it sleeps, an unconditional `PutItem` (the fast arm —
+    /// no condition, no images, so it never touches `rmw_lock`/the gate at
+    /// all) lands and lowers `hits` to `2`. The gated write's own
+    /// `ConditionExpression` (`hits < :cap`, cap 5) evaluated `false`
+    /// against the leader's stale `hits: 10` read (predicted
+    /// `ConditionFailed`) but evaluates `true` against apply's fresh
+    /// `hits: 2` (actual `Applied`) — so the item ends up fully replaced by
+    /// this write's own `Put`, proving it landed, not merely that the
+    /// request returned 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_leader_prediction_that_apply_supersedes_ticks_the_mismatch_metric_and_still_succeeds()
+     {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let addr = node.dynamo_addr();
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"seatbelt",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"seatbelt","Item":{"id":{"S":"k1"},"hits":{"N":"10"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "seed PutItem failed: {body}");
+
+        let before = metrics_value(addr, "kind_eval_seatbelt_mismatch").await;
+
+        super::rmw285_confirm_gate::arm("seatbelt", Duration::from_millis(300));
+        let gated = tokio::spawn(async move {
+            dynamo(
+                addr,
+                "DynamoDB_20120810.PutItem",
+                r#"{"TableName":"seatbelt",
+                    "Item":{"id":{"S":"k1"},"hits":{"N":"999"}},
+                    "ConditionExpression":"hits < :cap",
+                    "ExpressionAttributeValues":{":cap":{"N":"5"}}}"#,
+            )
+            .await
+        });
+
+        // Give the gated write time to acquire+release `rmw_lock` (reading
+        // `hits: 10`, predicting `ConditionFailed`) and reach the armed
+        // sleep before this unconditional write lands. The fast arm never
+        // touches `rmw_lock`/the gate, so ordering here relies only on the
+        // gated write's own read happening first — sequenced by issuing it
+        // first, above, and giving it a moment to reach the sleep.
+        sleep(Duration::from_millis(50)).await;
+        let (status, body) = dynamo(
+            addr,
+            "DynamoDB_20120810.PutItem",
+            r#"{"TableName":"seatbelt","Item":{"id":{"S":"k1"},"hits":{"N":"2"}}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "unconditional PutItem failed: {body}");
+
+        let (status, body) = gated.await.expect("task");
+        assert_eq!(
+            status, 200,
+            "the apply-side decision is authoritative — a stale leader \
+             prediction must never fail the request: {body}"
+        );
+
+        let (status, got) = dynamo(
+            addr,
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"seatbelt","Key":{"id":{"S":"k1"}},"ConsistentRead":true}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{got}");
+        assert!(
+            got.contains(r#""hits":{"N":"999"}"#),
+            "the gated write's own Put must have actually landed (proving \
+             Applied, not just a 200): {got}"
+        );
+
+        let after = metrics_value(addr, "kind_eval_seatbelt_mismatch").await;
+        assert!(
+            after > before,
+            "kind_eval_seatbelt_mismatch must tick when the leader's \
+             prediction disagrees with apply's confirmed outcome \
+             (before={before}, after={after})"
         );
     }
 }

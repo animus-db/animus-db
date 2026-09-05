@@ -976,6 +976,39 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Propose a **self-contained evaluated write** (ADR 0054 step 3 —
+    /// [`ClientCtx::cp_kind_eval_local`]'s own doc has the cutover). See
+    /// [`RaftKvNode::propose_kind_eval`].
+    pub(crate) fn propose_kind_eval(
+        &self,
+        schema: animus_item::WriteSchema,
+        pk: animus_dynamo::AttributeValue,
+        sk: Option<animus_dynamo::AttributeValue>,
+        op: animus_cp_data::KindEvalOp,
+        condition: Option<animus_dynamo::ConditionExpression>,
+        ttl_expired: bool,
+    ) -> ProposeResult {
+        match self {
+            CpGroup::Lsm(n) => n.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired),
+            CpGroup::Mem(n) => n.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired),
+        }
+    }
+
+    /// Take back the leader-local `old`/`new` payload of a confirmed
+    /// `KindEval` entry (ADR 0054 mechanism 3) — `Some` only on the node
+    /// that proposed it, and only once. See
+    /// [`RaftKvNode::take_kind_eval_result`].
+    pub(crate) fn take_kind_eval_result(
+        &self,
+        index: u64,
+        term: u64,
+    ) -> Option<animus_cp_data::KindEvalResult> {
+        match self {
+            CpGroup::Lsm(n) => n.take_kind_eval_result(index, term),
+            CpGroup::Mem(n) => n.take_kind_eval_result(index, term),
+        }
+    }
+
     /// Propose a split-build seed chunk into this (child) group's own log
     /// (ADR 0050 Train B rung 4). See [`RaftKvNode::propose_seed_batch`].
     pub(crate) fn propose_seed_batch(
@@ -1711,9 +1744,21 @@ fn classify_kind_batch_outcome(
         Some((term, KindBatchOutcome::Applied)) if term == accepted_term && effects_readable => {
             KindBatchSignal::Confirm
         }
-        Some((_, KindBatchOutcome::ConditionFailed { .. } | KindBatchOutcome::Sealed { .. })) => {
-            KindBatchSignal::NoOp
-        }
+        // `Rejected` (ADR 0054 step 2, `KvCommand::KindEval`-only) joins
+        // `ConditionFailed`/`Sealed` here for the identical reason: a
+        // rejected entry wrote nothing, so it is a no-op regardless of
+        // whose entry occupies the index — no term check needed, same as
+        // its two siblings. Before step 3 wired a real `KindEval` producer
+        // this arm was unreachable (nothing produced the variant), so the
+        // wildcard below silently treated it as `Inconclusive` — harmless
+        // then, wrong now that `cp_kind_eval_local` depends on it being
+        // classified as a definitive no-op.
+        Some((
+            _,
+            KindBatchOutcome::ConditionFailed { .. }
+            | KindBatchOutcome::Sealed { .. }
+            | KindBatchOutcome::Rejected { .. },
+        )) => KindBatchSignal::NoOp,
         _ => KindBatchSignal::Inconclusive,
     }
 }
@@ -1824,6 +1869,36 @@ mod kind_batch_signal_tests {
             classify_kind_batch_outcome(None, ACCEPTED_TERM, true),
             KindBatchSignal::Inconclusive
         );
+    }
+
+    /// **ADR 0054 step 3**: `Rejected` (`KvCommand::KindEval`-only) is a
+    /// no-op at any term too — same reasoning as `ConditionFailed`/
+    /// `Sealed` above, added when a real `KindEval` producer first made
+    /// this arm reachable.
+    #[test]
+    fn rejected_is_a_no_op_at_any_term() {
+        for term in [
+            ACCEPTED_TERM,
+            ACCEPTED_TERM + 1,
+            ACCEPTED_TERM.saturating_sub(1),
+        ] {
+            assert_eq!(
+                classify_kind_batch_outcome(
+                    Some((
+                        term,
+                        KindBatchOutcome::Rejected {
+                            key: b"k".to_vec(),
+                            code: "ValidationException".into(),
+                            message: "bad update".into(),
+                        }
+                    )),
+                    ACCEPTED_TERM,
+                    true,
+                ),
+                KindBatchSignal::NoOp,
+                "Rejected at term {term}"
+            );
+        }
     }
 }
 

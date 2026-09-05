@@ -390,3 +390,119 @@ wildcard needing an explicit `Rejected` arm once a real caller exists.
 
 Status stays **Proposed**: only step 3 changes observable behaviour, and it
 has not landed.
+
+## As-built amendment (2026-09-05, Sequencing step 3 — the single-item write
+path cut over, seatbelt kept as a double-check)
+
+Step 3 landed: `kind_write_item_at_leader` (`crates/animusd/src/dynamo.rs`)
+no longer builds the write's finished bytes itself. For every `PutItem`/
+`DeleteItem`/`UpdateItem` it serves — every table, since ADR 0049 made the
+kind-write path universal, indexed/streamed/plain alike, conditional or
+not — it now builds the `WriteSchema` slice (`write_schema_for`, already
+landed in step 2) and a `KindEvalOp` mirror of the client's operation, and
+proposes a `KvCommand::KindEval` via a new sibling of `cp_kind_local`,
+`ClientCtx::cp_kind_eval_local` (`write_path.rs`). The wire-visible result —
+`Ok{old, new}` / `ConditionFailed` / a `ValidationException` — now comes
+from **apply's own confirmed decision**, read back via `classify_kind_batch_
+outcome` (reused verbatim, with the `Rejected` arm step 2 anticipated now
+wired in) and, on `Applied`, `RaftKvNode::take_kind_eval_result`. This is
+the ADR's whole point landing for real: apply evaluates the condition and
+the update against the current committed value **in commit order**, so two
+concurrent evaluators of one key no longer race a stale before-image.
+
+**The motivating regression is fixed, not just re-labeled.**
+`dynamo_update_add_delete.rs::concurrent_increments_all_land_exactly_once`
+(ten concurrent `ADD`s on one key) now asserts `counter == WRITERS` and zero
+refusals — the doc comment that used to explain why 2-of-10 refusals were
+*correct behaviour* now explains why they no longer happen. A sibling,
+`concurrent_conditional_add_all_land_exactly_once`, proves the same property
+for a **conditioned** `ADD` (`attribute_exists(pk)`, genuinely true for
+every racing writer) — the condition is now evaluated fresh at apply, so
+contention cannot make a genuinely-true condition spuriously fail either.
+
+**The seatbelt is kept, for this step only, as a double-check — not as a
+gate.** `kind_write_item_at_leader` still takes `ctx.data().rmw_lock`,
+reads its own `old` via `ClientCtx::cp_get_local_resolving`, and evaluates
+`condition`/`op` against it (`predict_kind_eval_decision`) — but that
+prediction is used **only** to compare against apply's confirmed outcome
+(`report_kind_eval_seatbelt_mismatch`) and never to decide what the client
+sees. A disagreement never fails the request (apply's decision is
+authoritative by construction) — it increments a new metric,
+`Metric::KindEvalSeatbeltMismatch` (`kind_eval_seatbelt_mismatch` on
+`/metrics`), and logs both decisions via `tracing::warn!`. The metric's own
+doc names the two possible directions explicitly: the leader predicting
+`ConditionFailed`/`Rejected` from a before-image a concurrent write
+supersedes before apply — reading fresher state — actually applies the
+write is **expected**, the contention this ADR exists to absorb; the
+reverse (apply rejecting a write the leader's own read predicted would
+succeed) is the direction worth investigating as a real evaluator
+divergence. A dedicated regression
+(`dynamo.rs::stream_write_path_tests::
+a_stale_leader_prediction_that_apply_supersedes_ticks_the_mismatch_metric_and_still_succeeds`)
+manufactures the expected direction deterministically (via the existing
+issue #285 `rmw285_confirm_gate` test hook) and asserts the request still
+succeeds — landing the write the leader's own stale read would have
+refused — while the counter ticks.
+
+**The lost-payload residual (mechanism 3) resolved.** If apply confirms
+`Applied` but this node's own leader-local `old`/`new` slot is gone
+(bounded retention aged it out under an unusually slow confirm, or
+leadership churned between accept and confirm), an idempotent write
+recovers with a best-effort re-read of the current value as `new` (`old`
+stays `None`, genuinely unrecoverable); a non-idempotent write (`ADD`)
+returns the identical ambiguous, non-retried error the pre-existing
+confirm-timeout path already used (`"CP kind write did not commit in
+time"`, reused verbatim rather than inventing a new one) — the ADR's own
+"Not removed, deliberately: Ambiguity" consequence, not a new gap.
+
+**Error mapping is byte-identical.** `KindBatchOutcome::Rejected{code,
+message}` maps back to `WireError::validation(message)` for
+`"ValidationException"` (the only code either `ConditionError`/
+`UpdateError` produce today) — the same mapping `From<ConditionError>`/
+`From<UpdateError>` already performed pre-cutover, so
+`dynamo_expression_surface.rs`'s `size_of_an_existing_number_attribute_is_a_
+validation_exception` and the rest of that suite needed no changes.
+
+**What did NOT move.** `eval_kind_txn_write`/`txn_stage_local`
+(`TransactWriteItems`' own evaluation) still evaluate at the leader and
+propose `KindBatch` — ADR 0054's Sequencing text moves them in step 4,
+alongside deleting `rmw_lock`, the `KindBatch.conditions` seatbelt, and this
+step's own mismatch metric. `BatchWriteItem`, the TTL reaper
+(`ttl_reaper.rs`), and the admin seeder (`admin::action_data_seed`) all
+route through `kind_write_item_at_leader`, so they cut over for free —
+`dynamo_ttl.rs`, `batch_write.rs`, `dynamo_batch_get.rs`, and
+`stream_write_path_tests::admin_seed_writes_through_the_kind_path_on_both_
+table_shapes` all stayed green unmodified. Forwarding needed no new
+`ClientRequest` variant: a forwarded write already lands on the leader's
+own node before `kind_write_item_at_leader` (and its `cp_kind_eval_local`
+propose) ever runs — `control_only.rs::
+mixed_cluster_put_via_control_node_forwards_to_data_node` is unmodified and
+green.
+
+**Benchmark gate (ADR 0049 §5's harness,
+`dynamo::stream_write_path_tests::bench_plain_table_put_wall_clock`,
+`#[ignore]`d — run with `cargo test -p animusd --lib bench_plain_table_put
+-- --ignored --nocapture`), 200 sequential `PutItem`s on a plain
+(unindexed, unstreamed) table, one node, 3 runs each, same host/session:**
+
+| Run | Parent (`6fb818b`, leader-evaluated) | This commit (apply-evaluated) |
+|-----|---------------------------------------|--------------------------------|
+| 1   | 3.13 ms/op                            | 3.15 ms/op                     |
+| 2   | 3.15 ms/op                            | 3.15 ms/op                     |
+| 3   | 3.27 ms/op                            | 3.26 ms/op                     |
+
+No measurable regression — the two medians (3.15 ms/op both) are identical
+within run-to-run noise. The ADR's own risk section named the apply
+task's now-serial per-item evaluation as "the main risk, to be measured
+rather than argued": for a plain table's unconditional `Put`, apply's own
+read-then-evaluate cost is the same single engine read
+`kind_write_item_at_leader`'s old leader-side read already paid — moving
+*where* that read happens does not add a second one, so the risk did not
+materialize for this workload. (The seatbelt double-check kept for this
+step *does* add a second, redundant read+evaluate on the leader — the very
+thing step 4 removes — so this number is a conservative upper bound on
+step 3's own overhead, not a preview of the post-step-4 steady state.)
+
+Status stays **Proposed**: step 4 (moving the remaining producers and
+deleting the seatbelt/`rmw_lock`/this step's own mismatch metric) is still
+ahead, and the ADR's Sequencing text reserves Accepted for after it lands.
