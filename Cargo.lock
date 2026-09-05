@@ -222,6 +222,7 @@ dependencies = [
  "animus-sim",
  "animus-storage",
  "animus-tablet",
+ "animus-test",
  "async-trait",
  "futures",
  "opentelemetry",

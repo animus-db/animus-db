@@ -76,6 +76,10 @@ on:
         description: "Seeds per structural cell (ANIMUS_CONTROL_SEEDS, control-plane machinery fault-injection corpus)"
         required: false
         default: "40"
+      simcluster_seeds:
+        description: "Seeds per cell (ANIMUS_SIMCLUSTER_SEEDS, ADR 0061 rung D1 SimCluster cycles/durability corpus)"
+        required: false
+        default: "25"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -323,6 +327,22 @@ jobs:
           ANIMUS_CONTROL_SEEDS: ${{ github.event.inputs.control_seeds || '40' }}
         run: cargo test -p animus-control --test control_corpus -- --nocapture
 
+      # ADR 0061 rung D1's SimCluster cycles/durability corpus: a real
+      # multi-node, multi-tablet `animusd::ClientCtx` cluster (control-plane
+      # Raft + the CP data plane + the rung C3d relay wire) driven with a
+      # list-append Recorder/History workload, checked with
+      # check_cycles/check_durability/check_convergence, under leader/
+      # follower crash, a true process restart, leader/whole-cluster
+      # partition, RF-below-node-count forwarding, and a multi-table cell,
+      # scaled to depth. Each cell is a pure function of its seed, so a
+      # failure names one cell + seed and is replayable.
+      - name: deep SimCluster cycles/durability corpus (ADR 0061 rung D1)
+        id: simcluster
+        continue-on-error: true
+        env:
+          ANIMUS_SIMCLUSTER_SEEDS: ${{ github.event.inputs.simcluster_seeds || '25' }}
+        run: cargo test -p animusd --lib sim_cluster_corpus -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -352,10 +372,11 @@ jobs:
             [lsm_crash]="${{ steps.lsm_crash.outcome }}"
             [lsm_disk_fault]="${{ steps.lsm_disk_fault.outcome }}"
             [control]="${{ steps.control.outcome }}"
+            [simcluster]="${{ steps.simcluster.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
