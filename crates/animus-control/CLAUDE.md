@@ -817,6 +817,26 @@ per-tablet CP data plane (`animus-cp-data`).
   deadline from it, and it now also backs the driver's own abort-observability
   log (see the "Leadership transfer" entry below).
 
+  **`leader()`'s own hair-trigger clear on this timeout is exactly right for
+  consensus and exactly wrong for an operational health/readiness probe
+  (issue #595) — see `RaftCore::leader_within`'s own doc and ADR 0020's
+  2026-09-04 amendment for the full account.** `RaftCore::
+  last_leader_contact: Option<(NodeId, Nanos)>` is a second, purely
+  observational field: set only at a genuine leader contact
+  (`handle_append_entries`/`handle_install_snapshot`'s valid-leader-for-
+  this-term path, `become_leader` recording itself) and cleared only on a
+  real higher-term step-down — **never** by `start_pre_vote`/
+  `start_election`'s own `leader_id = None`, which is this node's own local
+  suspicion with no evidence the leader actually failed. `leader_within
+  (now, max_age)` (and `RaftNode`/`ControlHandle`'s thin wrappers, the
+  latter's `Remote` variant falling back to `leader()` since the wire
+  carries no contact timestamp yet) reads it against a caller-chosen grace
+  window; `animusd::admin::health` is the one production consumer, gated at
+  `3 × election_timeout()`. **Must never be read by any election/pre-vote/
+  safety/replication decision** — `leader()` itself is completely
+  unchanged and still backs every one of those. Regression:
+  `tests/leader_within_hysteresis.rs`.
+
 - **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
   gains a per-member `role`: alongside the existing voter `config`, a
   parallel `learners: BTreeSet<NodeId>` is kept in sync by the identical

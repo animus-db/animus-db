@@ -649,9 +649,26 @@ impl<E: Env> RaftNode<E> {
         self.lock().term()
     }
 
-    /// Best-known leader id.
+    /// Best-known leader id. See `RaftCore::leader`'s own doc: this is the
+    /// raw, pre-vote-driven consensus belief — an operational (health/
+    /// readiness) reader should call [`leader_within`](Self::leader_within)
+    /// instead (issue #595).
     pub fn leader(&self) -> Option<NodeId> {
         self.lock().leader()
+    }
+
+    /// Hysteresis-bearing leader read for an operational reader (issue
+    /// #595) — see `RaftCore::leader_within`'s own doc. Uses this node's own
+    /// `env.now()`, never a wall clock (ADR 0003).
+    pub fn leader_within(&self, max_age: Duration) -> Option<NodeId> {
+        self.lock().leader_within(self.env.now(), max_age)
+    }
+
+    /// This node's election-timeout base — the unit `leader_within` callers
+    /// typically size their own grace window in (e.g. `animusd::admin::
+    /// health`'s `HEALTH_LEADER_GRACE`).
+    pub fn election_timeout(&self) -> Duration {
+        self.lock().election_timeout()
     }
 
     /// A clone of the apply task's published `Metadata` cache (ADR 0038 PR3)

@@ -921,6 +921,29 @@ reusing the captured config is the point of the test.
   would still be caught. `tests/dashboard_endpoint.rs::
   dashboard_role_gating_split_deployment` covers the control-vs-data
   null/present split.
+
+  **`GET /admin/health` — the Kubernetes readiness probe (ADR 0060) — reads
+  a HYSTERESIS-gated leader belief, not the raw one (issue #595, ADR 0020's
+  2026-09-04 amendment).** `ctx.control.leader().is_some()` (the raw
+  consensus belief, `RaftCore::leader_id`) is cleared the instant a
+  follower's own election timer lapses (ADR 0009 pre-vote) — correct for
+  consensus, but it gave this probe a false-negative window on every
+  transient one-sided delay of one election timeout or more, even with a
+  fully healthy cluster leader. `health()` now gates `200`/`503` on
+  `ctx.control.leader_within(HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS ×
+  ctx.control.election_timeout())` (3 election timeouts, ~450ms at the
+  default 150ms base) instead — see `animus_node::control_handle::
+  ControlHandle::leader_within`/`animus_control::RaftCore::leader_within`'s
+  own docs for the mechanism (an observational `last_leader_contact`
+  timestamp, never read by any consensus decision). The JSON body's
+  `control_leader_known` still reports the raw flag unchanged;
+  `control_leader_recent` is the new hysteresis-gated one, and `ok`/the
+  HTTP status now track the latter. Regression: `animus-control/tests/
+  leader_within_hysteresis.rs` (the mechanism, at the `RaftCore` level) —
+  `admin_endpoint.rs`'s own `/admin/health` assertions are unchanged
+  (`ok == true`/`200` still holds on a healthy converged cluster). See
+  `docs/engineering-lessons.md`'s matching entry for the general lesson.
+
 - **`http.rs`** — thin `TcpStream` wrapper over `animus_node::http` (ADR
   0061 rung C4a): `read_http_request` does only `stream.read()`, handing
   every parsing decision (header-block framing, `Content-Length`

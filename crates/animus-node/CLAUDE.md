@@ -291,6 +291,21 @@ Phase D** — nothing here builds request/reply correlation.
   `relay_request_with_timeout`), plus that implementor itself — see that
   crate's own `CLAUDE.md` entry.
 
+  **`ControlHandle::leader_within(max_age)`/`election_timeout()` (issue
+  #595)** are a hysteresis-bearing sibling of `leader()`, for an
+  operational (health/readiness) reader only — never for consensus/pre-
+  vote/routing decisions, which keep using `leader()` unchanged.
+  `Local` delegates to `RaftNode::leader_within` (which reads
+  `animus_control::RaftCore`'s own observational `last_leader_contact`
+  timestamp, `self.env.now()`, never a wall clock); `Remote` has no local
+  `RaftCore` and the wire carries no contact timestamp today, so it falls
+  back to `leader()` — the hysteresis is `Local`-only for now, an honest
+  degrade rather than a gap silently papered over (a data-only node's own
+  health probe was never gated on a local Raft belief to begin with).
+  `animusd::admin::health` is the one production consumer. See
+  `animus-control/CLAUDE.md`'s matching `leader_within` entry and ADR
+  0020's 2026-09-04 amendment for the full mechanism.
+
 ## What's here (rung C4a/C4b/C4c/C4d — the HTTP edges)
 
 ADR 0061's fourth 2026-08-28 amendment split C4 into four sub-rungs and
