@@ -82,11 +82,10 @@ name = "animus-dynamo"
 version = "0.0.0"
 dependencies = [
  "animus-control",
+ "animus-item",
  "animus-storage",
- "bigdecimal",
  "futures",
  "hmac",
- "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -103,6 +102,16 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "animus-item"
+version = "0.0.0"
+dependencies = [
+ "bigdecimal",
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

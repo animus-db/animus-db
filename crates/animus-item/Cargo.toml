@@ -1,0 +1,20 @@
+[package]
+name = "animus-item"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB pure item model: AttributeValue/Item/TableSchema, condition/update evaluation, and secondary-index key derivation (ADR 0054 step 1)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+bigdecimal.workspace = true

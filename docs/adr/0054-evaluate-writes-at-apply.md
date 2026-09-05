@@ -191,3 +191,42 @@ producer and neither is touched.
 
 Each step is independently revertible, and only step 3 changes observable
 behaviour.
+
+## As-built amendment (2026-09-05, Sequencing step 1 — item model extracted)
+
+Step 1 landed: `AttributeValue`/`Item`/`TableSchema`, the key-encoding
+primitives (`escape`/`storage_key`/`numkey`), `ConditionExpression`/
+`SortKeyCondition` (`condition`), the `UpdateExpression` data model and its
+apply-time evaluator (`apply_update` and everything it calls), the
+stored-item codec, the item-size formula, and the GSI/LSI row/footprint/
+change-record derivation (`index`) moved into a new crate, `animus-item`,
+below both `animus-dynamo` and `animus-cp-data` — see
+`crates/animus-item/CLAUDE.md`. `animus-dynamo` re-exports all of it
+unchanged; every `animus_dynamo::X`/`animus_dynamo::wire::X` path a caller
+used before this step still resolves, and no test's assertion changed (a
+pure move, 324 tests before and after, redistributed rather than dropped).
+
+**What did not move, and why.** The `UpdateExpression`/`ConditionExpression`
+**string parser** — tokenizing a request's expression text and resolving its
+`#alias`/`:placeholder` references against `ExpressionAttributeNames`/
+`ExpressionAttributeValues` — stayed in `animus-dynamo::wire`. That is
+JSON/wire-decode work, not part of the pure item-mutation model: it needs
+`serde_json::Value`, which would have pulled wire-shaped decoding back into
+the crate this step exists to keep pure below the wire. Only the *data types*
+the parser produces (`PathSegment`/`UpdateOperand`/`UpdateExpr`/
+`UpdateAction`) and the *evaluator* that consumes them (`apply_update`)
+moved — exactly the boundary "evaluation moves below the wire adapter"
+describes. `animus-dynamo`'s `registry`/`schema` (the catalog bridge),
+`capacity` (`ConsumedCapacity` response shaping, though it now re-exports the
+item-size formula itself from `animus-item`), `sigv4`, `streams_wire`, and
+`ttl` are unaffected.
+
+`apply_update` still runs exactly where it always did — the tablet leader,
+under `rmw_lock`, via `kind_write_item_at_leader` — unchanged by this step;
+only *where the code lives* changed. Step 2 (adding the schema slice to
+`KindBatch` and the leader-local result payload) and step 3 (moving
+evaluation to apply for real) are still ahead; `animus-cp-data` does not yet
+depend on `animus-item`.
+
+Status stays **Proposed**: only step 3 changes observable behaviour, and it
+has not landed.

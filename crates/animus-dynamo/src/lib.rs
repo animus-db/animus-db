@@ -4,10 +4,21 @@
 //! attribute map — ADR 0004) onto the [`StorageEngine`] trait, so the same
 //! engine that backs the data plane also backs the DynamoDB surface.
 //!
+//! **The pure item model lives in `animus-item` now (ADR 0054 step 1).**
+//! `AttributeValue`/`Item`/`TableSchema`, the key-encoding primitives
+//! (`escape`/`storage_key`/[`numkey`]), `ConditionExpression`/
+//! `SortKeyCondition` ([`condition`]), the `UpdateExpression` model and its
+//! evaluator ([`wire::apply_update`] et al.), the stored-item codec, and the
+//! secondary-index key/footprint/change-record derivation ([`index`]) were
+//! extracted into that crate, which sits **below** both this crate and
+//! `animus-cp-data` — a protocol-agnostic KV state machine that cannot
+//! depend on a wire crate. Everything below is re-exported here unchanged,
+//! so every existing `animus_dynamo::X` path keeps compiling; see
+//! `crates/animus-item/CLAUDE.md` for what actually lives there now.
+//!
 //! **Scope.** This implements `PutItem` / `GetItem` / `DeleteItem` / `Query`
-//! against a [`StorageEngine`]. The DynamoDB HTTP/JSON *wire protocol*,
-//! conditional writes, secondary indexes, and the distributed request path are
-//! explicitly future work.
+//! against a [`StorageEngine`]. The DynamoDB HTTP/JSON *wire protocol* lives
+//! in [`wire`]; the distributed request path is `animusd`'s.
 //!
 //! ## Key encoding
 //!
@@ -16,16 +27,10 @@
 //! terminator). All items in a partition are therefore contiguous and ordered
 //! by sort key, so a `Query` is a single range scan over the partition's prefix.
 
-use std::collections::BTreeMap;
-
 use animus_storage::{StorageEngine, Version};
-use serde::{Deserialize, Serialize};
 
 pub mod capacity;
-pub mod condition;
-pub mod index;
 pub mod internal_tables;
-pub mod numkey;
 pub mod registry;
 pub mod schema;
 pub mod sigv4;
@@ -33,10 +38,11 @@ pub mod streams_wire;
 pub mod ttl;
 pub mod wire;
 
-pub use condition::{Comparator, ConditionError, ConditionExpression, SortKeyCondition};
-pub use index::{
-    ChangeRecord, FootprintEntry, GsiRowRef, IndexFootprint, ItemFootprint, LsiRowRef,
-    index_table_name, is_index_table_name, split_index_table_name,
+pub use animus_item::{
+    AttributeValue, ChangeRecord, Comparator, ConditionError, ConditionExpression, FootprintEntry,
+    GsiRowRef, IndexFootprint, Item, ItemFootprint, LsiRowRef, SortKeyCondition, TableSchema,
+    condition, index, index_table_name, is_index_table_name, numkey, split_index_table_name,
+    storage_key,
 };
 pub use internal_tables::{TXN_IDEMPOTENCY_TABLE, is_internal_table_name};
 pub use registry::{
@@ -44,102 +50,6 @@ pub use registry::{
     SecondaryIndex,
 };
 pub use ttl::{MAX_PAST_EXPIRY_SECS, expires_at, is_expired};
-
-/// A DynamoDB-style attribute value (a useful subset). Beyond the scalar
-/// types (`S`/`N`/`B`/`BOOL`/`NULL`), this carries the **document** types
-/// `M` (a nested attribute map) and `L` (a heterogeneous list), and the
-/// homogeneous **set** types `SS` (string set), `NS` (number set), and `BS`
-/// (binary set).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AttributeValue {
-    /// String (`S`).
-    S(String),
-    /// Number (`N`) — carried as text, as on the DynamoDB wire.
-    N(String),
-    /// Binary (`B`).
-    B(Vec<u8>),
-    /// Boolean (`BOOL`).
-    Bool(bool),
-    /// Null (`NULL`).
-    Null,
-    /// Map (`M`) — a nested attribute map (a document type).
-    M(BTreeMap<String, AttributeValue>),
-    /// List (`L`) — an ordered, heterogeneous list of values (a document type).
-    L(Vec<AttributeValue>),
-    /// String set (`SS`) — a set of unique strings, kept sorted/deduplicated.
-    SS(Vec<String>),
-    /// Number set (`NS`) — a set of unique numbers (text), sorted/deduplicated.
-    NS(Vec<String>),
-    /// Binary set (`BS`) — a set of unique binary values, sorted/deduplicated.
-    BS(Vec<Vec<u8>>),
-}
-
-impl AttributeValue {
-    /// Byte encoding used when an attribute is part of a key. String/number/
-    /// binary sort by these bytes, and for every one of the three that
-    /// bytewise order equals DynamoDB's own order — including `N`, via the
-    /// order-preserving codec in [`numkey`] (ADR 0063: sign class byte,
-    /// biased exponent, digit run). See that ADR/module for the full design.
-    ///
-    /// Only scalar types are valid key attributes in DynamoDB; the document
-    /// and set types return an empty encoding (the schema/registry layers
-    /// reject them as keys before this is reached).
-    pub(crate) fn key_bytes(&self) -> Vec<u8> {
-        match self {
-            AttributeValue::S(s) => s.clone().into_bytes(),
-            AttributeValue::N(n) => numkey::encode(n).unwrap_or_else(|| {
-                // A key attribute reaching this point has already been
-                // validated as a well-formed DynamoDB `N` by the wire layer
-                // (`numkey::encode` only returns `None` for malformed text or
-                // an exponent outside DynamoDB's own documented range, which
-                // a well-formed `N` never has) — this fallback exists so a
-                // read path never panics on data that somehow got here
-                // anyway, not because it is expected to be hit.
-                n.clone().into_bytes()
-            }),
-            AttributeValue::B(b) => b.clone(),
-            AttributeValue::Bool(b) => vec![u8::from(*b)],
-            AttributeValue::Null
-            | AttributeValue::M(_)
-            | AttributeValue::L(_)
-            | AttributeValue::SS(_)
-            | AttributeValue::NS(_)
-            | AttributeValue::BS(_) => Vec::new(),
-        }
-    }
-}
-
-/// An item: a map from attribute name to value.
-pub type Item = BTreeMap<String, AttributeValue>;
-
-/// A table's key schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableSchema {
-    /// Partition (hash) key attribute name.
-    pub partition_key: String,
-    /// Optional sort (range) key attribute name.
-    pub sort_key: Option<String>,
-}
-
-impl TableSchema {
-    /// A table with only a partition key.
-    #[must_use]
-    pub fn simple(partition_key: impl Into<String>) -> Self {
-        Self {
-            partition_key: partition_key.into(),
-            sort_key: None,
-        }
-    }
-
-    /// A table with a partition key and a sort key.
-    #[must_use]
-    pub fn composite(partition_key: impl Into<String>, sort_key: impl Into<String>) -> Self {
-        Self {
-            partition_key: partition_key.into(),
-            sort_key: Some(sort_key.into()),
-        }
-    }
-}
 
 /// Errors from the item API.
 #[derive(Debug, thiserror::Error)]
@@ -156,33 +66,6 @@ pub enum DynamoError {
 }
 
 type Result<T> = std::result::Result<T, DynamoError>;
-
-/// Order-preserving, prefix-free escape: a key's encoding never prefixes
-/// another's, so a partition's items stay contiguous and sort-ordered.
-pub(crate) fn escape(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + 2);
-    for &b in bytes {
-        out.push(b);
-        if b == 0x00 {
-            out.push(0x01);
-        }
-    }
-    out.extend_from_slice(&[0x00, 0x00]);
-    out
-}
-
-/// The storage key for an item addressed by partition key `pk` and optional
-/// sort key `sk`: `escape(pk) || sk`. This is the engine/data-plane key the
-/// item maps onto — exposed so the wire layer can route an item through the
-/// distributed data plane without instantiating a local-engine [`Table`].
-#[must_use]
-pub fn storage_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> {
-    let mut key = escape(&pk.key_bytes());
-    if let Some(sk) = sk {
-        key.extend_from_slice(&sk.key_bytes());
-    }
-    key
-}
 
 /// A table backed by a [`StorageEngine`]. Writes use a monotonic version
 /// counter seeded from the engine's latest version.
@@ -274,7 +157,11 @@ impl<S: StorageEngine> Table<S> {
         pk: &AttributeValue,
         condition: Option<&crate::condition::SortKeyCondition>,
     ) -> Result<Vec<Item>> {
-        let prefix = escape(&pk.key_bytes());
+        // `storage_key(pk, None)` is exactly `escape(pk.key_bytes())` — no
+        // sort key to append — which keeps this crate from needing
+        // `animus-item`'s private `escape`/`key_bytes` outside `storage_key`
+        // itself (ADR 0054 step 1).
+        let prefix = storage_key(pk, None);
         // The partition's keys all start with `prefix` (which ends in
         // `0x00 0x00`); bumping the final byte to `0x01` is the first key past
         // the partition.

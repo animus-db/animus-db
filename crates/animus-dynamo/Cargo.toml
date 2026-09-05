@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 animus-control.workspace = true
+animus-item.workspace = true
 animus-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,5 +25,3 @@ hmac.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-proptest.workspace = true
-bigdecimal.workspace = true
