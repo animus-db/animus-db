@@ -35,7 +35,7 @@
 //! - `GET  /admin/system-table`        — browse the control-plane system keyspace (`?kind=&after=&limit=`, ADR 0038 addendum)
 //! - `GET  /admin/backups`             — the replicated backup catalog: id, name, table, status, per-tablet progress (including split re-planning, ADR 0059 §6), sizes, creation time (ADR 0059 §3/§4; pure observer — the DynamoDB wire surface, `CreateBackup`/`DescribeBackup`/`ListBackups`/`DeleteBackup`, is Train 1 PR④, `animusd::dynamo`)
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
-//! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F)
+//! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — liveness/readiness
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
@@ -512,6 +512,8 @@ fn config_view(ctx: &ClientCtx) -> Value {
         "peers": peers,
         "cp_member_addrs": meta.cp_member_addrs,
         "auto_split_bytes_threshold": a.auto_split_bytes_threshold,
+        // W-09 (ADR 0034 amendment): the request-rate sibling.
+        "auto_split_ops_rate_threshold": a.auto_split_ops_rate_threshold,
         // U-06 (docs/roadmap.md): backup/segment store (redacted to kind +
         // root path, never credentials — see `StoreView`), the ADR 0048
         // quiescence threshold, ADR 0057 auth state (never the secret —
@@ -1414,7 +1416,26 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
         .into_iter()
         .map(|(tablet, bytes_per_sec)| json!({"tablet": tablet.0, "bytes_per_sec": bytes_per_sec}))
         .collect();
-    json!({ "counters": counters, "is_leader": is_leader, "stream_change_rates": stream_change_rates })
+    // W-09 (ADR 0034 amendment): the request-rate sibling of
+    // `stream_change_rates` above — this node's own per-tablet **write**
+    // rate estimates (ops/sec), the signal that catches a hot-but-small
+    // tablet neither the byte nor the (streamed-only) change-rate trigger
+    // can see. Empty on a control-only node. The two configured thresholds
+    // ride alongside so an operator/dashboard doesn't have to fetch
+    // `/admin/config` separately to know what "hot" means here.
+    let request_rates: Vec<Value> = ctx
+        .request_rates()
+        .into_iter()
+        .map(|(tablet, ops_per_sec)| json!({"tablet": tablet.0, "ops_per_sec": ops_per_sec}))
+        .collect();
+    json!({
+        "counters": counters,
+        "is_leader": is_leader,
+        "stream_change_rates": stream_change_rates,
+        "request_rates": request_rates,
+        "auto_split_bytes_threshold": ctx.admin.auto_split_bytes_threshold,
+        "auto_split_ops_rate_threshold": ctx.admin.auto_split_ops_rate_threshold,
+    })
 }
 
 /// This node's metrics-history ring buffer (ADR 0020), backing the Overview

@@ -353,6 +353,9 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // `seal_tick`'s own `ctx.data().raftkv_metrics` access below: this
         // loop is only ever spawned for a data-capable node.
         ctx.data().change_rates.retain_existing(&meta);
+        // W-09 (ADR 0034 amendment): bound the request-rate tracker the
+        // same way, for the same reason.
+        ctx.data().request_rates.retain_existing(&meta);
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -1739,7 +1742,9 @@ async fn seal_tick(
     // new scan, reusing exactly the data `StreamHotBytes` just read above.
     // Read by `/admin/metrics` and the opt-in `--auto-split-change-rate`
     // trigger (`auto_split_loop`).
-    ctx.data().change_rates.observe(tablet, approx_bytes);
+    ctx.data()
+        .change_rates
+        .observe(tablet, approx_bytes, ctx.env.now());
 
     if approx_bytes == 0 {
         // Nothing pending at all: no backlog for the age trigger to
@@ -3530,6 +3535,7 @@ mod stream_sealer_tests {
                 knobs,
                 SegmentStoreConfig::default(),
                 crate::DEFAULT_STREAM_RETENTION,
+                None,
                 None,
                 quiesce_after,
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,

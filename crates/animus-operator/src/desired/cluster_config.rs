@@ -85,6 +85,13 @@ pub struct ClusterSettings {
     pub auto_split_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_split_change_rate: Option<u64>,
+    /// W-09 (ADR 0034 amendment): the request-rate sibling of
+    /// `auto_split_change_rate`. Same precedent — no `AnimusClusterSpec`
+    /// field exposes this yet, so this crate never populates it; it stays
+    /// `None`/absent from the emitted JSON like every other CRD-unexposed
+    /// knob in this mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_split_ops_rate: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_sweep_after_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +373,29 @@ mod tests {
         assert!(
             value.get("cluster_settings").is_none(),
             "expected no cluster_settings key, got {value}"
+        );
+    }
+
+    #[test]
+    fn cluster_settings_ops_rate_field_is_never_populated_by_this_crate() {
+        // W-09: no `AnimusClusterSpec` field exposes `auto_split_ops_rate`
+        // yet (mirroring `auto_split_change_rate`'s own precedent), so it
+        // stays `None` and never appears in the emitted JSON even when the
+        // section is otherwise non-empty.
+        let mut s = spec(3);
+        s.auto_split_bytes = Some(1);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let settings = cfg
+            .cluster_settings
+            .clone()
+            .expect("auto_split_bytes alone is enough for the section to appear");
+        assert_eq!(settings.auto_split_ops_rate, None);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert!(
+            value["cluster_settings"]
+                .get("auto_split_ops_rate")
+                .is_none(),
+            "expected no auto_split_ops_rate key, got {value}"
         );
     }
 

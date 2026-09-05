@@ -395,6 +395,25 @@ async fn admin_interface_surfaces_state_and_actions() {
                 >= 1,
             "control leader won an election: {lmetrics}"
         );
+        // W-09 (ADR 0034 amendment): `request_rates` rides beside
+        // `stream_change_rates`, and both auto-split thresholds are
+        // reported (as `null` here — this cluster sets neither flag).
+        assert!(
+            metrics["stream_change_rates"].as_array().is_some(),
+            "stream_change_rates is always an array: {metrics}"
+        );
+        assert!(
+            metrics["request_rates"].as_array().is_some(),
+            "request_rates is always an array: {metrics}"
+        );
+        assert!(
+            metrics["auto_split_bytes_threshold"].is_null(),
+            "no --auto-split-bytes configured in this test cluster: {metrics}"
+        );
+        assert!(
+            metrics["auto_split_ops_rate_threshold"].is_null(),
+            "no --auto-split-ops-rate configured in this test cluster: {metrics}"
+        );
 
         // ---- /admin/metrics/history -----------------------------------------
         // The sampler ticks every 10s (METRICS_SAMPLE_INTERVAL); poll rather than

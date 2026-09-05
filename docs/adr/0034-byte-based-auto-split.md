@@ -326,3 +326,84 @@ three real `--config`/`--node`-shaped deployment paths. See
 config::ClusterSettings`'s own doc for the full field list and per-role
 applicability, and ADR 0040/0048's own amendment notes for the same
 mechanism's `orphan_sweep_after_secs`/`quiesce_after_secs` fields.
+
+## Amendment (2026-09-05, W-09): the deferred request-rate signal, closed
+
+The "Deferred" bullet above (a small-but-hot tablet, well under any size
+threshold but under disproportionate write load, that structurally cannot
+split) is closed. `animusd::RequestRateTracker` (`lib.rs`, beside — and
+sharing its EWMA machinery with — `ChangeRateTracker`, ADR 0042 §14's own
+change-append-rate signal) is a per-node, per-tablet estimate of a tablet's
+own **leader-side write** rate (ops/sec), observed at the two call sites
+that together cover every leader-side non-transactional write:
+`dynamo::kind_write_item_at_leader` (the ADR 0046 U3 evaluate-at-leader
+funnel — a condition, an old-image echo, or an images-carrying table) and
+`dynamo::fast_marker_write` (the ADR 0049 fast arm — an unconditioned
+`Put`/`Delete` on a plain, unindexed/unstreamed table, which never reaches
+the funnel at all and is in fact the *common* shape for an ordinary
+write). Both tick the tablet's own tracker once per successful write, so
+the signal needs no new counter plumbing beyond those two call sites — but
+both are load-bearing: a version scoped to only the evaluate-at-leader
+funnel (this ADR's original single-choke-point assumption) would be blind
+to the exact write shape a plain, unconditioned `PutItem` burst produces,
+which is precisely the scenario the deferred bullet named. `--auto-split-ops-rate
+RATE` (`AutoSplitThresholds.ops_rate`) joins `auto_split_loop`'s existing
+either/any-trigger-fires gate alongside bytes and (for streamed tables)
+change-rate: once a led tablet's smoothed write rate sustains above `RATE`,
+it splits via the identical `byte_weighted_median`/`trigger_split` path
+every other trigger already uses.
+
+**Writes only, deliberately, mirroring `ChangeRateTracker`'s own
+precedent** — and for a structural reason, not just symmetry. Since ADR
+0055 an eventually-consistent read (`ConsistentRead: false`, the DynamoDB
+wire default) is served from *any* replica's own applied state and never
+reaches the leader at all; folding reads into a leader-observed counter
+would silently undercount a tablet whose real hot path is reads spread
+across replicas, with no honest fix short of a second, cluster-wide
+aggregation this signal deliberately stays simple enough to avoid. A
+strong (`ConsistentRead: true`) read does reach the leader but is excluded
+too, for the same reason: a tablet's write load is what actually drives
+replica-move/recovery/compaction cost the way this ADR's own byte trigger
+already targets, and a hot-but-small tablet under heavy `PutItem`/
+`UpdateItem`/`DeleteItem` load — the exact failure mode the deferred bullet
+named — is fully visible through writes alone. A future revision wanting
+read pressure factored in would need its own, separately-reasoned signal.
+
+**Unlike `auto_split_change_rate`, this trigger is not streamed-tables-only**
+— nothing about counting writes needs a change log, so `RequestRateTracker`
+observes every table's tablets, streamed or not; this is what actually
+closes the deferred bullet's *general* case rather than only the
+change-rate amendment's already-covered streamed one.
+
+Knob shape mirrors `auto_split_change_rate` throughout: opt-in (`None` is a
+true no-op, zero behavior change for an existing deployment), no
+production-tuned default (an operator picks `RATE` per workload), threaded
+through the identical layered-wrapper stack
+(`BoundNode::start_with_growth`/`BoundDataNode::start_data_with_growth`,
+every `start_cluster_with_growth*`/`start_split_cluster_with_growth`
+variant, `run_node_with_cluster_settings`/`run_node_data_with_cluster_
+settings`), reachable from `--cluster N`/`--cluster-control`+
+`--cluster-data`'s own `--auto-split-ops-rate RATE` CLI flag and from
+`--config`/`--node`'s and `animusd data --config`'s `cluster_settings.
+auto_split_ops_rate` config-file field (S-06's mechanism, extended) — the
+identical "CLI flag and config field both set is a hard startup error"
+contract. Surfaced read-only via `/admin/metrics`'s `request_rates` array
+(beside `stream_change_rates`) and `auto_split_ops_rate_threshold` (beside
+`auto_split_bytes_threshold`, also newly added there). No CRD field on the
+Kubernetes operator side, mirroring `auto_split_change_rate`'s own
+precedent (`crates/animus-operator/src/desired/cluster_config.rs`'s mirror
+`ClusterSettings` carries the field for shape-completeness but nothing
+populates it from `AnimusClusterSpec` yet).
+
+**A pre-existing, unrelated determinism-rule violation found and fixed in
+the same change**: `ChangeRateTracker::observe` read `tokio::time::
+Instant::now()` directly instead of going through the `Env` seam — a
+violation of the root `CLAUDE.md`'s "no wall clock" rule that the
+workspace's `disallowed_methods` lint does not catch inside `lib.rs`
+(`animusd`'s package-level lint exemption, `crates/animusd/CLAUDE.md`).
+Fixed as a pure refactor, in scope here because `RequestRateTracker` needed
+the identical `RateSample` storage shape anyway: both trackers now take the
+caller's own `env.now()` reading as an explicit `Nanos` parameter rather
+than reading a clock internally, and both gained a `SimEnv`-driven unit
+test over virtual time (no real sleep) proving the EWMA converges toward a
+sustained rate and decays once observations slow or stop.

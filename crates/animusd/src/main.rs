@@ -6,8 +6,8 @@
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
-//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
@@ -223,8 +223,8 @@ const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
     animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
-    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--dynamo-auth PATH]\n  \
+    animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH]\n  \
@@ -310,6 +310,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // data) — this flag has no default-on behavior; pick `RATE` per
     // workload.
     let mut auto_split_change_rate: Option<u64> = None;
+    // `--auto-split-ops-rate RATE` (W-09, ADR 0034's own deferred bullet,
+    // closed): opt-in — a led tablet whose own smoothed **write** request
+    // rate (ops/sec, `/admin/metrics`'s `request_rates`) sustains above
+    // `RATE` triggers the same split path. Unlike `auto_split_change_rate`,
+    // this applies to **any** table, not just a streamed one — it closes
+    // the "hot-but-small tablet under heavy write load never splits" gap
+    // for the general case. Absent means disabled (zero behavior change);
+    // no production-tuned default exists yet — pick `RATE` per workload.
+    let mut auto_split_ops_rate: Option<u64> = None;
     // `--orphan-sweep-after SECS` (ADR 0040 PR6): overrides
     // `DEFAULT_ORPHAN_SWEEP_AFTER` (10 minutes) for the control-plane
     // leader's auto-reclaim sweep of never-activated members; `0` disables
@@ -385,6 +394,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--auto-split-change-rate" => {
                 auto_split_change_rate = Some(parse_next(&mut it, "--auto-split-change-rate")?);
             }
+            "--auto-split-ops-rate" => {
+                auto_split_ops_rate = Some(parse_next(&mut it, "--auto-split-ops-rate")?);
+            }
             "--orphan-sweep-after" => {
                 orphan_sweep_after = Some(parse_next(&mut it, "--orphan-sweep-after")?);
             }
@@ -426,6 +438,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     let cli_cluster_settings = animusd::config::ClusterSettings {
         auto_split_bytes,
         auto_split_change_rate,
+        auto_split_ops_rate,
         orphan_sweep_after_secs: orphan_sweep_after,
         quiesce_after_secs: quiesce_after,
         stream_seal_bytes,
@@ -471,6 +484,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             backend,
             auto_split_bytes,
             auto_split_change_rate,
+            auto_split_ops_rate,
             orphan_sweep_after,
             dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
         )
@@ -502,6 +516,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 backend,
                 auto_split_bytes,
                 auto_split_change_rate,
+                auto_split_ops_rate,
                 orphan_sweep_after,
                 stream_seal_knobs,
                 segment_store_config,
@@ -742,6 +757,7 @@ fn resolve_cluster_settings(
     }
     merge_field!(auto_split_bytes, "--auto-split-bytes");
     merge_field!(auto_split_change_rate, "--auto-split-change-rate");
+    merge_field!(auto_split_ops_rate, "--auto-split-ops-rate");
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
@@ -830,6 +846,7 @@ async fn run_single(
         quiesce_after,
         settings.auto_split_bytes,
         settings.auto_split_change_rate,
+        settings.auto_split_ops_rate,
         backup_store_config,
     )
     .await
@@ -849,6 +866,9 @@ async fn run_single(
         println!(
             "animusd: node {index} streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
         );
+    }
+    if let Some(rate) = settings.auto_split_ops_rate {
+        println!("animusd: node {index} auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
     println!("animusd: ready — Ctrl-C to stop");
     wait_for_ctrl_c().await;
@@ -1071,6 +1091,7 @@ async fn run_data_config(
         backend,
         settings.auto_split_bytes,
         settings.auto_split_change_rate,
+        settings.auto_split_ops_rate,
         quiesce_after,
         stream_seal_knobs_val,
         // Same documented gap as `--backup-store` (ADR 0059 §1): no
@@ -1272,6 +1293,7 @@ async fn run_in_process_cluster(
     backend: animusd::StorageBackend,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     orphan_sweep_after: Duration,
     stream_seal_knobs: animusd::StreamSealKnobs,
     segment_store_config: animusd::SegmentStoreConfig,
@@ -1297,6 +1319,7 @@ async fn run_in_process_cluster(
         segment_store_config,
         stream_retention,
         auto_split_change_rate,
+        auto_split_ops_rate,
         quiesce_after,
         dynamo_auth,
         backup_store_config,
@@ -1314,6 +1337,9 @@ async fn run_in_process_cluster(
         println!(
             "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
         );
+    }
+    if let Some(rate) = auto_split_ops_rate {
+        println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
     for (i, node) in nodes.iter().enumerate() {
         println!(
@@ -1346,6 +1372,7 @@ async fn run_in_process_split_cluster(
     backend: animusd::StorageBackend,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
     orphan_sweep_after: Duration,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
 ) -> Result<(), String> {
@@ -1362,6 +1389,7 @@ async fn run_in_process_split_cluster(
         auto_split_bytes,
         orphan_sweep_after,
         auto_split_change_rate,
+        auto_split_ops_rate,
         dynamo_auth,
     )
     .await
@@ -1379,6 +1407,9 @@ async fn run_in_process_split_cluster(
         println!(
             "animusd: streamed-table auto-split ALSO fires above {rate} change-bytes/sec/tablet"
         );
+    }
+    if let Some(rate) = auto_split_ops_rate {
+        println!("animusd: auto-split ALSO fires above {rate} write-ops/sec/tablet");
     }
     for (i, node) in nodes.iter().take(control_n).enumerate() {
         println!(
@@ -1630,6 +1661,25 @@ mod tests {
             .expect_err("the same field set on both sides must be rejected");
         assert!(err.contains("quiesce_after_secs"), "{err}");
         assert!(err.contains("--quiesce-after"), "{err}");
+        assert!(err.contains("one way, not both"), "{err}");
+    }
+
+    #[test]
+    fn cluster_settings_ops_rate_field_on_both_sides_is_a_hard_error() {
+        // W-09: the new field gets the identical merge/conflict treatment
+        // as every other `cluster_settings` knob.
+        let config = animusd::config::ClusterSettings {
+            auto_split_ops_rate: Some(200),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            auto_split_ops_rate: Some(50),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli)
+            .expect_err("the same field set on both sides must be rejected");
+        assert!(err.contains("auto_split_ops_rate"), "{err}");
+        assert!(err.contains("--auto-split-ops-rate"), "{err}");
         assert!(err.contains("one way, not both"), "{err}");
     }
 

@@ -105,20 +105,9 @@ the still-true paragraph after the table.
   coordinated, interaction with transaction atomicity.
 - **PRs:** (1) ADR; (2) bucket + tracker; (3) enforcement + error mapping;
   (4) config surface. **Size:** L.
-- **Depends:** W-09 first (shares the per-tablet tracker).
-
-### W-09 Hot-but-small auto-split signal (ADR 0034 deferred item)
-
-- **Gap:** the byte trigger cannot see a small tablet under heavy load.
-  ADR 0034 says no per-tablet rate signal exists. **Partly stale:**
-  `ChangeRateTracker` exists but is fed only from `KIND_CHANGE` bytes, so
-  only streamed/indexed tables get a rate.
-- **Plan:** sibling `RequestRateTracker` (ops/sec) observed unconditionally
-  from `kind_write_item_at_leader`; new `auto_split_loop` gate
-  (`lib.rs:8485-8520`) and `--auto-split-ops-rate` knob.
-- **ADR:** amendment note closing ADR 0034's deferred bullet.
-- **PRs:** one. **Size:** M. **Depends:** none (S-06 landed 2026-09-04: a new knob
-  goes in `cluster_settings`).
+- **Depends:** none — W-09 landed 2026-09-05, so `RequestRateTracker`
+  (`crates/animusd/src/lib.rs`) already exists as the per-tablet tracker
+  shape to copy.
 
 ---
 
@@ -392,7 +381,8 @@ wave are independent and can run in parallel.
 |---|---|---|
 | 1 | *landed 2026-09-04* (W-02, W-04, W-05, W-06, U-01, U-08(i), C-04 E1) | Small, ADR-free, no cross-deps |
 | 2 | *landed 2026-09-04* (W-01, W-10, W-11, S-06, U-02, U-03, U-04, U-06) | Depends only on wave 1 |
-| 3 | W-03 (ADR first), W-09, U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
+| — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3; W-08 now depends on nothing |
+| 3 | W-03 (ADR first), U-05, U-07, U-08(ii), C-04 D1 | W-03 after W-05; U-05 after its members panel; D1 before C-01 |
 | 4 | C-01, S-01, S-02, W-08 | Highest blast radius; C-01 in isolation from S-01's listener changes |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (webhook needs S-01) |

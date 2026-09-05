@@ -127,6 +127,7 @@ async fn start_streamed_cluster_with_change_rate(
         SegmentStoreConfig::default(),
         animusd::DEFAULT_STREAM_RETENTION,
         Some(change_rate_bytes_per_sec),
+        None,
     )
     .await
     .unwrap()
