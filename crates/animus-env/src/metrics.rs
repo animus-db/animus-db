@@ -623,12 +623,32 @@ pub enum Metric {
     /// action; it falls back to the pre-existing warn-and-skip behavior, and
     /// `plan` re-emits the action next tick.
     CpEngineRebuildFailed,
+
+    // --- Client-connection cancellation (issue #596) --- Appended after the
+    // engine-rebuild variant above; every earlier variant's slot and the
+    // text-export order stay stable, so the snapshot remains
+    // byte-reproducible. Recorded by `animusd`'s `handle_connection` (the
+    // per-connection request loop shared by the client and intra listeners,
+    // ADR 0047) at the one site that knows the real outcome — the peer's
+    // socket was observed closed (EOF or a read error) while a request was
+    // still in flight, and the in-flight request future was dropped rather
+    // than driven to completion. See `crates/animusd/CLAUDE.md`'s
+    // fire-and-forget-connection-handler entry for the mechanism this closes
+    // and `docs/engineering-lessons.md`'s matching entry (issue #585/#586)
+    // for why an abandoned forwarded RPC's full confirm-wait budget running
+    // with nobody listening is the amplifier this counter is meant to catch.
+    /// A client (or a forwarding peer) closed its connection while this node
+    /// was still handling that connection's in-flight request — the request
+    /// future was dropped instead of run to completion. A sustained nonzero
+    /// rate under a hint-chasing forward means abandoned server-side work is
+    /// piling up, not necessarily a client bug (see the issue #596 lesson).
+    ClientRequestsAbandoned,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 82] = [
+    pub const ALL: [Metric; 83] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -711,6 +731,7 @@ impl Metric {
         Metric::CpEngineOpenFailed,
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
+        Metric::ClientRequestsAbandoned,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -800,6 +821,7 @@ impl Metric {
             Metric::CpEngineOpenFailed => "cp_engine_open_failed",
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
+            Metric::ClientRequestsAbandoned => "client_requests_abandoned",
         }
     }
 

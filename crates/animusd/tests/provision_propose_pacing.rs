@@ -149,7 +149,7 @@ async fn provisioning_against_a_quorumless_control_plane_does_not_spam_proposals
         .expect("send put");
         // The reply (an error, after the provision budget) is irrelevant;
         // reading it just keeps the connection open for the duration.
-        let _ = read_frame::<ClientResponse>(&mut stream).await;
+        let _ = read_frame::<ClientResponse, _>(&mut stream).await;
     });
 
     // Sample the leader's log growth over an equal window inside the grind.

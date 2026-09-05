@@ -1617,7 +1617,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     animusd::write_frame(&mut stream, &ClientRequest::Status)
         .await
         .expect("send Status request");
-    let reply = read_frame::<ClientResponse>(&mut stream)
+    let reply = read_frame::<ClientResponse, _>(&mut stream)
         .await
         .expect("read reply frame")
         .expect("a reply, not a dropped connection");
