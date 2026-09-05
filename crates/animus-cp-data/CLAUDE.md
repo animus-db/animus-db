@@ -374,6 +374,25 @@ reconfigure_multi_replica_diff.rs` is the dedicated regression (60 seeds,
 several harness shapes) and `animusd/tests/
 split_placing_two_replica_diff_e2e.rs` its real `ProdEnv` sibling. See
 `docs/engineering-lessons.md` for the investigation writeup.
+**`RaftKvNode::voter_history()` (issue #596)** records every distinct voter
+configuration a group has adopted, in adoption order, in a small bounded
+in-process ring (`VoterHistory`, capacity 64, oldest dropped; never rebuilt
+at recovery — a pure observability record of THIS uptime). Recorded once per
+consensus-loop iteration, the same "recompute live, same lock acquisition"
+cadence `state_machine_behind`/the quiesce veto already use — see the
+`drive()` loop's own comment at the call site. Exists because the transient
+over-replicated intermediate `reconfigure_step`'s learner-phased sequencing
+guarantees is real but its *duration* is an implementation timing artifact:
+`split_placing_two_replica_diff_e2e.rs` used to prove the 5-voter
+intermediate occurred by sampling `/admin/raftkv` externally every 200ms,
+which a fast enough pair of consecutive reconciler ticks can race shut
+before the sample lands — see `docs/engineering-lessons.md`'s matching
+entry. `tests/voter_history_reconfigure_diff.rs` is the dedicated `SimEnv`
+regression (asserts the exact 3→4→5→4→3 sequence on the one replica present
+in both the initial and the desired set); `admin::CpRaftView`'s
+`voter_history` field (`animusd`) surfaces it read-only on `/admin/raftkv`,
+mirroring `learners`' own "purely observational" contract above — reading it
+never blocks, proposes, or wakes a quiesced group.
 **Eventually-consistent reads (ADR 0055)** are the second read path this
 crate serves, and the one whose budget is easiest to destroy by accident:
 `stale_read_ready()` (the gate), `stale_get_served()` (outer `None` =

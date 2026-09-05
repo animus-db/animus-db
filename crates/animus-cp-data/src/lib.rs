@@ -1750,6 +1750,67 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// `set_quiesce_veto` for this group imposes no freshness requirement
     /// at all (identical to pre-fix behavior).
     external_quiesce_veto_fresh_through: Arc<AtomicU64>,
+    /// Every distinct voter configuration this group has adopted, in
+    /// adoption order (issue #596) — see [`VoterHistory`]'s doc for why this
+    /// exists and [`voter_history`](Self::voter_history) for the read side.
+    voter_history: Arc<Mutex<VoterHistory>>,
+}
+
+/// A bounded, in-process ring of every distinct Raft voter configuration a
+/// [`RaftKvNode`] has adopted, in adoption order (issue #596). Exists
+/// because a transient intermediate configuration's own DURATION is an
+/// implementation timing artifact, never a property this crate promises —
+/// `reconfigure_step`'s learner-phased sequencing (this file's own doc,
+/// "reconfigure_step's learner-phased replica-move sequencing") only
+/// guarantees an over-replicated intermediate is logically *reached*
+/// between an add and the matching remove, not how long it survives before
+/// the next reconciler tick removes it. An external poller sampling the
+/// live voter set on a fixed interval can race that window shut — see
+/// `crates/animusd/tests/split_placing_two_replica_diff_e2e.rs` and
+/// `docs/engineering-lessons.md`'s matching entry for the incident this
+/// closes. Recording the sequence here, inside the same consensus-loop
+/// iteration that already re-derives every other "recompute live, once per
+/// tick" fact (`state_machine_behind`, the quiesce veto), makes the
+/// intermediate provable from a durable-for-this-uptime record instead of
+/// from how fast an external caller happens to poll.
+///
+/// Deliberately **not** rebuilt at group start/recovery — unlike
+/// `sealed`/`committed_ceiling`/`txn_tracker`, "what voter sets has this
+/// process observed" is a pure observability question about the CURRENT
+/// uptime, not a durable fact any correctness path depends on; a restart
+/// legitimately starts a fresh history (seeded with the just-recovered
+/// config, same as a fresh group's initial config).
+#[derive(Debug, Default)]
+struct VoterHistory {
+    entries: std::collections::VecDeque<(Nanos, BTreeSet<NodeId>)>,
+}
+
+impl VoterHistory {
+    /// Oldest-dropped ring capacity — generous next to any single
+    /// reconfigure sequence this crate's own `reconfigure_step` can produce
+    /// (a two-of-three-replica-diff swap is at most five distinct
+    /// configurations: 3→4→5→4→3, see `tests/reconfigure_multi_replica_
+    /// diff.rs`), while keeping the ring's memory bounded across a tablet
+    /// group's whole uptime.
+    const CAPACITY: usize = 64;
+
+    /// Append `voters` if it differs from the most recently recorded entry
+    /// (or the ring is empty so far) — a no-op call on an unchanged config
+    /// (the overwhelming majority of consensus-loop iterations) costs one
+    /// `BTreeSet` comparison, no further clone or allocation.
+    fn record(&mut self, now: Nanos, voters: BTreeSet<NodeId>) {
+        if self.entries.back().is_some_and(|(_, last)| last == &voters) {
+            return;
+        }
+        if self.entries.len() >= Self::CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((now, voters));
+    }
+
+    fn snapshot(&self) -> Vec<(Nanos, BTreeSet<NodeId>)> {
+        self.entries.iter().cloned().collect()
+    }
 }
 
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
@@ -1950,6 +2011,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // not `0` — a caller that never calls `set_quiesce_veto` for this
         // group must impose no freshness requirement at all.
         let external_quiesce_veto_fresh_through = Arc::new(AtomicU64::new(u64::MAX));
+        // Issue #596: no initial entry is seeded here — `drive()` records the
+        // real starting configuration (a fresh group's own initial config, or
+        // whatever WAL recovery restores) as its very first entry, so a
+        // restart's history never starts from a config this node never
+        // actually held.
+        let voter_history = Arc::new(Mutex::new(VoterHistory::default()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -1981,6 +2048,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn_tracker: Arc::clone(&txn_tracker),
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
+            voter_history: Arc::clone(&voter_history),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -2016,6 +2084,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto,
             external_quiesce_veto_fresh_through,
             campaign_immediately,
+            voter_history,
         }));
         node
     }
@@ -3556,6 +3625,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// trigger a promotion.
     pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
         self.lock().learner_caught_up(id, threshold)
+    }
+
+    /// Every distinct voter configuration this group has adopted since it
+    /// started (or last recovered), in adoption order — issue #596. See
+    /// [`VoterHistory`]'s doc for why this exists: a transient
+    /// over-replicated intermediate's own duration is an implementation
+    /// timing artifact, so proving it was reached needs a record the node
+    /// itself keeps, not an external poll racing a reconciler tick. A pure
+    /// accessor — reading it never blocks, proposes, or wakes a quiesced
+    /// group, mirroring [`is_quiesced`](Self::is_quiesced)'s own contract.
+    pub fn voter_history(&self) -> Vec<(Nanos, BTreeSet<NodeId>)> {
+        self.voter_history
+            .lock()
+            .expect("voter history poisoned")
+            .snapshot()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked
@@ -8116,6 +8200,10 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// genuine first formation instead of waiting out the randomized
     /// election timeout — see [`RaftKvNode::start_hosted_campaigning`]'s doc.
     campaign_immediately: bool,
+    /// See [`RaftKvNode::voter_history`]'s doc — threaded through so this
+    /// loop can record the initial (post-recovery) config and every later
+    /// distinct one it adopts.
+    voter_history: Arc<Mutex<VoterHistory>>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -8242,6 +8330,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         external_quiesce_veto,
         external_quiesce_veto_fresh_through,
         campaign_immediately,
+        voter_history,
     } = st;
 
     let wal = wal_file(stream);
@@ -8311,6 +8400,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                  InstallSnapshot closes the gap"
             );
         }
+    }
+    // Issue #596: seed the voter history with the real starting
+    // configuration — a fresh group's own initial config, or whatever WAL
+    // recovery just restored above — so the very first entry is never
+    // synthesized, and a config change that lands before this loop's first
+    // iteration (vanishingly unlikely, but not impossible on a slow
+    // recovery) still has a prior entry to be compared against.
+    {
+        let initial_voters = core.lock().expect("raftkv core poisoned").config();
+        voter_history
+            .lock()
+            .expect("voter history poisoned")
+            .record(env.now(), initial_voters);
     }
     // Rebuild this group's in-memory sealed-range set from the engine's own
     // durable marker keys (ADR 0018 §2 amendment) — the deterministic
@@ -8514,7 +8616,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // has actually caught the engine up to `last_applied` — in the same
         // lock acquisition as `next_deadline`, once per loop iteration, before
         // `tick` can ever consult it (`quiesce_entry_ok`'s own doc).
-        let (deadline, was_quiesced) = {
+        let (deadline, was_quiesced, current_voters) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             let caught_up = engine_applied.load(Ordering::SeqCst) == c.last_applied();
             c.set_quiesce_engine_caught_up(caught_up);
@@ -8572,8 +8674,17 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 txn_veto || persist_veto || external_quiesce_veto.load(Ordering::SeqCst),
                 external_quiesce_veto_fresh_through.load(Ordering::SeqCst),
             );
-            (c.next_deadline(), c.is_quiesced())
+            // Issue #596: same "recompute live, once per consensus-loop
+            // iteration, same lock acquisition" cadence as
+            // `state_machine_behind`/the quiesce veto above — `record` is a
+            // cheap no-op on the overwhelming majority of iterations, where
+            // the config hasn't changed since last checked.
+            (c.next_deadline(), c.is_quiesced(), c.config())
         };
+        voter_history
+            .lock()
+            .expect("voter history poisoned")
+            .record(env.now(), current_voters);
         // `None` (ADR 0044 phase-1 PR3 quiescence) drops the timer arm
         // entirely rather than sleeping on a synthetic wait, so a genuinely
         // quiesced group posts zero `SimEnv` timeline events instead of a
