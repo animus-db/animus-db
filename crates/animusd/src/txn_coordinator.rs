@@ -27,19 +27,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
     /// [`txn_prepare`](Self::txn_prepare)'s own `CpRoute::Local` branch (no
     /// forward needed) and `cp_serve_forwarded`'s `TxnPrepare` arm (a
-    /// forwarded hop just landed on the real leader). Evaluates every
-    /// `pending_kind_writes` entry **here**, under `ctx.data().rmw_lock` —
-    /// the identical lock [`dynamo::kind_write_item_at_leader`] takes for
-    /// the ordinary (non-transactional) write path — merging the result
-    /// into `writes` immediately before staging, never at the coordinator/
-    /// edge (see [`PendingKindWrite`]'s doc for the cross-node race this
-    /// closes). Every evaluated write also gets a mandatory own-key
-    /// `conditions` entry (ADR 0046 Fork C1: `(key, raw_old)`, the exact
-    /// bytes just read) — belt-and-suspenders against the residual window
-    /// between this read and the propose call a few lines down, even
-    /// though holding `rmw_lock` across both already closes it for every
-    /// write this node's own lock covers (a `txn_resolver_loop` recovery
-    /// push resolving a *different* transaction's intent never takes it).
+    /// forwarded hop just landed on the real leader).
+    ///
+    /// **ADR 0054 step 4a: no evaluation happens here any more.** Every
+    /// `pending_kind_writes` entry is turned into a self-contained
+    /// [`TxnWrite::pending`] payload — the schema slice this leader's own
+    /// `Metadata` read supplies, plus `pk`/`sk`/`op`/`condition` copied
+    /// straight through — and appended to `writes` unevaluated. No read, no
+    /// `rmw_lock`, no leader-side condition/update evaluation: the
+    /// propose→apply staleness window this used to leave open (closed only
+    /// by the mandatory own-key `conditions` seatbelt, ADR 0046 Fork C1) no
+    /// longer exists to close, because `KvCommand::TxnStage`'s own apply arm
+    /// now evaluates every pending write itself, reading the item's current
+    /// committed value **in commit order** — the identical win ADR 0054
+    /// already gave the ordinary (non-transactional) write path
+    /// (`kind_write_item_at_leader`/`KvCommand::KindEval`), extended here to
+    /// a transaction's own stage. `stage_marker` is still built here (a pure
+    /// function of `pk`/`sk`, never state that could go stale) via
+    /// [`dynamo::item_stage_marker_change_log`].
     #[allow(clippy::too_many_arguments)] // mirrors ClientRequest::TxnPrepare's own field count
     pub(crate) async fn txn_stage_local(
         &self,
@@ -47,51 +52,30 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         table: &str,
         anchor: Option<(TxnId, Vec<u8>, String)>,
         mut writes: Vec<TxnWrite>,
-        mut conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         participant_spans: Vec<(String, KeyRange)>,
         pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
         decide::frozen_refusal(leader.is_frozen()).map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
-            let _rmw = self.data().rmw_lock.lock().await;
+            let schema = dynamo::write_schema_for(&meta, table);
             for p in pending_kind_writes {
-                let evaluated = dynamo::eval_kind_txn_write(
-                    self,
-                    leader,
-                    &meta,
-                    table,
-                    &p.pk,
-                    p.sk.as_ref(),
-                    &p.op,
-                    p.condition.as_ref(),
-                )
-                .await
-                .map_err(|e| {
-                    TxnAbortReason::Other(format!(
-                        "txn prepare: leader-side evaluation failed: {e}"
-                    ))
-                })?;
-                // ADR 0018's 2026-08-24 `CancellationReasons` amendment
-                // (issue #374 C2b): a write action's own condition failing
-                // here is a **permanent** `ConditionalCheckFailedException`,
-                // never a `TransactionConflict` — `key` is this exact item's
-                // own data-plane key, recovered from `p.pk`/`p.sk` the same
-                // way `dynamo::item_key` derives it everywhere else.
-                let Some(eval) = evaluated else {
-                    return Err(TxnAbortReason::ConditionFailed {
-                        table: table.to_owned(),
-                        key: dynamo::item_key(&p.pk, p.sk.as_ref()),
-                    });
-                };
-                conditions.push((eval.key.clone(), eval.raw_old.clone()));
-                writes.push(animus_cp_data::TxnWrite {
-                    key: eval.key,
-                    value: Some(eval.value),
-                    kind_writes: eval.kind_writes,
-                    change_log: eval.change_log,
-                    stage_marker: Some(eval.stage_marker),
-                });
+                let key = dynamo::item_key(&p.pk, p.sk.as_ref());
+                let stage_marker = dynamo::item_stage_marker_change_log(&p.pk, p.sk.as_ref());
+                let op = dynamo::kind_write_op_to_eval_op(p.op);
+                writes.push(TxnWrite::pending_eval(
+                    key,
+                    Some(stage_marker),
+                    crate::PendingTxnWrite {
+                        schema: schema.clone(),
+                        pk: p.pk,
+                        sk: p.sk,
+                        op,
+                        condition: p.condition,
+                        ttl_expired: false,
+                    },
+                ));
             }
         }
         match anchor {
@@ -433,6 +417,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         key,
                     });
                 }
+                // ADR 0054 step 4a: a pending write's own apply-time
+                // evaluation was rejected — a validation-shaped failure
+                // (`condition.evaluate`/`apply_update` returning `Err`,
+                // never a false condition, which is `ConditionFailed`
+                // above). Final, like `ConditionFailed` — never retried —
+                // and, for the identical reason that site gives (no old
+                // image in hand, and this path must not add a read just to
+                // populate one), `key`/`code` are folded into the message
+                // rather than carried as a typed `TxnAbortReason` field;
+                // `dynamo.rs::run_transact`'s own `TxnAbortReason::Other(_)
+                // => None` arm already falls back to the aggregate-only
+                // `TransactionCanceledException` shape for this, matching
+                // the pre-4a fidelity a leader-side `ConditionError`/
+                // `UpdateError` already had (it too collapsed to `Other`
+                // via `WireError`, never a typed per-action reason).
+                StageOutcome::Rejected { key, code, message } => {
+                    return Err(TxnAbortReason::Other(format!(
+                        "txn prepare: stage on table `{table}` rejected pending write {key:?} \
+                         at apply ({code}): {message}"
+                    )));
+                }
                 StageOutcome::Fenced => {
                     return Err(TxnAbortReason::Other(format!(
                         "txn prepare: stage on table `{table}` was rejected (a stale route, an \
@@ -493,8 +498,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             (None, Some(msg)) => Err(TxnAbortReason::Other(msg)),
             // Every `TXN_STAGE_PUSH_ATTEMPTS` attempt returning `Ok` with an
             // outcome other than `Staged`/`IntentBlocked`/`ConditionFailed`/
-            // `Fenced` is unreachable (`StageOutcome` is exhaustively
-            // matched above) — kept as a typed fallback rather than an
+            // `Rejected`/`Fenced` is unreachable (`StageOutcome` is
+            // exhaustively matched above) — kept as a typed fallback rather
+            // than an
             // `unreachable!()` so a future `StageOutcome` variant fails soft
             // here instead of panicking a live node.
             (None, None) => Err(TxnAbortReason::Other(format!(

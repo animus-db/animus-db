@@ -76,7 +76,9 @@ mod txn;
 
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
-pub use txn::{ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite};
+pub use txn::{
+    PendingTxnWrite, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite,
+};
 
 /// The assumed maximum clock-offset bound across the cluster (ADR 0018 §2),
 /// threaded into every [`Hlc::new`] this crate constructs. Not yet consumed
@@ -373,6 +375,15 @@ pub const ALL_KINDS: [u8; 5] = [
 /// apply-time token check) names it the same way instead of repeating the
 /// tuple.
 pub type KindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
+
+/// ADR 0054 step 4a: one [`txn::TxnWrite`]'s evaluated-at-apply payload —
+/// `(base value, kind-scope writes excluding the base row, change-log
+/// record)` — substituted for that write's own (empty, at propose time)
+/// `value`/`kind_writes`/`change_log` fields when a [`KvCommand::TxnStage`]
+/// entry stages a [`txn::TxnWrite::pending`] write. `None` in the enclosing
+/// `Vec` means "use the write's own pre-set fields unchanged" (a non-
+/// `pending` write).
+type EvaluatedPendingWrite = (Option<Vec<u8>>, Vec<KindWrite>, Option<(Vec<u8>, Vec<u8>)>);
 
 /// The write operation a [`KvCommand::KindEval`] entry evaluates at apply
 /// (ADR 0054 step 2) — the self-contained mirror of `animus-node`'s
@@ -1008,6 +1019,22 @@ pub enum KvCommand {
     /// a validated rejection (folded into this stage's structural `Fenced`
     /// outcome), never an `assert!`, since this payload is wire-reachable
     /// (via `ClientRequest::TxnPrepare`).
+    ///
+    /// **ADR 0054 step 4a — `TxnWrite::pending` moves evaluation from the
+    /// leader (pre-propose) to right here (at apply, in commit order).**
+    /// A write whose `pending` field is `Some` carries no `value`/
+    /// `kind_writes`/`change_log` of its own at propose time; this arm
+    /// evaluates `condition`/`op` fresh against the key's current
+    /// committed value (drained from the pending run first, same as the
+    /// byte-OCC `conditions` check just above) and derives them via the
+    /// same `evaluate_kind_eval` core `KvCommand::KindEval` uses — closing
+    /// the propose→apply staleness window for a transactional write the
+    /// identical way this ADR already closed it for the ordinary write
+    /// path. A rejection folds into [`StageOutcome::ConditionFailed`] or
+    /// the new [`StageOutcome::Rejected`]; either way the WHOLE stage
+    /// no-ops, matching this variant's existing whole-or-nothing
+    /// discipline. See [`txn::TxnWrite::pending`]'s own doc for the full
+    /// design, including the same-txn-replay discipline this needs.
     TxnStage {
         txn_id: TxnId,
         record_key: Vec<u8>,
@@ -6501,6 +6528,21 @@ fn change_log_token_valid(base_key: &[u8], change_log: Option<&(Vec<u8>, Vec<u8>
     })
 }
 
+/// ADR 0054 step 4a: a [`txn::PendingTxnWrite`]'s own `pk`/`sk` must derive
+/// exactly the base key its enclosing [`txn::TxnWrite`] carries — checked
+/// here (a validated rejection, folding into the same structural `Fenced`
+/// bucket as the token checks above), never assumed, since `key` and
+/// `pending` are independently wire-reachable via `ClientRequest::
+/// TxnPrepare`. Mirrors `KvCommand::KindEval`'s own apply arm, which derives
+/// its base key fresh from `pk`/`sk` rather than trusting a leader-computed
+/// one for the identical reason.
+fn pending_base_key_matches(base_key: &[u8], p: &txn::PendingTxnWrite) -> bool {
+    let token = animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
+    let mut expected = token.to_vec();
+    expected.extend_from_slice(&animus_item::storage_key(&p.pk, p.sk.as_ref()));
+    expected == base_key
+}
+
 /// Logged-warning cap for [`surface_suspicious_merge_noop`] (below): the
 /// [`Metric`] counters there are always incremented (cheap, unconditional),
 /// but a genuinely-reoccurring bug logging one line per applied entry would
@@ -7428,6 +7470,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     kind_writes_token_valid(&w.key, &w.kind_writes)
                         && stage_marker_token_valid(&w.key, w.stage_marker.as_ref())
                         && change_log_token_valid(&w.key, w.change_log.as_ref())
+                        // ADR 0054 step 4a: a `pending` write's own `pk`/`sk`
+                        // must derive exactly this write's own `key` — a
+                        // validated rejection (folded into this same
+                        // structural `Fenced` bucket), never trusted, since
+                        // `key` and `pending` are independently
+                        // wire-reachable via `ClientRequest::TxnPrepare`.
+                        && w.pending.as_ref().is_none_or(|p| pending_base_key_matches(&w.key, p))
                 });
                 let all_in_fence = !already_decided
                     && !resurrection_attempt
@@ -7485,22 +7534,146 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 } else {
                     None
                 };
-                let stage_ok = all_in_fence && condition_failure.is_none();
+                // ADR 0054 step 4a: evaluate every `TxnWrite::pending` write
+                // right here, at apply, in commit order — the identical win
+                // `KvCommand::KindEval`'s own arm already gives the ordinary
+                // write path, extended to a transaction's own stage. Gated
+                // on `all_in_fence && condition_failure.is_none()`: a
+                // pending write's own evaluation never masks a more
+                // fundamental fence/seal/foreign-intent/already-decided/
+                // byte-OCC rejection — those reasons are exactly what
+                // `StageOutcome` still needs to tell apart from a genuine
+                // condition failure or validation rejection.
+                //
+                // Evaluated `(value, kind_writes, change_log)` per write
+                // index, substituted for that write's own (empty, at
+                // propose time) fields when merging below — `None` means
+                // "use the write's own pre-set fields unchanged" (a
+                // non-`pending` write, evaluated by its own caller as
+                // before ADR 0054, or one produced by a caller outside the
+                // Dynamo kind-write path, e.g. a raw `ClientRequest::Txn`).
+                let mut evaluated_payload: Vec<Option<EvaluatedPendingWrite>> =
+                    vec![None; writes.len()];
+                let mut pending_failure: Option<txn::StageOutcome> = None;
+                if all_in_fence
+                    && condition_failure.is_none()
+                    && writes.iter().any(|w| w.pending.is_some())
+                {
+                    flush_pending(storage, &mut pending, metrics, halted).await;
+                    'pending_eval: for (i, w) in writes.iter().enumerate() {
+                        let Some(p) = w.pending.as_ref() else {
+                            continue;
+                        };
+                        let raw = storage
+                            .get(&scope.physical(&w.key))
+                            .await
+                            .expect("raftkv txn stage pending-eval read");
+                        let old: Option<Item> = match raw.map(|vv| txn::decode_envelope(&vv.value))
+                        {
+                            None => None,
+                            Some(txn::Envelope::Committed(bytes)) => {
+                                animus_item::decode_stored_item(&bytes)
+                                    .expect("raftkv txn stage pending-eval decode")
+                            }
+                            // Same-txn re-staging (a WAL-replay
+                            // re-application): this exact stage already
+                            // landed this exact intent at this exact key —
+                            // reuse its already-computed payload verbatim
+                            // instead of re-evaluating `op`/`condition`
+                            // against it as though it were the pre-stage
+                            // value (which would, e.g., double-apply a
+                            // non-idempotent `ADD` against its own prior
+                            // result). A *foreign* intent here is
+                            // unreachable: `blocked_by` above already
+                            // rejected the whole stage (`all_in_fence ==
+                            // false`) before this loop ever runs.
+                            Some(txn::Envelope::Intent {
+                                txn_id: owner,
+                                staged_value,
+                                kind_writes,
+                                change_log,
+                                ..
+                            }) if owner == txn_id => {
+                                evaluated_payload[i] =
+                                    Some((staged_value, kind_writes, change_log));
+                                continue;
+                            }
+                            Some(txn::Envelope::Intent { .. }) => {
+                                unreachable!(
+                                    "a foreign intent here was already caught by `blocked_by` \
+                                     above (all_in_fence would be false)"
+                                )
+                            }
+                        };
+                        let token =
+                            animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
+                        match evaluate_kind_eval(
+                            &p.schema,
+                            &p.pk,
+                            p.sk.as_ref(),
+                            &token,
+                            old,
+                            &p.op,
+                            p.condition.as_ref(),
+                            p.ttl_expired,
+                        ) {
+                            KindEvalDecision::ConditionFailed => {
+                                pending_failure =
+                                    Some(txn::StageOutcome::ConditionFailed { key: w.key.clone() });
+                                break 'pending_eval;
+                            }
+                            KindEvalDecision::Rejected { code, message } => {
+                                pending_failure = Some(txn::StageOutcome::Rejected {
+                                    key: w.key.clone(),
+                                    code,
+                                    message,
+                                });
+                                break 'pending_eval;
+                            }
+                            KindEvalDecision::Applied {
+                                writes: derived_writes,
+                                change_log,
+                                ..
+                            } => {
+                                let base_value = derived_writes
+                                    .iter()
+                                    .find(|(kind, _, _)| *kind == KIND_BASE)
+                                    .and_then(|(_, _, v)| v.clone());
+                                let kind_writes_only: Vec<KindWrite> = derived_writes
+                                    .into_iter()
+                                    .filter(|(kind, _, _)| *kind != KIND_BASE)
+                                    .collect();
+                                evaluated_payload[i] =
+                                    Some((base_value, kind_writes_only, Some(change_log)));
+                            }
+                        }
+                    }
+                }
+                let stage_ok =
+                    all_in_fence && condition_failure.is_none() && pending_failure.is_none();
                 if stage_ok {
                     flush_pending(storage, &mut pending, metrics, halted).await;
                     let version = hlc::pack(ts);
-                    for w in &writes {
+                    for (i, w) in writes.iter().enumerate() {
                         // ADR 0046 A1: the derived kind-writes/change-log
                         // payload rides inside this intent, opaque until
                         // `TxnResolve`'s commit branch materializes it —
                         // never written into a kind scope here.
+                        let (value, kind_writes, change_log) = match &evaluated_payload[i] {
+                            Some((v, kw, cl)) => (v.as_deref(), kw.as_slice(), cl.as_ref()),
+                            None => (
+                                w.value.as_deref(),
+                                w.kind_writes.as_slice(),
+                                w.change_log.as_ref(),
+                            ),
+                        };
                         let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
                             &record_table,
-                            w.value.as_deref(),
-                            &w.kind_writes,
-                            w.change_log.as_ref(),
+                            value,
+                            kind_writes,
+                            change_log,
                         );
                         let physical_key = scope.physical(&w.key);
                         let took_effect = storage
@@ -7606,6 +7779,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     txn::StageOutcome::Fenced
                 } else if let Some(key) = condition_failure {
                     txn::StageOutcome::ConditionFailed { key }
+                } else if let Some(pf) = pending_failure {
+                    pf
                 } else {
                     txn::StageOutcome::Staged
                 };

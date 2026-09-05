@@ -253,6 +253,16 @@ amendment — the shape predates and outlives it.)
   a mis-tokened prefix rejects the whole stage as `Fenced` at the stage,
   never at resolve). Test: `txn_kind_writes.rs::
   a_change_log_prefix_off_its_own_token_is_rejected_at_apply`.
+  **`TxnWrite.pending` (ADR 0054 step 4a, codec version 26)**: an optional
+  `PendingTxnWrite` — the `TxnStage` sibling of `KvCommand::KindEval`'s own
+  self-contained payload (`schema`/`pk`/`sk`/`op`/`condition`/
+  `ttl_expired`, no `ts`). When `Some`, `value`/`kind_writes`/`change_log`
+  above are ignored at propose time and computed by `TxnStage`'s own apply
+  arm instead, reusing `evaluate_kind_eval` verbatim — see the Key
+  invariants section's `KvCommand::KindEval` entry for that evaluator and
+  this field's own doc for the same-txn-replay discipline a non-idempotent
+  update needs. `stage_marker` is unaffected (a pure function of `pk`/`sk`,
+  built at propose time regardless).
 
 ### lib.rs API
 

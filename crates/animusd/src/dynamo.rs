@@ -5754,14 +5754,17 @@ pub(crate) enum KindWriteOutcome {
 }
 
 /// **Issue #412: classify a leader-side old-image read failure before
-/// wrapping it**, shared by [`kind_write_item_at_leader`] and its
-/// transactional twin [`eval_kind_txn_write`]. Every error
+/// wrapping it**, used by [`kind_write_item_at_leader`]'s own seatbelt
+/// read (`predict_kind_eval_decision`'s pre-read) — its transactional twin
+/// `eval_kind_txn_write` was deleted in ADR 0054 step 4a, once
+/// `ClientCtx::txn_stage_local` stopped evaluating at the leader at all.
+/// Every error
 /// `ClientCtx::cp_get_local_resolving` can produce already carries the
 /// house `"; retry"` suffix (a leader-moved condition, a stale-routing
 /// scope miss, an in-flight transaction resolution race — see that
 /// function's own doc) — this makes threading that retryability through to
-/// the wrapped [`WireError`] an explicit, structural decision at the one
-/// place both callers turn this read's failure into their own error type,
+/// the wrapped [`WireError`] an explicit, structural decision at the
+/// place this read's failure turns into this function's own error type,
 /// mirroring how `FROZEN_REFUSAL` is threaded, rather than leaving it an
 /// accident of `{e}` happening to sit last in a `format!` string that a
 /// future edit (e.g. appending more context after the interpolated error)
@@ -5779,8 +5782,8 @@ fn leader_read_failure(e: String) -> WireError {
 
 /// Test-only fault injector for the issue #412 regression: forces the next
 /// `count` leader-side old-image reads for `table`
-/// ([`kind_write_item_at_leader`]/[`eval_kind_txn_write`]'s shared read
-/// step) to fail with the retryable `"CP group leader moved; retry"` shape,
+/// ([`kind_write_item_at_leader`]'s own seatbelt read step) to fail with
+/// the retryable `"CP group leader moved; retry"` shape,
 /// without needing to orchestrate a real leadership change. Mirrors
 /// [`rmw285_confirm_gate`]'s arm/consume idiom.
 #[cfg(test)]
@@ -5873,12 +5876,14 @@ pub(crate) mod leader_read_failure_gate {
 /// removed, deliberately: Ambiguity"), never a lost or double-applied
 /// write.
 ///
-/// **What did NOT move in this step.** `eval_kind_txn_write`/
-/// `txn_stage_local` (`TransactWriteItems`' own evaluation) stay on the
-/// leader-evaluated `KindBatch` path — ADR 0054's Sequencing text moves
-/// them in step 4, alongside deleting `rmw_lock`/the seatbelt entirely.
-/// `BatchWriteItem`, the TTL reaper, and the admin seeder all route
-/// through this same function, so they cut over with it for free.
+/// **What did NOT move in this step.** `ClientCtx::txn_stage_local`
+/// (`TransactWriteItems`' own evaluation) stayed on the leader-evaluated
+/// `KindBatch` path when this step landed — ADR 0054 step 4a moved it too
+/// (`eval_kind_txn_write` no longer exists; `txn_stage_local` builds a
+/// `TxnWrite::pending` payload instead and never reads/evaluates at the
+/// leader at all). `BatchWriteItem`, the TTL reaper, and the admin seeder
+/// all route through this same function, so they cut over with it for
+/// free.
 ///
 /// This function always runs **on the tablet's own leader** — called
 /// in-process by `ClientCtx::cp_kind_write_item`'s `Local` branch, or by
@@ -5944,13 +5949,7 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
         ProbeIdentity::RequiresOwnEntry
     };
     let schema = write_schema_for(meta, table);
-    let eval_op = match op {
-        KindWriteOp::Put(item) => animus_cp_data::KindEvalOp::Put(item),
-        KindWriteOp::Delete => animus_cp_data::KindEvalOp::Delete,
-        KindWriteOp::Update { key_item, actions } => {
-            animus_cp_data::KindEvalOp::Update { key_item, actions }
-        }
-    };
+    let eval_op = kind_write_op_to_eval_op(op);
     // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
     // takes no `self`/`R`-typed argument, so nothing here pins down `R` for
     // the now-generic `ClientCtx<E, R>` path — both `E`/`R` are already
@@ -6212,122 +6211,20 @@ type ChangeLog = (Vec<u8>, Vec<u8>);
 /// multi-kind writes and the change-log record that accompanies them.
 type IndexedWrite = (Vec<KindWrite>, ChangeLog);
 
-/// The result of [`eval_kind_txn_write`]: everything `ClientCtx::
-/// txn_stage_local` needs to build the [`animus_cp_data::TxnWrite`] a
-/// kind-write-path item's transactional write stages.
-pub(crate) struct KindTxnWriteEval {
-    /// The item's own base key — `TxnWrite::key`.
-    pub(crate) key: Vec<u8>,
-    /// The encoded new item, or the Dynamo-level tombstone marker for a
-    /// delete (never the engine's own `None`/tombstone — see
-    /// `kind_write_item_at_leader`'s identical convention) — `TxnWrite::value`.
-    pub(crate) value: Vec<u8>,
-    /// The raw bytes this evaluation's own old-image read observed (`None`
-    /// if absent) — used to build the mandatory own-key OCC `conditions`
-    /// entry (ADR 0046 Fork C1) the caller adds alongside this write.
-    pub(crate) raw_old: Option<Vec<u8>>,
-    /// The ADR 0049 §3 stage-marker `(change_key_prefix, record)` pair —
-    /// `TxnWrite::stage_marker`, written by `TxnStage`'s apply arm at the
-    /// stage entry's own HLC (see [`stage_marker_change_log`]).
-    pub(crate) stage_marker: (Vec<u8>, Vec<u8>),
-    /// The derived kind-scope writes (LSI rows), EXCLUDING the base row
-    /// itself (that's `key`/`value` above) — `TxnWrite::kind_writes`. Empty
-    /// if `table` lost its last index/stream in the gap between routing and
-    /// evaluation (mirrors `kind_write_item_at_leader`'s own `None`
-    /// fallback — still correct, just no longer index/stream-maintaining).
-    pub(crate) kind_writes: Vec<KindWrite>,
-    /// The change-log record to materialize alongside `kind_writes` at
-    /// resolve — `TxnWrite::change_log`.
-    pub(crate) change_log: Option<ChangeLog>,
-}
-
-/// **ADR 0046 U3, extended to the transactional path (`TxnStage` kind-writes
-/// stack PR2)**: evaluate one item's write **at the tablet's own leader**,
-/// the identical read → evaluate-`condition` → diff span
-/// [`kind_write_item_at_leader`] runs for the ordinary write path — but
-/// returning the diff instead of proposing it. The actual stage propose
-/// happens immediately afterward, in the SAME `TxnPrepare` call this runs
-/// inside of (`ClientCtx::txn_stage_local`), under the identical
-/// `ctx.data().rmw_lock` `kind_write_item_at_leader` takes — so every write
-/// of this item, transactional or not, from whichever edge node received
-/// it, still funnels through one lock on one node (the race U3 exists to
-/// close).
-///
-/// Returns `Ok(None)` for a condition mismatch (no diff computed, mirroring
-/// [`KindWriteOutcome::ConditionFailed`]); `Ok(Some(..))` otherwise.
-#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
-pub(crate) async fn eval_kind_txn_write<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    leader: &CpGroup<E>,
-    meta: &Metadata,
-    table: &str,
-    pk: &AttributeValue,
-    sk: Option<&AttributeValue>,
-    op: &KindWriteOp,
-    condition: Option<&ConditionExpression>,
-) -> Result<Option<KindTxnWriteEval>, WireError> {
-    let base_key = item_key(pk, sk);
-    #[cfg(test)]
-    if let Some(err) = leader_read_failure_gate::maybe_fail(table) {
-        return Err(leader_read_failure(err));
-    }
-    let raw_old = ctx
-        .cp_get_local_resolving(leader, &base_key)
-        .await
-        .map_err(leader_read_failure)?;
-    let old = match &raw_old {
-        Some(bytes) => wire::decode_stored_item(bytes)?,
-        None => None,
-    };
-    if let Some(cond) = condition
-        && !cond.evaluate(old.as_ref())?
-    {
-        return Ok(None);
-    }
-    let new = match op {
-        KindWriteOp::Put(item) => Some(item.clone()),
-        KindWriteOp::Delete => None,
+/// **ADR 0054 step 4a**: the `KindWriteOp` (wire-decode-free, but still
+/// wire-shaped) → `animus_cp_data::KindEvalOp` (fully self-contained)
+/// mirror every kind-write-path producer needs — shared by
+/// [`kind_write_item_at_leader`] (the ordinary write path, ADR 0054 step 3)
+/// and `ClientCtx::txn_stage_local` (the transactional path, this step),
+/// never duplicated inline at either call site.
+pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindEvalOp {
+    match op {
+        KindWriteOp::Put(item) => animus_cp_data::KindEvalOp::Put(item),
+        KindWriteOp::Delete => animus_cp_data::KindEvalOp::Delete,
         KindWriteOp::Update { key_item, actions } => {
-            let base = old.clone().unwrap_or_else(|| key_item.clone());
-            Some(wire::apply_update(base, actions)?)
+            animus_cp_data::KindEvalOp::Update { key_item, actions }
         }
-    };
-    let value = match &new {
-        Some(item) => wire::encode_stored_item(item),
-        None => wire::encode_tombstone(),
-    };
-    let (writes, change_log) = kind_writes_for_item(
-        meta,
-        table,
-        pk,
-        sk,
-        &base_key,
-        value.clone(),
-        old.as_ref(),
-        new.as_ref(),
-        // A transactional write never carries the TTL reaper's own service
-        // identity (ADR 0051 §7) — the reaper deletes through
-        // `kind_write_item_at_leader` directly, never `cp_txn`.
-        false,
-    );
-    // The base row itself rides as `TxnWrite::key`/`value`, not inside
-    // `kind_writes` — strip it out (it's always `writes[0]` by
-    // `kind_writes_for_item`'s own construction).
-    let (kind_writes, change_log) = (
-        writes
-            .into_iter()
-            .filter(|(kind, _, _)| *kind != KIND_BASE)
-            .collect(),
-        Some(change_log),
-    );
-    Ok(Some(KindTxnWriteEval {
-        key: base_key,
-        value,
-        raw_old,
-        kind_writes,
-        change_log,
-        stage_marker: item_stage_marker_change_log(pk, sk),
-    }))
+    }
 }
 
 /// The data-plane key for a within-table key of `pk`'s partition: the ADR 0022
@@ -6644,9 +6541,12 @@ fn item_marker_change_log(pk: &AttributeValue, sk: Option<&AttributeValue>) -> (
 
 /// The item-shaped wrapper over [`stage_marker_change_log`] (ADR 0049 §3) —
 /// `item_marker_change_log`'s stage-marker sibling, used by
-/// [`eval_kind_txn_write`] for every transactional write's
-/// `TxnWrite::stage_marker`.
-fn item_stage_marker_change_log(
+/// `ClientCtx::txn_stage_local` for every transactional write's
+/// `TxnWrite::stage_marker`. Still built at propose time regardless of ADR
+/// 0054 step 4a's apply-time evaluation (`TxnWrite::pending`) — a stage
+/// marker is a pure function of `pk`/`sk` alone, so it carries no state
+/// that could go stale between propose and apply.
+pub(crate) fn item_stage_marker_change_log(
     pk: &AttributeValue,
     sk: Option<&AttributeValue>,
 ) -> (Vec<u8>, Vec<u8>) {
@@ -6856,9 +6756,11 @@ mod txn_resolve_awaited_tests {
 /// `ttl_expired` (ADR 0051 §7) stamps the resulting change record's own
 /// [`ChangeRecord::ttl_expired`] flag — `true` only for the TTL reaper's own
 /// delete (`ttl_reaper::ttl_reaper_loop`, via [`kind_write_item_at_leader`]),
-/// `false` for every ordinary client write and every transactional write
-/// ([`eval_kind_txn_write`]'s own call always passes `false`, since a
-/// transaction never carries a service identity).
+/// `false` for every ordinary client write. A transactional write's own
+/// evaluation (ADR 0054 step 4a, `KvCommand::TxnStage`'s apply arm, never
+/// this function directly any more) hardcodes the identical `false` via
+/// `PendingTxnWrite::ttl_expired`, since a transaction never carries a
+/// service identity.
 /// **ADR 0054 step 2**: this function is now a thin wrapper —
 /// [`write_schema_for`] builds the frozen schema slice from `Metadata` (the
 /// three lookups this function used to perform directly:

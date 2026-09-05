@@ -2096,11 +2096,16 @@ no longer rejects it. `TxnTableWrite` carries either an already-known
 kind-write-path table's write: the item identity + op + condition, no
 coordinator-computed diff). `ClientCtx::txn_stage_local` — the ONE place a
 stage actually executes on the leader's own node, shared by `txn_prepare`'s
-own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — evaluates
-every `pending_kind_writes` entry there (`dynamo::eval_kind_txn_write`,
-mirroring `kind_write_item_at_leader`'s own U3 shape) under the identical
-`ctx.data().rmw_lock`, merging the result into `writes` immediately before
-staging; a mandatory own-key OCC condition rides alongside (Fork C1). For a
+own local branch and `cp_serve_forwarded`'s `TxnPrepare` arm — turns every
+`pending_kind_writes` entry into a self-contained `TxnWrite::pending`
+payload there, with no read/evaluation at all. **This paragraph describes
+the design as it stood before ADR 0054 step 4a**: `dynamo::
+eval_kind_txn_write`, the leader-side evaluator it originally called under
+`ctx.data().rmw_lock`, plus the mandatory own-key OCC condition (Fork C1)
+it used to build alongside, are gone — `KvCommand::TxnStage`'s own apply
+arm evaluates every pending write itself, in commit order, reusing the
+identical evaluator `KvCommand::KindEval` uses; see that ADR's step 4a
+as-built amendment for the full design. For a
 transaction touching any kind-write-path table, `cp_txn`'s post-commit
 resolve is **awaited under a short bounded budget**
 (`TXN_RESOLVE_ALL_AWAIT_BUDGET`) and parallelized across participants
@@ -2620,15 +2625,25 @@ route below the edge through the same `ClientCtx` CP primitives.
   conditions` OCC seatbelt this bullet describes is **no longer proposed
   for a single-item write** — `KvCommand::KindEval` carries no byte-level
   seatbelt at all, since apply's own fresh read already is the
-  authoritative current state. `TransactWriteItems`
-  (`eval_kind_txn_write`/`txn_stage_local`) is the one write path this step
-  did **not** move — it still evaluates at the leader and proposes
-  `KindBatch` with the OCC seatbelt exactly as this bullet describes; ADR
-  0054 step 4 moves it and deletes `rmw_lock`/the seatbelt/the mismatch
-  metric entirely. See ADR 0054's own step-3 as-built amendment for the
-  full design, the flipped `concurrent_increments_all_land_exactly_once`
-  regression (now zero refusals, not "2 of 10 is correct"), and the
+  authoritative current state. See ADR 0054's own step-3 as-built amendment
+  for the full design, the flipped `concurrent_increments_all_land_exactly_
+  once` regression (now zero refusals, not "2 of 10 is correct"), and the
   before/after benchmark numbers.
+
+  **`TransactWriteItems` moved too (ADR 0054 step 4a)** — `dynamo::
+  eval_kind_txn_write` (the leader-side evaluator step 3 left in place for
+  this one producer) is deleted; `ClientCtx::txn_stage_local` no longer
+  reads or evaluates at all. It builds a self-contained `TxnWrite::pending`
+  payload (the schema slice, `pk`/`sk`/`op`/`condition`, no `ts` — the
+  enclosing stage entry supplies one) and appends it unevaluated;
+  `KvCommand::TxnStage`'s own apply arm evaluates every pending write in
+  commit order, reusing the identical `evaluate_kind_eval` core
+  `KvCommand::KindEval` uses. The mandatory own-key OCC `conditions` entry
+  (ADR 0046 Fork C1) this bullet used to describe is gone for these writes
+  too, for the identical reason the single-item seatbelt is: apply's own
+  read already is the current state. See ADR 0054's step-4a as-built
+  amendment for the full design (including the same-txn WAL-replay
+  discipline a non-idempotent `ADD` needs).
 
   **The plain-table half of the old named gap is closed (ADR 0049)**: a
   plain table's conditioned `PutItem`/`DeleteItem` and `UpdateItem` now

@@ -188,7 +188,17 @@ const MAGIC: u8 = 0xCB;
 /// to any of these four types needs no codec change here at all. `ts`
 /// stays the standard trailing fixed-width encoding. Same house
 /// convention otherwise: a clean bump, no cross-version compatibility.
-const VERSION: u8 = 25;
+/// `26` (ADR 0054 step 4a): `TxnStage.writes`' element (`txn::TxnWrite`)
+/// gained `pending: Option<txn::PendingTxnWrite>` — a write awaiting
+/// apply-time evaluation (see that field's own doc). Encoded as one
+/// `put_json`-framed blob covering the whole `Option` (the same "JSON
+/// inside the binary envelope" convention version `25` established,
+/// since `PendingTxnWrite` nests the identical rich, evolving types
+/// `KvCommand::KindEval` already JSON-encodes) — `serde_json` renders
+/// `None` as `null` and `Some(..)` as the object, so one blob covers both
+/// cases with no separate tag byte needed. Same house convention: a clean
+/// bump, no cross-version compatibility.
+const VERSION: u8 = 26;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -665,6 +675,9 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
                 // Version 18: the stage marker shares change_log's own
                 // tagged-Option `(prefix, record)` encoding.
                 put_change_log(out, &w.stage_marker);
+                // Version 26: `Option<txn::PendingTxnWrite>` as one JSON
+                // blob (see the `VERSION` const's own doc).
+                put_json(out, &w.pending);
             }
             out.extend_from_slice(&(spans.len() as u32).to_be_bytes());
             for (table, span) in spans {
@@ -809,12 +822,14 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
                 let kind_writes = read_kind_writes(c)?;
                 let change_log = read_change_log(c)?;
                 let stage_marker = read_change_log(c)?;
+                let pending = c.json()?;
                 writes.push(TxnWrite {
                     key,
                     value,
                     kind_writes,
                     change_log,
                     stage_marker,
+                    pending,
                 });
             }
             let n = c.u32()?;
@@ -1373,8 +1388,35 @@ mod tests {
                                 b"k1-change-prefix".to_vec(),
                                 b"stage-marker".to_vec(),
                             )),
+                            // Version 26 (ADR 0054 step 4a): no apply-time
+                            // evaluation for this write — the sibling write
+                            // just below exercises the `Some` case.
+                            pending: None,
                         },
-                        TxnWrite::plain(b"k2".to_vec(), None), // a staged delete
+                        // Version 26 (ADR 0054 step 4a): a write awaiting
+                        // apply-time evaluation — exercises every
+                        // `PendingTxnWrite` field (the identical
+                        // `serde_json`-blob types `KindEval` above already
+                        // exercises, now nested one level deeper inside the
+                        // `Option` the JSON blob covers).
+                        TxnWrite::pending_eval(
+                            b"k2".to_vec(),
+                            None,
+                            crate::PendingTxnWrite {
+                                schema: animus_item::WriteSchema {
+                                    key: animus_item::TableSchema::simple("pk"),
+                                    lsis: Vec::new(),
+                                    change_records_carry_images: false,
+                                },
+                                pk: animus_item::AttributeValue::S("bob".to_owned()),
+                                sk: None,
+                                op: crate::KindEvalOp::Delete,
+                                condition: Some(animus_item::ConditionExpression::AttributeExists(
+                                    "pk".to_owned(),
+                                )),
+                                ttl_expired: false,
+                            },
+                        ),
                     ],
                     spans: vec![(
                         "orders".to_string(),

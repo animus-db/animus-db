@@ -156,6 +156,12 @@ type KvPair = (Vec<u8>, Vec<u8>);
 /// `txn_stage_participant`'s own `writes` shape exactly, so it rides through
 /// with zero conversion.
 type TxnWrite = animus_cp_data::TxnWrite;
+/// A [`TxnWrite`] awaiting apply-time evaluation (ADR 0054 step 4a) — a
+/// direct alias of `animus_cp_data::PendingTxnWrite`, mirroring `TxnWrite`'s
+/// own alias just above. Built by `ClientCtx::txn_stage_local` from each
+/// `PendingKindWrite` the coordinator/edge hands it, never evaluated here —
+/// see `TxnWrite::pending`'s own doc (`animus-cp-data`) for the full design.
+type PendingTxnWrite = animus_cp_data::PendingTxnWrite;
 /// A stage's own-key conditions, scoped to one (table, tablet) group — the
 /// `animus_cp_data::KvCommand::TxnStage`-shaped `(key, expected)` list
 /// [`ClientCtx::cp_txn`]/`txn_prepare`/`txn_prepare_pushing` pass through to
@@ -13216,13 +13222,25 @@ mod status_wire_compat_tests {
 
 /// Issue #412 regression: a leader-side old-image read failure with the
 /// house `"; retry"` shape (a leader-moved/no-longer-leader condition) must
-/// never surface as a terminal error while retries remain, for either the
-/// ordinary evaluate-at-leader write path (`dynamo::
-/// kind_write_item_at_leader` via `ClientCtx::cp_kind_write_item`) or its
-/// transactional twin (`dynamo::eval_kind_txn_write` via `ClientCtx::
-/// txn_prepare_pushing`). Uses `dynamo::leader_read_failure_gate` to inject
-/// the failure deterministically rather than orchestrating a real
-/// leadership change — same idiom as `dynamo::rmw285_confirm_gate`.
+/// never surface as a terminal error while retries remain, for the ordinary
+/// evaluate-at-leader write path's own seatbelt read (`dynamo::
+/// kind_write_item_at_leader` via `ClientCtx::cp_kind_write_item`). Uses
+/// `dynamo::leader_read_failure_gate` to inject the failure deterministically
+/// rather than orchestrating a real leadership change — same idiom as
+/// `dynamo::rmw285_confirm_gate`.
+///
+/// **The transactional twin this module used to also cover is retired (ADR
+/// 0054 step 4a)**: `dynamo::eval_kind_txn_write` — the leader-side
+/// old-image read `ClientCtx::txn_prepare_pushing`'s own retry loop used to
+/// have to retry around — no longer exists at all.
+/// `ClientCtx::txn_stage_local` builds a `TxnWrite::pending` payload and
+/// never reads/evaluates at the leader; the identical retry-a-leader-moved-
+/// condition property for a transactional write is now exercised at
+/// `KvCommand::TxnStage`'s own apply-time evaluation, which has no leader
+/// read to fail in the first place (see `animus-cp-data`'s `tests/
+/// kind_eval.rs`-style suite for that evaluator's own coverage) — there is
+/// no longer a mechanism here for this module's old fault injector to
+/// target on the transactional path.
 #[cfg(test)]
 mod issue_412_tests {
     use std::net::SocketAddr;
@@ -13344,52 +13362,6 @@ mod issue_412_tests {
                  never surfaced as a terminal error",
             );
         assert!(matches!(outcome, dynamo::KindWriteOutcome::Ok { .. }));
-
-        node.shutdown();
-    }
-
-    /// Issue #412's actual fix: the transactional stage-time evaluator
-    /// (`dynamo::eval_kind_txn_write`, reached via `TransactWriteItems`)
-    /// hits the identical leader-moved read failure — pre-fix, it escaped
-    /// `ClientCtx::txn_prepare_pushing`'s bounded retry loop via `?` on the
-    /// very first attempt and would have surfaced as a terminal whole-txn
-    /// cancel. Calls `txn_prepare_pushing` directly (the function whose
-    /// retry loop this fixes) with a single anchor-only pending kind write,
-    /// so a failure here can only mean that loop itself didn't retry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn txn_prepare_pushing_retries_a_leader_moved_read_failure_to_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = single_node(dir.path()).await;
-        let ctx = node.ctx_for_test();
-        provision_and_await_leader(&node, &ctx, "issue412_txn").await;
-
-        leader_read_failure_gate::arm("issue412_txn", 2);
-
-        let mut item = animus_dynamo::Item::new();
-        item.insert(
-            "pk".to_string(),
-            animus_dynamo::AttributeValue::S("k1".to_string()),
-        );
-        let pk = animus_dynamo::AttributeValue::S("k1".to_string());
-        let pending = crate::PendingKindWrite {
-            pk,
-            sk: None,
-            op: KindWriteOp::Put(item),
-            condition: None,
-        };
-        ctx.txn_prepare_pushing(
-            "issue412_txn",
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![pending],
-        )
-        .await
-        .expect(
-            "a retryable leader-moved read failure inside the stage-time evaluator must be \
-             retried to success, never a terminal whole-txn cancel",
-        );
 
         node.shutdown();
     }

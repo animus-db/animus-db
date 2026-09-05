@@ -867,6 +867,7 @@ fn scenario_single_tablet_backup_converges_under_concurrent_writes(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();
@@ -1247,6 +1248,7 @@ fn scenario_restore_round_trip_matches_model_at_capture_cut_version(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();
@@ -1865,6 +1867,7 @@ fn scenario_chaotic_network_capture_converges(seed: u64) {
         kind_writes: Vec::new(),
         change_log: None,
         stage_marker: None,
+        pending: None,
     };
     let n = group.nodes[leader].clone();
     let env = n.env().clone();
