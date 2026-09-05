@@ -512,3 +512,13 @@ default):
   bootstrap, scale-up/down, and the `kind`-based e2e smoke test — likely
   its own multi-PR stack given its size, left to that train's own
   scoping pass rather than pre-divided here.
+
+## Amendment (2026-09-05, ADR 0064)
+
+The "Not in v1 (explicitly deferred)" list above named TLS outright: "on
+any port. No milestone in this codebase has added TLS anywhere yet; this
+ADR doesn't start." [ADR 0064](0064-tls-on-every-port.md) is that
+milestone; its commit 3 adds the cert-manager `Certificate`/`Issuer`
+wiring + volume mounts + `ClusterConfig` cert-path fields this ADR
+deferred, once ADR 0064's commits 1–2 give the operator TLS-capable
+`animusd` config to point cert-manager output at.

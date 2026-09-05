@@ -19,7 +19,8 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0063**.
+The next free ADR number at the time of writing is **0065** (0064 is
+[TLS on every port](adr/0064-tls-on-every-port.md), S-01).
 
 ---
 
@@ -126,7 +127,11 @@ the still-true paragraph after the table.
 
 ### S-01 TLS on every port
 
-- **Gap:** none anywhere: client, intra-node, admin, console.
+- **Gap:** client, admin, console still plaintext. **Intra-node closed**:
+  mutual TLS on the raw Raft wire inside `ProdEnv` landed (commit 1,
+  [ADR 0064](adr/0064-tls-on-every-port.md)), config-gated and default off
+  — `ProdEnv::bind` is unchanged; `ProdEnv::bind_with_tls` is the new,
+  general entry point.
 - **Plan:** `rustls` (already in the workspace via `kube`, `ring`
   provider). Wrap `TcpListener::accept()` streams in a `TlsAcceptor` at
   `Node::bind`/`bind_control`/`bind_data` (`lib.rs:4184,4237,4275`) and
@@ -135,12 +140,15 @@ the still-true paragraph after the table.
   not change; the client/admin/console listeners live in `animusd` outside
   the seam. Operator: cert-manager `Certificate`/`Issuer` + volume mounts +
   `ClusterConfig` cert-path fields.
-- **Tests:** `prod::tests` loopback for intra; a TLS variant of each
-  real-listener `animusd` test (`prod`-feature-gated real-thread tests).
-- **ADR:** **yes, 0063 (or next)** — crosses ADR 0047, 0057, 0060.
-- **PRs:** (1) intra/`ProdEnv` with file certs; (2) client/admin/console
-  listeners; (3) operator cert-manager wiring; (4) ADR closing note +
-  website "Planned" pill. **Size:** L.
+- **Tests:** `prod::tests` loopback for intra (**done** — TLS `bound_pair`,
+  different-CA rejection, plain-dial-into-TLS-listener, reconnect after
+  restart); a TLS variant of each real-listener `animusd` test
+  (`prod`-feature-gated real-thread tests, commit 2).
+- **ADR:** **yes, [0064](adr/0064-tls-on-every-port.md)** — crosses ADR
+  0047, 0057, 0060; commit 1 implemented, commits 2–4 still to come.
+- **PRs:** (1) intra/`ProdEnv` with file certs — **done**; (2)
+  client/admin/console listeners; (3) operator cert-manager wiring; (4)
+  ADR closing note + website "Planned" pill. **Size:** L.
 
 ### S-02 SigV4 hardening (ADR 0057 follow-on)
 
