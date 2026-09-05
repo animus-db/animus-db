@@ -305,7 +305,10 @@ truth; this map is just for navigation.
   retrievable from git history if ever needed again; in-place fork is now
   the only split. Lineage is still frozen in `split_lineage`. Auto-split
   triggers on
-  **bytes** (ADR 0034, `animusd`); **tablets are split-only** — merge has
+  **bytes** (ADR 0034, `animusd`), change-rate/ops-rate (ADR 0042 §14/W-09),
+  and a provisioned table's own throughput-derived minimum tablet count
+  (ADR 0067, W-08b — DynamoDB's own `ceil(RCU/3000 + WCU/1000)` formula,
+  on by default); **tablets are split-only** — merge has
   been removed entirely (ADR 0044, supersedes ADR 0033); dropped tables'
   data is reclaimed by a convergent **GC** (ADR 0024). Tablet ids are never
   reused. An idle CP-data group **quiesces** (ADR 0048, phase 1 of ADR

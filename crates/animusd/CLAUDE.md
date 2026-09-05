@@ -1620,7 +1620,14 @@ auto_split_{bytes,change_rate,ops_rate}` section instead of a CLI flag
 "CLI flag and config field both set is a hard error" contract);
 `--cluster-control`/`--cluster-data` and the standalone `control`/`join`
 subcommands have no route to that config-file section, a documented gap
-S-06 itself names. **`--node I` is gone from
+S-06 itself names. **`--tablet-max-read-units`/`--tablet-max-write-units`
+(ADR 0067, W-08b) are a fourth trigger's knobs, but not opt-in like the
+three above** — they default to 3000/1000 (DynamoDB's own per-partition
+ceilings) rather than to "disabled"; `0` disables one dimension. Plumbed
+identically to `--throttle-read-units`/`--throttle-write-units` (CLI flag,
+`cluster_settings.tablet_max_{read,write}_units` config field, same "one
+way, not both" conflict check) — see this file's own "Throughput-derived
+minimum tablet count" entry above for the trigger itself. **`--node I` is gone from
 `join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
@@ -2511,6 +2518,51 @@ heavy write load — the exact gap ADR 0034 deferred — is fully visible
 through writes alone. When hot, splits via the identical
 `byte_weighted_median`/`trigger_split` path every other trigger uses. No
 production-tuned default exists — omitting the flag is a true no-op.
+
+**Throughput-derived minimum tablet count (ADR 0067, W-08b, a direct ADR
+0065 follow-up)**: a fourth trigger, `min_tablets.rs`'s pure
+`min_tablets_for(throughput, ceilings) = max(1, ceil(RCU/max_rcu +
+WCU/max_wcu))` — DynamoDB's own up-front partition-sizing formula.
+**Unlike every trigger above, its two ceilings are on by default, not
+opt-in**: `--tablet-max-read-units`/`--tablet-max-write-units` (3000/1000,
+DynamoDB's own defaults; `0` disables a dimension), threaded through
+`ClusterSettings`/`AdminInfo` the identical way
+`throttle_read_units`/`throttle_write_units` are. `auto_split_loop` is
+therefore now spawned **unconditionally** on every node shape (previously
+gated on at least one of the three opt-in triggers) — a cheap lock-free
+check (no opt-in trigger configured **and** `ClientCtx::
+any_table_throughput` false) is the first statement of every tick, so an
+unprovisioned cluster's added cost is one atomic load per
+`AUTO_SPLIT_INTERVAL`, not a metadata read. Runs as a **separate, per-table**
+pass after the per-tablet byte/change-rate/ops-rate pass: for every table
+with its own `ProvisionedThroughput` (`Metadata::table_throughput`) whose
+current `Active` tablet count sits below its derived minimum, forks the
+**widest** (by approximate token range, `min_tablets::token_range_width`)
+`Active` tablet of that table this node leads — at most one split per table
+per tick, per node — converging in `min - 1` ticks on a single-leader
+deployment (linear, since only one split happens per table per tick
+regardless of tablet count), faster when a table's tablets are spread
+across several leaders. A table with `>= 2`
+materialized pairs splits via the same `byte_weighted_median` every other
+trigger uses; a table with fewer (the common case immediately after
+`CreateTable`, before any write — the byte/rate triggers above never even
+reach a tablet this sparse) instead splits at `min_tablets::
+midpoint_split_key`'s synthetic **token midpoint** of the tablet's own
+range — a plain 8-byte token, inherently satisfying `KeyRange::split_at`'s
+strict-interior requirement whenever the range spans more than one token
+(a single-token range returns `None` and this tick's candidate is skipped,
+never a doomed propose). Tables without their own `throughput` are never
+touched. Deliberately does **not** skip a quiesced candidate (unlike the
+three triggers above) — this trigger fires on a *configured* value, not
+observed activity, so quiescence's "nothing could have changed" premise
+doesn't apply; reading a quiesced group's local pairs is itself a safe,
+wake-free scan (ADR 0048 fork F). **No cap on the derived minimum** — a
+huge provisioned value legitimately means many tablets; quiescence keeps
+an over-provisioned table's idle extras cheap, not a shrink mechanism
+(tablets are still split-only, ADR 0044 — raising throughput mints more,
+lowering it never merges back down). New metric:
+`Metric::AutoSplitMinTablets`, incremented on every successful split this
+arm triggers. See `docs/adr/0067-*.md` for the full design.
 
 **Per-table throttling (ADR 0065, W-08 — all four steps landed)**: `ThrottleTracker`
 (`lib.rs`, beside `ChangeRateTracker`/`RequestRateTracker`) is the

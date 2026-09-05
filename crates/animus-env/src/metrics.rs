@@ -681,12 +681,24 @@ pub enum Metric {
     /// catalog nor the static bootstrap map (ADR 0066 §4) —
     /// `UnrecognizedClientException`.
     AuthUnknownKey,
+
+    // --- Throughput-derived minimum tablet count (ADR 0067, W-08b) ---
+    // Appended after the throttling pair above; every earlier variant's
+    // slot and the text-export order stay stable. Recorded by `animusd`'s
+    // `auto_split_loop` fourth trigger arm each time it forks a
+    // provisioned table toward its derived minimum tablet count.
+    /// `auto_split_loop`'s throughput-derived-minimum-tablet-count trigger
+    /// (ADR 0067) split a tablet because its table's current `Active`
+    /// tablet count was below the minimum `min_tablets_for` derived from
+    /// the table's own `ProvisionedThroughput` and the cluster's per-tablet
+    /// capacity ceilings.
+    AutoSplitMinTablets,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 88] = [
+    pub const ALL: [Metric; 89] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -775,6 +787,7 @@ impl Metric {
         Metric::AuthRotatedSecretUsed,
         Metric::AuthDenied,
         Metric::AuthUnknownKey,
+        Metric::AutoSplitMinTablets,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -870,6 +883,7 @@ impl Metric {
             Metric::AuthRotatedSecretUsed => "auth_rotated_secret_used",
             Metric::AuthDenied => "auth_denied",
             Metric::AuthUnknownKey => "auth_unknown_key",
+            Metric::AutoSplitMinTablets => "auto_split_min_tablets",
         }
     }
 

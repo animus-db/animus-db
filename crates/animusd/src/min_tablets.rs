@@ -10,18 +10,6 @@
 //! toward it exactly like every other auto-split trigger. See ADR 0067
 //! (docs/adr/0067-throughput-derived-minimum-tablet-count.md) for the full
 //! design and rationale.
-//!
-//! Groundwork commit: `min_tablets_for`/`midpoint_split_key`/
-//! `token_range_width` are not wired into `auto_split_loop` yet (a
-//! follow-up change adds the fourth trigger arm that calls them) — the
-//! `TabletCapacityCeilings` ceilings themselves are already threaded
-//! through `AutoSplitThresholds`, which is why only the three derivation
-//! functions below need the temporary allow.
-#![allow(
-    dead_code,
-    reason = "min_tablets_for/midpoint_split_key/token_range_width are wired \
-              into auto_split_loop's fourth trigger arm in the next commit"
-)]
 
 use animus_control::ProvisionedThroughput;
 use animus_tablet::{KeyRange, TOKEN_BYTES};
