@@ -1192,6 +1192,23 @@ impl CancellationReason {
             item: None,
         }
     }
+
+    /// A `TransactWriteItems` action's own participant tablet refused it
+    /// for insufficient per-table capacity (ADR 0065 §6) — the
+    /// `CancellationReasons` code AWS uses for a throttled action inside a
+    /// transaction, distinct from the single-item
+    /// `ProvisionedThroughputExceededException`
+    /// ([`WireError::provisioned_throughput_exceeded`]) a non-transactional
+    /// write/read returns for the identical underlying refusal. Never
+    /// carries `Item`, mirroring [`Self::transaction_conflict`].
+    #[must_use]
+    pub fn throttling_error() -> Self {
+        Self {
+            code: "ThrottlingError",
+            message: Some("Throughput exceeds the current capacity of your table or index".into()),
+            item: None,
+        }
+    }
 }
 
 /// The bracketed aggregate `message` AWS derives from a `CancellationReasons`
@@ -1339,6 +1356,24 @@ impl WireError {
     pub fn transaction_in_progress(message: impl Into<String>) -> Self {
         Self {
             code: "TransactionInProgressException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
+    /// A single-item write or read (`PutItem`/`GetItem`/`UpdateItem`/
+    /// `DeleteItem`/`Query`/`Scan`) was refused because its tablet's own
+    /// per-table token bucket had insufficient capacity units (ADR 0065
+    /// §6). The AWS-faithful, client-SDK-retryable code every DynamoDB SDK
+    /// already backs off on — HTTP 400, matching `error_status`'s existing
+    /// "400 for client errors, 500 only for our own internal failures"
+    /// rule (`animusd::dynamo::error_status` falls through to 400 for any
+    /// code it doesn't special-case, so no wire-edge change was needed to
+    /// make this land as 400).
+    #[must_use]
+    pub fn provisioned_throughput_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: "ProvisionedThroughputExceededException",
             message: message.into(),
             reasons: None,
         }
@@ -4422,19 +4457,37 @@ pub fn transact_get_response(items: &[Option<Item>]) -> String {
 /// `BatchGetItem` reports misses by omission, unlike `TransactGetItems`, whose
 /// response is positional and carries an empty object per missing key.
 ///
-/// `UnprocessedKeys` is always empty: this adapter reads every requested key
-/// before responding rather than shedding load, so there is never a remainder
-/// for the client to retry.
+/// `unprocessed` (ADR 0065 §6) is every `(table, key)` this adapter refused
+/// to read because its tablet's own per-table read bucket was exhausted —
+/// rendered as `{"<table>": {"Keys": [key, ..]}}` under `UnprocessedKeys`,
+/// AWS's own shape for a shed `BatchGetItem` key, grouped by table exactly
+/// like `Responses` is. Empty (the common case, and the only case before
+/// this ADR — a throttled key is the only reason this adapter ever sheds
+/// one) renders `"UnprocessedKeys":{}`.
 #[must_use]
-pub fn batch_get_response(tables: &[(String, Vec<Item>)]) -> String {
+pub fn batch_get_response(
+    tables: &[(String, Vec<Item>)],
+    unprocessed: &[(String, Item)],
+) -> String {
     let mut responses = Map::new();
     for (table, items) in tables {
         let encoded: Vec<Value> = items.iter().map(encode_item).collect();
         responses.insert(table.clone(), Value::Array(encoded));
     }
+    let mut unprocessed_keys: Map<String, Value> = Map::new();
+    for (table, key) in unprocessed {
+        let entry = unprocessed_keys.entry(table.clone()).or_insert_with(|| {
+            Value::Object(Map::from_iter([("Keys".into(), Value::Array(Vec::new()))]))
+        });
+        if let Value::Object(o) = entry
+            && let Some(Value::Array(keys)) = o.get_mut("Keys")
+        {
+            keys.push(encode_item(key));
+        }
+    }
     let mut obj = Map::new();
     obj.insert("Responses".into(), Value::Object(responses));
-    obj.insert("UnprocessedKeys".into(), Value::Object(Map::new()));
+    obj.insert("UnprocessedKeys".into(), Value::Object(unprocessed_keys));
     serde_json::to_string(&Value::Object(obj)).expect("batch get response serializes")
 }
 
@@ -4510,12 +4563,43 @@ fn changed_attributes(old: Option<&Item>, new: Option<&Item>, from: Option<&Item
         .collect()
 }
 
-/// The JSON body for a successful `BatchWriteItem`: `{"UnprocessedItems": {}}`
-/// (we process every request, so nothing is ever left unprocessed).
+/// The JSON body for a `BatchWriteItem`: `{"UnprocessedItems": {"<table>":
+/// [{"PutRequest":{"Item":..}} | {"DeleteRequest":{"Key":..}}, ..], ..}}`.
+///
+/// `unprocessed` (ADR 0065 §6) is every `(table, WriteRequest)` this adapter
+/// refused to commit because its tablet's own per-table write bucket was
+/// exhausted — echoed back in the client's own request shape, exactly as
+/// AWS defines a shed `BatchWriteItem` request, so a real SDK's retry
+/// machinery can resubmit it unmodified. Empty (the common case, and the
+/// only case before this ADR — every request commits or the whole call
+/// errors) renders `"UnprocessedItems":{}`.
 #[must_use]
-pub fn batch_write_response() -> String {
+pub fn batch_write_response(unprocessed: &[(String, WriteRequest)]) -> String {
+    let mut by_table: Map<String, Value> = Map::new();
+    for (table, req) in unprocessed {
+        let entry = by_table
+            .entry(table.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(arr) = entry else {
+            unreachable!("by_table entries are always Value::Array")
+        };
+        let mut obj = Map::new();
+        match req {
+            WriteRequest::Put(item) => {
+                let mut put = Map::new();
+                put.insert("Item".into(), encode_item(item));
+                obj.insert("PutRequest".into(), Value::Object(put));
+            }
+            WriteRequest::Delete(key) => {
+                let mut del = Map::new();
+                del.insert("Key".into(), encode_item(key));
+                obj.insert("DeleteRequest".into(), Value::Object(del));
+            }
+        }
+        arr.push(Value::Object(obj));
+    }
     let mut obj = Map::new();
-    obj.insert("UnprocessedItems".into(), Value::Object(Map::new()));
+    obj.insert("UnprocessedItems".into(), Value::Object(by_table));
     serde_json::to_string(&Value::Object(obj)).expect("batch response serializes")
 }
 
@@ -9663,20 +9747,95 @@ mod tests {
         }
     }
 
-    /// The response groups items by table and always reports an empty
-    /// `UnprocessedKeys`, since every requested key is read before responding.
+    /// The response groups items by table and reports an empty
+    /// `UnprocessedKeys` when nothing was throttled.
     #[test]
     fn batch_get_response_groups_by_table() {
         let mut a = Item::new();
         a.insert("id".into(), s("a"));
-        let body =
-            batch_get_response(&[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())]);
+        let body = batch_get_response(
+            &[("t1".to_string(), vec![a]), ("t2".to_string(), Vec::new())],
+            &[],
+        );
         assert!(body.contains(r#""t1":[{"id":{"S":"a"}}]"#), "{body}");
         assert!(
             body.contains(r#""t2":[]"#),
             "a table with no hits is an empty list: {body}"
         );
         assert!(body.contains(r#""UnprocessedKeys":{}"#), "{body}");
+    }
+
+    /// ADR 0065 §6: a throttled `BatchGetItem` key is echoed back under
+    /// `UnprocessedKeys`, grouped by table, never dropped or turned into a
+    /// whole-call error.
+    #[test]
+    fn batch_get_response_reports_unprocessed_keys_grouped_by_table() {
+        let mut k1 = Item::new();
+        k1.insert("id".into(), s("k1"));
+        let mut k2 = Item::new();
+        k2.insert("id".into(), s("k2"));
+        let body = batch_get_response(
+            &[],
+            &[("t1".to_string(), k1), ("t1".to_string(), k2.clone())],
+        );
+        let v: Value = serde_json::from_str(&body).expect("valid JSON");
+        let keys = v["UnprocessedKeys"]["t1"]["Keys"]
+            .as_array()
+            .expect("Keys array");
+        assert_eq!(keys.len(), 2, "{body}");
+        assert_eq!(keys[1]["id"]["S"], "k2");
+    }
+
+    /// ADR 0065 §6: `BatchWriteItem`'s `UnprocessedItems` echoes a throttled
+    /// request in the client's own `PutRequest`/`DeleteRequest` shape.
+    #[test]
+    fn batch_write_response_reports_unprocessed_items_in_request_shape() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("p1"));
+        let mut key = Item::new();
+        key.insert("id".into(), s("d1"));
+        let body = batch_write_response(&[
+            ("t1".to_string(), WriteRequest::Put(item)),
+            ("t1".to_string(), WriteRequest::Delete(key)),
+        ]);
+        let v: Value = serde_json::from_str(&body).expect("valid JSON");
+        let entries = v["UnprocessedItems"]["t1"].as_array().expect("array");
+        assert_eq!(entries.len(), 2, "{body}");
+        assert_eq!(entries[0]["PutRequest"]["Item"]["id"]["S"], "p1");
+        assert_eq!(entries[1]["DeleteRequest"]["Key"]["id"]["S"], "d1");
+    }
+
+    /// A `BatchWriteItem` response with nothing throttled still reports the
+    /// empty-object shape every existing caller/test assumed.
+    #[test]
+    fn batch_write_response_with_nothing_unprocessed_is_empty() {
+        let body = batch_write_response(&[]);
+        assert_eq!(body, r#"{"UnprocessedItems":{}}"#);
+    }
+
+    /// ADR 0065 §6: the single-item throttle refusal's wire shape.
+    #[test]
+    fn provisioned_throughput_exceeded_renders_the_aws_faithful_code() {
+        let err = WireError::provisioned_throughput_exceeded("table t is throttled");
+        assert_eq!(err.code, "ProvisionedThroughputExceededException");
+        let json = err.to_json();
+        assert!(
+            json.contains(
+                "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException"
+            ),
+            "{json}"
+        );
+        assert!(json.contains("table t is throttled"), "{json}");
+    }
+
+    /// ADR 0065 §6: a throttled `TransactWriteItems` action's own
+    /// `CancellationReasons` entry.
+    #[test]
+    fn throttling_error_cancellation_reason_carries_no_item() {
+        let reason = CancellationReason::throttling_error();
+        assert_eq!(reason.code, "ThrottlingError");
+        assert!(reason.item.is_none());
+        assert!(reason.message.is_some());
     }
 
     /// `Segment`/`TotalSegments` decode together and are validated.

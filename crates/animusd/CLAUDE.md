@@ -2457,6 +2457,87 @@ costs at most two lock-free atomic loads and an `Option` check — no
 `Mutex` lock, no `BTreeMap` lookup — verified by `tests/batch_write.rs`'s
 existing ADR 0049 fast-arm throughput assertion staying green unmodified.
 
+**Enforcement points, as built (W-08 step 3)**: `write_path.rs`'s
+`cp_kind_write_raw` (the ADR 0049 fast marker arm, `throttle_check_write_raw`
+— a peek at `throttle_defaults.write_units()` before touching `Metadata` or
+the tracker at all, so the unconfigured case really is one `Option` check);
+`dynamo.rs`'s `kind_write_item_at_leader` (the evaluate-at-leader funnel —
+pre-charge before propose, a post-charge correction once the real
+`ConsumedCapacity` is known from the applied outcome); `read_path.rs`'s
+`cp_get_local_resolving`/`cp_read_eventual*`/`cp_scan_one*`/
+`cp_scan_kind_one*` (both the linearizable and ADR 0055 eventual arms — a
+throttled eventual read returns the refusal directly, **never** silently
+falls through to the linearizable retry path, which would defeat the whole
+point of a cheap admission check); and `txn_coordinator.rs`'s
+`txn_stage_local` (2× cost per pending kind-write, mirroring
+`ConsumedCapacity::scaled(2.0)`'s own transactional-write accounting —
+refusal surfaces as `TxnAbortReason::Throttled { table, key }`, mapped to a
+`CancellationReasons[].Code == "ThrottlingError"` entry in `run_transact`'s
+existing cancellation-reason match). A transactional write's pre-charge has
+**no post-charge correction** (unlike the single-item funnel) — the
+coordinator has no cheap point to reconcile actual `ConsumedCapacity` back
+into the bucket once a transaction commits, so a transactional write's
+charge is always its estimated cost, never trued up; this is a deliberate,
+minor over/under-charge tolerance, not a bug (see `docs/engineering-
+lessons.md` if this ever needs revisiting).
+
+**`BatchWriteItem`'s throttle granularity depends on the table shape it
+hits, and this is a real, user-visible difference, not a test artifact.**
+A **plain** (unindexed, unstreamed) table's batch commits as ONE
+`KindBatch` Raft entry per tablet (the ADR 0049 fast-arm batching
+`marker_batch_write_raw` already does for throughput) — so a throttle
+refusal there is necessarily **all-or-nothing per tablet-group**: either
+the whole per-tablet group of requests fits the tablet's current token
+balance, or every request in that group is shed to `UnprocessedItems`
+together, even if the balance could have covered some of them individually.
+An **indexed or streamed** table's batch instead routes each request
+through the per-item evaluate-at-leader funnel, one throttle check per
+item, so a partially-exhausted budget sheds only the specific items that
+don't fit. `Operation::BatchWriteItem`'s handler (`dynamo.rs`) reflects this
+directly: the marker arm maps a whole shed tablet-group's base keys back to
+their original `WriteRequest`s via a `BTreeMap`, while the per-item arm
+catches a `ProvisionedThroughputExceededException` one request at a time.
+`BatchGetItem` has no such split — every key is always checked
+individually regardless of table shape, since a read never batches into one
+entry the way a marker write does.
+
+**The config-surface hook step 4 must replace**: `ClientCtx::
+set_throttle_defaults(&self, read_units: Option<u64>, write_units:
+Option<u64>)` (`lib.rs`, `pub(crate)`) — the smallest test-reachable
+mechanism for setting the cluster-wide default limits, reached today only
+via `POST /admin/throttle/defaults` (`admin.rs::action_set_throttle_
+defaults`, `ThrottleDefaultsReq { read_units: Option<u64>, write_units:
+Option<u64> }`) and `SimCluster::set_throttle_defaults`/
+`set_throttle_defaults_all` (`sim_cluster.rs`, test-only). Step 4 replaces
+this ad hoc admin action with the real config surface (`ClusterSettings`,
+CLI flags, `CreateTable`'s `BillingMode`/`ProvisionedThroughput`,
+`MetaCommand::SetTableThroughput`, a `TableSchema.throughput` field) and
+should also give `throttle_limits_for` a genuine per-table override — that
+function already reads the cluster-wide default only, with a named comment
+at the point a per-table lookup belongs. `throttle_check_write_raw`/
+`kind_write_item_at_leader`/the read-path checks/`txn_stage_local` should
+all need zero changes for step 4: each already calls `throttle_limits_for`
+once per operation and reacts only to its `read_units`/`write_units`
+output, never to how those numbers were sourced.
+
+**Test coverage**: `sim_cluster_throttle.rs` (`#[cfg(test)] mod`, `cargo
+test -p animusd --lib sim_cluster_throttle`) is the `SimEnv`-driven,
+virtual-time-only corpus proving the bucket lifecycle (admit a burst,
+refuse, recover after a full 300s window) through `SimCluster`'s real
+route/propose/confirm and route/local-resolve loops, for both writes and
+eventual/linearizable reads — see that file's own module doc for why a
+per-op virtual-clock refill (`SimCluster`'s `OP_BUDGET`) means a throttle
+test's per-op cost must clear that refill by a wide margin, not just the
+nominal configured rate. `tests/dynamo_throttling.rs` is the real-thread,
+real-socket regression: single-item write/read throttling and recovery,
+`ProvisionedThroughputExceededException`'s wire shape, `BatchGetItem`'s
+`UnprocessedKeys`, `BatchWriteItem`'s `UnprocessedItems` (via a **streamed**
+table specifically, to get true per-item granularity rather than the
+marker fast-arm's per-tablet-group shape described above),
+`TransactWriteItems`' `ThrottlingError` cancellation reason, the
+`ThrottledWrites`/`ThrottledReads` metric counters, and an unthrottled
+table (the default) staying byte-for-byte unaffected.
+
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own
 byte-weighted median in one action (`ClientCtx::grow_stream` →

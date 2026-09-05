@@ -800,6 +800,11 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // multi-get `TransactGetItems` needs. A key that matches nothing
             // is omitted from its table's list.
             let mut tables: Vec<(String, Vec<Item>)> = Vec::with_capacity(requests.len());
+            // ADR 0065 §6: a per-key throttle refusal is reported under
+            // `UnprocessedKeys`, never a whole-call error — every other key
+            // in the batch, including every other key of the SAME table,
+            // still reads normally.
+            let mut unprocessed: Vec<(String, Item)> = Vec::new();
             for req in requests {
                 reject_internal_table(&req.table, false)?;
                 if !table_known(ctx, meta, &req.table) {
@@ -811,21 +816,26 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 for key in &req.keys {
                     let (pk, sk) = resolve_key(ctx, meta, &req.table, key)?;
                     let data_key = item_key(&pk, sk.as_ref());
-                    if let Some(item) = quorum_read(
+                    match quorum_read(
                         ctx,
                         meta,
                         &req.table,
                         &data_key,
                         ReadConsistency::from_consistent_read(req.consistent_read),
                     )
-                    .await?
+                    .await
                     {
-                        items.push(wire::project(req.projection.as_ref(), &item));
+                        Ok(Some(item)) => items.push(wire::project(req.projection.as_ref(), &item)),
+                        Ok(None) => {}
+                        Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                            unprocessed.push((req.table.clone(), key.clone()));
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 tables.push((req.table.clone(), items));
             }
-            Ok(wire::batch_get_response(&tables))
+            Ok(wire::batch_get_response(&tables, &unprocessed))
         }
         Operation::Query {
             table,
@@ -980,6 +990,10 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
             // tests::batch_write_on_a_streamed_table_emits_change_records`;
             // the general same-predicate lesson is in
             // `docs/engineering-lessons.md`.)
+            // ADR 0065 §6: a per-item (marker table) or per-tablet-group
+            // (images-carrying table) throttle refusal is reported under
+            // `UnprocessedItems`, never a whole-call error.
+            let mut unprocessed: Vec<(String, WriteRequest)> = Vec::new();
             for (table, reqs) in &requests {
                 reject_internal_table(table, false)?;
                 // ADR 0049 fast arm: a marker table's batch needs no
@@ -1000,8 +1014,14 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                 // DynamoDB's own `BatchWriteItem` contract either way.
                 if !table_change_records_carry_images(meta, table) {
                     let mut rows = Vec::with_capacity(reqs.len());
+                    // ADR 0065 §6: `marker_batch_write` sheds throttled rows
+                    // by their own base key (a whole tablet-group at a
+                    // time, since that group commits as one atomic Raft
+                    // entry — see its own doc) — this map recovers the
+                    // original `WriteRequest` to echo back.
+                    let mut by_key: BTreeMap<Vec<u8>, WriteRequest> = BTreeMap::new();
                     for req in reqs {
-                        rows.push(match req {
+                        let (pk, sk, value) = match req {
                             WriteRequest::Put(item) => {
                                 let (pk, sk) = resolve_key(ctx, meta, table, item)?;
                                 (pk, sk, wire::encode_stored_item(item))
@@ -1010,43 +1030,44 @@ async fn run_operation(ctx: &ClientCtx, op: Operation) -> Result<String, WireErr
                                 let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
                                 (pk, sk, wire::encode_tombstone())
                             }
-                        });
+                        };
+                        by_key.insert(item_key(&pk, sk.as_ref()), req.clone());
+                        rows.push((pk, sk, value));
                     }
-                    marker_batch_write(ctx, table, rows)
+                    let shed = marker_batch_write(ctx, table, rows)
                         .await
                         .map_err(|e| internal(&e))?;
+                    for key in shed {
+                        if let Some(req) = by_key.remove(&key) {
+                            unprocessed.push((table.clone(), req));
+                        }
+                    }
                     continue;
                 }
                 for req in reqs {
-                    match req {
+                    let (pk, sk, op) = match req {
                         WriteRequest::Put(item) => {
                             let (pk, sk) = resolve_key(ctx, meta, table, item)?;
-                            ctx.cp_kind_write_item(
-                                meta,
-                                table,
-                                &pk,
-                                sk.as_ref(),
-                                KindWriteOp::Put(item.clone()),
-                                None,
-                            )
-                            .await?;
+                            (pk, sk, KindWriteOp::Put(item.clone()))
                         }
                         WriteRequest::Delete(key_item) => {
                             let (pk, sk) = resolve_key(ctx, meta, table, key_item)?;
-                            ctx.cp_kind_write_item(
-                                meta,
-                                table,
-                                &pk,
-                                sk.as_ref(),
-                                KindWriteOp::Delete,
-                                None,
-                            )
-                            .await?;
+                            (pk, sk, KindWriteOp::Delete)
                         }
+                    };
+                    match ctx
+                        .cp_kind_write_item(meta, table, &pk, sk.as_ref(), op, None)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                            unprocessed.push((table.clone(), req.clone()));
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
-            Ok(wire::batch_write_response())
+            Ok(wire::batch_write_response(&unprocessed))
         }
         Operation::TransactWriteItems { actions, token } => {
             // Unlike the old serial-loop implementation, atomicity now comes
@@ -3631,6 +3652,13 @@ async fn run_transact(
                     .iter()
                     .position(|(t, k)| t == table && k == key)
                     .map(|i| (i, wire::CancellationReason::transaction_conflict())),
+                // ADR 0065 §6: a throttled participant maps to
+                // `ThrottlingError` at its own action index, the identical
+                // by-`(table,key)` correlation the two arms above use.
+                crate::TxnAbortReason::Throttled { table, key } => action_keys
+                    .iter()
+                    .position(|(t, k)| t == table && k == key)
+                    .map(|i| (i, wire::CancellationReason::throttling_error())),
                 crate::TxnAbortReason::Other(_) => None,
             };
             match matched {
@@ -5452,7 +5480,7 @@ async fn paginated_kind_examine(
         let pairs = ctx
             .cp_scan_kind_table(table, kind, cursor.clone(), end.clone(), fetch, consistency)
             .await
-            .map_err(|e| internal(&e))?;
+            .map_err(map_throttleable_error)?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
@@ -5506,7 +5534,7 @@ async fn paginated_kind_examine_one(
                 consistency,
             )
             .await
-            .map_err(|e| internal(&e))?;
+            .map_err(map_throttleable_error)?;
         let exhausted = fetch.is_none_or(|f| pairs.len() < f);
         let last_raw_key = pairs.last().map(|(k, _)| k.clone());
         for (key, value) in &pairs {
@@ -5856,6 +5884,39 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     ttl_expired: bool,
 ) -> Result<KindWriteOutcome, WireError> {
     let base_key = item_key(pk, sk);
+    // ADR 0065 §2/§3: pre-charge before ever proposing — this is the ADR
+    // 0046 U3 evaluate-at-leader funnel, one of the two write choke points
+    // every leader-side non-transactional write passes through (mirroring
+    // `RequestRateTracker`'s own observation site immediately below).
+    // `meta` is the caller's already-resolved routing snapshot, so this
+    // re-derives the tablet for free, exactly like the request-rate
+    // observation does. A cost is knowable up front only for `Put` (the
+    // item is already in hand); `Delete`/`Update` pre-charge the DynamoDB
+    // minimum (1 WCU) and the real total — including any GSI/LSI
+    // maintenance — is charged as a post-hoc correction once apply's own
+    // fresh read/evaluation is known (`KindEvalApplied::Ok`, below).
+    let throttle_tablet = crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key);
+    let throttle_precharge = match (
+        ctx.throttle_limits_for(meta, table).write_units,
+        throttle_tablet,
+    ) {
+        (Some(write_limit), Some(tablet)) => {
+            let share = write_limit as f64 / meta.tablets_for_table(table).count().max(1) as f64;
+            let precharge = kind_write_precharge_units(&op);
+            if ctx
+                .throttle
+                .check_write(tablet, share, precharge, ctx.env.now())
+            {
+                Some((tablet, share, precharge))
+            } else {
+                ctx.data().raftkv_metrics.incr(Metric::ThrottledWrites);
+                return Err(WireError::provisioned_throughput_exceeded(format!(
+                    "table `{table}` exceeds its provisioned write capacity"
+                )));
+            }
+        }
+        _ => None,
+    };
     // `identity` (issue #469): whether `cp_kind_eval_local`'s lost-payload
     // recovery may re-read the current value as a best-effort `new`. A
     // numeric `ADD` is not idempotent, so a re-read can't be trusted to
@@ -5903,6 +5964,21 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
                 crate::topology::tablet_for_key(meta.tablets_for_table(table), &base_key)
             {
                 ctx.data().request_rates.observe(tablet, ctx.env.now());
+            }
+            // ADR 0065 §3: correct the pre-charge to the real cost —
+            // `write_capacity` forced to `Indexes` detail regardless of
+            // what the client itself asked `ReturnConsumedCapacity` for,
+            // since this is an internal accounting charge, not a response
+            // field. Charged on `new` (the write's own after-image; `Put`'s
+            // pre-charge already priced this exactly, so `delta` is `0.0`
+            // there — only `Delete`/`Update`'s 1-WCU-minimum pre-charge
+            // ever needs correcting).
+            if let Some((tablet, _share, precharge)) = throttle_precharge {
+                let actual =
+                    write_capacity(meta, table, new.as_ref(), ReturnConsumedCapacity::Indexes)
+                        .map_or(0.0, |cc| cc.total());
+                ctx.throttle
+                    .charge_write(tablet, actual - precharge, ctx.env.now());
             }
             let collection_bytes = collection_bytes_at_leader(leader).await;
             Ok(KindWriteOutcome::Ok {
@@ -6009,6 +6085,19 @@ pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindE
         KindWriteOp::Update { key_item, actions } => {
             animus_cp_data::KindEvalOp::Update { key_item, actions }
         }
+    }
+}
+
+/// ADR 0065 §3: the write capacity units knowable **before** `op` ever
+/// reaches apply — `Put`'s own item is already in hand, so its pre-charge
+/// is exact; `Delete`/`Update` pre-charge DynamoDB's documented 1-WCU
+/// write minimum, corrected to the real total (including any GSI/LSI
+/// maintenance) once apply's own fresh read/evaluation is known
+/// (`kind_write_item_at_leader`'s post-charge, above).
+fn kind_write_precharge_units(op: &KindWriteOp) -> f64 {
+    match op {
+        KindWriteOp::Put(item) => capacity::write_units(capacity::item_size(item)),
+        KindWriteOp::Delete | KindWriteOp::Update { .. } => 1.0,
     }
 }
 
@@ -6236,7 +6325,7 @@ async fn fast_marker_write(
         vec![item_marker_change_log(pk, sk)],
     )
     .await
-    .map_err(|e| internal(&e))?;
+    .map_err(map_throttleable_error)?;
     // W-09 (ADR 0034 amendment): this fast arm is the OTHER structural half
     // of "every leader-side non-transactional write" — an unconditioned
     // `PutItem`/`DeleteItem` on a plain, unindexed/unstreamed table (this
@@ -6271,11 +6360,15 @@ async fn fast_marker_write(
 /// call it for a table whose records carry no images
 /// (`!table_change_records_carry_images`); an images table's batch must go
 /// through the per-item evaluate-at-leader funnel instead.
+/// Returns every base key ADR 0065's [`crate::write_path`] throttle check
+/// refused (its own tablet-group's whole write) rather than committed — see
+/// [`marker_batch_write_raw`]'s own doc for how that's distinguished from a
+/// genuine error.
 pub(crate) async fn marker_batch_write(
     ctx: &ClientCtx,
     table: &str,
     rows: Vec<(AttributeValue, Option<AttributeValue>, Vec<u8>)>,
-) -> Result<(), String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let raw = rows
         .into_iter()
         .map(|(pk, sk, value)| {
@@ -6301,12 +6394,21 @@ pub(crate) type MarkerRow = (Vec<u8>, Option<Vec<u8>>, (Vec<u8>, Vec<u8>));
 /// caller replaces: the put paths auto-provision (ADR 0023), a bare delete
 /// never did (deleting from a table nothing provisioned must not conjure an
 /// empty tablet).
+///
+/// **ADR 0065 §6**: a tablet-group's own `ClientCtx::cp_kind_write_raw` call
+/// commits atomically (one Raft entry, ADR 0049 §4) — there is no per-item
+/// granularity to throttle within it, so a throttle refusal
+/// (`write_path::THROTTLE_WRITE_REFUSAL`, recognized by exact string match)
+/// sheds that WHOLE tablet-group's own rows into the returned `Vec` instead
+/// of failing the entire call; every other tablet-group in the same batch
+/// still commits normally. Any OTHER error still aborts the whole call
+/// immediately, unchanged from before this ADR.
 pub(crate) async fn marker_batch_write_raw(
     ctx: &ClientCtx,
     table: &str,
     rows: Vec<MarkerRow>,
     provision_if_absent: bool,
-) -> Result<(), String> {
+) -> Result<Vec<Vec<u8>>, String> {
     if provision_if_absent && !ctx.effective_metadata().has_table_tablet(table) {
         ctx.provision_tablet(table).await?;
     }
@@ -6323,6 +6425,7 @@ pub(crate) async fn marker_batch_write_raw(
         entry.1.push(marker);
         entry.0.push((animus_cp_data::KIND_BASE, base_key, value));
     }
+    let mut unprocessed = Vec::new();
     for (tablet, (writes, markers)) in by_tablet {
         if tablet.is_none() {
             // An unroutable key (a racing split/provision moved the map
@@ -6331,9 +6434,16 @@ pub(crate) async fn marker_batch_write_raw(
             // same shape every routed write already has.
             return Err(format!("no tablet for a batch key of table {table}; retry"));
         }
-        ctx.cp_kind_write_raw(table, writes, markers).await?;
+        let keys: Vec<Vec<u8>> = writes.iter().map(|(_, k, _)| k.clone()).collect();
+        match ctx.cp_kind_write_raw(table, writes, markers).await {
+            Ok(()) => {}
+            Err(e) if e == THROTTLE_WRITE_REFUSAL => {
+                unprocessed.extend(keys);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(())
+    Ok(unprocessed)
 }
 
 /// The image-less **marker record** one mutation of a no-images Dynamo table
@@ -6714,7 +6824,7 @@ async fn native_scan(
         consistency,
     )
     .await
-    .map_err(|e| internal(&e))
+    .map_err(map_throttleable_error)
 }
 
 /// Whether `table` is known: present in the replicated catalog (ADR 0013) or
@@ -6770,7 +6880,7 @@ async fn raw_quorum_read(
     }
     ctx.cp_read(table, key.to_vec(), consistency)
         .await
-        .map_err(|e| internal(&e))
+        .map_err(map_throttleable_error)
 }
 
 /// CP read of `key` at the requested `consistency` (ADR 0055), decoding the
@@ -6798,6 +6908,42 @@ pub(crate) fn internal(message: &str) -> WireError {
         code: "InternalServerError",
         message: message.to_owned(),
         reasons: None,
+    }
+}
+
+/// ADR 0065 (per-table throttling, W-08 step 3): the sentinel error string
+/// a throttle-refused **write** returns across every plain-`String`-error
+/// primitive (`write_path::cp_kind_write_raw`, `txn_stage_local`'s
+/// `TxnAbortReason::Other`) — recognized by `marker_batch_write_raw` (to
+/// route the refused tablet-group's own rows into `UnprocessedItems`
+/// instead of failing the whole `BatchWriteItem` call) and by every
+/// `String`-to-`WireError` mapping site in this file (to render
+/// `ProvisionedThroughputExceededException` instead of `InternalServerError`).
+/// Deliberately **not** `"; retry"`-suffixed — `decide::read_should_retry`
+/// must never retry a throttle refusal inline (ADR 0065 §6: the client, not
+/// this server, backs off and resubmits).
+pub(crate) const THROTTLE_WRITE_REFUSAL: &str = "provisioned throughput exceeded for this table";
+
+/// [`THROTTLE_WRITE_REFUSAL`]'s **read**-side twin, returned by every
+/// plain-`String`-error read primitive (`cp_get_local_resolving`,
+/// `cp_scan_local`/`cp_scan_kind_local`'s callers, the eventual-read serve
+/// paths). Also never `"; retry"`-suffixed — ADR 0065 §2 requires a refused
+/// eventual read to return the refusal rather than silently falling back to
+/// the linearizable path, which is exactly what a retryable-shaped message
+/// would otherwise invite a caller to do.
+pub(crate) const THROTTLE_READ_REFUSAL: &str = "provisioned throughput exceeded for this table";
+
+/// Map a plain-`String` error from a read/write primitive to its
+/// [`WireError`] — [`THROTTLE_WRITE_REFUSAL`]/[`THROTTLE_READ_REFUSAL`]
+/// (both identical text, kept as two named constants purely so each call
+/// site documents which direction it means) become
+/// `ProvisionedThroughputExceededException`; everything else keeps the
+/// pre-ADR-0065 `internal(..)` fallback unchanged.
+pub(crate) fn map_throttleable_error(message: String) -> WireError {
+    if message == THROTTLE_WRITE_REFUSAL {
+        WireError::provisioned_throughput_exceeded(message)
+    } else {
+        internal(&message)
     }
 }
 

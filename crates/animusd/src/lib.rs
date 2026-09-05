@@ -201,6 +201,14 @@ pub(crate) enum TxnAbortReason {
     /// intent (`StageOutcome::IntentBlocked`) even after
     /// `txn_prepare_pushing`'s bounded retry budget.
     TransactionConflict { table: String, key: Vec<u8> },
+    /// ADR 0065 §6: `key`'s own tablet refused this write action's 2x-scaled
+    /// pre-charge (`ClientCtx::txn_stage_local`, before ever staging) —
+    /// its own participant's per-table write bucket had insufficient
+    /// capacity. Maps to a `CancellationReasons` entry of `ThrottlingError`
+    /// at this action's own index (`wire::CancellationReason::
+    /// throttling_error`), the AWS-faithful code for a throttled
+    /// transactional participant.
+    Throttled { table: String, key: Vec<u8> },
     /// Every other abort reason: a routing failure, a structural `Fenced`
     /// rejection, a precondition re-check mismatch, or any other internal
     /// error — carries only a human message, the same fidelity
@@ -329,6 +337,10 @@ impl std::fmt::Display for TxnAbortReason {
             TxnAbortReason::TransactionConflict { table, key } => write!(
                 f,
                 "table `{table}` key {key:?} lost a race against another in-flight transaction"
+            ),
+            TxnAbortReason::Throttled { table, key } => write!(
+                f,
+                "table `{table}` key {key:?} exceeds its provisioned write capacity"
             ),
             TxnAbortReason::Other(msg) => write!(f, "{msg}"),
         }
@@ -7103,10 +7115,6 @@ mod rate_tracker_tests {
 /// bucket's two enforcement homes, carry the crate's `#[deny(clippy::
 /// disallowed_methods)]`, ADR 0061 Phase C).
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 struct ThrottleBucket {
     tokens: f64,
     rate: f64,
@@ -7117,10 +7125,6 @@ struct ThrottleBucket {
 /// The DynamoDB-documented burst window (ADR 0065 Decision 4).
 const THROTTLE_BURST_SECS: f64 = 300.0;
 
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 impl ThrottleBucket {
     /// A freshly observed tablet (a [`ThrottleTracker`] map entry just
     /// created) starts **full** at `rate`'s own 300s burst — matching
@@ -7196,10 +7200,6 @@ impl ThrottleBucket {
 /// One tablet's read/write bucket pair plus lifetime throttled-request
 /// counters (ADR 0065 §7 — `/admin/metrics`'s `throttle` array).
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 struct ThrottleBuckets {
     read: ThrottleBucket,
     write: ThrottleBucket,
@@ -7207,10 +7207,6 @@ struct ThrottleBuckets {
     write_throttled: u64,
 }
 
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 impl ThrottleBuckets {
     fn new(read_rate: f64, write_rate: f64, now: Nanos) -> Self {
         Self {
@@ -7241,18 +7237,10 @@ impl ThrottleBuckets {
 /// [`ThrottleBucket::set_rate`], so a split or a changed limit is reflected
 /// the moment it's observed, per ADR 0065 Decision 1.
 #[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 struct ThrottleTracker {
     inner: Arc<Mutex<BTreeMap<TabletId, ThrottleBuckets>>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — wired to every write/read enforcement point in step 3"
-)]
 impl ThrottleTracker {
     fn new() -> Self {
         Self {
@@ -7355,10 +7343,6 @@ impl ThrottleTracker {
 /// One [`ThrottleTracker::snapshot`] entry — a currently-tracked tablet's
 /// own read/write bucket level, configured rate, and lifetime
 /// throttled-request counts.
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — rendered on /admin/metrics in step 3"
-)]
 pub(crate) struct ThrottleSnapshotEntry {
     pub(crate) tablet: TabletId,
     pub(crate) read_tokens: f64,
@@ -7388,10 +7372,6 @@ pub(crate) struct ThrottleSnapshotEntry {
 /// throttle_limits_for`]'s currently-`None` per-table hook a real
 /// `TableSchema.throughput` to read.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — read by throttle_limits_for in step 3"
-)]
 struct ThrottleDefaults {
     read_units: std::sync::atomic::AtomicU64,
     write_units: std::sync::atomic::AtomicU64,
@@ -7411,10 +7391,6 @@ impl Default for ThrottleDefaults {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — read by throttle_limits_for in step 3"
-)]
 impl ThrottleDefaults {
     fn read_units(&self) -> Option<u64> {
         match self.read_units.load(std::sync::atomic::Ordering::Relaxed) {
@@ -7448,10 +7424,6 @@ impl ThrottleDefaults {
 /// throttle_limits_for`]'s doc). `None` in either field means unthrottled
 /// for that direction.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "unwired plumbing (ADR 0065 W-08 step 2) — constructed by throttle_limits_for in step 3"
-)]
 pub(crate) struct ThrottleLimits {
     pub(crate) read_units: Option<u64>,
     pub(crate) write_units: Option<u64>,
@@ -7825,10 +7797,6 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// `sim_cluster.rs`) constructs `data: None`, and this ADR's own
     /// testing section requires a `SimCluster`-driven virtual-clock corpus
     /// to exercise real admission decisions.
-    #[allow(
-        dead_code,
-        reason = "unwired plumbing (ADR 0065 W-08 step 2) — read at every write/read enforcement point in step 3"
-    )]
     throttle: ThrottleTracker,
     /// ADR 0065 §5(a): the cluster-wide default read/write capacity
     /// units — see [`ThrottleDefaults`]'s own doc. `Arc`-shared (not
@@ -7836,10 +7804,6 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// set_throttle_defaults`] mutates one value every clone of this
     /// `ClientCtx` (one per connection) observes, the same sharing
     /// discipline `client_route`/`intra_route` already use.
-    #[allow(
-        dead_code,
-        reason = "unwired plumbing (ADR 0065 W-08 step 2) — read at every write/read enforcement point in step 3"
-    )]
     throttle_defaults: Arc<ThrottleDefaults>,
 }
 
@@ -8056,10 +8020,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// — `throttle` is provisioned on every node shape (see that field's
     /// own doc), so this is simply empty on a node that has never observed
     /// a configured limit or hosted a tablet.
-    #[allow(
-        dead_code,
-        reason = "unwired plumbing (ADR 0065 W-08 step 2) — rendered on /admin/metrics in step 3"
-    )]
     pub(crate) fn throttle_snapshot(&self) -> Vec<ThrottleSnapshotEntry> {
         self.throttle.snapshot()
     }
@@ -8079,10 +8039,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// override reads `meta.schemas`/`table` here and takes priority over
     /// `self.throttle_defaults` when set, per ADR 0065 Decision 5(b)
     /// ("per-table settings override the cluster default").
-    #[allow(
-        dead_code,
-        reason = "unwired plumbing (ADR 0065 W-08 step 2) — called from every write/read enforcement point in step 3"
-    )]
     pub(crate) fn throttle_limits_for(&self, _meta: &Metadata, _table: &str) -> ThrottleLimits {
         ThrottleLimits {
             read_units: self.throttle_defaults.read_units(),
@@ -8105,10 +8061,6 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `throttle_limits_for`) — not delete this setter outright, since an
     /// operator-facing debug lever in the same shape may still be worth
     /// keeping.
-    #[allow(
-        dead_code,
-        reason = "unwired plumbing (ADR 0065 W-08 step 2) — reached from an admin action in step 3"
-    )]
     pub(crate) fn set_throttle_defaults(&self, read_units: Option<u64>, write_units: Option<u64>) {
         self.throttle_defaults.set(read_units, write_units);
     }
@@ -10473,6 +10425,11 @@ async fn handle_request(
         // `BatchWriteItem`).
         ClientRequest::Put { key, value, table } => {
             let marker = dynamo::marker_change_log(&key, Vec::new());
+            // ADR 0065 §6: the plain client protocol has no `UnprocessedItems`-
+            // shaped response to shed a throttled row into, so a shed row
+            // (a non-empty `Ok` vec) is reported as a plain error — the
+            // pre-ADR-0065 all-or-nothing contract, unchanged for this
+            // internal protocol.
             match dynamo::marker_batch_write_raw(
                 ctx,
                 &table,
@@ -10481,7 +10438,8 @@ async fn handle_request(
             )
             .await
             {
-                Ok(()) => ClientResponse::PutOk,
+                Ok(shed) if shed.is_empty() => ClientResponse::PutOk,
+                Ok(_) => ClientResponse::Error(dynamo::THROTTLE_WRITE_REFUSAL.to_string()),
                 Err(e) => ClientResponse::Error(e),
             }
         }
@@ -10494,7 +10452,8 @@ async fn handle_request(
                 })
                 .collect();
             match dynamo::marker_batch_write_raw(ctx, &table, rows, true).await {
-                Ok(()) => ClientResponse::PutOk,
+                Ok(shed) if shed.is_empty() => ClientResponse::PutOk,
+                Ok(_) => ClientResponse::Error(dynamo::THROTTLE_WRITE_REFUSAL.to_string()),
                 Err(e) => ClientResponse::Error(e),
             }
         }
@@ -10528,7 +10487,8 @@ async fn handle_request(
             match dynamo::marker_batch_write_raw(ctx, &table, vec![(key, None, marker)], false)
                 .await
             {
-                Ok(()) => ClientResponse::PutOk,
+                Ok(shed) if shed.is_empty() => ClientResponse::PutOk,
+                Ok(_) => ClientResponse::Error(dynamo::THROTTLE_WRITE_REFUSAL.to_string()),
                 Err(e) => ClientResponse::Error(e),
             }
         }
@@ -15388,6 +15348,12 @@ mod sim_cluster;
 /// private fields stay reachable with no further visibility widened.
 #[cfg(test)]
 mod sim_cluster_corpus;
+/// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
+/// coverage, over the real `SimCluster` fixture — a sibling of
+/// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
+/// `pub(crate)` surface, no further visibility widened).
+#[cfg(test)]
+mod sim_cluster_throttle;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

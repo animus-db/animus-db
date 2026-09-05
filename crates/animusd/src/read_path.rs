@@ -4,6 +4,7 @@
 //! `lib.rs`'s `impl<E: Env> ClientCtx<E>` blocks -- no logic changes.
 
 use animus_cp_data::{FastRead, IntentInfo, TxnDecisionStatus};
+use animus_dynamo::capacity;
 use animus_env::{Env, Metric};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TabletId};
@@ -49,6 +50,69 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if let Some(data) = self.data.as_ref() {
             data.raftkv_metrics.incr(metric);
         }
+    }
+
+    /// ADR 0065 §2/§3 read-side pre-charge, shared by every read enforcement
+    /// point in this module and `forwarding.rs`'s serving arms. Peeks the
+    /// cluster default first (a lock-free atomic load, no `Metadata` fetch,
+    /// no bucket lock) — the common unconfigured case costs nothing more.
+    /// When a limit *is* configured, resolves `tablet`'s current per-tablet
+    /// share and pre-charges the cheapest this read could possibly cost
+    /// (`1.0` RCU for a consistent read, `0.5` for an eventual one — the
+    /// same halving `capacity::read_units` applies), refusing (`Err`,
+    /// deliberately never `"; retry"`-suffixed — a refused read must not be
+    /// silently retried inline, nor an eventual refusal fall back to the
+    /// linearizable path, ADR 0065 §2) if the bucket can't cover even that
+    /// minimum. Returns `Some((tablet, share, precharge))` for
+    /// [`Self::throttle_postcharge_read`] to correct once the real byte
+    /// count is known, or `None` when nothing was configured (post-charge
+    /// is then a no-op).
+    pub(crate) fn throttle_precharge_read(
+        &self,
+        table: &str,
+        tablet: TabletId,
+        consistent: bool,
+    ) -> Result<Option<(TabletId, f64)>, String> {
+        let Some(read_limit) = self.throttle_defaults.read_units() else {
+            return Ok(None);
+        };
+        let meta = self.effective_metadata();
+        let share = read_limit as f64 / meta.tablets_for_table(table).count().max(1) as f64;
+        let cost = if consistent { 1.0 } else { 0.5 };
+        if self
+            .throttle
+            .check_read(tablet, share, cost, self.env.now())
+        {
+            Ok(Some((tablet, cost)))
+        } else {
+            if let Some(data) = self.data.as_ref() {
+                data.raftkv_metrics.incr(Metric::ThrottledReads);
+            }
+            Err(crate::dynamo::THROTTLE_READ_REFUSAL.to_string())
+        }
+    }
+
+    /// [`Self::throttle_precharge_read`]'s post-charge correction: `bytes`
+    /// is what the read actually returned (`0` for an absent key, or the
+    /// summed key+value length of every returned scan pair). A no-op when
+    /// `precharge` is `None` (nothing was configured at pre-charge time).
+    /// Deliberately re-reads `tablet`'s share as `1.0`/`0.5` was already
+    /// spent — `charge_read` takes only the *delta*, so this recomputes the
+    /// actual cost and debits `actual - precharge` (may be negative,
+    /// correcting an over-charge; ADR 0065 §3 explicitly allows the bucket
+    /// to go negative the other way too, for an oversized read).
+    pub(crate) fn throttle_postcharge_read(
+        &self,
+        precharge: Option<(TabletId, f64)>,
+        bytes: usize,
+        consistent: bool,
+    ) {
+        let Some((tablet, pre)) = precharge else {
+            return;
+        };
+        let actual = capacity::read_units(bytes, consistent);
+        self.throttle
+            .charge_read(tablet, actual - pre, self.env.now());
     }
 
     pub(crate) fn cp_stale_local(&self, tablet: TabletId) -> Option<CpGroup<E>> {
@@ -123,32 +187,60 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// which is always correct. `Some(v)` is a served answer, with the
     /// inner `Option` carrying genuine presence/absence exactly as
     /// [`RaftKvNode::stale_get_served`] defines it.
-    async fn cp_read_eventual(&self, table: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        let served = self.cp_read_eventual_inner(table, key).await;
+    /// **`Ok(None)`** means "not served cheaply, fall back to the
+    /// linearizable path" (unchanged from before ADR 0065). **`Err`**
+    /// (ADR 0065 §2) means this tablet's own read bucket refused the
+    /// admission — deliberately **not** folded into the `Ok(None)`
+    /// fallback case: falling back to the linearizable path on a throttle
+    /// refusal would silently defeat the limit (an eventually-consistent
+    /// caller could always retry as a strong read and bypass it), so the
+    /// refusal propagates as a genuine error instead.
+    async fn cp_read_eventual(
+        &self,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<Option<Vec<u8>>>, String> {
+        let served = self.cp_read_eventual_inner(table, key).await?;
         if served.is_none() {
             self.record_eventual_read(Metric::CpEventualReadsFellBack);
         }
-        served
+        Ok(served)
     }
 
     /// [`cp_read_eventual`](Self::cp_read_eventual)'s body, split out only so
     /// the fallback counter has exactly one place to live rather than one per
-    /// `return None`.
-    async fn cp_read_eventual_inner(&self, table: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        let tablet = self.tablet_for(table, key)?;
+    /// `return Ok(None)`.
+    async fn cp_read_eventual_inner(
+        &self,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<Option<Vec<u8>>>, String> {
+        let Some(tablet) = self.tablet_for(table, key) else {
+            return Ok(None);
+        };
         if let Some(group) = self.cp_stale_local(tablet) {
             // The same read-side scope pre-check the linearizable local arm
             // makes (ADR 0033): routing that has raced a split crossover
             // must fall back, never answer from a scope that does not own
             // the key.
             if !group.scope_range().contains(key) {
-                return None;
+                return Ok(None);
             }
-            let served = group.stale_get_served(key).await?;
+            // ADR 0065 §2/§3: this node is the one serving the read, so the
+            // check/charge happens right here — pre-charge the cheapest
+            // possible (eventual = 0.5 RCU minimum) before touching the
+            // engine, post-charge the real byte count after.
+            let precharge = self.throttle_precharge_read(table, tablet, false)?;
+            let Some(served) = group.stale_get_served(key).await else {
+                return Ok(None);
+            };
+            self.throttle_postcharge_read(precharge, served.as_ref().map_or(0, Vec::len), false);
             self.record_eventual_read(Metric::CpEventualReadsLocal);
-            return Some(served);
+            return Ok(Some(served));
         }
-        let addr = self.cp_stale_forward_target(tablet)?;
+        let Some(addr) = self.cp_stale_forward_target(tablet) else {
+            return Ok(None);
+        };
         let request = ClientRequest::Get {
             key: key.to_vec(),
             table: table.to_owned(),
@@ -157,9 +249,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match self.relay_stale_read(addr, request).await {
             ClientResponse::Value(v) => {
                 self.record_eventual_read(Metric::CpEventualReadsForwarded);
-                Some(v)
+                Ok(Some(v))
             }
-            _ => None,
+            // The serving replica's own throttle check refused (ADR 0065 §2
+            // — the check runs on whichever node serves the read, so a
+            // forwarded eventual read is throttled there, not here); this
+            // is the one `ClientResponse::Error` this relay must NOT treat
+            // as "not served cheaply, fall back" — see this method's own
+            // doc.
+            ClientResponse::Error(e) if e == crate::dynamo::THROTTLE_READ_REFUSAL => Err(e),
+            _ => Ok(None),
         }
     }
 
@@ -167,6 +266,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// attempt at serving one tablet's share of an eventually-consistent
     /// base-scope range scan (ADR 0055). `None` falls back to
     /// [`cp_scan_one`](Self::cp_scan_one)'s linearizable loop.
+    ///
+    /// `Ok(None)` means "not served cheaply, fall back"; `Err` (ADR 0065
+    /// §2, mirroring [`cp_read_eventual_inner`](Self::cp_read_eventual_inner))
+    /// means the serving tablet's own read bucket refused — never folded
+    /// into the fallback case.
     async fn cp_scan_one_eventual(
         &self,
         table: &str,
@@ -174,8 +278,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        let tablet = self.tablet_for(table, start)?;
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, String> {
+        let Some(tablet) = self.tablet_for(table, start) else {
+            return Ok(None);
+        };
         if let Some(group) = self.cp_stale_local(tablet) {
             // The scan-side scope pre-check (ADR 0033, `cp_scan_local`'s own
             // rationale): a scope narrower than the requested window would
@@ -183,11 +289,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // instead of serving a short answer.
             let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
             if !group.scope_range().contains_range(&requested) {
-                return None;
+                return Ok(None);
             }
-            return Some(group.stale_scan(start, end, limit, reverse).await);
+            let precharge = self.throttle_precharge_read(table, tablet, false)?;
+            let p = group.stale_scan(start, end, limit, reverse).await;
+            let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+            self.throttle_postcharge_read(precharge, bytes, false);
+            return Ok(Some(p));
         }
-        let addr = self.cp_stale_forward_target(tablet)?;
+        let Some(addr) = self.cp_stale_forward_target(tablet) else {
+            return Ok(None);
+        };
         let request = ClientRequest::Scan {
             start: start.to_vec(),
             end: end.map(<[u8]>::to_vec),
@@ -197,8 +309,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             stale: true,
         };
         match self.relay_stale_read(addr, request).await {
-            ClientResponse::Pairs(p) => Some(p),
-            _ => None,
+            ClientResponse::Pairs(p) => Ok(Some(p)),
+            ClientResponse::Error(e) if e == crate::dynamo::THROTTLE_READ_REFUSAL => Err(e),
+            _ => Ok(None),
         }
     }
 
@@ -206,6 +319,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// sibling (ADR 0041 §3 scopes) — one tablet's share of an
     /// eventually-consistent LSI `Query`/`Scan`. `None` falls back to
     /// [`cp_scan_kind_one`](Self::cp_scan_kind_one)'s linearizable loop.
+    ///
+    /// `Ok(None)`/`Err` follow [`cp_scan_one_eventual`](Self::cp_scan_one_eventual)'s
+    /// identical ADR 0065 §2 contract.
     async fn cp_scan_kind_one_eventual(
         &self,
         table: &str,
@@ -214,21 +330,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        let tablet = self.tablet_for(table, start)?;
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, String> {
+        let Some(tablet) = self.tablet_for(table, start) else {
+            return Ok(None);
+        };
         if let Some(group) = self.cp_stale_local(tablet) {
             let requested = KeyRange::new(start.to_vec(), end.map(<[u8]>::to_vec));
             if !group.scope_range().contains_range(&requested) {
-                return None;
+                return Ok(None);
             }
+            let precharge = self.throttle_precharge_read(table, tablet, false)?;
             self.record_eventual_read(Metric::CpEventualReadsLocal);
-            return Some(
-                group
-                    .stale_scan_kind(kind, start, end, limit, reverse)
-                    .await,
-            );
+            let p = group
+                .stale_scan_kind(kind, start, end, limit, reverse)
+                .await;
+            let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+            self.throttle_postcharge_read(precharge, bytes, false);
+            return Ok(Some(p));
         }
-        let addr = self.cp_stale_forward_target(tablet)?;
+        let Some(addr) = self.cp_stale_forward_target(tablet) else {
+            return Ok(None);
+        };
         let request = ClientRequest::KindScan {
             table: table.to_owned(),
             kind,
@@ -241,9 +363,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match self.relay_stale_read(addr, request).await {
             ClientResponse::Pairs(p) => {
                 self.record_eventual_read(Metric::CpEventualReadsForwarded);
-                Some(p)
+                Ok(Some(p))
             }
-            _ => None,
+            ClientResponse::Error(e) if e == crate::dynamo::THROTTLE_READ_REFUSAL => Err(e),
+            _ => Ok(None),
         }
     }
 
@@ -275,6 +398,35 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// still-undecided foreign case after a declined push (the caller's own
     /// retry loop — `cp_read`'s `"; retry"` handling — tries again).
     pub(crate) async fn cp_get_local_resolving(
+        &self,
+        leader: &CpGroup<E>,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        // ADR 0065 §2/§3: this node is the one serving the read (this
+        // method runs only on a tablet's own leader, local or forwarded —
+        // see `cp_read`'s Local arm and `forwarding.rs`'s `Get{stale:
+        // false}` arm), so the check/charge happens right here, before any
+        // engine work. `tablet_for` re-resolves independently of the
+        // caller's own routing (the same redundant-but-cheap lookup
+        // `cp_read_eventual_inner` already does) — `None` (an extremely
+        // rare routing race) skips throttling entirely rather than
+        // refusing a read this node was just asked to serve.
+        let precharge = match self.tablet_for(table, key) {
+            Some(tablet) => self.throttle_precharge_read(table, tablet, true)?,
+            None => None,
+        };
+        let result = self.cp_get_local_resolving_inner(leader, key).await;
+        if let Ok(v) = &result {
+            self.throttle_postcharge_read(precharge, v.as_ref().map_or(0, Vec::len), true);
+        }
+        result
+    }
+
+    /// [`Self::cp_get_local_resolving`]'s body — unchanged from before ADR
+    /// 0065, split out only so the pre-/post-charge wrapper has a single
+    /// exit point to hook rather than one per `return` in the match below.
+    async fn cp_get_local_resolving_inner(
         &self,
         leader: &CpGroup<E>,
         key: &[u8],
@@ -528,18 +680,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // read, and fall straight through to the linearizable loop below
         // when no replica can serve it. The strong path is untouched — a
         // `Strong` read compiles down to exactly what it always did.
-        if consistency.is_eventual()
-            && let Some(v) = self.cp_read_eventual(table, &key).await
-        {
-            return Ok(v);
+        //
+        // ADR 0065 §2: a throttle refusal on the eventual path (`Err`) is
+        // NOT the same as "not served cheaply" (`Ok(None)`) — the former
+        // must propagate as a genuine error, never silently fall through to
+        // the linearizable loop below (which would defeat the limit).
+        if consistency.is_eventual() {
+            match self.cp_read_eventual(table, &key).await {
+                Ok(Some(v)) => return Ok(v),
+                Err(e) => return Err(e),
+                Ok(None) => {}
+            }
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &key).await {
-                CpRoute::Local(leader) => match self.cp_get_local_resolving(&leader, &key).await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => e,
-                },
+                CpRoute::Local(leader) => {
+                    match self.cp_get_local_resolving(&leader, table, &key).await {
+                        Ok(v) => return Ok(v),
+                        Err(e) => e,
+                    }
+                }
                 CpRoute::Forward(addr, hinted) => {
                     match self
                         .cp_forward(
@@ -667,20 +828,44 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         // ADR 0055: the cheap path, per tablet — a fan-out falls back only
         // for the sub-ranges no replica could serve, never wholesale.
-        if consistency.is_eventual()
-            && let Some(p) = self
+        //
+        // ADR 0065 §2: a throttle refusal (`Err`) is never folded into the
+        // "not served cheaply" fallback — see `cp_read`'s identical note.
+        if consistency.is_eventual() {
+            match self
                 .cp_scan_one_eventual(table, &start, end.as_deref(), limit, reverse)
                 .await
-        {
-            return Ok(p);
+            {
+                Ok(Some(p)) => return Ok(p),
+                Err(e) => return Err(e),
+                Ok(None) => {}
+            }
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
+                    // ADR 0065 §2/§3: one check per tablet actually
+                    // visited — this is that tablet's own leader-local
+                    // scan.
+                    let tablet = self.tablet_for(table, &start);
+                    let precharge = match tablet {
+                        // A throttle refusal is terminal here (never
+                        // `"; retry"`-suffixed) — surface it immediately
+                        // rather than looping.
+                        Some(t) => match self.throttle_precharge_read(table, t, true) {
+                            Ok(p) => p,
+                            Err(e) => return Err(e),
+                        },
+                        None => None,
+                    };
                     match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await
                     {
-                        Ok(p) => return Ok(p),
+                        Ok(p) => {
+                            let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                            self.throttle_postcharge_read(precharge, bytes, true);
+                            return Ok(p);
+                        }
                         Err(e) => e,
                     }
                 }
@@ -855,18 +1040,29 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         reverse: bool,
         consistency: ReadConsistency,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        // ADR 0055, per tablet — see `cp_scan_one`'s identical arm.
-        if consistency.is_eventual()
-            && let Some(p) = self
+        // ADR 0055/0065, per tablet — see `cp_scan_one`'s identical arm.
+        if consistency.is_eventual() {
+            match self
                 .cp_scan_kind_one_eventual(table, kind, &start, end.as_deref(), limit, reverse)
                 .await
-        {
-            return Ok(p);
+            {
+                Ok(Some(p)) => return Ok(p),
+                Err(e) => return Err(e),
+                Ok(None) => {}
+            }
         }
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start).await {
                 CpRoute::Local(leader) => {
+                    // ADR 0065 §2/§3 — see `cp_scan_one`'s identical arm.
+                    let precharge = match self.tablet_for(table, &start) {
+                        Some(t) => match self.throttle_precharge_read(table, t, true) {
+                            Ok(p) => p,
+                            Err(e) => return Err(e),
+                        },
+                        None => None,
+                    };
                     match Self::cp_scan_kind_local(
                         &leader,
                         kind,
@@ -877,7 +1073,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     )
                     .await
                     {
-                        Ok(p) => return Ok(p),
+                        Ok(p) => {
+                            let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+                            self.throttle_postcharge_read(precharge, bytes, true);
+                            return Ok(p);
+                        }
                         Err(e) => e,
                     }
                 }

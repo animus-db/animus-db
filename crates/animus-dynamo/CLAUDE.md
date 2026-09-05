@@ -423,6 +423,38 @@ comment for its full type/method inventory.
   so the apply-time `IntentBlocked` guard `TransactionConflict` maps from is
   reached by the raw client protocol's plain writes, not ordinary
   `TransactWriteItems` contention).
+- **Per-table throttling's wire fidelity (ADR 0065, W-08 step 3)**: two new
+  `WireError` constructors carry the AWS-faithful shapes for a throttle
+  refusal — `WireError::provisioned_throughput_exceeded(message)` (a `400`,
+  `__type: "...ProvisionedThroughputExceededException"`, for a single-item
+  `PutItem`/`GetItem`/`Query`/`Scan`/etc. refusal) and
+  `CancellationReason::throttling_error()` (code `"ThrottlingError"`, no
+  `Item` — used by `TransactWriteItems`' own `CancellationReasons[]` when a
+  staged write is throttled, alongside the existing
+  `ConditionalCheckFailed`/`TransactionConflict`/`None` variants above). All
+  enforcement itself lives in `animusd` (see that crate's own ADR 0065
+  entry); this crate only supplies the two wire shapes. `BatchGetItem`/
+  `BatchWriteItem` never fail wholesale for a throttle refusal — DynamoDB's
+  own batch contract is "ship what succeeded, name the rest" regardless of
+  *why* an item didn't make it, so a throttled key/item is folded into the
+  same `UnprocessedKeys`/`UnprocessedItems` machinery a capacity-exceeded
+  batch already uses, not a distinct error shape.
+  `wire::batch_get_response(tables: &[(String, Vec<Item>)], unprocessed:
+  &[(String, Item)]) -> String` and `wire::batch_write_response(unprocessed:
+  &[(String, WriteRequest)]) -> String` both gained an `unprocessed`
+  parameter for this (a signature change, not a new function — every
+  existing caller needed a compiler-driven update, the identical
+  E0061-arity-fan-out idiom the `animusd`-side `ClusterConfig` field
+  additions describe): `batch_get_response` renders `UnprocessedKeys`
+  grouped by table name (AWS's own shape — `{"TableName": {"Keys":
+  [...]}}`), and `batch_write_response` renders `UnprocessedItems` in the
+  original per-request shape (`PutRequest`/`DeleteRequest`, not a bare
+  item) so a retried request round-trips through the identical decoder a
+  fresh `BatchWriteItem` call would use. An empty `unprocessed` slice still
+  renders the field present as `{}` (matching the pre-existing
+  `batch_get_response_groups_by_table` test's own expectation), never
+  omitted — a caller checks for an empty object, exactly like real
+  DynamoDB.
 - `BatchGetItem` is implemented (`decode_batch_get` in `wire.rs`).
 - **`UpdateExpression` (issue #375/roadmap W-01) is now the full documented
   subset** (ADR 0054's 2026-09-05 step-1 amendment: `PathSegment`/

@@ -248,6 +248,18 @@ impl SimClusterHandle {
             .is_some_and(|g| g.is_leader())
     }
 
+    /// ADR 0065's test-reachable hook (`ClientCtx::set_throttle_defaults`)
+    /// on one node — mutates through the node's own `Arc<ThrottleDefaults>`,
+    /// so it's visible to every clone of that node's `ClientCtx`, including
+    /// the one closed over by its own relay-serving handler (installed
+    /// before this handle's `ctxs` vec was ever built — both clones share
+    /// the identical `Arc`). Plain sync: `set_throttle_defaults` itself
+    /// does no I/O and needs no simulator drive.
+    fn set_throttle_defaults(&self, node: u64, read_units: Option<u64>, write_units: Option<u64>) {
+        self.ctxs.lock().expect("ctxs poisoned")[node as usize]
+            .set_throttle_defaults(read_units, write_units);
+    }
+
     /// `node`'s own internal `SimEnv` — the env a corpus spawns a
     /// node-issued op's own driving task onto, mirroring [`SimCluster::
     /// spawn_and_capture`]'s identical read. Cheap: `SimEnv` is itself a
@@ -744,6 +756,34 @@ impl SimCluster {
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.shared.metadata(node)
+    }
+
+    /// ADR 0065's test-reachable hook: set `node`'s cluster-wide default
+    /// throttle limits — `None`/`None` (every node's own default) means
+    /// `PAY_PER_REQUEST`, unthrottled. See `ClientCtx::set_throttle_
+    /// defaults`'s own doc for why this exists at all (step 4's real
+    /// config surface doesn't yet).
+    pub(crate) fn set_throttle_defaults(
+        &self,
+        node: u64,
+        read_units: Option<u64>,
+        write_units: Option<u64>,
+    ) {
+        self.shared
+            .set_throttle_defaults(node, read_units, write_units);
+    }
+
+    /// [`SimCluster::set_throttle_defaults`] on every node at once — the
+    /// shape a real cluster-wide config knob would have, once step 4 adds
+    /// one.
+    pub(crate) fn set_throttle_defaults_all(
+        &self,
+        read_units: Option<u64>,
+        write_units: Option<u64>,
+    ) {
+        for node in 0..self.nodes as u64 {
+            self.set_throttle_defaults(node, read_units, write_units);
+        }
     }
 
     /// Spawn `fut` onto `node`'s own env and drive the simulator for

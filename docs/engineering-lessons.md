@@ -17691,3 +17691,90 @@ before copying an existing field's placement inside a gated `Option` group,
 check what the *new* field's own testing requirement actually needs
 constructed — a precedent's placement was correct for what it had to prove
 at the time, not necessarily for what the next field needs to prove.
+
+## Wiring a new refusal sentinel into a wire error requires auditing EVERY error-mapping call site, not just the primary write path (ADR 0065, W-08 step 3)
+
+Enforcing per-table throttling (`ThrottleTracker::check_write`/`check_read`)
+needed a plain `Result<_, String>` sentinel (`dynamo::THROTTLE_WRITE_
+REFUSAL`/`THROTTLE_READ_REFUSAL`) to propagate up from deep inside
+`write_path.rs`/`read_path.rs` to `dynamo.rs`, where it has to render as
+`ProvisionedThroughputExceededException` rather than a generic `500`. The
+obvious place to add that mapping (`map_throttleable_error`) is the single
+call site the throttled write path most directly feeds — but a
+`String`-typed error has no compiler-visible identity, so nothing forced an
+audit of every OTHER place a `.map_err(|e| internal(&e))`-shaped closure
+converts the identical error type into a wire response. Five separate call
+sites needed the fix, found only by grepping every `internal(&e)`-shaped
+mapping in `dynamo.rs`, not by inspection of the "main" path:
+`fast_marker_write`'s own `cp_kind_write_raw` error mapping, `raw_quorum_
+read`, `native_scan`, and two LSI-scan pagination call sites
+(`paginated_table_examine`'s `cp_scan_kind_table` call, `paginated_kind_
+examine_one`'s `cp_scan_kind` call). One of these (`fast_marker_write`) was
+caught only by a real integration test getting an unexpected `500` instead
+of a `400` — the other four were found by then auditing every structurally
+identical mapping pattern rather than trusting that the first fix was
+complete. **General form**: when a new internal sentinel error needs a
+wire-level translation, grep every `.map_err`/error-conversion call site
+that touches the same underlying `Result<_, String>`-shaped function family,
+not just the one test that happened to exercise the sentinel first — a
+string-typed error carries no type-system signal that a translation step
+was skipped, so the compiler will not find the other four sites for you.
+
+## A fixture whose op helper auto-advances virtual time must size per-op cost against the PER-CALL refill, not the nominal configured rate (ADR 0065, W-08 step 3)
+
+`SimCluster::spawn_and_capture` (the helper every `put`/`get`/`delete`/
+`scan` call goes through) advances the simulator's virtual clock by up to
+`OP_BUDGET` (12s) per call, regardless of how quickly the operation itself
+actually resolves — a deliberate design so a route/propose/confirm loop
+inside one op call can never itself hang the corpus. This is invisible to
+an ordinary op sequence, but it is directly load-bearing for a token-bucket
+throttle test: at a naively "obviously enough" rate like 1 unit/sec, a
+12-second-per-call refill hands back ~12 units between every single op —
+so a test whose per-op cost is anywhere near that (e.g. a ~10-RCU read on a
+40 KiB item) never nets any drain at all; `sim_cluster_throttle.rs`'s first
+draft of its read-throttle test admitted all 60 of 60 attempted reads with
+zero refusals, not because the throttle mechanism was broken but because
+the fixture's own per-call refill was outrunning the configured debit. The
+fix was sizing the test's own item at 512 KiB (~128 RCU/consistent-read),
+clearing the per-call refill by an order of magnitude rather than merely
+exceeding the nominal rate on paper; the write-throttle test's own ~100
+KiB/~100 WCU item was already, by luck, well clear of the identical
+12-WCU/call refill. **General form**: when a fixture's own driving loop
+advances a deterministic simulator's clock by a fixed budget per call (for
+liveness/hang-prevention reasons unrelated to what the test is actually
+proving), any rate-based assertion built on that fixture must size its
+per-op cost against that PER-CALL budget, not just against the nominal
+rate under test — read the fixture's own op-driving helper before picking
+"a rate that should obviously throttle."
+
+## An atomic multi-row Raft-entry batching optimization cannot offer finer admission granularity than "the whole entry" — a real, user-visible behavior difference, not a bug to fix (ADR 0065, W-08 step 3)
+
+The ADR 0049 fast marker arm commits an entire tablet's share of a
+`BatchWriteItem` call as ONE `KindBatch` Raft entry, specifically because
+that batching is what gives a plain unindexed/unstreamed table its
+throughput (N sequential fsync round trips would otherwise serialize a
+whole batch). Wiring per-table throttling into this path found — via a
+real integration test, not by inspection — that admission control
+necessarily inherits the same atomicity: `throttle_check_write_raw` checks
+and charges the WHOLE per-tablet group's cost against the bucket in one
+call, so a partially-exhausted budget either admits or refuses every
+request in that tablet's group together, never a subset. This is not a bug
+to work around; it is the direct, structural consequence of the same
+design choice that gives the fast arm its throughput, and "fix" it would
+mean either losing that atomicity (re-fragmenting the batch into per-item
+entries, undoing the throughput win it exists for) or charging an
+estimated per-item share speculatively (which cannot be made to agree with
+what the entry, once it commits, actually costs). The integration test
+covering `BatchWriteItem`'s true per-item throttle granularity had to
+target a **streamed** table instead — streamed/indexed writes already go
+through the per-item evaluate-at-leader funnel for unrelated correctness
+reasons (ADR 0054), so genuine per-item admission control falls out of
+that path for free, while a plain table's own regression proves only the
+coarser per-tablet-group behavior. **General form**: before writing a test
+that assumes an admission-control (or any per-request) decision is made at
+per-item granularity, check whether the write path it rides was already
+batched into one atomic unit for a *different*, unrelated reason (here,
+throughput) — the atomicity is not negotiable without undoing the reason
+the batching exists, and the right fix is usually "pick a different
+existing code path to test the finer-grained behavior," not "make this one
+path finer-grained."

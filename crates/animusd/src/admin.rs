@@ -505,6 +505,9 @@ impl AdminHost for ClientCtx {
     async fn action_data_seed(&self, body: &[u8]) -> (u16, Value) {
         action_data_seed(self, body).await
     }
+    async fn action_set_throttle_defaults(&self, body: &[u8]) -> (u16, Value) {
+        action_set_throttle_defaults(self, body).await
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
@@ -1471,11 +1474,30 @@ fn metrics_view(ctx: &ClientCtx) -> Value {
         .into_iter()
         .map(|(tablet, ops_per_sec)| json!({"tablet": tablet.0, "ops_per_sec": ops_per_sec}))
         .collect();
+    // ADR 0065 (per-table throttling, W-08 step 3): this node's own
+    // per-tablet throttle-bucket state — one entry per currently-tracked
+    // tablet, mirroring `request_rates`'s own shape.
+    let throttle: Vec<Value> = ctx
+        .throttle_snapshot()
+        .into_iter()
+        .map(|e| {
+            json!({
+                "tablet": e.tablet.0,
+                "read_tokens": e.read_tokens,
+                "read_rate": e.read_rate,
+                "read_throttled": e.read_throttled,
+                "write_tokens": e.write_tokens,
+                "write_rate": e.write_rate,
+                "write_throttled": e.write_throttled,
+            })
+        })
+        .collect();
     json!({
         "counters": counters,
         "is_leader": is_leader,
         "stream_change_rates": stream_change_rates,
         "request_rates": request_rates,
+        "throttle": throttle,
         "auto_split_bytes_threshold": ctx.admin.auto_split_bytes_threshold,
         "auto_split_ops_rate_threshold": ctx.admin.auto_split_ops_rate_threshold,
     })
@@ -1622,6 +1644,37 @@ async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
         .trigger_split(TabletId(req.tablet), req.split_key.into_bytes())
         .await;
     client_response_to_json(resp, json!({"ok": true, "tablet": req.tablet}))
+}
+
+#[derive(Deserialize)]
+struct ThrottleDefaultsReq {
+    read_units: Option<u64>,
+    write_units: Option<u64>,
+}
+
+/// `POST /admin/throttle/defaults` (ADR 0065, W-08 step 3) — sets this
+/// node's cluster-wide default throttle limits (`{"read_units": N|null,
+/// "write_units": N|null}`, either field omitted/`null` disables that
+/// direction) via `ClientCtx::set_throttle_defaults`. **This is the
+/// test-reachable hook step 4's own config surface
+/// (`ClusterSettings`/CLI/`CreateTable`'s `BillingMode`/
+/// `ProvisionedThroughput`) is meant to replace** — a real deployment has
+/// no other route to configure throttling today, since `TableSchema`
+/// carries no `throughput` field yet. Local-node-only (matches every other
+/// action here — no relay, no cluster-wide propagation): a multi-node
+/// cluster's real-thread throttle test sets this on the node the client
+/// actually dials, which for a leader-hosted write is sufficient since the
+/// check runs where the write is served.
+async fn action_set_throttle_defaults(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: ThrottleDefaultsReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    ctx.set_throttle_defaults(req.read_units, req.write_units);
+    (
+        200,
+        json!({"ok": true, "read_units": req.read_units, "write_units": req.write_units}),
+    )
 }
 
 #[derive(Deserialize)]
@@ -2253,7 +2306,15 @@ async fn action_data_seed(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
                                 )
                             })
                             .collect();
-                        crate::dynamo::marker_batch_write(ctx, &table, batch_rows).await
+                        // ADR 0065 §6: this admin seeder is not a real
+                        // DynamoDB client — a throttled row is silently
+                        // dropped rather than echoed under
+                        // `UnprocessedItems` (there is no such wire
+                        // response here); the whole-chunk retry loop above
+                        // is this endpoint's only recovery path.
+                        crate::dynamo::marker_batch_write(ctx, &table, batch_rows)
+                            .await
+                            .map(|_shed| ())
                     };
                     if last.is_ok() {
                         break;

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome};
+use animus_dynamo::capacity;
 use animus_env::{Env, EnvExt, Metric};
 use animus_node::host::RelayClient;
 use animus_tablet::{KeyRange, TOKEN_BYTES, TabletId};
@@ -62,6 +63,40 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             let schema = dynamo::write_schema_for(&meta, table);
             for p in pending_kind_writes {
                 let key = dynamo::item_key(&p.pk, p.sk.as_ref());
+                // ADR 0065 §2/§3/§6: check each participant write BEFORE
+                // ever staging, at **2x** the ordinary pre-charge — a
+                // transactional write costs double, `ConsumedCapacity::
+                // scaled(2.0)`'s existing factor. A refusal aborts this
+                // whole stage attempt with `TxnAbortReason::Throttled`,
+                // which `run_transact`'s own cancellation-reason mapping
+                // (site 3, `dynamo.rs`) turns into a `ThrottlingError`
+                // `CancellationReasons` entry at this action's own index.
+                if let Some(write_limit) = self.throttle_defaults.write_units()
+                    && let Some(tablet) =
+                        crate::topology::tablet_for_key(meta.tablets_for_table(table), &key)
+                {
+                    let share =
+                        write_limit as f64 / meta.tablets_for_table(table).count().max(1) as f64;
+                    let cost = 2.0
+                        * match &p.op {
+                            crate::KindWriteOp::Put(item) => {
+                                capacity::write_units(capacity::item_size(item))
+                            }
+                            crate::KindWriteOp::Delete | crate::KindWriteOp::Update { .. } => 1.0,
+                        };
+                    if !self
+                        .throttle
+                        .check_write(tablet, share, cost, self.env.now())
+                    {
+                        if let Some(data) = self.data.as_ref() {
+                            data.raftkv_metrics.incr(Metric::ThrottledWrites);
+                        }
+                        return Err(TxnAbortReason::Throttled {
+                            table: table.to_owned(),
+                            key,
+                        });
+                    }
+                }
                 let stage_marker = dynamo::item_stage_marker_change_log(&p.pk, p.sk.as_ref());
                 let op = dynamo::kind_write_op_to_eval_op(p.op);
                 writes.push(TxnWrite::pending_eval(

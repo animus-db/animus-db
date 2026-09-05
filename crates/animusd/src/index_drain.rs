@@ -356,6 +356,14 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
         // W-09 (ADR 0034 amendment): bound the request-rate tracker the
         // same way, for the same reason.
         ctx.data().request_rates.retain_existing(&meta);
+        // ADR 0065 (per-table throttling): bound the throttle tracker the
+        // same way — unlike the two trackers above, `ctx.throttle` lives
+        // directly on `ClientCtx` (see that field's own doc), so this call
+        // needs no `ctx.data()` at all and is technically safe on a
+        // control-only node too; this loop is only ever spawned for a
+        // data-capable node either way, so the distinction doesn't matter
+        // in practice.
+        ctx.throttle.retain_existing(&meta);
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;

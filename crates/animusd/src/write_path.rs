@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use animus_control::{Metadata, ProposeResult};
 use animus_cp_data::{KindBatchOutcome, KindEvalOp};
+use animus_dynamo::capacity;
 use animus_dynamo::{AttributeValue, ConditionExpression, Item};
-use animus_env::{Env, Nanos};
+use animus_env::{Env, Metric, Nanos};
 use animus_node::host::RelayClient;
 
 use crate::{
@@ -35,6 +36,15 @@ use crate::{
 /// [`ClientCtx::cp_kind_eval_local`]'s own doc for the two cases that reach
 /// this vs. the safe best-effort re-read.
 const KIND_EVAL_CONFIRM_AMBIGUOUS: &str = "CP kind write did not commit in time";
+
+/// One raw kind-write triple `(row kind, key, value-or-tombstone)` — the
+/// element type [`ClientCtx::cp_kind_write_raw`]'s own `writes` parameter
+/// carries. Named only so [`ClientCtx::throttle_check_write_raw`]'s slice
+/// parameter doesn't trip clippy's `type_complexity` lint; every other
+/// signature in this file keeps spelling the tuple out inline (unchanged),
+/// since a type alias is structurally transparent — callers need no change
+/// either way.
+type RawKindWrite = (u8, Vec<u8>, Option<Vec<u8>>);
 
 /// The confirmed, authoritative result of a [`KvCommand::KindEval`]
 /// (`animus_cp_data`) once [`ClientCtx::cp_kind_eval_local`]'s propose has
@@ -247,8 +257,65 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
         change_log: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<(), String> {
+        self.throttle_check_write_raw(table, &writes)?;
         self.cp_kind_write_raw_bounded(table, writes, change_log, CLIENT_TIMEOUT)
             .await
+    }
+
+    /// ADR 0065 §2/§3 pre-charge for the raw kind-write primitive — the ADR
+    /// 0049 fast arm's own choke point, reached from `dynamo::
+    /// fast_marker_write`/`marker_batch_write_raw` (the marker-table
+    /// `PutItem`/`DeleteItem`/`BatchWriteItem` path), the plain client
+    /// protocol's `Put`/`PutBatch`/`Delete` arms, and `SimCluster`'s own
+    /// ops. Cost is `write_units` of every `Some`-valued write's own
+    /// bytes, summed across the whole batch — there is no GSI/LSI diff to
+    /// correct after the fact on this path (a marker table by construction
+    /// carries no index), so the pre-charge already **is** the final cost;
+    /// unlike [`dynamo::kind_write_item_at_leader`](super::dynamo::
+    /// kind_write_item_at_leader) there is no post-charge step here.
+    ///
+    /// **Cheap early-return when nothing is configured**: one lock-free
+    /// atomic peek at `self.throttle_defaults.write_units()` before ever
+    /// touching `Metadata`, the bucket lock, or the `BTreeMap` — the ADR
+    /// 0049 fast arm's own throughput contract (`tests/batch_write.rs`).
+    /// **Known limitation, left for step 4**: this peek reads only the
+    /// cluster default, never a per-table override — the correct
+    /// trade-off today (`throttle_limits_for`'s per-table hook is a no-op
+    /// stub, so the two answers always agree), but step 4's real per-table
+    /// `TableSchema.throughput` will need this gate to fetch `Metadata`
+    /// whenever *any* table might carry an override, not only when the
+    /// cluster default is set.
+    fn throttle_check_write_raw(&self, table: &str, writes: &[RawKindWrite]) -> Result<(), String> {
+        let Some(write_limit) = self.throttle_defaults.write_units() else {
+            return Ok(());
+        };
+        let Some(first_key) = writes.first().map(|(_, k, _)| k.clone()) else {
+            return Ok(());
+        };
+        let meta = self.effective_metadata();
+        let Some(tablet) =
+            crate::topology::tablet_for_key(meta.tablets_for_table(table), &first_key)
+        else {
+            return Ok(());
+        };
+        let share = write_limit as f64 / meta.tablets_for_table(table).count().max(1) as f64;
+        let cost = capacity::write_units(
+            writes
+                .iter()
+                .filter_map(|(_, _, v)| v.as_ref().map(Vec::len))
+                .sum(),
+        );
+        if self
+            .throttle
+            .check_write(tablet, share, cost, self.env.now())
+        {
+            Ok(())
+        } else {
+            if let Some(data) = self.data.as_ref() {
+                data.raftkv_metrics.incr(Metric::ThrottledWrites);
+            }
+            Err(dynamo::THROTTLE_WRITE_REFUSAL.to_string())
+        }
     }
 
     /// [`cp_kind_write_raw`](Self::cp_kind_write_raw)'s single-attempt
