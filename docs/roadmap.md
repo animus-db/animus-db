@@ -19,10 +19,11 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0066** (0065 is
-[Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
-record — W-08 itself landed 2026-09-05 and is removed from this file, per
-this document's own maintenance rule above).
+The next free ADR number at the time of writing is **0067** (0066 is
+[SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's design of record;
+0065 is [Per-table throttling](adr/0065-per-table-throttling.md), W-08's —
+W-08 itself landed 2026-09-05 and is removed from this file, per this
+document's own maintenance rule above).
 
 ---
 
