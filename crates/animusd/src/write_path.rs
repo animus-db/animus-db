@@ -127,6 +127,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             let err = match self.cp_route(table, &base_key).await {
                 CpRoute::Local(leader) => {
                     match dynamo::kind_write_item_at_leader::<E, R>(
+                        self,
                         &leader,
                         meta,
                         table,

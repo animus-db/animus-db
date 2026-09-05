@@ -1462,21 +1462,34 @@ streams-enabled variant walking a `GetRecords` iterator from the parent's
 own shard 0 across the fork to both children's own shard 0s with no loss
 or duplication.
 
-`--auto-split-bytes B` (byte size) and `--auto-split-change-rate RATE`
+`--auto-split-bytes B` (byte size), `--auto-split-change-rate RATE`
 (streamed tables only, ADR 0042 §14 Fork F — bytes/sec of a tablet's own
-`KIND_CHANGE` growth, `/admin/metrics`'s `stream_change_rates`) are
-independent OR-gated triggers — either, both, or neither. (**The former
-key-count trigger, `--auto-split K`, was removed** — see the root
-`CLAUDE.md`'s auto-split entry.) `--auto-split-change-rate` closes the gap
-bytes structurally can't: `CpGroup::approx_bytes` is base-scoped (ADR 0034),
-so a high-churn, small-footprint streamed table never crosses a byte
-threshold regardless of write rate. No production-tuned default exists yet
-— omitting the flag disables the trigger entirely (zero behavior change);
-an operator must pick `RATE` for their own workload. Both flags are
-`--cluster N`/`--cluster-control`+`--cluster-data` dev-cluster-only (not
-reachable from `--config/--node`'s real per-process deployment — auto-split
-has never been reachable from a real per-process deployment, so this scope
-is unchanged by the key-count trigger's removal). **`--node I` is gone from
+`KIND_CHANGE` growth, `/admin/metrics`'s `stream_change_rates`), and
+`--auto-split-ops-rate RATE` (W-09, ADR 0034 amendment — any table, ops/sec
+of a tablet's own leader-side write rate, `/admin/metrics`'s
+`request_rates`) are independent OR-gated triggers — any subset of them,
+including none. (**The former key-count trigger, `--auto-split K`, was
+removed** — see the root `CLAUDE.md`'s auto-split entry.)
+`--auto-split-change-rate` closes the gap bytes structurally can't:
+`CpGroup::approx_bytes` is base-scoped (ADR 0034), so a high-churn,
+small-footprint streamed table never crosses a byte threshold regardless of
+write rate — but only for a *streamed* table. `--auto-split-ops-rate`
+closes the identical gap for **any** table (streamed or not): a tablet's
+`RequestRateTracker` estimate is fed from every successful leader-side
+write, not from the change log, so a plain table under heavy write load is
+visible to it too. Neither
+change-rate nor ops-rate has a production-tuned default — omitting a flag
+disables that trigger entirely (zero behavior change); an operator must
+pick its own `RATE` per workload. **All three flags reach every real
+deployment shape, not just `--cluster N`/`--cluster-control`+
+`--cluster-data`'s dev-cluster mode** — `--config`/`--node` and `animusd
+data --config` reach them via a config file's `cluster_settings.
+auto_split_{bytes,change_rate,ops_rate}` section instead of a CLI flag
+(S-06, `config.rs`'s own module-map entry has the full mechanism and the
+"CLI flag and config field both set is a hard error" contract);
+`--cluster-control`/`--cluster-data` and the standalone `control`/`join`
+subcommands have no route to that config-file section, a documented gap
+S-06 itself names. **`--node I` is gone from
 `join`/`data --seed` entirely** — there is no index to derive a
 default port range from, so `--base-port` is **required** on both. `--id
 NAME` proposes a durable identity (`NodeId::propose` validates it at the
@@ -2316,9 +2329,10 @@ test module — see `animus-node/CLAUDE.md`) — which scans every achievable
 key-boundary cut for the one closest to half the bytes, not a single
 accumulate-and-threshold pass (subtly wrong when one key dominates; see the
 root log). **The former key-count trigger (`--auto-split K`) and its plain
-positional-median split point were removed** — bytes (and, for streamed
-tables, change-rate below) cover every use case key count did, with no
-key-count-specific failure mode left to justify a third independent knob;
+positional-median split point were removed** — bytes (plus, for streamed
+tables, change-rate, and for any table, ops-rate — both below) cover every
+use case key count did, with no key-count-specific failure mode left to
+justify a fourth independent knob;
 `CpGroup::approx_key_count` itself is unchanged and still backs `/admin/
 raftkv`'s informational `key_count` display. **Tablets are split-only
 (ADR 0044)** — there is no merge, automatic or operator-driven, to trigger;
@@ -2340,6 +2354,32 @@ bytes/sec estimate — no new scan. Read via `ClientCtx::stream_change_rates`
 the identical `byte_weighted_median`/`trigger_split` path every other
 trigger uses, so F11/Fork E apply automatically. No production-tuned
 default exists — omitting the flag is a true no-op.
+
+**Request-rate trigger (opt-in, W-09, ADR 0034's own deferred bullet,
+closed)**: `--auto-split-ops-rate RATE` joins the same any-fires gate
+above, applicable to **any** table — unlike change-rate, this one needs no
+change log, so it isn't streamed-tables-only. `RequestRateTracker`
+(`lib.rs`, sharing `ChangeRateTracker`'s own `RateSample` EWMA shape) is
+observed at **two** choke points together covering every leader-side
+non-transactional write: `dynamo::kind_write_item_at_leader` (the ADR 0046
+U3 evaluate-at-leader funnel — a condition, an old-image echo, or an
+images-carrying table) and `dynamo::fast_marker_write` (the ADR 0049 fast
+arm — an unconditioned `Put`/`Delete` on a plain, unindexed/unstreamed
+table, which never reaches the funnel at all). Missing either one leaves
+the signal blind to a real write shape; the fast arm in particular is the
+*common* case for an ordinary plain-table write, so it is not optional.
+Each successful write ticks the tablet's own tracker once, converting
+inter-write timing into a smoothed ops/sec estimate — no separate counter
+plumbing. Read via `ClientCtx::request_rates` (`/admin/metrics`'s
+`request_rates` array) and `RequestRateTracker::get` (the trigger check
+itself). **Writes only, never reads** — an eventually-consistent read (ADR
+0055's wire default) is served from any replica and never reaches the
+leader at all, so folding reads in would silently undercount a tablet whose
+hot path is reads spread across replicas; a hot-but-small tablet under
+heavy write load — the exact gap ADR 0034 deferred — is fully visible
+through writes alone. When hot, splits via the identical
+`byte_weighted_median`/`trigger_split` path every other trigger uses. No
+production-tuned default exists — omitting the flag is a true no-op.
 
 **Manual growth trigger (`POST /admin/stream/grow {table}`, ADR 0042 §14,
 growth PR3)**: splits *every* tablet of a streamed table at its own

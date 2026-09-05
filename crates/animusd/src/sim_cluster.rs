@@ -467,6 +467,7 @@ impl SimCluster {
         let mut ctxs: Vec<SimNodeCtx> = Vec::with_capacity(nodes);
         for (i, id) in ids.iter().enumerate() {
             let admin = Arc::new(AdminInfo {
+                auto_split_ops_rate_threshold: None,
                 node_id: Some(id.clone()),
                 internal_addr: Some(placeholder_addr()),
                 client_addr: placeholder_addr(),
