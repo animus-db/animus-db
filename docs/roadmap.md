@@ -229,8 +229,16 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
   and this node's own `leader_tablets` count. Renders on the Storage tab.
   See ADR 0020's and ADR 0051's 2026-09-06 as-built notes and
   `crates/animusd/CLAUDE.md`'s `ttl_reaper.rs` entry.
-- `GET /admin/gc`: orphan-sweep phase from `segment_janitor_loop`
-  (ADR 0024/0040). Size L.
+- **Landed 2026-09-06.** `GET /admin/gc`: the DynamoDB Streams segment
+  janitor's own orphan-sweep phase and counters from `segment_janitor_loop`
+  (ADR 0042 §10/ADR 0043 §A9 — not ADR 0024/0040 as originally scoped
+  here: those cover the *drop-table* reconciler GC, a different subsystem
+  the segment janitor doesn't touch), via a `SegmentJanitorProgress` on
+  `ClientCtx` mutated directly by the loop (it never moved to
+  `animus-node`, so no capability trait was needed). Renders on the
+  Storage tab beside the TTL reaper card. See ADR 0020's and ADR 0043's
+  2026-09-06 as-built notes and `crates/animusd/CLAUDE.md`'s
+  `segment_janitor.rs` entry.
 - `GET /admin/segment-store`: placement per shard (already inside
   `ClusterSegmentStore`) plus counts. Size M.
 - Each renders on the Backups tab (landed with U-02) or Storage tab.

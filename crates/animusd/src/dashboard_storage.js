@@ -20,6 +20,19 @@
 // (control-leader-only, one SEED fetch), the TTL reaper runs on EVERY
 // node, self-gated per tablet, so this card is genuinely per-node, not a
 // single shared answer).
+//
+// docs/roadmap.md U-07's third route: a read-only "GC (stream segment
+// janitor)" card beside it, fed from `STATE.gc` (`dashboard_core.js`'s
+// existing single SEED-only `GET /admin/gc` fetch, `loadAll()`'s own
+// `backupStore` precedent — this janitor is control-plane-leader-only,
+// exactly like the backup janitor, not per-node like the TTL reaper just
+// above, so it gets that route's own fetch shape instead). Placed on the
+// Storage tab rather than Backups: this janitor sweeps DynamoDB Streams
+// segment objects/catalog rows (`stream_shards`, `SegmentStoreHandle`) — a
+// wholly different store/subsystem than the on-demand backup store the
+// Backups tab's own card covers — and "storage janitor diagnostics" is
+// exactly this tab's existing theme (the TTL reaper card sits here for the
+// identical reason).
 
 // docs/roadmap.md U-07: the "TTL reaper" card — every TTL-enabled table
 // (from any node that answered, since the catalog is identical everywhere)
@@ -64,8 +77,42 @@ function renderTtlReaper() {
   el.innerHTML = tableRows + nodeRows;
 }
 
+// docs/roadmap.md U-07: the "GC" card — the segment janitor's own live
+// phase and counters plus whether this node is the control leader,
+// straight off `GET /admin/gc`'s response shape (`{janitor, leader}`;
+// mirrors `dashboard_backups.js::renderBackupStore`'s own layout since
+// both routes share the identical control-leader-only gating).
+function renderGcJanitor() {
+  const el = $("gc-body");
+  if (!el) return;
+  const gc = STATE.gc;
+  if (!gc) { el.innerHTML = `<div class="empty">unavailable</div>`; return; }
+  const j = gc.janitor || {};
+  const phase = j.phase || "idle";
+  const rows = [
+    `<div class="list-row"><span class="detail">janitor</span><span>${
+      pill(phase === "idle" ? "forming" : "ok", phase.replace("_", " ").toUpperCase())
+    }${gc.leader ? "" : ` <span class="muted">(not control leader)</span>`}</span></div>`,
+    `<div class="list-row"><span class="detail">last tick</span><span class="status-text mono">${
+      j.last_tick_at_ms != null ? "t+" + monoDuration(j.last_tick_at_ms) : "—"
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">retention</span><span class="status-text mono">${
+      j.retention_ms != null ? `${esc(j.retention_ms)}ms` : "—"
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">deleted (tick / total) · seen total</span><span class="status-text mono">${
+      esc(j.deleted_last_tick ?? 0)} / ${esc(j.orphans_deleted_total ?? 0)} · ${esc(j.orphans_seen_total ?? 0)
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">pending (awaiting retention)</span><span class="status-text mono">${esc(j.pending_orphans ?? 0)}</span></div>`,
+  ];
+  if (j.last_error) {
+    rows.push(`<div class="list-row"><span class="detail">last error</span><span class="err-line">${esc(j.last_error)}</span></div>`);
+  }
+  el.innerHTML = rows.join("");
+}
+
 function renderStorageSelectors() {
   renderTtlReaper();
+  renderGcJanitor();
   const status = STATE.status;
   const tablets = status && status.tablets ? Object.keys(status.tablets).map(Number).sort((a, b) => a - b) : [1];
   const tsel = $("st-tablet");

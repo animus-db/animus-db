@@ -956,3 +956,49 @@ corpus-deep nightly):
    the whole scenario space, assert every acknowledged write is recoverable
    from either hot Raft state or a committed, K-replicated segment — never
    from neither.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/gc`)
+
+A new observability route, `GET /admin/gc`, surfaces the segment janitor's
+(§A9) own live phase/counters — the third of docs/roadmap.md's U-07 batch,
+copying `GET /admin/backup-store`'s own template (that route's own ADR 0020
+as-built note, and ADR 0059's matching amendment, are the fuller design
+write-ups; this amendment records only that the route lives in this
+subsystem's territory too). The janitor
+(`animusd::segment_janitor::segment_janitor_loop`/`segment_janitor_tick`)
+now publishes a small `SegmentJanitorProgress` snapshot — phase
+(`idle`/`listing`/`waiting_retention`/`deleting`/`sweeping`, mirroring this
+loop's own two-phase-retention/repair/orphan-reap structure), last tick,
+cumulative objects-seen/objects-deleted counters (spanning BOTH phase 1b's
+expired-row reclaims and phase 3's proven-orphan reap — one combined
+"objects this janitor has ever deleted" total), rows still pending
+retention, the configured retention window, and the last observed error —
+at each phase transition, directly into a `ClientCtx::
+segment_janitor_progress: Arc<std::sync::Mutex<..>>` field. No change to
+the janitor's own reclaim decisions anywhere in this amendment — only
+instrumentation layered on top of the existing phases §A9 already
+documents.
+
+**This is the one U-07 route whose progress type never crosses into
+`animus-node`** — unlike the backup janitor/TTL reaper (ADR 0061 rung C2),
+`segment_janitor.rs` was deliberately left in `animusd` (see that rung's
+own "segment_janitor did NOT move" reasoning: its replica-repair phase is
+real placement/membership orchestration, not a capability one narrow trait
+method can express) — so `SegmentJanitorProgress`/`SegmentJanitorPhase` are
+`animusd`-local types, and no `BackupJanitorProgressHost`-shaped capability
+trait was needed to publish them; the loop already held a genuine
+`&ClientCtx` to mutate directly. `animus_node::host::AdminHost` still
+gained one more route-dispatch method, `gc_view`, for the same reason
+every other admin route does — but it returns a plain `Value`, naming no
+new type across the crate boundary.
+
+`reap_orphans` (§A3's own orphan-reap phase) now returns `(seen: u64,
+deleted: u64, last_error: Option<String>)` instead of nothing — its two
+in-crate regression tests (`segment_janitor::orphan_reap_tests`) were
+extended to assert on these counts directly, strengthening (not just
+preserving) their existing coverage.
+
+See ADR 0020's own matching 2026-09-06 as-built note for the full route
+design (the exact JSON shape, the dashboard card, and why
+`dropped_tables_pending` — a different subsystem entirely, ADR 0024's
+drop-table GC — was deliberately not added) and the test references.

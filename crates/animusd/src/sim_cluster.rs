@@ -559,6 +559,9 @@ impl SimCluster {
                 ttl_reaper_progress: Arc::new(Mutex::new(
                     animus_node::ttl_reaper::TtlReaperProgress::default(),
                 )),
+                segment_janitor_progress: Arc::new(Mutex::new(
+                    segment_janitor::SegmentJanitorProgress::default(),
+                )),
                 client_route: Arc::new(Mutex::new(route.clone())),
                 intra_route: Arc::new(Mutex::new(route.clone())),
                 admin,

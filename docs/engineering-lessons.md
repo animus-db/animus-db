@@ -18351,3 +18351,84 @@ only shape; `/admin/segment-store` (placement per shard, already inside
 per-node fan-out shape like this one. Never assume the previous PR's own
 `STATE.<field>` idiom is the template to copy — re-derive the fetch shape
 from the route's own semantics every time.
+
+## A background loop deliberately left out of a lower crate needs no capability trait at all for new admin instrumentation — it already holds the real host (docs/roadmap.md U-07, `GET /admin/gc`)
+
+The first two U-07 routes (`/admin/backup-store`, `/admin/ttl`) each
+needed a small capability trait (`BackupJanitorProgressHost`/
+`TtlReaperProgressHost`, `animus_node::host`) purely because the loop
+publishing the progress had *already* moved to `animus-node` (ADR 0061
+rung C2) and therefore no longer held a concrete `animusd::ClientCtx` to
+mutate directly — the trait exists solely to let a lower, `E`-generic
+crate write into a field on a struct it cannot name. It would have been
+easy to assume the third route needed the identical shape, since the
+first two both established it and the task briefing described all "leaf
+background loops" as roughly interchangeable.
+
+`segment_janitor.rs`, though, is the one loop rung C2 explicitly left in
+`animusd` (documented in that crate's own `CLAUDE.md`, and in
+`animus-node/CLAUDE.md`'s "segment_janitor did NOT move" entry) — its
+replica-repair phase is real placement/membership orchestration over live
+cluster membership, not a value one narrow I/O-delegation method can
+express, so forcing the move would have meant either dragging real
+decision logic into the lower crate or building a capability trait wide
+enough to expose it anyway (the exact "contorted trait" failure mode ADR
+0061 warns against). Because it never moved, `segment_janitor_loop`/
+`segment_janitor_tick` already take a genuine `&ClientCtx`/`ClientCtx` by
+value — the *simplest* thing here was not to copy the two-crate
+capability-trait pattern at all, but to add the progress type as a plain
+`animusd`-local struct and mutate `ClientCtx::segment_janitor_progress`
+directly, with the `AdminHost::gc_view` method (still added in
+`animus-node`, since the dispatch table itself lives there) as the only
+place a lower crate needed to know anything about this route at all.
+
+The generalizable rule: when a task briefing describes several sibling
+mechanisms as needing "the same treatment," check each one's own actual
+location/scope before assuming the pattern that worked for the first two
+also fits the third — a loop that was deliberately, documentedly *not*
+moved in an earlier refactor is exactly the kind of exception that a
+template-copying pass will otherwise paper over with unnecessary
+indirection. The fix that turned out simplest also turned out to be less
+code, not more — a sign the extra trait would have been the wrong call
+had it been added anyway.
+
+## A roadmap bullet's own cited ADR/mechanism can be wrong — verify against the code before writing docs that repeat it (docs/roadmap.md U-07, `GET /admin/gc`)
+
+`docs/roadmap.md`'s own U-07 bullet for this route read "orphan-sweep
+phase from `segment_janitor_loop` (ADR 0024/0040)" — and the task briefing
+built on top of that citation, describing "GC internals" as living in ADR
+0024 (drop-table data GC) and ADR 0040 (self-minted node identities).
+Neither ADR mentions `segment_janitor.rs`, the segment janitor, or DynamoDB
+Streams orphan reaping anywhere — ADR 0040 is about node-id minting and
+registration-CAS membership, unrelated in subject entirely, and ADR 0024
+covers a genuinely different GC mechanism (the tablet-host reconciler's
+`Reclaim` action over dropped tables' *local engine files*, no admin-
+surfaced counter anywhere). The segment janitor this route actually
+instruments is documented in ADR 0042 §10 (the orphan-reap amendment) and
+ADR 0043 §A9 (the janitor loop itself, `crates/animusd/CLAUDE.md`'s own
+`segment_janitor.rs` entry, `docs/streams-notes.md`) — confirmed by
+grepping the ADR corpus for "segment janitor" / "segment_janitor" before
+writing a single line of the as-built note, which is what caught the
+mismatch.
+
+Two field-level consequences followed from taking the citation at face
+value having been avoided: the as-built notes went into ADR 0020 (route
+table) and ADR 0043 (the janitor's own doc), not ADR 0024/0040 where the
+roadmap bullet's citation would have pointed; and `dropped_tables_pending`
+— a field the task considered adding to this route, reasonably assuming
+"GC" meant the ADR-0024 drop-table mechanism the roadmap bullet named —
+was correctly recognized as belonging to a *different* subsystem with no
+cheap replicated counter to surface, rather than mistakenly wired to
+`stream_shards` data that has nothing to do with dropped-table tombstones.
+`docs/roadmap.md`'s own bullet was corrected in the same change (see this
+PR's U-07 entry) rather than left to keep misleading the next reader.
+
+The generalizable rule: a roadmap/task-brief ADR citation is planning
+prose, not verified fact — it can drift from the code the moment the
+feature it describes gets implemented under a different ADR than whoever
+wrote the roadmap entry assumed, and nothing re-checks a citation once
+it's written down. Grep the actual mechanism's own module/doc comments for
+which ADR it cites BEFORE trusting a task brief's or roadmap's citation of
+the same mechanism, especially when the citation is being asked to anchor
+new documentation of your own — propagating a wrong citation into a new
+as-built note makes the mistake harder to unwind later, not easier.

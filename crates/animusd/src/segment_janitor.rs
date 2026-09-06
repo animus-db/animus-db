@@ -96,6 +96,42 @@
 //!
 //! ## Why `ClientCtx::drop_table` does nothing new (the convergent design)
 //!
+//! ## Progress reporting (roadmap U-07)
+//!
+//! [`SegmentJanitorProgress`] is a small, `Env`-free snapshot of this
+//! loop's own state — phase, last tick, and cumulative counters —
+//! published at each phase transition below directly onto
+//! `ClientCtx::segment_janitor_progress` (an `Arc<std::sync::Mutex<..>>`,
+//! matching every other short lock/mutate/drop shared diagnostic state in
+//! this crate — never held across an `.await`), read by `GET /admin/gc`.
+//! **Unlike the backup janitor/TTL reaper's own progress types, this one
+//! stays entirely inside `animusd`** — `segment_janitor.rs` never moved to
+//! `animus-node` (see that crate's own `CLAUDE.md`, rung C2's "segment_
+//! janitor did NOT move" entry: this loop's replica-repair phase is real
+//! placement/membership orchestration, not a value one narrow capability
+//! trait can capture), so `segment_janitor_tick` already holds a genuine
+//! `&ClientCtx` and can mutate the shared slot directly — no
+//! `BackupJanitorProgressHost`/`TtlReaperProgressHost`-shaped capability
+//! trait is needed at all. Every timestamp is [`animus_env::Env::now`]-
+//! derived, never a wall clock (ADR 0003).
+//!
+//! `phase` reflects the loop's real per-tick structure: `Idle` (not the
+//! control leader, or a live tick that reclaimed nothing and has no rows
+//! waiting on retention), `WaitingRetention` (a live tick that reclaimed
+//! nothing but at least one live row exists, not yet due), `Listing`
+//! (phase 1a's scan for due rows, published at tick start), `Deleting`
+//! (phase 1b's object-delete/row-removal sweep), and `Sweeping` (phase 3's
+//! orphan reap). Phase 2 (replica repair) publishes no phase of its own —
+//! it already has independent counters on `/admin/metrics`
+//! (`Metric::StreamRepairsTotal`/`StreamRepairBacklog`), so folding it into
+//! this progress type would only duplicate an existing surface.
+//! `orphans_seen_total`/`orphans_deleted_total`/`deleted_last_tick` count
+//! every object this janitor has ever deleted across BOTH cleanup paths —
+//! phase 1b's expired-row object deletes and phase 3's proven-orphan
+//! deletes — the general "objects this janitor reclaimed because nothing
+//! references them any more" total the route's own name promises, not
+//! narrowly phase 3's own `reap_orphans` sub-routine alone.
+//!
 //! `MetaCommand::ExpireStreamShards` is deliberately **not relayable**
 //! (`animus-control`'s own doc on the command, and `lib.rs`'s
 //! `is_relayable_command` doc) — its only sanctioned caller is a
@@ -140,14 +176,98 @@ const SEGMENT_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
 /// attempt.
 const ORPHAN_GRACE: Duration = Duration::from_secs(5 * 60);
 
+/// One phase of the segment janitor's own tick (roadmap U-07) — rendered
+/// on `GET /admin/gc`. See the module doc's "Progress reporting" section
+/// for how each variant maps onto the loop's real phases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SegmentJanitorPhase {
+    /// Not currently the control leader, or a completed tick that
+    /// reclaimed nothing and has no live row waiting on retention either.
+    #[default]
+    Idle,
+    /// Phase 1a: scanning `Metadata::stream_shards` for rows due for
+    /// expiry (past retention, or their whole table dropped).
+    Listing,
+    /// A completed tick found at least one live row, but none of them are
+    /// due yet and nothing else needed reclaiming this tick — a genuine
+    /// steady state, distinct from `Idle`'s "nothing exists at all."
+    WaitingRetention,
+    /// Phase 1b: deleting objects for already-marked (expired) rows, then
+    /// physically removing whichever ones are now fully reclaimed.
+    Deleting,
+    /// Phase 3: sweeping proven-orphan segment objects ([`reap_orphans`]).
+    Sweeping,
+}
+
+/// A snapshot of the segment janitor's own progress (roadmap U-07) — see
+/// the "Progress reporting" section of the module doc for how this is
+/// published and what each counter means. Every counter is cumulative
+/// (never reset) for as long as the host process lives; `Default` is the
+/// correct initial state for a node that has never (yet) been the control
+/// leader.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SegmentJanitorProgress {
+    /// This tick's phase — see [`SegmentJanitorPhase`].
+    pub(crate) phase: SegmentJanitorPhase,
+    /// `env.now()` at the start of this loop's most recently observed
+    /// tick, in milliseconds — `None` before the first tick has ever run
+    /// (or on a node that has never been the control leader).
+    pub(crate) last_tick_at_ms: Option<u64>,
+    /// Cumulative count of segment objects this janitor has examined as
+    /// cleanup candidates (expired-row objects in phase 1b, plus proven-
+    /// orphan candidates in phase 3) across every tick since this node
+    /// became control leader.
+    pub(crate) orphans_seen_total: u64,
+    /// Cumulative count of segment objects this janitor has actually
+    /// deleted (phase 1b + phase 3 combined) across every tick since this
+    /// node became control leader.
+    pub(crate) orphans_deleted_total: u64,
+    /// Segment objects deleted on the most recently completed tick
+    /// (phase 1b + phase 3 combined).
+    pub(crate) deleted_last_tick: u64,
+    /// Count of live (unexpired) `stream_shards` rows still waiting on
+    /// retention as of the most recently completed tick — due eventually,
+    /// not yet.
+    pub(crate) pending_orphans: u64,
+    /// This loop's own configured retention window, in milliseconds — the
+    /// `retention` parameter `segment_janitor_loop` was started with.
+    pub(crate) retention_ms: u64,
+    /// The most recent object list/delete error observed, if any — cleared
+    /// once a full tick completes with no error.
+    pub(crate) last_error: Option<String>,
+}
+
+/// Apply `f` to the shared [`SegmentJanitorProgress`] under a short-held
+/// lock — the same short lock/mutate/drop shape every other shared
+/// diagnostic slot in this crate uses (`metrics_history`, `backup_
+/// janitor_progress`, `ttl_reaper_progress`), simplified to a plain
+/// `FnOnce` since, unlike those two, this loop already holds a real
+/// `&ClientCtx` and needs no cross-crate capability trait to reach it.
+fn update_segment_janitor_progress(ctx: &ClientCtx, f: impl FnOnce(&mut SegmentJanitorProgress)) {
+    let mut guard = ctx.segment_janitor_progress.lock().unwrap();
+    f(&mut guard);
+}
+
 /// The control-plane-leader-only background loop (ADR 0043 §A9) — see the
 /// module doc for who spawns this, why it self-gates every tick rather than
 /// being spawned only on whichever node happens to lead right now, and the
 /// documented control-only-leader scope gap.
 pub(crate) async fn segment_janitor_loop(ctx: ClientCtx, retention: Duration) {
+    let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     loop {
         tokio::time::sleep(SEGMENT_JANITOR_INTERVAL).await;
         let Some(leader) = ctx.edge.leader_handle() else {
+            // Not (or no longer) the control leader — report idle rather
+            // than leaving a stale, possibly-mid-tick phase behind (the
+            // same rationale `backup_janitor_loop`'s own not-leader arm
+            // uses).
+            let now_ms = ctx.env.now().0 / 1_000_000;
+            update_segment_janitor_progress(&ctx, |p| {
+                p.phase = SegmentJanitorPhase::Idle;
+                p.last_tick_at_ms = Some(now_ms);
+                p.retention_ms = retention_ms;
+            });
             continue;
         };
         segment_janitor_tick(&ctx, &leader, retention).await;
@@ -160,6 +280,12 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
     let now_ms = ctx.env.now().0 / 1_000_000;
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let metrics = ctx.env.metrics();
+
+    update_segment_janitor_progress(ctx, |p| {
+        p.phase = SegmentJanitorPhase::Listing;
+        p.last_tick_at_ms = Some(now_ms);
+        p.retention_ms = retention_ms;
+    });
 
     // --- Phase 1a: mark every due row (age past retention, or its whole
     // table has been dropped — the drop-table retention-zero rule) --------
@@ -184,20 +310,29 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
     }
     metrics.set(Metric::StreamSegmentsLive, live_count);
     metrics.set(Metric::StreamRepairBacklog, under_replicated);
+    let pending_orphans = live_count.saturating_sub(to_mark.len() as u64);
     if !to_mark.is_empty() {
         let _ = leader.propose(MetaCommand::ExpireStreamShards {
             rows: to_mark,
             remove: false,
         });
     }
+    update_segment_janitor_progress(ctx, |p| {
+        p.phase = SegmentJanitorPhase::Deleting;
+        p.pending_orphans = pending_orphans;
+    });
 
     // --- Phase 1b: delete objects for every already-marked row, then
     // physically remove whichever ones are now fully reclaimed -------------
     let mut removed: Vec<(TabletId, u64)> = Vec::new();
+    let mut tick_error: Option<String> = None;
+    let mut objects_deleted_this_tick: u64 = 0;
+    let mut expired_seen_this_tick: u64 = 0;
     for ((tablet, epoch), row) in meta.stream_shards.iter() {
         if !row.expired {
             continue;
         }
+        expired_seen_this_tick += 1;
         // **Epoch-derivation guard**: `index_drain::seal_now`'s own `next_
         // epoch` (and `dynamo_streams::current_open_epoch`) derive a
         // tablet's next/current epoch from its own chain's highest-numbered
@@ -245,14 +380,20 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
             // "nothing to delete." `ctx.segment_store` is provisioned on
             // every node shape, including a control-only leader (W-10).
             match ctx.segment_store.delete_sealed(&[], seg_id).await {
-                Ok(()) if may_remove_row => removed.push((*tablet, *epoch)),
-                Ok(()) => {}
-                Err(e) => tracing::warn!(
-                    tablet = tablet.0,
-                    epoch,
-                    error = %e,
-                    "segment janitor: fs-mode object delete failed, retrying next tick"
-                ),
+                Ok(()) if may_remove_row => {
+                    removed.push((*tablet, *epoch));
+                    objects_deleted_this_tick += 1;
+                }
+                Ok(()) => objects_deleted_this_tick += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        epoch,
+                        error = %e,
+                        "segment janitor: fs-mode object delete failed, retrying next tick"
+                    );
+                    tick_error = Some(e.to_string());
+                }
             }
             continue;
         }
@@ -276,14 +417,20 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
             .delete_sealed(&still_present, seg_id)
             .await
         {
-            Ok(()) if may_remove_row => removed.push((*tablet, *epoch)),
-            Ok(()) => {}
-            Err(e) => tracing::warn!(
-                tablet = tablet.0,
-                epoch,
-                error = %e,
-                "segment janitor: object delete failed, retrying next tick"
-            ),
+            Ok(()) if may_remove_row => {
+                removed.push((*tablet, *epoch));
+                objects_deleted_this_tick += 1;
+            }
+            Ok(()) => objects_deleted_this_tick += 1,
+            Err(e) => {
+                tracing::warn!(
+                    tablet = tablet.0,
+                    epoch,
+                    error = %e,
+                    "segment janitor: object delete failed, retrying next tick"
+                );
+                tick_error = Some(e.to_string());
+            }
         }
     }
     if !removed.is_empty() {
@@ -385,7 +532,27 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
     }
 
     // --- Phase 3: orphan reap (ledger-named-object amendment) ------------
-    reap_orphans(&ctx.segment_store, &meta, now_ms).await;
+    update_segment_janitor_progress(ctx, |p| {
+        p.phase = SegmentJanitorPhase::Sweeping;
+    });
+    let (orphans_seen_this_tick, orphans_deleted_this_tick, orphan_error) =
+        reap_orphans(&ctx.segment_store, &meta, now_ms).await;
+
+    let deleted_last_tick = objects_deleted_this_tick + orphans_deleted_this_tick;
+    let seen_this_tick = expired_seen_this_tick + orphans_seen_this_tick;
+    let final_error = orphan_error.or(tick_error);
+    let final_phase = if deleted_last_tick == 0 && pending_orphans > 0 {
+        SegmentJanitorPhase::WaitingRetention
+    } else {
+        SegmentJanitorPhase::Idle
+    };
+    update_segment_janitor_progress(ctx, |p| {
+        p.phase = final_phase;
+        p.deleted_last_tick = deleted_last_tick;
+        p.orphans_seen_total = p.orphans_seen_total.saturating_add(seen_this_tick);
+        p.orphans_deleted_total = p.orphans_deleted_total.saturating_add(deleted_last_tick);
+        p.last_error = final_error;
+    });
 }
 
 /// Phase 3: orphan reap (ADR 0042 §10/ADR 0043 §A3 as-built amendment) — a
@@ -420,7 +587,23 @@ async fn segment_janitor_tick(ctx: &ClientCtx, leader: &RaftNode<ProdEnv>, reten
 /// call only discovers this node's own local segment directory. See the
 /// module doc's own note on why this converges eventually rather than
 /// immediately.
-async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms: u64) {
+///
+/// Returns `(seen, deleted, last_error)` (roadmap U-07) — `seen` counts
+/// every proven-orphan candidate examined across both sub-cases below
+/// (case (a)'s every non-winning object, case (b)'s every successfully
+/// decoded candidate regardless of whether it cleared the grace window
+/// yet); `deleted` counts how many were actually removed; `last_error` is
+/// the most recent list/fetch/delete failure observed this call, if any —
+/// fed into [`SegmentJanitorProgress::last_error`] by the caller.
+async fn reap_orphans(
+    store: &crate::SegmentStoreHandle,
+    meta: &Metadata,
+    now_ms: u64,
+) -> (u64, u64, Option<String>) {
+    let mut seen: u64 = 0;
+    let mut deleted: u64 = 0;
+    let mut last_error: Option<String> = None;
+
     // (a) Sealed epochs: every non-winning object at the shard's own
     // prefix is a proven orphan.
     for ((tablet, epoch), row) in meta.stream_shards.iter() {
@@ -434,6 +617,7 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
                     error = %e,
                     "segment janitor: orphan sweep list failed (sealed epoch), retrying next tick"
                 );
+                last_error = Some(e.to_string());
                 continue;
             }
         };
@@ -441,12 +625,17 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
             if id == row.object_id {
                 continue; // the winning object itself
             }
-            if let Err(e) = store.delete_local(&id).await {
-                tracing::warn!(
-                    id = %id,
-                    error = %e,
-                    "segment janitor: sealed-epoch orphan delete failed, retrying next tick"
-                );
+            seen += 1;
+            match store.delete_local(&id).await {
+                Ok(()) => deleted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        id = %id,
+                        error = %e,
+                        "segment janitor: sealed-epoch orphan delete failed, retrying next tick"
+                    );
+                    last_error = Some(e.to_string());
+                }
             }
         }
     }
@@ -480,6 +669,7 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
                     error = %e,
                     "segment janitor: orphan sweep list failed (open epoch), retrying next tick"
                 );
+                last_error = Some(e.to_string());
                 continue;
             }
         };
@@ -489,6 +679,7 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
                 Ok(None) => continue, // raced its own delete elsewhere; fine
                 Err(e) => {
                     tracing::warn!(id = %id, error = %e, "segment janitor: orphan fetch failed, retrying next tick");
+                    last_error = Some(e.to_string());
                     continue;
                 }
             };
@@ -498,14 +689,21 @@ async fn reap_orphans(store: &crate::SegmentStoreHandle, meta: &Metadata, now_ms
                 // is one of this subsystem's own abandoned attempts.
                 continue;
             };
+            seen += 1;
             let age_ms = now_ms.saturating_sub(decoded.header.seal_wall_ms);
-            if age_ms >= u64::try_from(ORPHAN_GRACE.as_millis()).unwrap_or(u64::MAX)
-                && let Err(e) = store.delete_local(&id).await
-            {
-                tracing::warn!(id = %id, error = %e, "segment janitor: open-epoch orphan delete failed, retrying next tick");
+            if age_ms >= u64::try_from(ORPHAN_GRACE.as_millis()).unwrap_or(u64::MAX) {
+                match store.delete_local(&id).await {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        tracing::warn!(id = %id, error = %e, "segment janitor: open-epoch orphan delete failed, retrying next tick");
+                        last_error = Some(e.to_string());
+                    }
+                }
             }
         }
     }
+
+    (seen, deleted, last_error)
 }
 
 /// `node` is a current, `Active` cluster member.
@@ -617,7 +815,13 @@ mod orphan_reap_tests {
 
         // `now_ms` is deliberately tiny (younger than any real grace
         // window) — the sealed-epoch sub-case must reap regardless.
-        reap_orphans(&store, &meta, 1_500).await;
+        let (seen, deleted, last_error) = reap_orphans(&store, &meta, 1_500).await;
+        assert_eq!(seen, 1, "one non-winning candidate examined (roadmap U-07)");
+        assert_eq!(
+            deleted, 1,
+            "that one candidate was actually reaped (roadmap U-07)"
+        );
+        assert_eq!(last_error, None, "no error on a clean reap (roadmap U-07)");
 
         assert_eq!(
             store.get_local(&winner_id).await.expect("get winner"),
@@ -675,7 +879,13 @@ mod orphan_reap_tests {
             .await
             .expect("put old");
 
-        reap_orphans(&store, &meta, now_ms).await;
+        let (seen, deleted, last_error) = reap_orphans(&store, &meta, now_ms).await;
+        assert_eq!(seen, 2, "both candidates examined (roadmap U-07)");
+        assert_eq!(
+            deleted, 1,
+            "only the past-grace one is reaped (roadmap U-07)"
+        );
+        assert_eq!(last_error, None, "no error on a clean reap (roadmap U-07)");
 
         assert_eq!(
             store.get_local(&young_id).await.expect("get young"),

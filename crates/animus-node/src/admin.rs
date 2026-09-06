@@ -75,6 +75,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/credentials/revoke") => host.action_revoke_credential(body).await,
         ("GET", "/admin/backup-store") => (200, host.backup_store_view().await),
         ("GET", "/admin/ttl") => (200, host.ttl_view().await),
+        ("GET", "/admin/gc") => (200, host.gc_view().await),
         // A known admin path with the wrong verb vs. an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => (
             404,
@@ -273,6 +274,9 @@ mod tests {
         async fn ttl_view(&self) -> Value {
             self.record()
         }
+        async fn gc_view(&self) -> Value {
+            self.record()
+        }
     }
 
     #[test]
@@ -354,6 +358,15 @@ mod tests {
     fn get_admin_ttl_routes_to_ttl_view() {
         let host = FakeHost::new();
         let (status, body) = block_on(dispatch(&host, "GET", "/admin/ttl", "", b""));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"marker\""));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn get_admin_gc_routes_to_gc_view() {
+        let host = FakeHost::new();
+        let (status, body) = block_on(dispatch(&host, "GET", "/admin/gc", "", b""));
         assert_eq!(status, 200);
         assert!(body.contains("\"marker\""));
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);

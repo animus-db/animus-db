@@ -1188,6 +1188,71 @@ async fn dashboard_u07_ttl_reaper_card() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-07 (third route): the Storage tab's "GC (stream
+/// segment janitor)" card, fed from `STATE.gc` — same render-only-markers-
+/// plus-live-round-trip structure as `dashboard_u07_backup_store_card`
+/// above. Like that route (and unlike `/admin/ttl` just above), the
+/// segment janitor is control-plane-leader-only, so this card is fed from
+/// `dashboard_core.js`'s existing single SEED-only fetch, not a per-node
+/// fan-out. The actual janitor mechanics have their own coverage
+/// (`admin_endpoint.rs`'s
+/// `admin_gc_reports_segment_janitor_progress_and_leader_state`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u07_gc_card() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new card beside the TTL reaper card -----
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="gc-card""#) && shell.contains(r#"id="gc-body""#),
+            "the shell carries the GC card: {shell}"
+        );
+
+        // ---- dashboard_storage.js renders it from the route's own shape ----
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        assert!(
+            storage_js.contains("function renderGcJanitor"),
+            "dashboard_storage.js renders the GC card: {storage_js}"
+        );
+        assert!(
+            storage_js.contains("STATE.gc")
+                && storage_js.contains("gc.janitor")
+                && storage_js.contains("gc.leader"),
+            "the card reads every field GET /admin/gc serves: {storage_js}"
+        );
+
+        // ---- dashboard_core.js fetches it alongside /admin/backup-store, not
+        //      a per-node fan-out (the janitor only ever runs on the control
+        //      leader; a follower's own answer is honestly idle) -----------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains(r#"getJSON(SEED, "/admin/gc")"#),
+            "dashboard_core.js fetches the route once against SEED: {core_js}"
+        );
+
+        // ---- the route itself serves from a live node -----------------------
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc: {body}");
+        let v: Value = serde_json::from_str(&body).expect("gc view is JSON");
+        assert!(v.get("janitor").is_some(), "carries \"janitor\": {body}");
+        assert!(
+            v.get("leader").and_then(Value::as_bool).is_some(),
+            "carries a boolean \"leader\": {body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
 /// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
 /// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The

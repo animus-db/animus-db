@@ -3765,6 +3765,9 @@ fn spawn_common_tail(
         ttl_reaper_progress: Arc::new(Mutex::new(
             animus_node::ttl_reaper::TtlReaperProgress::default(),
         )),
+        segment_janitor_progress: Arc::new(Mutex::new(
+            segment_janitor::SegmentJanitorProgress::default(),
+        )),
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -7949,6 +7952,25 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// precedent: every access is a short lock/mutate/drop, never held
     /// across an `.await`.
     pub(crate) ttl_reaper_progress: Arc<Mutex<animus_node::ttl_reaper::TtlReaperProgress>>,
+    /// The DynamoDB Streams segment janitor's own live progress (roadmap
+    /// U-07, ADR 0042 §10/ADR 0043 §A9) — `segment_janitor::
+    /// segment_janitor_loop`/`segment_janitor_tick` mutate this directly
+    /// at each phase transition; `GET /admin/gc` reads it back out.
+    /// **Unlike `backup_janitor_progress`/`ttl_reaper_progress` above, no
+    /// capability trait sits between the loop and this field** —
+    /// `segment_janitor.rs` never moved to `animus-node` (see that crate's
+    /// own `CLAUDE.md`, rung C2's "segment_janitor did NOT move" entry:
+    /// its replica-repair phase is real placement/membership
+    /// orchestration, not a value one narrow capability method can
+    /// capture), so the loop already holds a genuine `&ClientCtx` and
+    /// mutates this `Mutex` directly. **Provisioned on every node shape**,
+    /// mirroring `backup_janitor_progress`'s own rationale — the janitor,
+    /// like the backup janitor, only ever runs while this node believes it
+    /// leads the control plane, so a non-leader's copy simply stays at its
+    /// default `Idle` state forever. Plain `std::sync::Mutex`, matching
+    /// `metrics_history`'s own precedent: every access is a short
+    /// lock/mutate/drop, never held across an `.await`.
+    pub(crate) segment_janitor_progress: Arc<Mutex<segment_janitor::SegmentJanitorProgress>>,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -15566,6 +15588,9 @@ mod simenv_client_ctx_tests {
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
@@ -15916,6 +15941,9 @@ mod two_node_relay_tests {
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
             // Node A never forwards outward in this test — empty routes.
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
@@ -15981,6 +16009,9 @@ mod two_node_relay_tests {
             )),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
             )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(intra_route_b)),

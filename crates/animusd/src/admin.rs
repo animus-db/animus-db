@@ -535,6 +535,9 @@ impl AdminHost for ClientCtx {
     async fn ttl_view(&self) -> Value {
         ttl_view(self)
     }
+    async fn gc_view(&self) -> Value {
+        gc_view(self)
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
@@ -1638,6 +1641,45 @@ fn ttl_view(ctx: &ClientCtx) -> Value {
         "reaper": reaper,
         "tables": tables,
         "leader_tablets": leader_tablets,
+    })
+}
+
+/// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07) — the third of
+/// U-07's four observability routes, copying `backup_store_view`'s own
+/// template above: the DynamoDB Streams **segment janitor**
+/// (`segment_janitor::segment_janitor_loop`) is control-plane-**leader**-
+/// only, exactly like the backup janitor, so this route's own `leader`
+/// field and a follower's honestly-`idle` `janitor` field mean the same
+/// thing here as they do on `/admin/backup-store` — see the lesson recorded
+/// in `docs/engineering-lessons.md` on why this route therefore copies that
+/// route's single-fetch dashboard shape rather than `/admin/ttl`'s
+/// per-node fan-out.
+///
+/// `janitor` is the live `segment_janitor::SegmentJanitorProgress` snapshot
+/// (`ClientCtx::segment_janitor_progress`) — see that type's own doc for
+/// what each phase/counter means; unlike the backup-store and TTL routes,
+/// this progress type lives entirely in `animusd` (`segment_janitor.rs`
+/// never moved to `animus-node`, see that crate's own `CLAUDE.md`), so
+/// there is no capability trait between the loop and this field.
+///
+/// **`dropped_tables_pending` is deliberately omitted**: `MetaCommand::
+/// DropTableTablets` removes a table's tablet rows from the replicated
+/// catalog *synchronously*, at apply time — there is no durable "dropped
+/// table tombstone" row anywhere in `Metadata` for this route to count.
+/// What genuinely stays pending after a drop is each node's own *local*
+/// on-disk reclaim of that tablet's now-orphaned engine files, tracked only
+/// as an ephemeral, per-node diff the tablet-host reconciler (ADR 0024,
+/// `animus_cp_data::host::plan`) recomputes fresh every tick from live
+/// hosted-vs-catalog state — not a replicated count this route (or any
+/// single node) can answer cheaply without a local filesystem scan across
+/// every node in the cluster. See ADR 0024's own doc for that mechanism;
+/// it is a different subsystem from the segment janitor this route
+/// reports on, despite both being colloquially "garbage collection."
+fn gc_view(ctx: &ClientCtx) -> Value {
+    let janitor = ctx.segment_janitor_progress.lock().unwrap().clone();
+    json!({
+        "janitor": janitor,
+        "leader": ctx.control.is_leader(),
     })
 }
 

@@ -273,6 +273,80 @@ async fn bring_up_with_fast_ttl(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up`], but with DynamoDB Streams enabled and a **generous**
+/// `stream_retention` (roadmap U-07's `admin_gc_reports_segment_janitor_
+/// progress_and_leader_state` needs to prove the segment janitor's own
+/// drop-table cascade — `segment_janitor.rs`'s own "table_dropped" rule,
+/// which reclaims a dropped table's stream-shard rows immediately,
+/// regardless of retention — the same shape `tests/stream_janitor.rs::
+/// drop_table_cascade_converges_via_the_janitor` uses a 600s retention for:
+/// if this test ever passed only because retention itself elapsed rather
+/// than the drop-table rule, a short retention would let it pass for the
+/// wrong reason). Seals almost immediately on any pending byte
+/// (`seal_bytes: 1`, mirroring `tests/stream_janitor.rs::tiny_seal_knobs`)
+/// so a single write reliably produces a sealed shard row for the janitor
+/// to later reclaim.
+async fn bring_up_with_streams(
+    n: usize,
+    dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs {
+                    seal_bytes: 1,
+                    seal_age: Duration::from_secs(3600),
+                },
+                animusd::SegmentStoreConfig::default(),
+                Duration::from_secs(600),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -2483,6 +2557,160 @@ async fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
         })
         .await
         .expect("no node's TTL reaper ever reported a delete within 20s");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07): a real 3-node
+/// cluster with DynamoDB Streams enabled and a generous retention (600s —
+/// see [`bring_up_with_streams`]'s own doc for why: this test's own
+/// reclaim must be driven by the segment janitor's drop-table cascade, not
+/// by retention itself elapsing, or a passing run would prove nothing).
+/// Creates a streamed table, writes one item, waits for it to seal, drops
+/// the table (the janitor's own "table_dropped" rule reclaims a dropped
+/// table's stream-shard rows immediately, regardless of retention — the
+/// same mechanism `tests/stream_janitor.rs::
+/// drop_table_cascade_converges_via_the_janitor` exercises), then polls
+/// converged-or-timeout until the control-plane leader's own route shows
+/// `orphans_deleted_total >= 1`. A follower reports `leader: false` and
+/// stays `idle` throughout, mirroring `admin_backup_store_reports_
+/// reclaim_progress_and_leader_state`'s own follower assertion — this
+/// janitor is control-plane-leader-only exactly like the backup janitor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_gc_reports_segment_janitor_progress_and_leader_state() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let leader_addr = nodes[leader_idx].admin_addr();
+        let follower_addr = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| n.admin_addr())
+            .expect("a follower exists in a 3-node cluster");
+
+        // ---- baseline: an unconfigured/no-drops-yet leader is honestly
+        //      idle, and reports itself the control leader -----------------
+        let (s, baseline) = admin_get(leader_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on the leader: {baseline}");
+        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
+        assert!(
+            baseline["janitor"]["phase"].is_string(),
+            "janitor.phase is always present: {baseline}"
+        );
+
+        // ---- a follower never runs the janitor, and says so ----------------
+        let (s, follower_view) = admin_get(follower_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_view}");
+        assert_eq!(
+            follower_view["leader"], false,
+            "a follower reports leader: false: {follower_view}"
+        );
+        assert_eq!(
+            follower_view["janitor"]["phase"], "idle",
+            "a follower's own janitor never advances past idle: {follower_view}"
+        );
+
+        // ---- create a streamed table and write one item through the admin
+        //      dynamo proxy on any node (it forwards internally) ------------
+        let any_addr = nodes[0].admin_addr();
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- wait for the write to seal into a catalog row (seal_bytes: 1
+        //      means this should be near-immediate) ---------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if !nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no sealed stream-shard row appeared within 20s");
+        assert!(
+            !nodes[leader_idx].metadata().stream_shards.is_empty(),
+            "test premise: at least one live catalog row exists before the drop"
+        );
+
+        // ---- drop the table: the janitor's own drop-table rule reclaims
+        //      its stream-shard row(s) immediately, regardless of retention --
+        let (s, drop_body) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/drop-table",
+            Some(r#"{"table":"t"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "drop-table: {drop_body}");
+
+        // ---- poll converged-or-timeout: the leader's own route shows the
+        //      janitor has actually deleted at least one segment object -----
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, v) = admin_get(leader_addr, "/admin/gc").await;
+                assert_eq!(s, 200, "GET /admin/gc: {v}");
+                if v["janitor"]["orphans_deleted_total"].as_u64().unwrap_or(0) >= 1 {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "the control leader's own /admin/gc never reported orphans_deleted_total >= 1 \
+             within 20s",
+        );
+
+        // ---- and the dropped table's own catalog rows are actually gone,
+        //      the same convergence `tests/stream_janitor.rs`'s own
+        //      drop-table-cascade test asserts -------------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stream-shard catalog rows were never cleared after the table drop");
+
+        // ---- a follower still reports leader: false throughout -------------
+        let (s, follower_after) = admin_get(follower_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_after}");
+        assert_eq!(
+            follower_after["leader"], false,
+            "a follower still reports leader: false after the drop: {follower_after}"
+        );
 
         for node in &nodes {
             node.shutdown_graceful().await;

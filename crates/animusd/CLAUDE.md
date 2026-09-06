@@ -724,6 +724,52 @@ reusing the captured config is the point of the test.
   the control-only trio) reclaims a sealed stream's segment objects,
   including the physical on-disk delete at every recorded (data-only)
   replica.
+  **Publishes its own progress (roadmap U-07)**: `segment_janitor_loop`/
+  `segment_janitor_tick` publish a small `SegmentJanitorProgress` (phase —
+  `idle`/`listing`/`waiting_retention`/`deleting`/`sweeping`, mirroring
+  this loop's own phase-1a-scan/phase-1b-delete/phase-3-orphan-reap
+  structure (phase 2's replica repair publishes no phase of its own — it
+  already has `/admin/metrics`' own `stream_repairs_total`/`stream_
+  repair_backlog`) — plus `last_tick_at_ms`, cumulative
+  `orphans_seen_total`/`orphans_deleted_total` (both cleanup paths
+  combined: phase 1b's expired-row object deletes, including a dropped
+  table's own immediately-due rows, and phase 3's proven-orphan deletes —
+  one "objects reclaimed because nothing references them any more" total),
+  `deleted_last_tick`, `pending_orphans` (live rows still awaiting
+  retention), `retention_ms`, and `last_error`) at each phase transition,
+  directly into `ClientCtx::segment_janitor_progress: Arc<std::sync::
+  Mutex<SegmentJanitorProgress>>`. **No capability trait sits between the
+  loop and this field** — unlike the backup janitor/TTL reaper (below),
+  `segment_janitor.rs` never moved to `animus-node` (see that crate's own
+  `CLAUDE.md`, rung C2's "segment_janitor did NOT move" entry), so the
+  loop already holds a genuine `&ClientCtx` to mutate directly.
+  `reap_orphans` (phase 3) now returns `(seen, deleted, last_error)`
+  instead of nothing, feeding the counters above; its own in-crate
+  regression tests (`orphan_reap_tests`) were extended to assert on these
+  counts. `GET /admin/gc` (`admin.rs::gc_view`) reports
+  `{janitor: SegmentJanitorProgress, leader: bool}` — `dropped_tables_
+  pending` was deliberately NOT added: `DropTableTablets` removes a
+  table's tablet rows from `Metadata` synchronously at apply time (ADR
+  0024), so there is no durable "dropped table tombstone" anywhere in the
+  replicated catalog for a route to count; what stays pending is each
+  node's own local on-disk reclaim, a per-node diff the tablet-host
+  reconciler recomputes fresh every tick — not something a single node can
+  answer cheaply without a filesystem scan across the whole cluster. A
+  non-leader's own progress simply stays `idle` forever, since the loop
+  only ever advances it while `ctx.edge.leader_handle()` answers `Some` —
+  an honest answer, not a gap. Renders on the Storage tab beside the TTL
+  reaper card (`dashboard_storage.js`'s "GC (stream segment janitor)"
+  card, `#gc-card`/`#gc-body`, fed from `STATE.gc` — a single SEED-only
+  fetch like `/admin/backup-store`'s own card, since this janitor is
+  control-plane-leader-only too, never `/admin/ttl`'s per-node fan-out).
+  Regression: `tests/admin_endpoint.rs::
+  admin_gc_reports_segment_janitor_progress_and_leader_state` (a real
+  3-node streamed cluster with a generous 600s retention — proving the
+  test's own reclaim is driven by the janitor's drop-table cascade, not
+  retention elapsing — create a streamed table, write, seal, drop the
+  table, poll converged-or-timeout until the leader's own route shows
+  `orphans_deleted_total >= 1`; a follower stays `leader: false`/`idle`
+  throughout) and `tests/dashboard_endpoint.rs::dashboard_u07_gc_card`.
 - **`index_backfill.rs`'s loop body moved to `animus_node::
   index_backfill`** (ADR 0061 rung C2 — the first loop moved, and the only
   one needing no capability beyond `ControlLeaderHost<E>`: `metadata()`/

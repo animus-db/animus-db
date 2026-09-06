@@ -568,6 +568,25 @@ sub-rungs below shipped.
   `tests/ttl_reaper_sim.rs`'s existing synthetic `FakeTtlHost` gained the
   new trait impl plus progress assertions on its existing scenarios.
 
+  **`AdminHost` gained a seventh method, `gc_view`, for roadmap U-07's
+  third route (2026-09-06)**: `GET /admin/gc` — added the identical way
+  again (`impl AdminHost for ClientCtx` in `animusd::admin` delegates to
+  that file's own `gc_view` function); `admin::tests::FakeHost` and
+  `dispatch`'s routing table both needed the one new arm too. **This is
+  the one route so far with no matching capability trait added here at
+  all** — the segment janitor it reports on
+  (`animusd::segment_janitor.rs`) never moved to this crate in rung C2
+  (see that rung's own "segment_janitor did NOT move" entry, above): its
+  replica-repair phase is real placement/membership orchestration, not a
+  value one narrow capability method can capture. Its new progress type,
+  `animusd::segment_janitor::SegmentJanitorProgress`, is therefore an
+  `animusd`-local type this crate never names — the loop already holds a
+  genuine `&ClientCtx` (it always did; it never left `animusd`) and
+  mutates `ClientCtx::segment_janitor_progress` directly, so there was
+  nothing for a `BackupJanitorProgressHost`-shaped trait to buy here.
+  `gc_view` itself is otherwise identical in shape to `backup_store_view`/
+  `ttl_view`: one method, returning the exact `Value` the route produces.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an

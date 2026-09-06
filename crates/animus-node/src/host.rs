@@ -406,4 +406,19 @@ pub trait AdminHost: Send + Sync {
     /// (`{name, attribute, enabled}`), and how many tablets this node
     /// currently leads of a TTL-enabled table.
     async fn ttl_view(&self) -> Value;
+    /// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07) — the
+    /// third of U-07's four observability routes: the DynamoDB Streams
+    /// **segment janitor**'s own live phase/counters (a control-plane-
+    /// leader-only loop, exactly like the backup janitor above — a
+    /// follower's own view simply stays `idle` forever) plus whether this
+    /// node currently believes it is the control-plane leader. Unlike
+    /// `backup_store_view`/`ttl_view`, the janitor's own progress type
+    /// (`animusd::segment_janitor::SegmentJanitorProgress`) lives entirely
+    /// in `animusd` — `segment_janitor.rs` never moved to this crate
+    /// (see this crate's own `CLAUDE.md`, rung C2's "segment_janitor did
+    /// NOT move" entry: its replica-repair phase is real placement/
+    /// membership orchestration, not a value one narrow capability method
+    /// can capture), so there is no new type to name here at all, only
+    /// this one more `Value`-returning route method.
+    async fn gc_view(&self) -> Value;
 }

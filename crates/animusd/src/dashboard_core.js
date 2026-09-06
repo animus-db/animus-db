@@ -14,7 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // State assembled each refresh.
-let STATE = { status: null, backups: null, restores: null, backupStore: null, nodes: [], peersErr: null };
+let STATE = { status: null, backups: null, restores: null, backupStore: null, gc: null, nodes: [], peersErr: null };
 
 // ---- this node's own role (ADR 0035 PR7) ----
 // `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
@@ -530,6 +530,15 @@ async function loadAll() {
   // with a fan-out).
   let backupStore = null;
   try { backupStore = await getJSON(SEED, "/admin/backup-store"); } catch (e) { /* shown per-panel */ }
+  // `/admin/gc` (docs/roadmap.md U-07): the DynamoDB Streams segment
+  // janitor's own orphan-sweep phase/counters — control-plane-leader-only
+  // exactly like `backup-store` above, so this is a single fetch against
+  // SEED, never a per-node fan-out (see docs/engineering-lessons.md: a
+  // card's fetch shape must match its route's OWN gating, not whichever
+  // shape the most recently added similar route happens to use — this
+  // route is gated like backup-store, not like ttl).
+  let gc = null;
+  try { gc = await getJSON(SEED, "/admin/gc"); } catch (e) { /* shown per-panel */ }
 
   const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
     : [SEED.replace(/^https?:\/\//, "")];
@@ -577,7 +586,7 @@ async function loadAll() {
     return node;
   }));
 
-  STATE = { status, backups, restores, backupStore, nodes, peersErr: STATE.peersErr };
+  STATE = { status, backups, restores, backupStore, gc, nodes, peersErr: STATE.peersErr };
   render();
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }

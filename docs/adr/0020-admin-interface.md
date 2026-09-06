@@ -553,6 +553,89 @@ tablets still answers its own honest counters rather than erroring),
 `animus_node`'s `tests/ttl_reaper_sim.rs` (extended with progress
 assertions on the existing `SimEnv`-driven reap/no-op scenarios).
 
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/gc`
+
+The third of U-07's four observability routes, copying `/admin/backup-
+store`'s own template again: the DynamoDB Streams **segment janitor**
+(ADR 0042 §10/ADR 0043 §A9, `crates/animusd/src/segment_janitor.rs`) is
+control-plane-**leader**-only, exactly like the backup janitor — a
+follower's own `janitor` field simply stays `idle` forever, an honest
+answer rather than a gap — so this route reuses `/admin/backup-store`'s
+own single-fetch dashboard shape, not `/admin/ttl`'s per-node fan-out (see
+`docs/engineering-lessons.md`'s matching U-07 lesson: a card's fetch shape
+must match its route's own gating, not whichever shape the most recently
+added similar route happens to use).
+
+**Unlike `/admin/backup-store`/`/admin/ttl`, the progress type behind this
+route never left `animusd` at all** — `segment_janitor.rs` did not move to
+`animus-node` in ADR 0061's rung C2 (that crate's own `CLAUDE.md` has the
+reasoning: its replica-repair phase is real placement/membership
+orchestration, not a value one narrow capability method can capture), so
+`segment_janitor_loop`/`segment_janitor_tick` already hold a genuine
+`&ClientCtx` and mutate `ClientCtx::segment_janitor_progress` directly — no
+`BackupJanitorProgressHost`/`TtlReaperProgressHost`-shaped capability trait
+was needed. `animus_node::host::AdminHost` still gained one more method,
+`gc_view`, for the route dispatch itself (the identical "one method per
+route, returning the exact JSON the route produces" shape every other
+`AdminHost` method uses) — but it names no new type, since
+`SegmentJanitorProgress`/`SegmentJanitorPhase` are `animusd`-local.
+
+`GET /admin/gc` returns `{janitor: SegmentJanitorProgress, leader: bool}`.
+`janitor.phase` is one of `idle`/`listing`/`waiting_retention`/`deleting`/
+`sweeping`, reflecting the loop's real per-tick structure (phase 1a's scan
+for due rows, phase 1b's object-delete/row-removal sweep, phase 3's orphan
+reap — phase 2's replica repair publishes no phase of its own, since it
+already has independent counters on `/admin/metrics`,
+`stream_repairs_total`/`stream_repair_backlog`). `orphans_seen_total`/
+`orphans_deleted_total`/`deleted_last_tick` count every segment object this
+janitor has ever deleted across BOTH cleanup paths — phase 1b's
+expired-row object deletes (including a dropped table's own immediately-due
+rows) and phase 3's proven-orphan deletes — the general "objects reclaimed
+because nothing references them any more" total the route's own name
+promises, not narrowly phase 3's own `reap_orphans` sub-routine alone.
+`pending_orphans` counts live rows still waiting on retention;
+`retention_ms` is this loop's own configured retention window;
+`last_error` is the most recent list/delete failure, if any.
+
+**`dropped_tables_pending` (which the task considered) is deliberately
+omitted.** `MetaCommand::DropTableTablets` removes a table's tablet rows
+from the replicated catalog *synchronously*, at apply time (ADR 0024) —
+there is no durable "dropped table tombstone" row anywhere in `Metadata`
+for a route to count. What genuinely stays pending after a drop is each
+node's own *local* on-disk reclaim of that tablet's now-orphaned engine
+files, recomputed fresh every tick as an ephemeral per-node diff by the
+tablet-host reconciler (`animus_cp_data::host::plan`) — not a replicated
+count any single node can answer cheaply without a local filesystem scan
+across every node in the cluster. This is a different subsystem from the
+segment janitor this route reports on, despite both being colloquially
+"garbage collection" — see this file's own `gc_view` doc comment
+(`crates/animusd/src/admin.rs`) for the fuller account.
+
+Wired through the identical conventional stack `/admin/backup-store`/
+`/admin/ttl` established: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+gc_view` method (`crates/animus-node/src/host.rs`) and its `FakeHost`
+stub/dispatch test, a handler in `crates/animusd/src/admin.rs`, and
+`animus admin gc <admin-addr>` (`animus-cli`). Renders on the **Storage**
+tab (`dashboard_storage.js`'s new "GC (stream segment janitor)" card,
+`#gc-card`/`#gc-body`) beside the TTL reaper card — this janitor sweeps
+DynamoDB Streams segment objects/catalog rows (`stream_shards`,
+`SegmentStoreHandle`), a different store/subsystem from the on-demand
+backup store the Backups tab's own card covers, and "storage janitor
+diagnostics" is exactly the Storage tab's existing theme.
+
+Regression: `tests/admin_endpoint.rs::
+admin_gc_reports_segment_janitor_progress_and_leader_state` (a real 3-node
+cluster with DynamoDB Streams enabled and a generous 600s retention —
+proving the reclaim is driven by the janitor's drop-table cascade, not by
+retention itself elapsing — create a streamed table, write one item, wait
+for it to seal, drop the table, and poll converged-or-timeout until the
+control-plane leader's own route shows `orphans_deleted_total >= 1`; a
+follower reports `leader: false` and stays `idle` throughout),
+`tests/dashboard_endpoint.rs::dashboard_u07_gc_card`, and
+`segment_janitor::orphan_reap_tests`' own extended progress-count
+assertions.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.
