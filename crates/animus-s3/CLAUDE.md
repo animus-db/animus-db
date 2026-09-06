@@ -8,15 +8,22 @@ this crate.
 An S3 client for AnimusDB's own use — the client half of S-04's three-PR
 plan (`docs/roadmap.md` §2; design amendment in
 `docs/adr/0059-backup-restore.md`, "S-04: S3 `SegmentStore` backend —
-design," 2026-09-06). **This PR ships no `SegmentStore` and no `s3:` URI on
-any CLI flag** — nothing in `animusd` depends on this crate yet. It is a
-self-contained, independently testable building block: a pure AWS
+design," 2026-09-06, plus its "As-built: PR 2" amendment). This PR (PR 1)
+is a self-contained, independently testable building block: a pure AWS
 Signature Version 4 request signer, and a minimal `put`/`get`/`delete`/
-`head`/`list_objects_v2` client generic over an explicit transport seam. PR
-2 (not yet started) wraps `client::S3Client` in an `animus_env::
-SegmentStore` implementation and wires `s3:` onto `--segment-store`/
-`--backup-store`; PR 3 does the Kubernetes-operator egress/credential-secret
-side.
+`head`/`list_objects_v2` client generic over an explicit transport seam —
+it ships no `SegmentStore` and no `s3:` URI on any CLI flag itself. **PR 2
+is done**: `animus_env::S3SegmentStore<T: client::Transport>`
+(`crates/animus-env/src/s3_store.rs`) wraps `client::S3Client<T>` behind
+the `SegmentStore` trait, and `animusd`'s `main.rs` wires `s3://...` onto
+both `--segment-store`/`--backup-store` — see that crate's own `CLAUDE.md`
+entry and `crates/animusd/CLAUDE.md`'s S-04 entry for the full design.
+`animus-env` depends on this crate as a plain (non-`fake`, non-`prod`)
+optional dependency for `client::S3Client`/`Transport`/`sigv4::Credentials`
+alone, and — the first real downstream consumer of the `fake` feature
+described below — takes it as a `[dev-dependencies]` feature for its own
+`S3SegmentStore` contract test. PR 3 (not yet started) does the
+Kubernetes-operator egress/credential-secret side.
 
 ## Entry points
 
@@ -67,10 +74,11 @@ side.
   `rustls`/`tokio-rustls`/`rustls-pki-types`/`rustls-native-certs`/
   `tracing`, all `optional = true` and otherwise absent from the build.
 - **`fake`** (default off) — makes `crate::fake` available outside
-  `#[cfg(test)]` (e.g. a downstream crate's own contract test, once PR 2's
-  `SegmentStore` impl exists). Adds no dependency: everything `fake.rs`
-  needs (`async-trait`, `std::sync::Mutex`, `BTreeMap`) is already
-  unconditional.
+  `#[cfg(test)]`. **Consumed since PR 2** by `animus-env`'s own
+  `[dev-dependencies]` (`S3SegmentStore`'s contract test, `s3_store.rs`) —
+  the downstream contract test this bullet used to describe as a future
+  possibility. Adds no dependency: everything `fake.rs` needs
+  (`async-trait`, `std::sync::Mutex`, `BTreeMap`) is already unconditional.
 - Neither feature is required to use `sigv4`/`client`/`xml` — those three
   modules, and this crate's own default build, need nothing beyond
   `async-trait`/`thiserror`/`sha2`/`hmac`.

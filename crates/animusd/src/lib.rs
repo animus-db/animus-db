@@ -2492,6 +2492,19 @@ mod redact_store_location_tests {
     }
 }
 
+/// Strip a `scheme://` prefix off an `S3StoreConfig::endpoint` for display —
+/// `redact_store_location`'s own job is stripping userinfo/query, not a
+/// scheme, and an S3 store's `StoreView::path` is built as `s3://bucket[/
+/// prefix]@host` (never the endpoint's own `scheme://host` form) so the
+/// rendered location reads like every other store kind's plain
+/// `scheme://host/path` shape while never repeating the endpoint twice.
+fn s3_endpoint_host(endpoint: &str) -> &str {
+    endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, host)| host)
+        .trim_end_matches('/')
+}
+
 impl From<&SegmentStoreConfig> for StoreView {
     fn from(config: &SegmentStoreConfig) -> Self {
         match config {
@@ -2502,6 +2515,10 @@ impl From<&SegmentStoreConfig> for StoreView {
             SegmentStoreConfig::Fs(path) => StoreView {
                 kind: "fs",
                 path: Some(path.display().to_string()),
+            },
+            SegmentStoreConfig::S3(s3) => StoreView {
+                kind: "s3",
+                path: Some(s3_store_location(s3)),
             },
         }
     }
@@ -2518,7 +2535,84 @@ impl From<&BackupStoreConfig> for StoreView {
                 kind: "fs",
                 path: Some(path.display().to_string()),
             },
+            BackupStoreConfig::S3(s3) => StoreView {
+                kind: "s3",
+                path: Some(s3_store_location(s3)),
+            },
         }
+    }
+}
+
+/// `s3://bucket[/prefix]@host` — never a query string, never credentials
+/// (an [`S3StoreConfig`] carries a real [`animus_s3::sigv4::Credentials`],
+/// whose own `Debug` already redacts the secret, but this function never
+/// even reads that field). Passed through [`redact_store_location`] anyway
+/// at every call site, for the same belt-and-suspenders reason every other
+/// store kind's location string is (this string alone carries nothing to
+/// redact, but the call site doesn't need to special-case that).
+fn s3_store_location(s3: &S3StoreConfig) -> String {
+    let host = s3_endpoint_host(&s3.endpoint);
+    match &s3.prefix {
+        Some(prefix) => format!("s3://{}/{prefix}@{host}", s3.bucket),
+        None => format!("s3://{}@{host}", s3.bucket),
+    }
+}
+
+#[cfg(test)]
+mod s3_store_view_tests {
+    use super::{BackupStoreConfig, S3StoreConfig, SegmentStoreConfig, StoreView};
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            bucket: "my-bucket".to_string(),
+            prefix: Some("prefix".to_string()),
+            endpoint: "https://s3.example.com:9000".to_string(),
+            region: "us-west-2".to_string(),
+            insecure_http: false,
+            credentials: animus_s3::sigv4::Credentials::new("AKIDTEST", "supersecret"),
+        }
+    }
+
+    /// The load-bearing admin-surface assertion (roadmap S-04 PR 2): an
+    /// `S3`-configured store renders `"kind": "s3"` with a location string
+    /// that contains the bucket/prefix/host but never the credential —
+    /// checked against the raw rendered string, not just the parsed
+    /// `StoreView` struct, so a secret leaking through some other field
+    /// would still be caught (mirrors `admin_config_reports_auth_state_
+    /// and_never_serves_the_secret`'s own raw-body-string-search idiom).
+    #[test]
+    fn segment_store_s3_view_reports_kind_s3_with_a_redacted_location() {
+        let cfg = SegmentStoreConfig::S3(test_s3_config());
+        let view = StoreView::from(&cfg);
+        assert_eq!(view.kind, "s3");
+        let location = view.path.expect("s3 store has a location");
+        assert!(location.contains("my-bucket"), "{location}");
+        assert!(location.contains("prefix"), "{location}");
+        assert!(location.contains("s3.example.com"), "{location}");
+        assert!(!location.contains("supersecret"), "{location}");
+        assert!(!location.contains("AKIDTEST"), "{location}");
+    }
+
+    #[test]
+    fn backup_store_s3_view_reports_kind_s3_with_a_redacted_location() {
+        let cfg = BackupStoreConfig::S3(test_s3_config());
+        let view = StoreView::from(&cfg);
+        assert_eq!(view.kind, "s3");
+        let location = view.path.expect("s3 store has a location");
+        assert!(location.contains("my-bucket"), "{location}");
+        assert!(!location.contains("supersecret"), "{location}");
+        assert!(!location.contains("AKIDTEST"), "{location}");
+    }
+
+    #[test]
+    fn s3_store_location_with_no_prefix_omits_the_slash() {
+        let mut cfg = test_s3_config();
+        cfg.prefix = None;
+        let view = StoreView::from(&SegmentStoreConfig::S3(cfg));
+        assert_eq!(
+            view.path.as_deref(),
+            Some("s3://my-bucket@s3.example.com:9000")
+        );
     }
 }
 
@@ -4363,7 +4457,7 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — a second, independently
         // configured handle alongside `segment_store` above; see
         // `build_backup_store`'s own doc. Plumbing only (Train 1 PR②): no
@@ -4374,7 +4468,7 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &backup_store_config,
-        );
+        )?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -5477,7 +5571,7 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — see `segment_store`'s
         // doc immediately above for why this is provisioned here too.
         let backup_store = build_backup_store(
@@ -5486,7 +5580,7 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &backup_store_config,
-        );
+        )?;
 
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -5928,7 +6022,7 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — see `BoundNode::
         // start_with_growth`'s identical construction; `control` here is
         // `ControlHandle::Remote`, which `ControlPlacementView` reads
@@ -5939,7 +6033,7 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &backup_store_config,
-        );
+        )?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -6508,6 +6602,18 @@ pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 pub(crate) enum SegmentStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// `--segment-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — a
+    /// `Arc<dyn SegmentStore>` rather than a concrete
+    /// `animus_env::S3SegmentStore<T>` for one specific reason: it lets an
+    /// in-crate test build this variant over `animus_s3::fake::FakeS3`
+    /// (`s3_store_tests`, below) with no change to this enum's own shape,
+    /// while production (`build_segment_store`) always constructs the
+    /// concrete `S3SegmentStore<animus_s3::prod::HyperRustlsTransport>`
+    /// instance and stores it here the same way. Like `Fs`, there is no
+    /// per-node replica concept — every node reads the identical bucket —
+    /// so this variant is handled identically to `Fs` in every method
+    /// below.
+    S3(Arc<dyn animus_env::SegmentStore>),
 }
 
 impl SegmentStoreHandle {
@@ -6516,17 +6622,21 @@ impl SegmentStoreHandle {
     /// to record in the `SealStreamShard` catalog row's own `replicas`
     /// field (ADR 0043 §A3 step 3) — the **cluster** store's own sorted
     /// K-replica set, or an **empty** one for the single-directory
-    /// `FsSegmentStore` opt-in: there is no per-node replica concept for a
-    /// store every node already reads the identical physical directory
-    /// through, so an empty `replicas` list is this PR's documented signal
-    /// for "no cluster replica set — ask any node" (the read path, a later
-    /// PR, is what interprets it).
+    /// `FsSegmentStore`/S3 opt-ins: there is no per-node replica concept for
+    /// a store every node already reads the identical physical directory
+    /// (or bucket) through, so an empty `replicas` list is this PR's
+    /// documented signal for "no cluster replica set — ask any node" (the
+    /// read path, a later PR, is what interprets it).
     async fn put_sealed(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
         match self {
             SegmentStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
             SegmentStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            SegmentStoreHandle::S3(s3) => {
+                s3.put(id, bytes).await?;
                 Ok(Vec::new())
             }
         }
@@ -6552,6 +6662,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6570,6 +6681,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 
@@ -6596,7 +6708,7 @@ impl SegmentStoreHandle {
     ) -> std::io::Result<Vec<NodeId>> {
         match self {
             SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
-            SegmentStoreHandle::Fs(_) => Ok(surviving.to_vec()),
+            SegmentStoreHandle::Fs(_) | SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
         }
     }
 
@@ -6615,6 +6727,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().list(prefix).await,
             SegmentStoreHandle::Fs(fs) => fs.list(prefix).await,
+            SegmentStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
 
@@ -6627,6 +6740,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().get(id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6641,6 +6755,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().delete(id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 }
@@ -6682,25 +6797,254 @@ impl animus_cp_data::cluster_segment_store::PlacementView for ControlPlacementVi
     }
 }
 
+/// One `s3://bucket[/prefix]?endpoint=...&region=...[&path_style=true]
+/// [&insecure_http=true]` store target (S-04 PR 2), shared verbatim by both
+/// [`SegmentStoreConfig::S3`] and [`BackupStoreConfig::S3`] — parsed by
+/// `main.rs`'s `parse_s3_uri` and never constructed any other way in
+/// production. **Credentials are never part of the URI** — `main.rs`
+/// resolves them separately (a `--s3-credentials PATH` file or the
+/// `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` env vars, see
+/// that file's own doc) and fills in `credentials` only once resolution
+/// succeeds; a URI naming `s3://` with no credentials resolvable anywhere is
+/// a startup error, never a value with an empty/placeholder credential.
+/// `credentials`' own `Debug` already redacts the secret
+/// (`animus_s3::sigv4::Credentials`), so deriving `Debug` here leaks
+/// nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3StoreConfig {
+    pub bucket: String,
+    /// Key prefix every stored id is joined under (`{prefix}/{id}`) — see
+    /// [`animus_env::S3SegmentStore`]'s own "Object layout" doc. `None` for
+    /// no prefix (`s3://bucket` with no path component).
+    pub prefix: Option<String>,
+    /// `scheme://host[:port]`, no trailing slash — `https://` unless
+    /// `insecure_http` is set, in which case `http://` (see
+    /// [`Self::insecure_http`]'s own doc for the gate).
+    pub endpoint: String,
+    pub region: String,
+    /// Whether this store's transport may dial `endpoint` over plain HTTP.
+    /// `main.rs`'s `parse_s3_uri` only ever sets this `true` when the URI's
+    /// own `insecure_http=true` query key is present **and** either the
+    /// endpoint host is loopback or `--allow-insecure-s3` was also given —
+    /// by the time a value reaches here, that gate has already been
+    /// enforced; this field just remembers the decision for
+    /// `build_segment_store`/`build_backup_store` to act on.
+    pub insecure_http: bool,
+    pub credentials: animus_s3::sigv4::Credentials,
+}
+
 /// `--segment-store` CLI opt-in (ADR 0043 §A7b): the default,
 /// [`SegmentStoreConfig::Cluster`], selects [`SegmentStoreHandle::Cluster`]
 /// (the K-replicated default store, F5's durability mandate);
 /// `Fs(PATH)` (parsed by `main.rs` from `--segment-store dir:PATH`) selects a
 /// bare, single-directory `FsSegmentStore` at `PATH` instead — dev use, or a
 /// directory every node in the cluster mounts at the identical path (NFS or
-/// similar). **The shared-mount caveat**: this opt-in trades away the
+/// similar); `S3(..)` (parsed from `--segment-store s3://bucket/...`, S-04 PR
+/// 2) selects a real S3-compatible bucket instead — see [`S3StoreConfig`]'s
+/// own doc for the URI shape and credential sourcing. **The shared-mount/
+/// external-store caveat**: both non-default opt-ins trade away the
 /// K-replication durability upgrade the *default* store exists to provide
 /// (ADR 0043's whole "the default store must uphold this database's own
-/// durability bar" argument) for needing no cluster wiring at all — the
-/// shared filesystem itself becomes a single point of failure/consistency
-/// this adapter no longer protects against, which is exactly the trade a dev
-/// setup or an operator with its own already-durable shared storage is
-/// choosing to accept.
+/// durability bar" argument) for needing no cluster-internal replication at
+/// all — the shared filesystem or S3 bucket itself becomes the single
+/// consistency/durability boundary this adapter no longer protects against,
+/// which is exactly the trade a dev setup, an operator with its own
+/// already-durable shared storage, or an operator relying on S3's own
+/// durability guarantees is choosing to accept.
 #[derive(Clone, Debug, Default)]
 pub enum SegmentStoreConfig {
     #[default]
     Cluster,
     Fs(PathBuf),
+    S3(S3StoreConfig),
+}
+
+/// Build the `T: Transport` + [`animus_s3::client::S3Config`] pair
+/// [`build_segment_store`]/[`build_backup_store`]'s `S3` arm both need from
+/// an [`S3StoreConfig`] — factored out since the two call sites are
+/// otherwise identical (same transport-construction/credential-forwarding
+/// logic, differing only in which handle enum wraps the result).
+///
+/// # Errors
+/// If installing the `ring` crypto provider fails (only possible if a
+/// *different* provider is already installed process-wide — see
+/// [`animus_s3::prod::HyperRustlsTransport::new`]'s own doc; tolerable
+/// "already installed by this same call" is not an error).
+fn s3_segment_store(
+    s3: &S3StoreConfig,
+) -> std::io::Result<animus_env::S3SegmentStore<animus_s3::prod::HyperRustlsTransport>> {
+    let transport = if s3.insecure_http {
+        animus_s3::prod::HyperRustlsTransport::new_allow_insecure_http()
+    } else {
+        animus_s3::prod::HyperRustlsTransport::new()
+    }
+    .map_err(|e| std::io::Error::other(format!("building S3 transport: {e}")))?;
+    let config = animus_s3::client::S3Config {
+        endpoint: s3.endpoint.clone(),
+        bucket: s3.bucket.clone(),
+        region: s3.region.clone(),
+        credentials: s3.credentials.clone(),
+    };
+    Ok(animus_env::S3SegmentStore::new(
+        transport,
+        config,
+        s3.prefix.clone(),
+    ))
+}
+
+/// S-04 PR 2's own end-to-end proof that `SegmentStoreHandle::S3`/
+/// `BackupStoreHandle::S3` are wired correctly, **without any real
+/// sockets**: an in-crate `#[cfg(test)] mod` (needs `BackupStoreHandle`'s
+/// own `pub(crate)` visibility — no external `tests/*.rs` file can reach it,
+/// the identical reason `simenv_client_ctx_tests`/`s3_store_view_tests`
+/// above live here too) that builds a real `BackupStoreHandle::S3`/
+/// `SegmentStoreHandle::S3` directly over `animus_s3::fake::FakeS3` (a
+/// signature-verifying in-memory S3 double, `animus-s3`'s own `fake`
+/// feature — see this crate's `Cargo.toml`) instead of production's real
+/// `s3_segment_store`/`animus_s3::prod::HyperRustlsTransport` construction
+/// path, then drives every method the production capture driver
+/// (`backup_capture.rs`'s `put`), the backup janitor (`backup_janitor.rs`'s
+/// `list_local`/`get_local`/`delete_local`), and the `/admin/backup-store`/
+/// `/admin/segment-store` routes (`admin.rs`'s own `list_local`/`get_local`
+/// calls on the same handle) actually call.
+///
+/// **Scope decision, stated plainly**: this does not stand up a full
+/// running `Node` with an injected transport and drive `CreateBackup`/
+/// `DeleteBackup` over the real DynamoDB wire — doing that would need
+/// either widening `BackupStoreHandle`'s visibility to `pub` (a public-API
+/// change beyond this PR's own scope) or a second, parallel node-
+/// construction entry point that accepts a pre-built handle instead of a
+/// `BackupStoreConfig` (a materially larger change to `spawn_common_tail`'s
+/// own call chain). This test instead proves the identical operations at
+/// the layer directly below the wire — the same `BackupStoreHandle`
+/// methods `backup_capture.rs`/`backup_janitor.rs`/`admin.rs` call, with
+/// the store itself indistinguishable from what those callers see in
+/// production apart from which `Transport` backs it — which is what this
+/// PR's own wiring actually needs proven; a live-node e2e over a fake HTTP
+/// listener is a reasonable follow-up, not required for this PR's own
+/// correctness claim.
+#[cfg(test)]
+mod s3_store_handle_tests {
+    use animus_s3::client::S3Config;
+    use animus_s3::fake::FakeS3;
+    use animus_s3::sigv4::Credentials;
+
+    use super::{BackupStoreHandle, SegmentStoreHandle};
+
+    fn fake_config() -> S3Config {
+        S3Config {
+            endpoint: "http://fake.example:9000".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Credentials::new("AKIDTEST", "secret"),
+        }
+    }
+
+    fn fake_backup_store() -> BackupStoreHandle {
+        let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
+        BackupStoreHandle::S3(std::sync::Arc::new(animus_env::S3SegmentStore::new(
+            fake,
+            fake_config(),
+            Some("backup".to_string()),
+        )))
+    }
+
+    fn fake_segment_store() -> SegmentStoreHandle {
+        let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
+        SegmentStoreHandle::S3(std::sync::Arc::new(animus_env::S3SegmentStore::new(
+            fake,
+            fake_config(),
+            Some("segments".to_string()),
+        )))
+    }
+
+    /// The `BackupStoreHandle::S3` round trip a real `CreateBackup` drives:
+    /// `put` (the capture driver's own primitive), `list_local`/`get_local`
+    /// (the `/admin/backup-store` route's object-count/byte scan and the
+    /// janitor's own reclaim-candidate discovery), then `delete_local` (the
+    /// janitor's own reclaim step) — proving the object is genuinely gone
+    /// afterward, mirroring a real `DeleteBackup` → janitor reclaim.
+    #[tokio::test]
+    async fn backup_store_s3_put_list_get_delete_round_trip() {
+        let store = fake_backup_store();
+        let replicas = store
+            .put("backup/b-1/manifest", b"manifest-bytes")
+            .await
+            .expect("put");
+        // The S3/Fs variants both record no per-node replica set — "ask any
+        // node" — exactly like `put_sealed`'s own doc documents.
+        assert!(replicas.is_empty());
+
+        let listed = store.list_local("backup/").await.expect("list_local");
+        assert_eq!(listed, vec!["backup/b-1/manifest".to_string()]);
+
+        let bytes = store
+            .get_local("backup/b-1/manifest")
+            .await
+            .expect("get_local")
+            .expect("object present");
+        assert_eq!(bytes, b"manifest-bytes");
+
+        // get_any (the restore driver's own "ask any node" read) must agree.
+        let via_get_any = store
+            .get_any("backup/b-1/manifest")
+            .await
+            .expect("get_any")
+            .expect("object present");
+        assert_eq!(via_get_any, b"manifest-bytes");
+
+        store
+            .delete_local("backup/b-1/manifest")
+            .await
+            .expect("delete_local");
+        let after_delete = store.list_local("backup/").await.expect("list_local");
+        assert!(
+            after_delete.is_empty(),
+            "reclaimed object must be gone: {after_delete:?}"
+        );
+        assert_eq!(
+            store
+                .get_local("backup/b-1/manifest")
+                .await
+                .expect("get_local after delete"),
+            None
+        );
+    }
+
+    /// The `SegmentStoreHandle::S3` sibling round trip — `put_sealed`/
+    /// `list_local`/`get_local`/`delete_local`, the exact methods the
+    /// stream sealer and segment janitor call.
+    #[tokio::test]
+    async fn segment_store_s3_put_sealed_list_get_delete_round_trip() {
+        let store = fake_segment_store();
+        let replicas = store
+            .put_sealed("table/label/1/0/attempt-a", b"segment-bytes")
+            .await
+            .expect("put_sealed");
+        assert!(replicas.is_empty());
+
+        let listed = store.list_local("table/").await.expect("list_local");
+        assert_eq!(listed, vec!["table/label/1/0/attempt-a".to_string()]);
+
+        let bytes = store
+            .get_local("table/label/1/0/attempt-a")
+            .await
+            .expect("get_local")
+            .expect("object present");
+        assert_eq!(bytes, b"segment-bytes");
+
+        store
+            .delete_local("table/label/1/0/attempt-a")
+            .await
+            .expect("delete_local");
+        assert!(
+            store
+                .list_local("table/")
+                .await
+                .expect("list_local")
+                .is_empty()
+        );
+    }
 }
 
 /// Build (and, for the cluster variant, **start**) this node's
@@ -6709,14 +7053,19 @@ pub enum SegmentStoreConfig {
 /// cluster variant's per-node local `FsSegmentStore` building block roots at
 /// `dir.join("segments")`, a sibling of the `internal/` subdirectory
 /// `ProdEnv::bind` already owns.
+///
+/// # Errors
+/// Only the `S3` variant can fail (see [`s3_segment_store`]'s own doc) —
+/// `Cluster`/`Fs` are infallible today, but the whole function is `Result`
+/// so a caller doesn't need to know which variant might fail.
 fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &SegmentStoreConfig,
-) -> SegmentStoreHandle {
-    match config {
+) -> std::io::Result<SegmentStoreHandle> {
+    Ok(match config {
         SegmentStoreConfig::Cluster => {
             let local = FsSegmentStore::new(dir.join("segments"));
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
@@ -6731,7 +7080,8 @@ fn build_segment_store(
             )
         }
         SegmentStoreConfig::Fs(path) => SegmentStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-    }
+        SegmentStoreConfig::S3(s3) => SegmentStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+    })
 }
 
 /// This node's **backup** [`SegmentStore`](animus_env::SegmentStore) handle
@@ -6764,6 +7114,10 @@ fn build_segment_store(
 pub(crate) enum BackupStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// `--backup-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — see
+    /// [`SegmentStoreHandle::S3`]'s doc for why this holds a
+    /// `Arc<dyn SegmentStore>` rather than a concrete type.
+    S3(Arc<dyn animus_env::SegmentStore>),
 }
 
 impl BackupStoreHandle {
@@ -6778,6 +7132,10 @@ impl BackupStoreHandle {
             BackupStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            BackupStoreHandle::S3(s3) => {
+                s3.put(id, bytes).await?;
                 Ok(Vec::new())
             }
         }
@@ -6798,6 +7156,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6819,6 +7178,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6833,6 +7193,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 
@@ -6852,6 +7213,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+            BackupStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
 
@@ -6864,6 +7226,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 
@@ -6879,6 +7242,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 }
@@ -6901,15 +7265,17 @@ impl BackupStoreHandle {
 /// **The default (`Cluster`) does not survive a whole-cluster loss** — it
 /// replicates within the same cluster the backups protect data *from*
 /// (operator/application mistakes), not from a total cluster failure.
-/// `fs:PATH` pointed at separately backed-up or replicated storage — and,
-/// later, an S3 backend (ADR 0059's own named follow-up) — is the actual
-/// disaster-recovery story. Stated here once, plainly, per the ADR's own
-/// instruction that this must not be left to be discovered the hard way.
+/// `fs:PATH` pointed at separately backed-up or replicated storage, or (ADR
+/// 0059's own named follow-up, S-04 PR 2) a real S3 bucket via `S3(..)` —
+/// see [`S3StoreConfig`]'s own doc — is the actual disaster-recovery story.
+/// Stated here once, plainly, per the ADR's own instruction that this must
+/// not be left to be discovered the hard way.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum BackupStoreConfig {
     #[default]
     Cluster,
     Fs(PathBuf),
+    S3(S3StoreConfig),
 }
 
 /// Build (and, for the cluster variant, **start**) this node's
@@ -6920,15 +7286,21 @@ pub enum BackupStoreConfig {
 /// store's own local directory even though the two stores' object
 /// namespaces are already disjoint (`animus_cp_data::backup`'s own module
 /// doc), the same belt-and-suspenders posture ADR 0059 §1 takes for the
-/// namespace split itself.
+/// namespace split itself. A distinct S3 bucket isn't required for the same
+/// reason (disjoint key namespaces already keep `S3StoreConfig`'s own
+/// `prefix` unambiguous even if an operator pointed both stores at the same
+/// bucket) — but the same belt-and-suspenders posture applies equally.
+///
+/// # Errors
+/// See [`build_segment_store`]'s own doc — only the `S3` variant can fail.
 fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &BackupStoreConfig,
-) -> BackupStoreHandle {
-    match config {
+) -> std::io::Result<BackupStoreHandle> {
+    Ok(match config {
         BackupStoreConfig::Cluster => {
             let local = FsSegmentStore::new(dir.join("backups"));
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
@@ -6943,7 +7315,8 @@ fn build_backup_store(
             )
         }
         BackupStoreConfig::Fs(path) => BackupStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-    }
+        BackupStoreConfig::S3(s3) => BackupStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+    })
 }
 
 /// A per-tablet EWMA-smoothed rate sample — the shared storage shape behind

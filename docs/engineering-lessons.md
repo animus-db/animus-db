@@ -18594,3 +18594,102 @@ plain `cargo build -p foo` (no test targets) still doesn't pull the
 feature in — exactly the boundary this crate wants (`prod`/`fake` off by
 default for a plain library consumer, on automatically the moment any test
 target of the crate itself is built).
+
+## A handle enum's variant should hold a trait object, not a concrete generic type, when only production needs the concrete type (S-04 PR 2, `animusd`)
+
+`SegmentStoreHandle`/`BackupStoreHandle` (`animusd::lib.rs`) each gained a
+third variant for the new S3-backed store (ADR 0059's 2026-09-06
+amendment). The store itself, `animus_env::S3SegmentStore<T: animus_s3::
+client::Transport>`, is generic over its transport specifically so it can
+be tested against `animus_s3::fake::FakeS3` (no sockets) while production
+uses `animus_s3::prod::HyperRustlsTransport` — the identical shape
+`animus_s3::client::S3Client<T>` itself already uses (S-04 PR 1). The
+naive way to add the variant would be `S3(animus_env::S3SegmentStore
+<animus_s3::prod::HyperRustlsTransport>)` — concretely typed, mirroring
+how `Cluster`/`Fs` are concretely typed today. That would have made an
+in-crate test wanting to exercise the `S3` variant over `FakeS3` impossible
+without also making the *enum itself* generic over a transport type
+parameter — a much bigger, more invasive change purely to serve a test.
+
+**The fix**: `S3(Arc<dyn animus_env::SegmentStore>)` — a trait object.
+`SegmentStore` is already `#[async_trait]` (boxes its futures), so it's
+dyn-compatible for free; `Arc` makes the variant cheaply `Clone` regardless
+of which concrete transport backs it. Production still constructs the
+concrete `S3SegmentStore<HyperRustlsTransport>` and stores it behind the
+same `Arc<dyn ..>` coercion; a test builds the identical variant over
+`S3SegmentStore<FakeS3>` with zero changes to either enum's shape, and
+every other match arm in both `impl` blocks treats `S3` exactly like `Fs`
+(no per-node replica concept) without ever needing to know or care which
+concrete transport is underneath. **General form**: when a handle enum's
+variant wraps a value that is generic purely so it can be swapped for a
+test double, and the enum's own consumers never need to be generic over
+that same parameter, a trait object at the variant boundary buys the
+testability without forcing genericity onto everything that touches the
+enum — reach for this before genericizing an enum (or a struct built
+around one) that has no other reason to carry a type parameter.
+
+## Avoid a new `ClusterConfig` field for a knob whose ADR already specifies "static, file/env-sourced" scope — the `error[E0063]` fan-out cost isn't worth paying twice (S-04 PR 2, `animusd`)
+
+This crate's own history already names the cost of adding a field to
+`ClusterConfig`: `dynamo_auth` and `cluster_settings` each triggered a
+compiler-enumerated ~55-60-call-site `error[E0063]: missing field` fan-out
+across every `ClusterConfig { .. }` struct literal in `src/`+`tests/`
+(`crates/animusd/CLAUDE.md`'s `config.rs` entry has the blow-by-blow). S-04
+PR 2 needed a place for S3 credentials to live and could have followed
+`dynamo_auth`'s own precedent (an `Option<S3CredentialsConfig>` field on
+`ClusterConfig`, populated from a config file's own section or a CLI flag
+merged in with a "one way, not both" conflict check) — but the ADR
+amendment this PR implements had already specified the credential-sourcing
+posture in full: static access-key-id/secret pair, from a config file or
+environment variable, mirroring ADR 0057's own `dynamo_auth` static map.
+Nothing about that posture needs `ClusterConfig`'s own per-node array
+shape or its "one config file describes the whole cluster" semantics — a
+set of S3 credentials is either process-global or, at most, per-invocation,
+never something a `ClusterConfig`'s per-node `nodes[]` entries need to vary
+independently.
+
+**The decision**: skip `ClusterConfig` entirely. `--s3-credentials PATH`
+names a **standalone** JSON file (`main.rs::S3CredentialsFile`), parsed and
+resolved independently of any `ClusterConfig` load, with an environment-
+variable fallback when the flag is omitted. This is a deliberate departure
+from the `dynamo_auth` precedent this codebase would otherwise reach for
+by pattern-matching — worth stating explicitly, since "make it look like
+the existing similar feature" is usually the right instinct and was
+wrong here specifically because the *scope* of the two features differs
+(a per-cluster credential *map*, keyed by access key id, genuinely
+benefits from living in the cluster-wide config a `dynamo_auth` section
+already is; a single static credential *pair* for one external system
+does not). **General form**: before reaching for an existing sibling
+feature's storage shape as a template, check whether its own scope
+(per-node vs. per-cluster vs. per-process) actually matches the new
+feature's — matching the pattern when the scope differs just imports that
+pattern's own cost (here, a `ClusterConfig` field's mechanical fan-out) for
+no benefit, and a real ADR that already specifies a narrower scope is
+license to use a narrower, cheaper mechanism instead.
+
+## `df -h /` reading near-zero and every Bash call failing with "the temp filesystem is full" can be the SAME root cause, not two problems
+
+Mid-session, every `Bash` tool call started failing with "Command output
+was lost: the temp filesystem at /tmp/claude-0/.../tasks is full (0MB
+free)" — including a bare `echo done > file`, which made it look like the
+harness's own tmpfs (unrelated to the repo) had filled up independently of
+anything this session was doing. It hadn't: `df -h /` (once a command
+finally got through) showed the **root filesystem itself** at 140K free —
+the harness's task-output tmpfs and `/home/user/animus-db/target` share the
+same underlying disk, so a 28GB `target/debug/deps` (accumulated across a
+long session's worth of `cargo build`/`test` invocations, many of them
+recompiling the same crates under slightly different feature combinations
+and leaving old-hash duplicate `.rlib`/test-binary artifacts behind) had
+quietly starved the whole filesystem, harness tmp included.
+
+**The fix**: exactly the prune this repo's own task instructions already
+describe for this situation — group `target/debug/deps/*` by basename
+(strip the trailing `-<16 hex>` build-hash suffix) and delete every file
+in a group except the newest by mtime, which recovered 17GB here. **The
+lesson worth generalizing**: when a sandboxed harness's own bookkeeping
+(temp files, output capture, anything **not** the actual task) starts
+failing with a space/quota-shaped error, check the *whole* filesystem's
+free space before assuming the harness's own storage is a separate,
+unrelated resource — on a single-disk sandbox it usually isn't, and the
+real fix lives in the repo's build output, not in anything the harness
+itself controls.

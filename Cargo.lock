@@ -101,6 +101,7 @@ dependencies = [
 name = "animus-env"
 version = "0.0.0"
 dependencies = [
+ "animus-s3",
  "async-trait",
  "rand 0.8.8",
  "rcgen",
@@ -263,6 +264,7 @@ dependencies = [
  "animus-env",
  "animus-item",
  "animus-node",
+ "animus-s3",
  "animus-sim",
  "animus-storage",
  "animus-tablet",

@@ -42,6 +42,17 @@ pub mod tls;
 #[cfg(feature = "prod")]
 pub use tls::{MaybeTlsStream, TlsConfig, TlsMaterial};
 
+/// S3-backed [`SegmentStore`] (S-04 PR 2, `docs/adr/0059-backup-restore.md`'s
+/// 2026-09-06 amendment) — gated alongside `prod.rs` for the identical
+/// reason: it wraps `animus_s3::client::S3Client<T>`, generic over
+/// `T: animus_s3::client::Transport`, so it is testable against
+/// `animus_s3::fake::FakeS3` (no sockets) and driven in production by
+/// `animus_s3::prod::HyperRustlsTransport`. See the module's own doc.
+#[cfg(feature = "prod")]
+pub mod s3_store;
+#[cfg(feature = "prod")]
+pub use s3_store::S3SegmentStore;
+
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 

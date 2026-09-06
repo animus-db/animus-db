@@ -92,22 +92,26 @@ the still-true paragraph after the table.
   (`main.rs:575-601`) know only `dir:`, `fs:`, `cluster`.
 - **Plan:** see the amendment in
   [`docs/adr/0059-backup-restore.md`](adr/0059-backup-restore.md#amendment-2026-09-06-s-04--s3-segmentstore-backend--design)
-  ("S-04: S3 `SegmentStore` backend — design," 2026-09-06) for the full
-  three-PR write-up: object layout, consistency assumptions, credential
-  sourcing, region/endpoint, TLS, and testing. **PR (1) — a new `animus-s3`
-  crate (pure SigV4 signer + a minimal S3 client over a `Transport` seam,
-  no `SegmentStore` impl yet, no `animus-env` dependency) — is done**;
-  `S3SegmentStore` behind the `prod` feature and `s3:` URIs on both flags
-  (PR 2) and the operator egress/credential-secret work
-  (`desired/networkpolicy.rs:99`, currently ingress-only, egress
-  unrestricted by omission) (PR 3) remain.
-- **Tests:** `assert_segment_store_contract` against minio, real-thread,
-  `prod`-gated (PR 2). PR 1's own signer/client tests are in
-  `crates/animus-s3/CLAUDE.md`.
+  ("S-04: S3 `SegmentStore` backend — design," 2026-09-06, plus the
+  "As-built (2026-09-06): PR 2" amendment) for the full three-PR write-up:
+  object layout, consistency assumptions, credential sourcing, region/
+  endpoint, TLS, and testing. **PR (1) — a new `animus-s3` crate (pure
+  SigV4 signer + a minimal S3 client over a `Transport` seam, no
+  `SegmentStore` impl yet, no `animus-env` dependency) — is done. PR (2) —
+  `animus_env::S3SegmentStore` behind the `prod` feature and `s3:` URIs on
+  both `--segment-store`/`--backup-store` (plus `--s3-credentials PATH`/
+  `--allow-insecure-s3`) — is done.** The operator egress/credential-secret
+  work (`desired/networkpolicy.rs:99`, currently ingress-only, egress
+  unrestricted by omission) (PR 3) remains.
+- **Tests:** `assert_segment_store_contract` against `animus_s3::fake::
+  FakeS3` (load-bearing, no network) and, opt-in, a real MinIO/localstack
+  endpoint (`crates/animus-env/tests/s3_segment_store_minio.rs`,
+  `ANIMUS_S3_TEST_ENDPOINT` — done, PR 2). PR 1's own signer/client tests
+  are in `crates/animus-s3/CLAUDE.md`.
 - **ADR:** amended 0059 in place 2026-09-06 (it reserves this exact
-  follow-up).
-- **PRs:** (1) client — done; (2) backend + flags; (3) operator egress +
-  secrets. **Size:** L. **Blocks:** S-05.
+  follow-up; PR 2 landed with an as-built amendment of its own).
+- **PRs:** (1) client — done; (2) backend + flags — done; (3) operator
+  egress + secrets. **Size:** L. **Blocks:** S-05.
 
 ### S-05 S3 export/import
 

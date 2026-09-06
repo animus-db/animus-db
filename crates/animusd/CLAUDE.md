@@ -1774,6 +1774,18 @@ precedence rule. Not accepted by `join`/`control` (a control-only node never
 binds the dynamo listener). Omitted (the default), auth stays disabled —
 byte-identical to pre-ADR-0057 behavior.
 
+**`--segment-store`/`--backup-store s3://bucket[/prefix]?endpoint=...&region=...
+[&path_style=true][&insecure_http=true]` (S-04 PR 2)** — an S3-compatible
+bucket in place of the default `cluster`/`fs:PATH` opt-ins; see this file's
+own Gotchas entry (grep "S-04 PR 2") for the full design. Needs
+`--s3-credentials PATH` (a standalone JSON credentials file — never a
+`ClusterConfig` field) or the `ANIMUS_S3_ACCESS_KEY_ID`/
+`ANIMUS_S3_SECRET_ACCESS_KEY` environment variables; a plaintext
+`insecure_http=true` endpoint needs `--allow-insecure-s3` too unless it's
+loopback. Reaches `run` (`--config`/`--node` and `--cluster N`) and
+`run_control` — the same two entry points `--segment-store`/
+`--backup-store` themselves already reached before this PR.
+
 **`--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit
 2)** — this **one process's own** TLS material: all three or none (the
 internal wire is always mutual TLS the moment TLS is configured at all, so
@@ -3905,6 +3917,111 @@ ADR itself for the full design/rationale.
   (W-10)**: `--segment-store`/`--backup-store` now thread through it
   exactly as they do through `--config`/`--node` and `--cluster N`
   (`main.rs`'s `run_control` → `run_node_control_with_stores`).
+- **Both stores gained a real S3 backend (S-04 PR 2, ADR 0059's 2026-09-06
+  amendment)** — `SegmentStoreConfig`/`BackupStoreConfig` each gained an
+  `S3(S3StoreConfig)` variant (`lib.rs`), selected by `--segment-store`/
+  `--backup-store s3://bucket[/prefix]?endpoint=scheme://host[:port]
+  &region=region[&path_style=true][&insecure_http=true]`
+  (`main.rs`'s `parse_s3_uri`, shared verbatim by `parse_segment_store`/
+  `parse_backup_store`). `SegmentStoreHandle`/`BackupStoreHandle`'s own new
+  `S3` variant holds `Arc<dyn animus_env::SegmentStore>` — a trait object,
+  not the concrete `animus_env::S3SegmentStore<animus_s3::prod::
+  HyperRustlsTransport>` production actually constructs (`s3_segment_store`,
+  `lib.rs`) — specifically so an in-crate test (`s3_store_handle_tests`,
+  below) can build the identical variant over `animus_s3::fake::FakeS3`
+  with no change to either enum's shape; every other variant (`Cluster`/
+  `Fs`) is handled identically for `S3` in every method (no per-node
+  replica concept — "ask any node," the same signal `Fs` already sends).
+  `build_segment_store`/`build_backup_store` became fallible
+  (`std::io::Result<..>`, `?`-propagated at their 3 call sites in `lib.rs`)
+  purely for the `S3` arm's own `HyperRustlsTransport::new()`/
+  `new_allow_insecure_http()` construction, which can fail only if a
+  *different* rustls crypto provider is already installed process-wide
+  (never actually possible in this process — nothing else in `animusd`
+  installs one — but propagated rather than `.expect()`ed, per this repo's
+  no-panic-on-a-remote-possibility discipline).
+
+  **Credentials are deliberately NOT a `ClusterConfig` field** — see this
+  file's own `config.rs` entry above for why a new field there means a
+  compiler-enumerated ~55-60-call-site `error[E0063]` fan-out across every
+  `ClusterConfig { .. }` literal in `src/`+`tests/`; a feature whose own ADR
+  already specifies "static, file/env-sourced, no cluster-wide semantics"
+  credentials had no reason to pay that cost. Instead: `--s3-credentials
+  PATH` (a standalone JSON file, `main.rs::S3CredentialsFile` —
+  `{"access_key_id": "...", "secret_access_key_file": "..."}` or
+  `{"access_key_id": "...", "secret_access_key_env": "VAR"}`, exactly one
+  of the two secret sources, mirroring ADR 0064's `tls` section's own
+  cert/key-**path** precedent rather than `dynamo_auth`'s in-`ClusterConfig`
+  static-map one), falling back to the `ANIMUS_S3_ACCESS_KEY_ID`/
+  `ANIMUS_S3_SECRET_ACCESS_KEY` environment variables
+  (`main.rs::resolve_s3_credentials`) when the flag is omitted. Resolved
+  **once** per process (`run`/`run_control`, before either
+  `parse_segment_store`/`parse_backup_store` call) and passed to both —
+  an `s3://` store with no credential resolvable anywhere is a startup
+  error naming both sourcing options, never a panic; a process with
+  neither store set to `s3://` never even attempts resolution's own
+  fs/env reads to fail on. `--s3-credentials`/`--allow-insecure-s3` (next
+  paragraph) reach `run` (`--config`/`--node` and `--cluster N`) and
+  `run_control` — the same two entry points `--segment-store`/
+  `--backup-store` themselves reach; not `run_data`/`join`/
+  `--cluster-control`+`--cluster-data`, the identical documented gap those
+  two flags already have on those entry points.
+
+  **The insecure-HTTP gate is enforced entirely inside `parse_s3_uri`,
+  at parse time**: `endpoint`'s own `http://`/`https://` prefix must agree
+  with the URI's `insecure_http` query key (an `http://` endpoint always
+  needs `insecure_http=true` and vice versa — this never infers a TLS
+  decision from the scheme string alone, so a copy-pasted `http://` can't
+  silently downgrade a production config), and `insecure_http=true` against
+  a non-loopback host (`is_loopback_host` — a conservative literal
+  `localhost`/`127.0.0.0/8`/`::1` match, never a DNS resolution) is refused
+  unless `--allow-insecure-s3` is also given. `path_style=false`
+  (virtual-hosted addressing) is rejected as unimplemented — this client
+  only ever addresses path-style — rather than silently ignored.
+
+  **Admin surface**: `GET /admin/segment-store`/`GET /admin/backup-store`
+  render `"kind": "s3"` with a `location` of `s3://bucket[/prefix]@host`
+  (host only — no query string, no credentials, ever) through the
+  pre-existing `StoreView`/`redact_store_location` machinery — the `S3` arm
+  of `StoreView`'s two `From` impls (`s3_store_location`/`s3_endpoint_host`,
+  `lib.rs`) is the only admin-side code this needed, since both routes
+  already project every store kind through that one type.
+
+  **Testing**: `main.rs`'s own `tests` module gained the URI-shape/
+  credential/insecure-http-gate matrix (accepted-well-formed, missing
+  endpoint/bucket/credentials, http-without-insecure_http, insecure_http
+  against loopback vs. non-loopback with/without `--allow-insecure-s3`,
+  `path_style=false`, an unknown query key, and `S3CredentialsFile`'s own
+  file/env resolution) directly on `parse_segment_store`/`parse_backup_store`/
+  `resolve_s3_credentials`. `lib.rs`'s own `s3_store_view_tests` (in-crate,
+  needs no private access — could have lived in `tests/` but sits beside
+  `redact_store_location_tests` for locality) asserts the admin-surface
+  rendering never leaks the credential, string-searching the rendered
+  location the same way `admin_config_reports_auth_state_and_never_
+  serves_the_secret` does. **`lib.rs`'s own `s3_store_handle_tests`
+  is this PR's end-to-end proof, deliberately scoped smaller than a live-
+  node e2e** — it needs `BackupStoreHandle`/`SegmentStoreHandle`'s
+  `pub(crate)` visibility (no external `tests/*.rs` file can reach them,
+  the identical reason `simenv_client_ctx_tests` lives here too), and
+  builds a real `BackupStoreHandle::S3`/`SegmentStoreHandle::S3` directly
+  over `animus_s3::fake::FakeS3` (no real sockets, `animus-s3`'s `fake`
+  feature — this crate's own `[dev-dependencies]` entry), then drives the
+  exact `put`/`put_sealed`/`list_local`/`get_local`/`get_any`/`delete_local`
+  methods `backup_capture.rs`/`backup_janitor.rs`/`admin.rs` call in
+  production. **What this deliberately does NOT do**: stand up a full
+  running `Node` with an injected transport and drive `CreateBackup`/
+  `DeleteBackup` over the real DynamoDB wire — that would need either
+  widening `BackupStoreHandle`'s visibility to `pub` (a public-API change
+  this PR didn't need) or a second, parallel node-construction entry point
+  accepting a pre-built handle instead of a `BackupStoreConfig` (a
+  materially larger change to `spawn_common_tail`'s own call chain); a
+  live-node fake-transport e2e is a reasonable follow-up, not required for
+  this PR's own correctness claim, which rests on the handle-level proof
+  above being the identical code path the wire-level operations call
+  through. See `crates/animus-env/CLAUDE.md`'s own `S3SegmentStore` entry
+  for the store's own object-layout/write-once/retry design and
+  `docs/adr/0059-backup-restore.md`'s "As-built: PR 2" amendment for the
+  full account.
 - **`backup_capture.rs`** (ADR 0059 §4/§5/§6, Train 1 PR③) — the on-demand
   backup **capture driver**: a per-tablet, leader-side, event-driven loop
   (`backup_capture_loop`, the same "run everywhere, self-gate per tablet on

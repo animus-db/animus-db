@@ -28,6 +28,7 @@ prod = [
     "dep:rustls",
     "dep:tokio-rustls",
     "dep:rustls-pki-types",
+    "dep:animus-s3",
 ]
 
 [dependencies]
@@ -49,8 +50,24 @@ tracing = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
+# `s3_store.rs`'s `S3SegmentStore<T>` (S-04 PR 2, ADR 0059 amendment): wraps
+# `animus_s3::client::S3Client<T>` behind the `SegmentStore` trait. Only
+# `animus_s3::client`'s `Transport`-generic pieces are needed here — no
+# `fake`/`prod` feature of `animus-s3` itself, since this crate never
+# constructs a concrete `Transport` (that's `animusd`'s job for the real
+# `HyperRustlsTransport`, and this crate's own dev-dependency below for
+# tests). Optional, pulled in by the `prod` feature like every other real-IO
+# dependency in this list.
+animus-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Self-signed CA + node cert generation for `prod::tests`' TLS loopback
 # tests (ADR 0064) — never a production dependency, only ever a dev one.
 rcgen = { workspace = true }
+# `s3_store.rs`'s own contract test drives `S3SegmentStore` against
+# `animus_s3::fake::FakeS3` (no sockets); `tests/s3_segment_store_minio.rs`
+# is the opt-in real-endpoint counterpart and needs `animus_s3::prod::
+# HyperRustlsTransport`, hence both features here. Cargo unifies this with
+# the plain (feature-less) `[dependencies]` entry above when building this
+# crate's own test targets with `--features prod`/`--all-features`.
+animus-s3 = { workspace = true, features = ["fake", "prod"] }
