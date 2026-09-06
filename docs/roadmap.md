@@ -213,36 +213,6 @@ tests: `admin_endpoint.rs`. CLI arg parsing is unit-tested via `admin_request`
 mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 `window.confirm` guard.
 
-### U-07 New observability routes
-
-- **Landed 2026-09-06.** `GET /admin/backup-store`: store config, object
-  counts (a bounded live `list` scan, debug posture — `BackupStoreHandle`
-  maintains no counter), janitor phase via an `Arc<Mutex<JanitorProgress>>`
-  on `ClientCtx` updated by `animus_node::backup_janitor`. Renders on the
-  Backups tab. See ADR 0020's and ADR 0059's 2026-09-06 as-built notes and
-  `crates/animusd/CLAUDE.md`'s `backup_janitor.rs` entry.
-- **Landed 2026-09-06.** `GET /admin/ttl`: reaper phase/cursor/deletes per
-  tick from `animus_node::ttl_reaper`, via a new
-  `Arc<Mutex<TtlReaperProgress>>` on `ClientCtx` — unlike the backup
-  janitor, published by every node (the reaper is leader-gated per
-  tablet, not control-plane-leader-gated), plus every TTL-enabled table
-  and this node's own `leader_tablets` count. Renders on the Storage tab.
-  See ADR 0020's and ADR 0051's 2026-09-06 as-built notes and
-  `crates/animusd/CLAUDE.md`'s `ttl_reaper.rs` entry.
-- **Landed 2026-09-06.** `GET /admin/gc`: the DynamoDB Streams segment
-  janitor's own orphan-sweep phase and counters from `segment_janitor_loop`
-  (ADR 0042 §10/ADR 0043 §A9 — not ADR 0024/0040 as originally scoped
-  here: those cover the *drop-table* reconciler GC, a different subsystem
-  the segment janitor doesn't touch), via a `SegmentJanitorProgress` on
-  `ClientCtx` mutated directly by the loop (it never moved to
-  `animus-node`, so no capability trait was needed). Renders on the
-  Storage tab beside the TTL reaper card. See ADR 0020's and ADR 0043's
-  2026-09-06 as-built notes and `crates/animusd/CLAUDE.md`'s
-  `segment_janitor.rs` entry.
-- `GET /admin/segment-store`: placement per shard (already inside
-  `ClusterSegmentStore`) plus counts. Size M.
-- Each renders on the Backups tab (landed with U-02) or Storage tab.
-
 ### U-08 CLI parity
 
 - **(i) landed 2026-09-04** (`admin_request` pure arg parser + eight flat
@@ -250,7 +220,6 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 - **(ii) Dynamo-proxy wrappers:** `backup create|delete`, `restore`,
   `pitr enable|disable`, `ttl`, `stream`, each a `run_*` helper posting
   to `/admin/data/dynamo`. Size M.
-- Trailing PRs add coverage for U-07's routes as they land.
 
 ---
 
@@ -297,7 +266,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
 | — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
-| 3 | *U-05 landed 2026-09-06*; U-07, U-08(ii) | No ordering constraint remains |
+| 3 | *U-05, U-07 landed 2026-09-06*; U-08(ii) | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |

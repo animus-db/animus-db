@@ -762,6 +762,32 @@ reusing the captured config is the point of the test.
   card, `#gc-card`/`#gc-body`, fed from `STATE.gc` — a single SEED-only
   fetch like `/admin/backup-store`'s own card, since this janitor is
   control-plane-leader-only too, never `/admin/ttl`'s per-node fan-out).
+  **A sibling route, `GET /admin/segment-store` (ADR 0043 §A7b, roadmap
+  U-07's fourth and last route), reports the STORE's own state rather than
+  this janitor's** — this node's configured segment store (redacted), the
+  shard→replica placement every sealed `stream_shards` row was given
+  (`StreamShardRow::replicas`, populated once, at seal time, by
+  `ClusterSegmentStore::put_replicated`'s own placement selection — `null`
+  for the single-shared-directory `fs` opt-in, which has no per-node
+  replica concept), and a bounded live local object-count/byte scan
+  (`SegmentStoreHandle::list_local`/`get_local`, mirroring `/admin/
+  backup-store`'s own scan). No new progress type or capability trait —
+  `admin.rs::segment_store_view` (`animus_node::host::AdminHost::
+  segment_store_view`) reads durable replicated state plus a local scan,
+  never a loop's own phase. Renders on the Storage tab beside the TTL
+  reaper and GC cards (`dashboard_storage.js`'s "Segment store" card,
+  `#seg-store-card`/`#seg-store-body`), fed from `dashboard_core.js`'s
+  existing PER-NODE `loadAll()` fan-out (`STATE.nodes[*].segmentStore`) —
+  like `/admin/ttl`, since this route's own `local_objects`/`local` fields
+  are genuinely per-node facts. **This closes docs/roadmap.md's whole
+  U-07 section.** Regression: `tests/admin_endpoint.rs::
+  admin_segment_store_reports_shard_placement_and_local_objects` (a real
+  3-node cluster with the default `cluster` store — create a streamed
+  table, write, wait for the write to seal, poll converged-or-timeout
+  until some node's own route shows `local_objects.count >= 1`, then until
+  every node reports the identical, non-empty shard→replica placement) and
+  `admin_segment_store_reports_null_shards_for_the_fs_kind`, plus
+  `tests/dashboard_endpoint.rs::dashboard_u07_segment_store_card`.
   Regression: `tests/admin_endpoint.rs::
   admin_gc_reports_segment_janitor_progress_and_leader_state` (a real
   3-node streamed cluster with a generous 600s retention — proving the

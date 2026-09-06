@@ -587,6 +587,21 @@ sub-rungs below shipped.
   `gc_view` itself is otherwise identical in shape to `backup_store_view`/
   `ttl_view`: one method, returning the exact `Value` the route produces.
 
+  **`AdminHost` gained an eighth and last method, `segment_store_view`, for
+  roadmap U-07's fourth and closing route (2026-09-06)**: `GET
+  /admin/segment-store` — added the identical way again (`impl AdminHost
+  for ClientCtx` in `animusd::admin` delegates to that file's own
+  `segment_store_view` function); `admin::tests::FakeHost` and
+  `dispatch`'s routing table both needed the one new arm too. Unlike
+  `gc_view`, this route needed no new `animusd`-local progress type at
+  all — it reports a durable catalog fact (`Metadata::stream_shards`'s own
+  `replicas` field, itself populated once, at seal time, by
+  `animus_cp_data::cluster_segment_store::ClusterSegmentStore::
+  put_replicated`'s own placement selection) plus a bounded live local
+  object scan, never a loop's own phase (that is `gc_view`'s job). This
+  closes docs/roadmap.md's whole U-07 section — every one of its four
+  routes has now landed.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an

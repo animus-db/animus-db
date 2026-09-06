@@ -347,6 +347,77 @@ async fn bring_up_with_streams(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up_with_streams`], but pins an explicit `fs:PATH`
+/// [`animusd::SegmentStoreConfig`] instead of the default `Cluster`
+/// variant — `admin_segment_store_reports_shard_placement_and_local_
+/// objects` needs one node with the single-shared-directory opt-in to
+/// prove `GET /admin/segment-store` reports `shards: null` for it (no
+/// per-node replica concept there — see `SegmentStoreHandle::put_sealed`'s
+/// own doc).
+async fn bring_up_with_fs_segment_store(
+    n: usize,
+    dir: &std::path::Path,
+    segment_store_dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs {
+                    seal_bytes: 1,
+                    seal_age: Duration::from_secs(3600),
+                },
+                animusd::SegmentStoreConfig::Fs(
+                    segment_store_dir.join(format!("attempt-{attempt}")),
+                ),
+                Duration::from_secs(600),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -2710,6 +2781,168 @@ async fn admin_gc_reports_segment_janitor_progress_and_leader_state() {
         assert_eq!(
             follower_after["leader"], false,
             "a follower still reports leader: false after the drop: {follower_after}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07's fourth and
+/// last route): a real 3-node cluster with DynamoDB Streams enabled and the
+/// default `cluster` segment store — creates a streamed table, writes one
+/// item, waits for it to seal into a `stream_shards` catalog row (the
+/// row's own `replicas` recorded by `ClusterSegmentStore::put_replicated`
+/// at seal time), then polls converged-or-timeout until SOME node's own
+/// route shows `local_objects.count >= 1` — proving that node actually
+/// holds a physical copy locally, not merely that the catalog row exists.
+/// Every node is then asserted to report the identical `shards` array (the
+/// replicated catalog is identical everywhere, ADR 0038), and a separate
+/// single-node cluster configured with the `fs` opt-in reports
+/// `shards: null` (no per-node replica concept for a single shared
+/// directory every node already reads).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_segment_store_reports_shard_placement_and_local_objects() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+
+        // ---- baseline: every node's own route reports the configured
+        //      `cluster` store and an honest (possibly empty) local scan --
+        for node in &nodes {
+            let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+            assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+            assert_eq!(v["store"]["kind"], "cluster", "the configured cluster store: {v}");
+            assert!(
+                v["local_objects"]["count"].as_u64().is_some(),
+                "local_objects.count is always present (even zero): {v}"
+            );
+            assert!(v["shards"].is_array(), "shards is an array for the cluster kind: {v}");
+        }
+
+        // ---- create a streamed table and write one item through the admin
+        //      dynamo proxy on any node (it forwards internally) ------------
+        let any_addr = nodes[0].admin_addr();
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- wait for the write to seal into a catalog row (seal_bytes: 1
+        //      means this should be near-immediate) ---------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if !nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no sealed stream-shard row appeared within 20s");
+
+        // ---- poll converged-or-timeout: SOME node's own route shows it
+        //      physically holds at least one local object -------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+                    assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+                    if v["local_objects"]["count"].as_u64().unwrap_or(0) >= 1 {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no node's own /admin/segment-store ever reported local_objects.count >= 1");
+
+        // ---- every node eventually reports the identical shard placement
+        //      — the replicated catalog is the same everywhere (ADR 0038),
+        //      but each node's own local control Raft applies the
+        //      `SealStreamShard` commit independently, so this is a
+        //      converged-or-timeout poll, never a one-shot snapshot -------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let mut views = Vec::with_capacity(nodes.len());
+                let mut all_non_empty = true;
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+                    assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+                    let shards = v["shards"].clone();
+                    if shards.as_array().is_none_or(|a| a.is_empty()) {
+                        all_non_empty = false;
+                    }
+                    views.push(shards);
+                }
+                if all_non_empty && views.windows(2).all(|w| w[0] == w[1]) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "every node never converged on the identical, non-empty shard->replica \
+             placement within 20s",
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/segment-store` on a node configured with the single-shared-
+/// directory `fs` opt-in reports `shards: null` — there is no per-node
+/// replica concept to report when every node already reads the identical
+/// directory (see `SegmentStoreHandle::put_sealed`'s own doc for the
+/// empty-`replicas`/"ask any node" convention this mirrors).
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_segment_store_reports_null_shards_for_the_fs_kind() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let segment_store_dir = dir.path().join("fs-segment-store");
+        let (nodes, _config) =
+            bring_up_with_fs_segment_store(1, dir.path(), &segment_store_dir).await;
+        await_bootstrap(&nodes).await;
+
+        let (s, v) = admin_get(nodes[0].admin_addr(), "/admin/segment-store").await;
+        assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+        assert_eq!(v["store"]["kind"], "fs", "the configured fs: store: {v}");
+        assert!(
+            v["shards"].is_null(),
+            "the fs kind has no per-node placement: {v}"
+        );
+        assert!(
+            v["local_objects"]["count"].as_u64().is_some(),
+            "local_objects.count is still reported for the fs kind: {v}"
         );
 
         for node in &nodes {

@@ -636,6 +636,75 @@ follower reports `leader: false` and stays `idle` throughout),
 `segment_janitor::orphan_reap_tests`' own extended progress-count
 assertions.
 
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/segment-store`
+
+The fourth and last of U-07's observability routes, copying `/admin/
+backup-store`'s own template a third time: `GET /admin/segment-store`
+(ADR 0043 §A7b) surfaces this node's own configured DynamoDB Streams
+segment store (kind + a credential-safe `location`, `redact_store_
+location`'s own second reuse), the **shard→replica placement** every
+sealed stream shard was given, and a bounded live scan of this node's own
+local object count/bytes. **This closes docs/roadmap.md's whole U-07
+section** — every one of its four bullets has now landed; see ADR 0043's
+own matching amendment for why the shard-placement half of this route
+lives in that ADR's territory rather than this one's.
+
+**The one genuinely new idea this route adds over its three siblings**:
+a shard's replica set is decided exactly once, at seal time, by
+`ClusterSegmentStore::put_replicated`'s own placement selection, and
+recorded durably right there in `Metadata::stream_shards`'s own
+`StreamShardRow::replicas` field — so this route reads that already-agreed
+record (identical on every node, ADR 0038) rather than recomputing
+placement a second way. `shards` is an array of `{shard, replicas, local}`
+— `shard` rendered via `animus_cp_data::segment::shard_id` (`shardId-
+<tablet>-<epoch>`, ADR 0042 §2's own wire id), `replicas` the recorded
+node ids, `local` whether this node's own id is among them — for the
+default `cluster` store kind; `null` for the single-shared-directory `fs`
+opt-in, which has no per-node replica concept at all (every node already
+reads the identical directory — the same "empty `replicas`, ask any node"
+signal `SegmentStoreHandle::put_sealed`'s own doc already documents for
+that variant).
+
+`local_objects` is the identical bounded-scan shape `/admin/backup-store`'s
+own `objects` field uses (`SegmentStoreHandle::list_local`/`get_local`,
+capped at 200 objects with `truncated: true` past the cap) — but scans the
+WHOLE local segment directory rather than a namespace prefix, since a
+segment id carries no fixed top-level namespace the way a backup object's
+`backup/` prefix does; this is safe because the segment store's own local
+directory (`dir.join("segments")`) is already disjoint from the backup
+store's (`dir.join("backups")`).
+
+**Unlike `/admin/backup-store`/`/admin/gc`, this route publishes no
+janitor/reaper progress of its own** — the segment janitor's own progress
+is already `GET /admin/gc`'s job; this route reports a durable catalog
+fact (placement) and a live local scan (object count/bytes), never a
+loop's phase. Wired through the full conventional stack: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+segment_store_view` method (`crates/animus-node/src/host.rs`) and its
+`FakeHost` stub/dispatch test, a handler in `crates/animusd/src/admin.rs`,
+`animus admin segment-store <admin-addr>` (`animus-cli`), and a new
+read-only "Segment store" card on the **Storage** tab
+(`dashboard_storage.js`/`dashboard.html`, `#seg-store-card`/
+`#seg-store-body`) beside the TTL reaper and GC cards. **Fed from
+`dashboard_core.js`'s existing PER-NODE `loadAll()` fan-out
+(`STATE.nodes[*].segmentStore`), not a single SEED-only fetch** — like
+`/admin/ttl` and unlike `/admin/backup-store`/`/admin/gc` — because this
+route's own `local_objects`/`local` fields are genuinely per-node facts
+(the lesson recorded when `/admin/ttl` landed: a card's fetch shape must
+match its route's own gating, not whichever shape the most recently added
+similar route happens to use).
+
+Regression: `tests/admin_endpoint.rs::
+admin_segment_store_reports_shard_placement_and_local_objects` (a real
+3-node cluster with the default `cluster` segment store — create a
+streamed table, write, wait for the write to seal, poll converged-or-
+timeout until some node's own route shows `local_objects.count >= 1`, then
+poll converged-or-timeout until every node reports the identical,
+non-empty shard→replica placement) and `admin_segment_store_reports_null_
+shards_for_the_fs_kind` (a single node configured with the `fs:` opt-in
+reports `shards: null`), plus `tests/dashboard_endpoint.rs::
+dashboard_u07_segment_store_card`.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

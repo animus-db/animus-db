@@ -7,7 +7,7 @@
 // (The bulk-seed tool used to live here too; it writes real DynamoDB items
 // now, so it moved to the Data Browser's DynamoDB panel,
 // `dashboard_browser.js`.) Depends on `dashboard_core.js` (STATE, $, esc,
-// pill, getJSON, bytes, nodeIdOf, syncStorageUrl,
+// pill, getJSON, bytes, humanBytes, nodeIdOf, syncStorageUrl,
 // applyPendingStorageParams, pendingStorageParams) and
 // `dashboard_streams.js` (monoDuration — the TTL reaper card's own
 // `last_tick_at_ms` renderer; see that function's own doc for why an
@@ -33,6 +33,15 @@
 // Backups tab's own card covers — and "storage janitor diagnostics" is
 // exactly this tab's existing theme (the TTL reaper card sits here for the
 // identical reason).
+//
+// docs/roadmap.md U-07's fourth and last route: a read-only "Segment
+// store" card beside it, fed from each node's own `GET /admin/segment-store`
+// (`STATE.nodes[*].segmentStore`, `dashboard_core.js`'s existing per-node
+// loadAll() fan-out) — per-node like the TTL reaper card above, not
+// SEED-only like the GC/backup-store cards, since this route's own
+// `local_objects`/`local` fields are genuinely per-node facts (the lesson
+// recorded when `/admin/ttl` landed: a card's fetch shape must match its
+// route's own gating).
 
 // docs/roadmap.md U-07: the "TTL reaper" card — every TTL-enabled table
 // (from any node that answered, since the catalog is identical everywhere)
@@ -110,9 +119,47 @@ function renderGcJanitor() {
   el.innerHTML = rows.join("");
 }
 
+// docs/roadmap.md U-07's fourth and last route: the "Segment store" card
+// — the shard→replica placement every node sees (identical everywhere,
+// since it's a replicated catalog fact; `null`/absent for the single-
+// shared-directory `fs` opt-in) plus one row per reachable node showing
+// its own store kind/location and a bounded local object count/bytes,
+// straight off `GET /admin/segment-store`'s response shape (`{store,
+// shards, local_objects}`).
+function renderSegmentStore() {
+  const el = $("seg-store-body");
+  if (!el) return;
+  const nodes = STATE.nodes.filter((n) => n.ok);
+  if (!nodes.length) { el.innerHTML = `<div class="empty">unavailable</div>`; return; }
+  const withShards = nodes.find((n) => n.segmentStore && Array.isArray(n.segmentStore.shards));
+  const shards = (withShards && withShards.segmentStore.shards) || [];
+  const shardRows = shards.length
+    ? shards.map((s) => `<div class="list-row"><span class="detail">${esc(s.shard)}</span><span class="status-text mono">${(s.replicas || []).join(", ") || "—"}</span></div>`).join("")
+    : `<div class="list-row"><span class="detail">${withShards ? "no shards yet" : "no shard placement (fs store, or unavailable)"}</span></div>`;
+  const nodeRows = nodes.map((n) => {
+    const s = n.segmentStore;
+    if (!s) {
+      return `<div class="list-row"><span class="id">${esc(n.addr)}</span><span class="muted">unavailable</span></div>`;
+    }
+    const store = s.store;
+    const lo = s.local_objects;
+    return `
+      <div class="list-row">
+        <span class="id">${esc(n.addr)}</span>
+        <span class="status-text mono">${store ? esc(store.kind) + (store.location ? " · " + esc(store.location) : "") : "—"}</span>
+      </div>
+      <div class="list-row"><span class="detail">&nbsp;&nbsp;local objects</span><span class="status-text mono">${
+        lo ? `${esc(lo.count)}${lo.truncated ? "+" : ""} obj · ${esc(humanBytes(lo.bytes))}${lo.truncated ? " (partial)" : ""}` : "—"
+      }</span></div>
+    `;
+  }).join("");
+  el.innerHTML = shardRows + nodeRows;
+}
+
 function renderStorageSelectors() {
   renderTtlReaper();
   renderGcJanitor();
+  renderSegmentStore();
   const status = STATE.status;
   const tablets = status && status.tablets ? Object.keys(status.tablets).map(Number).sort((a, b) => a - b) : [1];
   const tsel = $("st-tablet");

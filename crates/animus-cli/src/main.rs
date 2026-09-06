@@ -149,7 +149,7 @@ async fn maybe_tls_connect(
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
-    peers|txns|backups|restores|backup-store|ttl-reaper|gc|control-members|storage-control <admin-addr>\n    \
+    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
@@ -338,6 +338,11 @@ fn admin_request(
         // and counters (control-plane-leader-only, exactly like
         // `backup-store` above).
         "gc" => ("GET", "/admin/gc".into(), None),
+        // `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07): this
+        // node's own configured stream-segment store, the shard→replica
+        // placement it sees (`cluster` kind only), and a bounded local
+        // object count/bytes.
+        "segment-store" => ("GET", "/admin/segment-store".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
@@ -1133,6 +1138,7 @@ mod tests {
             ("backup-store", "/admin/backup-store"),
             ("ttl-reaper", "/admin/ttl"),
             ("gc", "/admin/gc"),
+            ("segment-store", "/admin/segment-store"),
             ("control-members", "/admin/control/members"),
             ("storage-control", "/admin/storage/control"),
         ];

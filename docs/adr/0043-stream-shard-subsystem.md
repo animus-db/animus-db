@@ -1002,3 +1002,51 @@ See ADR 0020's own matching 2026-09-06 as-built note for the full route
 design (the exact JSON shape, the dashboard card, and why
 `dropped_tables_pending` — a different subsystem entirely, ADR 0024's
 drop-table GC — was deliberately not added) and the test references.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/segment-store`)
+
+A second new observability route, `GET /admin/segment-store`, closes
+docs/roadmap.md's whole U-07 batch — the fourth and last of its four
+routes, copying `GET /admin/backup-store`'s own template a third time
+(that route's own ADR 0020 as-built note, and this section's own sibling
+above for `GET /admin/gc`, are the fuller write-ups this amendment does
+not repeat). Unlike `/admin/gc`, this route's territory is §A7b
+(`ClusterSegmentStore`'s own placement machinery), not §A9 (the janitor).
+
+**What it reports that no other route does**: for the default `cluster`
+segment-store kind, the shard→replica **placement** every sealed stream
+shard was given — read straight off `Metadata::stream_shards`'s own
+`StreamShardRow::replicas` field, itself populated once, at seal time, by
+`ClusterSegmentStore::put_replicated`'s own placement selection (§A7b
+above) — never recomputed a second way. `null` for the single-shared-
+directory `fs` opt-in, which has no per-node replica concept at all (the
+`put_sealed`/`get_sealed` "empty `replicas`, ask any node" convention
+§A7b's own K-replication section already documents). Alongside it, a
+bounded live local-object scan mirroring `/admin/backup-store`'s own
+`objects` field exactly, but over the store's WHOLE local directory rather
+than a namespace prefix — a segment id has no fixed top-level namespace
+the way a backup object's `backup/` prefix does (§ above,
+`{table}/{label}/{tablet}/{epoch}/...`), and this is safe only because the
+segment store's own local directory (`dir.join("segments")`) is already
+physically disjoint from the backup store's (`dir.join("backups")`).
+
+No new capability trait, and no new per-loop progress type: this route
+publishes a durable catalog fact plus a local scan, never a janitor's own
+phase (that is already `GET /admin/gc`'s job) — `animus_node::host::
+AdminHost` gained one more route-dispatch method, `segment_store_view`,
+the same "one method per route" shape every other route already uses.
+
+Wired through the identical conventional stack every U-07 route uses: a
+match arm in `crates/animus-node/src/admin.rs`'s dispatch table, the
+`AdminHost::segment_store_view` method (`crates/animus-node/src/host.rs`)
+and its `FakeHost` stub/dispatch test, a handler in
+`crates/animusd/src/admin.rs`, `animus admin segment-store <admin-addr>`
+(`animus-cli`), and a new read-only "Segment store" card on the Storage
+tab (`dashboard_storage.js`'s `#seg-store-card`/`#seg-store-body`, beside
+the TTL reaper and GC cards) — fed from `dashboard_core.js`'s existing
+PER-NODE `loadAll()` fan-out, like `/admin/ttl`, since this route's own
+`local_objects`/`local` fields are genuinely per-node facts.
+
+See ADR 0020's own matching 2026-09-06 as-built note for the full route
+design (the exact JSON shape, the placement/local-scan reasoning, and the
+dashboard card) and the test references.
