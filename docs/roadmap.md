@@ -163,9 +163,31 @@ the still-true paragraph after the table.
   injection. Gate the work on a `ProdEnv` wall-clock benchmark at
   realistic tablet density first: concurrent fsyncs to different files
   may already be cheap on some media.
+- **PR 1 landed 2026-09-06**
+  (`crates/animus-cp-data/benches/wal_fsync_bench.rs`, `cargo bench -p
+  animus-cp-data --bench wal_fsync_bench`; full method/numbers/threshold in
+  `docs/design/shared-wal-fsync-benchmark.md`, ADR 0028's matching
+  2026-09-06 amendment). **The open question above is answered NO on this
+  host's media** (a real block-device-backed `ext4` filesystem, not
+  `tmpfs`/`overlay`): concurrent fsyncs to K distinct per-group files are
+  NOT already cheap at realistic tablet density — round latency scales
+  with K (p50 ~500us at K=1 → ~10.5–11.2ms at K=128, p99 up to ~25–43ms),
+  while the same burst through the unwired `SharedWal::append` API stays
+  nearly flat (~1.4–1.6ms p50 at K=128) with the measured fsync count
+  dropping from 128 to ~2 — a ~7–8x p50 / ~15–20x p99 win at K=128, held
+  across three runs. A single-group 32-write control (also via
+  `SharedWal`, standing in for `persist_round.rs`'s own already-shipped
+  per-group group commit) confirms the gap is genuinely cross-group, not a
+  within-group coalescing gap.
+- **Recommendation (from PR 1): proceed with PR 2/3 as planned** — wire
+  `SharedWal` behind a flag with the cross-tablet ordering corpus, segment
+  GC, and crash-mid-roll fault injection (`ANIMUS_SHAREDWAL_SEEDS`) named
+  above, then cut over. Next step: **C-05 PR 2**.
 - **Files:** `crates/animus-control/src/shared_wal.rs` (stays as is),
-  `crates/animus-cp-data/src/lib.rs` persist path.
-- **ADR:** amend 0028 on wiring. **PRs:** (1) `ProdEnv` benchmark;
+  `crates/animus-cp-data/src/lib.rs` persist path,
+  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (PR 1, landed).
+- **ADR:** amend 0028 on wiring (0028's 2026-09-06 amendment records PR 1's
+  own numbers/recommendation). **PRs:** (1) `ProdEnv` benchmark — **done**;
   (2) wire behind a flag + corpus; (3) cutover. **Size:** L.
 
 ---

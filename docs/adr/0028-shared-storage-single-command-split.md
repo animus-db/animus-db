@@ -317,3 +317,43 @@ did. **Update (2026-08-14, ADR 0044): tablet merge, `MergeTablets`, and
 the F1 stopgap guarding it are all removed entirely — tablets are
 split-only.** A tablet's range only ever narrows now; "widen" no longer
 describes anything a tablet's range does.
+
+## Amendment (2026-09-06, C-05 PR 1 benchmark)
+
+The "Costs and risks knowingly accepted" section above deferred wiring
+`SharedWal` (`animus-control::shared_wal`) into the per-tablet WAL path,
+pending "its own segment-GC design and fault-injection tests." A later,
+now-superseded roadmap pass briefly recommended deleting `SharedWal`
+outright, reasoning from ADR 0048's "apply-poll term dominated" finding —
+that finding is about **idle** cost, which quiescence (ADR 0044 phase 1)
+already closes; it says nothing about **active-load** cross-group fsync
+cost, which is `SharedWal`'s actual target and which quiescence does not
+touch. `docs/roadmap.md`'s C-05 entry reversed that recommendation
+(2026-09-02) on exactly this basis, once a `SimEnv` measurement (a
+throwaway harness) confirmed the structural K-fsyncs-for-K-groups cost is
+real and uncoalesced today.
+
+This PR supplies the `ProdEnv` wall-clock benchmark the roadmap's own C-05
+entry named as the prerequisite before committing to the wiring work:
+`crates/animus-cp-data/benches/wal_fsync_bench.rs`
+(`cargo bench -p animus-cp-data --bench wal_fsync_bench`), full method and
+numbers in `docs/design/shared-wal-fsync-benchmark.md`. **Result: on this
+host's real block-device-backed filesystem (ext4 on `/dev/vda`, not a
+memory-backed `tmpfs`/`overlay` mount), concurrent fsyncs to K distinct
+per-group WAL files are NOT already cheap at realistic tablet density** —
+round latency scales with K (K=1 ~500us → K=128 ~10.5–11.2ms p50, ~25–43ms
+p99), while routing the identical burst through the already-built,
+unwired `SharedWal::append` API instead keeps latency nearly flat
+regardless of K (~1.4–1.6ms p50 at K=128) and cuts the measured fsync
+count from 128 to ~2 per round. Held consistently across three independent
+runs.
+
+**Recommendation: wire `SharedWal` (C-05 PR 2), then cut over (C-05 PR
+3)** — see the design note for the full threshold, numbers, and the
+single-group control that isolates this as a genuinely cross-group gap,
+not a per-group group-commit gap (`persist_round.rs` already closes the
+latter in production, independent of `SharedWal`). This benchmark's own
+numbers are host-specific and not a media-independent claim — a
+maintainer re-running it on `tmpfs`/`overlay` media should expect the gap
+to shrink and should read the bench's own printed media line before
+trusting a number gathered elsewhere.

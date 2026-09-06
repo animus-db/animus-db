@@ -243,6 +243,17 @@ per-tablet CP data plane (`animus-cp-data`).
   costs K fsyncs with no cross-group coalescing, a cost quiescence (ADR
   0048) does not address, so this is the right mechanism and wiring it
   into `animus-cp-data`'s persist path is a dedicated L-sized PR.
+  **Gated and confirmed worth it on real disk (C-05 PR 1, 2026-09-06)**:
+  `crates/animus-cp-data/benches/wal_fsync_bench.rs` measures this exact
+  API directly (unwired, called straight from the bench) against real
+  `ProdEnv` I/O — on this host's real block-device-backed filesystem, a
+  burst across K=128 groups costs ~10.5–11.2ms p50 as K separate per-group
+  fsyncs vs. ~1.4–1.6ms p50 routed through `SharedWal::append` into one
+  file, with the measured fsync count dropping from 128 to ~2. See
+  `docs/design/shared-wal-fsync-benchmark.md` for the full method/numbers
+  and ADR 0028's matching 2026-09-06 amendment. Recommendation: wire it
+  (C-05 PR 2, then PR 3's cutover) — not yet done, this module itself is
+  unchanged by PR 1.
 
 - **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
   key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =

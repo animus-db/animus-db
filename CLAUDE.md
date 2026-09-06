@@ -120,6 +120,7 @@ cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
+cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)
 ```
 
 All five gates (fmt, clippy `-D warnings`, build, test, deny) must be green; CI
@@ -163,6 +164,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `animus-storage`'s `engine_bench` workload tuning |
 | `ANIMUS_BENCH_{NODES,ITEMS,OPS,VALUE_BYTES,CLIENTS,JSON}` | — | `animusd`'s `cluster_bench` workload tuning (node count, preload size, measured ops/class, item size, concurrent-client sweep, JSON output path) |
+| `ANIMUS_BENCH_GROUPS` | `1,8,32,128` | `animus-cp-data`'s `wal_fsync_bench` active-tablet-count sweep (per-group-files vs. `SharedWal` fsync/latency comparison, C-05 PR 1) |
+| `ANIMUS_BENCH_ROUNDS`/`ANIMUS_BENCH_VALUE_BYTES`/`ANIMUS_BENCH_JSON` | `20`/`96`/unset | `wal_fsync_bench`'s own round count, per-write payload size, and JSON output path (same knob name/shape as the other two benches above) |
 
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.

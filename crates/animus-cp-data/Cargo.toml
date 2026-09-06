@@ -45,9 +45,11 @@ async-trait.workspace = true
 
 [dev-dependencies]
 # This crate's own library never constructs a `ProdEnv` — only its real-thread
-# regression tests do (`tests/prod_concurrent_ts_monotonic.rs`,
-# `tests/prod_compaction_persist_round.rs`), so `prod` is opted into here, not
-# on the `[dependencies]` entry above (ADR 0061 rung C0).
+# regression tests (`tests/prod_concurrent_ts_monotonic.rs`,
+# `tests/prod_compaction_persist_round.rs`) and, since C-05 PR 1,
+# `benches/wal_fsync_bench.rs` (a `ProdEnv` wall-clock macro-benchmark, ADR
+# 0061 Decision 4) do — so `prod` is opted into here, not on the
+# `[dependencies]` entry above (ADR 0061 rung C0).
 animus-env = { workspace = true, features = ["prod"] }
 animus-sim.workspace = true
 # Shared corpus seed-management scaffolding (ADR 0061 rung B1,
@@ -61,6 +63,9 @@ animus-test.workspace = true
 # `SimEnv`'s single-threaded cooperative scheduler (no `.await` point exists
 # between minting a ts and appending it to the log for two tasks to
 # interleave at), so this one test needs genuine OS-thread parallelism.
+# `benches/wal_fsync_bench.rs` also needs it directly (its own
+# `#[tokio::main(flavor = "multi_thread")]` entry point and its per-round
+# `tokio::spawn`ed writers).
 tokio.workspace = true
 # `codec.rs`'s never-panics/never-aborts fuzz property (arbitrary byte
 # sequences, including deliberately huge length prefixes, must always decode
@@ -69,6 +74,13 @@ tokio.workspace = true
 # `animus-placement`/`animus-dynamo` already use for their own codec/policy
 # property tests.
 proptest.workspace = true
+
+# Hand-rolled (no criterion, zero new dependencies), `harness = false`
+# `ProdEnv` wall-clock macro-benchmark (C-05 PR 1, ADR 0028) — mirrors
+# `animus-storage`'s own `[[bench]] engine_bench` stanza.
+[[bench]]
+name = "wal_fsync_bench"
+harness = false
 
 # Real-thread `ProdEnv` test (issue #286/#280): an explicit `[[test]]` stanza
 # so `required-features` can gate it off the default `cargo test` run. Adding

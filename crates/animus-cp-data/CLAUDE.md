@@ -1884,3 +1884,33 @@ reconciler-adoption rung's own fault-injection coverage — see this file's
 - **Run at depth**: `ANIMUS_RECONCILER_SEEDS=K cargo test -p animus-cp-data
   --test reconciler_corpus reconciler_corpus_runs_every_scenario` (default
   `K=1`; held green through `K=300` in ~52s).
+
+## Benchmark
+
+`benches/wal_fsync_bench.rs` (`cargo bench -p animus-cp-data --bench
+wal_fsync_bench`, C-05 PR 1, ADR 0028) is a hand-rolled (no criterion,
+zero new dependencies), `harness = false` **`ProdEnv` wall-clock**
+benchmark — mirrors `animus-storage`'s `engine_bench`/`animusd`'s
+`cluster_bench` in style. It answers the gating question `docs/roadmap.md`'s
+C-05 entry named before committing to wiring `animus-control`'s unwired
+`SharedWal` into this crate's persist path: whether K concurrent per-group
+WAL fsyncs are already cheap on real media, or genuinely cost more than
+`SharedWal`'s coalesced alternative. It measures round latency (p50/p99,
+plus a real, instrumented `Disk::sync` count — never assumed from the code
+shape) for a burst of one write to each of `K` active groups, three ways:
+today's per-group files (concurrent and sequential), and the real,
+already-built `SharedWal::append` API called directly (unwired — the bench
+proves what wiring it in *would* buy, without touching production code),
+plus a fixed single-group 32-write control isolating the effect to the
+cross-group case. Workload knobs: `ANIMUS_BENCH_GROUPS` (default
+`1,8,32,128`), `ANIMUS_BENCH_ROUNDS` (default `20`),
+`ANIMUS_BENCH_VALUE_BYTES` (default `96`), `ANIMUS_BENCH_JSON` (unset — a
+file path to also write results as JSON). Full method, this host's
+measured numbers, the threshold used, and the recommendation are in
+`docs/design/shared-wal-fsync-benchmark.md`; ADR 0028 has the matching
+amendment. **Manual/local only, like its two siblings** — real disk I/O
+and real elapsed wall clock make it unsuitable for a shared CI runner's
+noise floor; run it locally, and never compare its numbers against a
+different host/session/media (the bench prints the resolved `/proc/mounts`
+filesystem type + device for whatever directory it writes into, so a
+reader never has to take the media on faith).
