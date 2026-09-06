@@ -88,6 +88,10 @@ on:
         description: "Seeds per scenario (ANIMUS_HEARTBEAT_SEEDS, ADR 0044 phase 2 heartbeat-batcher fault corpus)"
         required: false
         default: "40"
+      sharedwal_seeds:
+        description: "Seeds per cell (ANIMUS_SHAREDWAL_SEEDS, ADR 0028 C-05 PR 2 SharedWal cross-tablet ordering/crash-safety/GC fault corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -381,6 +385,21 @@ jobs:
           ANIMUS_HEARTBEAT_SEEDS: ${{ github.event.inputs.heartbeat_seeds || '40' }}
         run: cargo test -p animus-cp-data --test heartbeat_batch_corpus -- --nocapture
 
+      # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
+      # coalescing under a burst of concurrent hosted-group writes, a crash
+      # mid-round proving no cross-tablet contamination and whole-or-absent
+      # recovery of the racy write, forget-driven per-tablet GC leaving
+      # sibling tails untouched, and a quiet tablet surviving a noisy
+      # sibling's real compaction, scaled to depth. Each cell is a pure
+      # function of its seed, so a failure names one cell + seed and is
+      # replayable.
+      - name: deep SharedWal fault corpus (ADR 0028, C-05 PR 2)
+        id: sharedwal
+        continue-on-error: true
+        env:
+          ANIMUS_SHAREDWAL_SEEDS: ${{ github.event.inputs.sharedwal_seeds || '40' }}
+        run: cargo test -p animus-cp-data --test sharedwal_fault_corpus -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -413,10 +432,11 @@ jobs:
             [simcluster]="${{ steps.simcluster.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
+            [sharedwal]="${{ steps.sharedwal.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster export_import heartbeat; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster export_import heartbeat sharedwal; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

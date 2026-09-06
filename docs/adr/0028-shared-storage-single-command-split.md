@@ -317,3 +317,298 @@ did. **Update (2026-08-14, ADR 0044): tablet merge, `MergeTablets`, and
 the F1 stopgap guarding it are all removed entirely — tablets are
 split-only.** A tablet's range only ever narrows now; "widen" no longer
 describes anything a tablet's range does.
+
+## Amendment (2026-09-06, C-05 PR 1 benchmark)
+
+The "Costs and risks knowingly accepted" section above deferred wiring
+`SharedWal` (`animus-control::shared_wal`) into the per-tablet WAL path,
+pending "its own segment-GC design and fault-injection tests." A later,
+now-superseded roadmap pass briefly recommended deleting `SharedWal`
+outright, reasoning from ADR 0048's "apply-poll term dominated" finding —
+that finding is about **idle** cost, which quiescence (ADR 0044 phase 1)
+already closes; it says nothing about **active-load** cross-group fsync
+cost, which is `SharedWal`'s actual target and which quiescence does not
+touch. `docs/roadmap.md`'s C-05 entry reversed that recommendation
+(2026-09-02) on exactly this basis, once a `SimEnv` measurement (a
+throwaway harness) confirmed the structural K-fsyncs-for-K-groups cost is
+real and uncoalesced today.
+
+This PR supplies the `ProdEnv` wall-clock benchmark the roadmap's own C-05
+entry named as the prerequisite before committing to the wiring work:
+`crates/animus-cp-data/benches/wal_fsync_bench.rs`
+(`cargo bench -p animus-cp-data --bench wal_fsync_bench`), full method and
+numbers in `docs/design/shared-wal-fsync-benchmark.md`. **Result: on this
+host's real block-device-backed filesystem (ext4 on `/dev/vda`, not a
+memory-backed `tmpfs`/`overlay` mount), concurrent fsyncs to K distinct
+per-group WAL files are NOT already cheap at realistic tablet density** —
+round latency scales with K (K=1 ~500us → K=128 ~10.5–11.2ms p50, ~25–43ms
+p99), while routing the identical burst through the already-built,
+unwired `SharedWal::append` API instead keeps latency nearly flat
+regardless of K (~1.4–1.6ms p50 at K=128) and cuts the measured fsync
+count from 128 to ~2 per round. Held consistently across three independent
+runs.
+
+**Recommendation: wire `SharedWal` (C-05 PR 2), then cut over (C-05 PR
+3)** — see the design note for the full threshold, numbers, and the
+single-group control that isolates this as a genuinely cross-group gap,
+not a per-group group-commit gap (`persist_round.rs` already closes the
+latter in production, independent of `SharedWal`). This benchmark's own
+numbers are host-specific and not a media-independent claim — a
+maintainer re-running it on `tmpfs`/`overlay` media should expect the gap
+to shrink and should read the bench's own printed media line before
+trusting a number gathered elsewhere.
+
+## Amendment (2026-09-06, C-05 PR 2 — `SharedWal` wired behind `--shared-wal`)
+
+`SharedWal` is now actually wired into `animus-cp-data`'s persist path,
+gated behind `--shared-wal`/`cluster_settings.shared_wal`, **additive
+default OFF** in this PR (byte-for-byte today's per-group-`wal_file`
+behavior when omitted; PR 3 is the still-pending default-flip cutover, the
+identical two-step shape `--heartbeat-batch`/C-02 used). This amendment
+records the design decisions PR 2 made; see `crates/animus-cp-data/
+CLAUDE.md` and `crates/animus-control/CLAUDE.md`'s `shared_wal.rs` entry
+for the mechanism-level detail.
+
+**`SharedWal` itself grew a second, group-aware API** (`animus-control::
+shared_wal`) on top of the PR-1-era raw `append`/`compact` pair (kept
+byte-for-byte unchanged, so `wal_fsync_bench.rs`'s own numbers stay
+reproducing the identical code path): `append_tagged`/`compact_group`/
+`forget`/`open`/`recovered_state`, backed by an in-memory `group_tails:
+BTreeMap<TabletId, Vec<WalRecord<C, S>>>` cache — each tablet's own
+currently-durable-on-the-shared-file record run. Every group-tails mutation
+and its corresponding physical-write enqueue happen inside the SAME
+critical section (the coordinator's pre-existing single-flight `inner`
+lock), which is the load-bearing property the round/ack and GC arguments
+below both rest on.
+
+- **Round/ack semantics.** A persist round's whole record batch is
+  submitted as ONE `append_tagged` call — one physical `Disk::append` +
+  `Disk::sync`, coalesced with any other hosted group's own overlapping
+  round (this is the mechanism PR 1's benchmark measured). The round's ack
+  fires only once that physical write actually lands, identical durability
+  semantics to the per-group file it replaces: a group's own entries are
+  durable in index order, one group's fsync never exposes a byte of
+  another's, and one group's truncation/compaction never blocks another's
+  append (each mutates only its own `group_tails` entry).
+- **Recovery indexing.** `SharedWal::open` is called exactly ONCE per node,
+  before any tablet's own driver starts (`RaftKvNode::start_inner`'s
+  `drive()` recovery step, gated on the constructor's `shared_wal: Option<
+  Arc<SharedWal<KvCommand, KvState>>>` — `None` is the untouched per-group
+  path). It reads the shared file once and demuxes it whole via
+  `PersistedState::decode_tagged`, seeding `group_tails` for every tablet
+  the file already holds; a tablet hosted later that was never in the file
+  starts with an empty (absent) tail, correctly. Each group's own recovery
+  is then `SharedWal::recovered_state(tablet)` — a `group_tails` lookup
+  plus `PersistedState::replay` — the shared-WAL analogue of a per-group
+  `env.read`+`decode`+`replay`, sourced from the one seeded read rather
+  than each tablet re-reading the file independently.
+- **GC policy and its bound.** There is no independent segment file to
+  reclaim — the coordinator holds one physical file, atomically rewritten
+  by `Disk::replace`. A tablet's own bytes are reclaimed the moment THAT
+  tablet itself calls `compact_group` (`apply_and_compact`'s existing
+  `COMPACT_THRESHOLD`/on-demand-image trigger, unchanged): its
+  `group_tails` entry is replaced by its fresh, minimal `wal_image()`
+  (snapshot + hard state + log tail), then the whole file is rewritten from
+  the union of every tablet's current `group_tails` entry. A DIFFERENT
+  tablet's compaction or append never touches another tablet's cached tail
+  except to re-include it verbatim in the rewrite — so one tablet's GC can
+  never reclaim (or lose) bytes another tablet still needs, and no tablet
+  ever waits on another's compaction to reclaim its own. Bound: the shared
+  file's size is the sum, over every hosted tablet, of that tablet's own
+  bytes accumulated since ITS OWN last compaction — identical to the sum of
+  today's per-group file sizes, just physically consolidated into one file
+  instead of N. `forget` (called from `host::Reconciler::
+  erase_tablet_files`'s shared-WAL branch, replacing the per-group
+  `env.remove(wal_file(tablet))` call) is the teardown-time counterpart: a
+  released/reclaimed tablet's bytes are dropped from `group_tails` and the
+  file rewritten without them at once, rather than waiting on some other
+  still-hosted tablet's next ordinary compaction.
+- **Crash safety.** Proven directly (`animus-control::shared_wal`'s own
+  unit tests, plus `animus-cp-data`'s `tests/sharedwal_fault_corpus.rs`
+  under real `RaftKvNode` groups): a crash mid-append, mid-sync, or
+  mid-rewrite yields, for every tablet, exactly its own last **durably
+  written** tail. This rests on two properties that were already true and
+  needed no change: `PersistedState::decode_tagged`'s per-record CRC32 +
+  torn-tail tolerance (issue #495) already drops a torn/corrupted trailing
+  record — and everything physically after it — rather than corrupting
+  recovery; and a torn/corrupted region can only ever be the file's
+  physical TAIL (append-only writes, `Disk::replace`'s own atomic swap), so
+  "stop the whole file at the first bad line, not per-tablet" (`decode_
+  tagged`'s own documented conservative choice) is safe by construction
+  here — every record physically before the tear, for every tablet, is
+  already fully valid. `decode_tagged`'s doc previously read "acceptable
+  since this shared-WAL path is currently unwired" — that sentence is now
+  stale and has been corrected in place; the residual it flagged was never
+  a real hazard, for the reason just given, not something this PR had to
+  close.
+- **Flag shape.** `--shared-wal` (bare boolean CLI flag, no `--no-shared-
+  wal` opt-out yet — meaningful only once PR 3 flips the default) /
+  `cluster_settings.shared_wal: Option<bool>`, threaded through the
+  identical `--config FILE --node I` and `--cluster N` entry points (and
+  no others yet) `--heartbeat-batch` reaches, via `host::Reconciler::
+  enable_shared_wal(Arc<SharedWal<..>>)` — mirroring `enable_heartbeat_
+  batching`'s "opt in once, applies to every group hosted from here on"
+  shape, except the `SharedWal::open` call itself (an `async` node-start
+  step) has to happen one layer up, in `BoundNode::start_with_growth`,
+  since a pure setter can't `.await`.
+- **Layout-mismatch handling — a LOUD refusal, not a silent reset
+  (corrected 2026-09-06).** The shared file (`animus_cp_data::SHARED_WAL =
+  "raftkv.wal.shared"`) and the per-group files (`wal_file(stream) =
+  "raftkv.wal.{stream}"`) live at disjoint names on the same data
+  directory — a flag flip against an existing data dir written under the
+  OTHER layout does not corrupt any *file*, since the newly-selected
+  layout's own name simply hasn't been written before. But an early draft
+  of this PR judged that a **silent** thing to allow, and it is not: the
+  layout not selected is simply never read, so a node started with the
+  flag flipped would recover every hosted tablet's `RaftCore` (log, term,
+  `voted_for`) as if it had never persisted anything on this node before —
+  a genuine **data-loss and Raft-safety hazard**, not a convenience, and
+  one PR 3's default flip would have inflicted on every existing cluster
+  the moment it landed. Fixed before this PR shipped: `animus_cp_data::
+  host::check_wal_layout(env, shared_wal) -> io::Result<()>` runs once, at
+  node start, **before** `SharedWal::open` and before any tablet's own
+  `drive()` recovery — a directory listing only (`Env::list()`, never a
+  file open) — and returns a hard `io::Error` naming both layouts and the
+  flag whenever `shared_wal` disagrees with what's already on disk
+  (per-group files present but `--shared-wal` is on; the shared file
+  present but it's off). `BoundNode::start_with_growth` calls it and
+  propagates the error with `?`, so it surfaces as an ordinary startup
+  failure — `main.rs` prints it and exits non-zero, the identical path
+  every other startup error already takes. A data directory holding
+  NEITHER layout yet (a genuinely fresh `--dir`) always passes. See
+  `animus-cp-data/CLAUDE.md`'s own `check_wal_layout` entry for the exact
+  error text and the unit tests (`host::wal_layout_tests`, both
+  directions) proving it, and `crates/animusd/tests/shared_wal_e2e.rs::
+  a_restart_with_shared_wal_flipped_refuses_to_start` for the real-`ProdEnv`
+  proof through the actual `run_node_with_cluster_settings` startup
+  surface. This closes the gap the original text below left open — kept
+  struck through rather than deleted, since the reasoning it gives for
+  *why a flag flip can't corrupt a file* is still correct and still worth
+  having on record: ~~No additional loud-failure check was added beyond
+  this — the reset is silent-but-safe (no corruption, no crash, no mixed
+  layout), which this PR judged sufficient for an internal, off-by-default
+  tuning flag; a future PR could add an explicit marker file + startup
+  check if the silent-reset behavior ever proves surprising in
+  practice.~~ There is still no migration path between the two layouts
+  (this repo's standing no-back-compat stance, root `CLAUDE.md`) — an
+  operator who genuinely wants to switch layouts still needs a fresh
+  cluster/data directory; the difference this fix makes is that doing so
+  *by accident* now fails loudly at startup instead of silently discarding
+  state.
+- **What PR 3 flips.** Only the default: `shared_wal.unwrap_or(false)`
+  becomes `shared_wal.unwrap_or(true)` at the same two resolution points
+  `DEFAULT_HEARTBEAT_BATCH` lives at (`main.rs`), plus (per that cutover's
+  own precedent) a `--no-shared-wal` opt-out flag and a real-thread
+  `ProdEnv` liveness proof mirroring `heartbeat_batch_liveness.rs`. The
+  mechanism itself (this PR) does not change.
+
+**Corpus**: `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`, depth
+knob `ANIMUS_SHAREDWAL_SEEDS` (default 1) — cross-group fsync coalescing
+under a real burst (cell a), crash-mid-round durability/isolation with
+`torn_tail_on_crash`/`corrupt_on_crash` armed (cell b), `forget`'s GC
+reclaim without disturbing a sibling (cell c), and a quiet group's write
+surviving a churning sibling's real `COMPACT_THRESHOLD`-crossing compaction
+(cell d). See that file's own module doc for what it deliberately does NOT
+cover (a shared-WAL-aware `raftkv_linearizable` `LeaderKill`/`FollowerKill`
+harness — a larger, separately-scoped harness change) and
+`crates/animusd/tests/shared_wal_e2e.rs` for the real-`ProdEnv`/real-disk
+complement (two tables, a genuine process restart, `--shared-wal` on).
+
+## Amendment (2026-09-06, C-05 PR 3 — cutover, as built)
+
+`--shared-wal`/`cluster_settings.shared_wal` now defaults **ON** —
+`main::DEFAULT_SHARED_WAL = true` at the same two resolution points
+`DEFAULT_HEARTBEAT_BATCH` lives at (`main.rs`'s `run_in_process_cluster`
+call and `run_single`), exactly the flip the PR 2 amendment's own "What PR
+3 flips" paragraph predicted. `--no-shared-wal` is the new opt-out (a bare
+boolean, mirroring `--heartbeat-batch`/`--no-heartbeat-batch`'s shape
+exactly); `--shared-wal` is kept as a no-op restating the default, for
+explicit/scripted invocations. **The mechanism itself (PR 2) is
+unchanged** — this PR is the default flip plus its two required proofs,
+the identical two-step shape C-02 (heartbeat batching) used.
+
+- **Layout-mismatch messages now read the way round the default runs.**
+  Both `animus_cp_data::host::check_wal_layout` error strings were
+  rewritten (not just their surrounding doc comments) since "omit the
+  flag" is no longer a valid fix once the flag defaults to `true`: the
+  `shared_wal: true` (now-default) branch — hit by any pre-cutover
+  per-group data directory on a plain upgrade with no flag passed at all —
+  now says to pass `--no-shared-wal`; the `shared_wal: false`
+  (`--no-shared-wal` passed) branch against an existing shared-layout
+  directory now says to *omit* `--no-shared-wal`, never to pass
+  `--shared-wal` (a no-op restating the value that's already the default).
+  Both directions still carry "Refusing to start" and "persisted Raft
+  state" verbatim — the substrings `host::wal_layout_tests` and
+  `crates/animusd/tests/shared_wal_e2e.rs::
+  a_restart_with_shared_wal_flipped_refuses_to_start` already asserted,
+  both of which pass unmodified; each `wal_layout_tests` case additionally
+  now asserts the exact new opt-out/omit phrasing.
+- **`animusd data --config`'s gap, closed.** PR 2 wired only the two
+  primary production entry points (`--config/--node` and `--cluster N`)
+  all the way through, leaving `cluster_settings.shared_wal` silently
+  ignored on a data-only node — a real gap, not the documented
+  `--cluster-control`/`--cluster-data`/`join`/`data --seed` scope cut PR
+  2's own amendment named (those stay hardcoded `false`, unaffected, the
+  identical gap `--heartbeat-batch` has at the same call sites). Since
+  `heartbeat_batch` already reached this path and PR 3 is the moment the
+  default flips everywhere else, leaving a split deployment's data-only
+  nodes permanently on the per-group layout with no way to opt in would
+  have been a new, worse inconsistency at the exact moment this cutover
+  ships — so `BoundDataNode::start_data_with_growth` gained the matching
+  trailing `shared_wal: bool` parameter and its own
+  `check_wal_layout`/`SharedWal::open`/`enable_shared_wal` call sequence,
+  byte-identical in shape to `BoundNode::start_with_growth`'s combined-mode
+  one; `run_node_data_with_cluster_settings` and `main.rs`'s
+  `run_data_config` now thread `settings.shared_wal.unwrap_or
+  (DEFAULT_SHARED_WAL)` through it. Every other documented gap
+  (`--cluster-control`/`--cluster-data`, `join`/`data --seed`, and every
+  narrower test/convenience wrapper) is unaffected — see `crates/animusd/
+  CLAUDE.md`'s "Shared WAL" section for the current, complete enumeration.
+- **Real-thread `ProdEnv` liveness proof under sustained load**:
+  `crates/animusd/tests/shared_wal_liveness.rs`, mirroring
+  `heartbeat_batch_liveness.rs`'s own role. A 3-node cluster hosting four
+  tablet groups (one per table) with the shared WAL on by default (no flag
+  passed) takes continuous concurrent writes across all four tables for a
+  fixed wall interval — every acked write immediately verified readable
+  over the linearizable `ConsistentRead`-equivalent path — long enough for
+  each table to cross `COMPACT_THRESHOLD` (64) and force a real
+  `SharedWal::compact_group` rewrite mid-load, not just append coalescing;
+  `GET /admin/metrics`'s `cp_shared_wal_gc_rewrites` counter (summed across
+  every node) is then polled to a nonzero value, direct proof the shared
+  WAL's segment GC actually ran under real concurrent load without
+  stalling the writer tasks' own timeouts. The busiest leader node (most
+  groups led) is then killed mid-test and every group it led re-elects
+  within a bounded budget, with reads/writes continuing via the survivors.
+  Run 5x locally with no flake.
+- **Full-gate soak**: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo build --workspace
+  --all-targets` (this time including `animusd`, closing the one residual
+  PR 2's own soak left — it had run with `--exclude animusd`), and `cargo
+  test --workspace` — the whole point of the cutover: every existing test
+  in the workspace now runs over the shared-WAL layout by default, so a
+  green `cargo test --workspace` here is itself the strongest evidence
+  that no other test anywhere silently assumed the per-group layout.
+  `ANIMUS_SHAREDWAL_SEEDS=20` against `sharedwal_fault_corpus.rs`, plus
+  `cargo deny check`, all green.
+- **The raftkv nemesis corpus gap named by PR 2's own module doc is still
+  open, deliberately** — `crates/animus-test/tests/raftkv_linearizable.rs`
+  builds its groups via the plain `RaftKvNode::start` constructor (used at
+  both its initial-bring-up and its crash-recovery-restart call sites),
+  which has no `shared_wal` parameter at all — a structurally different,
+  narrower constructor from the `start_hosted_*_with_shared_wal` family
+  `sharedwal_fault_corpus.rs` itself uses. Reaching the shared-WAL path
+  from that harness would mean threading one `Arc<SharedWal<..>>` through
+  every simulated node's own group set, reworking its `LeaderKill`/
+  `FollowerKill` nemesis handling and its crash-recovery restart path
+  (`RaftKvNode::start` → `SharedWal::open`+`recovered_state`) — the same
+  "larger, separately-scoped harness change" PR 2's own module doc already
+  declined to do, unchanged by the cutover. `sharedwal_fault_corpus.rs`'s
+  own cells (a)-(d) exercise the identical `persist_wal`/
+  `apply_and_compact`/`host::Reconciler::forget` code paths that harness's
+  groups would call if it were extended, and `shared_wal_liveness.rs`
+  above proves the real-thread, real-leader-kill case a plain `SimEnv`
+  corpus structurally cannot. This gap is not sized for a future PR here —
+  named honestly rather than silently left implicit.
+
+**C-05 is now complete** (all three PRs landed 2026-09-06: the `ProdEnv`
+benchmark, the flag-gated wiring, and this cutover).

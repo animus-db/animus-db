@@ -267,9 +267,17 @@ where
     /// deliberately conservative rather than a per-tablet skip-and-continue
     /// (which would risk re-admitting the exact silently-wrong-value gap
     /// this issue closes, now scoped to one tablet's own fold instead of the
-    /// whole file) — acceptable since this shared-WAL path is currently
-    /// unwired (`shared_wal.rs`'s own doc), so no production replica loses
-    /// interleaved siblings' records to this today.
+    /// whole file) — and it is **safe, not merely conservative, now that
+    /// this path is wired into production (C-05 PR 2)**: a torn/corrupted
+    /// region can only ever be the file's physical TAIL (every write is an
+    /// append, and a whole-file rewrite via `SharedWal::compact_group`/
+    /// `forget` is an atomic `Disk::replace`), so every record physically
+    /// BEFORE the tear — for every tablet, not just the one whose write was
+    /// torn — is already fully valid and decodes correctly; "stop the whole
+    /// file at the first bad line" therefore never discards a different
+    /// tablet's own already-durable data. See `animus_control::shared_wal`'s
+    /// own module doc ("Crash safety") and `docs/adr/0028-*.md`'s C-05 PR 2
+    /// amendment for the full argument.
     pub fn decode_tagged(bytes: &[u8]) -> Vec<(TabletId, WalRecord<C, S>)> {
         #[derive(Deserialize)]
         struct Line<C, S> {

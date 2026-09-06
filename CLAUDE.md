@@ -120,6 +120,7 @@ cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
+cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)
 ```
 
 All five gates (fmt, clippy `-D warnings`, build, test, deny) must be green; CI
@@ -156,6 +157,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_LSM_CRASH_SEEDS=K` | 1 | `LsmEngine` crash-safety corpus depth (`animus-storage`, `tests/lsm_crash.rs`) |
 | `ANIMUS_LSM_DISK_FAULT_SEEDS=K` | 1 | `LsmEngine` `DiskConfig` fault-injection corpus depth (`animus-storage`, `tests/lsm_disk_faults.rs`) |
 | `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
+| `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test sharedwal_fault_corpus` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test heartbeat_batch_corpus` |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
@@ -163,6 +165,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
 | `ANIMUS_BENCH_{KEYS,GETS,SCAN,VALUE_BYTES,APPLY_BATCH}` | — | `animus-storage`'s `engine_bench` workload tuning |
 | `ANIMUS_BENCH_{NODES,ITEMS,OPS,VALUE_BYTES,CLIENTS,JSON}` | — | `animusd`'s `cluster_bench` workload tuning (node count, preload size, measured ops/class, item size, concurrent-client sweep, JSON output path) |
+| `ANIMUS_BENCH_GROUPS` | `1,8,32,128` | `animus-cp-data`'s `wal_fsync_bench` active-tablet-count sweep (per-group-files vs. `SharedWal` fsync/latency comparison, C-05 PR 1) |
+| `ANIMUS_BENCH_ROUNDS`/`ANIMUS_BENCH_VALUE_BYTES`/`ANIMUS_BENCH_JSON` | `20`/`96`/unset | `wal_fsync_bench`'s own round count, per-write payload size, and JSON output path (same knob name/shape as the other two benches above) |
 
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.

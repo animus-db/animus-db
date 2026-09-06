@@ -216,12 +216,15 @@ impl TlsSection {
 ///   the control-plane **leader** (the segment janitor's own gate) — a
 ///   data-only node's `ControlHandle` is always `Remote`, so it never runs
 ///   that loop and ignores the field too.
-/// - The other eleven fields (`auto_split_bytes`, `auto_split_change_rate`,
+/// - The other twelve fields (`auto_split_bytes`, `auto_split_change_rate`,
 ///   `auto_split_ops_rate`, `quiesce_after_secs`, `heartbeat_batch`,
-///   `stream_seal_bytes`, `stream_seal_age_secs`, `throttle_read_units`,
-///   `throttle_write_units`, `tablet_max_read_units`,
+///   `shared_wal`, `stream_seal_bytes`, `stream_seal_age_secs`,
+///   `throttle_read_units`, `throttle_write_units`, `tablet_max_read_units`,
 ///   `tablet_max_write_units`)
-///   apply to any data-hosting node (combined or data-only).
+///   apply to any data-hosting node (combined or data-only) — `shared_wal`
+///   reaches `animusd data --config` as of C-05 PR 3 (before that, PR 2
+///   left it silently ignored there, unlike every other field in this
+///   list).
 ///
 /// A CLI flag naming the same knob **and** a config file's `cluster_
 /// settings` section setting it is a hard startup error, checked field by
@@ -272,6 +275,28 @@ pub struct ClusterSettings {
     /// `RaftCore::heartbeat_interval`, see that constant's own doc.
     #[serde(default)]
     pub heartbeat_batch: Option<bool>,
+    /// `--shared-wal`/`--no-shared-wal` (ADR 0028 — C-05 PR 2 shipped it
+    /// off by default; PR 3, the cutover, flips the default ON): routes
+    /// every data-plane CP group this node hosts through one per-node
+    /// [`SharedWal`](animus_control::SharedWal) instead of each group's own
+    /// private WAL file — coalesces a burst across several co-hosted groups
+    /// into far fewer physical `fsync`s (see `docs/design/shared-wal-fsync-
+    /// benchmark.md`). `None` (this field absent from a config file)
+    /// resolves to `main::DEFAULT_SHARED_WAL` (`true`) — the shared layout
+    /// ON, today's default; an explicit `false` (or `--no-shared-wal`)
+    /// restores byte-for-byte the per-group-WAL-file behavior, the
+    /// mechanism switch an operator can still reach in the field. No
+    /// on-disk compatibility promise between the two layouts (root
+    /// `CLAUDE.md`'s no-back-compat stance) — flipping this against an
+    /// existing data dir written under the OTHER layout fails node start
+    /// loudly rather than silently mixing them (see `animus-cp-data/
+    /// CLAUDE.md`'s `check_wal_layout` entry for the exact check); a node
+    /// whose data directory predates this cutover (written under the
+    /// per-group layout, before PR 3 landed) needs `--no-shared-wal`
+    /// passed explicitly to keep starting — the default alone is no longer
+    /// enough to reproduce that node's own on-disk layout.
+    #[serde(default)]
+    pub shared_wal: Option<bool>,
     /// `--stream-seal-bytes B` (ADR 0042 §13): the DynamoDB Streams
     /// sealer's size trigger.
     #[serde(default)]
@@ -769,6 +794,7 @@ mod tests {
             orphan_sweep_after_secs: Some(120),
             quiesce_after_secs: Some(10),
             heartbeat_batch: Some(true),
+            shared_wal: Some(true),
             stream_seal_bytes: Some(4_194_304),
             stream_seal_age_secs: Some(3600),
             stream_retention_secs: Some(86_400),
@@ -798,6 +824,7 @@ mod tests {
         assert_eq!(settings.auto_split_bytes, Some(2_000_000));
         assert_eq!(settings.quiesce_after_secs, None);
         assert_eq!(settings.heartbeat_batch, None);
+        assert_eq!(settings.shared_wal, None);
         assert_eq!(settings.orphan_sweep_after_secs, None);
         assert_eq!(settings.stream_seal_bytes, None);
         assert_eq!(settings.stream_seal_age_secs, None);

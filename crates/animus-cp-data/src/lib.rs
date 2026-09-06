@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use animus_control::SharedWal;
 use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
@@ -54,7 +55,7 @@ use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STRE
 // adapter — see `KvCommand::KindEval`'s own doc for how these are used.
 use animus_item::{AttributeValue, ConditionExpression, Item, UpdateAction, WriteSchema};
 use animus_storage::{MergeOp, StorageEngine, Version};
-use animus_tablet::{KeyRange, SplitChild};
+use animus_tablet::{KeyRange, SplitChild, TabletId};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
@@ -1805,6 +1806,20 @@ pub fn wal_file(stream: u64) -> String {
     format!("{WAL}.{stream}")
 }
 
+/// The **per-node** shared WAL filename (C-05 PR 2, ADR 0028): every hosted
+/// tablet's `RaftCore` log persists into this ONE file, tagged by tablet
+/// (`animus_control::PersistedState::encode_tagged_record`), when a node is
+/// started with `--shared-wal`/`cluster_settings.shared_wal`. A distinct
+/// name from [`WAL`]/[`wal_file`] on purpose — the two layouts live at
+/// disjoint filenames on the same data directory, so flipping the flag
+/// against an existing data dir never mixes them (see
+/// [`animus_control::shared_wal`]'s module doc, "Layout-mismatch (flag-flip)
+/// safety"). Public for the same reason [`wal_file`] is: a teardown path
+/// needs the name without owning a `SharedWal` handle (unused here — see
+/// `host::Reconciler::erase_tablet_files`, which forgets a tablet from an
+/// already-held `SharedWal` instead of deleting a file).
+pub const SHARED_WAL: &str = "raftkv.wal.shared";
+
 /// A running data-plane Raft node for one tablet group. Cheap to clone; clones
 /// share the one [`RaftCore`] + engine. The driver loop runs on `env`.
 #[derive(Clone)]
@@ -2081,6 +2096,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             PRIMARY_STREAM,
             false,
             None,
+            None,
         )
     }
 
@@ -2098,6 +2114,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             scope,
             PRIMARY_STREAM,
             false,
+            None,
             None,
         )
     }
@@ -2119,7 +2136,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, false, None)
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, false, None, None,
+        )
     }
 
     /// Like [`start_hosted`](Self::start_hosted), but every bare (no-entries)
@@ -2140,9 +2159,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
         batcher: Option<HeartbeatBatcher<E>>,
     ) -> Self {
+        Self::start_hosted_with_batcher_and_shared_wal(
+            env, all_nodes, storage, scope, stream, batcher, None,
+        )
+    }
+
+    /// Like [`start_hosted_with_batcher`](Self::start_hosted_with_batcher),
+    /// with the additional `shared_wal` opt-in (C-05 PR 2, ADR 0028): `Some`
+    /// routes this group's own Raft log persistence through the given
+    /// per-node [`SharedWal`] (tagged by `TabletId(stream)`) instead of this
+    /// group's own private `wal_file(stream)`. `None` (every pre-C-05-PR-2
+    /// caller) is byte-for-byte today's per-group-file behavior — the
+    /// production default until PR 3's cutover; `host::Reconciler::
+    /// enable_shared_wal` is the production opt-in.
+    pub fn start_hosted_with_batcher_and_shared_wal(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+        shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, batcher,
+            env, all_nodes, storage, metrics, scope, stream, false, batcher, shared_wal,
         )
     }
 
@@ -2191,7 +2232,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, true, None)
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, true, None, None,
+        )
     }
 
     /// Like [`start_hosted_campaigning`](Self::start_hosted_campaigning),
@@ -2208,9 +2251,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
         batcher: Option<HeartbeatBatcher<E>>,
     ) -> Self {
+        Self::start_hosted_campaigning_with_batcher_and_shared_wal(
+            env, all_nodes, storage, scope, stream, batcher, None,
+        )
+    }
+
+    /// Like [`start_hosted_campaigning_with_batcher`]
+    /// (Self::start_hosted_campaigning_with_batcher), with the identical
+    /// `shared_wal` opt-in
+    /// [`start_hosted_with_batcher_and_shared_wal`](Self::
+    /// start_hosted_with_batcher_and_shared_wal) documents — the
+    /// `host::Reconciler`'s own materialize-split-child path uses this one
+    /// when heartbeat batching, the deterministic-first-leader campaign, and
+    /// the shared WAL are all enabled together.
+    pub fn start_hosted_campaigning_with_batcher_and_shared_wal(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+        shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, batcher,
+            env, all_nodes, storage, metrics, scope, stream, true, batcher, shared_wal,
         )
     }
 
@@ -2233,6 +2298,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             PRIMARY_STREAM,
             false,
             None,
+            None,
         )
     }
 
@@ -2246,6 +2312,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
         campaign_immediately: bool,
         heartbeat_batcher: Option<HeartbeatBatcher<E>>,
+        shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
     ) -> Self {
         // ADR 0041 §3: callers hand in the tablet's **parent** scope
         // (`escape(table)` + this tablet's range); the group owns one sibling
@@ -2385,6 +2452,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             campaign_immediately,
             voter_history,
             heartbeat_batcher,
+            shared_wal,
         }));
         node
     }
@@ -6345,6 +6413,17 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// so a tolerated error can't spin the loop hot or ack anything. A failure while
 /// *not* halted is a real durability fault on a live leader (crash-stop-before-ack)
 /// and stays exactly as loud as before: a hard panic.
+///
+/// C-05 PR 2 (ADR 0028): when `shared` is `Some`, this round's whole record
+/// batch is submitted as ONE `SharedWal::append_tagged` call — one physical
+/// `append` and `sync`, coalesced with any other hosted group's own
+/// overlapping round, instead of this group's own per-record `env.append`
+/// followed by a trailing `env.sync` against its private file — the
+/// mechanism `docs/design/shared-wal-fsync-benchmark.md` measured. Error
+/// tolerance mirrors the raw path exactly (halted-gated, a hard panic
+/// otherwise), since `SharedWal`'s own `io::Result` is the identical error
+/// surface `env.append`/`env.sync` already return.
+#[allow(clippy::too_many_arguments)] // one extra param over the shared-WAL wiring
 async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
@@ -6353,6 +6432,9 @@ async fn persist_wal<E: Env>(
     apply_signal: &ApplySignal,
     halted: &AtomicBool,
     progress: &PersistProgress,
+    shared: Option<&SharedWal<KvCommand, KvState>>,
+    tablet: TabletId,
+    metrics: &MetricsHandle,
 ) {
     let _wal = wal_lock.lock().await;
     // The round number is claimed in the *same* core-lock acquisition as the
@@ -6370,24 +6452,35 @@ async fn persist_wal<E: Env>(
         debug_assert!(records.is_empty());
         return;
     };
-    for record in &records {
-        if let Err(e) = env
-            .append(wal, &PersistedState::encode_record(record))
-            .await
-        {
+    if let Some(shared) = shared {
+        if let Err(e) = shared.append_tagged(env, wal, tablet, &records).await {
             assert!(
                 halted.load(Ordering::SeqCst),
-                "raftkv wal append failed while running: {e}"
+                "raftkv shared wal append failed while running: {e}"
             );
             return;
         }
-    }
-    if let Err(e) = env.sync(wal).await {
-        assert!(
-            halted.load(Ordering::SeqCst),
-            "raftkv wal sync failed while running: {e}"
-        );
-        return;
+        metrics.incr(Metric::CpSharedWalSyncs);
+    } else {
+        for record in &records {
+            if let Err(e) = env
+                .append(wal, &PersistedState::encode_record(record))
+                .await
+            {
+                assert!(
+                    halted.load(Ordering::SeqCst),
+                    "raftkv wal append failed while running: {e}"
+                );
+                return;
+            }
+        }
+        if let Err(e) = env.sync(wal).await {
+            assert!(
+                halted.load(Ordering::SeqCst),
+                "raftkv wal sync failed while running: {e}"
+            );
+            return;
+        }
     }
     // Durable now: advance the log watermark and the round watermark under one
     // acquisition, then release whatever the consensus loop buffered on this
@@ -6814,6 +6907,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // *second* drainer (its compaction rewrite), so it must number and complete
     // the rounds it consumes or the consensus loop's buffered acks strand.
     persist: &PersistProgress,
+    // C-05 PR 2 (ADR 0028): `Some` routes this compaction rewrite through
+    // `SharedWal::compact_group` (this tablet's own cached tail replaced,
+    // the whole shared file atomically rewritten from every hosted
+    // tablet's own current tail) instead of `env.replace` against this
+    // group's private file. See `persist_wal`'s doc for the sibling append
+    // half.
+    shared: Option<&SharedWal<KvCommand, KvState>>,
 ) -> bool {
     let mut did_work = false;
 
@@ -8596,10 +8696,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // lazy-image design decouples the two).
                 metrics.incr(Metric::CpSnapshotTriggers);
                 let lli = c.last_log_index();
-                let mut buf = Vec::new();
-                for record in c.wal_image() {
-                    buf.extend(PersistedState::encode_record(&record));
-                }
+                // The full, minimal record set this compaction reduces the
+                // group's own durable state to (snapshot + hard state + log
+                // tail) — encoded to raw bytes below only on the non-shared
+                // path; the shared-WAL path (C-05 PR 2) hands the typed
+                // records straight to `SharedWal::compact_group`, which does
+                // its own encoding as part of the whole-file rewrite.
+                let records = c.wal_image();
                 // The rewrite (below) makes the whole current log durable, so the
                 // consensus loop's accumulated pending append records are now
                 // redundant — drop them (`replay` is push-based, so re-appending
@@ -8618,10 +8721,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // seconds. Now compaction completes the round it consumed (after
                 // its `replace` lands, below), and the buffered acks go out.
                 let (_superseded, round) = persist_round::drain_for_round(&mut c, persist);
-                (Some((buf, round, c.snapshot_index())), lli)
+                (Some((records, round, c.snapshot_index())), lli)
             }
         };
-        if let Some((bytes, round, new_snapshot_index)) = bytes {
+        if let Some((records, round, new_snapshot_index)) = bytes {
             // Issue #554: the durable applied-watermark marker is written
             // ONLY here (compaction/on-demand-image time), never on every
             // ordinary apply pass. Two reasons:
@@ -8675,8 +8778,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 )
                 .await
                 .expect("raftkv applied watermark marker (compaction)");
-            match env.replace(wal, &bytes).await {
+            let write_result = if let Some(shared) = shared {
+                shared
+                    .compact_group(env, wal, TabletId(tablet), records)
+                    .await
+            } else {
+                let mut buf = Vec::new();
+                for record in &records {
+                    buf.extend(PersistedState::encode_record(record));
+                }
+                env.replace(wal, &buf).await
+            };
+            match write_result {
                 Ok(()) => {
+                    if shared.is_some() {
+                        metrics.incr(Metric::CpSharedWalGcRewrites);
+                    }
                     // Physically durable now — advance both watermarks (the log
                     // index, and the persist round this rewrite consumed) under
                     // one acquisition, then let the consensus loop ship whatever
@@ -8917,6 +9034,12 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// shipping immediately — see [`heartbeat_batch`]'s module doc. `None`
     /// (every pre-PR-2 constructor) is byte-for-byte today's behavior.
     heartbeat_batcher: Option<HeartbeatBatcher<E>>,
+    /// C-05 PR 2 (ADR 0028): `Some` routes this group's own Raft log
+    /// persistence through the given per-node [`SharedWal`], tagged by
+    /// `TabletId(stream)`, instead of this group's own private
+    /// `wal_file(stream)`. `None` (every pre-C-05-PR-2 constructor) is
+    /// byte-for-byte today's per-group-file behavior.
+    shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -9047,6 +9170,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         campaign_immediately,
         voter_history,
         heartbeat_batcher,
+        shared_wal,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -9059,9 +9183,23 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .as_ref()
         .map(|b| b.register_hosted(stream));
 
-    let wal = wal_file(stream);
-    let bytes = env.read(&wal).await.unwrap_or_default();
-    let state = PersistedState::replay(PersistedState::decode(&bytes));
+    // C-05 PR 2 (ADR 0028): a `Some` shared WAL routes both the recovery
+    // READ and every future write through the per-node coordinator (tagged
+    // by `TabletId(stream)`, mirroring `host.rs`'s own `stream = tablet.0`
+    // convention) instead of this group's own private `wal_file(stream)`.
+    // Both branches produce the identical `PersistedState<KvCommand,
+    // KvState>` shape below, so every line after this block is unchanged
+    // either way.
+    let tablet = TabletId(stream);
+    let wal = shared_wal
+        .as_ref()
+        .map_or_else(|| wal_file(stream), |_| SHARED_WAL.to_string());
+    let state = if let Some(shared) = &shared_wal {
+        shared.recovered_state(tablet).await
+    } else {
+        let bytes = env.read(&wal).await.unwrap_or_default();
+        PersistedState::replay(PersistedState::decode(&bytes))
+    };
     // Witnessing point (ADR 0018 §2 amendment): "WAL recovery, each recovered
     // entry." Every command this node ever durably logged for this group —
     // applied or not yet — must be witnessed before this node ever mints or
@@ -9217,6 +9355,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&apply_signal),
         Arc::clone(&fork_signal),
         Arc::clone(&persist),
+        shared_wal.clone(),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -9335,6 +9474,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 &apply_signal,
                 &halted,
                 &persist,
+                shared_wal.as_deref(),
+                tablet,
+                &metrics,
             )));
         }
         // A group with an unfinished round or an undelivered ack must keep its
@@ -9797,6 +9939,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     apply_signal: Arc<ApplySignal>,
     fork_signal: Arc<ForkSignal>,
     persist: Arc<PersistProgress>,
+    shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -9848,6 +9991,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut suspicious_noop_log_budget,
             &fork_signal,
             &persist,
+            shared_wal.as_deref(),
         )
         .await;
         if !did_work {

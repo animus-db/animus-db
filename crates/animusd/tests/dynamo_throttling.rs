@@ -98,6 +98,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
                 Some(0),
                 Some(0),
                 None,
+                false,
             )
             .await
             {
@@ -185,6 +186,7 @@ async fn bring_up_with_throttle_defaults(
                 Some(0),
                 Some(0),
                 None,
+                false,
             )
             .await
             {

@@ -245,6 +245,7 @@ async fn batched_heartbeats_hold_stable_then_reelect_after_a_real_leader_kill() 
         None,
         None,
         None,
+        false,
     )
     .await
     .unwrap();

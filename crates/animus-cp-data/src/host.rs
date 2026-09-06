@@ -39,8 +39,10 @@ use animus_env::{Env, Metric, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
+use animus_control::SharedWal;
+
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
-use crate::{RaftKvNode, StorageScope, wal_file};
+use crate::{KvCommand, KvState, RaftKvNode, SHARED_WAL, StorageScope, WAL, wal_file};
 
 /// The per-tablet engine seam (ADR 0050, Train B rung 1): every hosted
 /// data-plane tablet gets its **own private `StorageEngine`**, opened by the
@@ -855,6 +857,13 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// reconciler hosts ships its own bare heartbeats immediately,
     /// unbatched, exactly as before this mechanism existed.
     heartbeat_batcher: Option<HeartbeatBatcher<E>>,
+    /// C-05 PR 2 (ADR 0028) production wiring: opt every group this
+    /// reconciler hosts *from now on* into the per-node shared WAL — see
+    /// [`enable_shared_wal`](Self::enable_shared_wal). `None` (the default)
+    /// is exactly today's behavior: every existing caller of
+    /// [`new`](Self::new) is unaffected, and every group this reconciler
+    /// hosts persists into its own private `wal_file(tablet)`, unchanged.
+    shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
 }
 
 /// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
@@ -895,6 +904,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             on_teardown: Box::new(on_teardown),
             quiesce_after: None,
             heartbeat_batcher: None,
+            shared_wal: None,
         }
     }
 
@@ -1016,6 +1026,27 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             DEFAULT_HEARTBEAT_BATCH_INTERVAL,
             self.env.metrics(),
         ));
+    }
+
+    /// Opt every group this reconciler hosts **from now on** into the
+    /// per-node shared WAL (C-05 PR 2, ADR 0028) — every subsequent
+    /// [`host`](Self::host)/[`materialize_split_child`]
+    /// (Self::materialize_split_child) call routes that group's own Raft
+    /// log persistence through `shared` (tagged by tablet id) instead of
+    /// `wal_file(tablet)`, and [`erase_tablet_files`]
+    /// (Self::erase_tablet_files) forgets a torn-down tablet from `shared`
+    /// instead of deleting a private file. Call once, right after
+    /// construction and before the first [`tick`](Self::tick) — mirrors
+    /// [`enable_heartbeat_batching`](Self::enable_heartbeat_batching)'s own
+    /// "opt in once, applies from here on" shape exactly. The caller is
+    /// responsible for having already `SharedWal::open`ed `shared` against
+    /// the SAME file every subsequently-hosted group will persist into —
+    /// this method only wires the already-open handle in, since opening it
+    /// is an `async` node-start step this pure setter can't do.
+    /// `animusd`'s `--shared-wal` CLI/`cluster_settings.shared_wal` config
+    /// flag calls this once at node start.
+    pub fn enable_shared_wal(&mut self, shared: Arc<SharedWal<KvCommand, KvState>>) {
+        self.shared_wal = Some(shared);
     }
 
     /// The live `RaftKvNode` this reconciler hosts for `tablet`, if any.
@@ -1272,13 +1303,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // witnesses this group's HLC off its engine's own `latest_version()`
         // at construction (the tablet's private engine since ADR 0050 rung 1
         // — its own data is the only history a fresh group must out-version).
-        let node = RaftKvNode::start_hosted_with_batcher(
+        let node = RaftKvNode::start_hosted_with_batcher_and_shared_wal(
             self.env.clone(),
             config,
             engine,
             scope,
             tablet.0,
             self.heartbeat_batcher.clone(),
+            self.shared_wal.clone(),
         );
         // ADR 0044 phase-1 PR4 production wiring: opt every freshly-hosted
         // data-plane group into quiescence if this reconciler has been
@@ -1480,22 +1512,24 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // waiting out a cold randomized election timeout — see
         // `start_hosted_campaigning`'s own doc for why this is safe.
         let node = if campaign {
-            RaftKvNode::start_hosted_campaigning_with_batcher(
+            RaftKvNode::start_hosted_campaigning_with_batcher_and_shared_wal(
                 self.env.clone(),
                 voters,
                 engine,
                 scope,
                 child.id.0,
                 self.heartbeat_batcher.clone(),
+                self.shared_wal.clone(),
             )
         } else {
-            RaftKvNode::start_hosted_with_batcher(
+            RaftKvNode::start_hosted_with_batcher_and_shared_wal(
                 self.env.clone(),
                 voters,
                 engine,
                 scope,
                 child.id.0,
                 self.heartbeat_batcher.clone(),
+                self.shared_wal.clone(),
             )
         };
         if let Some(after) = self.quiesce_after {
@@ -1573,13 +1607,189 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     async fn erase_tablet_files(&mut self, tablet: TabletId) {
         self.engines.remove(&tablet);
         self.factory.destroy(tablet).await;
-        if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
+        // C-05 PR 2 (ADR 0028): a shared-WAL tablet has no private WAL file
+        // to remove — `forget` drops its bytes from the coordinator's cache
+        // and rewrites the shared file without them at once, so this
+        // tablet's own bytes are reclaimed immediately rather than waiting
+        // on some other still-hosted tablet's next ordinary compaction.
+        if let Some(shared) = &self.shared_wal {
+            if let Err(e) = shared.forget(&self.env, SHARED_WAL, tablet).await {
+                tracing::warn!(
+                    ?e,
+                    tablet = tablet.0,
+                    "reconciler: forgetting the tablet from the shared WAL"
+                );
+            }
+        } else if let Err(e) = self.env.remove(&wal_file(tablet.0)).await {
             tracing::warn!(
                 ?e,
                 tablet = tablet.0,
                 "reconciler: removing the tablet's WAL"
             );
         }
+    }
+}
+
+/// Refuses to start if this node's own data directory already holds a WAL
+/// layout other than the one `shared_wal` selects (ADR 0028's
+/// layout-mismatch amendment, C-05 PR 2 follow-up) — a directory LISTING
+/// only (`Env::list`), no file opened, called once from `animusd`'s
+/// node-start path **before** `SharedWal::open` and before any tablet's own
+/// `RaftKvNode::start_*`/`drive()` recovery runs.
+///
+/// The shared file ([`crate::SHARED_WAL`]) and the per-tablet files
+/// (`{WAL}.{stream}`, [`crate::wal_file`]) live at disjoint names on the same
+/// data directory (`animus_control::shared_wal`'s module doc, "Layout-
+/// mismatch (flag-flip) safety") — nothing on disk is corrupted by a flag
+/// flip. What a *silent* flip would do is worse than a corrupted file: the
+/// layout not selected is simply never read, so a node started with the
+/// flag flipped against an existing data dir would recover every hosted
+/// tablet's `RaftCore` as if it had never persisted anything — a genuine
+/// **data-loss and Raft-safety hazard** (a durably-empty recovered WAL is
+/// indistinguishable, to everything downstream, from a legitimate first
+/// boot), not merely a "start from empty" convenience. Refused here,
+/// loudly, before that recovery can happen at all.
+///
+/// A node whose data directory holds NEITHER layout yet (a genuinely fresh
+/// `--dir`) always passes — there is nothing to conflict with.
+///
+/// **Since C-05 PR 3 (the default-flip cutover), `shared_wal: true` is what
+/// every caller gets with no flag/config field at all** — the practical
+/// effect is that a pre-cutover data directory (written under the
+/// per-group layout, before this cutover shipped) now hits the first
+/// branch below on a plain upgrade with no other change, and its error
+/// message says so explicitly: pass `--no-shared-wal` to keep starting
+/// against that directory's existing layout. The reverse branch's own
+/// message symmetrically says to *omit* `--no-shared-wal` (never to pass
+/// `--shared-wal`, which is a no-op restating the now-default value, not a
+/// fix for anything).
+pub async fn check_wal_layout<E: Env>(env: &E, shared_wal: bool) -> std::io::Result<()> {
+    let files = env.list().await?;
+    let has_shared = files.iter().any(|f| f == SHARED_WAL);
+    let has_per_group = files.iter().any(|f| is_per_group_wal_file(f));
+    if shared_wal && has_per_group {
+        return Err(std::io::Error::other(format!(
+            "--shared-wal is set (the default since ADR 0028's C-05 PR 3 \
+             cutover), but this node's data directory already holds \
+             per-group WAL file(s) ({WAL}.<stream>) written under the \
+             per-group layout (--shared-wal off). Refusing to start: \
+             switching WAL layouts on an existing data directory would \
+             silently discard this node's persisted Raft state for every \
+             hosted tablet. Start against a fresh data directory, or pass \
+             --no-shared-wal to keep using the existing per-group layout."
+        )));
+    }
+    if !shared_wal && has_shared {
+        return Err(std::io::Error::other(format!(
+            "--no-shared-wal is set, but this node's data directory already \
+             holds the shared WAL file ({SHARED_WAL}) written under the \
+             shared layout (--shared-wal on, the default since ADR 0028's \
+             C-05 PR 3 cutover). Refusing to start: switching WAL layouts \
+             on an existing data directory would silently discard this \
+             node's persisted Raft state for every hosted tablet. Start \
+             against a fresh data directory, or omit --no-shared-wal to \
+             keep using the existing shared layout."
+        )));
+    }
+    Ok(())
+}
+
+/// A per-tablet WAL filename (`{WAL}.<stream>`, [`wal_file`]) under the
+/// per-group layout — distinguished from [`SHARED_WAL`] (`{WAL}.shared`,
+/// not all-digits) by its suffix being non-empty and entirely ASCII digits.
+fn is_per_group_wal_file(name: &str) -> bool {
+    name.strip_prefix(&format!("{WAL}."))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod wal_layout_tests {
+    use animus_env::{Disk, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use futures::executor::block_on;
+
+    use super::check_wal_layout;
+    use crate::{SHARED_WAL, wal_file};
+
+    fn env(seed: u64) -> SimEnv {
+        Simulator::new(seed).env(nid(0))
+    }
+
+    #[test]
+    fn a_fresh_data_dir_passes_either_way() {
+        let e = env(0x5741_4c00);
+        block_on(async {
+            assert!(check_wal_layout(&e, false).await.is_ok());
+            assert!(check_wal_layout(&e, true).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn per_group_files_present_and_shared_wal_requested_is_refused() {
+        // Post-cutover (C-05 PR 3), `shared_wal: true` is the DEFAULT an
+        // operator gets with no flag at all — this is the case an existing,
+        // pre-cutover per-group data directory hits on a plain upgrade, so
+        // the message must tell the operator to pass `--no-shared-wal`
+        // (there is no longer an "omit the flag" fix, since omitting it now
+        // means the opposite of what it used to).
+        let e = env(0x5741_4c01);
+        block_on(async {
+            e.append(&wal_file(1), b"x").await.unwrap();
+            e.sync(&wal_file(1)).await.unwrap();
+            assert!(check_wal_layout(&e, false).await.is_ok());
+            let err = check_wal_layout(&e, true).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("--shared-wal"));
+            assert!(msg.contains("per-group WAL file"));
+            assert!(msg.contains("Refusing to start"));
+            assert!(msg.contains("persisted Raft state"));
+            assert!(
+                msg.contains("--no-shared-wal"),
+                "post-cutover message must tell the operator to pass \
+                 --no-shared-wal, not to omit a flag that's now on by \
+                 default: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn shared_wal_file_present_and_per_group_requested_is_refused() {
+        // The reverse direction: `--no-shared-wal` explicitly passed against
+        // a data directory already written under the shared layout. The fix
+        // here is to OMIT `--no-shared-wal` (shared is already the default),
+        // not to pass `--shared-wal` (that flag still exists as a no-op
+        // restating the default, but naming it as "the fix" would suggest
+        // it does something `--no-shared-wal`'s mere absence doesn't).
+        let e = env(0x5741_4c02);
+        block_on(async {
+            e.append(SHARED_WAL, b"x").await.unwrap();
+            e.sync(SHARED_WAL).await.unwrap();
+            assert!(check_wal_layout(&e, true).await.is_ok());
+            let err = check_wal_layout(&e, false).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("--shared-wal"));
+            assert!(msg.contains("shared WAL file"));
+            assert!(msg.contains("Refusing to start"));
+            assert!(msg.contains("persisted Raft state"));
+            assert!(
+                msg.contains("omit --no-shared-wal"),
+                "post-cutover message must tell the operator to omit \
+                 --no-shared-wal (shared is already the default), not to \
+                 pass --shared-wal: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn several_per_group_files_still_refuse_shared_wal() {
+        let e = env(0x5741_4c03);
+        block_on(async {
+            for stream in [1_u64, 2, 42] {
+                e.append(&wal_file(stream), b"x").await.unwrap();
+                e.sync(&wal_file(stream)).await.unwrap();
+            }
+            assert!(check_wal_layout(&e, true).await.is_err());
+        });
     }
 }
 
