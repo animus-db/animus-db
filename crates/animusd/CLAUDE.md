@@ -1279,6 +1279,54 @@ reusing the captured config is the point of the test.
   admin_interface_surfaces_state_and_actions`) — added
   `tests/admin_endpoint.rs::admin_storage_compact_action`. Dashboard-wiring
   test: `tests/dashboard_endpoint.rs::dashboard_u05_tablet_actions`.
+  **docs/roadmap.md U-05's fourth slice, the NODE action family**
+  (`dashboard_node.js`) added a new card, `#nd-actions`, beside the
+  control-plane members panel on the Node tab — three gated buttons over
+  three PRE-EXISTING routes: Drain (`POST /admin/drain {node}`, ADR 0032
+  PR3 decommission step 1), Remove (`POST /admin/member/remove {node}`,
+  decommission step 2 — a refusal of a still-undrained node is shown
+  verbatim, never retried), and Add member (`POST /admin/member/add
+  {node}`, ADR 0030 online growth); no new admin route. **There is no
+  separate "remove member" route to wire beyond Remove above** — `/admin/
+  member/remove` already IS both "finish decommissioning a drained node"
+  and "remove a member," the same route either way — so this family is
+  three buttons, not four, over the three data-plane-membership routes
+  `crates/animus-node/src/admin.rs`'s dispatch table actually has
+  (`/admin/control/member/{add,remove}`, the **control-plane** counterpart,
+  is the separate members-panel PR the roadmap already calls out — not this
+  slice). Same house style as the tablet family: `window.confirm` naming
+  the node id and the action → `postJSON` → the response/error in
+  `#nd-action-msg` → the tab's existing `loadAll()` refresh on success
+  only. **Targeting is NOT uniform, mirroring each route's own server-side
+  gating** (the tablet family's own precedent): Drain/Remove are
+  local-control-leader-only and deliberately not relayed
+  (`ClientCtx::admin_drain`/`admin_remove_member`'s own doc), so both post
+  to `ndControlLeaderBase()` — the control leader's admin `base`, resolved
+  from the identical cross-node fan-out (`STATE.nodes`, each node's own
+  `/admin/raft.is_leader`) `computeHealth()`'s own `controlLeader` already
+  reads, no extra probe; Add member IS relayed (`ClientCtx::
+  admin_add_member`'s own doc — "works from any reachable admin port"), so
+  it posts to `SEED`, this console's own node, needing no leader lookup at
+  all. **The node-id input defaults to THIS node's own id** (`SELF.config.
+  node_id` — how the Node tab already identifies "this node" everywhere
+  else on this view) but stays a plain editable text field, since `animus
+  admin drain <admin-addr> <node-id>`'s own `<node-id>` argument is
+  arbitrary — typically the node actually being decommissioned, reached
+  through a DIFFERENT (healthy) node's admin port, not necessarily the
+  console's own node — and persists across this tab's own poll cadence via
+  a module-level string kept in sync by an `input` listener
+  (`ndActionNode`), the identical "don't clobber an in-flight edit"
+  discipline `tbSplitKeyInput`/`tbReconfigureVoters` already use.
+  **`/admin/member/add` has no dedicated `animus-cli` one-shot subcommand**
+  (only `/admin/control/member/add` does) — in production this route is
+  called by a joining node's own startup code, never by an operator
+  directly, but it is a real, always-live, ungated POST route like every
+  other one this dashboard already wires a button to, so it gets one here
+  too. All three routes already had real-cluster integration coverage
+  before this slice (`tests/decommission.rs`, `tests/cluster_growth.rs`,
+  `tests/seed_join*.rs`, `tests/control_membership_admin.rs`) — no new
+  `admin_endpoint.rs` test was needed, only the dashboard-wiring one:
+  `tests/dashboard_endpoint.rs::dashboard_u05_node_actions`.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

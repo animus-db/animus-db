@@ -1540,3 +1540,90 @@ async fn dashboard_u05_tablet_actions() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's NODE action family (fourth slice of the same
+/// series as `dashboard_u05_control_members_panel`/`dashboard_u05_lineage_
+/// panel`/`dashboard_u05_tablet_actions` above): three gated buttons on the
+/// Node tab's new `#nd-actions` card — Drain, Remove, Add member — over the
+/// three pre-existing routes `POST /admin/drain`/`POST /admin/member/
+/// remove`/`POST /admin/member/add`. Mirrors `dashboard_u05_tablet_actions`'s
+/// own structure exactly: the buttons only ever exist in client-rendered
+/// JS (not the static shell), so this proves the served JS defines every
+/// button id, every route path it posts to, and the `window.confirm` guard
+/// on each — the wire-level round trip of all three routes is already
+/// covered by real-cluster tests that predate this slice (`tests/
+/// decommission.rs`, `tests/cluster_growth.rs`, `tests/seed_join*.rs`,
+/// `tests/control_membership_admin.rs`), so this test adds no new admin
+/// route coverage, only the dashboard-wiring proof on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_node_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-actions beside #nd-control-members -----
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        let actions_pos = shell
+            .find(r#"id="nd-actions""#)
+            .expect("shell carries #nd-actions");
+        assert!(
+            actions_pos > members_pos && actions_pos - members_pos < 200,
+            "#nd-actions sits immediately beside #nd-control-members: {shell}"
+        );
+
+        // ---- dashboard_node.js defines the three gated actions -------------
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        for btn_id in ["nd-drain-btn", "nd-remove-btn", "nd-add-member-btn"] {
+            assert!(
+                node_js.contains(btn_id),
+                "dashboard_node.js defines button #{btn_id}: {node_js}"
+            );
+        }
+        for route in ["/admin/drain", "/admin/member/remove", "/admin/member/add"] {
+            assert!(
+                node_js.contains(route),
+                "dashboard_node.js posts to the real route {route}: {node_js}"
+            );
+        }
+        assert!(
+            node_js.matches("window.confirm(").count() >= 3,
+            "every one of the three actions is guarded by window.confirm: {node_js}"
+        );
+        // Every action posts via the crate's one mutation idiom (postJSON)
+        // and refreshes through the tab's existing loader — no new timer.
+        assert!(
+            node_js.contains("postJSON(") && node_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {node_js}"
+        );
+        // Drain/Remove target the control leader (not relayed server-side);
+        // Add member targets SEED (relayed server-side) — the two-way split
+        // this slice's own doc calls for, not a uniform target.
+        assert!(
+            node_js.contains("function ndControlLeaderBase") && node_js.contains("is_leader"),
+            "leader-only actions resolve the live control leader's own admin address: {node_js}"
+        );
+        assert!(
+            node_js.contains(r#"postJSON(SEED, "/admin/member/add""#),
+            "the relayed add-member action posts to SEED, needing no leader lookup: {node_js}"
+        );
+
+        // ---- the three routes it posts to are real and live ---------------
+        for route in ["/admin/drain", "/admin/member/remove", "/admin/member/add"] {
+            let (s, _) = raw_post(admin_addr, route, "", "{}").await;
+            assert_ne!(s, 404, "{route} exists");
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

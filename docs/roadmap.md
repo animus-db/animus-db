@@ -217,11 +217,12 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 - Gated buttons over existing POST routes: split/flush/compact/reconfigure
   on the tablet detail (**landed 2026-09-06**); drain/decommission/member
-  add-remove on Node; control member add-remove on the new members panel.
-  Document that the only gate is `window.confirm` plus tab visibility (ADR
-  0020 admin port is trusted-network) — done for the tablet family (ADR
-  0020/0021's matching 2026-09-06 amendments), remaining for the other two.
-  Three PRs by action family. Size L total.
+  add-remove on Node (**landed 2026-09-06**); control member add-remove on
+  the new members panel remains. Document that the only gate is
+  `window.confirm` plus tab visibility (ADR 0020 admin port is
+  trusted-network) — done for the tablet and Node families (ADR 0020/0021's
+  matching 2026-09-06 amendments), remaining for the control-members panel.
+  One more PR. Size M remaining.
 
 ### U-07 New observability routes
 

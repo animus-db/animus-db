@@ -494,3 +494,30 @@ rendering on a control-role console — not a second authorization layer,
 since the admin port itself has none (§4, "localhost-only assumption").
 Node-tab (drain/decommission/member add-remove) and the control-members
 panel's own add-remove buttons are later PRs in the same U-05 series.
+
+## Amendment (2026-09-06, roadmap U-05, continued) — Actions: the Node-tab family
+
+The fourth PR in this series adds the Node-family half of the previous
+amendment's own deferred bullet: a new card, `#nd-actions`, beside the Node
+tab's control-plane members panel — Drain, Remove, and Add member, over the
+three pre-existing routes `POST /admin/drain`/`POST /admin/member/remove`/
+`POST /admin/member/add` (ADR 0032's decommission flow and ADR 0030's online
+growth, respectively). Same idiom as the tablet family: `window.confirm`
+naming the node id and the action, `postJSON`, an inline status line
+(`#nd-action-msg`), then `loadAll()` on success only. Unlike the tablet
+family's uniform "post to the tablet's own leader" default, targeting here
+splits on each route's own server-side gating: Drain/Remove are
+local-control-leader-only and never relayed, so both resolve and post to
+the current control leader's own admin address (from the same cross-node
+fan-out `computeHealth()`'s `controlLeader` already reads); Add member IS
+relayed, so it posts to this console's own node. The node-id input defaults
+to this node's own id but is freely editable — a Node console frequently
+needs to act on a DIFFERENT (often dead) node, exactly like the CLI's own
+`animus admin drain <admin-addr> <node-id>` — and, like the tablet card's
+own split-key/reconfigure inputs, survives this tab's poll cadence via its
+own persisted, input-listened-to module-level variable rather than being
+recomputed every render. See ADR 0020's matching amendment for the same
+"not a second auth layer" statement from the admin-interface side, and
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism. The control-members panel's own add/remove/transfer buttons
+remain the final PR of this series.

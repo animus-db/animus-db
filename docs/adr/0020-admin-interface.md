@@ -379,6 +379,26 @@ network can act. See `crates/animusd/CLAUDE.md`'s dashboard section and
 ADR 0021's own "Actions" note for the same statement from the dashboard's
 side.
 
+## As-built (2026-09-06, roadmap U-05, continued) — the Node tab's own action buttons
+
+The fourth PR of this series added the NODE family the note above deferred:
+three gated buttons on the Node tab's new `#nd-actions` card — Drain
+(`POST /admin/drain`), Remove (`POST /admin/member/remove` — the ADR 0032
+drain→remove decommission flow's own second half), and Add member
+(`POST /admin/member/add`, ADR 0030 online growth). No new admin route;
+same `postJSON` + `window.confirm` idiom as the tablet family above, and
+the identical statement applies unchanged: these buttons are not a second
+gate on this ADR's "no auth — bind to a trusted interface" posture, only a
+convenience for an operator already inside the trusted network — anyone
+who can reach the admin port can already call `/admin/drain`/`/admin/
+member/{add,remove}` directly. See `crates/animusd/CLAUDE.md`'s
+`dashboard_node.js` entry for the full mechanism (including why this is
+three buttons over three routes, not four — `/admin/member/remove` already
+is both "finish decommissioning" and "remove a member," the same route
+either way) and ADR 0021's matching amendment for the dashboard's own
+side. The control-members panel's own add/remove/transfer buttons
+(`/admin/control/member/{add,remove}`) remain the final PR of this series.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.
