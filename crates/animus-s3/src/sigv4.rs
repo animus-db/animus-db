@@ -537,6 +537,7 @@ pub(crate) fn percent_encode(bytes: &[u8]) -> String {
 /// exactly once — see `crate::client`'s module doc for why signing/wire
 /// building both start from a raw string and encode it independently,
 /// rather than ever re-encoding an already-encoded one.
+#[cfg(any(test, feature = "fake"))]
 pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -556,6 +557,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[cfg(any(test, feature = "fake"))]
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
