@@ -3555,6 +3555,7 @@ mod stream_sealer_tests {
                 None,
                 None,
                 quiesce_after,
+                false,
                 crate::ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 None,
                 crate::BackupStoreConfig::default(),

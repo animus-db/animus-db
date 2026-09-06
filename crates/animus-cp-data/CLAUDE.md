@@ -155,6 +155,59 @@ amendment — the shape predates and outlives it.)
   deleted along with `MergeTablets` (ADR 0044, tablets are now split-only);
   kept in case a future consumer needs the same token-vs-physical-presence
   disambiguation.
+- **`heartbeat_batch.rs`** (ADR 0044 phase 2, C-02 PR 2, `pub mod
+  heartbeat_batch`) — the per-node **`HeartbeatBatcher`**: coalesces every
+  co-hosted group's own bare (no-entries) Raft heartbeat toward the same
+  destination node into one physical `KvWire::HeartbeatBatch` frame per
+  destination per `RaftCore::heartbeat_interval` tick, on the reserved
+  `HEARTBEAT_BATCH_STREAM = u64::MAX - 2` (this crate's fourth reserved
+  stream constant, alongside `cluster_segment_store::SEGMENT_STREAM` and
+  `backup::BACKUP_SEGMENT_STREAM`) — instead of one `env.send_stream` call
+  per group per tick. **Off by default, additive** — a `RaftKvNode` with
+  no batcher attached (every pre-PR-2 constructor, and every PR-2
+  constructor called with `None`) behaves byte-for-byte as before this
+  module existed. `RaftKvNode::start_hosted_with_batcher`/
+  `start_hosted_campaigning_with_batcher` are the batching-aware siblings
+  of `start_hosted`/`start_hosted_campaigning`; `host::Reconciler::
+  enable_heartbeat_batching()` is the production opt-in, mirroring
+  `enable_quiescence`'s own "opt in once, applies to every group hosted
+  from then on" shape exactly (`animusd`'s `--heartbeat-batch` CLI/
+  `cluster_settings.heartbeat_batch` config flag calls it once at node
+  start). Only `RaftCore::tick`'s own heartbeat branch is filtered this
+  way — a bare `AppendEntries` from `replicate_now`'s wake-on-propose path
+  (ADR 0017's single-write-latency path) always ships immediately,
+  unbatched; a non-empty `AppendEntries` (real replication), `TimeoutNow`,
+  and `Quiesce` are all untouched. **Responses are not batched** — a
+  demuxed heartbeat's own `AppendEntriesResp` ships back on the responding
+  group's own stream individually, exactly like today (see the module's
+  own doc for why). **Receiver-side demux is owned entirely inside this
+  crate** (`HeartbeatBatcher`'s own `stream -> HeartbeatInbox` map,
+  populated by each `RaftKvNode`'s own `drive` loop at start/teardown) —
+  not `host.rs`'s `Reconciler` state or anything in `animusd`, so the demux
+  works under a bare `SimEnv` test with no `animusd` in the loop. A
+  demuxed heartbeat is fed through **exactly** the same
+  `witness_append_entries` → `core.handle` → durability-gate/send path a
+  wire-arrived message already takes — `from` is read from the message's
+  own embedded `leader: NodeId` field, never the physical batch-frame
+  envelope, since `RaftCore::handle`'s `AppendEntries` dispatch only ever
+  reads `msg.leader`. `Metric::CpAppendEntriesSent` keeps its pre-existing
+  meaning ("one per logical per-group heartbeat") unchanged — a batched
+  heartbeat is counted at `HeartbeatBatcher::register` instead of the
+  ordinary outbound-send accounting, since it never reaches that code
+  path; `Metric::CpHeartbeatFramesSent`/`CpHeartbeatDemuxDropped` are the
+  batcher's own new physical-frame/demux-drop counters. Fault-injection
+  corpus: `tests/heartbeat_batch_corpus.rs`, depth knob
+  `ANIMUS_HEARTBEAT_SEEDS` — frame-vs-logical scaling (leader forced to
+  one physical node so leadership doesn't spread as group count grows;
+  measured 1-vs-5-group ratio: frames 1.00, logical 5.00), every
+  per-group invariant holding under batching, a genuine partition losing a
+  whole batched frame at once (elections still occur) vs. a
+  lossy-but-connected link at a rate the unbatched path already tolerates
+  (no spurious elections), an unknown group in a received frame (dropped
+  and counted), and leader/follower kill converging with batching on. See
+  ADR 0044's 2026-09-06 phase-2 amendment for the full design record and
+  `docs/design/heartbeat-send-sites.md` for the original cost-model
+  investigation this implements.
 - **`seal.rs`** (ADR 0050 rung 5/7) — the **freeze marker**: the durable
   half of `KvCommand::Freeze` (the split-cutover terminal whole-range
   close; the zero-copy range seal this module used to serve was deleted
@@ -1737,8 +1790,35 @@ crates/animus-cp-data/tests/`) — covering single-tablet Raft mechanics,
 automatic reconfiguration/leadership-transfer, the ADR 0026/0041/0042/0043
 stream-addressing/`KindBatch`/`KIND_CURSOR`/`ClusterSegmentStore` suites,
 the ADR 0018 HLC/MVCC/range-seal/transaction suites, the `host.rs`
-reconciler end to end, and the real-thread `ProdEnv` regression noted
-above.
+reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline
+(`tests/heartbeat_cost.rs`, C-02 PR 1) and fault-injection corpus
+(`tests/heartbeat_batch_corpus.rs`, C-02 PR 2, below), and the real-thread
+`ProdEnv` regression noted above.
+
+### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
+
+ADR 0044 phase 2 (C-02 PR 2) — the `heartbeat_batch` module's own
+fault-injection corpus, depth knob `ANIMUS_HEARTBEAT_SEEDS` (default 1).
+Unlike `heartbeat_cost.rs`'s independent-`Simulator`-worlds baseline
+(each hosted group its own `Simulator`, since PR 1 needed no shared
+per-node state), this corpus co-hosts several `RaftKvNode` groups sharing
+the SAME three physical `NodeId`s in ONE `Simulator` — mirroring
+`tests/stream_addressing.rs`'s established pattern — since batching only
+has anything to amortize when several groups share one physical node's
+`env` (and thus one `HeartbeatBatcher`). Six scenarios: frame-vs-logical
+scaling (cell a — every group's leader forced to the same physical node
+via `start_hosted_campaigning_with_batcher`, so leadership doesn't spread
+across the cluster as group count grows and confound the measurement);
+every per-group invariant (election timers, term, commit index, ReadIndex
+confirmation) holding under batching over a long idle window; a genuine
+partition (leaders forced to different physical nodes so the "sibling
+sharing no partitioned pair is untouched" property is deterministic, not
+a per-seed coin flip); a 5%-lossy-but-connected link; an unknown group in
+a received frame; and leader kill / follower kill, each proving the
+sibling group unaffected unless it happens to share the faulted node. Run
+at depth: `ANIMUS_HEARTBEAT_SEEDS=K cargo test -p animus-cp-data --test
+heartbeat_batch_corpus` (default `K=1`; held green through `K=150`
+locally, `=40` in the nightly `corpus-deep.yml` tier).
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 

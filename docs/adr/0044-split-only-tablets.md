@@ -302,3 +302,92 @@ of its findings:
 See the document itself for the full per-message-type map, the exact
 `file:line` citations, the test-plan cell list (seed knob
 `ANIMUS_HEARTBEAT_SEEDS`), and the open questions PR 2 inherits.
+
+## Amendment (2026-09-06): phase 2 batcher behind a flag (C-02 PR 2)
+
+Implements the PR 1 investigation's own candidate shape (above), landing
+`animus_cp_data::heartbeat_batch::HeartbeatBatcher` — off by default, so
+this PR is additive-default with zero behavior change until a node opts
+in. Decisions the design doc left open, closed here:
+
+- **Reserved stream id: `u64::MAX - 2`** (`HEARTBEAT_BATCH_STREAM`), a
+  constant, not locally chosen per node — both ends of a link must agree
+  on it to demux correctly, so it has to be a fixed, cluster-wide value
+  like `PRIMARY_STREAM`/`SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`, not a
+  per-node choice. It sits at the same far end of the `u64` space as this
+  crate's other two reserved streams (`cluster_segment_store::
+  SEGMENT_STREAM = u64::MAX`, `backup::BACKUP_SEGMENT_STREAM = u64::MAX -
+  1`) — a `TabletId` (`animus_tablet::TabletId`, monotonic from 1, never
+  reused) can never plausibly reach this range, so it can never collide
+  with a real group's own `stream = tablet_id` address. ADR 0026's
+  single-consumer-per-`(node, stream)` rule is why a fourth distinct
+  constant was needed rather than reusing one of the other three: two
+  independent serving tasks bound to the same stream would race for the
+  same inbox.
+- **Responses are not batched.** The `AppendEntriesResp` a demuxed
+  heartbeat produces ships back on the responding group's own stream,
+  individually, exactly as today. Two reasons: the demux is a serial,
+  on-arrival dispatch with no natural aggregation point the way the
+  deadline-driven send side has, and an `AppendEntriesResp` is exactly the
+  traffic class `animus_control::persist_round::ships_before_durable`
+  gates on a durability round — batching it would need either reproducing
+  that gating outside the drive loop or deferring the batch until every
+  constituent response's own round lands, for a direction the PR 1 cost
+  model never measured as the problem. Every per-group invariant (§3 of
+  the design doc) still holds either way, since the demuxed message is fed
+  through the identical `core.handle` the wire-arrived path already uses —
+  batching only ever touches the request direction's own transport.
+- **Hosted-group lookup table: owned inside `animus-cp-data`, not
+  `animusd`'s `ClusterEdgeState`/`host::Reconciler`.** Each
+  `HeartbeatBatcher` keeps its own `stream -> HeartbeatInbox` map,
+  populated by `RaftKvNode`'s own `drive` loop at start/teardown. This
+  keeps the demux working under a bare `SimEnv` test with no `animusd` in
+  the loop, and needs no second registry kept in sync with the reconciler's
+  own `hosted` map.
+- **Flag shape and reach: additive-default, threaded exactly like
+  `--quiesce-after`.** `host::Reconciler::enable_heartbeat_batching()`
+  mirrors `enable_quiescence`'s "opt in once, applies to every group hosted
+  from then on" contract; `animusd`'s `--heartbeat-batch` CLI flag (a bare
+  boolean, no value — the batcher's own flush cadence is fixed at
+  `RaftCore::heartbeat_interval`, so there is no companion duration to
+  parse) and `cluster_settings.heartbeat_batch` config-file field reach
+  `--config FILE --node I`, `--cluster N`, and `animusd data --config`
+  through the identical wrapper chain `--quiesce-after` already threads
+  through, including that knob's own same documented gaps on
+  `--cluster-control`/`--cluster-data`, `join`, and `data --seed` (every
+  one of those paths hardcodes `false`, matching `--quiesce-after`'s own
+  `Duration::ZERO` at the identical call sites).
+- **Metrics keep the PR 1 recommendation**: `Metric::CpAppendEntriesSent`
+  still counts one per logical per-group heartbeat, recorded at
+  `HeartbeatBatcher::register` instead of the ordinary outbound-send path
+  when batching is on, so its meaning is unchanged whether or not the flag
+  is set. Two new counters observe the batcher itself:
+  `Metric::CpHeartbeatFramesSent` (one per physical frame — flat in the
+  number of co-hosted groups sharing a destination) and
+  `Metric::CpHeartbeatDemuxDropped` (a frame naming a not-currently-hosted
+  group — an ordinary, harmless release/host race, never a panic).
+- **Measured (`crates/animus-cp-data/tests/heartbeat_batch_corpus.rs`,
+  cell (a))**: with every group's leader forced to the same physical node
+  (so leadership doesn't spread across the cluster as group count grows —
+  see that test's own doc), 1 group vs. 5 groups gives `frames1=238`,
+  `frames5=238` (ratio 1.00) against `logical1=238`, `logical5=1190`
+  (ratio 5.00) — physical frames stay flat while the logical per-group
+  count keeps scaling with `G`, exactly the amortization this phase set
+  out to prove.
+- **What PR 3's cutover flips**: turning the flag on by default (or
+  removing it, if the maintainer decides the batcher should be the only
+  path) — this PR intentionally ships the mechanism proven correct and
+  measured, but inert in production until that decision is made
+  explicitly, per this repo's own "(2) batcher behind a flag; (3) cutover"
+  plan.
+
+See `crates/animus-cp-data/src/heartbeat_batch.rs`'s own module doc for
+the full sender/receiver design and
+`crates/animus-cp-data/tests/heartbeat_batch_corpus.rs` for the
+fault-injection corpus (seed knob `ANIMUS_HEARTBEAT_SEEDS`): frame-vs-
+logical scaling, every per-group invariant under batching over a long
+run, a genuine partition losing a whole batched frame at once (elections
+still fire), a lossy-but-connected link at a rate the unbatched path
+already tolerates (no spurious elections), an unknown group in a received
+frame (dropped and counted), and leader/follower kill converging with
+batching on.

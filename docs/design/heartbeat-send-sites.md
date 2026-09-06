@@ -401,6 +401,14 @@ group count. Phase 1 and phase 2 are complementary, not overlapping: phase
 
 ## 5. Candidate batcher shape (design sketch for PR 2 — not implemented here)
 
+**As built (C-02 PR 2, 2026-09-06)**: shape 2 below (a per-node
+`HeartbeatBatcher` in `animus-cp-data`) is what shipped, matching this
+sketch closely — `animus_cp_data::heartbeat_batch::HeartbeatBatcher`'s own
+module doc has the as-built design in full; the "Open questions carried
+into PR 2" section at the end of this document records exactly how each
+open question below was closed. This section is kept as the original
+investigation record.
+
 **Where the seam sits**: at the per-group send call site,
 `crates/animus-cp-data/src/lib.rs:9557-9558` (and its two durability-release
 siblings at `:9562-9563`/`:9579-9580`, though a heartbeat never takes the
@@ -519,6 +527,21 @@ considered:
 
 ## 6. Test plan for PR 2 / PR 3
 
+**As built (C-02 PR 2)**: `crates/animus-cp-data/tests/
+heartbeat_batch_corpus.rs`, seed knob `ANIMUS_HEARTBEAT_SEEDS` — cells (a)
+frame-vs-logical scaling, (b) every per-group invariant holding under
+batching, (c1) a genuine partition losing a whole batched frame still
+elects correctly, (c2) a lossy-but-connected link doesn't spuriously
+elect, (d) an unknown group in a received frame is dropped and counted,
+(e) leader kill and follower kill both converge with batching on. Not a
+separate file from `heartbeat_cost.rs` (PR 1's baseline, which stays as
+the flag-off scaling proof) — this file's own module doc explains why it
+co-hosts groups in one `Simulator` rather than PR 1's independent-worlds
+shape. See the ADR 0044 phase-2 amendment for cell (a)'s measured numbers.
+
+**Original plan below** (kept for the record — cell numbering/shape
+differs slightly from what shipped, noted above):
+
 **Corpus location**: a new `SimEnv` integration test file in
 `animus-cp-data/tests/` (mirroring `tests/quiescence.rs`'s exact harness
 shape — `RaftKvNode::start_with_metrics`/`start_hosted` per node, one
@@ -613,19 +636,52 @@ election-settle jitter and independent-`Simulator`-world timing drift.
 This is exactly the assertion §6 cell 2 (PR 3) flips to "flat as `G`
 grows."
 
-## Open questions carried into PR 2
+## Open questions carried into PR 2 — resolved, as built (C-02 PR 2)
 
-- The batcher's own receiver-side demux needs a concrete hosted-group
-  lookup table — reuse `host.rs`'s `Reconciler` state, or a new
-  purpose-built index? (§5, last open question.)
-- Whether `CpAppendEntriesSent`'s meaning should stay "logical per-group
-  heartbeat" (recommended) or shift to "physical frame," and what the new
-  counter for the other meaning should be named.
-- Whether the batched-heartbeat reserved stream id needs to be
-  cluster-wide-agreed (a constant) or can be locally chosen per node,
-  given both ends of a link need to agree on it to demux correctly — likely
-  a constant, mirroring `PRIMARY_STREAM`'s own reserved-value convention.
-- Whether ReadIndex's `ReadProbe`/`ReadProbeAck` traffic (§1c) is worth
-  folding into the same batched frame in a later phase, given it already
-  shares the identical `(node, stream)` address today — explicitly out of
-  scope for phase 2 as currently planned, named here so it isn't forgotten.
+Every question below is now closed by the landed `animus_cp_data::
+heartbeat_batch` module (ADR 0044's 2026-09-06 phase-2 amendment has the
+full account; this section just closes the loop on each bullet):
+
+- **Receiver-side demux lookup table**: owned inside `animus-cp-data`
+  itself (`HeartbeatBatcher`'s own `stream -> HeartbeatInbox` map,
+  populated by each `RaftKvNode`'s own `drive` loop at start/teardown) —
+  **not** `host.rs`'s `Reconciler` state or a new `animusd`-side index.
+  This keeps the demux reachable under a bare `SimEnv` test with no
+  `animusd` in the loop.
+- **`CpAppendEntriesSent`'s meaning**: stayed "logical per-group
+  heartbeat," as recommended — a batched heartbeat is still counted there,
+  at `HeartbeatBatcher::register`, since it never reaches the ordinary
+  outbound-send accounting. Two new counters, `Metric::
+  CpHeartbeatFramesSent` (physical frames) and `Metric::
+  CpHeartbeatDemuxDropped` (an unknown-group frame, dropped not delivered),
+  observe the batcher's own physical-frame behavior.
+- **Reserved stream id**: a constant, `HEARTBEAT_BATCH_STREAM = u64::MAX -
+  2`, mirroring `PRIMARY_STREAM`/`SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`'s
+  own reserved-value convention exactly, as anticipated — both ends of a
+  link must agree on it, so a locally-chosen value was never viable.
+- **ReadIndex's `ReadProbe`/`ReadProbeAck` traffic**: stayed out of scope
+  for phase 2, as planned — the batcher only ever intercepts a bare
+  `RaftMsg::AppendEntries` from `RaftCore::tick`'s own heartbeat branch,
+  never the separate `KvWire::ReadProbe`/`ReadProbeAck` messages. Left
+  named here for a possible later phase, unchanged from PR 1's own note.
+
+Additionally, two decisions the design sketch (§5) did not pose as
+explicit open questions but PR 2 still had to make: **response direction**
+(`AppendEntriesResp` for a demuxed heartbeat ships back on the responding
+group's own stream, individually — never re-aggregated into a return
+batch, since the demux is a serial on-arrival dispatch with no natural
+aggregation point the send side's own deadline-driven loop has) and
+**flag reach** (`--heartbeat-batch`/`cluster_settings.heartbeat_batch`
+threads through the identical wrapper chain `--quiesce-after` already
+uses, including that knob's own same documented gaps on
+`--cluster-control`/`--cluster-data`/`join`/`data --seed`). See the ADR
+amendment for the full reasoning behind both.
+
+**Measured** (§7's own baseline test methodology, now with the flag on):
+`crates/animus-cp-data/tests/heartbeat_batch_corpus.rs`'s cell (a), with
+every group's leader forced to the same physical node so leadership
+doesn't spread as `G` grows — 1 group vs. 5 groups: `frames1=238`,
+`frames5=238` (ratio 1.00, flat) against `logical1=238`, `logical5=1190`
+(ratio 5.00, still scaling with `G`) — confirming §4's own prediction
+exactly: physical frames flatten to per-node-pair while the logical
+per-group count is unchanged.

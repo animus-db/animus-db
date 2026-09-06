@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
@@ -250,8 +250,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -400,6 +400,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
+    // `--heartbeat-batch` (ADR 0044 phase 2, C-02 PR 2): opts every
+    // data-plane CP group into the per-node heartbeat batcher — a bare
+    // boolean flag (no value), off by default. See `animusd::config::
+    // ClusterSettings::heartbeat_batch`'s own doc for the full mechanism.
+    let mut heartbeat_batch: Option<bool> = None;
     // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
     // §5(a), W-08 step 4): the cluster-wide default read/write
     // capacity-units budget applied to any table that has not set its own
@@ -512,6 +517,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
+            "--heartbeat-batch" => heartbeat_batch = Some(true),
             "--throttle-read-units" => {
                 throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
             }
@@ -551,6 +557,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         auto_split_ops_rate,
         orphan_sweep_after_secs: orphan_sweep_after,
         quiesce_after_secs: quiesce_after,
+        heartbeat_batch,
         stream_seal_bytes,
         stream_seal_age_secs,
         stream_retention_secs,
@@ -667,6 +674,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
+                cli_cluster_settings.heartbeat_batch.unwrap_or(false),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
                 advertise_host,
@@ -1311,6 +1319,7 @@ fn resolve_cluster_settings(
     merge_field!(auto_split_ops_rate, "--auto-split-ops-rate");
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
+    merge_field!(heartbeat_batch, "--heartbeat-batch");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
@@ -1411,6 +1420,7 @@ async fn run_single(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        settings.heartbeat_batch.unwrap_or(false),
         settings.auto_split_bytes,
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
@@ -1720,6 +1730,7 @@ async fn run_data_config(
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
         quiesce_after,
+        settings.heartbeat_batch.unwrap_or(false),
         stream_seal_knobs_val,
         // Same documented gap as `--backup-store` (ADR 0059 §1): no
         // `--segment-store` flag reaches `animusd data --config` yet.
@@ -1945,6 +1956,7 @@ async fn run_in_process_cluster(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
@@ -1971,6 +1983,7 @@ async fn run_in_process_cluster(
         auto_split_change_rate,
         auto_split_ops_rate,
         quiesce_after,
+        heartbeat_batch,
         dynamo_auth,
         backup_store_config,
         throttle_read_units,

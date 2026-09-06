@@ -88,6 +88,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
                 animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
+                false,
                 None,
                 None,
                 None,
@@ -174,6 +175,7 @@ async fn bring_up_with_throttle_defaults(
                 animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO, // quiescence: irrelevant here, disabled
+                false,          // heartbeat batching: irrelevant here, off
                 None,
                 None,
                 None,

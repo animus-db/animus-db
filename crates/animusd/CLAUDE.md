@@ -3413,6 +3413,56 @@ sweeper-skip regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
 
+## Heartbeat batching (ADR 0044 phase 2, C-02 PR 2)
+
+Data-plane-only, additive-default (off), the mechanism itself
+(`animus_cp_data::heartbeat_batch::HeartbeatBatcher`,
+`host::Reconciler::enable_heartbeat_batching`) lives in `animus-cp-data` —
+see that crate's `CLAUDE.md`. This crate's own contribution is purely the
+CLI/config-flag plumbing, threaded through the **identical** wrapper
+chain `--quiesce-after` already uses, at each function's own new trailing
+`heartbeat_batch: bool` parameter placed right after `quiesce_after:
+Duration`:
+
+- **`--heartbeat-batch`** (`main.rs`, a bare boolean flag — no value, since
+  the batcher's own flush cadence is fixed at `RaftCore::
+  heartbeat_interval` with no independent tunable) threads through
+  `--config`/`--node` (`run_single` → `run_node_with_cluster_settings` →
+  `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
+  `BoundNode::start_with_growth`) and `--cluster N`
+  (`start_cluster_with_growth_and_quiesce_after` →
+  `start_cluster_inner`) — **off by default** (unlike `--quiesce-after`'s
+  own default-on-at-5s posture; this is a newer, less-soaked mechanism, so
+  it ships opt-in). `animusd data --config` reaches it too, via the same
+  `cluster_settings.heartbeat_batch` config-file field
+  `run_node_data_with_cluster_settings` reads, mirroring S-06's own
+  `quiesce_after_secs` route exactly (`ClusterSettings::heartbeat_batch`'s
+  own doc in `config.rs` has the field's applicability). A CLI flag and
+  the config section setting the same field is the identical "one way,
+  not both" hard-error contract `resolve_cluster_settings` already
+  enforces for every other knob there.
+- **Same documented gaps as `--quiesce-after`, at the identical call
+  sites**: `--cluster-control`/`--cluster-data` (the in-process split-
+  cluster dev path, `run_in_process_split_cluster` — hardcodes `false` at
+  its `start_data_with_growth` call, mirroring that path's own hardcoded
+  `Duration::ZERO` for quiescence), `join`/`data --seed` (same hardcode),
+  and every narrower test/convenience wrapper that doesn't expose every
+  knob its own widest sibling does (`run_node_with_streams_and_
+  quiesce_after`, `run_node_with_streams_and_pitr_snapshot_cadence`,
+  `run_node_with_streams_quiesce_and_backup_store`,
+  `start_cluster_with_quiesce_after`, `start_cluster_with_growth`, and
+  their own ancestors — each hardcodes `false` at its own call into a
+  batching-aware layer, with a comment pointing at the wider sibling that
+  does expose it).
+- **No `/admin/config` field yet** (unlike `--quiesce-after`'s own
+  `quiesce_after_ms`) — a deliberate scope cut for this PR, named here so
+  it isn't mistaken for an oversight; a follow-up can add one the same way
+  roadmap U-06 added `quiesce_after_ms`.
+
+See ADR 0044's 2026-09-06 phase-2 amendment for the full design record,
+including the reserved stream id, response-batching decision, and
+receiver-lookup-ownership decisions this flag's own mechanism rests on.
+
 ## Wire edges
 
 All edges are production-only I/O (real tokio sockets, hand-rolled framing) and

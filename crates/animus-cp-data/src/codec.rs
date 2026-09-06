@@ -208,7 +208,13 @@ const MAGIC: u8 = 0xCB;
 /// preconditions for a *transaction's* own-key writes) is untouched — the
 /// two were always independent fields on different variants that happened
 /// to share a name and a byte-level OCC shape, not one shared mechanism.
-const VERSION: u8 = 27;
+/// `28` (ADR 0044 phase 2, C-02 PR 2): `KvWire` gained
+/// `HeartbeatBatch(Vec<(u64, RaftMsg<KvCommand>)>)` (tag `3`) — the
+/// per-node heartbeat batcher's own physical frame, sent only on the
+/// reserved `heartbeat_batch::HEARTBEAT_BATCH_STREAM` (see that module's
+/// doc). Same house convention: a clean bump, no cross-version
+/// compatibility required.
+const VERSION: u8 = 28;
 
 /// A decode failure: a description of what was malformed, surfaced loudly by
 /// the caller (logged + dropped; never silently misread).
@@ -1159,6 +1165,14 @@ pub(crate) fn encode_wire(w: &KvWire) -> Vec<u8> {
             put_u64(&mut out, *term);
             put_u64(&mut out, *epoch);
         }
+        KvWire::HeartbeatBatch(entries) => {
+            put_u8(&mut out, 3);
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (stream, msg) in entries {
+                put_u64(&mut out, *stream);
+                put_raft(&mut out, msg);
+            }
+        }
     }
     out
 }
@@ -1185,6 +1199,20 @@ pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, DecodeError> {
             term: c.u64()?,
             epoch: c.u64()?,
         },
+        3 => {
+            let n = c.u32()?;
+            // Capped pre-allocation against an untrusted wire count — same
+            // discipline as `read_raft`'s own `AppendEntries` entry-count
+            // read (see this module's own doc, "untrusted length-prefixed
+            // collection pre-allocation").
+            let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
+            for _ in 0..n {
+                let stream = c.u64()?;
+                let msg = read_raft(&mut c)?;
+                entries.push((stream, msg));
+            }
+            KvWire::HeartbeatBatch(entries)
+        }
         other => return Err(format!("unknown KvWire tag {other}")),
     };
     c.finish()?;
@@ -1622,6 +1650,40 @@ mod tests {
         }
         roundtrip(&KvWire::ReadProbe { term: 7, epoch: 42 });
         roundtrip(&KvWire::ReadProbeAck { term: 7, epoch: 42 });
+    }
+
+    /// ADR 0044 phase 2 (C-02 PR 2): a batched-heartbeat frame round-trips,
+    /// including the empty-batch edge case (never sent in practice — the
+    /// flush loop skips an empty buffer — but the decoder must not choke on
+    /// one either).
+    #[test]
+    fn heartbeat_batch_round_trips() {
+        let entries = vec![
+            (
+                7u64,
+                RaftMsg::AppendEntries {
+                    term: 3,
+                    leader: nid(0),
+                    prev_log_index: 10,
+                    prev_log_term: 2,
+                    entries: Vec::new(),
+                    leader_commit: 10,
+                },
+            ),
+            (
+                12u64,
+                RaftMsg::AppendEntries {
+                    term: 5,
+                    leader: nid(0),
+                    prev_log_index: 4,
+                    prev_log_term: 1,
+                    entries: Vec::new(),
+                    leader_commit: 4,
+                },
+            ),
+        ];
+        roundtrip(&KvWire::HeartbeatBatch(entries));
+        roundtrip(&KvWire::HeartbeatBatch(Vec::new()));
     }
 
     #[test]

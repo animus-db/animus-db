@@ -19639,3 +19639,116 @@ you the same measurement without the code change. Don't reach for the
 missing constructor as the only path — ask what invariant the measurement
 actually depends on, and whether a simpler composition of existing pieces
 already satisfies it.
+
+## A hard-wrapped `+`/`-`/digit-`.` landing at the start of a doc-comment line is a markdown list marker, not prose — clippy's `doc_lazy_continuation` cascades errors onto every following line (ADR 0044 phase 2, C-02 PR 2)
+
+This repo's own long-form doc-comment style hard-wraps prose at roughly
+column 80, sometimes splitting a hyphenated or `+`-joined phrase across
+the line boundary (e.g. "...a second buffering\n/// + timer layer..."). A
+markdown line that starts (after the `///`/`//!` prefix) with `+ `, `- `,
+`* `, or `N. ` is a **list item marker** to pulldown_cmark regardless of
+authorial intent — the wrap in this case landed `+ timer layer purely for
+the...` at the start of its own raw source line, which rustdoc's markdown
+parser reads as opening a new bulleted list right there. `clippy::
+doc_lazy_continuation` (part of `-D warnings`) then flags **every
+subsequent line up to the next blank line** as "doc list item without
+indentation" — nine separate errors from one accidental wrap, none of
+which point at the actual `+` that caused it (the errors start on the
+line *after*). `cargo build`/`cargo test` don't run clippy, so this is
+invisible until the actual `-D warnings` gate — a genuinely confusing
+first read, since the flagged lines look like ordinary prose with nothing
+wrong.
+
+**Fix**: reflow the paragraph so no line begins with a markdown list/
+emphasis-adjacent character after word-wrapping — moving the `+`-joined
+phrase (or dash, or an ordinal like "1.") off the line start is enough;
+no `#[allow]` needed, and none should be reached for here, since the
+underlying text isn't actually a list and an allow would just suppress a
+real (if minor) rendering defect in the shipped rustdoc output too.
+
+**General form**: when `-D warnings` reports a `doc_lazy_continuation`
+error on a line that reads as unremarkable prose, don't inspect that
+line — inspect the line(s) *before* it (back to the last blank doc-comment
+line) for one that starts with `+`/`-`/`*`/a bare number followed by `.`
+or `)` purely as an artifact of hard-wrapping. Any hand-wrapped prose
+convention that can split a `word + word`/`word - word` phrase across a
+line boundary is exposed to this; it is cheap to avoid by keeping such a
+joiner on the same line as at least one of its operands.
+
+## A corpus scenario summing a metric across every physical node conflates "more work per node" with "more nodes doing work" — force a deterministic leader when the claim is about one node's own scaling (ADR 0044 phase 2, C-02 PR 2)
+
+The heartbeat-batcher corpus's first draft measured amortization by
+hosting `count` independent 3-node groups (random election per group, the
+same 3 physical node ids reused across groups) and asserting the summed
+`CpHeartbeatFramesSent` across all three `MetricsHandle`s stayed
+"flat-ish" as `count` grew from 1 to 5. It didn't: the ratio came in at
+~3.0, not ~1.0. The batcher was working correctly — the *test* was
+measuring the wrong thing. With only 1 group, exactly one of the three
+physical nodes is ever a leader, so the summed metric reflects one node's
+own traffic. With 5 independently, randomly elected groups spread across
+the same 3 physical nodes, it becomes overwhelmingly likely that **all
+three** physical nodes end up leading at least one group — so the summed
+metric now reflects up to three nodes' own traffic, each amortizing
+correctly on its own, but the sum across nodes naturally scales with the
+number of nodes-that-lead-something (bounded by the physical node count),
+not with the group count directly. The claim under test — "one node
+leading many groups sends a flat number of physical frames" — was never
+actually isolated from a second, unrelated variable — "how many of the
+3 physical nodes happen to lead *something* as group count grows."
+
+**Fix**: force every group's leadership onto the *same* physical node
+before comparing group counts, using the crate's own pre-existing
+deterministic-first-leader mechanism (`RaftKvNode::
+start_hosted_campaigning[_with_batcher]` — built for the in-place-split
+fork's own "campaign immediately, don't wait out a randomized election
+timeout" need, and directly reusable here for the identical property: one
+specific replica reliably wins) — then read only that one physical node's
+own `MetricsHandle`, never a sum across all of them. With the confound
+removed, the same experiment reproducibly gives frame-ratio ≈ 1.00 against
+logical-ratio ≈ 5.00, exactly the amortization claim being tested.
+
+**General form**: a corpus that sums a per-node metric across N physical
+nodes to test a claim about "one node's own behavior as some load
+parameter grows" is only valid if leadership/work assignment across those
+N nodes is held fixed across the compared runs. If the system under test
+elects/assigns work non-deterministically, growing the load parameter can
+independently grow the number of participating nodes too, and a summed
+metric cannot tell the two effects apart — either pin the assignment
+deterministically (as here) or measure and control for the actual
+participant count directly, never assume "more load, same node set."
+
+## A partition test's own "sibling group is untouched" assertion is only true when the two groups' leaders provably sit on different physical nodes (ADR 0044 phase 2, C-02 PR 2)
+
+A related corpus scenario partitioned one group's leader node away from
+its followers and asserted a second, co-hosted sibling group (sharing the
+same 3 physical node ids, on a different `stream`) stayed completely
+unaffected — same leader, same term. With natural random election for
+both groups, this intermittently failed with `leader_index` finding *two*
+leaders in the sibling group: the partition, applied at the **node** level
+(`sim.partition(node_a, node_b)` — every stream between those two node
+ids, not just the tablet under test), silently also isolated the sibling
+group's own leader whenever that leader happened to land on the same
+physical node as the first group's leader (a real, if not overwhelmingly
+likely, coincidence across two independent elections on the same 3-node
+id set) — and the sibling group then legitimately re-elected too, leaving
+its old (now-partitioned, frozen-belief) leader still reporting
+`is_leader() == true` alongside a genuinely new one.
+
+**Fix**: the same deterministic-first-leader mechanism as the previous
+entry, applied to force the two groups' leaders onto two *different*
+physical node indices (`hosted_group_fixed_leader(.., 0)` and
+`hosted_group_fixed_leader(.., 1)`) — making "the sibling shares no
+partitioned pair" a structural guarantee instead of a per-seed coin flip,
+so the test proves the property it was written to prove on every run,
+not just the runs where the elections happened to land favorably.
+
+**General form**: a fault-injection test whose fault is addressed at a
+coarser granularity than the unit under test (a node-level partition when
+the claim is about one group's own traffic) must account for every OTHER
+unit sharing that same coarser address — either force their assignment
+apart deterministically so the fault provably can't reach them, or make
+the assertion itself branch on whether the coincidence occurred (proving
+the correct, different property in each case) rather than assuming the
+coincidence never happens. A corpus running at depth (many seeds) will
+eventually hit the coincidence even when its author's first few manual
+runs didn't.

@@ -4170,6 +4170,7 @@ impl BoundNode {
             None,
             None,
             Duration::ZERO,
+            false,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
             BackupStoreConfig::default(),
@@ -4238,6 +4239,20 @@ impl BoundNode {
     /// `None`/`None` (every caller that doesn't expose the knob yet) is
     /// byte-identical to before this pair of parameters existed —
     /// `PAY_PER_REQUEST`, no throttling.
+    ///
+    /// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): opts every
+    /// data-plane group this node's tablet-host reconciler hosts into the
+    /// per-node [`HeartbeatBatcher`](animus_cp_data::heartbeat_batch::
+    /// HeartbeatBatcher) — mirrors `quiesce_after`'s own "additive-default,
+    /// off unless set" shape exactly: `false` (every pre-PR-2 call site) is
+    /// byte-for-byte today's unbatched behavior, one `AppendEntries`
+    /// heartbeat per hosted group per destination per tick.
+    /// `--heartbeat-batch` (`--config FILE --node I` and `--cluster N`)
+    /// threads through here, mirroring `--quiesce-after`'s own reach —
+    /// same documented gaps on `--cluster-control`/`--cluster-data`/
+    /// `join`/`data --seed` (this method's own call sites below hardcode
+    /// `false`, same "not yet wired here" precedent `--quiesce-after`
+    /// already set on those paths).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4257,6 +4272,7 @@ impl BoundNode {
         auto_split_change_rate: Option<u64>,
         auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
+        heartbeat_batch: bool,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
@@ -4572,6 +4588,16 @@ impl BoundNode {
                  quiescence — see that constant's own doc"
             );
             reconciler.enable_quiescence(quiesce_after);
+        }
+        // ADR 0044 phase 2 (C-02 PR 2) production wiring: opt every
+        // data-plane group this reconciler hosts into the per-node
+        // heartbeat batcher — `--heartbeat-batch` CLI/config flag, off by
+        // default (every existing call site passes `false`, zero behavior
+        // change). Mirrors `enable_quiescence`'s own "opt in once, applies
+        // from here on" shape exactly — see `host::Reconciler::
+        // enable_heartbeat_batching`'s own doc.
+        if heartbeat_batch {
+            reconciler.enable_heartbeat_batching();
         }
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
@@ -5930,6 +5956,7 @@ impl BoundDataNode {
             None,
             None,
             Duration::ZERO,
+            false,
             None,
             BackupStoreConfig::default(),
             None,
@@ -5963,6 +5990,11 @@ impl BoundDataNode {
     /// reconciler now enables quiescence exactly like [`BoundNode::
     /// start_with_growth`]'s combined-mode reconciler does, same
     /// `Duration::ZERO`-disables/`MIN_QUIESCE_AFTER`-floor contract.
+    ///
+    /// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): the identical
+    /// `--heartbeat-batch` opt-in as [`BoundNode::start_with_growth`]'s own
+    /// knob of the same name — `false` (every pre-PR-2 call site) is
+    /// byte-for-byte today's unbatched behavior.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5980,6 +6012,7 @@ impl BoundDataNode {
         auto_split_change_rate: Option<u64>,
         auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
+        heartbeat_batch: bool,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
         throttle_read_units: Option<u64>,
@@ -6177,6 +6210,12 @@ impl BoundDataNode {
                  quiescence — see that constant's own doc"
             );
             reconciler.enable_quiescence(quiesce_after);
+        }
+        // ADR 0044 phase 2 (C-02 PR 2): identical `--heartbeat-batch`
+        // opt-in as `BoundNode::start_with_growth`'s own gate above — see
+        // that call site's doc.
+        if heartbeat_batch {
+            reconciler.enable_heartbeat_batching();
         }
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
@@ -10306,6 +10345,15 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
+    /// [`Reconciler::enable_heartbeat_batching`]'s doc.
+    fn enable_heartbeat_batching(&mut self) {
+        match self {
+            CpReconciler::Lsm(r) => r.enable_heartbeat_batching(),
+            CpReconciler::Mem(r) => r.enable_heartbeat_batching(),
+        }
+    }
+
     /// ADR 0058 Train 2 rung 4 layer 1 — see [`Reconciler::fork_wake`]'s doc.
     async fn fork_wake(&self) {
         match self {
@@ -11862,6 +11910,7 @@ pub async fn start_cluster_with(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11900,6 +11949,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11935,6 +11985,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11977,6 +12028,7 @@ pub async fn start_cluster_with_streams(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -12017,6 +12069,7 @@ pub async fn start_cluster_with_growth(
         auto_split_change_rate,
         auto_split_ops_rate,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -12056,6 +12109,12 @@ pub async fn start_cluster_with_quiesce_after(
         None,
         None,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower,
+        // test-only wrapper (predates ADR 0044 phase 2 and, per this
+        // function's own doc, already didn't expose the streams/change-rate
+        // knobs `start_cluster_with_growth_and_quiesce_after` does) — a
+        // caller wanting batching-on calls that sibling directly instead.
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -12093,6 +12152,11 @@ pub async fn start_cluster_with_quiesce_after(
 /// `PAY_PER_REQUEST`, byte-identical to before this pair of parameters
 /// existed.
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2) opts every node in the
+/// in-process cluster into the per-node heartbeat batcher — `--cluster N`'s
+/// `--heartbeat-batch` CLI flag threads through here; `false` (every other
+/// wrapper above) is byte-for-byte today's unbatched behavior.
+///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
@@ -12107,6 +12171,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
@@ -12125,6 +12190,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         auto_split_change_rate,
         auto_split_ops_rate,
         quiesce_after,
+        heartbeat_batch,
         dynamo_auth,
         backup_store_config,
         throttle_read_units,
@@ -12147,6 +12213,7 @@ async fn start_cluster_inner(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
@@ -12224,6 +12291,7 @@ async fn start_cluster_inner(
                 auto_split_change_rate,
                 auto_split_ops_rate,
                 quiesce_after,
+                heartbeat_batch,
                 // `--cluster N` has no ttl-sweep-interval knob of its own
                 // yet (mirrors `stream_retention`'s own layered-stack
                 // precedent for a not-yet-CLI-exposed knob) — production
@@ -12504,6 +12572,8 @@ pub async fn start_split_cluster_with_growth(
                 // same documented gap `run`'s own module doc names (S-06
                 // scoped only the three real deployment paths).
                 Duration::ZERO,
+                // `--heartbeat-batch` has the identical documented gap here.
+                false,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
                 None,
@@ -12639,6 +12709,11 @@ pub async fn run_node_with_streams_and_quiesce_after(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower,
+        // test/convenience-only wrapper (mirrors `--auto-split-*`'s own
+        // "not exposed here" gap two lines down) — a caller wanting
+        // batching-on calls `run_node_with_cluster_settings` directly.
+        false,
         None,
         None,
         None,
@@ -12688,6 +12763,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        false,
         None,
         None,
         None,
@@ -12738,6 +12814,11 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower wrapper
+        // either (mirrors this file's own precedent above) — a caller
+        // wanting batching-on calls `run_node_with_cluster_settings`
+        // directly.
+        false,
         None,
         None,
         None,
@@ -12773,6 +12854,12 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// caller too. `None`/`None` (every other call site) is byte-identical to
 /// before this pair of parameters existed.
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): `--config FILE --node
+/// I`'s `--heartbeat-batch` CLI/`cluster_settings.heartbeat_batch` config
+/// flag — `false` (every other call site) is byte-for-byte today's
+/// unbatched behavior. `main.rs`'s `run_single` is this function's real
+/// caller, mirroring `quiesce_after`'s own reach exactly.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -12786,6 +12873,7 @@ pub async fn run_node_with_cluster_settings(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
@@ -12806,6 +12894,7 @@ pub async fn run_node_with_cluster_settings(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        heartbeat_batch,
         auto_split_bytes,
         auto_split_change_rate,
         auto_split_ops_rate,
@@ -12861,6 +12950,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
@@ -12939,6 +13029,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             auto_split_change_rate,
             auto_split_ops_rate,
             quiesce_after,
+            heartbeat_batch,
             ttl_sweep_interval,
             dynamo_auth,
             backup_store_config,
@@ -12979,6 +13070,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        false,
         None,
         None,
         None,
@@ -13178,6 +13270,7 @@ pub async fn run_node_data(
         None,
         None,
         Duration::ZERO,
+        false,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         None,
@@ -13219,6 +13312,7 @@ pub async fn run_node_data_with_streams(
         None,
         None,
         Duration::ZERO,
+        false,
         stream_seal_knobs,
         segment_store_config,
         None,
@@ -13253,6 +13347,13 @@ pub async fn run_node_data_with_streams(
 /// the identical gap `auto_split_bytes`/`quiesce_after` already document
 /// above).
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): `animusd data --config`'s
+/// only route to the per-node heartbeat batcher, the same
+/// `cluster_settings.heartbeat_batch` config-file section
+/// `run_node_with_cluster_settings`'s own combined-mode twin reads —
+/// `false` (every other call site) is byte-for-byte today's unbatched
+/// behavior.
+///
 /// # Errors
 /// As [`run_node_data`].
 #[allow(clippy::too_many_arguments)]
@@ -13265,6 +13366,7 @@ pub async fn run_node_data_with_cluster_settings(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
     throttle_read_units: Option<u64>,
@@ -13358,6 +13460,7 @@ pub async fn run_node_data_with_cluster_settings(
             auto_split_change_rate,
             auto_split_ops_rate,
             quiesce_after,
+            heartbeat_batch,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
             // CLI flag reaches `animusd data --config` yet, so this always
@@ -13939,6 +14042,8 @@ async fn finish_data_join(
             // `join`/`data --seed` (S-06 scoped only the three real
             // `--config`/`--node`-shaped deployment paths).
             Duration::ZERO,
+            // `--heartbeat-batch` has the identical documented gap here.
+            false,
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
