@@ -1458,3 +1458,85 @@ async fn dashboard_u05_lineage_panel() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's third slice (the TABLET action family): four
+/// gated buttons on the tablet detail card — Split, Flush, Compact,
+/// Reconfigure — over the four PRE-EXISTING `/admin/tablet/split`,
+/// `/admin/storage/{flush,compact}`, and `/admin/raftkv/reconfigure`
+/// routes (no new backend route). Same shell/JS-marker style as the two
+/// preceding U-05 slices above (`dashboard_u05_control_members_panel`,
+/// `dashboard_u05_lineage_panel`): the buttons themselves only ever exist
+/// in the client-rendered detail card (`renderTabletDetail`'s own
+/// template), not the static shell, so this proves the served JS defines
+/// every button id, every route path it posts to, and the `window.confirm`
+/// guard on each — the wire-level round trip of the four routes themselves
+/// is already covered (`admin_endpoint.rs`'s
+/// `admin_interface_surfaces_state_and_actions` for split/flush/reconfigure,
+/// and this slice's own new `admin_storage_compact_action` for compact,
+/// which had no coverage at all before this change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_tablet_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell still carries #tb-detail (the card these buttons
+        // render inside, client-side) --------------------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="tb-detail""#),
+            "shell still carries #tb-detail: {shell}"
+        );
+
+        // ---- dashboard_tablets.js defines the four gated actions -----------
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        for btn_id in [
+            "tb-split-btn",
+            "tb-flush-btn",
+            "tb-compact-btn",
+            "tb-reconfigure-btn",
+        ] {
+            assert!(
+                tablets_js.contains(btn_id),
+                "dashboard_tablets.js defines button #{btn_id}: {tablets_js}"
+            );
+        }
+        for route in [
+            "/admin/tablet/split",
+            "/admin/storage/flush",
+            "/admin/storage/compact",
+            "/admin/raftkv/reconfigure",
+        ] {
+            assert!(
+                tablets_js.contains(route),
+                "dashboard_tablets.js posts to the real route {route}: {tablets_js}"
+            );
+        }
+        assert!(
+            tablets_js.matches("window.confirm(").count() >= 4,
+            "every one of the four actions is guarded by window.confirm: {tablets_js}"
+        );
+        // Every action posts via the crate's one mutation idiom (postJSON)
+        // and refreshes through the tab's existing loader — no new timer.
+        assert!(
+            tablets_js.contains("postJSON(") && tablets_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {tablets_js}"
+        );
+        // Reconfigure targets the tablet's own CP leader, same as the
+        // pre-existing storage-detail/"Open in Storage" targeting.
+        assert!(
+            tablets_js.contains("function tbLeaderBase") && tablets_js.contains("lead.node.base"),
+            "leader-only actions resolve the same leader address the storage panel already uses: {tablets_js}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

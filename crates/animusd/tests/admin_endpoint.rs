@@ -1983,3 +1983,90 @@ async fn admin_control_transfer_on_a_follower_is_refused() {
     .await
     .expect("test timed out");
 }
+
+/// `POST /admin/storage/compact` (docs/roadmap.md U-05, tablet action
+/// family) had no integration coverage anywhere in this crate before this
+/// test — `admin_interface_surfaces_state_and_actions` above only exercises
+/// its sibling `/admin/storage/flush`. Mirrors that test's own flush
+/// sequence: write a key, find the CP group leader, flush it to a real
+/// on-disk SSTable (so compaction has real LSM state to act on, not a
+/// trivial empty-engine no-op), compact, and confirm the written pair
+/// still reads back afterward. Also proves the `not_hosted` refusal shape
+/// for a tablet id this node doesn't host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_storage_compact_action() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        put(
+            &mut stream,
+            "kv",
+            b"compact-key".to_vec(),
+            b"compact-val".to_vec(),
+        )
+        .await;
+
+        let mut leader_admin = None;
+        for node in &nodes {
+            let (_, rk) = admin_get(node.admin_addr(), "/admin/raftkv").await;
+            if rk["groups"][0]["is_leader"].as_bool() == Some(true) {
+                leader_admin = Some(node.admin_addr());
+                break;
+            }
+        }
+        let leader_admin = leader_admin.expect("a CP group leader exists");
+
+        let (s, flushed) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/flush",
+            Some("{\"tablet\":1}"),
+        )
+        .await;
+        assert_eq!(s, 200, "flush before compact: {flushed}");
+        assert_eq!(flushed["flushed"], true, "flush ran: {flushed}");
+
+        let (s, compacted) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/compact",
+            Some("{\"tablet\":1}"),
+        )
+        .await;
+        assert_eq!(s, 200, "compact action returns 200: {compacted}");
+        assert_eq!(compacted["compacted"], true, "compact ran: {compacted}");
+        assert_eq!(compacted["tablet"], 1);
+
+        // The written pair survives compaction.
+        let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=10").await;
+        assert_eq!(s, 200);
+        let items = scan["items"].as_array().expect("scan items array");
+        assert!(
+            items
+                .iter()
+                .any(|it| { it["key"] == "compact-key" && it["value"] == "compact-val" }),
+            "the written pair survives compaction: {scan}"
+        );
+
+        // An unhosted tablet id is refused (`not_hosted`'s 404 shape).
+        let (s, err) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/compact",
+            Some("{\"tablet\":999}"),
+        )
+        .await;
+        assert_eq!(s, 404, "compacting an unhosted tablet is refused: {err}");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

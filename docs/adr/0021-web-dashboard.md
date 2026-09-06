@@ -477,3 +477,20 @@ the full mechanism, `tests/dashboard_endpoint.rs::dashboard_u05_lineage_panel`
 for the dashboard-wiring regression, and `tests/admin_endpoint.rs::
 admin_system_table_split_lineage_after_a_real_split` for the real-cluster
 proof that a completed split actually populates the row this panel parses.
+
+## Amendment (2026-09-06, roadmap U-05) — Actions: the tablet-family buttons this design section anticipated
+
+Design §3's "Operator actions (gated)" paragraph above described
+`tablet/split`/`storage/flush`/`storage/compact`/`raftkv/reconfigure`
+buttons on the Tablets tab as a target shape; this PR is what actually
+built them. Four buttons on the tablet detail card (`#tb-detail`), each a
+`window.confirm` naming the tablet id and the action, posted via
+`postJSON` to the pre-existing route, response (or error) shown inline in
+the card rather than `alert()`, then the tab's own `loadAll()` refresh —
+no new mutation path, exactly as §3 already committed to. See ADR 0020's
+matching 2026-09-06 as-built note for the one thing worth restating
+plainly: the gate on these buttons is `window.confirm` plus this tab only
+rendering on a control-role console — not a second authorization layer,
+since the admin port itself has none (§4, "localhost-only assumption").
+Node-tab (drain/decommission/member add-remove) and the control-members
+panel's own add-remove buttons are later PRs in the same U-05 series.

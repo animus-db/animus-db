@@ -348,6 +348,37 @@ match arm and `FakeHost` stub, `crates/animusd/src/admin.rs`'s handler) and
 admin_control_transfer_moves_leadership_to_the_named_node`/
 `admin_control_transfer_on_a_follower_is_refused`.
 
+## As-built (2026-09-06, roadmap U-05) — dashboard action buttons over existing routes
+
+The Tablets tab's detail card gained four gated buttons — Split, Flush,
+Compact, Reconfigure — over the four routes that already existed
+(`POST /admin/tablet/split`, `POST /admin/storage/flush`, `POST
+/admin/storage/compact`, `POST /admin/raftkv/reconfigure`, the Phase 2
+route table above). No new admin route was added for this: the JS layer
+(`crates/animusd/src/dashboard_tablets.js`) calls these exactly as the
+`animus admin`/`animus-cli` forms already do, through the dashboard's one
+mutation idiom (`postJSON`, a `window.confirm` guard per action).
+
+**Worth stating plainly, since this is the second and third PR of a
+three-PR series adding buttons of this shape (Node/control-member families
+follow)**: a dashboard button is not a second gate on top of this ADR's
+"no auth — bind to a trusted interface" posture, and was never meant to be
+one. The **only** thing standing between a dashboard viewer and any of
+these four actions is (a) `window.confirm`'s dialog, purely a
+misclick guard, and (b) the fact that the Tablets tab — and this card in
+particular — is only ever shown on a control-role node's console
+(`ROLE_TABS`, ADR 0035 PR7 client-side gating). Neither is an
+authorization boundary: **anyone who can reach the admin port at all can
+already call every one of these routes directly**, with `curl` or the
+`animus admin` CLI, button or no button — exactly the trusted-network
+posture this ADR's Decision section states from the start ("No auth for
+v1 ... The admin port is meant to be bound to a private/management
+network"). Adding a button here changes nothing about who can act; it only
+changes how conveniently an operator who is already inside that trusted
+network can act. See `crates/animusd/CLAUDE.md`'s dashboard section and
+ADR 0021's own "Actions" note for the same statement from the dashboard's
+side.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

@@ -1241,6 +1241,44 @@ reusing the captured config is the point of the test.
   cluster split through to cutover, asserting the `split_lineage` kind
   actually carries the `{id, value: {parent, ...}}` shape this panel
   parses for both children).
+  **docs/roadmap.md U-05's third slice, the TABLET action family**
+  (`dashboard_tablets.js`) added four gated buttons to `#tb-detail`'s own
+  "Actions" section — Split, Flush, Compact, Reconfigure — over the four
+  PRE-EXISTING routes (`POST /admin/tablet/split`, `POST /admin/storage/
+  {flush,compact}`, `POST /admin/raftkv/reconfigure`); no new admin route.
+  Each button is a `window.confirm` naming the tablet id and the action,
+  posted through the same `postJSON` helper the Data Browser/Backups tabs'
+  own gated mutations use (this crate's one mutation idiom — see
+  `docs/roadmap.md`'s §4 Conventions note), with the route's response (or
+  error) rendered in a small status line inside the card
+  (`tbSetActionMsg`/`#tb-action-msg`) — never `alert()` — then the tab's
+  existing `loadAll()` refresh, no new timer. **Targeting mirrors each
+  route's own gating, not a uniform choice**: Split posts to `SEED` since
+  `ClientCtx::trigger_split` resolves/forwards to the tablet's leader
+  internally; Flush/Compact/Reconfigure post to `tbLeaderBase(tablet)` —
+  the identical `lead.node.base` the pre-existing storage-detail card and
+  "Open in Storage" button already resolve, re-derived nowhere else — since
+  Flush/Compact need a node that locally hosts the tablet and Reconfigure
+  is leader-only server-side (a `409` "retry on the leader" otherwise); a
+  refusal is shown verbatim, never retried automatically. Reconfigure's
+  voter-list input pre-fills from the tablet's current `replicas` and, like
+  the Split-key input, survives this tab's own ~5s poll re-render via a
+  module-level string kept in sync by an `input` listener (`tbSplitKeyInput`/
+  `tbReconfigureVoters`) rather than being recomputed from scratch every
+  tick — the same "don't clobber an in-flight edit" concern `dyTable`'s
+  render-gate in `dashboard_core.js::render` already documents for the Data
+  Browser. **The only gate on these four buttons is `window.confirm` plus
+  this tab (and card) only ever rendering on a control-role console** — see
+  ADR 0020's matching 2026-09-06 as-built note and ADR 0021's "Actions"
+  amendment for why that is a deliberate, plainly-stated non-gate rather
+  than an oversight: the admin port itself has no auth (ADR 0020), so
+  anyone who can reach it can already call any of these four routes
+  directly, button or not. `POST /admin/storage/compact` had **no**
+  integration coverage anywhere in this crate before this slice (`/admin/
+  storage/flush`'s own coverage predates it, `admin_endpoint.rs::
+  admin_interface_surfaces_state_and_actions`) — added
+  `tests/admin_endpoint.rs::admin_storage_compact_action`. Dashboard-wiring
+  test: `tests/dashboard_endpoint.rs::dashboard_u05_tablet_actions`.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
