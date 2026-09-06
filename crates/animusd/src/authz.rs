@@ -568,6 +568,34 @@ mod tests {
                 OpClass::Backup,
             ),
             (
+                Operation::ExportTableToPointInTime {
+                    table: table(),
+                    table_arn: "arn".to_string(),
+                    s3_bucket: "bucket".to_string(),
+                    s3_prefix: None,
+                    export_time_ms: None,
+                    client_token: None,
+                },
+                "ExportTableToPointInTime",
+                OpClass::Backup,
+            ),
+            (
+                Operation::DescribeExport {
+                    export_arn: "arn".to_string(),
+                },
+                "DescribeExport",
+                OpClass::Backup,
+            ),
+            (
+                Operation::ListExports {
+                    table_arn: None,
+                    max_results: None,
+                    next_token: None,
+                },
+                "ListExports",
+                OpClass::Backup,
+            ),
+            (
                 Operation::UpdateContinuousBackups {
                     table: table(),
                     enabled: true,
