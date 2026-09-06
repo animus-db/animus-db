@@ -9429,6 +9429,42 @@ debugging anything that feels like it might have happened before.
   command afterward) then keeps the rebuilt tree from reaching the same
   ceiling again — debug info alone was the difference between builds that
   fit in the freed headroom and ones that didn't, in the same session.
+- **Refinement (2026-09-05): running `fmt`/`clippy`/`check`/`build` back to
+  back in one session — not a parallel fan-out, just the ordinary per-push
+  gate sequence — is itself enough to exhaust the disk, because each
+  invocation mints its own content-hashed artifact filenames and cargo
+  never garbage-collects a superseded one.** `cargo clippy
+  --all-targets`/`cargo check --all-targets`/`cargo build --all-targets`
+  each compile the *same* ~100 test binaries under slightly different
+  flags, so `target/debug/deps/` accumulates several `-<16-hex-hash>`-named
+  copies of every one (e.g. `animusd-03e1a1...`, `animusd-9e4ac3...`,
+  `animusd-1f7ddd...`, `animusd-cb08f0...`, each 90-100 MB) — only the
+  newest actually backs the current build; the rest are pure dead weight
+  cargo has no reason to ever revisit. This is a different shape than
+  either existing entry above: it isn't the incremental cache (already
+  empty — `rm -rf target/debug/incremental` reclaimed almost nothing, ~44
+  MB, when tried first) and it isn't "delete every linked test binary" (that
+  would also delete the copies the *next* build still needs, forcing a full
+  relink of everything rather than nothing). **What actually worked**: group
+  `target/debug/deps/*` by filename with its trailing `-[0-9a-f]{16}` hash
+  stripped, and for every basename with more than one file, delete every
+  copy except the newest by mtime. On this repo that reclaimed **13.47 GB**
+  from 237 stale files in one pass, with zero rebuild cost — the very next
+  `cargo build --workspace --all-targets` found every dependency rlib it
+  needed already fresh and only relinked the handful of targets that had
+  actually changed. General rule: before reaching for `cargo clean` (nukes
+  everything, forces a full recompile of ~150 dependency crates) or an
+  executables-only sweep (still forces a full relink of every test binary),
+  check whether the bulk of `target/debug/deps/` is *duplicate* current-vs-
+  stale hash pairs from having run several separate gate invocations in one
+  session — pruning to one file per basename is strictly cheaper and just
+  as effective. **A second-order gotcha this hit**: at genuinely 0 bytes
+  free, even the `Edit`/`Write` tools failed with a raw `ENOSPC: no space
+  left on device, write` (a different message shape than the harness's own
+  "temp filesystem is full" Bash wrapper above, but the same underlying
+  cause) — so a repo-file edit failing with that exact message is a disk
+  symptom, not a tool bug or a signal to retry the edit differently; check
+  `df -h /` before assuming anything about the edit itself.
 - **Parallel agents share one `target/` dir; three concurrent
   `--all-targets` builds exhaust the session disk (2026-08-19).** Fanning three
   implementation agents across disjoint crates avoids *source* conflicts but
@@ -18081,3 +18117,149 @@ opt out of the new trigger (`tablet_max_{read,write}_units: Some(0)`) —
 scoping the new default-on behavior away from a test that was never about
 it, rather than letting an unrelated fixture's magnitude become an
 accidental second test of the new feature.
+
+## The same tablet id is a different JSON type depending on which side of `GET /admin/system-table` it comes from (docs/roadmap.md U-05, the Tablets tab lineage panel)
+
+Building the split-lineage/directed-placing panel (`dashboard_tablets.js`)
+needed to correlate two things read off the same `GET /admin/system-table?
+kind=split_lineage` response: a row's own `id` (a tablet id) against
+`value.parent` (also a tablet id) embedded inside a *different* row's JSON
+body. They look identical on the page — both are decimal tablet ids — but
+they cross the wire as two different JSON types, because `admin.rs`
+renders them through two different functions with two different
+conventions: `system_table_id_display` deliberately renders a numeric
+entity id (`TabletId`'s 8 raw big-endian bytes) as a decimal **string**
+(`"5"`, never a JSON number — the same file's own doc explains why:
+`u64` can exceed `f64`'s exact integer range), while `system_table_
+value_display`'s JSON-passthrough convention for `SplitLineage`/
+`SplitPlacing` just re-serializes the stored Rust struct as-is, and
+`TabletId`'s `#[derive(Serialize)]` on a one-field tuple struct is a serde
+*newtype*, which `serde_json` serializes transparently as the bare inner
+value — a JSON **number** (`5`), not a string. So the exact same tablet id
+shows up as `"5"` when it's a row's own `id` and `5` when it's a `parent`
+field inside a row's `value`. A client that builds a `Map` keyed by
+`row.id` and later looks it up with a bare `value.parent` (or compares the
+two with `===`) gets a silent miss — JavaScript's `"5" === 5` is `false`,
+and neither side throws, so a naive implementation just quietly finds no
+ancestor/child for every real relationship instead of erroring loudly.
+
+**General form**: whenever a UI cross-references two fields that name the
+"same kind of thing" (a foreign-key-shaped relationship) but arrive
+through two different serialization paths on the SAME endpoint — one
+because a route's own display layer normalizes ids to strings, the other
+because the underlying stored value passes straight through a derived
+`Serialize` — never assume they share a JSON type. Normalize both sides
+explicitly (`String(x)` in JS, or the equivalent) before keying a map or
+comparing, and grep the server-side rendering function for each field
+independently rather than trusting that "it's a tablet id on both sides"
+implies "it's the same wire shape on both sides." This is a live instance
+of a mechanical rule worth generalizing: a hand-rolled JSON view layer
+(as opposed to one type's own uniform `#[derive(Serialize)]`) is exactly
+where two fields carrying the identical domain value can diverge in wire
+representation, because each field's rendering was a separate decision.
+
+## A form input inside a subtree that is rebuilt from scratch on every poll tick needs its own persisted-and-listened-to variable, not a recomputed default (docs/roadmap.md U-05, tablet-detail action buttons)
+
+Adding Split/Reconfigure's text inputs to the Tablets tab's `#tb-detail`
+card surfaced a form-persistence hazard the dashboard's two existing
+precedents don't actually cover. `dashboard_core.js::render()` already
+documents "rebuild the Dynamo editor's skeleton only when the effective
+table changed... never on a routine refresh with the same selection, so
+in-progress edits survive" — but that works by gating the *whole rebuild*
+behind `dyTable !== lastRenderedDyTable`. The create-table form is a
+second precedent, but it isn't rebuilt at all — it's static HTML in
+`dashboard.html`, touched only by direct DOM reads/writes. `#tb-detail` is
+neither: `renderTabletDetail` reconstructs its entire `innerHTML` on
+*every* call, and it is called on every `renderTablets()` tick (this tab's
+existing ~5s `loadAll()` poll cadence) regardless of which card is open or
+whether anything about the tablet actually changed — by design, since the
+lineage panel beside it (U-05's second slice) deliberately needs that same
+per-tick rebuild to pick up a background split. Naively setting an
+input's `value=` from "the tablet's current replicas" (Reconfigure) or a
+plain empty string (Split) on every render would silently erase whatever
+an operator had half-typed, every single poll interval — a real, current
+bug in a first draft of this change caught by asking "what happens if I
+start typing during a refresh," not by any test.
+
+**The fix generalizes past this one card**: give the value its own
+module-level variable, attach a plain `input` event listener (re-attached
+each rebuild, since the whole subtree is fresh DOM) that keeps the
+variable in sync on every keystroke, and read *that* variable back when
+rebuilding — never recompute a "default" unconditionally. A default (here,
+the tablet's live `replicas`) is applied only when the variable is in its
+freshly-reset sentinel state (`null`, set by the selection-change handler,
+not by the render function), so it seeds the field once per selection and
+then gets out of the way. Any future gated-action input living inside a
+poll-rebuilt card (the Node-tab and control-members-panel button PRs this
+slice's own roadmap item queues up next) needs the identical treatment —
+"does this subtree get rebuilt on a timer regardless of user activity" is
+the question to ask before adding any editable control to it, not just
+before adding a *button*.
+
+## A dashboard action gated "local-leader-only, not relayed" server-side needs its own leader-address resolver — and for the CONTROL leader specifically, the existing cross-node fan-out already has it for free (docs/roadmap.md U-05, Node-tab action buttons)
+
+The tablet-family buttons (previous slice) already established "target
+whichever address the route actually requires, not a uniform `SEED`" —
+Flush/Compact/Reconfigure resolve the tablet's own CP leader via
+`tbLeaderBase`. The Node-tab family (`/admin/drain`, `/admin/member/
+remove`) needed the identical discipline for a DIFFERENT leader: both
+routes are `ClientCtx`-documented **local-control-leader-only, not
+relayed** — posting to the wrong node doesn't forward, it just 409s. The
+easy mistake here is reaching for a new probe (e.g. fetching `/admin/
+control/members` and cross-referencing against something) when the
+control leader is already sitting in data every view already has:
+`STATE.nodes` (the same cross-node `/admin/peers` + per-node `/admin/*`
+fan-out `loadAll()` performs for every tab) carries each node's own
+`/admin/raft.is_leader` — the exact field `dashboard_core.js::
+computeHealth()`'s own `controlLeader` already reads for the health pill.
+A one-line `STATE.nodes.find(n => n.ok && n.raft && n.raft.is_leader)`
+answers "which admin address do I post this to" with zero new requests,
+mirroring `cpGroupsByTablet()`'s own "the data to answer this is already
+in `STATE`, just index into it differently" precedent.
+
+**General form**: before adding a leader-resolution helper for a new
+gated action, check `STATE`/`SELF`'s existing shape for the fact you need
+first — a per-node liveness/leadership flag from the standard fan-out is
+usually already there, one `.find()` away, and reaching past it to build a
+second live probe (or worse, a second admin route) duplicates work the
+polling loop is already doing on your behalf. This generalizes past
+control-plane leadership specifically: any "is this the X leader/owner"
+question a dashboard action needs answered is worth checking against
+`STATE.nodes`/`STATE.status` before writing a new fetch for it.
+
+## A field merged into a different name at the wire layer stays a silent runtime miss wherever a caller reads it by string key, not by a typed struct (docs/roadmap.md U-05, control-members panel action buttons)
+
+Grounding the control-members Add button against `animus-cli`'s own
+`run_control_add` (the task's named ground truth for the wire body) turned
+up a real, previously undetected bug unrelated to this slice's own diff:
+that function resolves a new voter's internal control-Raft address by
+`GET`ting the new node's own `/admin/config` and reading `cfg["control"]`
+as a `serde_json::Value` index. `/admin/config`'s `config_view` has not
+served a top-level `control` field since ADR 0040 PR1 merged the old
+`control`/`raftkv` address pair into one `addrs.internal` field — a
+compiler-enumerated fan-out for every *Rust* construction site
+(`error[E0063]`, per this file's own entries on that migration), but
+`cfg["control"]` is a runtime string-keyed lookup into freshly-parsed JSON,
+which the compiler cannot check at all. The result: `cfg["control"]` has
+resolved to `None` on every call since that merge, so the 3-argument
+(operator-supplied-id) form of `animus admin control-add` has been
+silently broken ever since, with no test in this workspace ever
+exercising that code path to catch it (grep confirmed `crates/animus-cli`
+has no `tests/` directory at all).
+
+**The general lesson**: a field rename/merge on a JSON view is only as
+safe as the compiler's reach into every reader. A `#[derive(Serialize)]`
+struct's own field gets `error[E0063]`'s fan-out for free at every
+*construction* site in the same language; a `serde_json::Value["field"]`
+read anywhere — a CLI, a dashboard's JS, a shell script — gets no signal
+at all when the field it names stops existing, and keeps compiling and
+running while quietly returning `None`/`null`/`undefined` forever. When
+renaming or merging a field on any admin/wire JSON view, grep the whole
+workspace (and any JS/shell consumer, not just other Rust crates) for the
+old field's string literal, not just for the struct that used to carry it
+— the "compiler enumerates every site" safety net this codebase leans on
+elsewhere (port additions, `ClusterConfig` fields) does not extend past
+the language boundary. Reported as a pre-existing `animus-cli` bug, not
+fixed here — out of this slice's own scope, and it does not block the
+dashboard's own Add control, which asks the operator for the address
+directly rather than reproducing the CLI's now-broken shortcut.

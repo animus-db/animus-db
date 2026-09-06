@@ -1176,6 +1176,214 @@ reusing the captured config is the point of the test.
   round-trip structure as U-01/U-02's own tests above) — the actual
   `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics keep their full
   end-to-end coverage in `tests/dynamo_ttl.rs`, unchanged by this item.
+  **docs/roadmap.md U-05's own first slice** (`dashboard_node.js`) added a
+  control-plane members panel to the Node tab, next to `#nd-mirror`
+  (`#nd-control-members`, `renderNodeControlMembers`, called from
+  `renderNode()`): a render of `GET /admin/control/members`
+  (`admin.rs::control_members_view`, ADR 0037 PR3 — the live voter set plus
+  the replicated address book), fetched alongside everything else `SELF`
+  already carries (`dashboard_core.js::loadSelf`'s own `Promise.all`, so no
+  extra poll timer — same `loadAll()` cadence as every other Node-tab
+  panel). Per member: id, its most operator-useful address (`admin`,
+  falling back to `internal`), a role pill, a voter-vs-learner pill (a
+  third, neutral "unknown" state when `voters` is `null` — a `Remote`
+  handle that hasn't synced yet, per `ControlHandle::config`'s own
+  documented "unknown vs. genuinely empty" distinction — never conflated
+  with "learner"), and a leader marker (compared against this node's own
+  `/admin/raft`'s `leader` field, already fetched into `SELF.raft`). **Read-
+  only in this slice, deliberately** — no add/remove/transfer buttons yet;
+  those are the roadmap's own next U-05 PR, gated the same `window.confirm`
+  way every other admin action already is. No new `include_str!`/`<script>`
+  wiring needed — both `dashboard_node.js` and `dashboard_core.js` already
+  load on every role that shows the Node tab. Test:
+  `tests/dashboard_endpoint.rs::dashboard_u05_control_members_panel`.
+  **docs/roadmap.md U-05's second slice** (`dashboard_tablets.js`) added a
+  split-lineage/directed-placing panel to the Tablets tab, `#tb-lineage`, a
+  sibling card next to the existing per-tablet detail card (`#tb-detail`),
+  keyed by the same `tbSelectedId`: `renderTabletLineage` renders this
+  tablet's upward ancestor chain from `GET /admin/system-table?kind=
+  split_lineage` (ADR 0050 fork F9 — parent, grandparent, … as far as the
+  chain goes, each hop's own cutover time and the parent's final stream
+  epoch) and its downward children (the same kind's rows, walked in
+  REVERSE — every row whose own `parent` field names this tablet, however
+  many generations deep) plus its directed-Placing target/`done` state from
+  `?kind=split_placing` (ADR 0062 §2). Explicit "no lineage (never split)"/
+  "no pending placing" empty states rather than a blank card. **The
+  system-table route has no per-tablet filter** (only `kind`/`after`/
+  `limit`, per its own doc in `admin.rs`), and an ancestor lookup (point
+  read by id) and a children lookup (the reverse — which row names this id
+  as `parent`) need to see different things no single query can both
+  answer — so `fetchSystemTableAll`/`loadTabletLineage` fetch the WHOLE
+  kind (paginating `next_after`, `LINEAGE_FETCH_PAGE_CAP` = 20 pages of
+  1000 rows each — a real cluster's total split count is normally far
+  below that bound) and build both directions client-side rather than
+  asking the route for a filter it doesn't have. Fetched from `SEED` (the
+  node this console is attached to) — `split_lineage`/`split_placing` are
+  ordinary replicated `Metadata` collections mirrored identically on every
+  control-role node's own system keyspace (ADR 0038), the same "any
+  control-role node answers alike" reasoning `controlMembers`
+  (`dashboard_core.js`, above) already relies on, and the Tablets tab is
+  itself only ever shown on a control-role node (`ROLE_TABS`). **Refreshed
+  on selection change AND on this tab's existing `loadAll()` poll cadence**
+  (`renderTablets()` triggers a re-fetch unconditionally on every tick a
+  tablet is selected, since it already runs every tick regardless of which
+  card is open) — no dedicated timer of its own, matching the task's own
+  "reuse the existing poll idiom" instruction (unlike the Raft/storage
+  detail card beside it, `loadTabletDetailStorage`, which fetches once per
+  selection only — this panel's data can change out from under an open
+  selection via a background split, so it needed the extra per-tick
+  refresh the storage card didn't). No action buttons (read-only, later PRs
+  per the roadmap), no new admin route. Tests:
+  `tests/dashboard_endpoint.rs::dashboard_u05_lineage_panel` (shell/script
+  markers plus a live round trip against both kinds on a cluster that has
+  never split) and `tests/admin_endpoint.rs::
+  admin_system_table_split_lineage_after_a_real_split` (a real 3-node
+  cluster split through to cutover, asserting the `split_lineage` kind
+  actually carries the `{id, value: {parent, ...}}` shape this panel
+  parses for both children).
+  **docs/roadmap.md U-05's third slice, the TABLET action family**
+  (`dashboard_tablets.js`) added four gated buttons to `#tb-detail`'s own
+  "Actions" section — Split, Flush, Compact, Reconfigure — over the four
+  PRE-EXISTING routes (`POST /admin/tablet/split`, `POST /admin/storage/
+  {flush,compact}`, `POST /admin/raftkv/reconfigure`); no new admin route.
+  Each button is a `window.confirm` naming the tablet id and the action,
+  posted through the same `postJSON` helper the Data Browser/Backups tabs'
+  own gated mutations use (this crate's one mutation idiom — see
+  `docs/roadmap.md`'s §4 Conventions note), with the route's response (or
+  error) rendered in a small status line inside the card
+  (`tbSetActionMsg`/`#tb-action-msg`) — never `alert()` — then the tab's
+  existing `loadAll()` refresh, no new timer. **Targeting mirrors each
+  route's own gating, not a uniform choice**: Split posts to `SEED` since
+  `ClientCtx::trigger_split` resolves/forwards to the tablet's leader
+  internally; Flush/Compact/Reconfigure post to `tbLeaderBase(tablet)` —
+  the identical `lead.node.base` the pre-existing storage-detail card and
+  "Open in Storage" button already resolve, re-derived nowhere else — since
+  Flush/Compact need a node that locally hosts the tablet and Reconfigure
+  is leader-only server-side (a `409` "retry on the leader" otherwise); a
+  refusal is shown verbatim, never retried automatically. Reconfigure's
+  voter-list input pre-fills from the tablet's current `replicas` and, like
+  the Split-key input, survives this tab's own ~5s poll re-render via a
+  module-level string kept in sync by an `input` listener (`tbSplitKeyInput`/
+  `tbReconfigureVoters`) rather than being recomputed from scratch every
+  tick — the same "don't clobber an in-flight edit" concern `dyTable`'s
+  render-gate in `dashboard_core.js::render` already documents for the Data
+  Browser. **The only gate on these four buttons is `window.confirm` plus
+  this tab (and card) only ever rendering on a control-role console** — see
+  ADR 0020's matching 2026-09-06 as-built note and ADR 0021's "Actions"
+  amendment for why that is a deliberate, plainly-stated non-gate rather
+  than an oversight: the admin port itself has no auth (ADR 0020), so
+  anyone who can reach it can already call any of these four routes
+  directly, button or not. `POST /admin/storage/compact` had **no**
+  integration coverage anywhere in this crate before this slice (`/admin/
+  storage/flush`'s own coverage predates it, `admin_endpoint.rs::
+  admin_interface_surfaces_state_and_actions`) — added
+  `tests/admin_endpoint.rs::admin_storage_compact_action`. Dashboard-wiring
+  test: `tests/dashboard_endpoint.rs::dashboard_u05_tablet_actions`.
+  **docs/roadmap.md U-05's fourth slice, the NODE action family**
+  (`dashboard_node.js`) added a new card, `#nd-actions`, beside the
+  control-plane members panel on the Node tab — three gated buttons over
+  three PRE-EXISTING routes: Drain (`POST /admin/drain {node}`, ADR 0032
+  PR3 decommission step 1), Remove (`POST /admin/member/remove {node}`,
+  decommission step 2 — a refusal of a still-undrained node is shown
+  verbatim, never retried), and Add member (`POST /admin/member/add
+  {node}`, ADR 0030 online growth); no new admin route. **There is no
+  separate "remove member" route to wire beyond Remove above** — `/admin/
+  member/remove` already IS both "finish decommissioning a drained node"
+  and "remove a member," the same route either way — so this family is
+  three buttons, not four, over the three data-plane-membership routes
+  `crates/animus-node/src/admin.rs`'s dispatch table actually has
+  (`/admin/control/member/{add,remove}`, the **control-plane** counterpart,
+  is the separate members-panel PR the roadmap already calls out — not this
+  slice). Same house style as the tablet family: `window.confirm` naming
+  the node id and the action → `postJSON` → the response/error in
+  `#nd-action-msg` → the tab's existing `loadAll()` refresh on success
+  only. **Targeting is NOT uniform, mirroring each route's own server-side
+  gating** (the tablet family's own precedent): Drain/Remove are
+  local-control-leader-only and deliberately not relayed
+  (`ClientCtx::admin_drain`/`admin_remove_member`'s own doc), so both post
+  to `ndControlLeaderBase()` — the control leader's admin `base`, resolved
+  from the identical cross-node fan-out (`STATE.nodes`, each node's own
+  `/admin/raft.is_leader`) `computeHealth()`'s own `controlLeader` already
+  reads, no extra probe; Add member IS relayed (`ClientCtx::
+  admin_add_member`'s own doc — "works from any reachable admin port"), so
+  it posts to `SEED`, this console's own node, needing no leader lookup at
+  all. **The node-id input defaults to THIS node's own id** (`SELF.config.
+  node_id` — how the Node tab already identifies "this node" everywhere
+  else on this view) but stays a plain editable text field, since `animus
+  admin drain <admin-addr> <node-id>`'s own `<node-id>` argument is
+  arbitrary — typically the node actually being decommissioned, reached
+  through a DIFFERENT (healthy) node's admin port, not necessarily the
+  console's own node — and persists across this tab's own poll cadence via
+  a module-level string kept in sync by an `input` listener
+  (`ndActionNode`), the identical "don't clobber an in-flight edit"
+  discipline `tbSplitKeyInput`/`tbReconfigureVoters` already use.
+  **`/admin/member/add` has no dedicated `animus-cli` one-shot subcommand**
+  (only `/admin/control/member/add` does) — in production this route is
+  called by a joining node's own startup code, never by an operator
+  directly, but it is a real, always-live, ungated POST route like every
+  other one this dashboard already wires a button to, so it gets one here
+  too. All three routes already had real-cluster integration coverage
+  before this slice (`tests/decommission.rs`, `tests/cluster_growth.rs`,
+  `tests/seed_join*.rs`, `tests/control_membership_admin.rs`) — no new
+  `admin_endpoint.rs` test was needed, only the dashboard-wiring one:
+  `tests/dashboard_endpoint.rs::dashboard_u05_node_actions`.
+  **docs/roadmap.md U-05's fifth and LAST slice, the CONTROL-MEMBERS action
+  family (2026-09-06)** — gated add/remove/transfer buttons on the
+  control-plane members panel itself: `renderNodeControlMembers`'s per-row
+  template gained a **Transfer leadership here** button (hidden on a
+  member's own row while it already leads) and a **Remove** button, over
+  the pre-existing `POST /admin/control/transfer {to}` (fa41fcb) and
+  `POST /admin/control/member/remove {node}` (ADR 0037 PR3) routes; a new
+  sibling card, `#nd-control-actions`, gained an **Add** control over the
+  third pre-existing route, `POST /admin/control/member/add {node?, addr}`
+  — no new admin route anywhere in this slice. Same house style as every
+  earlier U-05 family: `window.confirm` naming the node id and the action →
+  `postJSON` → the response/error in `#nd-control-msg` → `loadAll()`
+  refresh on success only; Remove's response surfaces the server's own
+  `warning` field verbatim (ADR 0037 §2's quorum-loss cases), never
+  swallowed and never auto-retried with `force`. **All three target
+  `ndControlLeaderBase()`** (ae0ad02's own resolver, reused unchanged) —
+  every one of the three routes is local-control-leader-only and
+  deliberately not relayed (`ClientCtx::admin_transfer_control_leadership`/
+  `admin_remove_control_member`/`admin_add_control_member`'s own docs), the
+  same reasoning that already put Drain/Remove on this resolver on the
+  `#nd-actions` card beside it — unlike that card's own relayed Add member,
+  every control-member action here needs the leader specifically.
+  **Add's body needs an address, not just an id** — unlike the data-plane
+  `/admin/member/add` (a joining node registers its own address
+  separately), `/admin/control/member/add`'s wire body wants the new
+  voter's own **internal control-Raft** listen address directly. `animus
+  admin control-add`'s CLI form (`run_control_add`, `animus-cli`) resolves
+  this by fetching the new node's own `/admin/config` first and reading its
+  `control` field — **which no longer exists under that name**: ADR 0040
+  PR1 merged the old `control`/`raftkv` address pair into one
+  `addrs.internal` field, and nothing updated this one runtime JSON lookup
+  to match, so that 3-argument (operator-supplied-id) form of `control-add`
+  has been silently broken since that merge — a real, pre-existing
+  `animus-cli` bug found while grounding this slice against the CLI as
+  instructed, reported here rather than fixed (out of this slice's own
+  scope; no test in this crate or `animus-cli` ever exercised that code
+  path, so nothing caught it). This dashboard control sidesteps the whole
+  problem rather than reproducing the CLI's broken shortcut: it asks the
+  operator for the new voter's internal address directly (two inputs, node
+  id optional/blank-self-mints and address required, both persisted across
+  this tab's poll cadence via `ndCtlAddNode`/`ndCtlAddAddr` — the same
+  "don't clobber an in-flight edit" module-level-variable discipline
+  `ndActionNode`/`tbReconfigureVoters` already use) rather than attempting
+  a cross-origin fetch of another node's admin port, which this admin
+  surface advertises no CORS support for anyway. **There is no separate
+  `grow` route to wire** — `animus admin control-grow` is a purely
+  client-side loop of the same `control/member/add` call, one pair at a
+  time (`run_control_grow`, `animus-cli`), never a distinct server
+  endpoint, so a "Grow" button would just be "Add" invoked repeatedly and
+  adds no real capability this one control doesn't already offer — per the
+  task's own instruction to skip and say so when a would-be second route
+  turns out not to exist, this family is three actions (Transfer, Remove,
+  Add), not four. **This closes docs/roadmap.md's whole U-05 section** —
+  every bullet across all five PRs in the series has now landed; see ADR
+  0020's and ADR 0021's own matching 2026-09-06 closing amendments.
+  Regression: `tests/dashboard_endpoint.rs::
+  dashboard_u05_control_member_actions`.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —
@@ -4077,6 +4285,20 @@ ADR itself for the full design/rationale.
   `crates/animus-control/CLAUDE.md`'s "Leadership transfer" entry and
   `docs/engineering-lessons.md`'s issue #405 entry for the full mechanism
   and `tests/heartbeat_live_destinations.rs`'s fix.
+- **`POST /admin/control/transfer {"to": <node id>}` (ADR 0020/0037,
+  roadmap U-05, 2026-09-05)** — a standalone leadership-transfer route,
+  beside `admin_remove_control_member`'s own internal self-removal transfer
+  arm above: `ClientCtx::admin_transfer_control_leadership` lets an
+  operator move control-plane leadership without also removing a voter.
+  Same local-control-leader-only, not-relayed discipline as every other
+  `control/member/*` action; idempotent if `to` already leads, refused if
+  `to` isn't a current voter, otherwise arms `RaftCore::transfer_leadership`
+  and polls (bounded by the same `CONTROL_TRANSFER_POLL_TIMEOUT` the
+  self-removal arm uses) for this node to step down. `animus admin
+  control-transfer <admin-addr> <node-id>` is the CLI form. Regression:
+  `tests/admin_endpoint.rs::
+  admin_control_transfer_moves_leadership_to_the_named_node`/
+  `admin_control_transfer_on_a_follower_is_refused`.
 - **The CP group is durable by default** — and since ADR 0050 Train B rung
   1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
   prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps

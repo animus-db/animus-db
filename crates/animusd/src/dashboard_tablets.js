@@ -23,14 +23,78 @@
 // and in the detail panel's per-replica meta line; this view never fetches
 // it specially, since `CpRaftView` already carries it in the same payload
 // `key_count`/`byte_size` come from.
+//
+// Split lineage/placing panel (docs/roadmap.md U-05): a second, sibling
+// detail card, `#tb-lineage`, keyed by the same `tbSelectedId` as the Raft/
+// storage detail card above. It reads `GET /admin/system-table?kind=
+// split_lineage` (ADR 0050 fork F9) and `?kind=split_placing` (ADR 0062 §2)
+// — the control plane's own replicated provenance, not anything derived
+// from `status.tablets` (a retired split parent has no tablet-map row left
+// at all; its lineage only lives here). Neither kind can be filtered by
+// tablet id server-side (the route's only filters are `kind`/`after`/
+// `limit`, per its own doc in `admin.rs`), and finding a tablet's ancestors
+// needs a parent-id point lookup while finding its children needs the
+// REVERSE lookup (which row's `parent` equals this tablet) — no single
+// point read answers either, so `loadTabletLineage` fetches the whole kind
+// (paginating via `next_after`) and builds both directions client-side,
+// capped at `LINEAGE_FETCH_PAGE_CAP` pages as a safety bound (see that
+// constant's own doc). Fetched from `SEED` (the node this console is
+// attached to): `split_lineage`/`split_placing` are ordinary replicated
+// `Metadata` collections mirrored identically on every control-role node's
+// own system keyspace (ADR 0038), the same "any control-role node answers
+// alike, no per-node fan-out" reasoning `controlMembers`
+// (`dashboard_core.js`) already documents — and the Tablets tab itself is
+// only ever shown on a control-role node (`ROLE_TABS`), so this never hits
+// a data-only node's `{"available": false}` in practice (handled anyway).
+// Refetched on selection change AND on this tab's existing `loadAll()` poll
+// cadence (`renderTablets()` runs on every tick) — no dedicated timer.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, idSpan, getJSON,
-// humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
-// tabletStatus, tokenBound, gotoStorage, splitHiddenTable).
-
+// postJSON, loadAll, SEED, humanBytes, nodeIdOf, cpGroupsByTablet,
+// autoSplitThresholds, tabletStatus, tokenBound, gotoStorage,
+// splitHiddenTable).
+//
+// Gated actions (docs/roadmap.md U-05, tablet family): Split, Flush,
+// Compact, Reconfigure — four buttons in the detail card's own "Actions"
+// section, each behind a `window.confirm` naming the tablet id and the
+// action, posted through the SAME `postJSON` helper the Data Browser/
+// Backups tabs already use for their own gated mutations (this crate's one
+// mutation idiom — see the Conventions note in docs/roadmap.md's §4), then
+// `loadAll()` (the tab's existing loader — no new timer) on success. Unlike
+// the dynamo-proxy actions those tabs post through `/admin/data/dynamo`,
+// these four are real, pre-existing `/admin/tablet/split`,
+// `/admin/storage/{flush,compact}`, and `/admin/raftkv/reconfigure` routes
+// (`crates/animusd/src/admin.rs`) — no new backend route was added for
+// this. **Split/Flush/Compact/Reconfigure carry no gate beyond
+// `window.confirm` plus the fact that the Tablets tab (and this card) is
+// only ever shown on a control-role node** — the admin port itself has no
+// auth (ADR 0020: bind it to a trusted network) and every route it exposes
+// is reachable by anyone who can reach the port at all, dashboard button
+// or not; the confirm dialog exists to stop a misclick, not to authorize
+// the action.
+//
+// **Targeting** (per each route's own gating, `admin.rs`'s own doc
+// comments): Split's `ClientCtx::trigger_split` resolves/forwards to the
+// tablet's leader internally, so it is posted to `SEED` (this console's own
+// node) like every other status/lineage fetch on this tab. Flush/Compact
+// only require the target node to locally HOST the tablet
+// (`ctx.edge.local_cp`, no forward) and Reconfigure is leader-only
+// (`ctx.edge.cp_leader`, a `409` "retry on the leader" refusal otherwise
+// with no local replica) — both are posted to the tablet's own CP leader's
+// admin address, the identical `lead.node.base` the storage detail
+// card/"Open in Storage" button above already use (`loadTabletDetailStorage`,
+// `gotoStorage`) — never re-derived a second way. A refusal (a `409`, a
+// `404` "this node hosts no replica", or any other error body) is rendered
+// **verbatim** in the status line, never retried automatically — an
+// operator can already see which node is/isn't the leader from the Raft
+// group panel just above and retry there if they want to.
 let tbTableFilter = "all";
 let tbStatusFilter = "all";
 let tbSelectedId = null;
 let tbDetailStorage = null; // { tablet, data } | { tablet, error } | null
+let tbLineage = null; // { tablet, ancestors, childrenOf, placing, unavailable } | { tablet, error } | null
+let tbActionMsg = null; // { tablet, text, isError } | null — the actions status line
+let tbSplitKeyInput = ""; // the Split form's own in-progress text, reset on selection change
+let tbReconfigureVoters = null; // the Reconfigure form's own in-progress text; null until first rendered for this tablet (then defaults to the tablet's current replicas)
 
 function renderTablets() {
   const status = STATE.status;
@@ -108,6 +172,13 @@ function renderTablets() {
     tr.addEventListener("click", () => selectTablet(Number(tr.dataset.id))));
 
   renderTabletDetail(tablets, groups);
+  renderTabletLineage();
+  // This tab's existing poll cadence (`loadAll()`'s `setInterval`, dashboard.html)
+  // drives `renderTablets()` every tick regardless of which panel is open — so
+  // re-fetching the lineage panel's data here, unconditionally on a selection,
+  // refreshes it on that same cadence with no dedicated timer of its own.
+  // Fire-and-forget: `loadTabletLineage` re-renders itself once it resolves.
+  if (tbSelectedId != null) loadTabletLineage(tbSelectedId);
 }
 
 // A hidden GSI materialization table (`orders$by_status`) renders as
@@ -123,11 +194,20 @@ function tableCellHtml(name) {
 }
 
 function selectTablet(id) {
-  if (tbSelectedId === id) { tbSelectedId = null; tbDetailStorage = null; renderTablets(); return; }
+  if (tbSelectedId === id) {
+    tbSelectedId = null; tbDetailStorage = null; tbLineage = null;
+    tbActionMsg = null; tbSplitKeyInput = ""; tbReconfigureVoters = null;
+    renderTablets(); return;
+  }
   tbSelectedId = id;
   tbDetailStorage = null;
+  tbLineage = null;
+  tbActionMsg = null;
+  tbSplitKeyInput = "";
+  tbReconfigureVoters = null;
   renderTablets();
   loadTabletDetailStorage(id);
+  loadTabletLineage(id);
 }
 
 function renderTabletDetail(tablets, groups) {
@@ -189,6 +269,18 @@ function renderTabletDetail(tablets, groups) {
     }
   }
 
+  // Reconfigure's own voter-list input defaults to this tablet's CURRENT
+  // replicas the first time it's rendered for this selection — `null` only
+  // right after `selectTablet` resets it, so a user's in-progress edit
+  // survives every later re-render this tick's `loadAll()` poll causes
+  // (the same "don't clobber an in-flight edit" discipline `dyTable`'s own
+  // render-gate in `dashboard_core.js::render` follows for the Data Browser).
+  if (tbReconfigureVoters === null) tbReconfigureVoters = (t.replicas || []).join(",");
+
+  const actionMsgHtml = tbActionMsg && tbActionMsg.tablet === tbSelectedId
+    ? `<div class="${tbActionMsg.isError ? "err-line" : "muted"}" id="tb-action-msg" style="margin-top:10px">${esc(tbActionMsg.text)}</div>`
+    : `<div id="tb-action-msg"></div>`;
+
   $("tb-detail").innerHTML = `
     <div class="head"><span class="id">${esc(tbSelectedId)}</span>
       <button class="link-text" id="tb-detail-close">Close ×</button></div>
@@ -199,10 +291,144 @@ function renderTabletDetail(tablets, groups) {
     ${storageHtml}
     <div class="row" style="margin-top:16px">
       <button id="tb-open-storage">Open in Storage →</button>
-    </div>`;
+    </div>
+    <h3 style="margin-top:18px">Actions</h3>
+    <div class="row" style="margin-bottom:8px">
+      <input type="text" id="tb-split-key-input" class="mono" placeholder="split key" value="${esc(tbSplitKeyInput)}" style="flex:1;min-width:0">
+      <button id="tb-split-btn">Split</button>
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="tb-flush-btn">Flush</button>
+      <button id="tb-compact-btn">Compact</button>
+    </div>
+    <div class="row">
+      <input type="text" id="tb-reconfigure-input" class="mono" placeholder="comma-separated node ids" value="${esc(tbReconfigureVoters)}" style="flex:1;min-width:0">
+      <button id="tb-reconfigure-btn">Reconfigure</button>
+    </div>
+    ${actionMsgHtml}`;
   $("tb-detail").style.display = "";
-  $("tb-detail-close").addEventListener("click", () => { tbSelectedId = null; tbDetailStorage = null; renderTablets(); });
+  $("tb-detail-close").addEventListener("click", () => {
+    tbSelectedId = null; tbDetailStorage = null; tbLineage = null;
+    tbActionMsg = null; tbSplitKeyInput = ""; tbReconfigureVoters = null;
+    renderTablets();
+  });
   $("tb-open-storage").addEventListener("click", () => gotoStorage(tbSelectedId, lead ? lead.node.base : null));
+  $("tb-split-key-input").addEventListener("input", (e) => { tbSplitKeyInput = e.target.value; });
+  $("tb-reconfigure-input").addEventListener("input", (e) => { tbReconfigureVoters = e.target.value; });
+  $("tb-split-btn").addEventListener("click", splitSelectedTablet);
+  $("tb-flush-btn").addEventListener("click", flushSelectedTablet);
+  $("tb-compact-btn").addEventListener("click", compactSelectedTablet);
+  $("tb-reconfigure-btn").addEventListener("click", reconfigureSelectedTablet);
+}
+
+// Resolve the tablet's own CP group leader's fetchable admin origin — the
+// same `lead.node.base` `loadTabletDetailStorage`/`gotoStorage` above
+// already target, never re-derived a second way. `null` when no replica
+// currently reports itself as leader (a mid-election window, or every
+// replica unreachable).
+function tbLeaderBase(id) {
+  const gs = cpGroupsByTablet()[id] || [];
+  const lead = gs.find((x) => x.g.is_leader);
+  return lead ? lead.node.base : null;
+}
+
+// Redraws just the detail card (never the whole tab) after an action's
+// status changes — mirrors `loadTabletDetailStorage`'s own redraw-in-place
+// idiom above.
+function tbRedrawDetail() {
+  if (STATE.status) renderTabletDetail(STATE.status.tablets, cpGroupsByTablet());
+}
+
+function tbSetActionMsg(tablet, text, isError) {
+  tbActionMsg = { tablet, text, isError };
+  tbRedrawDetail();
+}
+
+// ---- Split (`POST /admin/tablet/split {tablet, split_key}`) --------------
+// `ClientCtx::trigger_split` resolves/forwards to the tablet's leader
+// internally (unlike Flush/Compact/Reconfigure below) and requires a real
+// split key — there is no server-side auto-pick on this route (the CLI's
+// own `split` subcommand requires one too; `POST /admin/stream/grow` is the
+// separate, auto-picking-median convenience, not this one) — so the input
+// is required, not optional.
+async function splitSelectedTablet() {
+  const tablet = tbSelectedId;
+  if (tablet == null) return;
+  const splitKey = tbSplitKeyInput.trim();
+  if (!splitKey) { tbSetActionMsg(tablet, "enter a split key first", true); return; }
+  if (!window.confirm(`Split tablet ${tablet} at key “${splitKey}”?`)) return;
+  tbSetActionMsg(tablet, "splitting…", false);
+  const { status, body } = await postJSON(SEED, "/admin/tablet/split", { tablet, split_key: splitKey });
+  if (status >= 300) {
+    tbSetActionMsg(tablet, (body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  tbSetActionMsg(tablet, "split kicked off: " + JSON.stringify(body), false);
+  await loadAll();
+}
+
+// ---- Flush (`POST /admin/storage/flush {tablet}`) -------------------------
+// Only needs a node that locally HOSTS the tablet (`ctx.edge.local_cp`, no
+// forward) — targeting the leader anyway keeps this button consistent with
+// the Storage-engine panel just above, which already reads from the same
+// node.
+async function flushSelectedTablet() {
+  const tablet = tbSelectedId;
+  if (tablet == null) return;
+  const base = tbLeaderBase(tablet);
+  if (!base) { tbSetActionMsg(tablet, "no reachable leader to query", true); return; }
+  if (!window.confirm(`Flush tablet ${tablet}'s memtable to disk now?`)) return;
+  tbSetActionMsg(tablet, "flushing…", false);
+  const { status, body } = await postJSON(base, "/admin/storage/flush", { tablet });
+  if (status >= 300) {
+    tbSetActionMsg(tablet, (body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  tbSetActionMsg(tablet, JSON.stringify(body), false);
+  await loadAll();
+}
+
+// ---- Compact (`POST /admin/storage/compact {tablet}`) ---------------------
+async function compactSelectedTablet() {
+  const tablet = tbSelectedId;
+  if (tablet == null) return;
+  const base = tbLeaderBase(tablet);
+  if (!base) { tbSetActionMsg(tablet, "no reachable leader to query", true); return; }
+  if (!window.confirm(`Compact tablet ${tablet}'s SSTables now?`)) return;
+  tbSetActionMsg(tablet, "compacting…", false);
+  const { status, body } = await postJSON(base, "/admin/storage/compact", { tablet });
+  if (status >= 300) {
+    tbSetActionMsg(tablet, (body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  tbSetActionMsg(tablet, JSON.stringify(body), false);
+  await loadAll();
+}
+
+// ---- Reconfigure (`POST /admin/raftkv/reconfigure {tablet, voters}`) -----
+// Leader-only on the server side (`ctx.edge.cp_leader`) — posted to the
+// tablet's own leader's admin address, same as Flush/Compact above. A
+// refusal (e.g. a `409` "this node does not lead the tablet's CP group;
+// retry on the leader" — the same message a stale/racing leader hint can
+// produce) is surfaced verbatim, never retried automatically: an operator
+// can already see the current leader in the Raft group panel above and
+// retry there.
+async function reconfigureSelectedTablet() {
+  const tablet = tbSelectedId;
+  if (tablet == null) return;
+  const base = tbLeaderBase(tablet);
+  if (!base) { tbSetActionMsg(tablet, "no reachable leader to query", true); return; }
+  const voters = tbReconfigureVoters.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!voters.length) { tbSetActionMsg(tablet, "enter at least one target node id", true); return; }
+  if (!window.confirm(`Reconfigure tablet ${tablet}'s replica set to [${voters.join(", ")}]?`)) return;
+  tbSetActionMsg(tablet, "reconfiguring…", false);
+  const { status, body } = await postJSON(base, "/admin/raftkv/reconfigure", { tablet, voters });
+  if (status >= 300) {
+    tbSetActionMsg(tablet, (body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  tbSetActionMsg(tablet, JSON.stringify(body), false);
+  await loadAll();
 }
 
 async function loadTabletDetailStorage(id) {
@@ -218,4 +444,171 @@ async function loadTabletDetailStorage(id) {
     tbDetailStorage = { tablet: id, error: String(e) };
   }
   renderTabletDetail(STATE.status.tablets, cpGroupsByTablet());
+}
+
+// ---- Split lineage / directed placing panel (docs/roadmap.md U-05) ----
+
+// Safety bound on how many `/admin/system-table?kind=split_lineage`/
+// `split_placing` pages `fetchSystemTableAll` will walk before giving up —
+// each page is the route's own max `limit` (1000), so this caps a single
+// panel load at 20,000 rows of either kind. There is no id-scoped filter on
+// this route (its own doc in `admin.rs`: only `kind`/`after`/`limit`), and
+// answering "what are this tablet's ancestors/children" needs to see every
+// row either way (an ancestor lookup is a point read by id, but a children
+// lookup is the REVERSE — which rows name this tablet as `parent` — so
+// nothing short of the whole kind answers it). A real cluster's total split
+// count is normally small next to this bound; if it's ever exceeded, the
+// panel silently works from a partial view rather than hanging the tab on
+// an unbounded fetch — a `truncated` flag would be the natural follow-up
+// if that ever becomes a real limitation, not attempted here.
+const LINEAGE_FETCH_PAGE_CAP = 20;
+
+// Fetch every row of one `EntityKind` from `GET /admin/system-table`,
+// walking `next_after` until the route reports no more pages or
+// `LINEAGE_FETCH_PAGE_CAP` is hit. Returns `{available, rows}` — `available:
+// false` mirrors the route's own honest-absence shape for a data-only node
+// (`ctx.control_storage` is `None`), which the Tablets tab should never
+// actually hit (`ROLE_TABS` never shows it there) but is handled rather than
+// assumed away.
+async function fetchSystemTableAll(base, kind) {
+  const rows = [];
+  let after = null;
+  for (let page = 0; page < LINEAGE_FETCH_PAGE_CAP; page++) {
+    let qs = "/admin/system-table?kind=" + encodeURIComponent(kind) + "&limit=1000";
+    if (after) qs += "&after=" + encodeURIComponent(after);
+    const r = await getJSON(base, qs);
+    if (!r.available) return { available: false, rows: [] };
+    rows.push(...(r.items || []));
+    if (!r.truncated || !r.next_after) break;
+    after = r.next_after;
+  }
+  return { available: true, rows };
+}
+
+// Loads (or reloads) the lineage panel's data for `id`: this tablet's
+// upward ancestor chain (from `split_lineage`, walking `child -> parent`
+// one hop at a time until a tablet with no lineage row of its own is
+// reached — the root of the chain), its downward children (the REVERSE of
+// that same map — every row whose own `parent` field equals `id`), and its
+// `split_placing` row, if any. Ignores a stale response if the selection
+// moved on while the fetch was in flight, the same discipline
+// `loadTabletDetailStorage` uses above.
+async function loadTabletLineage(id) {
+  try {
+    const [lineage, placing] = await Promise.all([
+      fetchSystemTableAll(SEED, "split_lineage"),
+      fetchSystemTableAll(SEED, "split_placing"),
+    ]);
+    if (tbSelectedId !== id) return;
+    if (!lineage.available) { tbLineage = { tablet: id, unavailable: true }; renderTabletLineage(); return; }
+
+    const byChild = new Map(); // child tablet id (string) -> its own split_lineage row value
+    const childrenOf = new Map(); // parent tablet id (string) -> [child id, ...]
+    for (const row of lineage.rows) {
+      const childId = String(row.id);
+      const v = row.value || {};
+      byChild.set(childId, v);
+      const parentId = String(v.parent);
+      if (!childrenOf.has(parentId)) childrenOf.set(parentId, []);
+      childrenOf.get(parentId).push(childId);
+    }
+    const placingByTablet = new Map();
+    for (const row of placing.rows) placingByTablet.set(String(row.id), row.value);
+
+    // Walk upward one hop per `split_lineage` row. Bounded by the row count
+    // plus one (`split_lineage` is a tree keyed child -> parent, written
+    // once per cutover — a cycle should never occur, but this walks
+    // client-rendered data from a live system, so bound it defensively
+    // rather than trust an `Array`-shaped `while (true)`).
+    const ancestors = [];
+    let cur = String(id);
+    const seenAncestors = new Set([cur]);
+    for (let i = 0; i <= lineage.rows.length; i++) {
+      const entry = byChild.get(cur);
+      if (!entry) break;
+      const parentId = String(entry.parent);
+      ancestors.push({
+        parent: parentId,
+        child: cur,
+        cutover_wall_ms: entry.cutover_wall_ms,
+        parents_final_epoch: entry.parents_final_epoch,
+      });
+      if (seenAncestors.has(parentId)) break;
+      seenAncestors.add(parentId);
+      cur = parentId;
+    }
+
+    tbLineage = { tablet: id, ancestors, childrenOf, placing: placingByTablet.get(String(id)) || null };
+  } catch (e) {
+    if (tbSelectedId !== id) return;
+    tbLineage = { tablet: id, error: String(e) };
+  }
+  renderTabletLineage();
+}
+
+// Renders the descendant subtree rooted at `id` (NOT including `id` itself)
+// as a nested list — every generation `childrenOf` records, however many
+// splits deep. Returns "" for a childless tablet so a caller can fall back
+// to an empty-state message.
+function renderLineageDescendants(id, childrenOf) {
+  const kids = childrenOf.get(String(id)) || [];
+  if (!kids.length) return "";
+  return `<ul class="lineage-tree">` + kids.map((k) =>
+    `<li>${idSpan(k, "mono")}${renderLineageDescendants(k, childrenOf)}</li>`
+  ).join("") + `</ul>`;
+}
+
+function renderTabletLineage() {
+  const el = $("tb-lineage");
+  if (tbSelectedId == null) { el.style.display = "none"; return; }
+  el.style.display = "";
+
+  if (!tbLineage || tbLineage.tablet !== tbSelectedId) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="empty">loading…</div>`;
+    return;
+  }
+  if (tbLineage.error) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="err-line">${esc(tbLineage.error)}</div>`;
+    return;
+  }
+  if (tbLineage.unavailable) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="empty">no control-plane system keyspace reachable</div>`;
+    return;
+  }
+
+  // Ancestry, nearest first: this tablet's immediate parent, then that
+  // parent's own parent, and so on as far as `split_lineage` goes.
+  const ancestorsHtml = tbLineage.ancestors.length
+    ? tbLineage.ancestors.map((a) => `<div class="replica-row">
+        ${idSpan(a.parent, "mono")}<span class="muted">→</span>${idSpan(a.child, "mono")}
+        <span class="meta">cutover ${esc(a.cutover_wall_ms != null ? new Date(a.cutover_wall_ms).toLocaleString() : "—")}${
+          a.parents_final_epoch != null ? `, parent's final stream epoch ${esc(a.parents_final_epoch)}` : ""
+        }</span>
+      </div>`).join("")
+    : `<div class="empty">no lineage (never split)</div>`;
+
+  const childrenTree = renderLineageDescendants(tbSelectedId, tbLineage.childrenOf);
+  const childrenHtml = childrenTree || `<div class="empty">no children</div>`;
+
+  const p = tbLineage.placing;
+  let placingHtml;
+  if (!p) {
+    placingHtml = `<div class="empty">no pending placing</div>`;
+  } else {
+    const target = p.target && p.target.length
+      ? p.target.map((n) => idSpan(n, "mono")).join(" ")
+      : `<span class="muted">unsatisfiable at cutover</span>`;
+    placingHtml = `<div class="replica-row">
+      <span class="meta">target:</span> ${target}
+      ${pill(p.done ? "healthy" : "forming", p.done ? "done" : "pending")}
+    </div>`;
+  }
+
+  el.innerHTML = `
+    <h3>Ancestry</h3>
+    <div style="margin-bottom:18px">${ancestorsHtml}</div>
+    <h3>Children</h3>
+    <div style="margin-bottom:18px">${childrenHtml}</div>
+    <h3>Directed placing</h3>
+    ${placingHtml}`;
 }

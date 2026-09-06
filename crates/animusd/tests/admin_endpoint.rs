@@ -1495,6 +1495,97 @@ async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-05's lineage panel on the Tablets tab
+/// (`dashboard_tablets.js`) reads `GET /admin/system-table?kind=
+/// split_lineage`/`?kind=split_placing`, keyed by tablet id off the item's
+/// own `id`/`value` shape. This is the real-cluster proof that a
+/// COMPLETED in-place split (ADR 0058 Train 2 rung 3 — cutover, not just
+/// kickoff) actually populates the `split_lineage` kind the panel's
+/// ancestor/child walk depends on, with the exact `{id, value: {parent,
+/// ...}}` shape the dashboard's `loadTabletLineage` parses, and that the
+/// `split_placing` kind stays an ordinary (if empty) `200` rather than
+/// erroring — a 3-node/RF-3 cluster's children inherit exactly the whole
+/// cluster, which already satisfies policy, so no directed-Placing entry
+/// is expected here (the panel's own "no pending placing" empty state).
+/// Rides the identical split recipe
+/// `admin_raftkv_key_count_is_scoped_per_tablet_after_split` above already
+/// proves end to end for a different surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_system_table_split_lineage_after_a_real_split() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        for i in 0..10u32 {
+            let key = format!("key{i:02}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            put(&mut stream, "kv", key, value).await;
+        }
+
+        let (s, split) = admin(
+            admin_addr,
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"key05"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "split committed: {split}");
+
+        // Wait for cutover to actually complete — `split_lineage` is written
+        // by `CutoverSplit`'s own apply, not by the fork alone, so the
+        // parent must be genuinely gone (not merely outnumbered mid-workflow).
+        let children: Vec<String> = timeout(Duration::from_secs(15), async {
+            loop {
+                let (_, status) = admin_get(admin_addr, "/admin/status").await;
+                let tablets = status["tablets"].as_object().cloned().unwrap_or_default();
+                if !tablets.contains_key("1") && tablets.len() == 2 {
+                    return tablets.keys().cloned().collect();
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("split did not cut over to two children");
+        assert_eq!(children.len(), 2, "exactly two children after cutover");
+
+        // Both children now carry a `split_lineage` row naming tablet 1 as
+        // their parent — the exact shape `loadTabletLineage`
+        // (dashboard_tablets.js) walks (`id` a decimal string, `value.parent`
+        // a plain JSON number — `TabletId`'s newtype serialization).
+        let (s, body) = admin_get(admin_addr, "/admin/system-table?kind=split_lineage").await;
+        assert_eq!(s, 200, "system-table split_lineage: {body}");
+        assert_eq!(body["available"], Value::Bool(true));
+        let items = body["items"].as_array().expect("items array");
+        for child in &children {
+            let row = items
+                .iter()
+                .find(|it| it["id"].as_str() == Some(child.as_str()))
+                .unwrap_or_else(|| panic!("no split_lineage row for child {child}: {body}"));
+            assert_eq!(
+                row["value"]["parent"],
+                Value::from(1),
+                "child {child}'s lineage row names tablet 1 as parent: {row}"
+            );
+        }
+
+        // `split_placing` stays a normal, available route even with no rows.
+        let (s, body) = admin_get(admin_addr, "/admin/system-table?kind=split_placing").await;
+        assert_eq!(s, 200, "system-table split_placing: {body}");
+        assert_eq!(body["available"], Value::Bool(true));
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// Bring up a single node with a `dynamo_auth` section (ADR 0057), retrying
 /// the port-TOCTOU race exactly like [`bring_up`] does — this file's own
 /// copy since `bring_up` always builds a config with `dynamo_auth: None`,
@@ -1794,6 +1885,183 @@ async fn admin_credentials_put_on_a_follower_is_relayed_to_the_leader() {
         })
         .await
         .expect("credential relayed via a follower did not replicate to every node in time");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05) moves
+/// control-plane leadership to another live voter — a standalone route
+/// alongside the leadership-transfer arm `control/member/remove`'s own
+/// self-removal path already had internally. Posts the transfer to the
+/// **current leader's** own admin address (local-control-leader-only, not
+/// relayed, mirroring every other `control/member/*` action), then polls
+/// (converged-or-timeout, per this crate's own testing discipline — never a
+/// fixed sleep) until the named target reports itself the control leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_control_transfer_moves_leadership_to_the_named_node() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let target = (0..nodes.len()).find(|&i| i != leader).unwrap();
+        let target_id = config.nodes[target].id.clone();
+
+        let body = serde_json::json!({"to": target_id}).to_string();
+        let (status, resp) = admin(
+            nodes[leader].admin_addr(),
+            "POST",
+            "/admin/control/transfer",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, 200, "transfer should be accepted: {resp}");
+        assert_eq!(resp["ok"], true, "response: {resp}");
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if nodes[target].is_control_leader() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("control leadership never moved to the named target");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A follower's admin port refuses the transfer (not the control leader) —
+/// mirroring every other `control/member/*` action's own not-relayed,
+/// local-leader-only discipline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_control_transfer_on_a_follower_is_refused() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+        let other = (0..nodes.len())
+            .find(|&i| i != leader && i != follower)
+            .unwrap();
+        let target_id = config.nodes[other].id.clone();
+
+        let body = serde_json::json!({"to": target_id}).to_string();
+        let (status, resp) = admin(
+            nodes[follower].admin_addr(),
+            "POST",
+            "/admin/control/transfer",
+            Some(&body),
+        )
+        .await;
+        assert_ne!(status, 200, "a follower should refuse the transfer: {resp}");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `POST /admin/storage/compact` (docs/roadmap.md U-05, tablet action
+/// family) had no integration coverage anywhere in this crate before this
+/// test — `admin_interface_surfaces_state_and_actions` above only exercises
+/// its sibling `/admin/storage/flush`. Mirrors that test's own flush
+/// sequence: write a key, find the CP group leader, flush it to a real
+/// on-disk SSTable (so compaction has real LSM state to act on, not a
+/// trivial empty-engine no-op), compact, and confirm the written pair
+/// still reads back afterward. Also proves the `not_hosted` refusal shape
+/// for a tablet id this node doesn't host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_storage_compact_action() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        put(
+            &mut stream,
+            "kv",
+            b"compact-key".to_vec(),
+            b"compact-val".to_vec(),
+        )
+        .await;
+
+        let mut leader_admin = None;
+        for node in &nodes {
+            let (_, rk) = admin_get(node.admin_addr(), "/admin/raftkv").await;
+            if rk["groups"][0]["is_leader"].as_bool() == Some(true) {
+                leader_admin = Some(node.admin_addr());
+                break;
+            }
+        }
+        let leader_admin = leader_admin.expect("a CP group leader exists");
+
+        let (s, flushed) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/flush",
+            Some("{\"tablet\":1}"),
+        )
+        .await;
+        assert_eq!(s, 200, "flush before compact: {flushed}");
+        assert_eq!(flushed["flushed"], true, "flush ran: {flushed}");
+
+        let (s, compacted) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/compact",
+            Some("{\"tablet\":1}"),
+        )
+        .await;
+        assert_eq!(s, 200, "compact action returns 200: {compacted}");
+        assert_eq!(compacted["compacted"], true, "compact ran: {compacted}");
+        assert_eq!(compacted["tablet"], 1);
+
+        // The written pair survives compaction.
+        let (s, scan) = admin_get(leader_admin, "/admin/storage/scan?tablet=1&limit=10").await;
+        assert_eq!(s, 200);
+        let items = scan["items"].as_array().expect("scan items array");
+        assert!(
+            items
+                .iter()
+                .any(|it| { it["key"] == "compact-key" && it["value"] == "compact-val" }),
+            "the written pair survives compaction: {scan}"
+        );
+
+        // An unhosted tablet id is refused (`not_hosted`'s 404 shape).
+        let (s, err) = admin(
+            leader_admin,
+            "POST",
+            "/admin/storage/compact",
+            Some("{\"tablet\":999}"),
+        )
+        .await;
+        assert_eq!(s, 404, "compacting an unhosted tablet is refused: {err}");
 
         for node in &nodes {
             node.shutdown_graceful().await;

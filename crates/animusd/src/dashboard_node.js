@@ -15,6 +15,9 @@ function renderNode() {
   renderNodeIdentity();
   renderNodeHealth();
   renderNodeMirror();
+  renderNodeControlMembers();
+  renderNodeControlActions();
+  renderNodeActions();
   renderNodeTablets();
   renderConsoleLink();
   renderNodeTabletOptions();
@@ -110,6 +113,334 @@ function renderNodeMirror() {
     <div class="list-row"><span class="detail">control leader</span><span class="status-text mono">${r.leader != null ? "node " + idSpan(r.leader) : "—"}</span></div>
     <div class="list-row"><span class="detail">leader address hint</span><span class="status-text mono">${cm.leader_hint ? esc(cm.leader_hint) : "—"}</span></div>
     ${note}`;
+}
+
+// Control-plane members panel (docs/roadmap.md U-05, ADR 0037 PR3):
+// `/admin/control/members` served read-only on any node — the live voter set
+// plus the replicated address book. Per-row gated actions were the roadmap's
+// own last U-05 slice (2026-09-06): "Transfer leadership here" (hidden on
+// the current leader's own row — nothing to transfer to itself) and "Remove"
+// — both `window.confirm`-gated, over the pre-existing
+// `POST /admin/control/transfer {to}`/`POST /admin/control/member/remove
+// {node}` routes (fa41fcb / ADR 0037 PR3). `renderNodeControlActions` below
+// carries the sibling "Add" control (its own card, since it targets no
+// particular row). Refreshed on the same `loadAll()`/`loadSelf()` cadence as
+// every other Node-tab panel; no dedicated poll of its own.
+function renderNodeControlMembers() {
+  const s = SELF;
+  const cmv = s.controlMembers;
+  if (!s.ok || !cmv) {
+    $("nd-control-members").innerHTML = `<div class="section-head"><span class="title">Control-plane members</span></div><div class="empty">loading…</div>`;
+    return;
+  }
+  const voters = cmv.voters; // null = never observed (a Remote handle before its first sync); [] = genuinely zero
+  const leader = s.raft && s.raft.leader != null ? String(s.raft.leader) : null;
+  const addrs = cmv.addrs || {};
+  const ids = Object.keys(addrs).sort();
+  const rows = ids.map((id) => {
+    const a = addrs[id] || {};
+    const isVoter = voters == null ? null : voters.map(String).includes(id);
+    const isLeader = leader != null && id === leader;
+    const roleBadge = pill("forming", a.role || "combined");
+    const voterBadge = isVoter == null
+      ? pill("forming", "unknown")
+      : pill(isVoter ? "healthy" : "forming", isVoter ? "voter" : "learner");
+    // Transfer only makes sense onto a live voter that isn't already
+    // leading; Remove is offered regardless (the server itself refuses a
+    // still-live-quorum-endangering removal, surfaced verbatim below).
+    const canTransfer = !isLeader && isVoter !== false;
+    const transferBtn = canTransfer
+      ? `<button class="nd-cm-transfer-btn" data-node="${esc(id)}">Transfer here</button>`
+      : "";
+    return `<div class="list-row">
+      ${dot(isLeader ? "ok-dot" : "dim-dot")}
+      <span class="id mono">${idSpan(id)}</span>
+      <span class="detail mono">${esc(a.admin || a.internal || "—")}</span>
+      <span class="status-text">${roleBadge} ${voterBadge}${isLeader ? " " + pill("healthy", "leader") : ""}</span>
+      <span class="row" style="gap:6px">${transferBtn}<button class="nd-cm-remove-btn" data-node="${esc(id)}">Remove</button></span>
+    </div>`;
+  }).join("");
+  const msgHtml = ndControlMsg
+    ? `<div class="${ndControlMsg.isError ? "err-line" : "muted"}" id="nd-control-msg" style="margin-top:10px">${esc(ndControlMsg.text)}</div>`
+    : `<div id="nd-control-msg"></div>`;
+  $("nd-control-members").innerHTML = `
+    <div class="section-head"><span class="title">Control-plane members</span>${pill("forming", `${ids.length} known`)}</div>
+    ${rows || `<div class="empty">no members observed yet</div>`}
+    ${msgHtml}`;
+  ids.forEach((id) => {
+    const t = document.querySelector(`.nd-cm-transfer-btn[data-node="${cssEsc(id)}"]`);
+    if (t) t.addEventListener("click", () => ndTransferControlLeadership(id));
+    const r = document.querySelector(`.nd-cm-remove-btn[data-node="${cssEsc(id)}"]`);
+    if (r) r.addEventListener("click", () => ndRemoveControlMember(id));
+  });
+}
+
+// Escapes a value for safe interpolation into a CSS attribute-selector
+// string (`querySelector`) — distinct from `esc`'s HTML-escaping, since a
+// node id could in principle contain a quote or backslash.
+function cssEsc(s) {
+  return String(s).replace(/(["\\])/g, "\\$1");
+}
+
+let ndControlMsg = null; // { text, isError } | null
+
+function ndSetControlMsg(text, isError) {
+  ndControlMsg = { text, isError };
+  renderNodeControlMembers();
+}
+
+// Both routes are **local-control-leader-only, not relayed**
+// (`ClientCtx::admin_transfer_control_leadership`/
+// `admin_remove_control_member`'s own doc) — the identical
+// `ndControlLeaderBase()` every other control-member action on this tab
+// already resolves from the cross-node fan-out (`STATE.nodes`).
+async function ndTransferControlLeadership(node) {
+  const base = ndControlLeaderBase();
+  if (!base) { ndSetControlMsg("no control leader currently known", true); return; }
+  if (!window.confirm(`Transfer control-plane leadership to node ${node}?`)) return;
+  ndSetControlMsg("transferring…", false);
+  const { status, body } = await postJSON(base, "/admin/control/transfer", { to: node });
+  if (status >= 300) {
+    ndSetControlMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetControlMsg(JSON.stringify(body), false);
+  await loadAll();
+}
+
+// A successful removal's own `warning` field (ADR 0037 §2's deliberately-
+// allowed-but-risky quorum-loss cases) is surfaced verbatim, never swallowed
+// — mirroring `animus admin control-remove`'s own print-then-check-status
+// shape. A refusal (e.g. "would drop below a majority") is shown verbatim
+// too, never retried automatically with `force` on the caller's behalf —
+// an operator who means it re-runs `animus admin control-remove --force`
+// from the CLI, the same as every other force-gated admin action here.
+async function ndRemoveControlMember(node) {
+  const base = ndControlLeaderBase();
+  if (!base) { ndSetControlMsg("no control leader currently known", true); return; }
+  if (!window.confirm(`Remove control-plane voter ${node}? This shrinks the control group's quorum.`)) return;
+  ndSetControlMsg("removing…", false);
+  const { status, body } = await postJSON(base, "/admin/control/member/remove", { node });
+  if (status >= 300) {
+    ndSetControlMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetControlMsg(JSON.stringify(body) + (body && body.warning ? ` — warning: ${body.warning}` : ""), false);
+  await loadAll();
+}
+
+// Add control-plane member (docs/roadmap.md U-05's own last slice,
+// `POST /admin/control/member/add {node?, addr}`, ADR 0037 PR3). Unlike the
+// data-plane `Add member` action on `#nd-actions` (which takes only a node
+// id — the joining node's own startup registers its address separately),
+// this route's wire body wants the new voter's **internal control-Raft**
+// listen address directly (`animus admin control-add`'s own CLI form
+// resolves this by fetching the new node's own `/admin/config` first — see
+// `run_control_add` in `animus-cli`); this panel asks for it directly rather
+// than cross-origin-fetching another node's admin port from the browser,
+// which would need CORS support this admin surface doesn't advertise for
+// that purpose. `node` is optional — blank self-mints, mirroring the CLI's
+// own 2-arg (self-minted) vs. 3-arg (operator-supplied) dispatch. There is
+// **no separate `grow` route to wire**: `animus admin control-grow` is a
+// purely client-side loop of this same `control/member/add` call, one pair
+// at a time (`run_control_grow` in `animus-cli`) — not a distinct server
+// endpoint, so a "Grow" button here would just be "Add" called repeatedly
+// and adds nothing this one control doesn't already offer.
+let ndCtlAddNode = "";
+let ndCtlAddAddr = "";
+
+function renderNodeControlActions() {
+  const s = SELF;
+  if (!s.ok || !s.config) {
+    $("nd-control-actions").innerHTML = `<div class="section-head"><span class="title">Add control member</span></div><div class="empty">loading…</div>`;
+    return;
+  }
+  const msgHtml = ndCtlAddMsg
+    ? `<div class="${ndCtlAddMsg.isError ? "err-line" : "muted"}" id="nd-ctl-add-msg" style="margin-top:10px">${esc(ndCtlAddMsg.text)}</div>`
+    : `<div id="nd-ctl-add-msg"></div>`;
+  $("nd-control-actions").innerHTML = `
+    <div class="section-head"><span class="title">Add control member</span></div>
+    <div class="row" style="margin-bottom:8px;gap:6px">
+      <input type="text" id="nd-ctl-add-node" class="mono" placeholder="node id (blank = self-mint)" value="${esc(ndCtlAddNode)}" style="flex:1;min-width:0">
+      <input type="text" id="nd-ctl-add-addr" class="mono" placeholder="internal control address, host:port" value="${esc(ndCtlAddAddr)}" style="flex:1;min-width:0">
+    </div>
+    <div class="row">
+      <button id="nd-ctl-add-btn">Add member</button>
+    </div>
+    ${msgHtml}`;
+  $("nd-ctl-add-node").addEventListener("input", (e) => { ndCtlAddNode = e.target.value; });
+  $("nd-ctl-add-addr").addEventListener("input", (e) => { ndCtlAddAddr = e.target.value; });
+  $("nd-ctl-add-btn").addEventListener("click", ndAddControlMember);
+}
+
+let ndCtlAddMsg = null; // { text, isError } | null
+
+function ndSetCtlAddMsg(text, isError) {
+  ndCtlAddMsg = { text, isError };
+  renderNodeControlActions();
+}
+
+// Local-control-leader-only, not relayed (`ClientCtx::
+// admin_add_control_member`'s own doc) — same `ndControlLeaderBase()`
+// target as Transfer/Remove above.
+async function ndAddControlMember() {
+  const addr = (ndCtlAddAddr || "").trim();
+  if (!addr) { ndSetCtlAddMsg("enter the new voter's internal control address first", true); return; }
+  const node = (ndCtlAddNode || "").trim();
+  const base = ndControlLeaderBase();
+  if (!base) { ndSetCtlAddMsg("no control leader currently known", true); return; }
+  const label = node ? `node ${node} (${addr})` : `a self-minted node at ${addr}`;
+  if (!window.confirm(`Add ${label} as a new control-plane voter?`)) return;
+  ndSetCtlAddMsg("adding…", false);
+  const payload = node ? { node, addr } : { addr };
+  const { status, body } = await postJSON(base, "/admin/control/member/add", payload);
+  if (status >= 300) {
+    ndSetCtlAddMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetCtlAddMsg(JSON.stringify(body), false);
+  await loadAll();
+}
+
+// Gated data-plane membership actions (docs/roadmap.md U-05, ADR 0030/0032):
+// Drain (`POST /admin/drain {node}`), Remove (`POST /admin/member/remove
+// {node}` — the ADR 0032 drain→remove decommission flow's own second half;
+// there is no separate "remove member" route to wire, `/admin/member/remove`
+// IS this button), and Add member (`POST /admin/member/add {node}`, ADR 0030
+// online growth). Same house style as `dashboard_tablets.js`'s tablet-action
+// family (b3e208a): `window.confirm` naming the node id and the action →
+// `postJSON` → the response/error in `#nd-action-msg` → `loadAll()` refresh
+// on success only, never on a refusal.
+//
+// The node-id input defaults to THIS node's own id (`SELF.config.node_id` —
+// how the Node tab already identifies "this node" everywhere else on this
+// view) but is a plain editable text field, not a fixed target: `animus
+// admin drain <admin-addr> <node-id>` takes an arbitrary node id (typically
+// the node actually being decommissioned, reached through a DIFFERENT node's
+// admin port), and this panel mirrors that — an operator on a healthy node's
+// console drains/removes a DEAD peer from here just as readily as itself.
+// `null` only right after this module loads; once set (by the user typing,
+// or defaulted on first render) it survives every later `renderNode()` this
+// tab's ~5s poll cadence causes, the identical "don't clobber an in-flight
+// edit" discipline `tbSplitKeyInput`/`tbReconfigureVoters` already use.
+let ndActionNode = null;
+let ndActionMsg = null; // { text, isError } | null
+
+// `/admin/drain`/`/admin/member/remove` are **local-control-leader-only,
+// not relayed** (`ClientCtx::admin_drain`/`admin_remove_member`'s own doc,
+// mirrored in `admin.rs`'s route comments) — unlike a tablet's CP leader,
+// the control leader is a cluster-wide fact already on hand from the same
+// cross-node fan-out `dashboard_core.js::loadAll()` performs for every other
+// view (`STATE.nodes`, each carrying its own `/admin/raft`'s `is_leader`) —
+// no extra probe, and the identical source `computeHealth()`'s own
+// `controlLeader` already reads. `null` when no leader is currently known
+// (mid-election, or the fan-out hasn't completed yet).
+function ndControlLeaderBase() {
+  const n = STATE.nodes.find((x) => x.ok && x.raft && x.raft.is_leader);
+  return n ? n.base : null;
+}
+
+function ndRedrawActions() {
+  renderNodeActions();
+}
+
+function ndSetActionMsg(text, isError) {
+  ndActionMsg = { text, isError };
+  ndRedrawActions();
+}
+
+function renderNodeActions() {
+  const s = SELF;
+  if (!s.ok || !s.config) {
+    $("nd-actions").innerHTML = `<div class="section-head"><span class="title">Membership actions</span></div><div class="empty">loading…</div>`;
+    return;
+  }
+  if (ndActionNode === null) ndActionNode = String(s.config.node_id);
+  const msgHtml = ndActionMsg
+    ? `<div class="${ndActionMsg.isError ? "err-line" : "muted"}" id="nd-action-msg" style="margin-top:10px">${esc(ndActionMsg.text)}</div>`
+    : `<div id="nd-action-msg"></div>`;
+  $("nd-actions").innerHTML = `
+    <div class="section-head"><span class="title">Membership actions</span></div>
+    <div class="row" style="margin-bottom:8px">
+      <input type="text" id="nd-action-node-input" class="mono" placeholder="node id" value="${esc(ndActionNode)}" style="flex:1;min-width:0">
+    </div>
+    <div class="row">
+      <button id="nd-drain-btn">Drain</button>
+      <button id="nd-remove-btn">Remove</button>
+      <button id="nd-add-member-btn">Add member</button>
+    </div>
+    ${msgHtml}`;
+  $("nd-action-node-input").addEventListener("input", (e) => { ndActionNode = e.target.value; });
+  $("nd-drain-btn").addEventListener("click", ndDrainNode);
+  $("nd-remove-btn").addEventListener("click", ndRemoveNode);
+  $("nd-add-member-btn").addEventListener("click", ndAddMember);
+}
+
+// ---- Drain (`POST /admin/drain {node}`, ADR 0032 PR3 decommission step 1) --
+async function ndDrainNode() {
+  const node = (ndActionNode || "").trim();
+  if (!node) { ndSetActionMsg("enter a node id first", true); return; }
+  const base = ndControlLeaderBase();
+  if (!base) { ndSetActionMsg("no control leader currently known", true); return; }
+  if (!window.confirm(`Drain node ${node}? It stops being assigned new tablet replicas until removed or restarted.`)) return;
+  ndSetActionMsg("draining…", false);
+  const { status, body } = await postJSON(base, "/admin/drain", { node });
+  if (status >= 300) {
+    ndSetActionMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetActionMsg(JSON.stringify(body), false);
+  await loadAll();
+}
+
+// ---- Remove (`POST /admin/member/remove {node}`, ADR 0032 PR3 decommission
+// step 2) — a drained member's actual removal from `Metadata`. Refuses a
+// still-undrained (or still-replica-carrying) node; the refusal is shown
+// verbatim, exactly as `ClientCtx::admin_remove_member` returns it, never
+// retried automatically — an operator checks `Drain` first, same as the CLI
+// `animus admin decommission` sequence this button doesn't attempt to fully
+// automate (that composite also polls `/admin/member/drain-status` and can
+// cascade into `control-remove`; this button is the two underlying routes,
+// gated individually, not the CLI's whole orchestration).
+async function ndRemoveNode() {
+  const node = (ndActionNode || "").trim();
+  if (!node) { ndSetActionMsg("enter a node id first", true); return; }
+  const base = ndControlLeaderBase();
+  if (!base) { ndSetActionMsg("no control leader currently known", true); return; }
+  if (!window.confirm(`Remove drained node ${node} from the cluster? This is irreversible — a fresh process at the same id rejoins like a brand-new node.`)) return;
+  ndSetActionMsg("removing…", false);
+  const { status, body } = await postJSON(base, "/admin/member/remove", { node });
+  if (status >= 300) {
+    ndSetActionMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetActionMsg(JSON.stringify(body), false);
+  await loadAll();
+}
+
+// ---- Add member (`POST /admin/member/add {node}`, ADR 0030 online growth) -
+// Relayed server-side (unlike Drain/Remove above — `ClientCtx::
+// admin_add_member`'s own doc), so it works from any reachable admin port;
+// posted to this console's own node (`SEED`) for that reason, no control
+// leader needed. In production this route is called by a joining node's own
+// startup code, not by an operator (`animus-cli` has no dedicated one-shot
+// subcommand for it), but it is a real, always-live POST route with no
+// gate beyond this one — registers `node` `Down`, promoted to `Active` by
+// its own first heartbeat. No labels input: `AddMemberReq.labels` defaults
+// to empty (`#[serde(default)]`) when omitted, the same as an unlabeled node
+// registered any other way.
+async function ndAddMember() {
+  const node = (ndActionNode || "").trim();
+  if (!node) { ndSetActionMsg("enter a node id first", true); return; }
+  if (!window.confirm(`Register node ${node} as a new data-plane member (Down until its own first heartbeat)?`)) return;
+  ndSetActionMsg("adding…", false);
+  const { status, body } = await postJSON(SEED, "/admin/member/add", { node });
+  if (status >= 300) {
+    ndSetActionMsg((body && body.error) || `HTTP ${status}`, true);
+    return;
+  }
+  ndSetActionMsg(JSON.stringify(body), false);
+  await loadAll();
 }
 
 function renderNodeTablets() {

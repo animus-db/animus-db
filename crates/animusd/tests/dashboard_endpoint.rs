@@ -1296,3 +1296,462 @@ async fn dashboard_u04_create_table_form() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's first slice: a read-only control-plane members
+/// panel on the Node tab, beside `#nd-mirror`. Mirrors
+/// `dashboard_u04_ttl_row`'s own structure — shell/script markers plus a
+/// live round trip against the route it renders
+/// (`/admin/control/members`, already covered end to end at the wire level
+/// by `tests/control_membership_admin.rs`, so this test only proves the
+/// dashboard wiring: the shell carries the new card next to the mirror
+/// card, `dashboard_node.js` renders it from `SELF.controlMembers`, and
+/// `dashboard_core.js` fetches the route on the same cadence as everything
+/// else `SELF` carries).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn dashboard_u05_control_members_panel() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-control-members beside #nd-mirror -------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let mirror_pos = shell
+            .find(r#"id="nd-mirror""#)
+            .expect("shell carries #nd-mirror");
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        assert!(
+            members_pos > mirror_pos && members_pos - mirror_pos < 200,
+            "#nd-control-members sits immediately beside #nd-mirror: {shell}"
+        );
+
+        // ---- dashboard_node.js renders it from SELF.controlMembers ---------
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        assert!(
+            node_js.contains("function renderNodeControlMembers")
+                && node_js.contains("controlMembers")
+                && node_js.contains("nd-control-members"),
+            "dashboard_node.js defines the control-members panel's render function: {node_js}"
+        );
+
+        // ---- dashboard_core.js fetches /admin/control/members into SELF ----
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/control/members") && core_js.contains("controlMembers"),
+            "dashboard_core.js fetches control members into SELF alongside everything else: {core_js}"
+        );
+
+        // ---- the route it renders is live and carries every voter ---------
+        // Converged-or-timeout, never a one-shot assert: `await_bootstrap`
+        // returns once a control leader exists and every node sees a
+        // non-empty membership, but a node's own ADR 0030 `RegisterNode`
+        // (which is what puts it in the address book) is a separate
+        // replicated command that can still be in flight on the queried
+        // node at that instant. Observed in CI as an address book carrying
+        // n0 and n2 but not yet n1 while `voters` already had all three.
+        support::poll_until_or_stalled(
+            admin_addr,
+            "GET /admin/control/members carries every bootstrap voter and address",
+            Duration::from_millis(100),
+            || async {
+                let (s, _, body) = raw(admin_addr, "GET", "/admin/control/members").await;
+                if s != 200 {
+                    return false;
+                }
+                let members: Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let voters_ok = members["voters"]
+                    .as_array()
+                    .is_some_and(|v| v.len() == 3);
+                let addrs_ok = members["addrs"].as_object().is_some_and(|addrs| {
+                    config
+                        .nodes
+                        .iter()
+                        .all(|n| addrs.contains_key(n.id.to_string().as_str()))
+                });
+                voters_ok && addrs_ok
+            },
+        )
+        .await;
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-05's second slice: a lineage/directed-placing panel on
+/// the Tablets tab, keyed by the currently selected tablet. Same structure
+/// as `dashboard_u05_control_members_panel` above: shell markers proving
+/// the new card sits beside the existing detail card, `dashboard_tablets.js`
+/// markers proving it renders from `GET /admin/system-table?kind=
+/// split_lineage`/`split_placing` (the two kinds it walks client-side, since
+/// that route has no per-tablet filter — see the file's own module doc), and
+/// a live round trip against those two routes. **The route's own end-to-end
+/// proof — a real split populating a `split_lineage` row with the shape this
+/// panel parses — lives in `admin_endpoint.rs::
+/// admin_system_table_split_lineage_after_a_real_split`** (that file already
+/// has split-cluster fixtures this one doesn't); this test only proves the
+/// dashboard wiring on top of it, against a cluster that has never split
+/// (the panel's own "no lineage (never split)"/"no pending placing" empty
+/// states).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_lineage_panel() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #tb-lineage beside #tb-detail ---------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let detail_pos = shell
+            .find(r#"id="tb-detail""#)
+            .expect("shell carries #tb-detail");
+        let lineage_pos = shell
+            .find(r#"id="tb-lineage""#)
+            .expect("shell carries #tb-lineage");
+        assert!(
+            lineage_pos > detail_pos && lineage_pos - detail_pos < 200,
+            "#tb-lineage sits immediately beside #tb-detail: {shell}"
+        );
+
+        // ---- dashboard_tablets.js renders it from the system-table route ---
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        assert!(
+            tablets_js.contains("function loadTabletLineage")
+                && tablets_js.contains("function renderTabletLineage")
+                && tablets_js.contains("tb-lineage"),
+            "dashboard_tablets.js defines the lineage panel's load + render functions: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("\"split_lineage\"") && tablets_js.contains("\"split_placing\""),
+            "the panel fetches both system-table kinds it renders: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("no lineage (never split)") && tablets_js.contains("no pending placing"),
+            "the panel states both empty conditions explicitly: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("loadTabletLineage(id)")
+                && tablets_js.contains("if (tbSelectedId != null) loadTabletLineage"),
+            "the panel refreshes on selection AND on renderTablets()'s own poll-cadence call: {tablets_js}"
+        );
+
+        // ---- the routes it reads are live, on a cluster that never split ---
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/system-table?kind=split_lineage").await;
+        assert_eq!(s, 200, "GET /admin/system-table?kind=split_lineage: {body}");
+        let lineage: Value = serde_json::from_str(&body).expect("split_lineage is JSON");
+        assert_eq!(lineage["available"], Value::Bool(true));
+        assert_eq!(
+            lineage["items"].as_array().map(Vec::len),
+            Some(0),
+            "no tablet has ever split on this fresh cluster: {lineage}"
+        );
+
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/system-table?kind=split_placing").await;
+        assert_eq!(s, 200, "GET /admin/system-table?kind=split_placing: {body}");
+        let placing: Value = serde_json::from_str(&body).expect("split_placing is JSON");
+        assert_eq!(placing["available"], Value::Bool(true));
+        assert_eq!(placing["items"].as_array().map(Vec::len), Some(0));
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-05's third slice (the TABLET action family): four
+/// gated buttons on the tablet detail card — Split, Flush, Compact,
+/// Reconfigure — over the four PRE-EXISTING `/admin/tablet/split`,
+/// `/admin/storage/{flush,compact}`, and `/admin/raftkv/reconfigure`
+/// routes (no new backend route). Same shell/JS-marker style as the two
+/// preceding U-05 slices above (`dashboard_u05_control_members_panel`,
+/// `dashboard_u05_lineage_panel`): the buttons themselves only ever exist
+/// in the client-rendered detail card (`renderTabletDetail`'s own
+/// template), not the static shell, so this proves the served JS defines
+/// every button id, every route path it posts to, and the `window.confirm`
+/// guard on each — the wire-level round trip of the four routes themselves
+/// is already covered (`admin_endpoint.rs`'s
+/// `admin_interface_surfaces_state_and_actions` for split/flush/reconfigure,
+/// and this slice's own new `admin_storage_compact_action` for compact,
+/// which had no coverage at all before this change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_tablet_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell still carries #tb-detail (the card these buttons
+        // render inside, client-side) --------------------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="tb-detail""#),
+            "shell still carries #tb-detail: {shell}"
+        );
+
+        // ---- dashboard_tablets.js defines the four gated actions -----------
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        for btn_id in [
+            "tb-split-btn",
+            "tb-flush-btn",
+            "tb-compact-btn",
+            "tb-reconfigure-btn",
+        ] {
+            assert!(
+                tablets_js.contains(btn_id),
+                "dashboard_tablets.js defines button #{btn_id}: {tablets_js}"
+            );
+        }
+        for route in [
+            "/admin/tablet/split",
+            "/admin/storage/flush",
+            "/admin/storage/compact",
+            "/admin/raftkv/reconfigure",
+        ] {
+            assert!(
+                tablets_js.contains(route),
+                "dashboard_tablets.js posts to the real route {route}: {tablets_js}"
+            );
+        }
+        assert!(
+            tablets_js.matches("window.confirm(").count() >= 4,
+            "every one of the four actions is guarded by window.confirm: {tablets_js}"
+        );
+        // Every action posts via the crate's one mutation idiom (postJSON)
+        // and refreshes through the tab's existing loader — no new timer.
+        assert!(
+            tablets_js.contains("postJSON(") && tablets_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {tablets_js}"
+        );
+        // Reconfigure targets the tablet's own CP leader, same as the
+        // pre-existing storage-detail/"Open in Storage" targeting.
+        assert!(
+            tablets_js.contains("function tbLeaderBase") && tablets_js.contains("lead.node.base"),
+            "leader-only actions resolve the same leader address the storage panel already uses: {tablets_js}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-05's NODE action family (fourth slice of the same
+/// series as `dashboard_u05_control_members_panel`/`dashboard_u05_lineage_
+/// panel`/`dashboard_u05_tablet_actions` above): three gated buttons on the
+/// Node tab's new `#nd-actions` card — Drain, Remove, Add member — over the
+/// three pre-existing routes `POST /admin/drain`/`POST /admin/member/
+/// remove`/`POST /admin/member/add`. Mirrors `dashboard_u05_tablet_actions`'s
+/// own structure exactly: the buttons only ever exist in client-rendered
+/// JS (not the static shell), so this proves the served JS defines every
+/// button id, every route path it posts to, and the `window.confirm` guard
+/// on each — the wire-level round trip of all three routes is already
+/// covered by real-cluster tests that predate this slice (`tests/
+/// decommission.rs`, `tests/cluster_growth.rs`, `tests/seed_join*.rs`,
+/// `tests/control_membership_admin.rs`), so this test adds no new admin
+/// route coverage, only the dashboard-wiring proof on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_node_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-actions beside #nd-control-members -----
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        let actions_pos = shell
+            .find(r#"id="nd-actions""#)
+            .expect("shell carries #nd-actions");
+        assert!(
+            actions_pos > members_pos && actions_pos - members_pos < 200,
+            "#nd-actions sits immediately beside #nd-control-members: {shell}"
+        );
+
+        // ---- dashboard_node.js defines the three gated actions -------------
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        for btn_id in ["nd-drain-btn", "nd-remove-btn", "nd-add-member-btn"] {
+            assert!(
+                node_js.contains(btn_id),
+                "dashboard_node.js defines button #{btn_id}: {node_js}"
+            );
+        }
+        for route in ["/admin/drain", "/admin/member/remove", "/admin/member/add"] {
+            assert!(
+                node_js.contains(route),
+                "dashboard_node.js posts to the real route {route}: {node_js}"
+            );
+        }
+        assert!(
+            node_js.matches("window.confirm(").count() >= 3,
+            "every one of the three actions is guarded by window.confirm: {node_js}"
+        );
+        // Every action posts via the crate's one mutation idiom (postJSON)
+        // and refreshes through the tab's existing loader — no new timer.
+        assert!(
+            node_js.contains("postJSON(") && node_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {node_js}"
+        );
+        // Drain/Remove target the control leader (not relayed server-side);
+        // Add member targets SEED (relayed server-side) — the two-way split
+        // this slice's own doc calls for, not a uniform target.
+        assert!(
+            node_js.contains("function ndControlLeaderBase") && node_js.contains("is_leader"),
+            "leader-only actions resolve the live control leader's own admin address: {node_js}"
+        );
+        assert!(
+            node_js.contains(r#"postJSON(SEED, "/admin/member/add""#),
+            "the relayed add-member action posts to SEED, needing no leader lookup: {node_js}"
+        );
+
+        // ---- the three routes it posts to are real and live ---------------
+        for route in ["/admin/drain", "/admin/member/remove", "/admin/member/add"] {
+            let (s, _) = raw_post(admin_addr, route, "", "{}").await;
+            assert_ne!(s, 404, "{route} exists");
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// docs/roadmap.md U-05's fifth and last slice (the CONTROL-MEMBERS action
+/// family): gated buttons on the members panel itself (`#nd-control-members`,
+/// landed by `dashboard_u05_control_members_panel` above as read-only) plus
+/// a sibling `#nd-control-actions` card for Add — over the pre-existing
+/// `POST /admin/control/transfer {to}` (fa41fcb), `POST
+/// /admin/control/member/remove {node}`, and `POST
+/// /admin/control/member/add {node?, addr}` routes (ADR 0037 PR3; no new
+/// admin route). Same structure as every other U-05 slice above: the
+/// per-row Transfer/Remove buttons only ever exist in client-rendered JS
+/// (`renderNodeControlMembers`'s own per-member template), not the static
+/// shell, so this proves the served JS defines the button classes, the
+/// route paths it posts to, and the `window.confirm` guard on each — the
+/// wire-level round trip of all three routes is already covered by
+/// `tests/control_membership_admin.rs` and `admin_endpoint.rs`'s
+/// `admin_control_transfer_*` tests (fa41fcb), so this test adds no new
+/// admin-route coverage, only the dashboard-wiring proof plus a live check
+/// that all three routes exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_control_member_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-control-actions beside #nd-control-
+        // members and #nd-actions -------------------------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        let ctl_actions_pos = shell
+            .find(r#"id="nd-control-actions""#)
+            .expect("shell carries #nd-control-actions");
+        let actions_pos = shell
+            .find(r#"id="nd-actions""#)
+            .expect("shell carries #nd-actions");
+        assert!(
+            members_pos < ctl_actions_pos && ctl_actions_pos < actions_pos,
+            "#nd-control-actions sits between #nd-control-members and #nd-actions: {shell}"
+        );
+
+        // ---- dashboard_node.js defines the gated control-member actions ---
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        for marker in [
+            "nd-cm-transfer-btn",
+            "nd-cm-remove-btn",
+            "nd-ctl-add-btn",
+            "function ndTransferControlLeadership",
+            "function ndRemoveControlMember",
+            "function ndAddControlMember",
+        ] {
+            assert!(
+                node_js.contains(marker),
+                "dashboard_node.js defines {marker}: {node_js}"
+            );
+        }
+        for route in [
+            "/admin/control/transfer",
+            "/admin/control/member/remove",
+            "/admin/control/member/add",
+        ] {
+            assert!(
+                node_js.contains(route),
+                "dashboard_node.js posts to the real route {route}: {node_js}"
+            );
+        }
+        assert!(
+            node_js.matches("window.confirm(").count() >= 6,
+            "every action (three pre-existing plus three new) is guarded by window.confirm: {node_js}"
+        );
+        assert!(
+            node_js.contains("postJSON(") && node_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {node_js}"
+        );
+        // Every one of the three is local-control-leader-only, not relayed
+        // — all target `ndControlLeaderBase()`, the same resolver the
+        // pre-existing Drain/Remove data-plane actions already use.
+        assert!(
+            node_js.contains(r#"postJSON(base, "/admin/control/transfer""#)
+                && node_js.contains(r#"postJSON(base, "/admin/control/member/remove""#)
+                && node_js.contains(r#"postJSON(base, "/admin/control/member/add""#),
+            "control-member actions target the resolved control leader base: {node_js}"
+        );
+        // Add's node-id input is optional (blank self-mints) and its addr
+        // input persists across poll ticks the same "don't clobber an
+        // in-flight edit" way ndActionNode/tbSplitKeyInput already do.
+        assert!(
+            node_js.contains("ndCtlAddNode") && node_js.contains("ndCtlAddAddr"),
+            "the Add control's inputs are persisted module-level state: {node_js}"
+        );
+
+        // ---- the three routes it posts to are real and live ---------------
+        for route in [
+            "/admin/control/transfer",
+            "/admin/control/member/remove",
+            "/admin/control/member/add",
+        ] {
+            let (s, _) = raw_post(admin_addr, route, "", "{}").await;
+            assert_ne!(s, 404, "{route} exists");
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

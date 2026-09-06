@@ -316,6 +316,128 @@ Regression: `animus-control/tests/leader_within_hysteresis.rs` (a one-sided
 partition inside the grace, then held past it, across 12 seeds). See
 `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
+## As-built (2026-09-05, roadmap U-05) — `POST /admin/control/transfer`
+
+The roadmap's U-05 audit found no standalone leadership-transfer route:
+`GET /admin/raft`'s `transfer_target` (ADR 0037's escape-valve field) is
+read-only, and the only place this codebase ever armed a transfer was
+buried inside `admin_remove_control_member`'s self-removal arm (ADR 0037) —
+an operator who wanted to move leadership *without* also removing a voter
+had no route to ask for it. Added `POST /admin/control/transfer {"to":
+<node id>}`, beside the existing `control/member/add`/`control/member/remove`
+pair — like those two, documented in ADR 0037 rather than duplicated in
+this file's own design-time route table above, since all three are ADR
+0037-shaped control-plane-membership actions.
+
+Same discipline as every other `control/member/*` action: **local-control-
+leader-only, not relayed** (`RaftCore::transfer_leadership` is a call on
+this node's own in-process `RaftNode` handle, not a `MetaCommand`
+proposal — a follower refuses with the ordinary not-the-leader error). The
+handler (`ClientCtx::admin_transfer_control_leadership`) is idempotent if
+`to` already names the current leader, refuses outright if `to` is not a
+current voter, and otherwise arms the transfer and polls (bounded by the
+same `CONTROL_TRANSFER_POLL_TIMEOUT` the self-removal arm already used) for
+this node to step down — success means this node confirmed stepping down,
+not a confirmed new leader elsewhere (the caller retries against the new
+leader exactly as every other post-transfer caller in this codebase already
+does). Wired through the full `AdminHost` stack
+(`crates/animus-node/src/host.rs`'s trait method, `admin.rs`'s dispatch
+match arm and `FakeHost` stub, `crates/animusd/src/admin.rs`'s handler) and
+`animus admin control-transfer <admin-addr> <node-id>`. Regression:
+`tests/admin_endpoint.rs::
+admin_control_transfer_moves_leadership_to_the_named_node`/
+`admin_control_transfer_on_a_follower_is_refused`.
+
+## As-built (2026-09-06, roadmap U-05) — dashboard action buttons over existing routes
+
+The Tablets tab's detail card gained four gated buttons — Split, Flush,
+Compact, Reconfigure — over the four routes that already existed
+(`POST /admin/tablet/split`, `POST /admin/storage/flush`, `POST
+/admin/storage/compact`, `POST /admin/raftkv/reconfigure`, the Phase 2
+route table above). No new admin route was added for this: the JS layer
+(`crates/animusd/src/dashboard_tablets.js`) calls these exactly as the
+`animus admin`/`animus-cli` forms already do, through the dashboard's one
+mutation idiom (`postJSON`, a `window.confirm` guard per action).
+
+**Worth stating plainly, since this is the second and third PR of a
+three-PR series adding buttons of this shape (Node/control-member families
+follow)**: a dashboard button is not a second gate on top of this ADR's
+"no auth — bind to a trusted interface" posture, and was never meant to be
+one. The **only** thing standing between a dashboard viewer and any of
+these four actions is (a) `window.confirm`'s dialog, purely a
+misclick guard, and (b) the fact that the Tablets tab — and this card in
+particular — is only ever shown on a control-role node's console
+(`ROLE_TABS`, ADR 0035 PR7 client-side gating). Neither is an
+authorization boundary: **anyone who can reach the admin port at all can
+already call every one of these routes directly**, with `curl` or the
+`animus admin` CLI, button or no button — exactly the trusted-network
+posture this ADR's Decision section states from the start ("No auth for
+v1 ... The admin port is meant to be bound to a private/management
+network"). Adding a button here changes nothing about who can act; it only
+changes how conveniently an operator who is already inside that trusted
+network can act. See `crates/animusd/CLAUDE.md`'s dashboard section and
+ADR 0021's own "Actions" note for the same statement from the dashboard's
+side.
+
+## As-built (2026-09-06, roadmap U-05, continued) — the Node tab's own action buttons
+
+The fourth PR of this series added the NODE family the note above deferred:
+three gated buttons on the Node tab's new `#nd-actions` card — Drain
+(`POST /admin/drain`), Remove (`POST /admin/member/remove` — the ADR 0032
+drain→remove decommission flow's own second half), and Add member
+(`POST /admin/member/add`, ADR 0030 online growth). No new admin route;
+same `postJSON` + `window.confirm` idiom as the tablet family above, and
+the identical statement applies unchanged: these buttons are not a second
+gate on this ADR's "no auth — bind to a trusted interface" posture, only a
+convenience for an operator already inside the trusted network — anyone
+who can reach the admin port can already call `/admin/drain`/`/admin/
+member/{add,remove}` directly. See `crates/animusd/CLAUDE.md`'s
+`dashboard_node.js` entry for the full mechanism (including why this is
+three buttons over three routes, not four — `/admin/member/remove` already
+is both "finish decommissioning" and "remove a member," the same route
+either way) and ADR 0021's matching amendment for the dashboard's own
+side. The control-members panel's own add/remove/transfer buttons
+(`/admin/control/member/{add,remove}`) remain the final PR of this series.
+
+## As-built (2026-09-06, roadmap U-05, closing) — the control-members panel's own action buttons
+
+The fifth and last PR of this series closes the one bullet the two notes
+above deferred: the control-plane members panel itself
+(`#nd-control-members`, landed read-only by an earlier PR in this series)
+gained per-row **Transfer leadership here** and **Remove** buttons, plus a
+sibling `#nd-control-actions` card for **Add**, over three routes that all
+already existed — `POST /admin/control/transfer {to}` (this ADR's own
+2026-09-05 entry above), `POST /admin/control/member/remove {node}`, and
+`POST /admin/control/member/add {node?, addr}` (ADR 0037 PR3). No new
+admin route. Same `postJSON` + `window.confirm` idiom, and the identical
+statement applies unchanged a third time: these buttons are not a second
+gate on this ADR's "no auth — bind to a trusted interface" posture, only a
+convenience for an operator already inside the trusted network — anyone
+who can reach the admin port can already call any of the three routes
+directly. Transfer is hidden on a member's own row while it already leads
+(nothing to transfer to itself); Remove surfaces the server's own
+`warning`/refusal verbatim, including the quorum-loss guard ADR 0037 §2
+describes, never auto-retrying with `force`. Add's body needs the new
+voter's own internal control-Raft address, not just its id (`animus admin
+control-add`'s own CLI form resolves that by fetching the new node's
+`/admin/config` first — see `crates/animusd/CLAUDE.md`'s `dashboard_node.js`
+entry for a pre-existing bug found while confirming this: that CLI helper
+reads a `cfg["control"]` field `/admin/config` hasn't served under that
+name since the ADR 0040 PR1 identity merge, so the 3-argument
+operator-supplied-id form of `control-add` currently always fails —
+reported, not fixed here, since it's a `animus-cli`-only defect this
+slice's own scope doesn't touch), so this panel asks the operator for the
+address directly rather than attempting a cross-origin fetch of another
+node's admin port. There is **no separate `grow` route** to wire — `animus
+admin control-grow` is a purely client-side loop of the same
+`control/member/add` call (`animus-cli`'s own `run_control_grow`), not a
+distinct server endpoint, so "Add," called as many times as needed, is
+already the whole feature. **This closes docs/roadmap.md's whole U-05
+section** — every bullet across all five PRs has now landed. See
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism and `tests/dashboard_endpoint.rs::
+dashboard_u05_control_member_actions` for the regression.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

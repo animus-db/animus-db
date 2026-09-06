@@ -430,3 +430,123 @@ body and in the amendment above is historical: read it as naming the
 surface now called animusd admin. ADR 0052's data console is renamed
 alongside it, to **animusd console** — see that ADR's own matching
 amendment.
+
+## Amendment (2026-09-05, roadmap U-05) — control-plane members panel on the Node tab
+
+The Node tab (ADR 0035 PR7's data-only dedicated view, also shown appended
+last on a combined node) gained a read-only render of `GET
+/admin/control/members` (ADR 0037 PR3) beside its existing control-plane
+mirror card: every known member's id, address, role, voter-vs-learner
+state, and whether it is the current control leader. Fetched on the same
+per-refresh cadence as everything else `SELF` carries — no dedicated poll
+timer, no new route. **Deliberately read-only**: no add/remove/transfer
+buttons in this slice — those, and a lineage panel on the Tablets tab, are
+later U-05 PRs this one is a prerequisite for. See
+`crates/animusd/CLAUDE.md`'s matching `dashboard_node.js` entry for the
+full mechanism and `tests/dashboard_endpoint.rs::
+dashboard_u05_control_members_panel` for the regression.
+
+## Amendment (2026-09-06, roadmap U-05) — split lineage and directed-placing panel on the Tablets tab
+
+The Tablets tab's per-tablet detail panel (`#tb-detail`) gained a sibling
+card, `#tb-lineage`, keyed by the same selected tablet: a read-only render
+of `GET /admin/system-table?kind=split_lineage` (ADR 0050 fork F9) and
+`?kind=split_placing` (ADR 0062 §2) — this tablet's upward ancestor chain
+(parent, grandparent, … as far as `split_lineage` goes, each hop's own
+cutover time and the parent's final stream epoch), its downward children
+(recursively, however many splits deep), and its directed-Placing target/
+`done` state if any. Explicit empty states for both — "no lineage (never
+split)" and "no pending placing" — rather than a blank card. Fetched on
+tablet selection and re-fetched on this tab's existing `loadAll()` poll
+cadence (`renderTablets()` runs every tick regardless of which card is
+open) — no dedicated timer, no new admin route.
+
+**The system-table route has no per-tablet filter** (only `kind`/`after`/
+`limit`) and answering "who are this tablet's ancestors" is a point lookup
+by id while "who are its children" is the REVERSE lookup (which row names
+this tablet as `parent`) — no single query answers both, so the panel
+fetches the WHOLE `split_lineage`/`split_placing` kind (paginating via
+`next_after`, capped at 20 pages of 1000 rows each) and builds both
+directions client-side. A real cluster's total split count is normally
+small next to that bound; see `crates/animusd/src/dashboard_tablets.js`'s
+own module doc for the full reasoning and what a future per-tablet filter
+route would look like if this bound is ever hit in practice.
+
+See `crates/animusd/CLAUDE.md`'s matching `dashboard_tablets.js` entry for
+the full mechanism, `tests/dashboard_endpoint.rs::dashboard_u05_lineage_panel`
+for the dashboard-wiring regression, and `tests/admin_endpoint.rs::
+admin_system_table_split_lineage_after_a_real_split` for the real-cluster
+proof that a completed split actually populates the row this panel parses.
+
+## Amendment (2026-09-06, roadmap U-05) — Actions: the tablet-family buttons this design section anticipated
+
+Design §3's "Operator actions (gated)" paragraph above described
+`tablet/split`/`storage/flush`/`storage/compact`/`raftkv/reconfigure`
+buttons on the Tablets tab as a target shape; this PR is what actually
+built them. Four buttons on the tablet detail card (`#tb-detail`), each a
+`window.confirm` naming the tablet id and the action, posted via
+`postJSON` to the pre-existing route, response (or error) shown inline in
+the card rather than `alert()`, then the tab's own `loadAll()` refresh —
+no new mutation path, exactly as §3 already committed to. See ADR 0020's
+matching 2026-09-06 as-built note for the one thing worth restating
+plainly: the gate on these buttons is `window.confirm` plus this tab only
+rendering on a control-role console — not a second authorization layer,
+since the admin port itself has none (§4, "localhost-only assumption").
+Node-tab (drain/decommission/member add-remove) and the control-members
+panel's own add-remove buttons are later PRs in the same U-05 series.
+
+## Amendment (2026-09-06, roadmap U-05, continued) — Actions: the Node-tab family
+
+The fourth PR in this series adds the Node-family half of the previous
+amendment's own deferred bullet: a new card, `#nd-actions`, beside the Node
+tab's control-plane members panel — Drain, Remove, and Add member, over the
+three pre-existing routes `POST /admin/drain`/`POST /admin/member/remove`/
+`POST /admin/member/add` (ADR 0032's decommission flow and ADR 0030's online
+growth, respectively). Same idiom as the tablet family: `window.confirm`
+naming the node id and the action, `postJSON`, an inline status line
+(`#nd-action-msg`), then `loadAll()` on success only. Unlike the tablet
+family's uniform "post to the tablet's own leader" default, targeting here
+splits on each route's own server-side gating: Drain/Remove are
+local-control-leader-only and never relayed, so both resolve and post to
+the current control leader's own admin address (from the same cross-node
+fan-out `computeHealth()`'s `controlLeader` already reads); Add member IS
+relayed, so it posts to this console's own node. The node-id input defaults
+to this node's own id but is freely editable — a Node console frequently
+needs to act on a DIFFERENT (often dead) node, exactly like the CLI's own
+`animus admin drain <admin-addr> <node-id>` — and, like the tablet card's
+own split-key/reconfigure inputs, survives this tab's poll cadence via its
+own persisted, input-listened-to module-level variable rather than being
+recomputed every render. See ADR 0020's matching amendment for the same
+"not a second auth layer" statement from the admin-interface side, and
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism. The control-members panel's own add/remove/transfer buttons
+remain the final PR of this series.
+
+## Amendment (2026-09-06, roadmap U-05, closing) — Actions: the control-members panel's own family
+
+The fifth and final PR of this series closes the deferral both amendments
+above named: the control-plane members panel (`#nd-control-members`)
+gained per-row **Transfer leadership here** and **Remove** buttons over
+`POST /admin/control/transfer`/`POST /admin/control/member/remove`, and a
+new sibling card, `#nd-control-actions`, gained an **Add** control over
+`POST /admin/control/member/add` — three pre-existing routes, no new one.
+Same idiom as the tablet and Node families: `window.confirm`, `postJSON`,
+an inline status line (`#nd-control-msg`), `loadAll()` on success only,
+and all three post to the resolved control leader (none of the three is
+relayed server-side). Two design points worth recording: Transfer is
+omitted from a member's own row while it already leads, since transferring
+leadership to the current leader is a no-op the button would only invite
+someone to click by mistake; and Add's two inputs (node id, optional; the
+new voter's internal control-Raft address, required) mirror the route's
+actual wire body rather than a single node-id field, since — unlike the
+data-plane `Add member` action on `#nd-actions`, which only ever needs an
+id — the control plane genuinely has no address for an unregistered node
+to look up, and the CLI's own way of avoiding that keystroke (fetching the
+new node's `/admin/config` first) isn't reproducible from the browser
+without a cross-origin fetch this admin surface doesn't advertise CORS
+support for. **This is the last PR of the whole U-05 series** — see ADR
+0020's matching closing amendment for the "not a second auth layer"
+statement and the pre-existing `animus-cli` bug this slice found (but did
+not fix) while confirming the Add route's wire shape, and
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism.

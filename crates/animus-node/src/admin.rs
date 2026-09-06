@@ -64,6 +64,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("GET", "/admin/control/members") => (200, host.control_members_view().await),
         ("POST", "/admin/control/member/add") => host.action_add_control_member(body).await,
         ("POST", "/admin/control/member/remove") => host.action_remove_control_member(body).await,
+        ("POST", "/admin/control/transfer") => host.action_transfer_control_leadership(body).await,
         ("POST", "/admin/data/dynamo") => host.action_data_dynamo(body).await,
         ("POST", "/admin/data/drop-table") => host.action_drop_table(body).await,
         ("POST", "/admin/data/seed") => host.action_data_seed(body).await,
@@ -235,6 +236,10 @@ mod tests {
         async fn action_remove_control_member(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
+        async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
+            assert_eq!(body, b"the-body");
+            (200, self.record())
+        }
         async fn action_data_dynamo(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
@@ -307,6 +312,20 @@ mod tests {
             &host,
             "POST",
             "/admin/credentials",
+            "",
+            b"the-body",
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn post_admin_control_transfer_routes_to_action() {
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(
+            &host,
+            "POST",
+            "/admin/control/transfer",
             "",
             b"the-body",
         ));
