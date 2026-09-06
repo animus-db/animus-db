@@ -59,6 +59,19 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # The pod-proxy subresource: how every admin-port call (the scale-down
+  # drain sequence, `crate::admin_client::ProxyAdminClient`) reaches a
+  # pod's admin port by default (`--admin-access proxy`) — a `GET` through
+  # the proxy is a `get` on this subresource, a `POST` a `create` (see
+  # `deploy/operator/README.md`'s own admin-access section). Grants no
+  # broader pod access than the plain `pods: get/list/watch` above already
+  # has; this is specifically the subresource that lets the controller
+  # forward an HTTP request *through* the API server to a pod it can
+  # already see, which is what makes admin-port calls work whether this
+  # process runs in-cluster or out-of-cluster.
+  - apiGroups: [""]
+    resources: ["pods/proxy"]
+    verbs: ["get", "create"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

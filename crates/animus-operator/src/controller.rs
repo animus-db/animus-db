@@ -28,7 +28,7 @@ use kube::{Api, Client, ResourceExt};
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::admin_client::{AdminClient, AdminOps};
+use crate::admin_client::{AdminAccessMode, AdminOps, RealAdminClient};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
@@ -175,7 +175,18 @@ async fn control_nodes_changed<C: ClusterApi>(
 /// — `animusd` serves `admin` that way whenever `spec.tls` is set), which
 /// selects the URL scheme; the caller must pass the matching CA bytes to
 /// `AdminOps::get_json`/`post_json` in that case (see [`drain_and_remove_node`]).
-fn admin_base_url(name: &str, ns: &str, ordinal: i32, admin_port: i32, tls: bool) -> String {
+///
+/// `pub(crate)`: `crate::admin_client`'s `ProxyAdminClient` parses this
+/// exact URL shape back apart (`parse_admin_url`), and its own unit tests
+/// build one through this function rather than hand-duplicating the format
+/// string.
+pub(crate) fn admin_base_url(
+    name: &str,
+    ns: &str,
+    ordinal: i32,
+    admin_port: i32,
+    tls: bool,
+) -> String {
     let scheme = if tls { "https" } else { "http" };
     format!(
         "{scheme}://{}:{admin_port}",
@@ -511,11 +522,17 @@ fn error_policy<C: ClusterApi, A: AdminOps>(
 /// watched here) so an out-of-band edit to a child (e.g. `kubectl edit
 /// statefulset`) triggers a reconcile that reverts the drift, not just a
 /// spec change on the parent.
-pub async fn run(client: Client) {
+///
+/// `admin_access` (`--admin-access {proxy,direct}`, `crate::main`) selects
+/// how every admin-port call this loop makes — the scale-down drain
+/// sequence today — reaches its target pod; see `crate::admin_client`'s
+/// own doc for the trade-off. Defaults to `AdminAccessMode::Proxy`, which
+/// works in every deployment shape this crate supports.
+pub async fn run(client: Client, admin_access: AdminAccessMode) {
     let clusters = Api::<AnimusCluster>::all(client.clone());
     let ctx = Arc::new(Context {
         cluster_api: RealClusterApi::new(client.clone()),
-        admin: AdminClient::new(),
+        admin: RealAdminClient::new(admin_access, client.clone()),
     });
 
     Controller::new(clusters, watcher::Config::default())
@@ -540,8 +557,8 @@ pub async fn run(client: Client) {
             watcher::Config::default(),
         )
         .run(
-            reconcile::<RealClusterApi, AdminClient>,
-            error_policy::<RealClusterApi, AdminClient>,
+            reconcile::<RealClusterApi, RealAdminClient>,
+            error_policy::<RealClusterApi, RealAdminClient>,
             ctx,
         )
         .for_each(|res| async move {

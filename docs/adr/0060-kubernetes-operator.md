@@ -845,3 +845,116 @@ smoke's own 3-node/3-`controlNodes` shape, both right after the initial
 3/3-ready wait and again after the scale-up to 4 nodes (pinning the
 scale-invariance claim above against a real cluster, not just the unit
 corpus).
+
+## Amendment (2026-09-06): operator admin access through the API server pod proxy
+
+**Groundwork for S-07d and for `drain_and_remove_node`'s own reachability.**
+`scripts/e2e-kind.sh` runs the operator **out-of-cluster**
+(`cargo run -p animus-operator -- run` against the runner's local
+kubeconfig) — the documented local-iteration shape, and the shape every
+`e2e-kind` CI leg uses. From there, neither a pod's headless-`Service` DNS
+name (`<pod>.<svc>.<ns>.svc.cluster.local`) nor its `10.244.x.x` pod IP is
+routable: both live on the cluster's own pod network, which a process
+outside the cluster (a laptop, a CI runner) simply has no route to. Every
+admin-port call this controller makes — the scale-down drain sequence
+(`drain_and_remove_node`, this ADR's own "Scale-up and scale-down"
+section) today, and S-07d's `spec.controlNodes` growth sequence once it
+lands — therefore could never succeed out-of-cluster, a gap the e2e smoke
+never caught because it has never yet forced a scale-down (a real
+`kind`-cluster reproduction of this exact failure mode is documented in
+`docs/engineering-lessons.md`).
+
+**Fix: reach the pod through the Kubernetes API server's pod-proxy
+subresource instead of dialing it directly** — `GET`/`POST
+/api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy{path}`, `scheme`
+being `http` or `https`. The API server is the one address this
+controller reaches from *every* deployment shape (it is what `kube::
+Client::try_default()` connects to, whether that resolves to an in-cluster
+service account or a local kubeconfig), so proxying an admin request
+through it — rather than dialing the pod's own address — closes the
+reachability gap structurally, the same way this ADR's Part 1 (a stable
+pod DNS name instead of a moving pod IP) closed the *stale-address*
+problem structurally rather than adding a repair loop. **No CA plumbing
+is needed on this path**: the API server itself dials TLS to the pod for
+an `https:` proxy target and does not verify the pod's serving
+certificate (Kubernetes' own pod-proxy behavior, not a choice made here)
+— this is genuinely simpler than the direct-dial TLS client
+(`crate::admin_client`'s `AdminConnector`/`build_tls_connector`, ADR 0064
+commit 3), which still exists and still verifies the cluster CA, for the
+other mode below.
+
+**`animus-operator run --admin-access {proxy,direct}`**, defaulting to
+`proxy`:
+
+- **`proxy`** (default): every admin call goes through the pod-proxy
+  subresource above. Works in-cluster and out-of-cluster identically —
+  one mode, one behavior, regardless of `deployment.yaml` vs. `cargo run
+  -p animus-operator -- run`. The extra API-server hop this adds is a
+  non-concern: an admin-port call is rare (a handful of requests across a
+  whole scale-down or a one-voter growth step), never a hot path.
+- **`direct`**: dials the pod's admin port itself, exactly as before this
+  amendment (plain HTTP, or server-only TLS trusting `spec.tls`'s
+  resolved CA). Kept because it is strictly simpler when it does apply —
+  no extra hop, no proxy-subresource RBAC — and because a future
+  operator-hardening item might want to reason about it independently;
+  it only works in-cluster.
+
+`deployment.yaml` (the in-cluster shape) passes no `--admin-access` flag
+either, so it also gets `proxy` by default — deliberately: this ADR's
+whole point in Part 3 was one controller binary working identically
+in-cluster and out-of-cluster (`animusd`'s own combined/control-only/
+data-only role split precedent), and special-casing the in-cluster
+deployment onto a different admin-access mode than local iteration uses
+would reintroduce exactly the "works here, not there" asymmetry this
+amendment closes. An operator that wants the old direct-dial behavior
+in-cluster can still ask for it explicitly.
+
+**Every admin request, in both modes, is bounded by a real timeout**
+(`crate::admin_client::ADMIN_REQUEST_TIMEOUT`, a few seconds) — connect
+through response for `direct`, the whole API-server round trip for
+`proxy`. An unroutable pod IP or DNS name used to have no such bound (a
+`direct`-mode `TcpStream::connect` against a dead address can hang far
+longer than any reconcile loop should tolerate); now it fails a reconcile
+step fast, surfacing as a real, retried `DrainFailed`/growth-failure
+condition rather than a stuck reconcile indistinguishable from a hung
+controller process.
+
+**`AdminOps`'s signature is unchanged.** `crate::admin_client::AdminOps::
+get_json`/`post_json` still take the same `url: &str` +
+`ca_pem: Option<&[u8]>` shape `AdminClient` (the pre-existing direct
+implementor) always has — `crate::admin_client::ProxyAdminClient` parses
+`admin_base_url`'s own URL shape (`{scheme}://{pod}.{internal-svc}.
+{ns}.svc.cluster.local:{port}{path}`, six dot-separated host labels, pod
+name first and namespace third) back apart into the `(namespace, pod,
+port, scheme)` the pod-proxy path needs, rather than threading a second,
+structured target type through the trait. This crate owns both ends of
+that URL contract (`admin_base_url` is its only producer), so parsing it
+back apart is safe and keeps every existing `AdminOps` call site —
+`drain_and_remove_node` today, S-07d's growth sequence once it lands —
+unchanged; `ca_pem` is accepted by `ProxyAdminClient` only to keep the
+signature identical, and ignored (see above). `crate::fakes::
+FakeAdminClient` (the test seam) is likewise untouched: it already records
+the same logical `(method, url)` pair regardless of which real
+implementor would have served it.
+
+**RBAC**: `deploy/operator/rbac.yaml` adds `pods/proxy` (`get`/`create`)
+alongside the pre-existing `pods: get/list/watch` — granted unconditionally
+(RBAC has no notion of "only when `--admin-access proxy`"), documented in
+`deploy/operator/README.md`'s new "Admin access" section.
+
+**Deliverable**: `crate::admin_client::{ProxyAdminClient, AdminAccessMode,
+RealAdminClient, ADMIN_REQUEST_TIMEOUT}` (+ unit tests for proxy-path
+construction, URL round-tripping, error mapping, and the timeout/mode
+defaults), `crate::controller::run`'s new `admin_access` parameter and
+`admin_base_url`'s `pub(crate)` visibility bump (so `ProxyAdminClient`'s
+own tests can build one), `crate::main`'s `--admin-access` argv parsing,
+`deploy/operator/rbac.yaml`, `deploy/operator/README.md`, this ADR, and
+`docs/engineering-lessons.md`. No CRD field, no `deploy/operator/crd.yaml`
+regeneration. **What only a real `kind` cluster can prove**: that the API
+server's pod-proxy subresource actually forwards a request to a live
+pod's admin port end to end (method, headers, body, and the response
+verbatim) — this crate's own unit corpus proves path construction and
+error-mapping only, never a live proxied round trip; `scripts/e2e-kind.sh`
+already runs entirely out-of-cluster (this amendment's default `proxy`
+mode is exercised on every leg by construction, not as a special case),
+and closes the S-07d CI failure this amendment's own title names.

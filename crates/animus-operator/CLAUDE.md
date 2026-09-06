@@ -97,6 +97,25 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   `None` plain TCP; `crate::controller::reconcile` reads the bytes out of
   `spec.tls`'s resolved `Secret` via `ClusterApi::get_secret` (the
   Kubernetes API, not a mounted file — see the TLS section below for why).
+  This is `AdminClient`, one of two `AdminOps` implementors, selected by
+  `--admin-access direct`; it only works when the operator runs
+  in-cluster. `ProxyAdminClient`, in the same file, is the **default**
+  (`--admin-access proxy`) — see ADR 0060's own dated amendment ("operator
+  admin access through the API server pod proxy") for the full rationale:
+  it parses `admin_base_url`'s own URL shape back apart
+  (`parse_admin_url`) into `(namespace, pod, port, scheme)` and issues the
+  same GET/POST as a Kubernetes API request against the pod-proxy
+  subresource (`/api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
+  {path}`) instead of dialing the pod directly — the one address this
+  works from is the API server, reachable in every deployment shape
+  including out-of-cluster (`scripts/e2e-kind.sh`'s own shape), unlike a
+  pod's headless-`Service` DNS name or pod IP. `RealAdminClient` (an enum,
+  `Direct`/`Proxy`) is what `run()` actually constructs from
+  `AdminAccessMode`, keeping `Context<C, A>` monomorphized against one
+  concrete `A: AdminOps` type regardless of which mode was chosen at
+  startup. Both implementors bound every request with
+  `ADMIN_REQUEST_TIMEOUT` — an unroutable pod fails a reconcile step fast,
+  never hangs it.
 - `src/cluster_api.rs` — `ClusterApi`, the test seam over the `kube::Api`
   calls `controller.rs` performs, plus `RealClusterApi`, its production
   implementor (ADR 0061 rung E1 — see Tests).

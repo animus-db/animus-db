@@ -93,11 +93,58 @@ The scale-down drain sequence's admin-port calls (`crate::admin_client`)
 switch to TLS automatically once `spec.tls` is set: the controller reads
 the resolved `Secret`'s `ca.crt` through the same `kube::Api` the rest of
 the controller already uses (RBAC `secrets: get/list/watch`, added by
-`rbac.yaml`) — not a mounted file on the operator's own pod — which is what
-lets this work identically whether the operator runs in-cluster
-(`deployment.yaml`) or out-of-cluster via `cargo run -p animus-operator --
-run` against a local kubeconfig (the `scripts/e2e-kind.sh` shape): both
-paths reach the API server, neither needs a filesystem mount of its own.
+`rbac.yaml`) — not a mounted file on the operator's own pod. That CA is
+consulted only in `--admin-access direct` mode (below); the default
+`proxy` mode dials no TLS of its own and ignores it (the Kubernetes API
+server verifies nothing about the pod's serving certificate either — see
+the next section).
+
+## Admin access (`--admin-access {proxy,direct}`, ADR 0060's dated amendment)
+
+Every admin-port call this controller makes (today: the scale-down drain
+sequence, `crate::admin_client::drain_and_remove_node`) reaches its target
+pod one of two ways, chosen by `animus-operator run`'s own
+`--admin-access` flag:
+
+- **`proxy` (the default)** routes the request through the Kubernetes API
+  server's pod-proxy subresource — `GET`/`POST
+  /api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy{path}` — so the
+  only address this process ever dials for an admin call is the API
+  server itself, which it already talks to for everything else. This is
+  what makes admin-port calls reachable at all when the operator runs
+  **out-of-cluster** against a local kubeconfig (`cargo run -p
+  animus-operator -- run`, the shape `scripts/e2e-kind.sh` and any other
+  local-iteration workflow use): from outside the cluster network,
+  neither a pod's headless-`Service` DNS name
+  (`<pod>.<svc>.<ns>.svc.cluster.local`) nor its `10.244.x.x` pod IP is
+  routable — only the API server's own (already-reachable) address is.
+  `proxy` also works in-cluster, at the cost of one extra hop through the
+  API server; admin calls are rare (a handful of requests across a whole
+  scale-down), so that hop is not a concern. **No CA plumbing needed**:
+  the API server itself dials TLS to the pod for a `https:` proxy target
+  and does not verify the pod's serving certificate — this is
+  Kubernetes' own pod-proxy behavior, not a choice made here.
+- **`direct`** dials the pod's admin port itself — plain HTTP, or
+  server-only TLS trusting `spec.tls`'s resolved CA, verified end-to-end
+  — exactly what this controller did before `proxy` existed. Only
+  reachable when the operator runs **in-cluster**
+  (`deployment.yaml`); out-of-cluster, every direct-mode admin call fails
+  (both the pod DNS name and its IP are unroutable from outside the
+  cluster network) rather than hanging — every admin request, in both
+  modes, is bounded by `crate::admin_client::ADMIN_REQUEST_TIMEOUT` (a
+  few seconds), so an unroutable target fails a reconcile step fast.
+
+`deployment.yaml` passes no `--admin-access` flag, so the in-cluster
+deployment also defaults to `proxy` — deliberately: one access mode
+covers both deployment shapes, and there's no operational reason to
+special-case in-cluster onto `direct`. Pass `--admin-access direct`
+explicitly if you want the old direct-dial behavior in-cluster.
+
+**RBAC**: `proxy` mode needs `pods/proxy` (`get` for the drain-status
+poll, `create` for the drain/remove POSTs) in addition to the pre-existing
+`pods: get/list/watch` — both are already granted by `rbac.yaml`
+regardless of which mode you actually run with, since the flag is a
+per-process runtime choice RBAC can't see.
 
 ## S3 backup/segment stores (S-04 PR 3)
 
