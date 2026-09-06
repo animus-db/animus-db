@@ -951,6 +951,23 @@ per-tablet CP data plane (`animus-cp-data`).
   Regression: `tests/slow_disk_no_livelock.rs` (verified red on the pre-fix
   driver across four seeds: 2/10 proposals accepted, the group leaderless).
 
+  **This same "one slow thing on the shared driver task starves everyone"
+  shape recurred on the *network* side (issue #661, S-07d)**: `drive`'s own
+  outbound dispatch (`for (to, msg) in outs { env.send(to, bytes).await; }`)
+  sequentially `.await`s one peer at a time; `ProdEnv::send_stream` used to
+  run its `TcpStream::connect`+write inline with no timeout, so one
+  silently-unreachable peer (a recreated pod's collapsed old network
+  endpoint — exactly what a wiped-`EmptyDir` voter restart looks like)
+  could ride the OS's own multi-minute TCP retry timeout and starve
+  heartbeats to every *other* peer queued behind it in the same round —
+  cluster-wide leaderlessness for 60+ seconds, invisible to `SimEnv` (no
+  real sockets, no OS TCP timers). Fixed in `animus-env`'s `ProdEnv`
+  (spawn + bounded `SEND_TIMEOUT`), not here — see
+  `docs/engineering-lessons.md`'s matching entry and `wiped_voter_rejoin.rs`
+  (this crate's own three `SimEnv` cells proving the *Raft protocol* side
+  of a wiped-voter rejoin was never the bug: pre-vote's log-up-to-date
+  check already makes a fresh, empty-log rejoiner safe).
+
   **`node.rs`'s `persist_wal` has no halted-gate at all** (unlike
   `animus-cp-data`'s own `persist_wal`/`flush_pending`, which tolerate a
   live I/O error only while a group's `halted: AtomicBool` is set — see

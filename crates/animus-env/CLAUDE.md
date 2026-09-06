@@ -136,6 +136,25 @@ the production implementation; the deterministic implementation lives in
   warning).
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
+  **`ProdEnv::send_stream` actually honors that contract now (issue #661)**:
+  the connect+write runs on its own spawned task (tracked by the same
+  `AbortHandle` list `shutdown`/`shutdown_and_wait` drain), bounded by
+  `SEND_TIMEOUT` (2s). Before this it ran inline on the caller's own
+  `.await` with no timeout at all — harmless for a caller that only ever
+  sends to one peer, but every Raft driver (`animus-control`/
+  `animus-cp-data`'s `drive()`) dispatches to *several* peers sequentially
+  in one task, so one silently-unreachable peer (no RST — a recreated pod's
+  collapsed old network endpoint is the real-world instance, ADR 0060 S-07d)
+  rode the OS's own multi-minute TCP retry timeout and starved delivery to
+  every other peer queued behind it: a 60+ second cluster-wide leaderless
+  outage, invisible to `SimEnv` (no real sockets, no OS TCP timers) and
+  structurally the network-path twin of `animus-control`'s issue #279
+  slow-`fsync` livelock. See `docs/engineering-lessons.md`'s matching entry
+  and `crates/animus-env/src/prod.rs`'s
+  `a_send_to_an_unreachable_peer_does_not_delay_a_live_peers_delivery`
+  regression (points at the reserved/unrouted `10.255.255.1`, confirmed by
+  direct probe to hang rather than fail fast, modelling a real black hole
+  without needing actual internet access).
 - **`ProdEnv`'s peer book is keyed by `host:port` string, not `SocketAddr`
   (ADR 0060's advertise/dial split)** — `set_peers`/`merge_peer` both take
   `String`, and `Network::send`'s dial path resolves it (numeric parse or a

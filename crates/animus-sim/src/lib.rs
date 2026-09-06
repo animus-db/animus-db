@@ -349,6 +349,12 @@ pub enum TraceEvent {
         file: String,
         offset: u64,
     },
+    /// Every file on `node`'s disk was wiped clean — both durable and
+    /// buffered bytes dropped ([`Simulator::wipe_disk`]), modelling a pod
+    /// whose ephemeral (`EmptyDir`) volume does not survive a restart: the
+    /// node id and any in-flight network/task state are untouched, only the
+    /// persisted store is gone.
+    DiskWipe { t: u64, node: NodeId },
 }
 
 impl std::fmt::Display for TraceEvent {
@@ -444,6 +450,9 @@ impl std::fmt::Display for TraceEvent {
                     f,
                     "t={t} DISKCORRUPT node={node} file={file} offset={offset}"
                 )
+            }
+            TraceEvent::DiskWipe { t, node } => {
+                write!(f, "t={t} DISKWIPE node={node}")
             }
         }
     }
@@ -834,6 +843,36 @@ impl Simulator {
             offset,
         });
         true
+    }
+
+    /// Wipe `node`'s entire disk clean — every file's durable **and**
+    /// buffered bytes dropped, in place, keeping the node's id/registration
+    /// (network inbox, tasks) untouched. Models an ephemeral (`EmptyDir`)
+    /// volume that does not survive a pod restart, distinct from
+    /// [`crash`](Self::crash)/[`stop`](Self::stop), both of which
+    /// deliberately preserve durable disk state (a real process restart on
+    /// persistent storage). Pair with [`stop`](Self::stop) (drop the old
+    /// process's tasks) and then start a fresh node on the same id — its
+    /// `read(WAL)` comes back empty, exactly like a recreated pod reading an
+    /// empty mount. Deterministic: draws no RNG; records one
+    /// [`TraceEvent::DiskWipe`] regardless of how many files existed.
+    pub fn wipe_disk(&self, node: NodeId) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let t = st.clock;
+        let keys: Vec<_> = st
+            .disks
+            .keys()
+            .filter(|(n, _)| *n == node)
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(f) = st.disks.get_mut(&k) {
+                f.durable.clear();
+                f.buffered.clear();
+            }
+        }
+        st.trace.push(TraceEvent::DiskWipe { t, node });
     }
 
     /// Block delivery in the direction `from -> to`. Use
