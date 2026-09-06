@@ -1218,6 +1218,7 @@ async fn start_split_streamed_cluster(
                     console: addrs[6 * i + 5],
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 }
             })
             .collect();

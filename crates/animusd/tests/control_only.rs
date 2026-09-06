@@ -71,6 +71,7 @@ async fn bring_up_control(n: usize, dir: &std::path::Path) -> (Vec<Node>, animus
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -402,6 +403,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
                     console: addrs[6 * i + 5],
                     advertise_host: None,
                     tls: None,
+                    encryption_key_path: None,
                 })
                 .collect();
             nodes_cfg.push(animusd::RoleAddrs {
@@ -415,6 +417,7 @@ async fn mixed_cluster_put_via_control_node_forwards_to_data_node() {
                 console: addrs[23],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             });
             let config = animusd::ClusterConfig {
                 nodes: nodes_cfg,

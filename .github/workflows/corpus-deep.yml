@@ -72,6 +72,10 @@ on:
         description: "Seeds per scenario (ANIMUS_LSM_DISK_FAULT_SEEDS, LsmEngine DiskConfig fault-injection corpus)"
         required: false
         default: "40"
+      lsm_encrypted_seeds:
+        description: "Seeds per scenario (ANIMUS_LSM_ENCRYPTED_SEEDS, LsmEngine<EncryptedEnv<SimEnv>> crash/fault corpus, ADR 0069)"
+        required: false
+        default: "40"
       control_seeds:
         description: "Seeds per structural cell (ANIMUS_CONTROL_SEEDS, control-plane machinery fault-injection corpus)"
         required: false
@@ -325,6 +329,19 @@ jobs:
           ANIMUS_LSM_DISK_FAULT_SEEDS: ${{ github.event.inputs.lsm_disk_fault_seeds || '40' }}
         run: cargo test -p animus-storage --test lsm_disk_faults -- --nocapture
 
+      # LsmEngine<EncryptedEnv<SimEnv>> crash/fault corpus (ADR 0069, S-03
+      # PR 1): the encrypted sibling of the two corpora above — a torn or
+      # corrupted write must never partially decrypt, a wrong/missing key
+      # is the loud refusal, and mid-file corruption of an already-durable
+      # frame is a hard error (never a silent loss of intact data after
+      # it), scaled to depth.
+      - name: deep LSM encrypted crash/fault corpus (ADR 0069)
+        id: lsm_encrypted
+        continue-on-error: true
+        env:
+          ANIMUS_LSM_ENCRYPTED_SEEDS: ${{ github.event.inputs.lsm_encrypted_seeds || '40' }}
+        run: cargo test -p animus-storage --test lsm_crash_encrypted -- --nocapture
+
       # The control-plane machinery corpus: the ADR 0038 async apply task
       # (including its real `StopRestart` crash-recovery path), the
       # replicated schema catalog's exclusivity guarantee, the tablet-id/
@@ -428,6 +445,7 @@ jobs:
             [pitr]="${{ steps.pitr.outcome }}"
             [lsm_crash]="${{ steps.lsm_crash.outcome }}"
             [lsm_disk_fault]="${{ steps.lsm_disk_fault.outcome }}"
+            [lsm_encrypted]="${{ steps.lsm_encrypted.outcome }}"
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
@@ -436,7 +454,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster export_import heartbeat sharedwal; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted control simcluster export_import heartbeat sharedwal; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

@@ -224,6 +224,7 @@
       </ul></div>
     </div>
     <p class="body-text">TLS is available on every port — mutual on the Raft/intra-cluster ports, server-only on the client, admin and console ports — config-gated per cluster and <strong>off by default</strong>.</p>
+    <p class="body-text">Encryption at rest is available too, per node, via a key file (<code>--encryption-key PATH</code>, or the same field in a cluster config): every AEAD-sealed byte covers the Raft WAL and each hosted tablet's own engine files, with a wrong or missing key against an already-encrypted data directory refused loudly at startup rather than silently reset. It's <strong>off by default</strong>, and doesn't yet reach backup, point-in-time-recovery or stream segment objects on a local segment store — those stay plaintext regardless of the key.</p>
     <div class="warnbox" style="max-width:860px">
       <span class="label">Off by default, still just SigV4 for caller identity</span>
       <p>A cluster with no TLS configured is exactly as before: plain TCP everywhere. Turn it on and the internal ports refuse a non-cluster-member outright; the client port still only verifies a signature — opt-in, off by default independently of TLS. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>

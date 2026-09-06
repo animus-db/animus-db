@@ -59,6 +59,7 @@ async fn node_joins_via_a_hostname_seed() {
             console: raw[5],
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         let node_dir = dir.path().join(format!("join-{join_index}-{attempt}"));
         match animusd::run_node_join(

@@ -58,6 +58,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -148,6 +149,7 @@ async fn bring_up_with_throttle_defaults(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {

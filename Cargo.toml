@@ -108,6 +108,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 rustls-pki-types = "1"
 rcgen = "0.13"
+# Encryption at rest (ADR 0069): XChaCha20-Poly1305 AEAD for the `Disk`-seam
+# frame wrapper, chosen over AES-GCM specifically for its 24-byte extended
+# nonce (room for a 16-byte per-file random salt plus a 64-bit frame counter
+# with no birthday-bound risk within one salt's lifetime — see the ADR).
+# RustCrypto, MIT OR Apache-2.0, pure Rust (no unsafe backend enabled).
+# `zeroize` scrubs the loaded key from memory on drop.
+chacha20poly1305 = "0.10"
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

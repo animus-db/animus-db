@@ -80,6 +80,7 @@ fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
         console: a[5],
         advertise_host: None,
         tls: None,
+        encryption_key_path: None,
     }
 }
 

@@ -3327,6 +3327,7 @@ mod system_table_tests {
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

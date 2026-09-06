@@ -26,6 +26,35 @@ the production implementation; the deterministic implementation lives in
 - `tls.rs` — `TlsConfig`/`TlsMaterial`/`MaybeTlsStream` (ADR 0064, S-01):
   the intra-node wire's TLS material and transport wrapper. See "TLS on the
   intra-node wire" below.
+- `encrypted.rs` — encryption at rest (ADR 0069, S-03 PR 1):
+  `EncryptedDisk<D: Disk, R: Rng>` (a frame-sealing AEAD wrapper — every
+  `Disk::append`/`Disk::replace` call seals one XChaCha20-Poly1305 frame; a
+  lazily-built per-file frame index serves `read`/`read_at`/`size` without
+  ever decrypting a whole file), `EncryptedEnv<E: Env>` (the same wrapper
+  as a drop-in `Env`, so `LsmEngine<EncryptedEnv<SimEnv>>` reuses the
+  crash/fault corpora unchanged), `EncryptionKey` (a zeroize-on-drop
+  256-bit key, `EncryptionKey::load_from_file` reading `--encryption-key
+  PATH`'s 64-hex-character format), and `verify_or_init_marker` (the
+  directory-level loud-refusal check — a listing plus at most one small
+  marker-file read, mirroring `animus_cp_data::host::check_wal_layout`).
+  **Unconditional, no `prod` feature** — generic over any `Disk`/`Env`, so
+  `SimEnv`-driven tests/corpora in `animus-sim`/`animus-storage` exercise
+  it with no `ProdEnv` in the build at all. `ProdEnv` (`prod.rs`) composes
+  the *same* `EncryptedDisk`/`verify_or_init_marker` primitives internally
+  (`DiskBackend::{Plain, Encrypted}` over a new `RawFsDisk`, dispatched by
+  a small macro in `impl Disk for ProdEnv`) rather than being replaced by
+  `EncryptedEnv<ProdEnv>` — see ADR 0069's "Crate placement" section for
+  why (an `Arc` reference cycle risk, and `animusd`'s own concrete-`ProdEnv`
+  call-site count). `DiskSaltRng` is a minimal, zero-sized `Rng` drawing
+  real OS randomness for `RawFsDisk`'s per-file salts — deliberately not
+  `ProdEnv` itself, which would create that cycle (`ProdEnv`'s `Inner`
+  holding a `DiskBackend::Encrypted` that held a `ProdEnv` pointing back at
+  the same `Inner`). Construct via `ProdEnv::bind_with_tls_and_key` (the
+  general form `bind`/`bind_with_tls` both funnel through with
+  `encryption_key: None`) — the loud refusal runs before the returned env
+  is usable at all. Off by default: no key configured is byte-identical to
+  pre-ADR-0069 `ProdEnv` (verified directly, `prod::tests::
+  no_key_writes_no_marker_and_stays_byte_identical`).
 - **`prod.rs`/`tls.rs` are gated behind a default-off `prod` Cargo feature
   (ADR 0061 rung C0)**, added specifically so `ProdEnv`/`FsSegmentStore`
   can be made compiler-unreachable from a crate's manifest, not just

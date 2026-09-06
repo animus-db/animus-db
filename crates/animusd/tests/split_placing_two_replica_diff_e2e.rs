@@ -74,6 +74,7 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -261,6 +262,7 @@ async fn join_extra(core_intra: &[SocketAddr], ids: &[&str], dir: &Path) -> Vec<
                 console: a[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             };
             match animusd::run_node_join(
                 core_intra.iter().map(ToString::to_string).collect(),

@@ -156,6 +156,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_PITR_SEEDS=K` | 1 | PITR sealing fault-injection corpus depth (`animus-test`, ADR 0059 Train 3) |
 | `ANIMUS_LSM_CRASH_SEEDS=K` | 1 | `LsmEngine` crash-safety corpus depth (`animus-storage`, `tests/lsm_crash.rs`) |
 | `ANIMUS_LSM_DISK_FAULT_SEEDS=K` | 1 | `LsmEngine` `DiskConfig` fault-injection corpus depth (`animus-storage`, `tests/lsm_disk_faults.rs`) |
+| `ANIMUS_LSM_ENCRYPTED_SEEDS=K` | 1 | `LsmEngine<EncryptedEnv<SimEnv>>` crash/fault-injection corpus depth (`animus-storage`, `tests/lsm_crash_encrypted.rs`, ADR 0069) |
 | `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
 | `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test sharedwal_fault_corpus` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |

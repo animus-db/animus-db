@@ -1822,6 +1822,34 @@ acceptor` vs `server_acceptor`) — see this file's "TLS" section below for
 the full design. Omitted (the default), every listener/dialer stays plain
 TCP, byte-identical to before this ADR.
 
+**`--encryption-key PATH` (ADR 0069, S-03 PR 1)** — this node's own data
+directory encryption key file (`animus_env::EncryptionKey::
+load_from_file`'s format: 64 hex characters, optionally a trailing
+newline; generate one with `openssl rand -hex 32 > key.hex`). Threads to
+`RoleAddrs::encryption_key_path: Option<String>` — **per-node**, mirroring
+`tls`'s own shape (not `dynamo_auth`'s cluster-wide one), since each
+node's disk is independent. `--config FILE --node I`: merged onto that
+one node's own config entry (`apply_encryption_key_flag`, the identical
+"flag and config both set it is a hard error" contract `apply_tls_flag`
+uses). `--cluster N`: the same path applied to every generated node
+(`bind_cluster_with_advertise_host_and_key`) — each still writes to its
+own distinct data directory, so one shared key just means every node's
+disk is sealed under it. **Rejected outright** (a loud `Err`, matching
+`--tls-*`'s own posture) by `--cluster-control`/`--cluster-data`. **Not
+yet accepted** by `animusd control`, `animusd data --config`, `animusd
+data --seed`, or `animusd join` — a documented reach gap, the same shape
+several other per-node flags already have on those entry points (issue
+#676's own precedent). `Node::bind`/`bind_control`/`bind_data` each load
+the key and call the new `ProdEnv::bind_with_tls_and_key` (`bind_with_
+tls`'s general form, `animus-env`) instead of `bind_with_tls` — the loud
+refusal (a key/directory mismatch in either direction) happens inside
+that call, before any listener binds. Omitted (the default), every
+node's disk stays plaintext, byte-for-byte pre-ADR-0069 behavior. See
+`docs/adr/0069-encryption-at-rest.md` for the full design and
+`crates/animus-env/CLAUDE.md`'s `encrypted.rs` entry for the wrapper
+itself; `crates/animusd/tests/encryption_at_rest_e2e.rs` is the real
+`ProdEnv`/disk/DynamoDB-wire regression.
+
 **`--advertise-host NAME` (ADR 0060's advertise/dial split)** — this
 node's own stable dial name, when its bind address isn't itself something a
 peer can dial reliably (a Kubernetes pod's wildcard/pod-IP bind, whose IP

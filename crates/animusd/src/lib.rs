@@ -2249,6 +2249,19 @@ pub struct RoleAddrs {
     /// all-or-none rule this field is checked against.
     #[serde(default)]
     pub tls: Option<config::TlsSection>,
+    /// This node's own local data directory encryption key (ADR 0069,
+    /// S-03 PR 1) — a path to a key file (`--encryption-key PATH`'s own
+    /// format: 64 hex characters), not the key itself. `None` (every
+    /// pre-ADR-0069 config, `#[serde(default)]`) means plaintext on disk,
+    /// byte-for-byte today's behavior. **Per-node**, mirroring `tls`'s own
+    /// shape (not `dynamo_auth`'s cluster-wide one) — each node's disk is
+    /// independent, so there is no single cluster-wide field to hold it;
+    /// `--encryption-key PATH` applies the same path to every node it
+    /// reaches (see `main.rs`'s own doc for exactly which entry points).
+    /// See `Node::bind`/`bind_control`/`bind_data` for where this is
+    /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
+    #[serde(default)]
+    pub encryption_key_path: Option<String>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -4975,6 +4988,18 @@ pub struct Node {
     test_ctx: ClientCtx,
 }
 
+/// Load `RoleAddrs::encryption_key_path` (ADR 0069, S-03 PR 1) into a real
+/// `EncryptionKey`, or `None` if the node's own config carries no key path
+/// at all — the shared load step `Node::bind`/`bind_control`/`bind_data`
+/// each call once before binding their internal `ProdEnv`.
+fn load_encryption_key(
+    path: &Option<String>,
+) -> std::io::Result<Option<animus_env::EncryptionKey>> {
+    path.as_deref()
+        .map(|p| animus_env::EncryptionKey::load_from_file(std::path::Path::new(p)))
+        .transpose()
+}
+
 impl Node {
     /// Bind this node's listeners (the one internal env + the client TCP
     /// server + the DynamoDB HTTP endpoint) and create its data
@@ -4999,9 +5024,15 @@ impl Node {
         // byte-for-byte today's plain-TCP behavior on every port.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key,
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -5052,9 +5083,15 @@ impl Node {
         // own listeners below.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key,
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let admin_listener = TcpListener::bind(addrs.admin).await?;
@@ -5098,9 +5135,15 @@ impl Node {
         // own listeners below.
         let tls_config = addrs.tls.as_ref().map(config::TlsSection::to_tls_config);
         let tls = tls_config.clone().map(|c| c.load()).transpose()?;
-        let (env, internal_addr) =
-            ProdEnv::bind_with_tls(id.clone(), addrs.internal, dir.join("internal"), tls_config)
-                .await?;
+        let encryption_key = load_encryption_key(&addrs.encryption_key_path)?;
+        let (env, internal_addr) = ProdEnv::bind_with_tls_and_key(
+            id.clone(),
+            addrs.internal,
+            dir.join("internal"),
+            tls_config,
+            encryption_key,
+        )
+        .await?;
         let client_listener = TcpListener::bind(addrs.client).await?;
         let client_addr = client_listener.local_addr()?;
         let dynamo_listener = TcpListener::bind(addrs.dynamo).await?;
@@ -11939,6 +11982,27 @@ pub async fn bind_cluster_with_advertise_host(
     dir: impl Into<PathBuf>,
     advertise_host: Option<String>,
 ) -> std::io::Result<Vec<BoundNode>> {
+    bind_cluster_with_advertise_host_and_key(n, ip, dir, advertise_host, None).await
+}
+
+/// Like [`bind_cluster_with_advertise_host`], but with `--encryption-key
+/// PATH` (ADR 0069, S-03 PR 1) explicit: the same key-file path is applied
+/// to every generated node's own [`RoleAddrs::encryption_key_path`] — each
+/// still writes to its own distinct data directory (`dir.join("node-{i}")`),
+/// so one shared key simply means every node's own disk is sealed under it.
+/// `None` (the default) is byte-for-byte pre-ADR-0069 plaintext behavior.
+///
+/// # Errors
+/// Propagates any bind / directory-creation failure, including a loud
+/// refusal (`Node::bind` → `ProdEnv::bind_with_tls_and_key`) if a node's
+/// existing data directory is incompatible with the given key.
+pub async fn bind_cluster_with_advertise_host_and_key(
+    n: usize,
+    ip: std::net::IpAddr,
+    dir: impl Into<PathBuf>,
+    advertise_host: Option<String>,
+    encryption_key_path: Option<String>,
+) -> std::io::Result<Vec<BoundNode>> {
     let dir = dir.into();
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
@@ -11954,6 +12018,7 @@ pub async fn bind_cluster_with_advertise_host(
             console: addr(),
             advertise_host: advertise_host.clone(),
             tls: None,
+            encryption_key_path: encryption_key_path.clone(),
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -12527,6 +12592,7 @@ pub async fn start_split_cluster_with_growth(
             console: ephemeral(),
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -12545,6 +12611,7 @@ pub async fn start_split_cluster_with_growth(
             console: ephemeral(),
             advertise_host: None,
             tls: None,
+            encryption_key_path: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -14447,6 +14514,7 @@ mod confirm_futility_tests {
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -14683,6 +14751,7 @@ mod forward_transport_failure_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -14957,6 +15026,7 @@ mod forward_hop_timeout_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -15654,6 +15724,7 @@ mod client_cancellation_tests {
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         ClusterConfig {
@@ -15983,6 +16054,7 @@ mod halted_shutdown_tests {
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -17027,6 +17099,7 @@ mod issue_298_conflict_tests {
                 intra: addrs[4],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

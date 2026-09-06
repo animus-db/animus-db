@@ -20067,3 +20067,112 @@ find it is to read the applicability claim against the code that's
 supposed to honor it, the same "grep the code, don't trust the prose"
 discipline root `CLAUDE.md`'s own closing convention already names for a
 different kind of drift.
+
+## Composing an `Env`/`Disk` wrapper *inside* the concrete env it wraps creates a self-referential `Arc` cycle unless the wrapped-side state is deliberately kept independent (ADR 0069, encryption at rest)
+
+`ProdEnv` is `Clone`-cheap because it is one `Arc<Inner>` handle; every
+clone shares the same `Inner`. The natural way to add encryption to its
+`Disk` impl looked like: store an `EncryptedDisk<ProdEnv, ProdEnv>` (disk
++ rng both supplied by `ProdEnv` itself) as a field on `Inner`. That is a
+genuine reference cycle: `Inner` (behind `Arc`) would own an
+`EncryptedDisk` that owns a `ProdEnv` clone, which is itself another
+`Arc<Inner>` pointing at the *same* `Inner` — the strong-count never
+drops to zero, so the whole node's `Inner` (sockets, peer book, metrics,
+everything) leaks for the life of the process, invisible until a test
+loop that constructs many short-lived `ProdEnv`s (a temp-dir-per-attempt
+retry loop, a corpus, a long test suite) shows unbounded memory growth.
+
+**General form**: before storing "a wrapper over `Self`" as a field on a
+type that is itself an `Arc`-backed handle, check whether the wrapper's
+generic parameters actually need `Self` — or just a narrower capability
+`Self` happens to provide (here: real OS randomness for a per-file salt,
+not literally `ProdEnv`'s full `Disk`/`Network`/`Clock` surface). The fix
+was a minimal, purpose-scoped type (`DiskSaltRng`, a zero-sized `Rng`
+implementor drawing from the identical `OsRng` source `ProdEnv`'s own
+`Rng` impl and `PreBindRng` already use) instead of reusing `ProdEnv`
+itself — it satisfies the generic bound with no reference back to
+`Inner` at all, so no cycle is possible by construction rather than by
+discipline. The same shape generalizes: a type wrapping `Self` inside its
+own `Arc`-shared state is worth a five-second "does this actually need
+the whole handle, or just one capability off it" check before writing the
+field.
+
+## A crash-torn-tail-vs-real-corruption distinction converged independently on the same rule an existing sibling layer already uses — a signal the rule is right, not a coincidence to ignore (ADR 0069, encryption at rest)
+
+Building the AEAD frame-index scanner for encryption at rest
+(`animus-env/src/encrypted.rs`), the question was: when a frame in an
+already-marker-verified (so provably correctly-keyed) file fails to parse
+or authenticate, is that a torn tail (safe to truncate and forget) or
+real corruption of already-durable bytes (which must be a hard error, or
+silent data loss follows for every intact frame that happened to sit
+after the corrupted one)? The answer arrived at — continue scanning past
+a failure using its own still-intact length field purely to check whether
+anything *valid* follows; nothing valid after it means a genuine tear
+(truncate), something valid after it means real corruption (refuse) —
+was derived independently, before rereading `animus-storage`'s own
+hand-rolled WAL-record codec.
+
+It turned out `lsm.rs`'s own doc already states the identical rule for
+its own, unrelated CRC32-framed WAL records, in almost the same words:
+"distinguishing a legitimate crash-torn trailing record from real
+corruption is not a magnitude check on the frame — it's positional... a
+bad frame *followed* by more valid frames can only be corruption of
+previously-durable data (a crash cannot reach past the tear point)."
+Two independently-designed framing layers, at different levels of the
+stack, converged on the same rule because the rule follows directly from
+what a crash physically *can* and *cannot* do to a file (only ever tear
+the true end; never leave valid bytes downstream of where it stopped) —
+not from either format's own specifics. **General form**: when a new
+framed/chunked on-disk format needs a torn-tail recovery rule, check
+whether a sibling format in the same codebase already solved the
+identical positional question — a match is strong validation the
+answer is right, not merely convenient; a mismatch is worth understanding
+before shipping either design as the codebase's convention.
+
+## A long single-session build/test loop needs proactive disk-space discipline, not just cleanup-on-failure (this session, ADR 0069)
+
+Iterating on this crate's own encryption-at-rest work — dozens of
+`cargo build`/`cargo test` invocations across several crates, each
+producing its own debug-symbol-heavy artifacts — silently exhausted the
+sandbox's root filesystem mid-build (`rustc-LLVM ERROR: IO failure on
+output stream: No space left on device`), and the failure mode compounded:
+once the disk is fully out of space, even the *tool harness's own*
+temp-output capture for a trivial `df -h` command fails
+(`ENOSPC` writing to the session's own scratch directory), so diagnosing
+the problem requires commands that themselves avoid writing meaningful
+output until enough space is freed to unblock everything else. Deleting
+`.rmeta`/`.d` files freed a little; the real fix was sweeping
+`target/debug/deps` for **stale duplicate build artifacts** — cargo keeps
+every previous build's hash-suffixed `.rlib`/binary alongside the current
+one rather than replacing it in place, so a long session's repeated
+`cargo build -p <crate>` invocations across many crates accumulate dozens
+of superseded copies of the same dependency, several hundred MB to
+several GB total. A script keeping only the newest file per
+`(basename-without-hash, extension)` group freed over 11 GB in one pass.
+
+**General form**: in any session doing many incremental `cargo
+build`/`test` invocations, check `df -h` periodically (not just after a
+build fails with ENOSPC) and proactively prune `target/debug/deps` to the
+newest artifact per basename group well before the filesystem is full —
+recovering from a *fully* exhausted disk is materially harder than
+staying ahead of it, since the tools needed to diagnose and fix the
+problem may themselves need scratch space to run.
+
+**Addendum — a `df`-reported "Size" is not the real ceiling, and a
+crate with many integration-test files needs a batched run, not a
+one-shot `cargo test -p`.** Two more turns of the same problem, same
+session: (1) `df -h /`'s Size column (252G here) can be the raw device
+size while `resv_strict` reserved-block accounting caps what this uid can
+actually write to a small fraction of it (Avail, ~11G) — trust
+`Avail`/`stat -f`'s `Available` block count, never `Size`, when judging
+headroom. (2) `cargo test -p <crate>` **links every integration-test
+binary in `tests/*.rs` before running any of them** — a crate with 115
+separate test files (`animusd`, each linking the full dependency graph,
+~100MB apiece here) transiently needs over 11GB simultaneously just for
+that one crate's test binaries, on top of whatever `target/debug/deps`
+already holds. The fix that stayed inside an ~11-22GB headroom the whole
+time: loop `cargo test -p <crate> --test <name>` one file at a time,
+`rm`-ing that test's own binary and re-running the duplicate-artifact
+prune after each one, so at most one extra test binary exists at a time
+instead of all of them at once. The same shape generalizes to any crate
+whose `tests/` directory has grown past a couple dozen files.

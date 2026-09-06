@@ -72,22 +72,48 @@ the still-true paragraph after the table.
 
 ### S-03 Encryption at rest
 
-- **Gap:** not mentioned anywhere in the docs.
-- **Plan:** decide `Disk`-seam byte-level AES-GCM in `ProdEnv`
-  (`animus-env/src/lib.rs:435`) versus LSM block-level in
-  `animus-storage`; per-node key file (same pattern as `--dynamo-auth
-  PATH`); `SegmentStore`/`FsSegmentStore` (`lib.rs:581`) get the same
-  treatment for backup, PITR, and stream objects.
-- **Tests:** `assert_segment_store_contract` (`animus-env/src/test_support.rs`)
-  encrypted round-trip; LSM crash corpus under `SimEnv` faults (a torn
-  write must never partially decrypt).
-- **ADR:** **yes** — new number; seam choice and key management.
-- **PRs:** (1) key loading + `Disk` wrapper for WAL/engine; (2)
-  `SegmentStore`; (3) operator key secret mount. **Size:** XL (interacts
-  with the `Disk` seam's fsync/durability contract).
-- **Depends:** was sequenced after S-02 specifically to avoid three crypto
-  ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
-  landed 2026-09-05, so this item is unblocked.
+- **Status: PR 1 of 3 landed** ([ADR 0069](adr/0069-encryption-at-rest.md),
+  2026-09-06) — key loading + a generic AEAD `Disk`-seam wrapper
+  (`EncryptedDisk<D: Disk, R: Rng>`/`EncryptedEnv<E: Env>`,
+  `crates/animus-env/src/encrypted.rs`), a per-node `--encryption-key
+  PATH`/`RoleAddrs::encryption_key_path` key file (the `--dynamo-auth`/
+  `--tls-cert` pattern), and a marker-file loud refusal on a key/directory
+  mismatch. `ProdEnv` composes the same primitives internally rather than
+  becoming `EncryptedEnv<ProdEnv>` — see the ADR's "Crate placement"
+  section for why. Reaches `--config FILE --node I` and `--cluster N`;
+  `--cluster-control`/`--cluster-data`, `animusd control`, `animusd data`,
+  and `animusd join` do not yet accept the flag (a documented reach gap,
+  the same shape several other per-node flags already have on those entry
+  points).
+- **Still pending:**
+  - **PR 2 — `SegmentStore`**: `FsSegmentStore`/the local `dir:`/`fs:`
+    opt-in store still write plaintext objects — backup manifests/data
+    chunks, PITR segments, and DynamoDB Streams shard objects on a local
+    disk are unencrypted even with `--encryption-key` set. The `Disk`-seam
+    wrapper's frame codec should be directly reusable (a `SegmentStore`
+    object is write-once/immutable, simpler than `Disk`'s incremental-
+    append contract), but the wiring itself — `FsSegmentStore`'s own
+    `put`/`get`/`delete`/`list` methods, and threading the key through
+    `--backup-store`/`--segment-store fs:PATH` — is unbuilt.
+  - **PR 3 — operator key-secret mount**: `crates/animus-operator` has no
+    `spec.encryptionKey`-shaped CRD field or Kubernetes `Secret` mount for
+    this key at all yet — every operator-deployed cluster runs unencrypted
+    regardless of what a hand-run `animusd` process could do with the flag.
+    `RoleAddrs::encryption_key_path` is the config-field hook this PR
+    would populate, the same way ADR 0064's `spec.tls` populates
+    `RoleAddrs::tls`.
+- **Tests (PR 1):** `crates/animus-sim/tests/encrypted_disk.rs` (14 direct
+  unit tests over `SimEnv`); `crates/animus-storage/tests/
+  lsm_crash_encrypted.rs` (the crash/fault corpus sibling of
+  `lsm_crash.rs`, depth knob `ANIMUS_LSM_ENCRYPTED_SEEDS`); `crates/
+  animusd/tests/encryption_at_rest_e2e.rs` (real `ProdEnv`/disk/DynamoDB
+  wire); `crates/animus-env/src/prod.rs`'s own real-filesystem unit tests.
+- **ADR:** [0069](adr/0069-encryption-at-rest.md) — seam choice, key
+  management, threat model, and the positional torn-tail-vs-corruption
+  rule.
+- **PRs:** (1) key loading + `Disk` wrapper for WAL/engine — **landed**;
+  (2) `SegmentStore`; (3) operator key secret mount. **Size:** XL
+  (interacts with the `Disk` seam's fsync/durability contract).
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
@@ -218,7 +244,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
+| 6 | *S-03 PR 1 landed 2026-09-06* (ADR 0069); S-03 PR 2/3, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

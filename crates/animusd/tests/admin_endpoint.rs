@@ -42,6 +42,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -98,6 +99,7 @@ async fn bring_up_with_streams_quiesce(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -165,6 +167,7 @@ async fn bring_up_with_fs_backup_store(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -236,6 +239,7 @@ async fn bring_up_with_fast_ttl(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -304,6 +308,7 @@ async fn bring_up_with_streams(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -373,6 +378,7 @@ async fn bring_up_with_fs_segment_store(
                 console: addrs[6 * i + 5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -1887,6 +1893,7 @@ async fn bring_up_with_auth(
                 console: addrs[5],
                 advertise_host: None,
                 tls: None,
+                encryption_key_path: None,
             }],
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),

@@ -63,6 +63,7 @@ fn named_role_addrs(name: &str, i: usize, addrs: &[SocketAddr]) -> RoleAddrs {
         console: addrs[6 * i + 5],
         advertise_host: None,
         tls: None,
+        encryption_key_path: None,
     }
 }
 

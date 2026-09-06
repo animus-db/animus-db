@@ -42,6 +42,18 @@ pub mod tls;
 #[cfg(feature = "prod")]
 pub use tls::{MaybeTlsStream, TlsConfig, TlsMaterial};
 
+/// Encryption at rest (ADR 0069): the `EncryptedDisk`/`EncryptedEnv` AEAD
+/// wrapper over the `Disk` seam, the per-node `EncryptionKey`, and the
+/// `verify_or_init_marker` loud-refusal check. Unconditional (no `prod`
+/// feature needed) — generic over any `D: Disk`/`E: Env`, so `SimEnv`'s
+/// crash/fault corpora can drive it deterministically; `ProdEnv` composes
+/// the same machinery internally rather than being replaced by
+/// `EncryptedEnv<ProdEnv>` (see the module doc and ADR 0069).
+pub mod encrypted;
+pub use encrypted::{
+    EncryptedDisk, EncryptedEnv, EncryptionKey, MARKER_FILE, verify_or_init_marker,
+};
+
 /// S3-backed [`SegmentStore`] (S-04 PR 2, `docs/adr/0059-backup-restore.md`'s
 /// 2026-09-06 amendment) — gated alongside `prod.rs` for the identical
 /// reason: it wraps `animus_s3::client::S3Client<T>`, generic over
