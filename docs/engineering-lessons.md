@@ -18988,6 +18988,28 @@ destination tablet `Building` too) — not yet observed failing live, but
 the code shape is proven vulnerable to the identical race by this
 investigation and should get the identical fix.
 
+**Update (issue #657, 2026-09-06): fixed.** `finish_restore_kickoff` now
+calls the identical `await_active_metadata_for_new_tablet` wait/retry
+helper `finish_import_kickoff` was refactored to use (the two loops had
+become byte-for-byte identical, so this fix factored them into one shared
+function rather than pasting a second copy) — both kickoffs wait, bounded
+by their own per-attempt `SCHEMA_COMMIT_TIMEOUT`, for at least one `Active`
+member before computing `replicas` via the shared
+`active_replicas_for_new_tablet`, and both skip their propose (retrying
+with a fresh id) if the wait still ends empty. Since `finish_restore_kickoff`
+is shared by both `RestoreTableFromBackup` and `RestoreTableToPointInTime`,
+fixing the one function closes the gap for both wire entry points at once.
+Regression is a `Metadata`-only pin (`active_replicas_tests`'s
+`restore_kickoff_shares_the_import_kickoffs_selection`/
+`restore_kickoff_sees_no_replicas_when_every_member_is_down`), the same
+"pure selection is unit-testable, the async wait/retry shape itself is
+real-thread-liveness-only and stays untested" split this entry's own fix
+already established — no new general lesson beyond what this entry already
+records, since it's the identical mechanism applied to the identical twin.
+Issue #657's second half (`backup_restore.rs`'s own missing propose-side
+patience/confirm-timeout logging, described two paragraphs below) is
+unrelated to this kickoff-guard half and remains open in its own PR.
+
 **A separate, real defect family found along the way while chasing the
 original (wrong) hypothesis, also NOT fixed here**: `backup_restore.rs`'s
 restore driver (`propose_local`, confirming a `SeedBatch` propose by

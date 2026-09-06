@@ -2620,15 +2620,16 @@ async fn provision_import_target(
 }
 
 /// The first `min(N, MAX_REPLICATION_FACTOR)` `Active` members of `meta` —
-/// [`finish_import_kickoff`]'s own replica pick, factored out to a pure
-/// function purely so the one property that matters (an empty `Metadata`,
-/// or one with no `Active` member at all, yields an **empty** `Vec`, never
-/// a panic or a garbage placeholder) is unit-testable without a real
-/// cluster. See [`finish_import_kickoff`]'s own doc for why the caller must
-/// never propose `BeginImport` with an empty result from this function —
-/// unlike [`provision_tablet`](ClientCtx::provision_tablet)'s own identical
-/// selection for `CreateTablet`, this one feeds a tablet minted `Building`,
-/// which `reconcile_placement` can never later repair.
+/// [`finish_import_kickoff`]'s and [`finish_restore_kickoff`]'s shared
+/// replica pick, factored out to a pure function purely so the one property
+/// that matters (an empty `Metadata`, or one with no `Active` member at all,
+/// yields an **empty** `Vec`, never a panic or a garbage placeholder) is
+/// unit-testable without a real cluster. See either kickoff's own doc for
+/// why its caller must never propose its `Begin*` command with an empty
+/// result from this function — unlike
+/// [`provision_tablet`](ClientCtx::provision_tablet)'s own identical
+/// selection for `CreateTablet`, both of these feed a tablet minted
+/// `Building`, which `reconcile_placement` can never later repair.
 fn active_replicas_for_new_tablet(meta: &Metadata) -> Vec<NodeId> {
     let mut replicas: Vec<NodeId> = meta
         .members
@@ -2638,6 +2639,37 @@ fn active_replicas_for_new_tablet(meta: &Metadata) -> Vec<NodeId> {
         .collect();
     replicas.truncate(crate::MAX_REPLICATION_FACTOR);
     replicas
+}
+
+/// Wait, bounded by [`SCHEMA_COMMIT_TIMEOUT`], for a fresh `Metadata` read
+/// whose [`active_replicas_for_new_tablet`] is non-empty, returning the
+/// freshest snapshot seen either way (empty, if the deadline expired first).
+/// Shared by [`finish_import_kickoff`] and [`finish_restore_kickoff`] — both
+/// mint a tablet in `Building`, a state [`reconcile_placement`] never
+/// repairs (see [`active_replicas_for_new_tablet`]'s own doc), so both must
+/// give a transient every-member-`Down` false positive (ADR 0012's failure
+/// detector under real-thread CPU contention, not a `SimEnv`-provable race)
+/// a chance to clear before minting rather than commit an unhostable
+/// `replicas: []` tablet outright. The caller still owns the "still empty
+/// after waiting → skip this propose, retry with a fresh id" decision — this
+/// helper only waits and logs, it never itself decides to give up.
+async fn await_active_metadata_for_new_tablet(ctx: &ClientCtx) -> Metadata {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        let candidate = metadata_fresh(ctx).await;
+        if !active_replicas_for_new_tablet(&candidate).is_empty() {
+            return candidate;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "no Active member observed while provisioning a new tablet's \
+                 initial replica set; proceeding, caller will retry with a \
+                 fresh id if still empty"
+            );
+            return candidate;
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
 }
 
 /// Mint the single destination tablet + propose `MetaCommand::BeginImport`
@@ -2699,23 +2731,7 @@ async fn finish_import_kickoff(
         // `ClientCtx::provision_tablet`'s own `!replicas.is_empty()` gate
         // (`schema.rs`) — never propose a destination this cluster cannot
         // yet route to.
-        let fresh = {
-            let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
-            loop {
-                let candidate = metadata_fresh(ctx).await;
-                if !active_replicas_for_new_tablet(&candidate).is_empty() {
-                    break candidate;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "import: no Active member observed while provisioning the \
-                         destination tablet; proceeding, next attempt will retry"
-                    );
-                    break candidate;
-                }
-                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-            }
-        };
+        let fresh = await_active_metadata_for_new_tablet(ctx).await;
         let tablet = fresh.next_free_tablet_id();
         let replicas = active_replicas_for_new_tablet(&fresh);
         if replicas.is_empty() {
@@ -3113,19 +3129,34 @@ async fn provision_restore_target(
 /// [`restore_table_to_point_in_time`] — the only difference between the two
 /// callers is `backup_id` (a client-named ARN vs. the chosen PITR base
 /// snapshot's own ARN) and `pitr` (`None` vs. `Some` the resolved
-/// [`animus_control::PitrRestorePlan`]). The replica set mirrors
+/// [`animus_control::PitrRestorePlan`]). The replica set follows
 /// `provision_tablet`'s own convention — the first `min(N,
-/// MAX_REPLICATION_FACTOR)` `Active` members, best-effort under-sized if the
-/// cluster is still bootstrapping (nothing here self-heals an under-sized
-/// set the way `reconcile_placement` does for an ordinary tablet's recorded
-/// RF policy, a named residual: this restore tablet gets no
-/// `SetTabletPolicy` at all, so it is never a `reconcile_placement`/
-/// `rebalance_placement` candidate — a smaller follow-up, not a correctness
-/// gap, since restore still succeeds with fewer replicas than the target
-/// RF). Returns immediately once the row commits — **asynchronous**, unlike
-/// `create_table`'s own blocking `await_table_serveable` wait: the restore
-/// driver (`crate::backup_restore`) seeds and activates the tablet in the
-/// background.
+/// MAX_REPLICATION_FACTOR)` `Active` members ([`active_replicas_for_new_tablet`]),
+/// best-effort under-sized if the cluster is still bootstrapping (nothing
+/// here self-heals an under-sized *but non-empty* set the way
+/// `reconcile_placement` does for an ordinary tablet's recorded RF policy, a
+/// named residual: this restore tablet gets no `SetTabletPolicy` at all, so
+/// it is never a `reconcile_placement`/`rebalance_placement` candidate — a
+/// smaller follow-up, not a correctness gap, since restore still succeeds
+/// with fewer replicas than the target RF). Returns immediately once the row
+/// commits — **asynchronous**, unlike `create_table`'s own blocking
+/// `await_table_serveable` wait: the restore driver (`crate::
+/// backup_restore`) seeds and activates the tablet in the background.
+///
+/// **Never proposes `BeginRestore` with an empty replica set** — the twin of
+/// [`finish_import_kickoff`]'s own identical guard (issue #657, twin of the
+/// import fix; see `docs/engineering-lessons.md`'s entry on the original
+/// `dynamo_import.rs` CI flake for the full diagnosis, which this kickoff
+/// shares byte-for-byte): `BeginRestore` mints its destination tablet
+/// `Building`, a state [`reconcile_placement`] never repairs, so an
+/// every-member-transiently-`Down` false positive (ADR 0012's failure
+/// detector under real-thread CPU contention, not a `SimEnv`-provable race)
+/// landing at this snapshot would otherwise commit a permanently-unhostable
+/// tablet exactly like the import kickoff's own. Fixed with the same shared
+/// wait/retry shape ([`await_active_metadata_for_new_tablet`]): wait,
+/// bounded by this function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`], for
+/// at least one `Active` member before minting, and skip the propose
+/// (retrying with a fresh id) if the wait still ends empty.
 async fn finish_restore_kickoff(
     ctx: &ClientCtx,
     backup_id: &str,
@@ -3138,15 +3169,19 @@ async fn finish_restore_kickoff(
         internal("restore did not commit its restore row in time (no leader reachable?)");
     for _ in 0..RESTORE_ID_ATTEMPTS {
         let restore_id = format!("restore-{:016x}", ctx.env.next_u64());
-        let fresh = metadata_fresh(ctx).await;
+        // Wait (bounded) for at least one `Active` member before minting
+        // this restore's destination tablet — see this function's own doc
+        // and `finish_import_kickoff`'s identical guard for why a
+        // `Building`-minting kickoff can never propose an empty replica set.
+        let fresh = await_active_metadata_for_new_tablet(ctx).await;
         let tablet = fresh.next_free_tablet_id();
-        let mut replicas: Vec<_> = fresh
-            .members
-            .iter()
-            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
-            .map(|(id, _)| id.clone())
-            .collect();
-        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        let replicas = active_replicas_for_new_tablet(&fresh);
+        if replicas.is_empty() {
+            // Still nothing `Active` after waiting out the deadline above —
+            // mint a fresh id and retry rather than commit a tablet no node
+            // will ever host.
+            continue;
+        }
         ctx.propose_schema(&MetaCommand::BeginRestore {
             restore_id: restore_id.clone(),
             backup_id: backup_id.to_owned(),
@@ -9250,12 +9285,19 @@ mod list_backups_tests {
     }
 }
 
-/// Regression for the 2026-09-06 CI flake (`docs/engineering-lessons.md`):
-/// [`active_replicas_for_new_tablet`] must never manufacture a nonempty
-/// result out of nothing, and must never include a non-`Active` member —
-/// the exact property whose absence let `finish_import_kickoff` commit a
-/// `Building` tablet with `replicas: []` when every member was transiently
-/// `Down`. Pure `Metadata::apply` — no cluster, no `ClientCtx`, no timing.
+/// Regression for the 2026-09-06 CI flake (`docs/engineering-lessons.md`)
+/// and its issue #657 restore twin: [`active_replicas_for_new_tablet`] must
+/// never manufacture a nonempty result out of nothing, and must never
+/// include a non-`Active` member — the exact property whose absence let
+/// `finish_import_kickoff` (and, before the #657 fix, `finish_restore_kickoff`)
+/// commit a `Building` tablet with `replicas: []` when every member was
+/// transiently `Down`. Both kickoffs call this identical free function for
+/// their replica pick, so every test below pins both call sites at once;
+/// `restore_kickoff_shares_the_import_kickoffs_selection` additionally pins
+/// that fact itself — a future edit reintroducing a bespoke selection at
+/// either kickoff's own call site rather than reusing this function would
+/// not by itself fail the tests above, only this one. Pure `Metadata::apply`
+/// — no cluster, no `ClientCtx`, no timing.
 #[cfg(test)]
 mod active_replicas_tests {
     use animus_control::{MetaCommand, NodeStatus};
@@ -9310,6 +9352,55 @@ mod active_replicas_tests {
         assert_eq!(
             active_replicas_for_new_tablet(&meta).len(),
             crate::MAX_REPLICATION_FACTOR
+        );
+    }
+
+    /// Issue #657 (the restore twin of the import fix): `finish_restore_kickoff`
+    /// (`BeginRestore`) must derive its initial replica set the identical way
+    /// `finish_import_kickoff` (`BeginImport`) does — both call this same
+    /// [`active_replicas_for_new_tablet`] function rather than each keeping
+    /// its own selection, which is what let the two drift out of sync with
+    /// the import kickoff's own guard in the first place (the restore
+    /// kickoff used to inline a byte-for-byte copy of the pre-fix, unguarded
+    /// selection). Pinned against a mixed-status fixture exercising every
+    /// property that matters for a restore's own kickoff: a `Down` member is
+    /// excluded, an `Active` one is kept in encounter order, and a
+    /// `Joining` one (a status a restore's target cluster can plausibly be
+    /// mid-growth under, unlike the plain up/down mix the tests above use)
+    /// is excluded too.
+    #[test]
+    fn restore_kickoff_shares_the_import_kickoffs_selection() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(3), NodeStatus::Joining);
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta),
+            vec![crate::config::node_id(1), crate::config::node_id(2)],
+            "finish_restore_kickoff's BeginRestore and finish_import_kickoff's \
+             BeginImport must pick the identical Active-only, RF-truncated \
+             replica set from the identical Metadata snapshot"
+        );
+    }
+
+    /// Issue #657's own failure mode, restated for the restore kickoff
+    /// specifically (the import twin is `every_member_down_yields_no_replicas`
+    /// above): every member transiently `Down` — the exact real-thread
+    /// failure-detector false positive `docs/engineering-lessons.md`'s CI
+    /// flake entry diagnoses — must still read as "not ready" for a
+    /// `BeginRestore` kickoff, never as a valid empty set it would have
+    /// minted a permanently-unhostable `Building` tablet from before this
+    /// fix.
+    #[test]
+    fn restore_kickoff_sees_no_replicas_when_every_member_is_down() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Down);
+        assert!(
+            active_replicas_for_new_tablet(&meta).is_empty(),
+            "every member Down must never be read as a mintable (empty) \
+             BeginRestore replica set"
         );
     }
 }

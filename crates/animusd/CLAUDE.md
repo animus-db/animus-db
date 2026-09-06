@@ -4545,10 +4545,26 @@ ADR itself for the full design/rationale.
   test binary run under contention from three sibling `animusd`
   integration-test binaries (50-150 iterations, ~5-9% failure rate before
   the fix, 0/250+ after); see `docs/engineering-lessons.md` for the full
-  diagnosis. **`dynamo::finish_restore_kickoff`
-  (`RestoreTableFromBackup`'s kickoff) has the byte-for-byte identical gap
-  and the identical `Building`-state freeze — not yet observed failing in
-  CI, not fixed here (own PR).**
+  diagnosis. **`dynamo::finish_restore_kickoff` (issue #657, the kickoff
+  half): fixed with the identical guard.** The twin gap this entry
+  originally flagged as not-yet-fixed is closed — `finish_restore_kickoff`
+  (shared by both `RestoreTableFromBackup`'s and `RestoreTableToPointInTime`'s
+  own wire handlers, since both route through it) now calls the same shared
+  `await_active_metadata_for_new_tablet` wait/retry helper `finish_import_kickoff`
+  was factored to use, so both `Building`-minting kickoffs wait (bounded by
+  their own per-attempt `SCHEMA_COMMIT_TIMEOUT`) for at least one `Active`
+  member before computing `replicas` via the same `active_replicas_for_new_tablet`,
+  and both skip their propose (retrying with a fresh id) if the wait still
+  ends empty. Regression: `active_replicas_tests` gained a restore-specific
+  pin (`restore_kickoff_shares_the_import_kickoffs_selection`,
+  `restore_kickoff_sees_no_replicas_when_every_member_is_down`) — the async
+  wait/retry shape itself stays untested the same way `finish_import_kickoff`'s
+  own is, for the identical reason (real-thread liveness only, `dynamo.rs`
+  is not generic over `E: Env`, out of scope for this fix). Issue #657's
+  second half — `backup_restore.rs`'s own missing propose-side patience and
+  confirm-timeout logging, the `import.rs`-inherited issue #268 amplification
+  shape this same investigation found but did not fix — **remains open, its
+  own separate PR.**
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
