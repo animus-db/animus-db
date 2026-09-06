@@ -25,6 +25,7 @@ animus-placement = { path = "crates/animus-placement" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-item = { path = "crates/animus-item" }
 animus-dynamo = { path = "crates/animus-dynamo" }
+animus-s3 = { path = "crates/animus-s3" }
 animus-test = { path = "crates/animus-test" }
 animus-node = { path = "crates/animus-node" }
 animusd = { path = "crates/animusd" }

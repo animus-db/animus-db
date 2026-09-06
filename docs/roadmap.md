@@ -90,16 +90,23 @@ the still-true paragraph after the table.
 
 - **Gap:** `parse_segment_store`/`parse_backup_store`
   (`main.rs:575-601`) know only `dir:`, `fs:`, `cluster`.
-- **Plan:** spike whether `sigv4.rs`'s signing-key chain can be exposed as
-  a `sign_request` for a minimal PUT/GET/DELETE/LIST client (no
-  `aws-sdk-s3` in tree today); `S3SegmentStore` behind the `prod` feature;
-  `s3:` URIs on both flags; operator: document/restrict egress in
-  `desired/networkpolicy.rs:99` (currently ingress-only, egress
-  unrestricted by omission) plus credential secret.
+- **Plan:** see the amendment in
+  [`docs/adr/0059-backup-restore.md`](adr/0059-backup-restore.md#amendment-2026-09-06-s-04--s3-segmentstore-backend--design)
+  ("S-04: S3 `SegmentStore` backend — design," 2026-09-06) for the full
+  three-PR write-up: object layout, consistency assumptions, credential
+  sourcing, region/endpoint, TLS, and testing. **PR (1) — a new `animus-s3`
+  crate (pure SigV4 signer + a minimal S3 client over a `Transport` seam,
+  no `SegmentStore` impl yet, no `animus-env` dependency) — is done**;
+  `S3SegmentStore` behind the `prod` feature and `s3:` URIs on both flags
+  (PR 2) and the operator egress/credential-secret work
+  (`desired/networkpolicy.rs:99`, currently ingress-only, egress
+  unrestricted by omission) (PR 3) remain.
 - **Tests:** `assert_segment_store_contract` against minio, real-thread,
-  `prod`-gated.
-- **ADR:** amend 0059 in place (it reserves this exact follow-up).
-- **PRs:** (1) client; (2) backend + flags; (3) operator egress +
+  `prod`-gated (PR 2). PR 1's own signer/client tests are in
+  `crates/animus-s3/CLAUDE.md`.
+- **ADR:** amended 0059 in place 2026-09-06 (it reserves this exact
+  follow-up).
+- **PRs:** (1) client — done; (2) backend + flags; (3) operator egress +
   secrets. **Size:** L. **Blocks:** S-05.
 
 ### S-05 S3 export/import

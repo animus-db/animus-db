@@ -100,6 +100,7 @@ the relevant one before working in a crate:
 | `animus-item` | [crates/animus-item/CLAUDE.md](crates/animus-item/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
+| `animus-s3` | [crates/animus-s3/CLAUDE.md](crates/animus-s3/CLAUDE.md) |
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |

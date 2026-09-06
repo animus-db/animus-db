@@ -178,6 +178,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "animus-s3"
+version = "0.0.0"
+dependencies = [
+ "animus-dynamo",
+ "animus-s3",
+ "async-trait",
+ "bytes",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "animus-sim"
 version = "0.0.0"
 dependencies = [

@@ -18477,3 +18477,120 @@ converged-or-timeout discipline this codebase already applies to "did my
 own write show up yet" — a bare one-shot snapshot comparison across
 nodes is exactly as flaky as a bare one-shot snapshot of a single node's
 own eventual state, for the same underlying reason.
+
+## A pure request signer must encode from RAW input exactly once per purpose, never re-encode an already-encoded string (S-04 PR 1, `animus-s3`)
+
+Building `animus-s3`'s SigV4 signer/client, the first draft percent-encoded
+an S3 object key at the client's own call site (`format!("/{bucket}/{}",
+encode_key_path(key))`, building a wire-ready path up front) and then
+handed that already-escaped string to `sigv4::RequestToSign::uri`, which
+the canonical-request builder (`canonical_uri_s3`) percent-encodes AGAIN
+internally. A key containing a space would sign against `%2520` (the `%`
+of a real `%20` re-escaped) while the actual wire path sent `%20` —
+guaranteed signature mismatch for any key needing escaping at all,
+silently correct only for keys made entirely of unreserved characters
+(exactly the case every early hand-written test happened to use). The
+identical bug existed for the query string half (a hand-built,
+already-percent-encoded query string handed to a function whose contract
+is "raw in, canonical out"). Caught by adding one test with a key
+containing a space, `+`, and parentheses (`a_key_containing_special_
+characters_round_trips` in `crates/animus-s3/tests/client_fake.rs`) — no
+existing test exercised anything but alphanumeric keys.
+
+**The fix, and the general rule**: thread the RAW (unescaped) string all
+the way from construction (`client::S3Client`'s own methods) to the
+signer's input type, and derive each of the two representations that
+actually need percent-encoding — the wire URI/query, and the signed
+canonical form — **independently, by calling the encoding function once
+each on the same raw input**, never by feeding one encoded output into the
+other's encoder. This composes correctly by construction (the function is
+pure and deterministic, so two independent calls on the same input always
+agree) and needs no "is this string already encoded?" bookkeeping anywhere.
+The mirror-image version of the same bug shows up on a **verifier** (this
+crate's own `fake::FakeS3`, which receives an already-canonical wire
+URI/query and must reconstruct the canonical form to check a signature
+against): the fix there is `percent_decode` once, recovering a raw string,
+before handing it to the same canonicalization function real signing uses
+— never re-canonicalizing the wire bytes directly. Any code that both
+signs/builds a request AND independently reconstructs/verifies one (which
+describes every SigV4 signer-plus-verifier pair, and generalizes to any
+"canonicalize a string for one purpose, transmit a related-but-different
+representation of it for another" design) should state, in one place,
+which representation ("raw" vs. "canonical") each function's input/output
+contract expects — and grep every call site for a mismatch before trusting
+a test suite that happens to only exercise inputs where the bug is
+invisible (plain ASCII, no reserved characters).
+
+## Don't hardcode an external "known answer" test value you cannot independently verify — a wrong memorized constant is a worse oracle than no test at all (S-04 PR 1, `animus-s3`)
+
+The task brief for `animus-s3`'s SigV4 signer named a specific known-answer
+case to include: AWS's own published S3 "GetObject" SigV4 worked example
+(`GET /test.txt`, access key `AKIAIOSFODNN7EXAMPLE`), with a specific
+expected final `Signature` value. Reconstructing the exact request that
+example signs from memory alone (no network access in this sandbox, no
+vendored copy of that specific worked example anywhere in the local
+toolchain or registry cache) — several independently plausible
+byte-for-byte reconstructions (with/without a `Range` header, with/without
+`x-amz-content-sha256` in the signed-header set) — none reproduced the
+stated signature, even though the same HMAC chain independently reproduces
+every vendored `aws-sig-v4-test-suite` vector byte-for-byte (proving the
+*algorithm* is correct) and independently reproduces the worked example's
+own commonly-quoted intermediate `StringToSign` hash. The conclusion: the
+exact canonical request bytes for that specific example were misremembered
+somewhere in the reconstruction, not that the code was wrong — but there
+was no way to tell which, without an authoritative source to check against.
+
+**The decision made instead of guessing**: drop the hardcoded external
+constant rather than ship a test asserting a value that cannot be
+independently verified in the environment building it. Pinning a
+plausible-but-unverified memorized value as a "known answer" regression
+test is actively worse than not having one — a future mismatch would say
+nothing about whether the *code* regressed, only whether the *test's own
+memorized oracle* was ever right in the first place, and a lucky
+coincidental match would prove nothing either. The test that shipped
+instead checks what's actually self-verifiable without an external
+oracle: the request's own `SignedHeaders` shape, and that the signer's own
+output round-trips through the same crate's own independent verifier
+function — plus a cross-crate equivalence test against `animus_dynamo`'s
+already-shipped, independently-implemented SigV4 chain (which *is*
+verified, against the vendored AWS test suite, in that crate's own test
+suite). Both are documented in place as deliberate, with the reasoning for
+why, rather than silently substituting a weaker test with no explanation.
+
+**General form**: when a task brief hands you a specific external
+"known-good" value to test against and you cannot independently verify the
+exact input that produces it (no network access, no vendored fixture, no
+authoritative local copy) — reconstructing it from memory and asserting
+equality anyway is a coin flip dressed as a regression test. Verify what
+you can with tools you actually have (vendored fixtures, independently-
+reimplemented cross-checks, self-consistency round-trips), state plainly
+what you could not verify and why, and let the person who can reach a
+network/the authoritative source fill in the one assertion you couldn't
+make honestly.
+
+## A `#[cfg(any(test, feature = "X"))]` module is invisible to an integration test without a self dev-dependency enabling that feature
+
+`animus-s3`'s in-process fake transport (`fake.rs`) is gated
+`#[cfg(any(test, feature = "fake"))]` — the intent being "always available
+to this crate's own tests, and to anyone else's tests via an explicit
+feature." That gate alone does NOT make `fake` visible to an integration
+test under `tests/`: `#[cfg(test)]` is only active for the crate's own
+lib/bin compiled *as a test binary* (`cargo test`'s unittest target); an
+integration test in `tests/` links against the crate's plain,
+non-`cfg(test)` `rlib` — the same one a normal downstream dependent would
+get. Without the `fake` feature explicitly on, `tests/client_fake.rs` got
+`error[E0432]: unresolved import` with `note: found an item that was
+configured out`, even though `cargo test -p animus-s3` (no `--features`)
+was clearly running "this crate's own tests."
+
+**The fix**: add the crate as its own `[dev-dependencies]` entry with the
+feature turned on (`animus-s3 = { path = ".", features = ["fake"] }`) —
+Cargo's standard, documented idiom for "this optional/test-only module
+should be available to every test target of this crate without requiring
+`--features` on the command line." Cargo's newer feature resolver unifies
+a package's dev-dependency features into the build specifically when
+building dev targets (tests/benches/examples) in the same invocation, so a
+plain `cargo build -p foo` (no test targets) still doesn't pull the
+feature in — exactly the boundary this crate wants (`prod`/`fake` off by
+default for a plain library consumer, on automatically the moment any test
+target of the crate itself is built).
