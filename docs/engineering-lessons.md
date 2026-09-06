@@ -18263,3 +18263,17 @@ the language boundary. Reported as a pre-existing `animus-cli` bug, not
 fixed here — out of this slice's own scope, and it does not block the
 dashboard's own Add control, which asks the operator for the address
 directly rather than reproducing the CLI's now-broken shortcut.
+
+**Fixed 2026-09-06** (the control-add `/admin/config` field issue):
+`run_control_add`'s extraction moved into a small pure helper,
+`internal_addr_from_admin_config`, reading `cfg["addrs"]["internal"]`
+instead — unit-tested against both the current shape and the removed
+legacy `{"control": ..}`-only shape (the latter must now error, not
+silently resolve). `crates/animusd/tests/control_membership_admin.rs`
+gained a real-cluster regression pinning `/admin/config`'s actual wire
+shape against that same key path, closing the "no test in this workspace
+ever exercised that code path" gap this entry originally named. This is
+the concrete instance the general lesson above already generalizes from —
+no new lesson to add here beyond it now having a regression on both
+sides of the JSON boundary (a pure-function unit test for the extraction,
+a real-server test for the shape it extracts from).

@@ -421,12 +421,11 @@ describes, never auto-retrying with `force`. Add's body needs the new
 voter's own internal control-Raft address, not just its id (`animus admin
 control-add`'s own CLI form resolves that by fetching the new node's
 `/admin/config` first — see `crates/animusd/CLAUDE.md`'s `dashboard_node.js`
-entry for a pre-existing bug found while confirming this: that CLI helper
-reads a `cfg["control"]` field `/admin/config` hasn't served under that
-name since the ADR 0040 PR1 identity merge, so the 3-argument
-operator-supplied-id form of `control-add` currently always fails —
-reported, not fixed here, since it's a `animus-cli`-only defect this
-slice's own scope doesn't touch), so this panel asks the operator for the
+entry for a bug found while confirming this and fixed 2026-09-06: that CLI
+helper used to read a `cfg["control"]` field `/admin/config` hadn't served
+under that name since the ADR 0040 PR1 identity merge, so the 3-argument
+operator-supplied-id form of `control-add` always failed — now reads
+`addrs.internal` instead), so this panel asks the operator for the
 address directly rather than attempting a cross-origin fetch of another
 node's admin port. There is **no separate `grow` route** to wire — `animus
 admin control-grow` is a purely client-side loop of the same

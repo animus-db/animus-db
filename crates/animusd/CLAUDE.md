@@ -1355,16 +1355,20 @@ reusing the captured config is the point of the test.
   voter's own **internal control-Raft** listen address directly. `animus
   admin control-add`'s CLI form (`run_control_add`, `animus-cli`) resolves
   this by fetching the new node's own `/admin/config` first and reading its
-  `control` field — **which no longer exists under that name**: ADR 0040
-  PR1 merged the old `control`/`raftkv` address pair into one
-  `addrs.internal` field, and nothing updated this one runtime JSON lookup
-  to match, so that 3-argument (operator-supplied-id) form of `control-add`
-  has been silently broken since that merge — a real, pre-existing
-  `animus-cli` bug found while grounding this slice against the CLI as
-  instructed, reported here rather than fixed (out of this slice's own
-  scope; no test in this crate or `animus-cli` ever exercised that code
-  path, so nothing caught it). This dashboard control sidesteps the whole
-  problem rather than reproducing the CLI's broken shortcut: it asks the
+  internal address — **fixed 2026-09-06**: ADR 0040 PR1 had merged the old
+  `control`/`raftkv` address pair into one `addrs.internal` field, and the
+  CLI's own runtime JSON lookup was left reading the removed top-level
+  `control` field, so the 3-argument (operator-supplied-id) form of
+  `control-add` had been silently broken since that merge (found while
+  grounding this slice against the CLI, reported at the time rather than
+  fixed since it was out of this slice's own scope). The read now goes
+  through a small pure helper (`internal_addr_from_admin_config`,
+  `animus-cli`), unit-tested against both the current and the removed
+  legacy shape, plus a real-cluster regression pinning the wire shape
+  (`tests/control_membership_admin.rs::
+  admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through`).
+  This dashboard control still sidesteps the whole problem rather than
+  reproducing the CLI's own resolution step: it asks the
   operator for the new voter's internal address directly (two inputs, node
   id optional/blank-self-mints and address required, both persisted across
   this tab's poll cadence via `ndCtlAddNode`/`ndCtlAddAddr` — the same

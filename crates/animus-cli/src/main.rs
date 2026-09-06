@@ -717,6 +717,28 @@ async fn run_decommission(
     Ok(())
 }
 
+/// Pulls the new voter's internal control-Raft dial address out of a `GET
+/// /admin/config` response body (`animusd::admin::config_view`'s JSON
+/// shape). Since ADR 0040 PR1 merged the old top-level `control`/`raftkv`
+/// address pair into one `addrs.internal` field, that is the key path to
+/// read — **not** a top-level `control` field, which no longer exists at
+/// all (see `run_control_add`'s own doc for the incident this fixes: that
+/// stale read had silently broken the operator-supplied-id form of
+/// `control-add` since the ADR 0040 PR1 rename, with nothing exercising the
+/// path to catch it). Factored out as a pure, unit-testable function
+/// specifically so this key path can be pinned against a captured real
+/// response shape without opening a socket.
+fn internal_addr_from_admin_config(cfg: &serde_json::Value) -> Result<String, String> {
+    cfg["addrs"]["internal"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "the new node's /admin/config has no `addrs.internal` address \
+             (is it a control-role or combined-mode node?)"
+                .to_string()
+        })
+}
+
 /// `animus admin control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
 /// (ADR 0037 PR3, the **operator-supplied-id** form — see [`run_admin`]'s
 /// arity dispatch and [`run_control_add_allocated`] for the allocator-minted
@@ -726,7 +748,8 @@ async fn run_decommission(
 /// wire payload actually wants. This resolves the difference itself: a `GET
 /// /admin/config` against the new node's own admin port doubles as the
 /// "confirm it's up" liveness check the runbook wants and yields its
-/// `control` address, which then goes into the add request to the **leader**.
+/// internal address (via [`internal_addr_from_admin_config`]), which then
+/// goes into the add request to the **leader**.
 /// Finally polls the **new node's own** `/admin/control/members` until it
 /// reports itself a voter — mirroring `run_decommission`'s
 /// poll-to-convergence shape (bounded, no fixed sleep-and-hope).
@@ -745,10 +768,8 @@ async fn run_control_add(
     }
     let cfg: serde_json::Value = serde_json::from_str(&resp)
         .map_err(|e| format!("malformed /admin/config response: {e}"))?;
-    let control_addr = cfg["control"].as_str().ok_or(
-        "the new node's /admin/config has no `control` address \
-         (is it a control-role or combined-mode node?)",
-    )?;
+    let control_addr = internal_addr_from_admin_config(&cfg)?;
+    let control_addr = control_addr.as_str();
 
     let body = serde_json::json!({"node": node, "addr": control_addr}).to_string();
     let (status, resp) = http_call(
@@ -1193,6 +1214,59 @@ mod tests {
     #[test]
     fn control_transfer_needs_a_node_id() {
         assert!(admin_request("control-transfer", &args(&[])).is_err());
+    }
+
+    /// Regression for the control-add `/admin/config` field issue: the old
+    /// code read a top-level `control` field, removed by ADR 0040 PR1's
+    /// `control`/`raftkv` → `addrs.internal` merge. A response carrying
+    /// *only* the legacy shape must fail with a clear error, not silently
+    /// resolve to nothing/panic.
+    #[test]
+    fn internal_addr_from_admin_config_rejects_the_removed_legacy_shape() {
+        let legacy = serde_json::json!({"control": "127.0.0.1:9001"});
+        let err = internal_addr_from_admin_config(&legacy)
+            .expect_err("a `control`-only body must not resolve — that field is gone");
+        assert!(
+            err.contains("addrs.internal"),
+            "error should name the field it actually looked for: {err}"
+        );
+    }
+
+    /// The current real shape (`animusd::admin::config_view`, ADR 0040
+    /// PR1): `addrs.internal` is where the new voter's internal
+    /// control-Raft dial address actually lives. Captured field-for-field
+    /// from that function's own `json!({ .. })` literal (a subset — only
+    /// the fields this helper's key path touches need be present).
+    #[test]
+    fn internal_addr_from_admin_config_reads_the_current_shape() {
+        let current = serde_json::json!({
+            "role": "combined",
+            "node_id": "n0",
+            "control_ids": ["n0"],
+            "addrs": {
+                "internal": "127.0.0.1:9001",
+                "client": "127.0.0.1:9002",
+                "dynamo": "127.0.0.1:9003",
+                "admin": "127.0.0.1:9004",
+            },
+            "peers": {},
+        });
+        assert_eq!(
+            internal_addr_from_admin_config(&current).unwrap(),
+            "127.0.0.1:9001"
+        );
+    }
+
+    /// `AdminInfo::internal_addr` is modeled as `Option<SocketAddr>`
+    /// (`animusd::lib.rs`'s own doc: `None` only for a node with no internal
+    /// role at all, which "doesn't occur in practice") — so `addrs.internal`
+    /// can in principle serialize as JSON `null`, not just be absent or a
+    /// string. Must be treated the same as "no address available", never as
+    /// a literal `"null"` string.
+    #[test]
+    fn internal_addr_from_admin_config_rejects_a_null_internal_addr() {
+        let no_internal = serde_json::json!({"addrs": {"internal": null}});
+        assert!(internal_addr_from_admin_config(&no_internal).is_err());
     }
 
     #[test]
