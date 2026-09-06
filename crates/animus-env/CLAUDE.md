@@ -605,3 +605,12 @@ mirroring `animus-s3`'s own `tests/minio_real_endpoint.rs` down to the exact
 environment variables — unset, it prints a skip line and does nothing (never
 `#[ignore]`d), so this crate's own gates stay green with no MinIO/localstack
 infrastructure.
+
+**`send_stream` ordering after #666.** Each send is its own bounded task,
+so two back-to-back sends to the same destination may reach the pooled
+connection in either order. That is within the `Network` contract (it may
+delay, reorder, or drop) and Raft/snapshot chunking tolerates it; a
+measured attribution (issue #670) found no convergence regression from it.
+If a real ordering dependency ever surfaces, the fix idiom is a
+per-destination bounded queue drained by one task per destination, which
+keeps the head-of-line isolation without giving up FIFO on a connection.
