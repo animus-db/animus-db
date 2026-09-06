@@ -3493,110 +3493,137 @@ record — the reserved stream id, response-batching decision, and
 receiver-lookup-ownership decisions from PR 2 are unchanged; this
 amendment only records the default flip and its measured proof.
 
-## Shared WAL (ADR 0028's amendment, C-05 PR 2)
+## Shared WAL (ADR 0028's amendment — C-05 PR 2 shipped it off by default;
+PR 3 flips the default ON — C-05 is now complete)
 
-Data-plane-only, **off by default** (PR 3 flips the cutover — see that
-PR's own future entry once it lands). The mechanism itself
-(`animus_control::SharedWal`, the per-node coordinator; the two persist-path
-drainer branches; `host::Reconciler::enable_shared_wal`) lives in
-`animus-control`/`animus-cp-data` — see `animus-control/CLAUDE.md`'s
-`shared_wal.rs` entry and `animus-cp-data/CLAUDE.md`'s own "`SharedWal` is
-wired into this exact persist path" entry for the coordinator and the
-persist-path wiring, respectively. This crate's own contribution is the
-CLI/config-flag plumbing, threaded through the **identical** wrapper chain
-`--heartbeat-batch`/`--quiesce-after` already use, at each function's own
-trailing `shared_wal: bool` parameter placed right after that chain's
+Data-plane-only, **on by default since the PR 3 cutover** (2026-09-06, same
+day as PR 2). The mechanism itself (`animus_control::SharedWal`, the
+per-node coordinator; the two persist-path drainer branches;
+`host::Reconciler::enable_shared_wal`) lives in `animus-control`/
+`animus-cp-data` — see `animus-control/CLAUDE.md`'s `shared_wal.rs` entry
+and `animus-cp-data/CLAUDE.md`'s own "`SharedWal` is wired into this exact
+persist path" entry for the coordinator and the persist-path wiring,
+respectively, unchanged by the cutover. This crate's own contribution is
+the CLI/config-flag plumbing, threaded through the **identical** wrapper
+chain `--heartbeat-batch`/`--quiesce-after` already use, at each function's
+own trailing `shared_wal: bool` parameter placed right after that chain's
 existing trailing knobs:
 
-- **`--shared-wal`** (`main.rs`, a bare boolean flag — no value, no
-  `--no-shared-wal` opt-out yet since the default stays OFF until PR 3)
-  threads through `--config`/`--node` (`run_single` →
+- **`--shared-wal` / `--no-shared-wal`** (`main.rs`, both bare boolean
+  flags — no value) thread through `--config`/`--node` (`run_single` →
   `run_node_with_cluster_settings` →
   `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
   `BoundNode::start_with_growth`) and `--cluster N`
   (`start_cluster_with_growth_and_quiesce_after` → `start_cluster_inner`)
-  — **off by default** (every call site not explicitly passed `true`
-  resolves the flag's absence to `false`, mirroring `--heartbeat-batch`'s
-  own `Option<bool>`-resolution shape one layer up in `main.rs`, except
-  there is no config-relative default to resolve against yet — a bare
-  `Option<bool>` collapsing to `unwrap_or(false)`). `animusd data
-  --config` reaches the same knob too, via the `cluster_settings.
-  shared_wal: Option<bool>` config-file field (`config.rs`) that
-  `run_node_data_with_cluster_settings`-equivalent paths read — the
+  — **on by default** (`main::DEFAULT_SHARED_WAL = true`), the identical
+  default-ON posture `--heartbeat-batch`/`--quiesce-after` already have.
+  `--shared-wal` is a no-op restating the default (kept for
+  explicit/scripted invocations); `--no-shared-wal` is the real opt-out,
+  resolving `Option<bool>` to `Some(false)` instead of `None` defaulting to
+  `DEFAULT_SHARED_WAL`. `animusd data --config` reaches the same knob too,
+  via the `cluster_settings.shared_wal: Option<bool>` config-file field
+  (`config.rs`) that `run_node_data_with_cluster_settings` now reads — the
   identical S-06 route `--quiesce-after`/`--heartbeat-batch` already use.
-  A CLI flag and the config section setting the same field is the
-  identical "one way, not both" hard-error contract
-  `resolve_cluster_settings` already enforces for every other knob there.
-- **`BoundNode::start_with_growth`'s own `shared_wal: bool` parameter**
-  is where the flag actually does something. **Before anything else**, it
-  calls `animus_cp_data::host::check_wal_layout(&env, shared_wal)` — a
-  directory listing checked against `shared_wal`, refusing to start (a
-  named `io::Error`, propagated with `?`) if this node's data directory
-  already holds the OTHER WAL layout (see `animus-cp-data/CLAUDE.md`'s own
-  `check_wal_layout` entry and ADR 0028's corrected layout-mismatch
-  paragraph for why this has to be a loud startup failure, not a silent
-  reset: flipping the flag against an existing data dir would otherwise
-  silently discard every hosted tablet's persisted Raft state). Only once
-  that check passes does it call `SharedWal::<KvCommand, KvState>::open
-  (&env, SHARED_WAL)` **once, before the reconciler hosts anything**, then
-  `reconciler.enable_shared_wal(shared)` — every group this node ever
-  hosts (initial bring-up, a later split child, a later GC) then threads
-  that one `Arc<SharedWal<..>>` through automatically (`host::Reconciler`'s
-  own doc has the call-site list). A failure to open the shared WAL file
-  itself (distinct from the layout-mismatch refusal above) is also a hard
-  startup error (`std::io::Error::other`), not a silent fallback to the
-  per-group path — the flag means "use the shared file," and a node that
-  can't open it has nothing safe to fall back to mid-recovery.
+  **Widened onto this path by PR 3** — PR 2 left `cluster_settings.
+  shared_wal` silently ignored for a data-only node even though the
+  identical config-file field already reached `heartbeat_batch` there; a
+  real gap, not a documented scope cut, closed as part of this cutover
+  (`BoundDataNode::start_data_with_growth` gained the matching trailing
+  `shared_wal: bool` parameter and its own `check_wal_layout`/
+  `SharedWal::open`/`enable_shared_wal` call sequence, byte-identical in
+  shape to `BoundNode::start_with_growth`'s own below). A CLI flag and the
+  config section setting the same field is the identical "one way, not
+  both" hard-error contract `resolve_cluster_settings` already enforces
+  for every other knob there.
+- **`BoundNode::start_with_growth`'s (and, as of PR 3,
+  `BoundDataNode::start_data_with_growth`'s) own `shared_wal: bool`
+  parameter** is where the flag actually does something. **Before anything
+  else**, it calls `animus_cp_data::host::check_wal_layout(&env,
+  shared_wal)` — a directory listing checked against `shared_wal`, refusing
+  to start (a named `io::Error`, propagated with `?`) if this node's data
+  directory already holds the OTHER WAL layout (see `animus-cp-data/
+  CLAUDE.md`'s own `check_wal_layout` entry and ADR 0028's corrected
+  layout-mismatch paragraph for why this has to be a loud startup failure,
+  not a silent reset: flipping the flag against an existing data dir would
+  otherwise silently discard every hosted tablet's persisted Raft state).
+  **Since the default is now ON, this is the check every pre-cutover data
+  directory hits on a plain upgrade with no flag at all** — its error
+  message says so explicitly, naming `--no-shared-wal` as the fix (see
+  `check_wal_layout`'s own doc and this crate's `main.rs` module doc for
+  the exact text); the reverse direction's message symmetrically says to
+  *omit* `--no-shared-wal`, never to pass `--shared-wal` (a no-op restating
+  the now-default value). Only once the check passes does it call
+  `SharedWal::<KvCommand, KvState>::open(&env, SHARED_WAL)` **once, before
+  the reconciler hosts anything**, then `reconciler.enable_shared_wal
+  (shared)` — every group this node ever hosts (initial bring-up, a later
+  split child, a later GC) then threads that one `Arc<SharedWal<..>>`
+  through automatically (`host::Reconciler`'s own doc has the call-site
+  list). A failure to open the shared WAL file itself (distinct from the
+  layout-mismatch refusal above) is also a hard startup error
+  (`std::io::Error::other`), not a silent fallback to the per-group path —
+  the flag means "use the shared file," and a node that can't open it has
+  nothing safe to fall back to mid-recovery.
 - **Same documented gaps as `--heartbeat-batch`/`--quiesce-after`, at the
-  identical call sites, for the identical reason**: `--cluster-control`/
+  identical call sites, unaffected by the cutover**: `--cluster-control`/
   `--cluster-data` (the in-process split-cluster dev path), `join`/`data
   --seed`, and every narrower test/convenience wrapper that doesn't
-  expose every knob its own widest sibling does (the 6 narrower
-  `start_cluster_with*` wrappers, the 4 narrower `run_node_with_streams_
-  *` wrappers, `index_drain.rs`'s own in-crate bring-up helper) all
+  expose every knob its own widest sibling does (the narrower
+  `start_cluster_with*` wrappers, `start_data_with_streams`, the narrower
+  `run_node_with_streams_*` wrappers, `index_drain.rs`'s own in-crate
+  bring-up helper, `run_node_data`/`run_node_data_with_streams`) all
   hardcode `false` directly at their own call into a shared-WAL-aware
-  layer, mirroring `--heartbeat-batch`'s own hardcoded-`false` wrapper
-  list exactly (see that section's own bullet for the full enumeration
-  and reasoning — this PR extended every one of the same call sites with
-  the same trailing-parameter convention rather than introducing a
-  parallel wrapper shape). A test using one of these narrower wrappers
-  gets the shared WAL OFF regardless of what this section says — read the
-  wrapper's own doc, not this section, before assuming a test exercises
-  it. **Scoped even narrower than `--heartbeat-batch` was at its own PR 2
-  stage**: this PR wires only the two primary production entry points
-  (`--config/--node` and `--cluster N`) all the way through; a future PR
-  can widen the config-file route to `--cluster-control`/`--cluster-data`
-  and the standalone `control`/`join` subcommands the same way S-06 later
-  did for `--quiesce-after`, if ever needed — named here as a deliberate
-  scope cut, not an oversight.
+  layer, mirroring `--heartbeat-batch`'s own hardcoded-`false` wrapper list
+  exactly (see that section's own bullet for the full enumeration and
+  reasoning). A test using one of these narrower wrappers gets the shared
+  WAL OFF regardless of what this section says — read the wrapper's own
+  doc, not this section, before assuming a test exercises the new default.
 - **No `/admin/config` field yet** (the identical, deliberate scope cut
-  `--heartbeat-batch` itself still has) — a follow-up can add one the same
-  way roadmap U-06 added `quiesce_after_ms`.
+  `--heartbeat-batch` itself still has, unchanged by the cutover) — a
+  follow-up can add one the same way roadmap U-06 added `quiesce_after_ms`.
 - **`crates/animusd/tests/shared_wal_e2e.rs`** is the real-`ProdEnv`/
-  real-disk liveness-and-correctness proof this PR added — a single
-  combined-mode node hosting two tables (two distinct CP-data tablets
-  sharing the one node's `SharedWal` over a real `LsmEngine`), writes to
-  both, a genuine process restart (same data dir/addresses,
+  real-disk liveness-and-correctness proof PR 2 added, unchanged by the
+  cutover except for the layout-mismatch error text it asserts (see below)
+  — a single combined-mode node hosting two tables (two distinct CP-data
+  tablets sharing the one node's `SharedWal` over a real `LsmEngine`),
+  writes to both, a genuine process restart (same data dir/addresses,
   `run_node_with_cluster_settings` called fresh with the flag still on),
   and both tables' data — plus a fresh post-restart write — converging
   (polled, never a fixed-deadline single-shot assert — the tablet-host
   reconciler re-hosts each table's tablet asynchronously after a fresh
-  process start) back to their pre-restart values. Mirrors
-  `heartbeat_batch_liveness.rs`'s own role for that mechanism's cutover.
-  The deterministic/fault-injection side (cross-tablet ordering, crash
-  mid-round, GC, a quiet tablet surviving a noisy sibling's compaction) is
-  `animus-cp-data`'s own `sharedwal_fault_corpus.rs`
-  (`ANIMUS_SHAREDWAL_SEEDS`) — this file is deliberately the smaller,
-  real-disk complement, not a second corpus. A second test in this same
-  file, `a_restart_with_shared_wal_flipped_refuses_to_start`, is the
-  layout-mismatch loud-failure proof (ADR 0028's corrected amendment) —
-  both directions (written shared, restarted per-group; written per-group,
-  restarted shared) through the real `run_node_with_cluster_settings`
-  startup surface, asserting the returned error names `--shared-wal`, the
-  layout it found, "Refusing to start", and "persisted Raft state".
+  process start) back to their pre-restart values. The deterministic/
+  fault-injection side (cross-tablet ordering, crash mid-round, GC, a quiet
+  tablet surviving a noisy sibling's compaction) is `animus-cp-data`'s own
+  `sharedwal_fault_corpus.rs` (`ANIMUS_SHAREDWAL_SEEDS`) — this file is
+  deliberately the smaller, real-disk complement, not a second corpus. A
+  second test in this same file, `a_restart_with_shared_wal_flipped_
+  refuses_to_start`, is the layout-mismatch loud-failure proof (ADR 0028's
+  corrected amendment) — both directions (written shared, restarted
+  per-group; written per-group, restarted shared) through the real
+  `run_node_with_cluster_settings` startup surface, asserting the returned
+  error names `--shared-wal`, the layout it found, "Refusing to start", and
+  "persisted Raft state" — substrings that still hold under the new,
+  default-aware phrasing (`check_wal_layout`'s own doc has the exact
+  before/after text).
+- **`crates/animusd/tests/shared_wal_liveness.rs` (C-05 PR 3)** is the
+  real-thread `ProdEnv` liveness proof this cutover added — a multi-node
+  cluster hosting several tables (several CP-data tablets sharing each
+  node's own `SharedWal`) with the shared WAL on by default (no flag
+  passed) under continuous concurrent client writes for a fixed wall
+  interval, proving: every acked write is `ConsistentRead: true`-readable;
+  a leader kill/restart mid-load converges (converged-or-timeout poll,
+  never a fixed-deadline one-shot assert); and the shared WAL's segment GC
+  actually runs under sustained load without stalling writes. Mirrors
+  `heartbeat_batch_liveness.rs`'s own role for that mechanism's cutover
+  (root `CLAUDE.md`'s "`SimEnv` proves logic and ordering, not real-thread
+  liveness" lesson) — the `prod-liveness-animusd` CI shard now runs this
+  test alongside every other real-socket integration binary. Run 5x
+  locally to confirm no flake before landing any future change to this
+  path.
 
 See `docs/adr/0028-shared-storage-single-command-split.md`'s C-05 PR 2
-amendment for the full design record.
+amendment for the wiring design record, and its C-05 PR 3 amendment for
+the cutover itself (the default flip, the `--no-shared-wal` opt-out, the
+`animusd data --config` gap closed, and the liveness proof).
 
 ## Wire edges
 

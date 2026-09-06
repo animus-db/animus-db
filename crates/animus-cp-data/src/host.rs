@@ -1652,30 +1652,43 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
 ///
 /// A node whose data directory holds NEITHER layout yet (a genuinely fresh
 /// `--dir`) always passes — there is nothing to conflict with.
+///
+/// **Since C-05 PR 3 (the default-flip cutover), `shared_wal: true` is what
+/// every caller gets with no flag/config field at all** — the practical
+/// effect is that a pre-cutover data directory (written under the
+/// per-group layout, before this cutover shipped) now hits the first
+/// branch below on a plain upgrade with no other change, and its error
+/// message says so explicitly: pass `--no-shared-wal` to keep starting
+/// against that directory's existing layout. The reverse branch's own
+/// message symmetrically says to *omit* `--no-shared-wal` (never to pass
+/// `--shared-wal`, which is a no-op restating the now-default value, not a
+/// fix for anything).
 pub async fn check_wal_layout<E: Env>(env: &E, shared_wal: bool) -> std::io::Result<()> {
     let files = env.list().await?;
     let has_shared = files.iter().any(|f| f == SHARED_WAL);
     let has_per_group = files.iter().any(|f| is_per_group_wal_file(f));
     if shared_wal && has_per_group {
         return Err(std::io::Error::other(format!(
-            "--shared-wal is set, but this node's data directory already holds \
-             per-group WAL file(s) ({WAL}.<stream>) written under the per-group \
-             layout (--shared-wal off). Refusing to start: switching WAL \
-             layouts on an existing data directory would silently discard this \
-             node's persisted Raft state for every hosted tablet. Start against \
-             a fresh data directory, or omit --shared-wal to keep using the \
-             existing per-group layout."
+            "--shared-wal is set (the default since ADR 0028's C-05 PR 3 \
+             cutover), but this node's data directory already holds \
+             per-group WAL file(s) ({WAL}.<stream>) written under the \
+             per-group layout (--shared-wal off). Refusing to start: \
+             switching WAL layouts on an existing data directory would \
+             silently discard this node's persisted Raft state for every \
+             hosted tablet. Start against a fresh data directory, or pass \
+             --no-shared-wal to keep using the existing per-group layout."
         )));
     }
     if !shared_wal && has_shared {
         return Err(std::io::Error::other(format!(
-            "--shared-wal is not set, but this node's data directory already \
-             holds the shared WAL file ({SHARED_WAL}) written under the shared \
-             layout (--shared-wal on). Refusing to start: switching WAL \
-             layouts on an existing data directory would silently discard this \
-             node's persisted Raft state for every hosted tablet. Start against \
-             a fresh data directory, or pass --shared-wal to keep using the \
-             existing shared layout."
+            "--no-shared-wal is set, but this node's data directory already \
+             holds the shared WAL file ({SHARED_WAL}) written under the \
+             shared layout (--shared-wal on, the default since ADR 0028's \
+             C-05 PR 3 cutover). Refusing to start: switching WAL layouts \
+             on an existing data directory would silently discard this \
+             node's persisted Raft state for every hosted tablet. Start \
+             against a fresh data directory, or omit --no-shared-wal to \
+             keep using the existing shared layout."
         )));
     }
     Ok(())
@@ -1713,6 +1726,12 @@ mod wal_layout_tests {
 
     #[test]
     fn per_group_files_present_and_shared_wal_requested_is_refused() {
+        // Post-cutover (C-05 PR 3), `shared_wal: true` is the DEFAULT an
+        // operator gets with no flag at all — this is the case an existing,
+        // pre-cutover per-group data directory hits on a plain upgrade, so
+        // the message must tell the operator to pass `--no-shared-wal`
+        // (there is no longer an "omit the flag" fix, since omitting it now
+        // means the opposite of what it used to).
         let e = env(0x5741_4c01);
         block_on(async {
             e.append(&wal_file(1), b"x").await.unwrap();
@@ -1723,11 +1742,24 @@ mod wal_layout_tests {
             assert!(msg.contains("--shared-wal"));
             assert!(msg.contains("per-group WAL file"));
             assert!(msg.contains("Refusing to start"));
+            assert!(msg.contains("persisted Raft state"));
+            assert!(
+                msg.contains("--no-shared-wal"),
+                "post-cutover message must tell the operator to pass \
+                 --no-shared-wal, not to omit a flag that's now on by \
+                 default: {msg}"
+            );
         });
     }
 
     #[test]
     fn shared_wal_file_present_and_per_group_requested_is_refused() {
+        // The reverse direction: `--no-shared-wal` explicitly passed against
+        // a data directory already written under the shared layout. The fix
+        // here is to OMIT `--no-shared-wal` (shared is already the default),
+        // not to pass `--shared-wal` (that flag still exists as a no-op
+        // restating the default, but naming it as "the fix" would suggest
+        // it does something `--no-shared-wal`'s mere absence doesn't).
         let e = env(0x5741_4c02);
         block_on(async {
             e.append(SHARED_WAL, b"x").await.unwrap();
@@ -1738,6 +1770,13 @@ mod wal_layout_tests {
             assert!(msg.contains("--shared-wal"));
             assert!(msg.contains("shared WAL file"));
             assert!(msg.contains("Refusing to start"));
+            assert!(msg.contains("persisted Raft state"));
+            assert!(
+                msg.contains("omit --no-shared-wal"),
+                "post-cutover message must tell the operator to omit \
+                 --no-shared-wal (shared is already the default), not to \
+                 pass --shared-wal: {msg}"
+            );
         });
     }
 

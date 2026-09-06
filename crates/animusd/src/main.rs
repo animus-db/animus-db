@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
@@ -115,6 +115,29 @@
 //! (`--cluster-control`/`--cluster-data`, the standalone `control`/`join`
 //! subcommands), same `animusd data --config FILE` route via
 //! `cluster_settings.heartbeat_batch`.
+//!
+//! `--shared-wal`/`--no-shared-wal` (ADR 0028 — C-05 PR 2 shipped the
+//! mechanism off by default; PR 3, this cutover, flips the default ON)
+//! routes every data-plane CP group this node hosts through one per-node
+//! [`animus_control::SharedWal`] instead of each group's own private WAL
+//! file, coalescing a burst across several co-hosted groups into far fewer
+//! physical `fsync`s (`docs/design/shared-wal-fsync-benchmark.md`).
+//! **Defaults ON at `main::DEFAULT_SHARED_WAL` (`true`)** — see that
+//! constant's own doc for the evidence; `--no-shared-wal` (or
+//! `cluster_settings.shared_wal: false`) restores byte-identical
+//! per-group-file behavior. **Flipping this against an existing data
+//! directory written under the OTHER layout is a loud startup failure, not
+//! a silent reset** (`animus_cp_data::host::check_wal_layout`, ADR 0028's
+//! corrected layout-mismatch amendment) — there is no migration path
+//! between the two layouts (root `CLAUDE.md`'s no-back-compat stance), so
+//! an operator who deliberately wants the old per-group layout on a node
+//! whose data directory predates this cutover must pass `--no-shared-wal`
+//! explicitly; a node started fresh needs no flag either way. Reaches the
+//! same entry points `--heartbeat-batch` does, with the identical
+//! documented gaps at the identical call sites
+//! (`--cluster-control`/`--cluster-data`, `join`/`data --seed` hardcode
+//! `false`), plus `animusd data --config FILE`'s own
+//! `cluster_settings.shared_wal` route, widened to match by this cutover.
 //!
 //! **`cluster_settings` (S-06)**: a `ClusterConfig` file (`--config FILE`)
 //! may also carry a `cluster_settings` section — the same auto-split/
@@ -266,8 +289,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -428,14 +451,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // needs to be turned off in the field. See `animusd::config::
     // ClusterSettings::heartbeat_batch`'s own doc for the full mechanism.
     let mut heartbeat_batch: Option<bool> = None;
-    // `--shared-wal` (C-05 PR 2, ADR 0028): routes every data-plane CP group
-    // this node hosts through one per-node `SharedWal` instead of each
-    // group's own private WAL file. A bare boolean flag, no opt-out
-    // counterpart yet (unlike `--heartbeat-batch`/`--no-heartbeat-batch`) —
-    // the default stays OFF in this PR (PR 3 is the cutover that would make
-    // an opt-out meaningful); omitting the flag is byte-for-byte today's
-    // per-group-file behavior. See `animusd::config::ClusterSettings::
-    // shared_wal`'s own doc for the full mechanism.
+    // `--shared-wal` / `--no-shared-wal` (ADR 0028 — C-05 PR 2 shipped it
+    // off by default; PR 3, this cutover, flips the default ON): routes
+    // every data-plane CP group this node hosts through one per-node
+    // `SharedWal` instead of each group's own private WAL file. Both are
+    // bare boolean flags (no value). `--shared-wal` is now a no-op
+    // restating the default, kept for explicit/scripted invocations;
+    // `--no-shared-wal` is the opt-out an operator can still reach if the
+    // mechanism ever needs to be turned off in the field, or to keep an
+    // existing data directory on the per-group layout. See
+    // `animusd::config::ClusterSettings::shared_wal`'s own doc for the
+    // full mechanism.
     let mut shared_wal: Option<bool> = None;
     // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
     // §5(a), W-08 step 4): the cluster-wide default read/write
@@ -552,6 +578,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--heartbeat-batch" => heartbeat_batch = Some(true),
             "--no-heartbeat-batch" => heartbeat_batch = Some(false),
             "--shared-wal" => shared_wal = Some(true),
+            "--no-shared-wal" => shared_wal = Some(false),
             "--throttle-read-units" => {
                 throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
             }
@@ -719,7 +746,9 @@ async fn run(args: &[String]) -> Result<(), String> {
                 throttle_write_units,
                 tablet_max_read_units,
                 tablet_max_write_units,
-                cli_cluster_settings.shared_wal.unwrap_or(false),
+                cli_cluster_settings
+                    .shared_wal
+                    .unwrap_or(DEFAULT_SHARED_WAL),
             )
             .await
         }
@@ -799,6 +828,41 @@ const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
 /// unmodified with batching on by default — no destabilization was found.
 /// See ADR 0044's 2026-09-06 phase-2-cutover amendment for the full record.
 const DEFAULT_HEARTBEAT_BATCH: bool = true;
+
+/// **Default ON** when `--shared-wal`/`--no-shared-wal` is omitted and
+/// `cluster_settings.shared_wal` is absent from a config file (ADR 0028,
+/// C-05 PR 3 — the cutover) — every data-plane CP group this node hosts is
+/// routed through one per-node [`animus_control::SharedWal`] from the
+/// moment it is hosted, coalescing a burst of concurrent writes across
+/// every co-hosted group into far fewer physical `fsync`s than one per
+/// group per round. `--no-shared-wal` (or `cluster_settings.shared_wal:
+/// false`) restores byte-identical per-group-WAL-file behavior — the
+/// mechanism switch an operator can still reach in the field, or must use
+/// to keep an existing data directory that predates this cutover on its
+/// current per-group layout (`animus_cp_data::host::check_wal_layout`
+/// refuses to start otherwise — see that function's own doc and this
+/// binary's module-level `--shared-wal` paragraph). The mechanism itself
+/// is unchanged from C-05 PR 2; this only flips which behavior a caller
+/// gets with no flag at all.
+///
+/// **Why default-ON rather than staying opt-in**: `crates/animus-cp-data/
+/// benches/wal_fsync_bench.rs` (C-05 PR 1) measured the win directly on
+/// real block-device-backed I/O (~7-8x p50 / ~15-20x p99 at K=128 co-hosted
+/// groups, fsync count 128 → ~2); the mechanism and every per-tablet
+/// isolation/GC/crash-safety invariant built on top of it are exercised by
+/// a seed-reproducible `SimEnv` fault-injection corpus at depth
+/// (`crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`,
+/// `ANIMUS_SHAREDWAL_SEEDS`) — cross-tablet coalescing, a crash mid-round
+/// with no cross-tablet contamination, `forget`-driven GC, and a quiet
+/// tablet surviving a noisy sibling's real compaction — plus a real-thread
+/// `ProdEnv` liveness regression proving durability/GC/leader-kill
+/// convergence hold under sustained concurrent load across several
+/// co-hosted tables (`tests/shared_wal_liveness.rs`) and the real-disk
+/// restart-recovery proof in `tests/shared_wal_e2e.rs`. The whole `cargo
+/// test --workspace` suite passes unmodified with the shared WAL on by
+/// default — no destabilization was found. See ADR 0028's 2026-09-06 C-05
+/// PR 3 amendment for the full record.
+const DEFAULT_SHARED_WAL: bool = true;
 
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
@@ -1386,7 +1450,7 @@ fn resolve_cluster_settings(
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
     merge_field!(heartbeat_batch, "--heartbeat-batch/--no-heartbeat-batch");
-    merge_field!(shared_wal, "--shared-wal");
+    merge_field!(shared_wal, "--shared-wal/--no-shared-wal");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
@@ -1497,7 +1561,7 @@ async fn run_single(
         settings.tablet_max_read_units,
         settings.tablet_max_write_units,
         export_s3,
-        settings.shared_wal.unwrap_or(false),
+        settings.shared_wal.unwrap_or(DEFAULT_SHARED_WAL),
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -1807,6 +1871,10 @@ async fn run_data_config(
         settings.throttle_write_units,
         settings.tablet_max_read_units,
         settings.tablet_max_write_units,
+        // C-05 PR 3: widened to match `--heartbeat-batch`'s own reach here
+        // (PR 2 left `data --config` unwired — a real gap, not a
+        // documented scope cut, closed by this cutover).
+        settings.shared_wal.unwrap_or(DEFAULT_SHARED_WAL),
     )
     .await
     .map_err(|e| format!("failed to start data node {index}: {e}"))?;

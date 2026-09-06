@@ -1655,8 +1655,9 @@ demand the identical action, so no disambiguation is needed.
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.
-- **`SharedWal` is wired into this exact persist path behind `--shared-wal`
-  (C-05 PR 2, ADR 0028's amendment)** — an **additive, default-OFF**
+- **`SharedWal` is wired into this exact persist path behind
+  `--shared-wal`/`--no-shared-wal` (C-05 PR 2 wired it, PR 3 — 2026-09-06,
+  same day — cut it over to on-by-default; ADR 0028's amendments)** — an
   alternative to the per-group `raftkv.wal` file above, not a replacement
   for it: every `RaftKvNode::start_*` constructor gained a trailing
   `shared_wal: Option<Arc<animus_control::SharedWal<KvCommand, KvState>>>`
@@ -1729,11 +1730,20 @@ demand the identical action, so no disambiguation is needed.
     failure**, not a silent per-tablet Raft-state reset — see this
     section's own "What this does NOT change" bullet just below for why a
     silent reset would have been a genuine data-loss/Raft-safety hazard,
-    not a convenience. Unit-tested both directions, `host::
-    wal_layout_tests` (a `SimEnv` fixture, no `ProdEnv`/sockets needed —
-    `Env::list()` is deterministic under `SimEnv` like every other `Disk`
-    method); real-`ProdEnv` proof through the actual `animusd` startup
-    surface: `crates/animusd/tests/shared_wal_e2e.rs::
+    not a convenience. **Since C-05 PR 3's default flip (2026-09-06)**, the
+    two error messages read the way round the DEFAULT now runs: the
+    `shared_wal: true` (default) branch tells the operator to pass
+    `--no-shared-wal` (omitting the flag no longer keeps the per-group
+    layout — that behavior moved to needing the opt-out named explicitly),
+    and the `shared_wal: false` (`--no-shared-wal` passed) branch tells the
+    operator to *omit* `--no-shared-wal` rather than to pass `--shared-wal`
+    (a no-op restating the default, not a fix). Unit-tested both
+    directions, `host::wal_layout_tests` (a `SimEnv` fixture, no
+    `ProdEnv`/sockets needed — `Env::list()` is deterministic under
+    `SimEnv` like every other `Disk` method — each direction's test now
+    also asserts the exact opt-out/omit phrasing named above); real-
+    `ProdEnv` proof through the actual `animusd` startup surface:
+    `crates/animusd/tests/shared_wal_e2e.rs::
     a_restart_with_shared_wal_flipped_refuses_to_start`.
   - **What this does NOT change**: the per-group `wal_lock`, the
     `persist_round`/`ships_before_durable` accounting, `snapshot_upto`'s
@@ -1748,7 +1758,9 @@ demand the identical action, so no disambiguation is needed.
     and `docs/adr/0028-shared-storage-single-command-split.md`'s C-05 PR 2
     amendment for the full design record (round/ack semantics, recovery
     indexing, the GC bound, the flag's exact reach, and the layout-
-    mismatch loud-failure check). Fault-injection corpus:
+    mismatch loud-failure check) — its C-05 PR 3 amendment records the
+    default-flip cutover itself (unchanged mechanism, `--no-shared-wal`
+    opt-out, the real-thread liveness proof). Fault-injection corpus:
     `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
     (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing, a
     crash mid-round with no cross-tablet contamination, `forget`-driven

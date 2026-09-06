@@ -1,5 +1,6 @@
 //! C-05 PR 2 (ADR 0028) — the real-`ProdEnv` end-to-end proof that
-//! `--shared-wal`/`cluster_settings.shared_wal` actually works wired into a
+//! `--shared-wal`/`--no-shared-wal`/`cluster_settings.shared_wal` actually
+//! works wired into a
 //! genuine running node: two tables (so two distinct CP-data tablets, each
 //! its own `RaftKvNode`, share the one node's per-node `SharedWal` over a
 //! real `LsmEngine`/disk), `PutItem`/`GetItem` on both, then a REAL process

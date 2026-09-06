@@ -143,81 +143,6 @@ the still-true paragraph after the table.
   every test U-08 already added) would close it; not sized here.
 - **ADR:** amendment notes on 0061.
 
-### C-05 `SharedWal`: PR 1/2 landed, PR 3 (default cutover) pending
-
-- **Measured 2026-09-02** (`SimEnv`, exact `Disk::sync` count,
-  single-voter groups, throwaway harness not committed): a burst of one
-  write to each of K active groups on one node costs K fsyncs, one per
-  group's own WAL file, with no cross-group coalescing (K=1 → 1, K=32 →
-  32). A burst of 32 writes to one group costs 1 fsync, so
-  `persist_round.rs`'s group commit works but is scoped per group.
-- **Why the earlier delete recommendation was wrong:** ADR 0048's
-  "apply-poll term dominated" finding is about idle cost, which quiescence
-  closes. `SharedWal` targets active-load cross-group fsync count, which
-  quiescence never touches. `persist_round.rs`'s own doc names this
-  shape (a split multiplying concurrently fsyncing groups) as the root
-  of the issue #279 livelock.
-- **Plan:** wire `SharedWal` into `animus-cp-data`'s persist path
-  (`persist_wal` and the apply task's compaction rewrite) with a
-  cross-tablet ordering corpus, segment GC, and crash-mid-roll fault
-  injection. Gate the work on a `ProdEnv` wall-clock benchmark at
-  realistic tablet density first: concurrent fsyncs to different files
-  may already be cheap on some media.
-- **PR 1 landed 2026-09-06**
-  (`crates/animus-cp-data/benches/wal_fsync_bench.rs`, `cargo bench -p
-  animus-cp-data --bench wal_fsync_bench`; full method/numbers/threshold in
-  `docs/design/shared-wal-fsync-benchmark.md`, ADR 0028's matching
-  2026-09-06 amendment). **The open question above is answered NO on this
-  host's media** (a real block-device-backed `ext4` filesystem, not
-  `tmpfs`/`overlay`): concurrent fsyncs to K distinct per-group files are
-  NOT already cheap at realistic tablet density — round latency scales
-  with K (p50 ~500us at K=1 → ~10.5–11.2ms at K=128, p99 up to ~25–43ms),
-  while the same burst through the unwired `SharedWal::append` API stays
-  nearly flat (~1.4–1.6ms p50 at K=128) with the measured fsync count
-  dropping from 128 to ~2 — a ~7–8x p50 / ~15–20x p99 win at K=128, held
-  across three runs. A single-group 32-write control (also via
-  `SharedWal`, standing in for `persist_round.rs`'s own already-shipped
-  per-group group commit) confirms the gap is genuinely cross-group, not a
-  within-group coalescing gap.
-- **Recommendation (from PR 1): proceed with PR 2/3 as planned** — wire
-  `SharedWal` behind a flag with the cross-tablet ordering corpus, segment
-  GC, and crash-mid-roll fault injection (`ANIMUS_SHAREDWAL_SEEDS`) named
-  above, then cut over. Next step: **C-05 PR 2**.
-- **PR 2 landed 2026-09-06** — `SharedWal` is wired into `animus-cp-data`'s
-  persist path (`persist_wal`'s append, `apply_and_compact`'s compaction
-  rewrite, and `host::erase_tablet_files`'s GC) behind `--shared-wal`
-  (`cluster_settings.shared_wal`), additive-default-OFF, reaching
-  `--config/--node` and `--cluster N` (the same two entry points PR 1's own
-  benchmark targeted). Fault corpus:
-  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
-  (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing (measured:
-  16 concurrently-writing groups → 2 physical `SharedWal` writes, stable
-  across 8 seeds), a crash mid-round with no cross-tablet contamination,
-  `forget`-driven per-tablet GC, and a quiet tablet surviving a noisy
-  sibling's real compaction. Real-`ProdEnv`/real-disk proof:
-  `crates/animusd/tests/shared_wal_e2e.rs`. New metrics:
-  `Metric::CpSharedWalSyncs`/`CpSharedWalGcRewrites`. See ADR 0028's C-05
-  PR 2 amendment for the full design record (round/ack semantics, recovery
-  indexing, GC bound, flag shape, layout-mismatch handling) and
-  `crates/animus-control/CLAUDE.md`/`crates/animus-cp-data/CLAUDE.md`/
-  `crates/animusd/CLAUDE.md` for the mechanism/wiring/flag-plumbing detail
-  respectively. **PR 3 (the default cutover) is not yet started** — mirrors
-  what C-02 (heartbeat batching) PR 3 did for that mechanism: flip the
-  default on, add a `--no-shared-wal` opt-out, and add a real-thread
-  liveness proof under sustained load (`heartbeat_batch_liveness.rs`'s own
-  role).
-- **Files:** `crates/animus-control/src/shared_wal.rs` (PR 1, unchanged
-  shape; PR 2 made it generic and added the tagged/group-aware API),
-  `crates/animus-cp-data/src/lib.rs`/`src/host.rs` persist path (PR 2, wired),
-  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (PR 1, landed),
-  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs` (PR 2, new),
-  `crates/animusd/tests/shared_wal_e2e.rs` (PR 2, new),
-  `crates/animusd/src/{lib,main,config}.rs` (PR 2, flag plumbing).
-- **ADR:** amend 0028 on wiring (0028's 2026-09-06 amendment records PR 1's
-  own numbers/recommendation; a second 2026-09-06 amendment records PR 2's
-  as-built design). **PRs:** (1) `ProdEnv` benchmark — **done**; (2) wire
-  behind a flag + corpus — **done**; (3) cutover — not started. **Size:** L.
-
 ---
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
@@ -292,7 +217,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04, S-05, S-07b–d landed 2026-09-06; C-02 landed 2026-09-06* → C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

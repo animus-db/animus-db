@@ -237,9 +237,13 @@ per-tablet CP data plane (`animus-cp-data`).
 - **`shared_wal.rs`** — `SharedWal<C, S>` (ADR 0028): a multi-tenant WAL I/O
   coordinator that serializes concurrent tablet WAL writers into one file
   with coalesced `append`+`sync`. **Wired into `animus-cp-data`'s persist
-  path behind `--shared-wal`/`cluster_settings.shared_wal` since C-05 PR 2
-  (2026-09-06) — additive default OFF** (PR 3 is the still-pending
-  default-flip cutover). Two APIs: the original raw, untyped `append`/
+  path behind `--shared-wal`/`--no-shared-wal`/`cluster_settings.shared_wal`
+  since C-05 PR 2 (2026-09-06) — additive default OFF; C-05 PR 3
+  (2026-09-06, same day) is the cutover that flips the default ON**, the
+  identical two-step shape C-02 (heartbeat batching) used — see `crates/
+  animusd/CLAUDE.md`'s "Shared WAL" section for the flag/default/opt-out
+  detail and the real-thread liveness proof this cutover added
+  (`tests/shared_wal_liveness.rs`). Two APIs: the original raw, untyped `append`/
   `compact` pair (unchanged — still what `benches/wal_fsync_bench.rs`
   measures directly) and a **tagged, group-aware** one added by PR 2 —
   `append_tagged`/`compact_group`/`forget`/`open`/`recovered_state`,

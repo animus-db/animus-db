@@ -5995,6 +5995,10 @@ impl BoundDataNode {
             None,
             None,
             None,
+            // `--shared-wal` has the identical hardcoded-`false` gap here as
+            // `--heartbeat-batch` just above — this narrower wrapper doesn't
+            // expose every knob `start_data_with_growth` does.
+            false,
         )
         .await
     }
@@ -6027,6 +6031,13 @@ impl BoundDataNode {
     /// `--heartbeat-batch` opt-in as [`BoundNode::start_with_growth`]'s own
     /// knob of the same name — `false` (every pre-PR-2 call site) is
     /// byte-for-byte today's unbatched behavior.
+    ///
+    /// `shared_wal` (ADR 0028, C-05 PR 3): the identical `--shared-wal`
+    /// opt-in as [`BoundNode::start_with_growth`]'s own knob of the same
+    /// name, including the same [`check_wal_layout`] loud-refusal call
+    /// **before** anything else here touches disk — see that method's own
+    /// doc for the full argument (a silent flip would be a genuine
+    /// data-loss/Raft-safety hazard, not a convenience).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -6051,6 +6062,7 @@ impl BoundDataNode {
         throttle_write_units: Option<u64>,
         tablet_max_read_units: Option<u64>,
         tablet_max_write_units: Option<u64>,
+        shared_wal: bool,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -6071,6 +6083,11 @@ impl BoundDataNode {
         let my_client_addr = self.client_addr;
         let my_admin_addr = self.admin_addr;
         let my_intra_addr = self.intra_addr;
+        // C-05 PR 3 (ADR 0028): a clone kept for the `--shared-wal` opt-in
+        // below, taken BEFORE `hook_env` is moved into the reconciler's own
+        // `EngineFactory` construction further down — identical shape to
+        // `start_with_growth`'s own `shared_wal_env`.
+        let shared_wal_env = hook_env.clone();
 
         let control = ControlHandle::Remote(RemoteControlClient::new(
             control_seeds.clone(),
@@ -6195,6 +6212,15 @@ impl BoundDataNode {
             None,
         );
 
+        // ADR 0028's layout-mismatch amendment (C-05 PR 2/3): identical
+        // loud-refusal gate as `BoundNode::start_with_growth`'s own call
+        // above — a directory listing only, before touching a single
+        // WAL/engine file — refusing to start if this node's data
+        // directory already holds a WAL layout other than the one
+        // `shared_wal` selects. See `animus_cp_data::host::
+        // check_wal_layout`'s own doc for why a silent flip would be a
+        // genuine data-loss/Raft-safety hazard, not a mere convenience.
+        check_wal_layout(&shared_wal_env, shared_wal).await?;
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
         // shape to `BoundNode::start_with`'s.
         let mut reconciler = {
@@ -6248,6 +6274,18 @@ impl BoundDataNode {
         // that call site's doc.
         if heartbeat_batch {
             reconciler.enable_heartbeat_batching();
+        }
+        // C-05 PR 3 (ADR 0028): identical `--shared-wal` opt-in as
+        // `BoundNode::start_with_growth`'s own gate above — see that call
+        // site's doc for why `SharedWal::open` has to happen here (an
+        // `async` step) rather than inside `enable_shared_wal` itself.
+        if shared_wal {
+            let shared = SharedWal::<KvCommand, KvState>::open(&shared_wal_env, SHARED_WAL)
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("opening the shared WAL failed: {e}"))
+                })?;
+            reconciler.enable_shared_wal(shared);
         }
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
@@ -12631,6 +12669,8 @@ pub async fn start_split_cluster_with_growth(
                 None,
                 None,
                 None,
+                // `--shared-wal` has the identical documented gap here.
+                false,
             )
             .await?,
         );
@@ -13342,6 +13382,9 @@ pub async fn run_node_data(
         None,
         None,
         None,
+        // `--shared-wal` has the identical hardcoded-`false` gap as
+        // `heartbeat_batch` above — this wrapper doesn't expose it.
+        false,
     )
     .await
 }
@@ -13384,6 +13427,9 @@ pub async fn run_node_data_with_streams(
         None,
         None,
         None,
+        // `--shared-wal` has the identical hardcoded-`false` gap as
+        // `heartbeat_batch` above — this wrapper doesn't expose it.
+        false,
     )
     .await
 }
@@ -13419,6 +13465,18 @@ pub async fn run_node_data_with_streams(
 /// `false` (every other call site) is byte-for-byte today's unbatched
 /// behavior.
 ///
+/// `shared_wal` (ADR 0028, C-05 PR 3): `animusd data --config`'s route to
+/// the per-node [`SharedWal`], the same `cluster_settings.shared_wal`
+/// config-file field `run_node_with_cluster_settings`'s own combined-mode
+/// twin reads. **Widened onto this path by C-05 PR 3** — PR 2 wired only
+/// the two primary production entry points (`--config/--node` and
+/// `--cluster N`), leaving `cluster_settings.shared_wal` silently ignored
+/// for a data-only node even though the identical field already reached
+/// `heartbeat_batch` here; this cutover closes that gap so a split
+/// deployment's data-only nodes get the same default (and the same
+/// opt-out) as every other shape. See `main::run_data_config` for the
+/// resolution against `main::DEFAULT_SHARED_WAL`.
+///
 /// # Errors
 /// As [`run_node_data`].
 #[allow(clippy::too_many_arguments)]
@@ -13438,6 +13496,7 @@ pub async fn run_node_data_with_cluster_settings(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    shared_wal: bool,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -13535,6 +13594,7 @@ pub async fn run_node_data_with_cluster_settings(
             throttle_write_units,
             tablet_max_read_units,
             tablet_max_write_units,
+            shared_wal,
         )
         .await
 }
@@ -14116,6 +14176,10 @@ async fn finish_data_join(
             None,
             None,
             None,
+            // `--shared-wal` has the identical documented gap here as
+            // `--heartbeat-batch` just above, unaffected by the C-05 PR 3
+            // cutover — a seed/join startup takes neither flag yet.
+            false,
         )
         .await
 }

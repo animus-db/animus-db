@@ -513,3 +513,102 @@ cover (a shared-WAL-aware `raftkv_linearizable` `LeaderKill`/`FollowerKill`
 harness — a larger, separately-scoped harness change) and
 `crates/animusd/tests/shared_wal_e2e.rs` for the real-`ProdEnv`/real-disk
 complement (two tables, a genuine process restart, `--shared-wal` on).
+
+## Amendment (2026-09-06, C-05 PR 3 — cutover, as built)
+
+`--shared-wal`/`cluster_settings.shared_wal` now defaults **ON** —
+`main::DEFAULT_SHARED_WAL = true` at the same two resolution points
+`DEFAULT_HEARTBEAT_BATCH` lives at (`main.rs`'s `run_in_process_cluster`
+call and `run_single`), exactly the flip the PR 2 amendment's own "What PR
+3 flips" paragraph predicted. `--no-shared-wal` is the new opt-out (a bare
+boolean, mirroring `--heartbeat-batch`/`--no-heartbeat-batch`'s shape
+exactly); `--shared-wal` is kept as a no-op restating the default, for
+explicit/scripted invocations. **The mechanism itself (PR 2) is
+unchanged** — this PR is the default flip plus its two required proofs,
+the identical two-step shape C-02 (heartbeat batching) used.
+
+- **Layout-mismatch messages now read the way round the default runs.**
+  Both `animus_cp_data::host::check_wal_layout` error strings were
+  rewritten (not just their surrounding doc comments) since "omit the
+  flag" is no longer a valid fix once the flag defaults to `true`: the
+  `shared_wal: true` (now-default) branch — hit by any pre-cutover
+  per-group data directory on a plain upgrade with no flag passed at all —
+  now says to pass `--no-shared-wal`; the `shared_wal: false`
+  (`--no-shared-wal` passed) branch against an existing shared-layout
+  directory now says to *omit* `--no-shared-wal`, never to pass
+  `--shared-wal` (a no-op restating the value that's already the default).
+  Both directions still carry "Refusing to start" and "persisted Raft
+  state" verbatim — the substrings `host::wal_layout_tests` and
+  `crates/animusd/tests/shared_wal_e2e.rs::
+  a_restart_with_shared_wal_flipped_refuses_to_start` already asserted,
+  both of which pass unmodified; each `wal_layout_tests` case additionally
+  now asserts the exact new opt-out/omit phrasing.
+- **`animusd data --config`'s gap, closed.** PR 2 wired only the two
+  primary production entry points (`--config/--node` and `--cluster N`)
+  all the way through, leaving `cluster_settings.shared_wal` silently
+  ignored on a data-only node — a real gap, not the documented
+  `--cluster-control`/`--cluster-data`/`join`/`data --seed` scope cut PR
+  2's own amendment named (those stay hardcoded `false`, unaffected, the
+  identical gap `--heartbeat-batch` has at the same call sites). Since
+  `heartbeat_batch` already reached this path and PR 3 is the moment the
+  default flips everywhere else, leaving a split deployment's data-only
+  nodes permanently on the per-group layout with no way to opt in would
+  have been a new, worse inconsistency at the exact moment this cutover
+  ships — so `BoundDataNode::start_data_with_growth` gained the matching
+  trailing `shared_wal: bool` parameter and its own
+  `check_wal_layout`/`SharedWal::open`/`enable_shared_wal` call sequence,
+  byte-identical in shape to `BoundNode::start_with_growth`'s combined-mode
+  one; `run_node_data_with_cluster_settings` and `main.rs`'s
+  `run_data_config` now thread `settings.shared_wal.unwrap_or
+  (DEFAULT_SHARED_WAL)` through it. Every other documented gap
+  (`--cluster-control`/`--cluster-data`, `join`/`data --seed`, and every
+  narrower test/convenience wrapper) is unaffected — see `crates/animusd/
+  CLAUDE.md`'s "Shared WAL" section for the current, complete enumeration.
+- **Real-thread `ProdEnv` liveness proof under sustained load**:
+  `crates/animusd/tests/shared_wal_liveness.rs`, mirroring
+  `heartbeat_batch_liveness.rs`'s own role. A 3-node cluster hosting four
+  tablet groups (one per table) with the shared WAL on by default (no flag
+  passed) takes continuous concurrent writes across all four tables for a
+  fixed wall interval — every acked write immediately verified readable
+  over the linearizable `ConsistentRead`-equivalent path — long enough for
+  each table to cross `COMPACT_THRESHOLD` (64) and force a real
+  `SharedWal::compact_group` rewrite mid-load, not just append coalescing;
+  `GET /admin/metrics`'s `cp_shared_wal_gc_rewrites` counter (summed across
+  every node) is then polled to a nonzero value, direct proof the shared
+  WAL's segment GC actually ran under real concurrent load without
+  stalling the writer tasks' own timeouts. The busiest leader node (most
+  groups led) is then killed mid-test and every group it led re-elects
+  within a bounded budget, with reads/writes continuing via the survivors.
+  Run 5x locally with no flake.
+- **Full-gate soak**: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo build --workspace
+  --all-targets` (this time including `animusd`, closing the one residual
+  PR 2's own soak left — it had run with `--exclude animusd`), and `cargo
+  test --workspace` — the whole point of the cutover: every existing test
+  in the workspace now runs over the shared-WAL layout by default, so a
+  green `cargo test --workspace` here is itself the strongest evidence
+  that no other test anywhere silently assumed the per-group layout.
+  `ANIMUS_SHAREDWAL_SEEDS=20` against `sharedwal_fault_corpus.rs`, plus
+  `cargo deny check`, all green.
+- **The raftkv nemesis corpus gap named by PR 2's own module doc is still
+  open, deliberately** — `crates/animus-test/tests/raftkv_linearizable.rs`
+  builds its groups via the plain `RaftKvNode::start` constructor (used at
+  both its initial-bring-up and its crash-recovery-restart call sites),
+  which has no `shared_wal` parameter at all — a structurally different,
+  narrower constructor from the `start_hosted_*_with_shared_wal` family
+  `sharedwal_fault_corpus.rs` itself uses. Reaching the shared-WAL path
+  from that harness would mean threading one `Arc<SharedWal<..>>` through
+  every simulated node's own group set, reworking its `LeaderKill`/
+  `FollowerKill` nemesis handling and its crash-recovery restart path
+  (`RaftKvNode::start` → `SharedWal::open`+`recovered_state`) — the same
+  "larger, separately-scoped harness change" PR 2's own module doc already
+  declined to do, unchanged by the cutover. `sharedwal_fault_corpus.rs`'s
+  own cells (a)-(d) exercise the identical `persist_wal`/
+  `apply_and_compact`/`host::Reconciler::forget` code paths that harness's
+  groups would call if it were extended, and `shared_wal_liveness.rs`
+  above proves the real-thread, real-leader-kill case a plain `SimEnv`
+  corpus structurally cannot. This gap is not sized for a future PR here —
+  named honestly rather than silently left implicit.
+
+**C-05 is now complete** (all three PRs landed 2026-09-06: the `ProdEnv`
+benchmark, the flag-gated wiring, and this cutover).
