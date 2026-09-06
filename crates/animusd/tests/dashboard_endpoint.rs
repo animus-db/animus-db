@@ -1348,23 +1348,39 @@ async fn dashboard_u05_control_members_panel() {
         );
 
         // ---- the route it renders is live and carries every voter ---------
-        let (s, _, body) = raw(admin_addr, "GET", "/admin/control/members").await;
-        assert_eq!(s, 200, "GET /admin/control/members: {body}");
-        let members: Value = serde_json::from_str(&body).expect("control/members is JSON");
-        let voters = members["voters"]
-            .as_array()
-            .expect("voters is a populated array on a combined node");
-        assert_eq!(voters.len(), 3, "every bootstrap node is a voter: {members}");
-        let addrs = members["addrs"]
-            .as_object()
-            .expect("addrs is a populated object");
-        for n in &config.nodes {
-            assert!(
-                addrs.contains_key(n.id.to_string().as_str()),
-                "the address book carries node {}: {members}",
-                n.id
-            );
-        }
+        // Converged-or-timeout, never a one-shot assert: `await_bootstrap`
+        // returns once a control leader exists and every node sees a
+        // non-empty membership, but a node's own ADR 0030 `RegisterNode`
+        // (which is what puts it in the address book) is a separate
+        // replicated command that can still be in flight on the queried
+        // node at that instant. Observed in CI as an address book carrying
+        // n0 and n2 but not yet n1 while `voters` already had all three.
+        support::poll_until_or_stalled(
+            admin_addr,
+            "GET /admin/control/members carries every bootstrap voter and address",
+            Duration::from_millis(100),
+            || async {
+                let (s, _, body) = raw(admin_addr, "GET", "/admin/control/members").await;
+                if s != 200 {
+                    return false;
+                }
+                let members: Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let voters_ok = members["voters"]
+                    .as_array()
+                    .is_some_and(|v| v.len() == 3);
+                let addrs_ok = members["addrs"].as_object().is_some_and(|addrs| {
+                    config
+                        .nodes
+                        .iter()
+                        .all(|n| addrs.contains_key(n.id.to_string().as_str()))
+                });
+                voters_ok && addrs_ok
+            },
+        )
+        .await;
 
         for node in &nodes {
             node.shutdown_graceful().await;
