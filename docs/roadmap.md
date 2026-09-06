@@ -113,75 +113,12 @@ the still-true paragraph after the table.
 
 ## 3. Core design items still proposed
 
-### C-02 Heartbeat amortization (ADR 0044 phase 2)
-
-- **PR (1) map landed 2026-09-06**: `docs/design/heartbeat-send-sites.md`
-  — every `RaftCore::heartbeat_interval` (50ms; the per-**group** Raft
-  heartbeat, one `RaftCore` instance per hosted tablet group,
-  `animus-cp-data::lib.rs`'s own per-group `drive` loop — **not**
-  `animus-cp-data::host` as this entry used to say; `host.rs` is the ADR
-  0031 reconciler, which never sends a Raft message itself) send site,
-  plus `animus_control::node::HEARTBEAT_INTERVAL` (100ms, the unrelated,
-  already-per-node ADR 0012 liveness ping this entry's own former wording
-  conflated with the target above — confirmed **not** a C-02 target).
-  Cost model: `≈ 40 × G` outbound `AppendEntries`/sec per node leading `G`
-  groups at RF 3; `≈ 80T/3` msgs/sec per node pair for `T` total tablets in
-  a `--cluster 3` default — linear in `T` today, for a fixed node-pair
-  count. Baseline `SimEnv` measurement landed alongside it
-  (`crates/animus-cp-data/tests/heartbeat_cost.rs`): 5 co-hosted groups
-  send ≈ 5x 1 group's `Metric::CpAppendEntriesSent` traffic (234 vs. 1166,
-  seed-reproducible). See ADR 0044's own "Amendment (2026-09-06): phase 2
-  investigation (C-02 PR 1)" for the summary and the map document for the
-  full per-message-type breakdown, the per-group-vs-per-node-pair crux, the
-  candidate batcher shape, and the open questions PR (2) inherits.
-- **PR (2) batcher behind a flag landed 2026-09-06**:
-  `animus_cp_data::heartbeat_batch::HeartbeatBatcher` — a per-node batcher,
-  shared by every `RaftKvNode` a node hosts, coalescing every co-hosted
-  group's own bare heartbeat toward the same destination into one physical
-  `KvWire::HeartbeatBatch` frame per destination per
-  `RaftCore::heartbeat_interval` tick, on a reserved stream
-  (`HEARTBEAT_BATCH_STREAM = u64::MAX - 2`). **Off by default, additive**:
-  `animusd`'s `--heartbeat-batch` CLI/`cluster_settings.heartbeat_batch`
-  config flag threads through the identical wrapper chain
-  `--quiesce-after` already uses (`host::Reconciler::
-  enable_heartbeat_batching()` mirrors `enable_quiescence`'s own shape);
-  with the flag off, PR (1)'s own baseline test
-  (`heartbeat_cost.rs`) still passes unchanged, proving byte-for-byte
-  today's behavior. Responses are not batched (ship individually, as
-  today); the receiver-side demux is owned entirely inside
-  `animus-cp-data`, not `animusd`. Measured
-  (`heartbeat_batch_corpus.rs` cell (a), leader forced to one physical
-  node so leadership doesn't spread as group count grows): 1 vs. 5
-  groups gives a physical-frame ratio of 1.00 against a logical-heartbeat
-  ratio of 5.00 — frames flatten to per-node-pair while the logical
-  per-group count is unchanged, confirming PR (1)'s own cost-model
-  prediction. See ADR 0044's 2026-09-06 phase-2 amendment for the full
-  design record (reserved stream id, response-batching and
-  lookup-ownership decisions, flag reach and documented gaps) and
-  `crates/animus-cp-data/CLAUDE.md`'s/`crates/animusd/CLAUDE.md`'s own
-  entries for the mechanism/plumbing split.
-- **Plan:** ~~a per-node-pair heartbeat batcher below each `RaftCore`
-  tick~~ (landed, PR 2) → (3) cutover, flipping PR (1)'s baseline test's
-  own assertion to "flat in `G`, scales with node pairs only" (turning the
-  flag on by default, or removing it, per the maintainer's own explicit
-  decision at that point).
-- **Tests:** a `SimEnv` corpus (depth knob `ANIMUS_HEARTBEAT_SEEDS`,
-  `crates/animus-cp-data/tests/heartbeat_batch_corpus.rs`) — six cells:
-  frame-vs-logical scaling, every per-group invariant (election timers,
-  term, commit index, ReadIndex confirmation) holding under batching, a
-  genuine partition losing a whole batched frame at once (elections still
-  occur) vs. a lossy-but-connected link at a rate the unbatched path
-  already tolerates (no spurious elections), an unknown group in a
-  received frame (dropped and counted), and leader/follower kill
-  converging with batching on.
-- **ADR:** amendment on 0044 (landed with PR 1; phase-2 amendment landed
-  with PR 2). **PRs:** (1) map — done; (2) batcher behind a flag — done;
-  (3) cutover. **Size:** L.
-
 ### C-03 Log-only replicas (ADR 0044 phase 3)
 
-- Prerequisite only: needs its own ADR after C-02 ships and shows whether
-  it is still needed. Not sized.
+- C-02 (ADR 0044 phase 2, heartbeat amortization) landed 2026-09-06 —
+  investigation, batcher, and default-on cutover all shipped (see that
+  ADR's phase-2 and phase-2-cutover amendments). Whether phase 3 is still
+  needed on top of it hasn't been assessed; prerequisite only, not sized.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -305,7 +242,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04, S-05, S-07b–d landed 2026-09-06; C-02 PR (1)/(2) landed 2026-09-06* → C-02 PR (3), C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, S-07b–d landed 2026-09-06; C-02 landed 2026-09-06* → C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

@@ -685,3 +685,26 @@ doesn't spread as `G` grows — 1 group vs. 5 groups: `frames1=238`,
 (ratio 5.00, still scaling with `G`) — confirming §4's own prediction
 exactly: physical frames flatten to per-node-pair while the logical
 per-group count is unchanged.
+
+## Closing note: C-02 PR 3, the cutover (2026-09-06)
+
+The stack's own "(1) investigation; (2) batcher behind a flag; (3)
+cutover" plan is complete. PR 3 flipped `--heartbeat-batch`/
+`cluster_settings.heartbeat_batch`'s default from off to **on**
+(`animusd::main::DEFAULT_HEARTBEAT_BATCH = true`), keeping `--no-
+heartbeat-batch` as the field opt-out, and added the one proof PR 2 could
+not give by construction — real-thread `ProdEnv` liveness
+(`crates/animusd/tests/heartbeat_batch_liveness.rs`, mirroring `tests/
+cp_quiescence.rs`'s own role: `SimEnv` proves logic and ordering, not real
+OS-thread/timer scheduling). No change to the mechanism itself
+(`heartbeat_batch.rs`) — every decision this document and the ADR's phase-2
+amendment recorded stands unmodified.
+
+`heartbeat_cost.rs` (§7's baseline) now measures the DEFAULT (batching-on)
+behavior instead of the pre-batcher one — physical frames flat, logical
+count still scaling with `G`, identical numbers to §6's own cell (a)
+measurement above, since it is now the same shape proving the same claim
+as today's default rather than an opt-in capability. The flag-off proof
+this displaced moved into `heartbeat_batch_corpus.rs` as an explicit
+opt-out cell. See the ADR's 2026-09-06 phase-2-cutover amendment for the
+full record.

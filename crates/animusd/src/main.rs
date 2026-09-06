@@ -5,8 +5,8 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
 //! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
@@ -99,6 +99,22 @@
 //! change-consumer sweep interval — issue #302 fix) is rejected at parse
 //! time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
+//!
+//! `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02 PR 2
+//! shipped the mechanism off by default; PR 3, the cutover, flips the
+//! default ON) opts every data-plane CP group into the per-node
+//! [`animus_cp_data::heartbeat_batch::HeartbeatBatcher`], coalescing every
+//! co-hosted group's own bare heartbeat toward the same destination into
+//! one physical wire frame per destination per heartbeat interval instead
+//! of one frame per group. **Defaults ON at `main::DEFAULT_HEARTBEAT_BATCH`
+//! (`true`)** — see that constant's own doc for the evidence behind this
+//! default; `--no-heartbeat-batch` (or `cluster_settings.heartbeat_batch:
+//! false`) restores byte-identical pre-batcher behavior. The flag threads
+//! through the **identical** wrapper chain and reaches the **identical**
+//! set of entry points `--quiesce-after` does — same gaps
+//! (`--cluster-control`/`--cluster-data`, the standalone `control`/`join`
+//! subcommands), same `animusd data --config FILE` route via
+//! `cluster_settings.heartbeat_batch`.
 //!
 //! **`cluster_settings` (S-06)**: a `ClusterConfig` file (`--config FILE`)
 //! may also carry a `cluster_settings` section — the same auto-split/
@@ -250,8 +266,8 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -400,9 +416,16 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
-    // `--heartbeat-batch` (ADR 0044 phase 2, C-02 PR 2): opts every
-    // data-plane CP group into the per-node heartbeat batcher — a bare
-    // boolean flag (no value), off by default. See `animusd::config::
+    // `--heartbeat-batch` / `--no-heartbeat-batch` (ADR 0044 phase 2 —
+    // C-02 PR 2 shipped it off by default; PR 3, this cutover, flips the
+    // default ON): opts every data-plane CP group into the per-node
+    // heartbeat batcher. Both are bare boolean flags (no value — the
+    // batcher's own flush cadence is fixed at `RaftCore::
+    // heartbeat_interval`, so there is no companion duration to parse).
+    // `--heartbeat-batch` is now a no-op restating the default, kept for
+    // explicit/scripted invocations and back-compat; `--no-heartbeat-batch`
+    // is the opt-out an operator can still reach if the mechanism ever
+    // needs to be turned off in the field. See `animusd::config::
     // ClusterSettings::heartbeat_batch`'s own doc for the full mechanism.
     let mut heartbeat_batch: Option<bool> = None;
     // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
@@ -518,6 +541,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
             "--heartbeat-batch" => heartbeat_batch = Some(true),
+            "--no-heartbeat-batch" => heartbeat_batch = Some(false),
             "--throttle-read-units" => {
                 throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
             }
@@ -674,7 +698,9 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
-                cli_cluster_settings.heartbeat_batch.unwrap_or(false),
+                cli_cluster_settings
+                    .heartbeat_batch
+                    .unwrap_or(DEFAULT_HEARTBEAT_BATCH),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
                 advertise_host,
@@ -733,6 +759,34 @@ fn quiesce_after_duration(secs: Option<u64>) -> Duration {
 /// fix is lowering this constant or defaulting to `0` — never changing the
 /// mechanism itself, which is correct at any threshold `> 0`.
 const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
+
+/// **Default ON** when `--heartbeat-batch`/`--no-heartbeat-batch` is
+/// omitted and `cluster_settings.heartbeat_batch` is absent from a config
+/// file (ADR 0044 phase 2's cutover, C-02 PR 3) — every data-plane CP group
+/// gets the per-node [`animus_cp_data::heartbeat_batch::HeartbeatBatcher`]
+/// from the moment it is hosted, amortizing every co-hosted group's own
+/// bare heartbeat toward the same destination into one physical wire frame
+/// per destination per `RaftCore::heartbeat_interval` tick. `--no-
+/// heartbeat-batch` (or `cluster_settings.heartbeat_batch: false`) restores
+/// byte-identical pre-batcher behavior — one frame per group per tick — for
+/// an operator who needs the mechanism switch in the field; the mechanism
+/// itself is unchanged from C-02 PR 2, this only flips which behavior a
+/// caller gets with no flag at all.
+///
+/// **Why default-ON rather than staying opt-in**: the mechanism (C-02 PR 2)
+/// and every per-group invariant built on top of it are exercised by a
+/// seed-reproducible `SimEnv` fault-injection corpus at depth
+/// (`crates/animus-cp-data/tests/heartbeat_batch_corpus.rs`,
+/// `ANIMUS_HEARTBEAT_SEEDS`) — frame-vs-logical scaling, election timers/
+/// term/commit index preserved per group under batching, a genuine
+/// partition losing a whole batched frame, a lossy-but-connected link, an
+/// unknown group in a received frame, and leader/follower kill converging —
+/// plus a real-thread `ProdEnv` liveness regression proving the batched
+/// timers hold under real scheduling (`tests/heartbeat_batch_liveness.rs`).
+/// The whole `cargo test --workspace` / `prod-liveness-*` suite set passes
+/// unmodified with batching on by default — no destabilization was found.
+/// See ADR 0044's 2026-09-06 phase-2-cutover amendment for the full record.
+const DEFAULT_HEARTBEAT_BATCH: bool = true;
 
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
@@ -1319,7 +1373,7 @@ fn resolve_cluster_settings(
     merge_field!(auto_split_ops_rate, "--auto-split-ops-rate");
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
-    merge_field!(heartbeat_batch, "--heartbeat-batch");
+    merge_field!(heartbeat_batch, "--heartbeat-batch/--no-heartbeat-batch");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
@@ -1420,7 +1474,7 @@ async fn run_single(
         segment_store_config,
         stream_retention,
         quiesce_after,
-        settings.heartbeat_batch.unwrap_or(false),
+        settings.heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH),
         settings.auto_split_bytes,
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
@@ -1730,7 +1784,7 @@ async fn run_data_config(
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
         quiesce_after,
-        settings.heartbeat_batch.unwrap_or(false),
+        settings.heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH),
         stream_seal_knobs_val,
         // Same documented gap as `--backup-store` (ADR 0059 §1): no
         // `--segment-store` flag reaches `animusd data --config` yet.

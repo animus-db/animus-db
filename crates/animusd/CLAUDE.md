@@ -3413,39 +3413,53 @@ sweeper-skip regression
 (`write_after_leader_kill_of_a_quiesced_group_converges`) — the one
 property `SimEnv` structurally cannot prove.
 
-## Heartbeat batching (ADR 0044 phase 2, C-02 PR 2)
+## Heartbeat batching (ADR 0044 phase 2 — C-02 PR 2 shipped it off by
+default; PR 3, the cutover, flips the default ON — C-02 is now complete)
 
-Data-plane-only, additive-default (off), the mechanism itself
-(`animus_cp_data::heartbeat_batch::HeartbeatBatcher`,
+Data-plane-only, **on by default since the PR 3 cutover**, the mechanism
+itself (`animus_cp_data::heartbeat_batch::HeartbeatBatcher`,
 `host::Reconciler::enable_heartbeat_batching`) lives in `animus-cp-data` —
-see that crate's `CLAUDE.md`. This crate's own contribution is purely the
-CLI/config-flag plumbing, threaded through the **identical** wrapper
-chain `--quiesce-after` already uses, at each function's own new trailing
-`heartbeat_batch: bool` parameter placed right after `quiesce_after:
-Duration`:
+see that crate's `CLAUDE.md`, unchanged by the cutover. This crate's own
+contribution is purely the CLI/config-flag plumbing, threaded through the
+**identical** wrapper chain `--quiesce-after` already uses, at each
+function's own trailing `heartbeat_batch: bool` parameter placed right
+after `quiesce_after: Duration`:
 
-- **`--heartbeat-batch`** (`main.rs`, a bare boolean flag — no value, since
-  the batcher's own flush cadence is fixed at `RaftCore::
-  heartbeat_interval` with no independent tunable) threads through
-  `--config`/`--node` (`run_single` → `run_node_with_cluster_settings` →
+- **`--heartbeat-batch` / `--no-heartbeat-batch`** (`main.rs`, both bare
+  boolean flags — no value, since the batcher's own flush cadence is fixed
+  at `RaftCore::heartbeat_interval` with no independent tunable) thread
+  through `--config`/`--node` (`run_single` →
+  `run_node_with_cluster_settings` →
   `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
   `BoundNode::start_with_growth`) and `--cluster N`
   (`start_cluster_with_growth_and_quiesce_after` →
-  `start_cluster_inner`) — **off by default** (unlike `--quiesce-after`'s
-  own default-on-at-5s posture; this is a newer, less-soaked mechanism, so
-  it ships opt-in). `animusd data --config` reaches it too, via the same
-  `cluster_settings.heartbeat_batch` config-file field
-  `run_node_data_with_cluster_settings` reads, mirroring S-06's own
-  `quiesce_after_secs` route exactly (`ClusterSettings::heartbeat_batch`'s
-  own doc in `config.rs` has the field's applicability). A CLI flag and
-  the config section setting the same field is the identical "one way,
-  not both" hard-error contract `resolve_cluster_settings` already
-  enforces for every other knob there.
+  `start_cluster_inner`) — **on by default** (`main::
+  DEFAULT_HEARTBEAT_BATCH = true`), the identical default-ON posture
+  `--quiesce-after` already has (that flag's own `DEFAULT_QUIESCE_AFTER_
+  SECS`), now that C-02 PR 2's own corpus/liveness proof gives this
+  mechanism the same soak `--quiesce-after` had when ADR 0048 defaulted it
+  on. `--heartbeat-batch` is a no-op restating the default (kept for
+  explicit/scripted invocations); `--no-heartbeat-batch` is the real opt-
+  out, resolving `Option<bool>` to `Some(false)` instead of `None`
+  defaulting to `DEFAULT_HEARTBEAT_BATCH`. `animusd data --config` reaches
+  the same knob too, via the `cluster_settings.heartbeat_batch`
+  config-file field `run_node_data_with_cluster_settings` reads, mirroring
+  S-06's own `quiesce_after_secs` route exactly (`ClusterSettings::
+  heartbeat_batch`'s own doc in `config.rs` has the field's applicability
+  — `None`/absent resolves to `DEFAULT_HEARTBEAT_BATCH`, an explicit
+  `false` is the opt-out). A CLI flag and the config section setting the
+  same field is the identical "one way, not both" hard-error contract
+  `resolve_cluster_settings` already enforces for every other knob there.
 - **Same documented gaps as `--quiesce-after`, at the identical call
-  sites**: `--cluster-control`/`--cluster-data` (the in-process split-
-  cluster dev path, `run_in_process_split_cluster` — hardcodes `false` at
-  its `start_data_with_growth` call, mirroring that path's own hardcoded
-  `Duration::ZERO` for quiescence), `join`/`data --seed` (same hardcode),
+  sites, unaffected by the cutover** — these narrower wrappers hardcode
+  `false` directly rather than routing through `DEFAULT_HEARTBEAT_BATCH`,
+  the identical shape `--quiesce-after`'s own `Duration::ZERO` hardcodes at
+  these same sites (that flag's default-ON resolution lives only in
+  `quiesce_after_duration`, called at the two real deployment-path CLI
+  entry points, never at these narrower wrappers either):
+  `--cluster-control`/`--cluster-data` (the in-process split-cluster dev
+  path, `run_in_process_split_cluster` — hardcodes `false` at its
+  `start_data_with_growth` call), `join`/`data --seed` (same hardcode),
   and every narrower test/convenience wrapper that doesn't expose every
   knob its own widest sibling does (`run_node_with_streams_and_
   quiesce_after`, `run_node_with_streams_and_pitr_snapshot_cadence`,
@@ -3453,15 +3467,31 @@ Duration`:
   `start_cluster_with_quiesce_after`, `start_cluster_with_growth`, and
   their own ancestors — each hardcodes `false` at its own call into a
   batching-aware layer, with a comment pointing at the wider sibling that
-  does expose it).
+  does expose it). A test using one of these narrower wrappers gets
+  batching OFF regardless of this cutover — read the wrapper's own doc,
+  not this section, before assuming a test exercises the new default.
 - **No `/admin/config` field yet** (unlike `--quiesce-after`'s own
-  `quiesce_after_ms`) — a deliberate scope cut for this PR, named here so
-  it isn't mistaken for an oversight; a follow-up can add one the same way
-  roadmap U-06 added `quiesce_after_ms`.
+  `quiesce_after_ms`) — a deliberate scope cut, unchanged by the cutover,
+  named here so it isn't mistaken for an oversight; a follow-up can add
+  one the same way roadmap U-06 added `quiesce_after_ms`.
+- **`crates/animusd/tests/heartbeat_batch_liveness.rs` (C-02 PR 3)** is the
+  real-thread `ProdEnv` liveness proof this cutover added — a 3-node
+  cluster hosting three tablet groups with batching on by default (no flag
+  passed), proving a stable leader/term under continuous traffic for a
+  fixed wall interval, then re-election within a bounded budget after
+  killing the physical node leading the most groups (the busiest batcher
+  source), with reads/writes continuing to work throughout via the
+  survivors. Mirrors `tests/cp_quiescence.rs`'s own role for quiescence
+  (root `CLAUDE.md`'s "`SimEnv` proves logic and ordering, not real-thread
+  liveness" lesson) — the `prod-liveness-animusd` CI shard now runs this
+  test alongside every other real-socket integration binary. Run 5x
+  locally to confirm no flake before landing any future change to this
+  path.
 
-See ADR 0044's 2026-09-06 phase-2 amendment for the full design record,
-including the reserved stream id, response-batching decision, and
-receiver-lookup-ownership decisions this flag's own mechanism rests on.
+See ADR 0044's 2026-09-06 phase-2-cutover amendment for the full design
+record — the reserved stream id, response-batching decision, and
+receiver-lookup-ownership decisions from PR 2 are unchanged; this
+amendment only records the default flip and its measured proof.
 
 ## Wire edges
 

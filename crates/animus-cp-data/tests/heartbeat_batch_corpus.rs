@@ -202,6 +202,10 @@ fn scenario_cells() -> Vec<Scenario> {
             scenario_frames_scale_with_peers_not_groups
         ),
         scenario!(
+            "batching_off_frames_scale_with_groups_like_the_old_default",
+            scenario_batching_off_frames_scale_with_groups_like_the_old_default
+        ),
+        scenario!(
             "per_group_invariants_hold_under_batching",
             scenario_per_group_invariants_hold_under_batching
         ),
@@ -319,6 +323,96 @@ fn scenario_frames_scale_with_peers_not_groups(seed: u64) {
         frames1 > 0,
         "sanity: at least one physical frame must have been sent for a \
          single actively-ticking group (seed={seed})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Explicit opt-out cell (C-02 PR 3, ADR 0044 phase-2 cutover): with the
+// batcher OFF (`--no-heartbeat-batch`), the logical heartbeat count still
+// scales with the hosted-group count exactly as it did before this crate
+// had a batcher at all (C-02 PR 1's own pre-batcher baseline,
+// `heartbeat_cost.rs`, moved here now that that file's own baseline measures
+// the DEFAULT (batching-on) behavior instead) — proving the opt-out flag
+// genuinely restores the pre-cutover byte-for-byte behavior, not merely
+// "some traffic reduction." Independent `Simulator` worlds, not co-hosted
+// (see `spawn_unbatched_group`'s own doc for why). No batcher is attached
+// at all, so there is no physical-frame count to measure separately here:
+// `Metric::CpHeartbeatFramesSent` is only ever incremented by
+// `HeartbeatBatcher::register`, never by the plain unbatched send path — a
+// `--no-heartbeat-batch` node reports a flat zero on that counter forever,
+// which `docs/design/heartbeat-send-sites.md`'s own closing note documents
+// as the expected read, not a bug.
+// ---------------------------------------------------------------------------
+
+/// Stand up one independent 3-node group in its OWN `Simulator` world,
+/// recording into the caller's per-node-id `handles` — `heartbeat_cost.rs`'s
+/// (C-02 PR 1) own pre-cutover harness shape, reused verbatim here rather
+/// than `hosted_group`'s co-hosted-with-injectable-batcher shape: with no
+/// batcher at all there is nothing to co-host for (unbatched groups share
+/// no destination-frame amortization to prove either way), and
+/// `RaftKvNode::start_hosted_with_batcher(.., None)` — the co-hosted
+/// constructor — calls `env.metrics()` internally, which is `SimEnv`'s
+/// no-op handle unless a caller injects one; `start_with_metrics` is the
+/// one constructor that both forces a real recording handle AND needs no
+/// batcher, at the cost of forcing `PRIMARY_STREAM` (so it must live in its
+/// own `Simulator` world to avoid a stream collision with any sibling
+/// group on the same node ids — identical to PR 1's own reasoning).
+fn spawn_unbatched_group(seed: u64, handles: &[MetricsHandle; 3]) -> (Simulator, Vec<KvNode>) {
+    let sim = Simulator::new(seed);
+    let nodes: Vec<KvNode> = NODES
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            RaftKvNode::start_with_metrics(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                handles[i].clone(),
+            )
+        })
+        .collect();
+    (sim, nodes)
+}
+
+/// Run `count` independent groups (batcher OFF), each for `SETTLE + 5s` of
+/// its own virtual time, and return the combined `Metric::
+/// CpAppendEntriesSent` total across every group's replicas — the
+/// per-node-aggregate metric a real `--no-heartbeat-batch` node's own
+/// shared `env.metrics()` sink would show.
+fn run_unbatched_groups(count: u64, seed_base: u64) -> u64 {
+    let handles = metrics_handles();
+    let mut groups: Vec<(Simulator, Vec<KvNode>)> = Vec::new();
+    for g in 0..count {
+        let (mut sim, nodes) = spawn_unbatched_group(seed_base.wrapping_add(g), &handles);
+        sim.run_for(SETTLE);
+        groups.push((sim, nodes));
+    }
+    for (sim, _nodes) in groups.iter_mut() {
+        sim.run_for(Duration::from_secs(5));
+    }
+    handles
+        .iter()
+        .map(|h| h.get(Metric::CpAppendEntriesSent))
+        .sum()
+}
+
+fn scenario_batching_off_frames_scale_with_groups_like_the_old_default(seed: u64) {
+    let low = run_unbatched_groups(1, seed);
+    let high = run_unbatched_groups(5, seed.wrapping_add(1));
+
+    let ratio = high as f64 / low as f64;
+    assert!(
+        (4.0..=6.0).contains(&ratio),
+        "with the batcher off (`--no-heartbeat-batch`), AppendEntries \
+         traffic must still scale ~5x with 5x the hosted groups — this is \
+         the pre-cutover default behavior, and the opt-out flag must \
+         restore it byte-for-byte: low={low} high={high} ratio={ratio:.2} \
+         (seed={seed})"
+    );
+    assert!(
+        low > 0,
+        "sanity: a single active group must have sent some heartbeats \
+         (seed={seed})"
     );
 }
 

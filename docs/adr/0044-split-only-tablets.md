@@ -391,3 +391,90 @@ still fire), a lossy-but-connected link at a rate the unbatched path
 already tolerates (no spurious elections), an unknown group in a received
 frame (dropped and counted), and leader/follower kill converging with
 batching on.
+
+## Amendment (2026-09-06): phase 2 cutover — batching on by default (C-02 PR 3)
+
+Flips the flag PR 2 shipped: `--heartbeat-batch`/`cluster_settings.
+heartbeat_batch` now default **ON** (`animusd::main::DEFAULT_HEARTBEAT_
+BATCH = true`) rather than off — a node started with no flag at all now
+gets the per-node `HeartbeatBatcher` from the moment it hosts its first CP
+group. The mechanism itself, landed and measured by PR 2, is **unchanged**
+— this PR only flips which behavior a caller gets by default and keeps the
+opt-out:
+
+- **The opt-out is kept, not removed** — of the two options PR 2's own
+  closing paragraph named ("turning the flag on by default... or removing
+  it, if the maintainer decides the batcher should be the only path"), the
+  maintainer chose the former: an operator can still reach the mechanism
+  switch in the field via **`--no-heartbeat-batch`** (a bare boolean flag,
+  the mirror of `--heartbeat-batch`) or `cluster_settings.heartbeat_batch:
+  false`. `--heartbeat-batch` itself is now a no-op restating the default
+  (kept for explicit/scripted invocations and back-compat with a PR-2-era
+  invocation) rather than deleted outright.
+- **Reach and gaps are byte-for-byte identical to PR 2's own** — same
+  wrapper chain, same entry points (`--config`/`--node`, `--cluster N`,
+  `animusd data --config` via `cluster_settings.heartbeat_batch`), same
+  documented gaps (`--cluster-control`/`--cluster-data`, `join`/`data
+  --seed`, and every narrower test wrapper) where the knob hardcodes
+  `false` regardless of the new default — exactly the same shape
+  `--quiesce-after`'s own default-ON resolution has always had (that
+  flag's `DEFAULT_QUIESCE_AFTER_SECS` is applied only in
+  `quiesce_after_duration`, called at the two real deployment-path CLI
+  entry points; every narrower wrapper hardcodes `Duration::ZERO`
+  regardless). This PR did not widen reach — a follow-up closing one of
+  `--quiesce-after`'s own documented gaps should close the matching
+  `--heartbeat-batch` one in the same change, per `crates/animusd/
+  CLAUDE.md`'s own note.
+- **Why default-ON now, not at PR 2**: PR 2's own corpus
+  (`heartbeat_batch_corpus.rs`, `ANIMUS_HEARTBEAT_SEEDS`) already proved
+  every per-group invariant holds under batching — election timers, term,
+  commit index, ReadIndex confirmation, a genuine partition losing a whole
+  frame, a lossy-but-connected link, an unknown group in a frame, and
+  leader/follower kill, all converging correctly. What PR 2 could not
+  prove is real-thread liveness (`SimEnv` proves logic and ordering, not
+  real OS-thread/timer scheduling — root `CLAUDE.md`'s standing lesson).
+  This PR adds that proof: `crates/animusd/tests/
+  heartbeat_batch_liveness.rs`, a real `ProdEnv` 3-node cluster hosting
+  three tablet groups with batching on by default (no flag passed) —
+  stable leader/term under continuous traffic for a fixed wall interval,
+  then re-election within a bounded budget after killing the physical node
+  leading the most groups, with reads/writes continuing to work throughout
+  via the survivors. Run 5x locally with no flake before this cutover
+  landed. Combined with the whole existing `cargo test --workspace` /
+  `prod-liveness-*` suite set passing unmodified with batching on by
+  default, this closes the "proven correct... but inert in production"
+  gap PR 2's own closing note named.
+- **The PR 1 baseline (`heartbeat_cost.rs`) now pins the amortization as
+  default behavior, not merely an opt-in capability** — its own single
+  test used to host `G` independent, unbatched groups (no shared node env,
+  since nothing to batch existed yet) and assert `AppendEntries` traffic
+  scales with `G`; it now hosts `G` groups co-hosted on the SAME three
+  physical nodes with the batcher attached (mirroring PR 2's own corpus
+  cell (a) exactly — `RaftKvNode::start_hosted_campaigning_with_batcher`/
+  `start_hosted_with_batcher`, deterministic fixed leader) and asserts
+  `Metric::CpHeartbeatFramesSent` stays flat (`frames1=238`, `frames5=238`,
+  ratio 1.00) while `Metric::CpAppendEntriesSent` — the logical per-group
+  count — keeps scaling with `G` exactly as before (`logical1=238`,
+  `logical5=1190`, ratio 5.00). The flag-OFF proof this displaced moved to
+  `heartbeat_batch_corpus.rs` as a new explicit opt-out cell
+  (`batching_off_frames_scale_with_groups_like_the_old_default`),
+  independent `Simulator` worlds exactly like the old `heartbeat_cost.rs`
+  shape — `RaftKvNode::start_hosted_with_batcher(.., None)` calls `env.
+  metrics()` internally, which is `SimEnv`'s no-op handle unless a caller
+  injects one, and there is no co-hosted-AND-injectable-metrics-AND-no-
+  batcher constructor, so the unbatched proof still needs
+  `start_with_metrics`'s own independent-world shape (this was hit as a
+  real bug while building this cutover — an early draft tried co-hosting
+  the unbatched cell and got zero traffic recorded everywhere; see
+  `docs/engineering-lessons.md`).
+- **No production code changed beyond `animusd`'s own default resolution**
+  — `crates/animus-cp-data/src/heartbeat_batch.rs` is untouched by this
+  PR; every mechanism decision PR 2's own amendment above recorded (the
+  reserved stream id, response-batching, receiver-lookup ownership,
+  `CpAppendEntriesSent`'s unchanged meaning) stands as-is.
+
+This closes the C-02 stack: "(1) investigation, (2) batcher behind a flag,
+(3) cutover" is now complete. See `crates/animusd/CLAUDE.md`'s "Heartbeat
+batching" section for the CLI/config plumbing detail and
+`docs/design/heartbeat-send-sites.md`'s own closing note for the design
+doc's final account.

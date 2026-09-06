@@ -256,17 +256,20 @@ pub struct ClusterSettings {
     /// disables quiescence entirely.
     #[serde(default)]
     pub quiesce_after_secs: Option<u64>,
-    /// `--heartbeat-batch` (ADR 0044 phase 2, C-02 PR 2): opts every
-    /// data-plane CP group this node hosts into the per-node heartbeat
-    /// batcher (`animus_cp_data::heartbeat_batch::HeartbeatBatcher`) —
-    /// coalesces every co-hosted group's own bare Raft heartbeat toward the
-    /// same destination node into one physical wire frame per
-    /// `RaftCore::heartbeat_interval` tick instead of one frame per group.
-    /// `None`/`false` (every pre-PR-2 config) is byte-for-byte today's
-    /// unbatched behavior — additive-default, mirroring `quiesce_after_secs`'s
-    /// own "off unless set" shape, except this knob is a plain boolean (no
+    /// `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02
+    /// PR 2 shipped it off by default; PR 3, the cutover, flips the default
+    /// ON): opts every data-plane CP group this node hosts into the
+    /// per-node heartbeat batcher (`animus_cp_data::heartbeat_batch::
+    /// HeartbeatBatcher`) — coalesces every co-hosted group's own bare Raft
+    /// heartbeat toward the same destination node into one physical wire
+    /// frame per `RaftCore::heartbeat_interval` tick instead of one frame
+    /// per group. `None` (this field absent from a config file) resolves to
+    /// `main::DEFAULT_HEARTBEAT_BATCH` (`true`) — batching ON, today's
+    /// default; an explicit `false` (or `--no-heartbeat-batch`) restores
+    /// byte-for-byte the pre-batcher unbatched behavior, the mechanism
+    /// switch an operator can still reach in the field. Plain boolean, no
     /// tunable interval — the batcher's own flush cadence always matches
-    /// `RaftCore::heartbeat_interval`, see that constant's own doc).
+    /// `RaftCore::heartbeat_interval`, see that constant's own doc.
     #[serde(default)]
     pub heartbeat_batch: Option<bool>,
     /// `--stream-seal-bytes B` (ADR 0042 §13): the DynamoDB Streams

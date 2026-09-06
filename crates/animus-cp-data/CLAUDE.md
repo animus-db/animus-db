@@ -155,18 +155,23 @@ amendment — the shape predates and outlives it.)
   deleted along with `MergeTablets` (ADR 0044, tablets are now split-only);
   kept in case a future consumer needs the same token-vs-physical-presence
   disambiguation.
-- **`heartbeat_batch.rs`** (ADR 0044 phase 2, C-02 PR 2, `pub mod
-  heartbeat_batch`) — the per-node **`HeartbeatBatcher`**: coalesces every
-  co-hosted group's own bare (no-entries) Raft heartbeat toward the same
-  destination node into one physical `KvWire::HeartbeatBatch` frame per
-  destination per `RaftCore::heartbeat_interval` tick, on the reserved
+- **`heartbeat_batch.rs`** (ADR 0044 phase 2 — mechanism landed C-02 PR 2,
+  on by default since PR 3's cutover, `pub mod heartbeat_batch`) — the
+  per-node **`HeartbeatBatcher`**: coalesces every co-hosted group's own
+  bare (no-entries) Raft heartbeat toward the same destination node into
+  one physical `KvWire::HeartbeatBatch` frame per destination per
+  `RaftCore::heartbeat_interval` tick, on the reserved
   `HEARTBEAT_BATCH_STREAM = u64::MAX - 2` (this crate's fourth reserved
   stream constant, alongside `cluster_segment_store::SEGMENT_STREAM` and
   `backup::BACKUP_SEGMENT_STREAM`) — instead of one `env.send_stream` call
-  per group per tick. **Off by default, additive** — a `RaftKvNode` with
-  no batcher attached (every pre-PR-2 constructor, and every PR-2
-  constructor called with `None`) behaves byte-for-byte as before this
-  module existed. `RaftKvNode::start_hosted_with_batcher`/
+  per group per tick. **The mechanism itself is unchanged by the cutover
+  — only which production caller reaches for `None` vs. `Some` flipped**,
+  entirely in `animusd` (`main::DEFAULT_HEARTBEAT_BATCH = true`; see that
+  crate's own CLAUDE.md). A `RaftKvNode` with no batcher attached (`None`,
+  now reached only via `--no-heartbeat-batch`/`cluster_settings.
+  heartbeat_batch: false`) still behaves byte-for-byte as before this
+  module existed — the additive-default *mechanism* contract PR 2 built
+  never changed, only PR 3's own caller-side default. `RaftKvNode::start_hosted_with_batcher`/
   `start_hosted_campaigning_with_batcher` are the batching-aware siblings
   of `start_hosted`/`start_hosted_campaigning`; `host::Reconciler::
   enable_heartbeat_batching()` is the production opt-in, mirroring
@@ -1797,18 +1802,22 @@ reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline
 
 ### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
 
-ADR 0044 phase 2 (C-02 PR 2) — the `heartbeat_batch` module's own
-fault-injection corpus, depth knob `ANIMUS_HEARTBEAT_SEEDS` (default 1).
-Unlike `heartbeat_cost.rs`'s independent-`Simulator`-worlds baseline
-(each hosted group its own `Simulator`, since PR 1 needed no shared
-per-node state), this corpus co-hosts several `RaftKvNode` groups sharing
-the SAME three physical `NodeId`s in ONE `Simulator` — mirroring
-`tests/stream_addressing.rs`'s established pattern — since batching only
-has anything to amortize when several groups share one physical node's
-`env` (and thus one `HeartbeatBatcher`). Six scenarios: frame-vs-logical
-scaling (cell a — every group's leader forced to the same physical node
-via `start_hosted_campaigning_with_batcher`, so leadership doesn't spread
-across the cluster as group count grows and confound the measurement);
+ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection
+corpus, depth knob `ANIMUS_HEARTBEAT_SEEDS` (default 1). This corpus
+co-hosts several `RaftKvNode` groups sharing the SAME three physical
+`NodeId`s in ONE `Simulator` — mirroring `tests/stream_addressing.rs`'s
+established pattern — since batching only has anything to amortize when
+several groups share one physical node's `env` (and thus one
+`HeartbeatBatcher`). Eight scenarios: frame-vs-logical scaling (cell a —
+every group's leader forced to the same physical node via
+`start_hosted_campaigning_with_batcher`, so leadership doesn't spread
+across the cluster as group count grows and confound the measurement); the
+**explicit `--no-heartbeat-batch` opt-out proof** (C-02 PR 3, added at the
+cutover — no batcher attached at all, independent `Simulator` worlds
+exactly like `heartbeat_cost.rs`'s own pre-cutover shape below, proving
+the flag genuinely restores byte-for-byte the pre-batcher scaling
+behavior — moved here from `heartbeat_cost.rs` once that file's own
+baseline started measuring the DEFAULT, batching-on behavior instead);
 every per-group invariant (election timers, term, commit index, ReadIndex
 confirmation) holding under batching over a long idle window; a genuine
 partition (leaders forced to different physical nodes so the "sibling
@@ -1819,6 +1828,27 @@ sibling group unaffected unless it happens to share the faulted node. Run
 at depth: `ANIMUS_HEARTBEAT_SEEDS=K cargo test -p animus-cp-data --test
 heartbeat_batch_corpus` (default `K=1`; held green through `K=150`
 locally, `=40` in the nightly `corpus-deep.yml` tier).
+
+**`tests/heartbeat_cost.rs`'s own baseline flipped at the C-02 PR 3
+cutover** — it used to be the flag-OFF (pre-batcher) baseline (independent
+`Simulator` worlds, no batcher at all, `AppendEntries` traffic scaling
+with hosted-group count); now that batching is on by default, it measures
+the DEFAULT behavior instead: `RaftKvNode::start_hosted_campaigning_with_
+batcher`/`start_hosted_with_batcher`, co-hosted in one `Simulator` exactly
+like this corpus's own cell (a), pinning `CpHeartbeatFramesSent` flat
+(ratio ≈ 1.00, `frames1=238`/`frames5=238`) while `CpAppendEntriesSent`
+keeps scaling with the hosted-group count (ratio ≈ 5.00,
+`logical1=238`/`logical5=1190`) as today's default, not merely an opt-in
+capability. The flag-OFF proof this corpus's own `batching_off_frames_
+scale_with_groups_like_the_old_default` scenario now carries is exactly
+`heartbeat_cost.rs`'s old shape, moved here — see that scenario's own doc
+for why it stayed independent-`Simulator`-worlds rather than following
+cell (a)'s co-hosted-with-injectable-batcher shape (`RaftKvNode::
+start_hosted_with_batcher(.., None)` calls `env.metrics()` internally,
+which is `SimEnv`'s no-op handle unless a caller injects one — there is no
+co-hosted-AND-injectable-metrics-AND-no-batcher constructor, so the
+unbatched proof needs `start_with_metrics`'s own independent-world shape
+instead, exactly as PR 1 originally found).
 
 ### Reconciler lifecycle corpus (`tests/reconciler_corpus.rs`)
 
