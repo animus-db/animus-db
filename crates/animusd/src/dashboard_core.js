@@ -35,14 +35,21 @@ async function loadSelf() {
     // not cluster-aggregated (the same "one sink" caveat `/admin/metrics`
     // itself carries) — deliberately, since a sparkline of a SUM across
     // nodes would hide which node is actually doing the work.
-    const [config, raft, raftkv, health, metricsHistory] = await Promise.all([
+    // `controlMembers` (docs/roadmap.md U-05) — `/admin/control/members`
+    // (ADR 0037 PR3): the live control-plane voter set + the replicated
+    // address book, served read-only on **any** node (a `Remote`/data-only
+    // node answers off its own last-observed mirror, per
+    // `ControlHandle::config`'s doc) — so this is safe to fetch against
+    // SEED like everything else here, never a peer fan-out.
+    const [config, raft, raftkv, health, metricsHistory, controlMembers] = await Promise.all([
       getJSON(SEED, "/admin/config"),
       getJSON(SEED, "/admin/raft").catch(() => null),
       getJSON(SEED, "/admin/raftkv").catch(() => null),
       getJSON(SEED, "/admin/health").catch(() => null),
       getJSON(SEED, "/admin/metrics/history").catch(() => null),
+      getJSON(SEED, "/admin/control/members").catch(() => null),
     ]);
-    SELF = { base: SEED, config, raft, raftkv, health, metricsHistory, ok: true };
+    SELF = { base: SEED, config, raft, raftkv, health, metricsHistory, controlMembers, ok: true };
     ROLE = config.role || "combined";
   } catch (e) {
     SELF = { base: SEED, ok: false, error: String(e) };

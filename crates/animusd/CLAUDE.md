@@ -1176,6 +1176,27 @@ reusing the captured config is the point of the test.
   round-trip structure as U-01/U-02's own tests above) — the actual
   `UpdateTimeToLive`/`DescribeTimeToLive` wire mechanics keep their full
   end-to-end coverage in `tests/dynamo_ttl.rs`, unchanged by this item.
+  **docs/roadmap.md U-05's own first slice** (`dashboard_node.js`) added a
+  control-plane members panel to the Node tab, next to `#nd-mirror`
+  (`#nd-control-members`, `renderNodeControlMembers`, called from
+  `renderNode()`): a render of `GET /admin/control/members`
+  (`admin.rs::control_members_view`, ADR 0037 PR3 — the live voter set plus
+  the replicated address book), fetched alongside everything else `SELF`
+  already carries (`dashboard_core.js::loadSelf`'s own `Promise.all`, so no
+  extra poll timer — same `loadAll()` cadence as every other Node-tab
+  panel). Per member: id, its most operator-useful address (`admin`,
+  falling back to `internal`), a role pill, a voter-vs-learner pill (a
+  third, neutral "unknown" state when `voters` is `null` — a `Remote`
+  handle that hasn't synced yet, per `ControlHandle::config`'s own
+  documented "unknown vs. genuinely empty" distinction — never conflated
+  with "learner"), and a leader marker (compared against this node's own
+  `/admin/raft`'s `leader` field, already fetched into `SELF.raft`). **Read-
+  only in this slice, deliberately** — no add/remove/transfer buttons yet;
+  those are the roadmap's own next U-05 PR, gated the same `window.confirm`
+  way every other admin action already is. No new `include_str!`/`<script>`
+  wiring needed — both `dashboard_node.js` and `dashboard_core.js` already
+  load on every role that shows the Node tab. Test:
+  `tests/dashboard_endpoint.rs::dashboard_u05_control_members_panel`.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

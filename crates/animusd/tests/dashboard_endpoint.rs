@@ -1296,3 +1296,80 @@ async fn dashboard_u04_create_table_form() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's first slice: a read-only control-plane members
+/// panel on the Node tab, beside `#nd-mirror`. Mirrors
+/// `dashboard_u04_ttl_row`'s own structure — shell/script markers plus a
+/// live round trip against the route it renders
+/// (`/admin/control/members`, already covered end to end at the wire level
+/// by `tests/control_membership_admin.rs`, so this test only proves the
+/// dashboard wiring: the shell carries the new card next to the mirror
+/// card, `dashboard_node.js` renders it from `SELF.controlMembers`, and
+/// `dashboard_core.js` fetches the route on the same cadence as everything
+/// else `SELF` carries).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn dashboard_u05_control_members_panel() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-control-members beside #nd-mirror -------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let mirror_pos = shell
+            .find(r#"id="nd-mirror""#)
+            .expect("shell carries #nd-mirror");
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        assert!(
+            members_pos > mirror_pos && members_pos - mirror_pos < 200,
+            "#nd-control-members sits immediately beside #nd-mirror: {shell}"
+        );
+
+        // ---- dashboard_node.js renders it from SELF.controlMembers ---------
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        assert!(
+            node_js.contains("function renderNodeControlMembers")
+                && node_js.contains("controlMembers")
+                && node_js.contains("nd-control-members"),
+            "dashboard_node.js defines the control-members panel's render function: {node_js}"
+        );
+
+        // ---- dashboard_core.js fetches /admin/control/members into SELF ----
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/control/members") && core_js.contains("controlMembers"),
+            "dashboard_core.js fetches control members into SELF alongside everything else: {core_js}"
+        );
+
+        // ---- the route it renders is live and carries every voter ---------
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/control/members").await;
+        assert_eq!(s, 200, "GET /admin/control/members: {body}");
+        let members: Value = serde_json::from_str(&body).expect("control/members is JSON");
+        let voters = members["voters"]
+            .as_array()
+            .expect("voters is a populated array on a combined node");
+        assert_eq!(voters.len(), 3, "every bootstrap node is a voter: {members}");
+        let addrs = members["addrs"]
+            .as_object()
+            .expect("addrs is a populated object");
+        for n in &config.nodes {
+            assert!(
+                addrs.contains_key(n.id.to_string().as_str()),
+                "the address book carries node {}: {members}",
+                n.id
+            );
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

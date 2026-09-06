@@ -15,6 +15,7 @@ function renderNode() {
   renderNodeIdentity();
   renderNodeHealth();
   renderNodeMirror();
+  renderNodeControlMembers();
   renderNodeTablets();
   renderConsoleLink();
   renderNodeTabletOptions();
@@ -110,6 +111,44 @@ function renderNodeMirror() {
     <div class="list-row"><span class="detail">control leader</span><span class="status-text mono">${r.leader != null ? "node " + idSpan(r.leader) : "—"}</span></div>
     <div class="list-row"><span class="detail">leader address hint</span><span class="status-text mono">${cm.leader_hint ? esc(cm.leader_hint) : "—"}</span></div>
     ${note}`;
+}
+
+// Control-plane members panel (docs/roadmap.md U-05, ADR 0037 PR3):
+// `/admin/control/members` served read-only on any node — the live voter set
+// plus the replicated address book. Read-only for now (no add/remove/
+// transfer buttons here yet — those are a later PR, gated the same
+// `window.confirm` way every other admin action already is). Refreshed on
+// the same `loadAll()`/`loadSelf()` cadence as every other Node-tab panel;
+// no dedicated poll of its own.
+function renderNodeControlMembers() {
+  const s = SELF;
+  const cmv = s.controlMembers;
+  if (!s.ok || !cmv) {
+    $("nd-control-members").innerHTML = `<div class="section-head"><span class="title">Control-plane members</span></div><div class="empty">loading…</div>`;
+    return;
+  }
+  const voters = cmv.voters; // null = never observed (a Remote handle before its first sync); [] = genuinely zero
+  const leader = s.raft && s.raft.leader != null ? String(s.raft.leader) : null;
+  const addrs = cmv.addrs || {};
+  const ids = Object.keys(addrs).sort();
+  const rows = ids.map((id) => {
+    const a = addrs[id] || {};
+    const isVoter = voters == null ? null : voters.map(String).includes(id);
+    const isLeader = leader != null && id === leader;
+    const roleBadge = pill("forming", a.role || "combined");
+    const voterBadge = isVoter == null
+      ? pill("forming", "unknown")
+      : pill(isVoter ? "healthy" : "forming", isVoter ? "voter" : "learner");
+    return `<div class="list-row">
+      ${dot(isLeader ? "ok-dot" : "dim-dot")}
+      <span class="id mono">${idSpan(id)}</span>
+      <span class="detail mono">${esc(a.admin || a.internal || "—")}</span>
+      <span class="status-text">${roleBadge} ${voterBadge}${isLeader ? " " + pill("healthy", "leader") : ""}</span>
+    </div>`;
+  }).join("");
+  $("nd-control-members").innerHTML = `
+    <div class="section-head"><span class="title">Control-plane members</span>${pill("forming", `${ids.length} known`)}</div>
+    ${rows || `<div class="empty">no members observed yet</div>`}`;
 }
 
 function renderNodeTablets() {

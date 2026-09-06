@@ -215,9 +215,6 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ### U-05 Control-plane visibility, lineage, and infrastructure actions
 
-- Render `/admin/control/members` (`admin.rs:1754`) on the Node tab
-  (near `#nd-mirror`, `dashboard.html:352`). Size S. Prerequisite for the
-  control-member buttons.
 - Lineage panel on the Tablets tab from `system-table?kind=split_lineage`
   / `split_placing`, keyed by the selected tablet. Size M.
 - Gated buttons over existing POST routes: split/flush/compact/reconfigure
@@ -225,10 +222,6 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
   control member add-remove on the new members panel. Document that the
   only gate is `window.confirm` plus tab visibility (ADR 0020 admin port
   is trusted-network). Three PRs by action family. Size L total.
-- **Verify then add:** there is no standalone leadership-transfer admin
-  route (`raft_view.transfer_target` is read-only; the CLI's
-  `control-remove` arms a transfer internally). If confirmed, add
-  `POST /admin/control/transfer` before its button. Size S.
 
 ### U-07 New observability routes
 

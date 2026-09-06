@@ -430,3 +430,18 @@ body and in the amendment above is historical: read it as naming the
 surface now called animusd admin. ADR 0052's data console is renamed
 alongside it, to **animusd console** — see that ADR's own matching
 amendment.
+
+## Amendment (2026-09-05, roadmap U-05) — control-plane members panel on the Node tab
+
+The Node tab (ADR 0035 PR7's data-only dedicated view, also shown appended
+last on a combined node) gained a read-only render of `GET
+/admin/control/members` (ADR 0037 PR3) beside its existing control-plane
+mirror card: every known member's id, address, role, voter-vs-learner
+state, and whether it is the current control leader. Fetched on the same
+per-refresh cadence as everything else `SELF` carries — no dedicated poll
+timer, no new route. **Deliberately read-only**: no add/remove/transfer
+buttons in this slice — those, and a lineage panel on the Tablets tab, are
+later U-05 PRs this one is a prerequisite for. See
+`crates/animusd/CLAUDE.md`'s matching `dashboard_node.js` entry for the
+full mechanism and `tests/dashboard_endpoint.rs::
+dashboard_u05_control_members_panel` for the regression.
