@@ -154,6 +154,41 @@ exactly. Every cluster now gets an explicit `Egress` section with two
 baseline rules (intra-cluster on the `internal`/`intra` ports, and DNS to
 `kube-system`'s `kube-dns`/CoreDNS pods) whether or not `spec.s3` is set.
 
+## Non-S3 backup/segment stores (S-07b)
+
+`spec.backupStore`/`spec.segmentStore` are the CRD surface for the
+*non-S3* forms `spec.s3` above doesn't cover — pinning `--backup-store
+cluster|fs:<path>` or `--segment-store dir:<path>` from the spec instead of
+configuring it by hand, closing `docs/roadmap.md`'s S-07 item b:
+
+```yaml
+spec:
+  backupStore: "fs:/var/lib/animus/backups"   # or "cluster" (the default, spelled out)
+  segmentStore: "dir:/var/lib/animus/segments" # --segment-store has no "cluster" keyword
+```
+
+Each field accepts exactly the literal forms named above — a malformed
+value, a `segmentStore: "cluster"` (rejected: `--segment-store` has no such
+keyword at all; omit the field to select its default instead), or an
+`s3://...` URI (rejected, pointing at `spec.s3` — only that section
+supplies the credentials an S3 store needs) sets a `StoreSpecInvalid`
+status condition and reconciles the rest of the spec with both fields
+stripped, the same posture `TlsSpecInvalid`/`S3SpecInvalid` use above.
+Setting the same store in both `spec.s3` and the matching top-level field
+(e.g. both `spec.s3.backupStore` and `spec.backupStore`) is also rejected,
+naming both fields.
+
+**The `fs:`/`dir:` path must live under the pod's own data volume**
+(`/var/lib/animus` by default — a `PersistentVolumeClaim`, or an
+`emptyDir` when `spec.storage.ephemeral` is set) — a path elsewhere on the
+container filesystem is never a sensible place to point a store, and a
+path equal to that root itself is rejected too (that's where `animusd
+--dir` puts its own on-disk files). Unlike `spec.s3`, **no new volume or
+`Secret` is mounted for this** — `cluster`/`fs:`/`dir:` need no
+credentials, so the pod's already-mounted data volume is all that's
+involved. Reaches only **combined-role pods**, the same pre-existing
+`animusd` gap `spec.s3` documents above.
+
 ## Testing
 
 `cargo test -p animus-operator` is the pure `desired`-builder unit suite —

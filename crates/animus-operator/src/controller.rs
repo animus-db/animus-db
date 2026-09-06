@@ -32,7 +32,8 @@ use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
     CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
+    ConditionStatus,
 };
 use crate::desired;
 
@@ -299,6 +300,30 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     status
         .conditions
         .retain(|c| c.type_ != CONDITION_S3_SPEC_INVALID);
+
+    // Validate `spec.backupStore`/`spec.segmentStore` (S-07b): same "no
+    // admission webhook in v1" posture as `spec.tls`/`spec.s3` above — set a
+    // condition and reconcile the rest of the spec with both fields
+    // stripped rather than getting stuck entirely. Checked *after*
+    // `spec.s3` above (not before): an invalid `spec.s3` already returned
+    // early, so by this point `cluster.spec.s3` is either `None` or valid,
+    // which is what lets `validate_store_spec`'s own conflict check trust
+    // it.
+    if let Err(e) = cluster.spec.validate_store_spec() {
+        warn!(
+            cluster = %name,
+            error = %e,
+            "refusing invalid spec.backupStore/spec.segmentStore"
+        );
+        set_condition(&mut status, CONDITION_STORE_SPEC_INVALID, e);
+        let mut pinned = (*cluster).clone();
+        pinned.spec.backup_store = None;
+        pinned.spec.segment_store = None;
+        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_STORE_SPEC_INVALID);
 
     // Refuse an immutable `controlNodes` change: set a condition, keep
     // going (the rest of the spec — image, resources, scale — still
@@ -1296,5 +1321,159 @@ mod tests {
             .expect("statefulset applied");
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
+    }
+
+    // --- (8) spec.backupStore / spec.segmentStore (S-07b) ------------------
+
+    #[tokio::test]
+    async fn reconcile_applies_the_same_five_children_with_a_valid_non_s3_store_spec() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert_eq!(
+            ctx.cluster_api.applies(),
+            vec![
+                (AppliedKind::ConfigMap, desired::config_map_name("demo")),
+                (AppliedKind::Service, desired::internal_service_name("demo")),
+                (AppliedKind::Service, desired::client_service_name("demo")),
+                (
+                    AppliedKind::NetworkPolicy,
+                    desired::network_policy_name("demo")
+                ),
+                (AppliedKind::StatefulSet, "demo".to_string()),
+            ]
+        );
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(script.contains("--backup-store 'fs:/var/lib/animus/backups'"));
+        // No S3 credentials machinery for a non-S3 backupStore.
+        assert!(!script.contains("--s3-credentials"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_segment_store_cluster_literal() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.segment_store = Some("cluster".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+        // Reconciled as if segmentStore were unset: no --segment-store flag.
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(!script.contains("--segment-store"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_backup_store_path_outside_data_dir() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("fs:/tmp/backups".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_backup_store_conflicting_with_spec_s3() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("cluster".to_string());
+        cluster.spec.s3 = Some(valid_s3());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_store_spec_still_applies_no_store_flags() {
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID)
+        );
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(!script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
     }
 }

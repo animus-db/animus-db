@@ -34,6 +34,21 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              backupStore:
+                description: |-
+                  The **non-S3** `--backup-store` value for every combined-role pod
+                  (S-07b, closing `docs/roadmap.md`'s S-07 item b — `spec.s3` above is
+                  the CRD surface for an `s3://...` URI specifically). Accepts exactly
+                  `"cluster"` (the default K-replicated store, spelled out — the same
+                  literal keyword `animusd`'s own `--backup-store cluster` accepts) or
+                  `"fs:<absolute path>"`, where `<path>` must live under the pod's own
+                  data volume (`crate::desired::cluster_config::DATA_DIR`) to persist
+                  — see [`AnimusClusterSpec::validate_store_spec`]. `None` (default)
+                  leaves `--backup-store` unset, i.e. `animusd`'s own default
+                  (`cluster`) — byte-for-byte the pre-S-07b behavior. Mutually
+                  exclusive with `spec.s3.backupStore`: set at most one.
+                nullable: true
+                type: string
               basePort:
                 description: |-
                   The first of the six-port stride every pod binds
@@ -140,7 +155,7 @@ spec:
                   S3-compatible object-store wiring for the cluster's backup and/or
                   stream-segment stores (S-04 PR 3). `None` (default) leaves both
                   stores at their pre-existing default (`cluster`/`ClusterSegmentStore`)
-                  or whatever a future non-S3 CRD surface sets (S-07b, not this PR).
+                  or whatever `backupStore`/`segmentStore` below set instead.
                   See [`S3StoreSpec`]'s own doc for the two mutually-independent store
                   fields, the referenced credential `Secret`, and the egress CIDRs.
                 nullable: true
@@ -199,6 +214,19 @@ spec:
                 required:
                 - credentialsSecretName
                 type: object
+              segmentStore:
+                description: |-
+                  The **non-S3** `--segment-store` value for every combined-role pod
+                  (S-07b). Accepts only `"dir:<absolute path>"` with the same
+                  under-`DATA_DIR` rule `backupStore` above uses — **`animusd`'s own
+                  `--segment-store` has no `"cluster"` keyword at all** (omitting the
+                  flag is the only way to select its default), so a literal
+                  `"cluster"` here is rejected by [`Self::validate_store_spec`] rather
+                  than silently treated as "omit the flag". `None` (default) leaves
+                  `--segment-store` unset. Mutually exclusive with
+                  `spec.s3.segmentStore`: set at most one.
+                nullable: true
+                type: string
               storage:
                 default: {}
                 description: Data volume configuration.

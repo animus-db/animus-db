@@ -17,6 +17,16 @@
 #
 # Assumes: docker, kind, kubectl on PATH, and a docker daemon reachable.
 #
+# S-07b: the AnimusCluster manifest always sets `spec.segmentStore:
+# dir:<data-mount>/segments` (the non-S3 store CRD surface), and the plain
+# path checks `GET /admin/segment-store` reports `store.kind: "fs"` right
+# after the pod readiness wait — no separate CI job, no gating env var,
+# since a `dir:` path needs no external dependency the way MinIO (E2E_S3)
+# or cert-manager (E2E_TLS) do. `segmentStore`, not `backupStore`, so this
+# composes with the pre-existing E2E_S3=1 leg below (which sets
+# `spec.s3.backupStore` — the two backup-store fields together would be a
+# rejected conflict).
+#
 # Issue #595: this smoke flaked twice with the identical signature — the
 # first `CreateTable` (issued once, immediately after the statefulset
 # reported 3/3 ready) failing with a 500 whose message is "CreateTable did
@@ -109,6 +119,11 @@ S3_CREDS_SECRET_NAME="e2e-s3-creds"
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
 AC_NAME="e2e"
+# S-07b: the pod's own data volume mount path — must match
+# crates/animus-operator/src/desired/cluster_config.rs's DATA_DIR constant.
+# spec.segmentStore's dir:<path> below is required (AnimusClusterSpec::
+# validate_store_spec) to live under this exact prefix.
+DATA_MOUNT_DIR="/var/lib/animus"
 DYNAMO_LOCAL_PORT="18100"
 DYNAMO_REMOTE_PORT="14002" # base_port(14000) + PORT_DYNAMO(2), the CRD's own default base port.
 ADMIN_LOCAL_PORT="18101"
@@ -470,6 +485,12 @@ spec:
   controlNodes: 3
   storage:
     ephemeral: true
+  # S-07b: the non-S3 store CRD surface, exercised unconditionally (not
+  # gated on E2E_S3) — segmentStore rather than backupStore specifically so
+  # this composes with the E2E_S3=1 leg below, which already sets
+  # spec.s3.backupStore (spec.backupStore/spec.s3.backupStore both set is a
+  # rejected conflict; segmentStore has no such overlap here).
+  segmentStore: "dir:${DATA_MOUNT_DIR}/segments"
 ${TLS_SPEC_YAML}
 ${S3_SPEC_YAML}
 EOF
@@ -556,6 +577,13 @@ phase "wait for that pod's own readiness (GET /admin/health == 200)"
 # is a second, independent line of defense on top of that root-cause fix,
 # not a replacement for it.
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
+
+phase "check GET /admin/segment-store reports the S-07b dir: store (kind: fs)"
+RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+    "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/segment-store")"
+KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
+[ "$KIND" = "fs" ] || fail "GET /admin/segment-store did not report store.kind \"fs\": ${RESULT}"
+log "admin/segment-store reports store.kind=fs (spec.segmentStore: dir:${DATA_MOUNT_DIR}/segments)"
 
 phase "exercise DynamoDB wire: CreateTable"
 # Issue #595: a bounded converged-or-timeout retry, scoped narrowly to the

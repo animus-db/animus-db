@@ -32,3 +32,11 @@ spec:
   #   credentialsSecretName: example-s3-credentials
   #   allowInsecureHttp: false
   #   egressCidrs: ["0.0.0.0/0"]
+  # Non-S3 backup/segment stores (S-07b) — mutually exclusive with the
+  # matching field under `s3:` above. `backupStore` accepts `cluster` (the
+  # default, spelled out) or `fs:<path>`; `segmentStore` accepts only
+  # `dir:<path>` (--segment-store has no `cluster` keyword). Either path
+  # must live under the pod's own data volume (/var/lib/animus by default)
+  # to persist.
+  # backupStore: "fs:/var/lib/animus/backups"
+  # segmentStore: "dir:/var/lib/animus/segments"

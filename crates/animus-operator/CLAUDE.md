@@ -28,7 +28,9 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 - `src/crd.rs` — the `AnimusCluster` type (`kube::CustomResource` derive):
   `AnimusClusterSpec`/`AnimusClusterStatus`/`StorageSpec`/
   `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`/`TlsSpec`/
-  `S3StoreSpec` (S-04 PR 3, see this file's own S3 section below). Pure
+  `S3StoreSpec` (S-04 PR 3, see this file's own S3 section below), and
+  the non-S3 `backup_store`/`segment_store` fields (S-07b, see this
+  file's own Non-S3 stores section below). Pure
   data + a handful of `_or_default()`/`validate()` helpers; no k8s API
   calls, no logic that needs a live object beyond its own fields.
 - `src/s3_uri.rs` — a small, deliberately minimal syntax-only check of an
@@ -175,6 +177,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   | `--ephemeral` | yes | yes |
   | `--dynamo-auth` | yes | yes |
   | `--backup-store`/`--segment-store`/`--s3-credentials`/`--allow-insecure-s3` (S-04 PR 3, `spec.s3`) | yes | **no** |
+  | `--backup-store`/`--segment-store` (S-07b, `spec.backupStore`/`spec.segmentStore` — the non-S3 `cluster`/`fs:`/`dir:` forms) | yes | **no** |
 
   **The S-04 PR 3 row's "no" on the data branch is a pre-existing
   `animusd` gap, not introduced here**: `run_data_config` (`main.rs`)
@@ -182,7 +185,11 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   documented gap as `--backup-store`" comment. A data-only pod still
   mounts `spec.s3.credentialsSecretName`'s `Secret` at `/etc/animus/s3`
   like every other pod (`desired::statefulset::build` doesn't condition
-  the mount on role), it just never reads it.
+  the mount on role), it just never reads it. **S-07b's own row is the
+  identical gap** — `spec.backupStore`/`spec.segmentStore` reach only the
+  combined branch for the same reason, but need no `Secret`/volume at all:
+  a `fs:`/`dir:` path is required to live under `DATA_DIR`, which every
+  pod already has mounted.
 
   **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
   flags on either branch (S-06)** — both now reach `animusd` through
@@ -389,6 +396,51 @@ exists and defaults open (`["0.0.0.0/0"]`): narrow it to your object
 store's real address range — `deploy/operator/example.yaml`'s commented
 `s3:` section says so inline.
 
+## Non-S3 stores (S-07b, closes `docs/roadmap.md`'s S-07 item b)
+
+`AnimusClusterSpec.backup_store`/`.segment_store: Option<String>` (`crd.rs`)
+are the CRD surface for the *non-S3* forms `spec.s3` above doesn't cover —
+carrying the literal `--backup-store`/`--segment-store` flag value
+verbatim (`"cluster"`, `"fs:<path>"`, `"dir:<path>"`), unlike `S3StoreSpec`
+which is a sub-object. `AnimusClusterSpec::validate_store_spec` (called
+from `crate::controller::reconcile`, same "no admission webhook in v1"
+posture as `TlsSpec`/`S3StoreSpec`'s own `validate`) accepts exactly
+`"cluster"` or `"fs:<path>"` for `backupStore`, and only `"dir:<path>"`
+for `segmentStore` — **`animusd`'s own `--segment-store` has no `"cluster"`
+keyword at all** (`parse_segment_store`'s own doc: omitting the flag is
+the *only* way to select its default), so a literal `"cluster"` there is
+rejected rather than silently remapped to "omit the flag." An `s3://...`
+value in either field is rejected pointing at `spec.s3` instead (only that
+section supplies the credentials an S3 store needs), and setting the same
+store in both `spec.s3` and the matching top-level field is rejected as a
+conflict naming both — a `StoreSpecInvalid` status condition either way,
+`backupStore`/`segmentStore` stripped for the rest of that reconcile.
+
+**Every `fs:`/`dir:` path must live strictly under
+`desired::cluster_config::DATA_DIR`** (`/var/lib/animus`) — the one
+directory every pod already has mounted (a `PersistentVolumeClaim`, or an
+`emptyDir` when `spec.storage.ephemeral` is set), and never `DATA_DIR`
+itself (that's where `animusd --dir` puts the storage engine's own
+on-disk files; a store sharing that exact root would mix its own objects
+in among them). **No new volume or `Secret` for this** — unlike `spec.s3`,
+`cluster`/`fs:`/`dir:` need no credentials, so `desired::statefulset`
+needed no change at all: the pod's already-mounted data volume is
+sufficient.
+
+`desired::cluster_config::entrypoint_script` emits `--backup-store`/
+`--segment-store` from whichever of `spec.s3.{backup,segment}Store` (the
+`s3://...` form, credentials wired as described above) or the plain
+top-level `spec.{backup,segment}Store` is set — the two are mutually
+exclusive per store (enforced by `validate_store_spec` before this
+function ever runs on an invalid combination), so the builder itself just
+takes the first `Some` of the two, `.or()`-chained. Both values are
+`shell_single_quote`d like every other operator-controlled string
+interpolated into the generated `sh` script (`fs:`/`dir:` paths happen not
+to contain shell metacharacters today, but nothing about the type says
+they can't). Reaches only **combined-role pods**, the identical
+pre-existing `animusd` gap `spec.s3` documents in the flag-support table
+above.
+
 **`scripts/e2e-kind.sh`'s `E2E_S3=1` leg is UNVERIFIED in this sandbox**
 — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see the e2e
 section below): it deploys a single-pod MinIO + Service, creates the
@@ -403,13 +455,15 @@ failure on the `e2e-kind-s3` job as this leg finding its first real bug.
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (131 tests total as of S-04 PR 3's landing):
+own `#[cfg(test)] mod tests` (159 tests total as of S-07b's landing):
 golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
 `ConfigMap` contents (including the no-port-striding invariant, a
 scale-up byte-for-byte-preserves-existing-entries regression, and, since
-S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags), `Service`
-port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable storage
-shape (plus the `spec.s3` `Secret` mount), and `NetworkPolicy`
+S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags, and since
+S-07b, the non-S3 `backupStore`/`segmentStore` flag emission and its
+"whichever of `spec.s3` or the top-level field is set" precedence),
+`Service` port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable
+storage shape (plus the `spec.s3` `Secret` mount), and `NetworkPolicy`
 selector/ingress/egress rule structure (including the S-04 PR 3 egress
 additions: baseline intra+DNS on every cluster, an S3 rule only when
 `spec.s3` is set). **No cluster is needed** — every test constructs an
@@ -460,7 +514,14 @@ directly.
   (neither store set, empty `credentialsSecretName`, malformed URI,
   `insecure_http` without `allowInsecureHttp`) surfaces `S3SpecInvalid`
   and strips `spec.s3` for that reconcile; and a cluster with no `spec.s3`
-  still gets the new baseline egress (intra + DNS) with no `s3` volume.
+  still gets the new baseline egress (intra + DNS) with no `s3` volume;
+  and, since S-07b, `spec.backupStore`/`spec.segmentStore`: a valid
+  non-S3 spec applies the same five children with the entrypoint flag
+  present and no S3 credentials wiring; `validate_store_spec` rejections
+  (`segmentStore: "cluster"`, a path outside `DATA_DIR`, a conflict with
+  `spec.s3`'s own store field) surface `StoreSpecInvalid` and strip both
+  fields for that reconcile; and a cluster with neither field set emits
+  no `--backup-store`/`--segment-store` flag at all.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership

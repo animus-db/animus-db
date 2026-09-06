@@ -345,6 +345,14 @@ pub fn tls_section() -> TlsSection {
 /// even though it's the less sensitive of the two (AWS access key ids are
 /// `[A-Za-z0-9]+`, so no JSON-escaping surprises from a well-formed one).
 ///
+/// **`spec.backupStore`/`spec.segmentStore` (S-07b) — the non-S3
+/// `cluster`/`fs:`/`dir:` forms — share the same `--backup-store`/
+/// `--segment-store` flag emission as `spec.s3`'s own two fields above (see
+/// this function's body), same combined-branch-only reach, but need no
+/// credentials preamble and no new volume: a `fs:`/`dir:` path is required
+/// (`AnimusClusterSpec::validate_store_spec`) to live under
+/// [`DATA_DIR`], which every pod already has mounted.
+///
 /// **No `--split-mode` flag is emitted on either branch**: the flag and the
 /// copy-based split workflow it selected were deleted outright
 /// (2026-09-01, ADR 0058's rung 4 layer) — `animusd`'s CLI parser no longer
@@ -400,18 +408,36 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
         if s3.allow_insecure_http {
             both_flags.push_str(" --allow-insecure-s3");
         }
-        if let Some(backup_store) = &s3.backup_store {
-            both_flags.push_str(&format!(
-                " --backup-store {}",
-                shell_single_quote(backup_store)
-            ));
-        }
-        if let Some(segment_store) = &s3.segment_store {
-            both_flags.push_str(&format!(
-                " --segment-store {}",
-                shell_single_quote(segment_store)
-            ));
-        }
+    }
+    // S-07b: `--backup-store`/`--segment-store`'s value comes from whichever
+    // of `spec.s3.{backup,segment}Store` (the `s3://...` form, credentials
+    // wired above) or the plain top-level `spec.{backup,segment}Store` (the
+    // non-S3 `cluster`/`fs:`/`dir:` forms, no credentials needed — the
+    // existing data-volume mount is all a `fs:`/`dir:` path needs) is set.
+    // The two are mutually exclusive per store, enforced by
+    // `AnimusClusterSpec::validate_store_spec` at reconcile time, so this
+    // function only ever sees at most one `Some` for each store.
+    let backup_store_value = spec
+        .s3
+        .as_ref()
+        .and_then(|s3| s3.backup_store.as_deref())
+        .or(spec.backup_store.as_deref());
+    if let Some(backup_store) = backup_store_value {
+        both_flags.push_str(&format!(
+            " --backup-store {}",
+            shell_single_quote(backup_store)
+        ));
+    }
+    let segment_store_value = spec
+        .s3
+        .as_ref()
+        .and_then(|s3| s3.segment_store.as_deref())
+        .or(spec.segment_store.as_deref());
+    if let Some(segment_store) = segment_store_value {
+        both_flags.push_str(&format!(
+            " --segment-store {}",
+            shell_single_quote(segment_store)
+        ));
     }
 
     format!(
@@ -997,6 +1023,95 @@ mod tests {
         let script = entrypoint_script(&s);
         assert!(script.contains("--backup-store"));
         assert!(!script.contains("--segment-store"));
+    }
+
+    // --- `backupStore`/`segmentStore` (S-07b) ------------------------------
+
+    #[test]
+    fn entrypoint_emits_backup_store_cluster_literal_on_combined_branch_only() {
+        let mut s = spec(3);
+        s.backup_store = Some("cluster".to_string());
+        let script = entrypoint_script(&s);
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        assert!(both_branch.contains("--backup-store 'cluster'"));
+        assert!(!data_branch.contains("--backup-store"));
+    }
+
+    #[test]
+    fn entrypoint_emits_backup_store_fs_path() {
+        let mut s = spec(3);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let script = entrypoint_script(&s);
+        assert!(script.contains("--backup-store 'fs:/var/lib/animus/backups'"));
+    }
+
+    #[test]
+    fn entrypoint_emits_segment_store_dir_path() {
+        let mut s = spec(3);
+        s.segment_store = Some("dir:/var/lib/animus/segments".to_string());
+        let script = entrypoint_script(&s);
+        assert!(script.contains("--segment-store 'dir:/var/lib/animus/segments'"));
+    }
+
+    #[test]
+    fn entrypoint_omits_backup_and_segment_store_flags_when_both_unset() {
+        let script = entrypoint_script(&spec(3));
+        assert!(!script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
+    }
+
+    #[test]
+    fn entrypoint_non_s3_backup_store_never_emits_s3_credentials_wiring() {
+        // A plain `fs:`/`cluster` backupStore needs no credentials Secret,
+        // no --s3-credentials flag, and no preamble reading /etc/animus/s3
+        // — only spec.s3 (a distinct field) triggers that machinery.
+        let mut s = spec(3);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let script = entrypoint_script(&s);
+        assert!(!script.contains("--s3-credentials"));
+        assert!(!script.contains("--allow-insecure-s3"));
+        assert!(!script.contains("/etc/animus/s3"));
+    }
+
+    #[test]
+    fn entrypoint_prefers_spec_s3_store_value_over_top_level_field_when_only_s3_is_set() {
+        // Pure-builder sanity: this function has no knowledge of the
+        // controller-enforced mutual exclusion, so when only spec.s3 sets a
+        // store it alone drives the flag — the ordinary spec.s3 case,
+        // unaffected by the existence of the top-level field.
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket/backups?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        let script = entrypoint_script(&s);
+        assert!(
+            script.contains("--backup-store 's3://bucket/backups?endpoint=https://s3.example.com'")
+        );
+    }
+
+    #[test]
+    fn entrypoint_backup_and_segment_store_flags_from_top_level_fields_are_accepted_by_animusd() {
+        let mut s = spec(4);
+        s.control_nodes = Some(2);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        s.segment_store = Some("dir:/var/lib/animus/segments".to_string());
+        let script = entrypoint_script(&s);
+
+        let mut unknown = Vec::new();
+        for line in script.lines() {
+            for token in line.split_whitespace() {
+                if token.starts_with("--") && !ANIMUSD_ACCEPTED_FLAGS.contains(&token) {
+                    unknown.push(token.to_string());
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
+             script:\n{script}"
+        );
     }
 
     #[test]

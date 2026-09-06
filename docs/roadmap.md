@@ -91,8 +91,6 @@ the still-true paragraph after the table.
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
-- **b. `backupStore`/`segmentStore` CRD fields** mirrored into the
-  ConfigMap/entrypoint. Size M. (S-06 landed 2026-09-04.)
 - **c. `PodDisruptionBudget` builder** (`desired/poddisruptionbudget.rs`,
   pure-builder pattern + golden test). Size S.
 - **d. `controlNodes` growth via the CRD**: controller drives ADR 0037
@@ -105,8 +103,12 @@ the still-true paragraph after the table.
   including this crate's own cert-manager `Certificate` builder and CRD
   shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
   directly. No longer blocked; open to pick up on its own schedule. Size L.
-- **ADR:** amend 0060 for a–c; d and e get their own section or a new
-  number if the webhook design grows.
+- **ADR:** amend 0060 for c; d and e get their own section or a new
+  number if the webhook design grows. (Item b — `backupStore`/
+  `segmentStore` CRD fields for the non-S3 `cluster`/`fs:`/`dir:` forms —
+  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07b"
+  section; `spec.s3` already covers the `s3://...` form, ADR 0060's S-04
+  PR 3 amendment.)
 
 ---
 
@@ -251,7 +253,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04 and S-05 landed 2026-09-06* → S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, and S-07b landed 2026-09-06* → S-07c–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

@@ -618,3 +618,101 @@ sandbox** — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see
 `crates/animus-operator/CLAUDE.md`'s e2e section): written carefully and
 `bash -n`-checked, never run end to end anywhere. Treat a first real CI
 failure on `e2e-kind-s3` as this leg finding its first real bug.
+
+## Amendment (2026-09-06): S-07b — non-S3 store CRD surface
+
+`docs/roadmap.md`'s S-07 item b is closed by this amendment: the previous
+S-04 PR 3 amendment above left `fs:`/`cluster`/`dir:` stores with no CRD
+surface at all — an operator user wanting a plain filesystem-backed backup
+store (no S3 bucket, no credentials) had to configure it by hand outside
+the CRD. This amendment adds exactly that surface, alongside `spec.s3`,
+never replacing it.
+
+**Shape**: two plain top-level fields, not a sub-object —
+`AnimusClusterSpec.backup_store: Option<String>` and `.segment_store:
+Option<String>` (`crd.rs`) — carrying the literal `--backup-store`/
+`--segment-store` flag value verbatim: `"cluster"` or `"fs:<path>"` for
+`backupStore`, `"dir:<path>"` only for `segmentStore`. A plain `String`
+was chosen over a `StoreSpec` enum (`Cluster`/`Fs(String)`) because the
+value *is* the CLI flag's own text, unparsed, the same posture `spec.s3`'s
+own `backupStore`/`segmentStore` fields already established for the
+`s3://...` form — inventing a typed enum here would just be a second
+representation of the identical three-way choice `animusd`'s own parser
+already makes, for a section with no sub-fields (no credentials, no CIDR
+list) to justify a struct the way `S3StoreSpec` earns one.
+
+**Validation** (`AnimusClusterSpec::validate_store_spec`, called from
+`crate::controller::reconcile` right after `spec.s3`'s own validation —
+same "no admission webhook in v1" posture as `TlsSpec`/`S3StoreSpec`):
+
+- `backupStore` accepts exactly `"cluster"` or `"fs:<path>"`.
+- `segmentStore` accepts only `"dir:<path>"` — **`animusd`'s own
+  `--segment-store` has no `"cluster"` keyword at all**
+  (`crates/animusd/src/main.rs::parse_segment_store`'s own doc comment:
+  omitting the flag is the *only* way to select its default). A literal
+  `"cluster"` in `segmentStore` is rejected rather than silently
+  remapped to "omit the flag" — this is the one place the two fields'
+  grammars are *not* symmetric, and getting it wrong would otherwise
+  surface as a live pod-startup failure (`animusd` rejecting an unknown
+  value) instead of a reconcile-time status condition.
+- `<path>` must be an absolute path strictly under
+  `desired::cluster_config::DATA_DIR` (`/var/lib/animus`) — **the pod's
+  own data volume, and the only directory this operator can vouch is
+  actually mounted**: a `PersistentVolumeClaim`, or an `emptyDir` when
+  `spec.storage.ephemeral` is set. Never `DATA_DIR` itself (that root is
+  where `animusd --dir` puts the storage engine's own on-disk files — a
+  store sharing it exactly would mix its own objects in among them; a
+  subdirectory is required). A path outside `DATA_DIR` is rejected
+  outright rather than silently accepted and left to fail at pod startup
+  with a permissions or missing-directory error — the same "catch it at
+  reconcile time, not at container start" motivation `S3StoreSpec::
+  validate` already has for a malformed URI.
+- An `s3://...` value in either field is rejected, pointing at `spec.s3`
+  instead: only that section supplies the credentials an S3 store needs,
+  so an `s3://...` string in the non-S3 field is always a copy-paste
+  error, never a valid configuration.
+- Setting the same store in both `spec.s3` and the matching top-level
+  field (e.g. both `spec.s3.backupStore` and `spec.backupStore`) is
+  rejected as a conflict naming both — there is no sensible "last one
+  wins" semantics here, and picking one silently would make the
+  generated `entrypoint.sh` depend on write order in a way nothing in
+  the spec exposes.
+
+Any rejection sets a `StoreSpecInvalid` status condition and reconciles
+the rest of the spec with both fields stripped (never getting stuck
+entirely on one bad field) — the identical posture `TlsSpecInvalid`/
+`S3SpecInvalid` already use.
+
+**No new volume, no new `Secret`, no `desired::statefulset` change at
+all** — this is the detail that makes this surface materially smaller
+than `spec.s3`'s: `cluster`/`fs:`/`dir:` need no credentials, so the
+pod's already-mounted data volume is the only thing an `fs:`/`dir:` path
+can point at, and the `DATA_DIR`-prefix validation rule above is what
+makes that true by construction rather than by convention. `desired::
+cluster_config::entrypoint_script` emits `--backup-store`/
+`--segment-store` from whichever of `spec.s3.{backup,segment}Store` (the
+`s3://...` form, its own credentials preamble unchanged from the S-04 PR
+3 amendment) or the new top-level `spec.{backup,segment}Store` is set —
+mutually exclusive per store by the validation above, so the builder
+itself is a plain `.or()` between the two `Option<&str>`s. Both single-
+quoted via the pre-existing `shell_single_quote`, same as every other
+operator-controlled string this generator interpolates into the `sh`
+script. Reaches only **combined-role pods** — the identical pre-existing
+`animusd` gap (`animusd data --config` accepts none of these flags) the
+S-04 PR 3 amendment already documents; a data-role pod's data volume is
+mounted the same way, it just has no `entrypoint.sh` branch that would
+ever read these fields.
+
+**Deliverable**: `crd.rs` (fields + `validate_store_spec` + unit tests),
+`desired::cluster_config` (flag emission + golden tests),
+`controller.rs` (the validation call + fake-harness tests),
+`deploy/operator/crd.yaml` regenerated (`crd_manifest_pinned` green),
+`deploy/operator/example.yaml`/`README.md` updated, this ADR, this
+crate's own `CLAUDE.md`, and `docs/roadmap.md`'s S-07 item b removed.
+`scripts/e2e-kind.sh`'s plain-TCP leg additionally sets
+`spec.segmentStore: dir:<data-mount>/segments` unconditionally (chosen
+over `backupStore` specifically so it composes with the pre-existing
+`E2E_S3=1` leg, which already sets `spec.s3.backupStore` — using
+`segmentStore` here avoids a same-reconcile conflict between the two
+legs when both are enabled) and checks `GET /admin/segment-store` reports
+`"kind":"fs"`.
