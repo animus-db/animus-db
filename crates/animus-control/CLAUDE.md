@@ -234,26 +234,38 @@ per-tablet CP data plane (`animus-cp-data`).
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
 
-- **`shared_wal.rs`** — `SharedWal` (ADR 0028): a multi-tenant WAL I/O
+- **`shared_wal.rs`** — `SharedWal<C, S>` (ADR 0028): a multi-tenant WAL I/O
   coordinator that serializes concurrent tablet WAL writers into one file
-  with coalesced `append`+`sync`. **Built and unit-tested but UNWIRED** — no
-  `animusd`/`animus-cp-data` code constructs one; every tablet still writes
-  its own WAL file. **Keep (measured 2026-09-02, see
-  `docs/roadmap.md` C-05):** a burst across K active groups on one node
-  costs K fsyncs with no cross-group coalescing, a cost quiescence (ADR
-  0048) does not address, so this is the right mechanism and wiring it
-  into `animus-cp-data`'s persist path is a dedicated L-sized PR.
+  with coalesced `append`+`sync`. **Wired into `animus-cp-data`'s persist
+  path behind `--shared-wal`/`cluster_settings.shared_wal` since C-05 PR 2
+  (2026-09-06) — additive default OFF** (PR 3 is the still-pending
+  default-flip cutover). Two APIs: the original raw, untyped `append`/
+  `compact` pair (unchanged — still what `benches/wal_fsync_bench.rs`
+  measures directly) and a **tagged, group-aware** one added by PR 2 —
+  `append_tagged`/`compact_group`/`forget`/`open`/`recovered_state`,
+  backed by an in-memory `group_tails: BTreeMap<TabletId, Vec<WalRecord<C,
+  S>>>` cache mutated in the same critical section as each op's own queue
+  enqueue (the property the round/ack and GC arguments both rest on — see
+  the type's own module doc for the full "Two APIs"/"Recovery / GC
+  contract" account). `physical_write_count()` is a plain running counter
+  of completed physical writes (append-batches and rewrites alike) —
+  the coalescing-observability primitive a caller (or a test) reads
+  before/after a burst to measure the win directly, without needing a
+  `MetricsHandle` threaded through this coordinator (`animus-cp-data`'s
+  own `Metric::CpSharedWalSyncs`/`CpSharedWalGcRewrites` are recorded from
+  its caller side, using this as the underlying signal).
   **Gated and confirmed worth it on real disk (C-05 PR 1, 2026-09-06)**:
-  `crates/animus-cp-data/benches/wal_fsync_bench.rs` measures this exact
-  API directly (unwired, called straight from the bench) against real
-  `ProdEnv` I/O — on this host's real block-device-backed filesystem, a
-  burst across K=128 groups costs ~10.5–11.2ms p50 as K separate per-group
-  fsyncs vs. ~1.4–1.6ms p50 routed through `SharedWal::append` into one
-  file, with the measured fsync count dropping from 128 to ~2. See
-  `docs/design/shared-wal-fsync-benchmark.md` for the full method/numbers
-  and ADR 0028's matching 2026-09-06 amendment. Recommendation: wire it
-  (C-05 PR 2, then PR 3's cutover) — not yet done, this module itself is
-  unchanged by PR 1.
+  `crates/animus-cp-data/benches/wal_fsync_bench.rs` measures the raw API
+  directly against real `ProdEnv` I/O — on this host's real block-device-
+  backed filesystem, a burst across K=128 groups costs ~10.5–11.2ms p50 as
+  K separate per-group fsyncs vs. ~1.4–1.6ms p50 routed through
+  `SharedWal::append` into one file, with the measured fsync count
+  dropping from 128 to ~2. See `docs/design/shared-wal-fsync-benchmark.md`
+  for the full method/numbers and ADR 0028's 2026-09-06 amendments (both
+  PR 1's benchmark and PR 2's wiring) for the full design record —
+  including the round/ack semantics, the GC policy and its bound, the
+  flag shape, and layout-mismatch handling. See `crates/animus-cp-data/
+  CLAUDE.md`'s own C-05 PR 2 entry for the persist-path wiring itself.
 
 - **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
   key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =

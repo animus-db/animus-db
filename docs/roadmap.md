@@ -143,7 +143,7 @@ the still-true paragraph after the table.
   every test U-08 already added) would close it; not sized here.
 - **ADR:** amendment notes on 0061.
 
-### C-05 `SharedWal` (built, unwired): keep, wire later
+### C-05 `SharedWal`: PR 1/2 landed, PR 3 (default cutover) pending
 
 - **Measured 2026-09-02** (`SimEnv`, exact `Disk::sync` count,
   single-voter groups, throwaway harness not committed): a burst of one
@@ -183,12 +183,40 @@ the still-true paragraph after the table.
   `SharedWal` behind a flag with the cross-tablet ordering corpus, segment
   GC, and crash-mid-roll fault injection (`ANIMUS_SHAREDWAL_SEEDS`) named
   above, then cut over. Next step: **C-05 PR 2**.
-- **Files:** `crates/animus-control/src/shared_wal.rs` (stays as is),
-  `crates/animus-cp-data/src/lib.rs` persist path,
-  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (PR 1, landed).
+- **PR 2 landed 2026-09-06** — `SharedWal` is wired into `animus-cp-data`'s
+  persist path (`persist_wal`'s append, `apply_and_compact`'s compaction
+  rewrite, and `host::erase_tablet_files`'s GC) behind `--shared-wal`
+  (`cluster_settings.shared_wal`), additive-default-OFF, reaching
+  `--config/--node` and `--cluster N` (the same two entry points PR 1's own
+  benchmark targeted). Fault corpus:
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
+  (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing (measured:
+  16 concurrently-writing groups → 2 physical `SharedWal` writes, stable
+  across 8 seeds), a crash mid-round with no cross-tablet contamination,
+  `forget`-driven per-tablet GC, and a quiet tablet surviving a noisy
+  sibling's real compaction. Real-`ProdEnv`/real-disk proof:
+  `crates/animusd/tests/shared_wal_e2e.rs`. New metrics:
+  `Metric::CpSharedWalSyncs`/`CpSharedWalGcRewrites`. See ADR 0028's C-05
+  PR 2 amendment for the full design record (round/ack semantics, recovery
+  indexing, GC bound, flag shape, layout-mismatch handling) and
+  `crates/animus-control/CLAUDE.md`/`crates/animus-cp-data/CLAUDE.md`/
+  `crates/animusd/CLAUDE.md` for the mechanism/wiring/flag-plumbing detail
+  respectively. **PR 3 (the default cutover) is not yet started** — mirrors
+  what C-02 (heartbeat batching) PR 3 did for that mechanism: flip the
+  default on, add a `--no-shared-wal` opt-out, and add a real-thread
+  liveness proof under sustained load (`heartbeat_batch_liveness.rs`'s own
+  role).
+- **Files:** `crates/animus-control/src/shared_wal.rs` (PR 1, unchanged
+  shape; PR 2 made it generic and added the tagged/group-aware API),
+  `crates/animus-cp-data/src/lib.rs`/`src/host.rs` persist path (PR 2, wired),
+  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (PR 1, landed),
+  `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs` (PR 2, new),
+  `crates/animusd/tests/shared_wal_e2e.rs` (PR 2, new),
+  `crates/animusd/src/{lib,main,config}.rs` (PR 2, flag plumbing).
 - **ADR:** amend 0028 on wiring (0028's 2026-09-06 amendment records PR 1's
-  own numbers/recommendation). **PRs:** (1) `ProdEnv` benchmark — **done**;
-  (2) wire behind a flag + corpus; (3) cutover. **Size:** L.
+  own numbers/recommendation; a second 2026-09-06 amendment records PR 2's
+  as-built design). **PRs:** (1) `ProdEnv` benchmark — **done**; (2) wire
+  behind a flag + corpus — **done**; (3) cutover — not started. **Size:** L.
 
 ---
 

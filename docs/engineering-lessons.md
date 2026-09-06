@@ -19846,3 +19846,169 @@ the actual Cargo/rustc behavior with a quick `cargo check` rather than
 trusting first-glance reasoning about what `#[cfg(test)]` should or
 shouldn't reach — Cargo's bench-target compilation semantics are not
 obvious from the attribute's name alone.
+
+## A crash/restart scenario must reuse the SAME `Simulator` instance across the restart — a second `Simulator::new(seed)` is a brand-new, empty simulated world sharing nothing but the RNG seed (C-05 PR 2, `sharedwal_fault_corpus.rs`)
+
+Writing the shared-WAL crash-mid-round corpus cell, the first draft
+structured the "reconstruct after crash" phase as a fresh `let sim2 =
+Simulator::new(seed);` — reasoning, wrongly, that reusing the same seed
+would reproduce the same simulated disk state the first `Simulator` had
+accumulated (including the crash's own torn-tail/corruption effects). It
+does not: `Simulator::new(seed)` seeds only the deterministic RNG stream
+a run *drives itself* with going forward: a fresh `Simulator` starts with
+a completely empty in-memory disk, no matter what seed it shares with an
+earlier, unrelated `Simulator` value. The bug surfaced immediately and
+unambiguously — a write confirmed durable before the "crash" read back as
+`None` after "recovery," which looks exactly like a real durability bug
+in the mechanism under test until traced back to the test's own fixture
+shape.
+
+**Fix**: use one `let mut sim = Simulator::new(seed);` for the whole
+scenario. `sim.crash(node)` mutes tasks and tears the node's buffered
+(unsynced) disk state per `DiskConfig`'s fault settings; `sim.stop(node)`
+removes tasks while preserving durable disk state; `sim.restart(node)`
+re-arms tasks and clears the `crashed` flag — all three act on the SAME
+simulated disk, so reconstructing fresh `SharedWal`/`RaftKvNode` handles
+afterward genuinely recovers from what the crash left behind. This
+mirrors a pattern already established in `crates/animus-control/src/
+shared_wal.rs`'s own unit tests (e.g.
+`survives_two_crash_restart_cycles_with_interleaved_tablets`) — grep for
+that shape before writing a new crash/restart scenario rather than
+re-deriving it.
+
+**General form**: a `Simulator`'s seed determines its own *future*
+random choices, not a snapshot of accumulated *state* — two `Simulator`
+values sharing a seed are two independent empty worlds that will make the
+same sequence of random decisions if driven identically from scratch,
+never two views onto the same disk. A crash/restart scenario needs
+exactly one `Simulator` value, mutated in place through `crash`/`stop`/
+`restart`, for its whole lifetime.
+
+## `SimEnv`'s cooperative scheduler needs an injected `sync_delay` to make "concurrent" disk writes genuinely overlap — with none configured, one task's whole persist round runs to completion before the executor ever polls a second one (C-05 PR 2, `sharedwal_fault_corpus.rs`)
+
+The shared-WAL coalescing cell (`scenario_a_coalescing`) is meant to prove
+that a burst of writes to many hosted tablet groups, issued back-to-back
+with no intervening `run_for`, coalesces into far fewer physical
+`SharedWal` writes than groups. The first draft showed **zero**
+coalescing (16 groups, 16 groups' worth of physical writes) even though
+the mechanism under test was already correctly wired. The cause was not
+in `SharedWal` at all: `SimEnv`'s disk operations resolve synchronously
+(no forced yield) unless a `DiskConfig::set_sync_delay` is configured, so
+under the default zero-delay disk, each group's driver task ran its
+entire persist round — enqueue, win the internal leader race, flush,
+release — to completion before the single-threaded cooperative executor
+ever got a chance to poll a *second* group's task. With no two groups'
+writes ever pending at the same instant, `SharedWal`'s own coalescing
+logic had nothing to coalesce — correct behavior, wrong test setup.
+
+**Fix**: arm `DiskConfig::set_sync_delay(Duration::from_millis(20))`
+before issuing the burst. A nonzero delay forces a real virtual-time
+suspension inside each `env.append`/`env.sync` call, which lets the
+executor advance other groups' tasks and let them enqueue behind the
+current "leader" before it finishes its round — after this fix, 16
+writes coalesced into 2 physical writes, stably across 8 seeds.
+
+**General form**: a `SimEnv` test whose whole point is to prove
+*concurrent* activity coalesces/interacts (group commit, batching, a
+race between two async tasks) needs an artificially injected disk delay
+(or an equivalent yield point) to make the interleaving happen at all —
+otherwise the cooperative single-threaded scheduler silently serializes
+what production concurrency would have genuinely overlapped, and the
+test proves nothing about the property it was written to check. This
+generalizes the "SimEnv proves logic and ordering, not real-thread
+liveness" lesson one level further: without a deliberate yield point, it
+may not even prove *ordering* under concurrency, because nothing forces
+two tasks to actually interleave.
+
+## A test's own single-shot assertion right after a fresh process bring-up can race an event-driven background reconciler, even when the mechanism under test is fully correct — poll to convergence, not just "the write landed before the crash" (C-05 PR 2, `shared_wal_e2e.rs`)
+
+The real-`ProdEnv` shared-WAL end-to-end test restarts a node on the same
+data directory/addresses and immediately re-reads both tables' data
+through a fresh `GetItem`. An early draft asserted this with a single,
+immediate `assert_eq!` right after the restarted node's bring-up returned
+successfully, and it flaked — not because the shared WAL lost data (the
+values were genuinely durable and recoverable), but because the
+tablet-host reconciler re-hosts each table's tablet **asynchronously**,
+on its own event-driven cadence with a fallback poll interval, after a
+process restart; a request landing before that settles can legitimately
+route to a not-yet-hosted group and read back `None` or time out
+internally, independent of anything shared-WAL-specific. This is exactly
+the class of bug the root `CLAUDE.md`'s "Eventual properties get a
+converged-or-timeout poll, never a fixed-deadline one-shot assert" rule
+exists to prevent — and it was reproduced here in freshly written test
+code, not inherited from an older test, which is worth naming plainly:
+following house discipline is not optional just because the code is new.
+
+Separately, the very first bring-up (before any restart) also needs the
+established "port-TOCTOU bring-up retry" idiom (retry the *whole*
+fresh-port-allocation-plus-start as a unit against a wall-clock deadline)
+— a freshly `free_addrs`-allocated port can still lose a bind race under
+`cargo test`-level contention, and a single-attempt bring-up is a
+documented flake class in this codebase, not a "this test is flaky" one.
+
+**Fix**: added a `poll_get_item_consistent` helper (bounded convergence
+poll, 50ms retry interval, a genuine budget-exceeded failure still fails
+the test — this is about tolerating the reconciler's own catch-up window,
+never about tolerating real data loss) for every post-restart read, and a
+`bring_up` helper mirroring `tests/support::bring_up_deadline`'s shape for
+the initial bring-up. Verified 0/25 failures after both fixes (25
+consecutive `--nocapture` runs), confirming the flake was a genuine
+test-harness race against an asynchronous reconciler, not a product bug.
+
+**General form**: any test that restarts a real node and then reads
+through the wire immediately afterward must poll to convergence, even
+when the write itself long predates the restart and the mechanism being
+tested is otherwise proven correct — a fresh process's own background
+reconcilers (tablet hosting, membership catch-up, cache warm-up) are
+themselves eventual properties, and a single-shot read racing them is a
+harness bug that looks exactly like a product bug until traced.
+
+## A flag that changes which durable file a node reads at startup needs a loud mismatch check before the first read, not a documented "silent reset is fine" judgment call (C-05 PR 2, `--shared-wal` layout mismatch)
+
+The first cut of the `--shared-wal` layout-mismatch design (ADR 0028's
+amendment) reasoned that flipping the flag against an existing data
+directory was safe because the two layouts (`raftkv.wal.shared` vs.
+`raftkv.wal.<stream>`) live at disjoint filenames — no file gets
+overwritten or corrupted, so the newly-selected layout just "starts from
+whatever it already has" (empty, on a first flip) while the old layout's
+files sit unread beside it. That reasoning is correct as far as it goes,
+and is exactly why it read as a reasonable, deliberate scope cut at the
+time ("no additional loud-failure check... which this PR judged
+sufficient for an internal, off-by-default tuning flag"). It missed the
+actual hazard: "no file gets corrupted" is not the same claim as "no data
+is lost." A node started with the flag flipped reads the *other* file —
+the durably-empty one — and recovers every hosted tablet's Raft state
+(log, term, `voted_for`) as if it had never persisted anything, which is
+indistinguishable, to the recovery code, from a legitimate first boot. For
+an off-by-default flag that a later PR (this same mechanism's own PR 3)
+intends to default ON across every existing deployment, "silently reset
+every tablet's Raft state on the next restart with no operator action
+beyond a version upgrade" is not a tolerable failure mode — it needed to
+be a hard startup refusal from the start, not a documented risk accepted
+for later.
+
+**Fix**: `animus_cp_data::host::check_wal_layout(env, shared_wal)` — a
+directory listing (`Env::list()`, not a file open, so it costs nothing and
+can run before any recovery path touches a durable file at all) that
+refuses to start whenever `shared_wal` disagrees with what the data
+directory already holds under the *other* layout, naming both layouts and
+the flag in the error. Called once, before `SharedWal::open` and before
+any tablet's own `drive()` recovery. Proven both directions with a
+`SimEnv`-backed unit test and, since a directory-listing check is cheap
+enough to be worth proving through the real production entry point too,
+a real-`ProdEnv` end-to-end test asserting the actual `main.rs`-visible
+error text after a genuine process restart with the flag flipped.
+
+**General form**: when a boolean (or enum) startup flag selects which
+*durable file* a node's recovery path reads — not just which code path
+runs — a mismatch between the flag and what's already on disk is a
+silent-data-loss hazard by construction, even when the two candidate
+files are individually well-isolated from each other on disk. The
+question to ask before shipping such a flag isn't "can flipping it
+corrupt a file" (usually no, if the files are disjoint) but "can flipping
+it make a real recovery read from an empty/wrong file and proceed as if
+that were legitimate" (often yes) — and if so, a loud pre-flight check
+belongs in the same PR that introduces the flag, not deferred to "if it
+ever proves surprising in practice," especially when a follow-on PR in
+the same feature train plans to flip the flag's default for every
+existing deployment.

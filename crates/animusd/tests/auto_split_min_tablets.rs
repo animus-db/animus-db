@@ -53,6 +53,7 @@ async fn start_cluster_with_tablet_ceilings(
         None,
         Some(max_read_units),
         Some(max_write_units),
+        false,
     )
     .await
     .unwrap()

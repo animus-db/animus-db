@@ -121,12 +121,12 @@ mod write_path;
 use control_handle::{AnimusdRelayClient, ControlHandle, RemoteControlClient};
 
 use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
-use animus_control::{PlacementPolicy, ProposeResult, RaftNode};
+use animus_control::{PlacementPolicy, ProposeResult, RaftNode, SharedWal};
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler};
+use animus_cp_data::host::{MemoryTabletEngines, MetadataView, Reconciler, check_wal_layout};
 use animus_cp_data::{
-    FastRead, KindBatchOutcome, RaftKvNode, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId,
-    TxnOutcome, TxnRecordView,
+    FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome, SHARED_WAL,
+    StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
     Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
@@ -4180,6 +4180,7 @@ impl BoundNode {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -4282,6 +4283,7 @@ impl BoundNode {
         tablet_max_read_units: Option<u64>,
         tablet_max_write_units: Option<u64>,
         export_s3: Option<ExportS3Config>,
+        shared_wal: bool,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4540,6 +4542,18 @@ impl BoundNode {
         // stands each table's group up once `CreateTable` provisions its
         // tablet, and re-forms it from the shared engine's already-durable
         // data on restart.
+        // C-05 PR 2 (ADR 0028): a clone kept for the `--shared-wal` opt-in
+        // below, taken BEFORE `hook_env` is moved into the reconciler's own
+        // `EngineFactory` construction in the match arms right after.
+        let shared_wal_env = hook_env.clone();
+        // ADR 0028's layout-mismatch amendment (C-05 PR 2 follow-up): refuse
+        // to start — loudly, before touching a single WAL/engine file — if
+        // this node's data directory already holds a WAL layout other than
+        // the one `shared_wal` selects. A directory listing only; see
+        // `animus_cp_data::host::check_wal_layout`'s own doc for why a
+        // silent flip would be a genuine data-loss/Raft-safety hazard, not
+        // a mere convenience, and must never be allowed to happen quietly.
+        check_wal_layout(&shared_wal_env, shared_wal).await?;
         let mut reconciler = {
             let host_edge = edge.clone();
             let teardown_edge = edge.clone();
@@ -4598,6 +4612,24 @@ impl BoundNode {
         // enable_heartbeat_batching`'s own doc.
         if heartbeat_batch {
             reconciler.enable_heartbeat_batching();
+        }
+        // C-05 PR 2 (ADR 0028) production wiring: route every data-plane
+        // group this reconciler hosts through the per-node shared WAL —
+        // `--shared-wal` CLI/`cluster_settings.shared_wal` config flag, off
+        // by default (every existing call site passes `false`, zero
+        // behavior change). `SharedWal::open` is the ONE seeding read
+        // (`animus_control::shared_wal`'s module doc, "Recovery / GC
+        // contract") — it must run exactly once, before any group's own
+        // driver starts, which is why this sits here rather than inside
+        // `host::Reconciler::enable_shared_wal` itself (a pure, sync
+        // setter that can't `.await`).
+        if shared_wal {
+            let shared = SharedWal::<KvCommand, KvState>::open(&shared_wal_env, SHARED_WAL)
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("opening the shared WAL failed: {e}"))
+                })?;
+            reconciler.enable_shared_wal(shared);
         }
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
@@ -10354,6 +10386,15 @@ impl CpReconciler {
         }
     }
 
+    /// C-05 PR 2 (ADR 0028) production wiring — see [`Reconciler::
+    /// enable_shared_wal`]'s doc.
+    fn enable_shared_wal(&mut self, shared: Arc<SharedWal<KvCommand, KvState>>) {
+        match self {
+            CpReconciler::Lsm(r) => r.enable_shared_wal(shared),
+            CpReconciler::Mem(r) => r.enable_shared_wal(shared),
+        }
+    }
+
     /// ADR 0058 Train 2 rung 4 layer 1 — see [`Reconciler::fork_wake`]'s doc.
     async fn fork_wake(&self) {
         match self {
@@ -11917,6 +11958,7 @@ pub async fn start_cluster_with(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -11956,6 +11998,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -11992,6 +12035,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12035,6 +12079,7 @@ pub async fn start_cluster_with_streams(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12076,6 +12121,7 @@ pub async fn start_cluster_with_growth(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12121,6 +12167,7 @@ pub async fn start_cluster_with_quiesce_after(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12178,6 +12225,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    shared_wal: bool,
 ) -> std::io::Result<Vec<Node>> {
     start_cluster_inner(
         bound,
@@ -12197,6 +12245,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         throttle_write_units,
         tablet_max_read_units,
         tablet_max_write_units,
+        shared_wal,
     )
     .await
 }
@@ -12220,6 +12269,7 @@ async fn start_cluster_inner(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    shared_wal: bool,
 ) -> std::io::Result<Vec<Node>> {
     let n = bound.len();
     let control_ids: Vec<NodeId> = (0..n).map(config::node_id).collect();
@@ -12310,6 +12360,7 @@ async fn start_cluster_inner(
                 // `Node::set_export_store_factory` to inject a test store
                 // on a node started this way.
                 None,
+                shared_wal,
             )
             .await?;
         nodes.push(node);
@@ -12725,6 +12776,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12775,6 +12827,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12830,6 +12883,7 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -12860,6 +12914,12 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// unbatched behavior. `main.rs`'s `run_single` is this function's real
 /// caller, mirroring `quiesce_after`'s own reach exactly.
 ///
+/// `shared_wal` (C-05 PR 2, ADR 0028): `--config FILE --node I`'s
+/// `--shared-wal` CLI/`cluster_settings.shared_wal` config flag — `false`
+/// (every other call site) is byte-for-byte today's per-tablet-WAL-file
+/// behavior. `main.rs`'s `run_single` is this function's real caller,
+/// mirroring `heartbeat_batch`'s own reach exactly.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -12883,6 +12943,7 @@ pub async fn run_node_with_cluster_settings(
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
     export_s3: Option<ExportS3Config>,
+    shared_wal: bool,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -12906,6 +12967,7 @@ pub async fn run_node_with_cluster_settings(
         tablet_max_read_units,
         tablet_max_write_units,
         export_s3,
+        shared_wal,
     )
     .await
 }
@@ -12962,6 +13024,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
     export_s3: Option<ExportS3Config>,
+    shared_wal: bool,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -13039,6 +13102,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             tablet_max_read_units,
             tablet_max_write_units,
             export_s3,
+            shared_wal,
         )
         .await
 }
@@ -13082,6 +13146,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         None,
         None,
         None,
+        false,
     )
     .await
 }

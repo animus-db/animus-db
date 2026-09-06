@@ -428,6 +428,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // needs to be turned off in the field. See `animusd::config::
     // ClusterSettings::heartbeat_batch`'s own doc for the full mechanism.
     let mut heartbeat_batch: Option<bool> = None;
+    // `--shared-wal` (C-05 PR 2, ADR 0028): routes every data-plane CP group
+    // this node hosts through one per-node `SharedWal` instead of each
+    // group's own private WAL file. A bare boolean flag, no opt-out
+    // counterpart yet (unlike `--heartbeat-batch`/`--no-heartbeat-batch`) —
+    // the default stays OFF in this PR (PR 3 is the cutover that would make
+    // an opt-out meaningful); omitting the flag is byte-for-byte today's
+    // per-group-file behavior. See `animusd::config::ClusterSettings::
+    // shared_wal`'s own doc for the full mechanism.
+    let mut shared_wal: Option<bool> = None;
     // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
     // §5(a), W-08 step 4): the cluster-wide default read/write
     // capacity-units budget applied to any table that has not set its own
@@ -542,6 +551,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
             "--heartbeat-batch" => heartbeat_batch = Some(true),
             "--no-heartbeat-batch" => heartbeat_batch = Some(false),
+            "--shared-wal" => shared_wal = Some(true),
             "--throttle-read-units" => {
                 throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
             }
@@ -582,6 +592,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         orphan_sweep_after_secs: orphan_sweep_after,
         quiesce_after_secs: quiesce_after,
         heartbeat_batch,
+        shared_wal,
         stream_seal_bytes,
         stream_seal_age_secs,
         stream_retention_secs,
@@ -708,6 +719,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 throttle_write_units,
                 tablet_max_read_units,
                 tablet_max_write_units,
+                cli_cluster_settings.shared_wal.unwrap_or(false),
             )
             .await
         }
@@ -1374,6 +1386,7 @@ fn resolve_cluster_settings(
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
     merge_field!(heartbeat_batch, "--heartbeat-batch/--no-heartbeat-batch");
+    merge_field!(shared_wal, "--shared-wal");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
@@ -1484,6 +1497,7 @@ async fn run_single(
         settings.tablet_max_read_units,
         settings.tablet_max_write_units,
         export_s3,
+        settings.shared_wal.unwrap_or(false),
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -2018,6 +2032,7 @@ async fn run_in_process_cluster(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    shared_wal: bool,
 ) -> Result<(), String> {
     if n == 0 {
         return Err("--cluster must be at least 1".into());
@@ -2044,6 +2059,7 @@ async fn run_in_process_cluster(
         throttle_write_units,
         tablet_max_read_units,
         tablet_max_write_units,
+        shared_wal,
     )
     .await
     .map_err(|e| format!("failed to start cluster: {e}"))?;

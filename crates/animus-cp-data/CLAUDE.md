@@ -1655,6 +1655,107 @@ demand the identical action, so no disambiguation is needed.
 - Distinct WAL file (`raftkv.wal`) from the control plane's `raft.wal`, so a
   node can host both planes. The name is exported (`animus_cp_data::WAL`) so
   the drop-table GC (ADR 0024) can delete a stopped group's WAL.
+- **`SharedWal` is wired into this exact persist path behind `--shared-wal`
+  (C-05 PR 2, ADR 0028's amendment)** — an **additive, default-OFF**
+  alternative to the per-group `raftkv.wal` file above, not a replacement
+  for it: every `RaftKvNode::start_*` constructor gained a trailing
+  `shared_wal: Option<Arc<animus_control::SharedWal<KvCommand, KvState>>>`
+  parameter (threaded onto `DriveState`), and both drainers described in
+  "What's non-obvious" above branch on it:
+  - **`persist_wal`** (the consensus loop's own drainer) takes the shared
+    handle plus this group's `TabletId` and the node's `MetricsHandle`
+    now. With a handle present it calls `SharedWal::append_tagged(env,
+    SHARED_WAL, tablet, &records)` instead of its own `env.append`-loop +
+    `env.sync` — one **tagged** record per `WalRecord`, written under
+    `SharedWal`'s own internal `wal_lock`-equivalent (a `futures::lock::
+    Mutex` serializing every hosted group's writers into one coalesced
+    `append`+`sync` round, C-05 PR 1) rather than this group's own
+    private `wal_lock`. Every halted-gating/hard-panic-on-a-live-error
+    rule described above for the per-group path is unchanged — a
+    `SharedWal::append_tagged` error is tolerated iff `halted`, a hard
+    panic otherwise, identically. Increments `Metric::CpSharedWalSyncs`
+    on success (a per-physical-write counter, not per-group-append — see
+    "one fsync per round" below).
+  - **`apply_and_compact`** (the apply task's compaction rewrite) takes
+    the shared handle too. With a handle present, compaction calls
+    `SharedWal::compact_group(env, SHARED_WAL, TabletId(tablet),
+    c.wal_image())` instead of building its own whole-file `buf` and
+    calling `env.replace(wal, &buf)` — `compact_group` **whole-file
+    rewrites the shared file**, replacing only this tablet's own record
+    slice (`group_tails[tablet]`) while re-serializing every *other*
+    hosted group's own latest tail verbatim
+    (`encode_multiplexed_image`) — never touching a sibling group's own
+    records. `erase_tablet_files` (`host.rs`) mirrors this split: with a
+    handle present it calls `SharedWal::forget(env, SHARED_WAL, tablet)`
+    (a compaction with an empty image for this tablet — the "GC" this
+    file's Reconciler entry describes) instead of `env.remove(&wal_file
+    (tablet.0))`. Increments `Metric::CpSharedWalGcRewrites` on success.
+  - **Recovery** (`drive`'s startup section): with a handle present, the
+    file name resolved is `SHARED_WAL` (`"raftkv.wal.shared"`, exported
+    alongside `WAL`) rather than this group's own `wal_file(stream)`, and
+    the initial `PersistedState` comes from `SharedWal::recovered_state
+    (tablet)` — a per-tablet replay over whatever `group_tails[tablet]`
+    `SharedWal::open` seeded at node startup (once, before any group's
+    own `drive()` runs — see `host::Reconciler::enable_shared_wal` below)
+    — instead of a direct `env.read(&wal_file(..))` +
+    `PersistedState::decode`/`replay`. Every downstream witnessing-loop/
+    `fresh_group`/`RaftCore::recovered` step is unchanged either way —
+    both branches produce the identical `PersistedState` shape, just from
+    a different physical source.
+  - **`host::Reconciler::enable_shared_wal(shared: Arc<SharedWal<..>>)`**
+    (mirroring `enable_heartbeat_batching`'s existing shape) is the one
+    production entry point: `animusd` calls it once per node, right after
+    `SharedWal::open`, before hosting anything — every one of
+    `Reconciler::host`/`materialize_split_child`'s calls into
+    `RaftKvNode::start_hosted*` and `erase_tablet_files`'s GC path then
+    thread `self.shared_wal.clone()` through automatically. A node with
+    the flag off (`self.shared_wal: None`) takes every branch above's
+    `None` arm — byte-identical to pre-PR-2 behavior, including the exact
+    physical file layout (`raftkv.wal.shared` is simply never created).
+  - **`host::check_wal_layout(env, shared_wal) -> io::Result<()>`** (free
+    function, corrected 2026-09-06 — an earlier draft of this PR shipped
+    the layout-mismatch case as a silent, deliberate data reset instead;
+    see the ADR amendment's own corrected paragraph for why that was
+    wrong, not merely conservative) is the loud-failure half of the flag:
+    called once, from `animusd`'s node-start path, **before**
+    `SharedWal::open` and before any tablet's own `drive()` recovery runs.
+    A directory listing only (`Env::list()`, never a file open) — it
+    refuses (a plain `io::Error::other`, naming both layouts and the flag)
+    whenever `shared_wal` disagrees with what the data directory already
+    holds: per-group `{WAL}.<stream>` files present but `shared_wal` is
+    `true`, or `SHARED_WAL` present but it's `false`. A directory holding
+    neither layout yet (a genuinely fresh `--dir`) always passes. This is
+    what makes flipping the flag against an existing data dir a **startup
+    failure**, not a silent per-tablet Raft-state reset — see this
+    section's own "What this does NOT change" bullet just below for why a
+    silent reset would have been a genuine data-loss/Raft-safety hazard,
+    not a convenience. Unit-tested both directions, `host::
+    wal_layout_tests` (a `SimEnv` fixture, no `ProdEnv`/sockets needed —
+    `Env::list()` is deterministic under `SimEnv` like every other `Disk`
+    method); real-`ProdEnv` proof through the actual `animusd` startup
+    surface: `crates/animusd/tests/shared_wal_e2e.rs::
+    a_restart_with_shared_wal_flipped_refuses_to_start`.
+  - **What this does NOT change**: the per-group `wal_lock`, the
+    `persist_round`/`ships_before_durable` accounting, `snapshot_upto`'s
+    discard-under-lock, `COMPACT_THRESHOLD`/`COMPACT_DEFER_CEILING`, and
+    every ack/durability-claim rule described above are all unmodified —
+    `SharedWal` only changes *where the bytes physically land and how
+    many fsyncs a round of concurrent hosted-group writes costs*, never
+    *when* an ack may fire relative to those bytes landing. See
+    `crates/animus-control/CLAUDE.md`'s own `shared_wal.rs` entry for the
+    coordinator's internal mechanism (the tagged vs. raw API split,
+    `submit_with_mutation`'s atomicity argument, `physical_write_count()`)
+    and `docs/adr/0028-shared-storage-single-command-split.md`'s C-05 PR 2
+    amendment for the full design record (round/ack semantics, recovery
+    indexing, the GC bound, the flag's exact reach, and the layout-
+    mismatch loud-failure check). Fault-injection corpus:
+    `crates/animus-cp-data/tests/sharedwal_fault_corpus.rs`
+    (`ANIMUS_SHAREDWAL_SEEDS`, default 1) — cross-tablet coalescing, a
+    crash mid-round with no cross-tablet contamination, `forget`-driven
+    GC, and a quiet tablet surviving a noisy sibling's real compaction.
+    Real-`ProdEnv`/real-disk proof: `crates/animusd/tests/
+    shared_wal_e2e.rs` (two tables sharing one node's `SharedWal` over a
+    genuine process restart).
 - **Quiescence (ADR 0044 phase 1 / ADR 0048), data-plane groups only.** An
   idle group opted in via `RaftKvNode::enable_quiescence(after)` stops
   ticking entirely once its leader has had no local activity for `after`

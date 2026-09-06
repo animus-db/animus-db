@@ -157,6 +157,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_LSM_CRASH_SEEDS=K` | 1 | `LsmEngine` crash-safety corpus depth (`animus-storage`, `tests/lsm_crash.rs`) |
 | `ANIMUS_LSM_DISK_FAULT_SEEDS=K` | 1 | `LsmEngine` `DiskConfig` fault-injection corpus depth (`animus-storage`, `tests/lsm_disk_faults.rs`) |
 | `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
+| `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 PR 2) — `cargo test -p animus-cp-data --test sharedwal_fault_corpus` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test heartbeat_batch_corpus` |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |

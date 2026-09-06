@@ -272,6 +272,22 @@ pub struct ClusterSettings {
     /// `RaftCore::heartbeat_interval`, see that constant's own doc.
     #[serde(default)]
     pub heartbeat_batch: Option<bool>,
+    /// `--shared-wal` (C-05 PR 2, ADR 0028): routes every data-plane CP
+    /// group this node hosts through one per-node [`SharedWal`](animus_
+    /// control::SharedWal) instead of each group's own private WAL file —
+    /// coalesces a burst across several co-hosted groups into far fewer
+    /// physical `fsync`s (see `docs/design/shared-wal-fsync-benchmark.md`).
+    /// `None`/absent (this field's own default) is `false` —
+    /// **additive-default OFF**, unlike `heartbeat_batch`'s post-cutover
+    /// default-on posture: this is C-05 PR 2, the wiring PR, not yet PR 3's
+    /// cutover. An explicit `true` opts in. No on-disk compatibility
+    /// promise between the two layouts (root `CLAUDE.md`'s no-back-compat
+    /// stance) — flipping this against an existing data dir written under
+    /// the OTHER layout fails node start loudly rather than silently
+    /// mixing them (see `animus-cp-data/CLAUDE.md`'s C-05 PR 2 entry for
+    /// the exact check).
+    #[serde(default)]
+    pub shared_wal: Option<bool>,
     /// `--stream-seal-bytes B` (ADR 0042 §13): the DynamoDB Streams
     /// sealer's size trigger.
     #[serde(default)]
@@ -769,6 +785,7 @@ mod tests {
             orphan_sweep_after_secs: Some(120),
             quiesce_after_secs: Some(10),
             heartbeat_batch: Some(true),
+            shared_wal: Some(true),
             stream_seal_bytes: Some(4_194_304),
             stream_seal_age_secs: Some(3600),
             stream_retention_secs: Some(86_400),
@@ -798,6 +815,7 @@ mod tests {
         assert_eq!(settings.auto_split_bytes, Some(2_000_000));
         assert_eq!(settings.quiesce_after_secs, None);
         assert_eq!(settings.heartbeat_batch, None);
+        assert_eq!(settings.shared_wal, None);
         assert_eq!(settings.orphan_sweep_after_secs, None);
         assert_eq!(settings.stream_seal_bytes, None);
         assert_eq!(settings.stream_seal_age_secs, None);

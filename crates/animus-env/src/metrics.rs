@@ -719,12 +719,31 @@ pub enum Metric {
     /// (a group released or not-yet-hosted at the instant a peer's frame
     /// arrived) worth investigating, not a hard fault on its own.
     CpHeartbeatDemuxDropped,
+    /// C-05 PR 2 (ADR 0028): one physical `SharedWal` `Disk::append` +
+    /// `Disk::sync` round completed — recorded once per **round**, whether
+    /// that round carried one hosted group's own records or several
+    /// overlapping groups' coalesced together. This is the coalescing win
+    /// `docs/design/shared-wal-fsync-benchmark.md` measured, made
+    /// observable: on a node with `--shared-wal` on and K co-hosted active
+    /// groups bursting together, this counter should stay far below K per
+    /// burst instead of scaling with it. Recorded only on the shared-WAL
+    /// path — a per-group `wal_file` node never touches this metric.
+    CpSharedWalSyncs,
+    /// C-05 PR 2 (ADR 0028): one `SharedWal::compact_group`/`forget`
+    /// whole-file rewrite completed — the shared WAL's GC mechanism (see
+    /// `animus_control::shared_wal`'s module doc, "GC policy"). Distinct
+    /// from [`CpSnapshotTriggers`], which fires on the identical trigger
+    /// condition regardless of whether the WAL is shared or per-group;
+    /// this one is shared-WAL-specific observability for how often a
+    /// tablet's own compaction pays the cost of rewriting every OTHER
+    /// co-hosted tablet's own cached tail too.
+    CpSharedWalGcRewrites,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 91] = [
+    pub const ALL: [Metric; 93] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -816,6 +835,8 @@ impl Metric {
         Metric::AutoSplitMinTablets,
         Metric::CpHeartbeatFramesSent,
         Metric::CpHeartbeatDemuxDropped,
+        Metric::CpSharedWalSyncs,
+        Metric::CpSharedWalGcRewrites,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -914,6 +935,8 @@ impl Metric {
             Metric::AutoSplitMinTablets => "auto_split_min_tablets",
             Metric::CpHeartbeatFramesSent => "cp_heartbeat_frames_sent",
             Metric::CpHeartbeatDemuxDropped => "cp_heartbeat_demux_dropped",
+            Metric::CpSharedWalSyncs => "cp_shared_wal_syncs",
+            Metric::CpSharedWalGcRewrites => "cp_shared_wal_gc_rewrites",
         }
     }
 
