@@ -182,7 +182,7 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, MaybeTlsStream, Metric, Rng};
+use animus_env::{Clock, Env, MaybeTlsStream, Metric, NodeId, Rng};
 use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -2619,13 +2619,50 @@ async fn provision_import_target(
     })
 }
 
+/// The first `min(N, MAX_REPLICATION_FACTOR)` `Active` members of `meta` —
+/// [`finish_import_kickoff`]'s own replica pick, factored out to a pure
+/// function purely so the one property that matters (an empty `Metadata`,
+/// or one with no `Active` member at all, yields an **empty** `Vec`, never
+/// a panic or a garbage placeholder) is unit-testable without a real
+/// cluster. See [`finish_import_kickoff`]'s own doc for why the caller must
+/// never propose `BeginImport` with an empty result from this function —
+/// unlike [`provision_tablet`](ClientCtx::provision_tablet)'s own identical
+/// selection for `CreateTablet`, this one feeds a tablet minted `Building`,
+/// which `reconcile_placement` can never later repair.
+fn active_replicas_for_new_tablet(meta: &Metadata) -> Vec<NodeId> {
+    let mut replicas: Vec<NodeId> = meta
+        .members
+        .iter()
+        .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+        .map(|(id, _)| id.clone())
+        .collect();
+    replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+    replicas
+}
+
 /// Mint the single destination tablet + propose `MetaCommand::BeginImport`
 /// (mirrors [`restore_table_from_backup`]'s own [`finish_restore_kickoff`]).
 /// The replica set follows [`provision_tablet`](ClientCtx::provision_tablet)'s
 /// own convention — the first `min(N, MAX_REPLICATION_FACTOR)` `Active`
-/// members. Returns immediately once the row commits — **asynchronous**;
-/// the import driver (`crate::import`) does the actual seeding in the
-/// background.
+/// members ([`active_replicas_for_new_tablet`]). Returns immediately once
+/// the row commits — **asynchronous**; the import driver (`crate::import`)
+/// does the actual seeding in the background.
+///
+/// **Never proposes `BeginImport` with an empty replica set** (issue found
+/// on a CI shard running several `animusd` integration-test binaries under
+/// heavy contention, 2026-09-06; `docs/engineering-lessons.md` has the full
+/// diagnosis): every member transiently `Down` — a real-thread failure-
+/// detector false positive under CPU-starved scheduling, ADR 0012, not a
+/// `SimEnv`-provable race — used to commit a `Building` tablet with
+/// `replicas: []`, which no node's tablet-host reconciler can ever host
+/// (`plan_join_host`'s own `replicas.contains(&base_id)` check) and which
+/// `reconcile_placement`'s ordinary self-heal can never repair either
+/// (its own `TabletState::Active` gate — this tablet stays `Building`
+/// until it is fully seeded, a state it can now never reach): a permanent,
+/// silent dead end, not a slow recovery. Fixed by waiting (bounded by this
+/// function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`]) for at least one
+/// `Active` member before minting, and skipping the propose (retrying with
+/// a fresh id) if the wait still ends empty.
 async fn finish_import_kickoff(
     ctx: &ClientCtx,
     s3_bucket: &str,
@@ -2646,15 +2683,47 @@ async fn finish_import_kickoff(
         // — a fresh random hex string, never interpreted, purely for the
         // `TableId` field real `ImportTableDescription` responses carry.
         let table_id = format!("{:032x}", ctx.env.next_u64());
-        let fresh = metadata_fresh(ctx).await;
+        // Wait (bounded) for at least one `Active` member before minting
+        // this import's destination tablet. Unlike `provision_tablet`'s own
+        // `CreateTablet` — whose tablet is minted `Active` and so stays
+        // reachable by `reconcile_placement`'s ordinary self-heal even if
+        // its own initial replica pick under-shoots — this tablet is minted
+        // `Building` and stays placement-frozen for as long as it is
+        // (`reconcile_placement`'s own `TabletState::Active` gate,
+        // `animus-control`'s `meta.rs`), so a `BeginImport` committed with
+        // an **empty** replica set (every member transiently `Down` under
+        // real-thread scheduling pressure — ADR 0012's failure detector, not
+        // a `SimEnv`-provable race) can never self-heal once committed: no
+        // node ever hosts it, `import_loop` polls "not hosted" forever, and
+        // the wire caller's own terminal-state poll times out. Mirrors
+        // `ClientCtx::provision_tablet`'s own `!replicas.is_empty()` gate
+        // (`schema.rs`) — never propose a destination this cluster cannot
+        // yet route to.
+        let fresh = {
+            let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+            loop {
+                let candidate = metadata_fresh(ctx).await;
+                if !active_replicas_for_new_tablet(&candidate).is_empty() {
+                    break candidate;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "import: no Active member observed while provisioning the \
+                         destination tablet; proceeding, next attempt will retry"
+                    );
+                    break candidate;
+                }
+                tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        };
         let tablet = fresh.next_free_tablet_id();
-        let mut replicas: Vec<_> = fresh
-            .members
-            .iter()
-            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
-            .map(|(id, _)| id.clone())
-            .collect();
-        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        let replicas = active_replicas_for_new_tablet(&fresh);
+        if replicas.is_empty() {
+            // Still nothing `Active` after waiting out the deadline above —
+            // mint a fresh id and retry rather than commit a tablet no node
+            // will ever host.
+            continue;
+        }
         ctx.propose_schema(&MetaCommand::BeginImport {
             import_id: import_id.clone(),
             target_table: provision.target_table.clone(),
@@ -9178,5 +9247,69 @@ mod list_backups_tests {
         )
         .expect("list_backups");
         assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
+    }
+}
+
+/// Regression for the 2026-09-06 CI flake (`docs/engineering-lessons.md`):
+/// [`active_replicas_for_new_tablet`] must never manufacture a nonempty
+/// result out of nothing, and must never include a non-`Active` member —
+/// the exact property whose absence let `finish_import_kickoff` commit a
+/// `Building` tablet with `replicas: []` when every member was transiently
+/// `Down`. Pure `Metadata::apply` — no cluster, no `ClientCtx`, no timing.
+#[cfg(test)]
+mod active_replicas_tests {
+    use animus_control::{MetaCommand, NodeStatus};
+
+    use super::*;
+
+    fn upsert(meta: &mut Metadata, node: NodeId, status: NodeStatus) {
+        meta.apply(&MetaCommand::UpsertMember {
+            node,
+            labels: Default::default(),
+            status,
+        });
+    }
+
+    #[test]
+    fn an_empty_metadata_yields_no_replicas() {
+        let meta = Metadata::default();
+        assert!(active_replicas_for_new_tablet(&meta).is_empty());
+    }
+
+    #[test]
+    fn every_member_down_yields_no_replicas() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Joining);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Leaving);
+        assert!(
+            active_replicas_for_new_tablet(&meta).is_empty(),
+            "no member is Active — this must read as \"not ready\", never as a \
+             valid (empty) replica set to commit"
+        );
+    }
+
+    #[test]
+    fn a_single_active_member_among_down_ones_is_picked() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Down);
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta),
+            vec![crate::config::node_id(1)]
+        );
+    }
+
+    #[test]
+    fn truncates_to_the_replication_factor() {
+        let mut meta = Metadata::default();
+        for i in 0..(crate::MAX_REPLICATION_FACTOR + 3) {
+            upsert(&mut meta, crate::config::node_id(i), NodeStatus::Active);
+        }
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta).len(),
+            crate::MAX_REPLICATION_FACTOR
+        );
     }
 }

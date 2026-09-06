@@ -153,11 +153,14 @@ pub(crate) async fn import_loop(ctx: ClientCtx) {
                 .find(|(t, _)| *t == row.tablet)
                 .map(|(_, g)| g.clone())
             else {
+                tracing::debug!(import_id, tablet = ?row.tablet, "import: tablet not hosted here yet");
                 continue; // not (or not yet) hosted here
             };
             if !group.is_leader() {
+                tracing::debug!(import_id, tablet = ?row.tablet, "import: hosted here but not leader yet");
                 continue;
             }
+            tracing::debug!(import_id, tablet = ?row.tablet, "import: ticking as leader");
             let now = Instant::now();
             let stuck = {
                 let mut guard = tracking.lock().await;
@@ -592,6 +595,7 @@ async fn propose_local(group: &CpGroup, rows: Vec<animus_cp_data::SeedRow>) -> b
     if rows.is_empty() {
         return true;
     }
+    let rows_len = rows.len();
     let index = match group.propose_seed_batch(rows) {
         ProposeResult::Accepted { index, .. } => index,
         other => {
@@ -599,13 +603,25 @@ async fn propose_local(group: &CpGroup, rows: Vec<animus_cp_data::SeedRow>) -> b
             return false;
         }
     };
+    tracing::debug!(
+        index,
+        rows_len,
+        "import: seed batch accepted, awaiting confirm"
+    );
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if group.engine_applied_index() >= index {
+            tracing::debug!(index, "import: seed batch confirmed");
             return true;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    tracing::warn!(
+        index,
+        applied = group.engine_applied_index(),
+        elapsed_ms = CONFIRM_TIMEOUT.as_millis() as u64,
+        "import: seed batch confirm timed out, will re-propose next tick"
+    );
     false
 }
 
@@ -627,7 +643,7 @@ async fn complete_import(
     processed_size_bytes: u64,
 ) {
     let completed_wall_ms = ctx.env.wall_now().0;
-    let _ = ctx
+    let accepted = ctx
         .propose_schema(&MetaCommand::CompleteImport {
             import_id: import_id.to_owned(),
             processed_item_count,
@@ -637,6 +653,11 @@ async fn complete_import(
             completed_wall_ms,
         })
         .await;
+    tracing::debug!(
+        import_id,
+        accepted,
+        "import: complete_import propose_schema result"
+    );
     // Read fresh: this import's own row (for its target table + GSI plan)
     // may have been mirrored by a different node's own apply task by now.
     let meta = ctx.effective_metadata();

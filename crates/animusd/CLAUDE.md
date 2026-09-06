@@ -4521,6 +4521,34 @@ ADR itself for the full design/rationale.
   `IN_PROGRESS` forever, since every fault in this driver is deliberately
   retried rather than surfaced — until the outer test's own
   converged-or-timeout poll finally gave up.
+  **A second, real production bug found the same way (CI flake,
+  2026-09-06, fixed)**: `dynamo::finish_import_kickoff`'s destination-
+  tablet replica pick — the identical "first `min(N, MAX_REPLICATION_
+  FACTOR)` `Active` members" snapshot `ClientCtx::provision_tablet` also
+  takes — had no guard against that snapshot coming back **empty** (every
+  member transiently `Down`, a real-thread failure-detector false positive
+  under CPU-starved contention, ADR 0012 — not a `SimEnv`-provable race).
+  `provision_tablet`'s own `CreateTablet` tolerates this because its
+  tablet mints `Active`, so `reconcile_placement`'s ordinary policy-driven
+  self-heal can still grow an under-shot set later; this tablet mints
+  `Building` and stays placement-frozen for its whole seeding lifetime
+  (`reconcile_placement`'s own `TabletState::Active` gate,
+  `animus-control`'s `meta.rs`) — a `Building` tablet with `replicas: []`
+  can never become `Active` (hosting requires a nonempty replica set in
+  the first place), so it never self-heals: `import_loop` polls "not
+  hosted here yet" forever and the wire caller's own terminal-state poll
+  times out. Fixed with the same guard `provision_tablet` already
+  established — wait (bounded by the existing `SCHEMA_COMMIT_TIMEOUT` per
+  attempt) for at least one `Active` member before computing `replicas`,
+  and skip proposing `BeginImport` (retry with a fresh id) if the wait
+  still ends empty. Reproduced with a foreground loop of the standalone
+  test binary run under contention from three sibling `animusd`
+  integration-test binaries (50-150 iterations, ~5-9% failure rate before
+  the fix, 0/250+ after); see `docs/engineering-lessons.md` for the full
+  diagnosis. **`dynamo::finish_restore_kickoff`
+  (`RestoreTableFromBackup`'s kickoff) has the byte-for-byte identical gap
+  and the identical `Building`-state freeze — not yet observed failing in
+  CI, not fixed here (own PR).**
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and
