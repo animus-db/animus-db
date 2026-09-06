@@ -883,6 +883,19 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // a live `RaftNode` handle, the identical `ExpireStreamShards`
         // precedent this function's own doc states above.
         | MetaCommand::MarkBackupDeleted { .. }
+        // S3 export workflow (ADR 0068, S-05): `ExportTableToPointInTime`
+        // (`animusd::dynamo::create_export`) may land on any node, exactly
+        // like `CreateBackup`. Unlike backup capture (per-tablet,
+        // control-plane-leader-agnostic), the export job is a single
+        // leader-driven job that runs on whichever node received the wire
+        // request (never necessarily the control-plane leader), so
+        // `CompleteExport`/`FailExport` — proposed by that same job once
+        // it finishes — need the identical relay path, unlike
+        // `CompleteBackup`/`FailBackup` (which are always proposed by the
+        // control-plane leader itself and so need none).
+        | MetaCommand::BeginExport { .. }
+        | MetaCommand::CompleteExport { .. }
+        | MetaCommand::FailExport { .. }
         // Restore workflow (ADR 0059 §7, Train 2): `RestoreTableFromBackup`
         // (`animusd::dynamo::restore_table_from_backup`) may land on any
         // node, exactly like `CreateTable`; the restore driver
@@ -1357,6 +1370,30 @@ mod tests {
             },
             MetaCommand::MarkBackupDeleted {
                 backup_id: "b1".to_string(),
+            },
+            MetaCommand::BeginExport {
+                export_id: "e1".to_string(),
+                table: table.clone(),
+                table_arn: "arn:aws:dynamodb:animus:0:table/t".to_string(),
+                s3_bucket: "bucket".to_string(),
+                s3_prefix: None,
+                format: animus_control::ExportFormat::DynamoDbJson,
+                export_type: animus_control::ExportType::Full,
+                export_time_ms: None,
+                client_token: None,
+                created_wall_ms: 0,
+            },
+            MetaCommand::CompleteExport {
+                export_id: "e1".to_string(),
+                item_count: 0,
+                billed_size_bytes: 0,
+                export_manifest: "manifest-summary.json".to_string(),
+                completed_wall_ms: 0,
+            },
+            MetaCommand::FailExport {
+                export_id: "e1".to_string(),
+                reason: "x".to_string(),
+                completed_wall_ms: 0,
             },
             MetaCommand::BeginRestore {
                 restore_id: "r1".to_string(),

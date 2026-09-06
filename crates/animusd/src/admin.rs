@@ -1358,6 +1358,10 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
                 Err(_) => Value::Null,
             }
         }
+        // An `ExportRow` (ADR 0068 §3) — same JSON passthrough convention
+        // as `Backup`/`Restore`/etc. above (no secret to redact — an S3
+        // bucket name/prefix is not a credential).
+        syskv::EntityKind::Export => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
     }
 }
 

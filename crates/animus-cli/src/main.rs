@@ -178,7 +178,10 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     restore <admin-addr> <backup-arn> <target-table>\n    \
     pitr-enable|pitr-disable <admin-addr> <table>\n    \
     ttl <admin-addr> <table> <attribute> [--disable]\n    \
-    stream <admin-addr> <table> <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>";
+    stream <admin-addr> <table> <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>\n    \
+    export-create <admin-addr> <table-arn> <s3-bucket> [s3-prefix]\n    \
+    export-describe <admin-addr> <export-arn>\n    \
+    export-list <admin-addr> [table-arn]";
 
 async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -618,6 +621,53 @@ fn admin_request(
             let body = serde_json::json!({
                 "op": "UpdateTable",
                 "payload": {"TableName": table, "StreamSpecification": spec},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // S3 export (ADR 0068, S-05) — same dynamo-proxy-wrapper shape as
+        // the backup/restore/PITR/TTL/stream group above:
+        // `export-create` takes the source table's own ARN directly (this
+        // adapter's own convention: `arn:aws:dynamodb:animus:0:table/
+        // <name>`, printed by `DescribeTable`/`CreateTable`), never a bare
+        // table name — matching real AWS's own
+        // `aws dynamodb export-table-to-point-in-time --table-arn` shape,
+        // and sidestepping ARN construction here (this crate has no
+        // `animus-dynamo` dependency to build one with).
+        "export-create" => {
+            let table_arn = arg(2).ok_or("export-create needs <table-arn>")?;
+            let bucket = arg(3).ok_or("export-create needs <s3-bucket>")?;
+            let mut payload = serde_json::json!({"TableArn": table_arn, "S3Bucket": bucket});
+            if let Some(prefix) = arg(4) {
+                payload["S3Prefix"] = serde_json::Value::String(prefix.to_string());
+            }
+            let body = serde_json::json!({
+                "op": "ExportTableToPointInTime",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "export-describe" => {
+            let export_arn = arg(2).ok_or("export-describe needs <export-arn>")?;
+            let body = serde_json::json!({
+                "op": "DescribeExport",
+                "payload": {"ExportArn": export_arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "export-list" => {
+            let mut payload = serde_json::Map::new();
+            if let Some(table_arn) = arg(2) {
+                payload.insert(
+                    "TableArn".to_string(),
+                    serde_json::Value::String(table_arn.to_string()),
+                );
+            }
+            let body = serde_json::json!({
+                "op": "ListExports",
+                "payload": payload,
             })
             .to_string();
             ("POST", "/admin/data/dynamo".into(), Some(body))
@@ -1713,6 +1763,88 @@ mod tests {
     fn stream_needs_table_and_view_type() {
         assert!(admin_request("stream", &args(&[])).is_err());
         assert!(admin_request("stream", &args(&["orders"])).is_err());
+    }
+
+    // --- S3 export (ADR 0068, S-05) ---------------------------------------
+
+    #[test]
+    fn export_create_posts_the_real_export_table_shape() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (method, path, body) =
+            admin_request("export-create", &args(&[table_arn, "my-bucket"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ExportTableToPointInTime");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TableArn": table_arn, "S3Bucket": "my-bucket"})
+        );
+    }
+
+    #[test]
+    fn export_create_includes_an_optional_s3_prefix() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request(
+            "export-create",
+            &args(&[table_arn, "my-bucket", "exports/orders"]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableArn": table_arn,
+                "S3Bucket": "my-bucket",
+                "S3Prefix": "exports/orders",
+            })
+        );
+    }
+
+    #[test]
+    fn export_create_needs_table_arn_and_bucket() {
+        assert!(admin_request("export-create", &args(&[])).is_err());
+        assert!(
+            admin_request(
+                "export-create",
+                &args(&["arn:aws:dynamodb:animus:0:table/orders"])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn export_describe_posts_the_real_describe_export_shape() {
+        let arn = "arn:aws:dynamodb:animus:0:table/orders/export/01234";
+        let (method, path, body) = admin_request("export-describe", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DescribeExport");
+        assert_eq!(v["payload"], serde_json::json!({"ExportArn": arn}));
+    }
+
+    #[test]
+    fn export_describe_needs_an_export_arn() {
+        assert!(admin_request("export-describe", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn export_list_with_no_filter_posts_an_empty_payload() {
+        let (method, path, body) = admin_request("export-list", &args(&[])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ListExports");
+        assert_eq!(v["payload"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn export_list_with_a_table_arn_filters_by_it() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request("export-list", &args(&[table_arn])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["payload"], serde_json::json!({"TableArn": table_arn}));
     }
 
     #[test]

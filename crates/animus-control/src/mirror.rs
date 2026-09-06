@@ -496,6 +496,18 @@ pub fn apply_and_derive_mirror(
                 &meta.backups[backup_id],
             ));
         }
+        MetaCommand::BeginExport { export_id, .. } => {
+            writes.push(put_json(
+                syskv::export_key(export_id),
+                &meta.exports[export_id],
+            ));
+        }
+        MetaCommand::CompleteExport { export_id, .. } | MetaCommand::FailExport { export_id, .. } => {
+            writes.push(put_json(
+                syskv::export_key(export_id),
+                &meta.exports[export_id],
+            ));
+        }
         MetaCommand::BeginRestore {
             restore_id,
             tablet,
@@ -754,6 +766,12 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 serde_json::from_slice(value).expect("mirrored credential value decodes");
             meta.credentials.insert(access_key_id, row);
         }
+        EntityKind::Export => {
+            let export_id = String::from_utf8(id).expect("export id is UTF-8");
+            let row: crate::meta::ExportRow =
+                serde_json::from_slice(value).expect("mirrored export value decodes");
+            meta.exports.insert(export_id, row);
+        }
     }
 }
 
@@ -856,6 +874,13 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // outright (ADR 0066 §2).
             let access_key_id = String::from_utf8(id).expect("access key id is UTF-8");
             meta.credentials.remove(&access_key_id);
+        }
+        EntityKind::Export => {
+            // Never deleted in practice (no `DeleteExport` command exists,
+            // mirroring DynamoDB's own API — see `Metadata::exports`'s own
+            // doc) — listed for match exhaustiveness.
+            let export_id = String::from_utf8(id).expect("export id is UTF-8");
+            meta.exports.remove(&export_id);
         }
     }
 }

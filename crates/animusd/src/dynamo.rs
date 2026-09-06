@@ -1231,6 +1231,36 @@ async fn run_operation(
             backup_type,
         ),
         Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
+        Operation::ExportTableToPointInTime {
+            table,
+            table_arn,
+            s3_bucket,
+            s3_prefix,
+            export_time_ms,
+            client_token,
+        } => {
+            create_export(
+                ctx,
+                &table,
+                &table_arn,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                export_time_ms,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeExport { export_arn } => describe_export(meta, &export_arn),
+        Operation::ListExports {
+            table_arn,
+            max_results,
+            next_token,
+        } => list_exports(
+            meta,
+            table_arn.as_deref(),
+            max_results,
+            next_token.as_deref(),
+        ),
         Operation::RestoreTableFromBackup {
             backup_arn,
             target_table_name,
@@ -1937,6 +1967,472 @@ async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, Wire
         }
         tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
     }
+}
+
+// --- S3 export (ADR 0068, S-05) --------------------------------------------
+
+/// How many fresh-id retries [`create_export`] attempts before giving up —
+/// mirrors [`CREATE_BACKUP_ID_ATTEMPTS`]'s own reasoning exactly.
+const CREATE_EXPORT_ID_ATTEMPTS: u32 = 3;
+
+/// `ExportTableToPointInTime` (ADR 0068 §1/§3/§4): begin a leader-driven
+/// export of `table`'s data into the customer's own S3 bucket, in
+/// DynamoDB's JSON export layout. Validates the table exists
+/// (`TableNotFoundException`), resolves `ClientToken` idempotency (a
+/// repeated call with the same token **and table** resolves back to the
+/// existing export's description rather than minting a second one — ADR
+/// 0068 §5), and — when `export_time_ms` is given — validates it against
+/// the table's own PITR restore window
+/// (`InvalidExportTimeException`/mirroring
+/// [`restore_table_to_point_in_time`]'s identical validation, see
+/// [`validate_export_time`]). Mints a fresh opaque export identity as an
+/// ARN ([`wire::export_arn`]) — the ARN itself **is** the catalog's
+/// `ExportId` key, exactly like [`wire::backup_arn`] — stamped with
+/// `env.wall_now()`, proposes `MetaCommand::BeginExport`, and commit-waits
+/// only for the row to **appear** — never for `COMPLETED`. The export job
+/// (`run_export_job`) then runs asynchronously **on this same node** — see
+/// that function's own doc for why this is a deliberate, named
+/// simplification against the on-demand backup train's per-tablet-leader-
+/// driven, crash-resumable design (ADR 0059 §4).
+#[allow(clippy::too_many_arguments)] // mirrors every other DDL-shaped handler's full request shape
+async fn create_export(
+    ctx: &ClientCtx,
+    table: &str,
+    table_arn: &str,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    export_time_ms: Option<u64>,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+
+    if let Some(token) = client_token
+        && let Some(existing_id) = meta.export_by_client_token(table, token).cloned()
+        && let Some(row) = meta.export(&existing_id)
+    {
+        return Ok(wire::export_description_response(&export_details_from_row(
+            &existing_id,
+            row,
+        )));
+    }
+
+    if let Some(export_time_ms) = export_time_ms {
+        validate_export_time(ctx, &meta, table, export_time_ms)?;
+    }
+
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err = internal(
+        "ExportTableToPointInTime did not commit to the control plane in time (no leader \
+         reachable?)",
+    );
+    for _ in 0..CREATE_EXPORT_ID_ATTEMPTS {
+        let export_id = wire::export_arn(table, &format!("{:016x}", ctx.env.next_u64()));
+        ctx.propose_schema(&MetaCommand::BeginExport {
+            export_id: export_id.clone(),
+            table: table.to_owned(),
+            table_arn: table_arn.to_owned(),
+            s3_bucket: s3_bucket.to_owned(),
+            s3_prefix: s3_prefix.map(str::to_owned),
+            format: animus_control::ExportFormat::DynamoDbJson,
+            export_type: animus_control::ExportType::Full,
+            export_time_ms,
+            client_token: client_token.map(str::to_owned),
+            created_wall_ms,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.export(&export_id) {
+                let details = export_details_from_row(&export_id, row);
+                tokio::spawn(run_export_job(
+                    ctx.clone(),
+                    export_id.clone(),
+                    table.to_owned(),
+                    s3_bucket.to_owned(),
+                    s3_prefix.map(str::to_owned),
+                ));
+                return Ok(wire::export_description_response(&details));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Either a (vanishingly unlikely) id collision rejected this
+                // attempt outright, or the propose itself never reached a
+                // leader — mint a fresh id and retry, mirroring
+                // `create_backup`'s own identical reasoning.
+                break;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// Validate a requested `ExportTime` against `table`'s currently
+/// restorable point-in-time window — the identical check
+/// [`restore_table_to_point_in_time`] performs for `RestoreDateTime`, ADR
+/// 0068 §1's own "served through the PITR machinery" clause. `None` PITR
+/// history at all is `InvalidExportTimeException` here (unlike
+/// `RestoreTableToPointInTime`'s `PointInTimeRecoveryUnavailableException`)
+/// — real DynamoDB uses this single exception for every `ExportTime`
+/// validation failure on `ExportTableToPointInTime`, never a second code
+/// for "PITR was never enabled at all."
+fn validate_export_time(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    export_time_ms: u64,
+) -> Result<(), WireError> {
+    let Some(window) = meta.pitr_restore_window(table) else {
+        return Err(WireError {
+            code: "InvalidExportTimeException",
+            message: format!(
+                "`ExportTime` was requested but point-in-time recovery is not enabled (or has \
+                 no history yet) for table `{table}`"
+            ),
+            reasons: None,
+        });
+    };
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = window.earliest_ms.max(floor_ms);
+    let latest_ms = window.latest_ms.max(earliest_ms);
+    if export_time_ms < earliest_ms || export_time_ms > latest_ms {
+        return Err(WireError {
+            code: "InvalidExportTimeException",
+            message: format!(
+                "`ExportTime` ({export_time_ms}ms) is outside the currently restorable window \
+                 [{earliest_ms}ms, {latest_ms}ms] for table `{table}`"
+            ),
+            reasons: None,
+        });
+    }
+    Ok(())
+}
+
+/// Build an [`wire::ExportDetails`] from one catalog row — shared by
+/// [`create_export`]/[`describe_export`]/[`list_exports`]'s own per-summary
+/// detail (mirrors [`backup_description_json`]'s identical role for
+/// backups).
+fn export_details_from_row(
+    export_id: &str,
+    row: &animus_control::ExportRow,
+) -> wire::ExportDetails {
+    let (status, failure_code, failure_message) = match &row.status {
+        animus_control::ExportStatus::InProgress => ("IN_PROGRESS", None, None),
+        animus_control::ExportStatus::Completed => ("COMPLETED", None, None),
+        animus_control::ExportStatus::Failed { reason } => (
+            "FAILED",
+            Some("ExportFailed".to_owned()),
+            Some(reason.clone()),
+        ),
+    };
+    wire::ExportDetails {
+        export_arn: export_id.to_owned(),
+        table_arn: row.table_arn.clone(),
+        status,
+        s3_bucket: row.s3_bucket.clone(),
+        s3_prefix: row.s3_prefix.clone(),
+        client_token: row.client_token.clone(),
+        start_wall_ms: row.created_wall_ms,
+        end_wall_ms: row.completed_wall_ms,
+        export_time_ms: row.export_time_ms,
+        item_count: row.item_count,
+        billed_size_bytes: row.billed_size_bytes,
+        export_manifest: row.export_manifest.clone(),
+        failure_code,
+        failure_message,
+    }
+}
+
+/// An export row visible at the wire — every export row is visible forever
+/// (unlike a backup, ADR 0068 §3: there is no delete/reclaim command, so
+/// there is no "already gone" state to filter, unlike
+/// [`visible_backup`]'s own filter).
+fn visible_export<'a>(
+    meta: &'a Metadata,
+    export_arn: &str,
+) -> Result<&'a animus_control::ExportRow, WireError> {
+    meta.export(export_arn).ok_or_else(|| WireError {
+        code: "ExportNotFoundException",
+        message: format!("export `{export_arn}` does not exist"),
+        reasons: None,
+    })
+}
+
+/// `DescribeExport` (ADR 0068 §3): a pure read of one export's catalog row
+/// by its ARN.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_export(meta: &Metadata, export_arn: &str) -> Result<String, WireError> {
+    let row = visible_export(meta, export_arn)?;
+    Ok(wire::export_description_response(&export_details_from_row(
+        export_arn, row,
+    )))
+}
+
+/// `ListExports` (ADR 0068 §3): paginated export summaries in ascending-ARN
+/// order — `Metadata::exports`' own `BTreeMap<ExportId, _>` iteration
+/// order, which is exactly the order [`wire::paginate_export_summaries`]
+/// relies on, since an `ExportId` **is** its own ARN
+/// ([`wire::export_arn`]'s doc).
+fn list_exports(
+    meta: &Metadata,
+    table_arn: Option<&str>,
+    max_results: Option<usize>,
+    next_token: Option<&str>,
+) -> Result<String, WireError> {
+    let candidates: Vec<wire::ExportSummary> = meta
+        .exports
+        .iter()
+        .filter(|(_, row)| table_arn.is_none_or(|t| row.table_arn == t))
+        .map(|(export_id, row)| wire::ExportSummary {
+            export_arn: export_id.clone(),
+            status: match &row.status {
+                animus_control::ExportStatus::InProgress => "IN_PROGRESS",
+                animus_control::ExportStatus::Completed => "COMPLETED",
+                animus_control::ExportStatus::Failed { .. } => "FAILED",
+            },
+        })
+        .collect();
+    let (page, next) = wire::paginate_export_summaries(&candidates, next_token, max_results);
+    Ok(wire::list_exports_response(&page, next.as_deref()))
+}
+
+/// DynamoDB's own export-manifest root segment (ADR 0068 §1) — every
+/// object [`run_export_job`] writes lives at `[S3Prefix/]AWSDynamoDB/<export
+/// id suffix>/...` inside the customer's bucket. `S3Prefix`, if any, is
+/// already baked into the [`animus_env::SegmentStore`] handle by
+/// [`ClientCtx::export_store_factory`] — this job's own object ids never
+/// repeat it.
+const EXPORT_MANIFEST_ROOT: &str = "AWSDynamoDB";
+
+/// Items per gzip-compressed data file — a deliberate row-count budget,
+/// mirroring the on-demand backup capture driver's own `CHUNK_ROWS`
+/// simplification against a byte budget (`backup_capture.rs`'s own doc;
+/// ADR 0068 §1).
+const EXPORT_CHUNK_ROWS: usize = 1000;
+
+/// The bare export id (the random hex suffix [`create_export`] minted) from
+/// its own ARN — the last `/`-separated segment ([`wire::export_arn`]
+/// never lets that suffix itself contain a `/`).
+fn export_id_suffix(export_id: &str) -> &str {
+    export_id.rsplit('/').next().unwrap_or(export_id)
+}
+
+/// One rendered data file's own `manifest-files.json` entry.
+struct ExportDataFile {
+    item_count: u64,
+    checksum_hex: String,
+    data_file_s3_key: String,
+}
+
+/// The leader-driven S3 export job (ADR 0068 §1/§4): runs **once**, on
+/// whichever node's wire edge received the `ExportTableToPointInTime` call
+/// that spawned it (`create_export`'s own `tokio::spawn`) — a deliberate,
+/// **named simplification** against the on-demand backup train's per-
+/// tablet-leader-driven, crash-resumable design (ADR 0059 §4): if this node
+/// crashes mid-export, the row is left permanently `InProgress` with no
+/// janitor yet built to time it out (a follow-up, tracked in ADR 0068's own
+/// "Known residuals" section, not a silently-accepted gap). Reuses the
+/// native quorum range scan ([`ClientCtx::cp_scan`], the same primitive a
+/// plain `Scan` itself uses via [`native_scan`]) to sweep `table`'s current
+/// committed state (read-through-intent-resolution — the identical
+/// consistency `cp_scan` already gives every other reader, ADR 0018 §2) —
+/// [`ClientCtx::export_store_factory`]'s customer-bucket store is where
+/// every object lands. **Content fidelity for a validated `ExportTime` is a
+/// second named residual**: `create_export`/`validate_export_time` reject a
+/// request outside the table's PITR window, but the payload this job
+/// actually renders is always the table's *current* committed state, never
+/// a true point-in-time reconstruction as of the requested instant — a
+/// real gap against ADR 0068 §1's own "served through the PITR machinery"
+/// design intent, tracked as a follow-up rather than silently claimed.
+async fn run_export_job(
+    ctx: ClientCtx,
+    export_id: String,
+    table: String,
+    s3_bucket: String,
+    s3_prefix: Option<String>,
+) {
+    match run_export_job_inner(&ctx, &export_id, &table, &s3_bucket, s3_prefix.as_deref()).await {
+        Ok((item_count, billed_size_bytes, export_manifest)) => {
+            let completed_wall_ms = ctx.env.wall_now().0;
+            ctx.propose_schema(&MetaCommand::CompleteExport {
+                export_id,
+                item_count,
+                billed_size_bytes,
+                export_manifest,
+                completed_wall_ms,
+            })
+            .await;
+        }
+        Err(reason) => {
+            tracing::warn!(export_id = %export_id, error = %reason, "S3 export job failed");
+            let completed_wall_ms = ctx.env.wall_now().0;
+            ctx.propose_schema(&MetaCommand::FailExport {
+                export_id,
+                reason,
+                completed_wall_ms,
+            })
+            .await;
+        }
+    }
+}
+
+/// [`run_export_job`]'s actual work — factored out so the caller can turn
+/// any `Err` into a `FailExport` proposal uniformly. Returns `(item_count,
+/// billed_size_bytes, export_manifest_s3_key)` on success.
+async fn run_export_job_inner(
+    ctx: &ClientCtx,
+    export_id: &str,
+    table: &str,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+) -> Result<(u64, u64, String), String> {
+    let build_store = ctx
+        .export_store_factory
+        .lock()
+        .expect("export store factory lock")
+        .clone();
+    let store =
+        build_store(s3_bucket, s3_prefix).map_err(|e| format!("building S3 export store: {e}"))?;
+
+    let root = format!("{EXPORT_MANIFEST_ROOT}/{}", export_id_suffix(export_id));
+    store
+        .put(&format!("{root}/_started"), b"")
+        .await
+        .map_err(|e| format!("writing _started marker: {e}"))?;
+
+    let mut item_count: u64 = 0;
+    let mut billed_size_bytes: u64 = 0;
+    let mut data_files: Vec<ExportDataFile> = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut file_index: u64 = 0;
+    loop {
+        let pairs = ctx
+            .cp_scan(
+                table,
+                cursor.clone(),
+                None,
+                Some(EXPORT_CHUNK_ROWS),
+                false,
+                ReadConsistency::Strong,
+            )
+            .await
+            .map_err(|e| format!("scanning table `{table}`: {e}"))?;
+        let exhausted = pairs.len() < EXPORT_CHUNK_ROWS;
+        let last_key = pairs.last().map(|(k, _)| k.clone());
+
+        let mut lines = String::new();
+        let mut chunk_items: u64 = 0;
+        for (_, value) in &pairs {
+            let Some(item) = wire::decode_stored_item(value)
+                .map_err(|e| format!("decoding stored item: {e:?}"))?
+            else {
+                continue; // a DynamoDB tombstone value — never exported
+            };
+            let line = serde_json::json!({ "Item": wire::encode_item(&item) });
+            lines.push_str(&serde_json::to_string(&line).expect("json serializes"));
+            lines.push('\n');
+            chunk_items += 1;
+        }
+        if chunk_items > 0 {
+            let gz = gzip_bytes(lines.as_bytes());
+            let data_key = format!("{root}/data/{file_index:04}.json.gz");
+            store
+                .put(&data_key, &gz)
+                .await
+                .map_err(|e| format!("writing data file: {e}"))?;
+            data_files.push(ExportDataFile {
+                item_count: chunk_items,
+                checksum_hex: crc32_hex(&gz),
+                data_file_s3_key: data_key,
+            });
+            item_count += chunk_items;
+            billed_size_bytes += lines.len() as u64;
+            file_index += 1;
+        }
+
+        if exhausted {
+            break;
+        }
+        let mut next = last_key.expect("non-exhausted scan returned pairs");
+        next.push(0x00);
+        cursor = next;
+    }
+
+    let mut files_lines = String::new();
+    for f in &data_files {
+        let line = serde_json::json!({
+            "itemCount": f.item_count,
+            "md5Checksum": f.checksum_hex,
+            "etag": f.checksum_hex,
+            "dataFileS3Key": f.data_file_s3_key,
+        });
+        files_lines.push_str(&serde_json::to_string(&line).expect("json serializes"));
+        files_lines.push('\n');
+    }
+    let files_key = format!("{root}/manifest-files.json");
+    store
+        .put(&files_key, files_lines.as_bytes())
+        .await
+        .map_err(|e| format!("writing manifest-files.json: {e}"))?;
+
+    // `manifest-summary.json` is written LAST — a reader (this export's own
+    // `DescribeExport`, or real AWS export/import tooling) must never see a
+    // partial export as complete (ADR 0068 §1's durable-before-visible
+    // rule, mirroring ADR 0059 §4's identical rule for on-demand backups).
+    let summary = serde_json::json!({
+        "version": "2020-06-30",
+        "exportArn": export_id,
+        "s3Bucket": s3_bucket,
+        "s3Prefix": s3_prefix,
+        "manifestFilesS3Key": files_key,
+        "itemCount": item_count,
+        "billedSizeBytes": billed_size_bytes,
+        "outputFormat": "DYNAMODB_JSON",
+    });
+    let summary_key = format!("{root}/manifest-summary.json");
+    store
+        .put(
+            &summary_key,
+            serde_json::to_string(&summary)
+                .expect("json serializes")
+                .as_bytes(),
+        )
+        .await
+        .map_err(|e| format!("writing manifest-summary.json: {e}"))?;
+
+    Ok((item_count, billed_size_bytes, summary_key))
+}
+
+/// gzip-compress `bytes` at the default compression level — the `.json.gz`
+/// data-file format DynamoDB's own S3 export layout expects (ADR 0068 §1).
+fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("an in-memory gzip write never fails");
+    encoder
+        .finish()
+        .expect("an in-memory gzip finish never fails")
+}
+
+/// A stand-in for AWS's own MD5-based `md5Checksum`/`etag` fields (ADR 0068
+/// §1) — this adapter uses CRC32 (already a workspace dependency,
+/// `animus-storage`'s SSTable block checksums) rather than a true MD5,
+/// documented here rather than left for a reader to discover by diffing
+/// against real AWS output: a consumer that specifically re-verifies these
+/// hashes against a real MD5 of the object bytes needs this closed as a
+/// follow-up.
+fn crc32_hex(bytes: &[u8]) -> String {
+    format!("{:08x}", crc32fast::hash(bytes))
 }
 
 /// How many fresh-id retries [`restore_table_from_backup`] attempts before

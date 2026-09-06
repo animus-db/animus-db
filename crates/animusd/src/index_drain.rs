@@ -3563,6 +3563,7 @@ mod stream_sealer_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("bring up single node with streams + quiescence");

@@ -18775,3 +18775,49 @@ command in the assertion message — so a spec change fails `cargo test`
 locally, not the one CI job that needs a cluster. The general form: the
 gate that guards a generated artifact must live in the same gate set as
 the change that invalidates it.
+## A `#[cfg(test)]`-gated field or method is invisible to an external `tests/*.rs` integration binary — a test-only injection point needs a genuinely `pub` hook
+
+Building S-05 PR 1's `dynamo_export.rs` e2e suite, the natural instinct was
+to reuse the crate's existing `#[cfg(test)] test_ctx` pattern (`animusd`'s
+`Node` already carries one, gated behind `#[cfg(test)]`, for other
+in-crate test needs) to inject a fake S3 store factory into a running
+`Node`. That doesn't work for a file under `tests/`: each file there
+compiles as its own separate integration-test crate linked against the
+*library* crate built without `--cfg test` (only the harness binary itself
+gets `cfg(test)`), so any item gated `#[cfg(test)]` in the library simply
+doesn't exist from an integration test's point of view — not a visibility
+error, a "no such field" compile error that looks like a typo until you
+remember the two are different compilation units. The fix was a genuinely
+public, always-compiled method whose only real-world purpose is a test
+injection point: `Node::set_export_store_factory(&self, factory:
+ExportStoreFactory)`, storing the factory behind `Arc<Mutex<..>>` so
+swapping it in place is visible to every already-cloned per-connection
+`ClientCtx` sharing that `Arc`. **General form**: when a `tests/*.rs` file
+needs to inject or override library-internal state, `#[cfg(test)]` is not
+available to you at all — the hook must be unconditionally compiled (and
+named/documented as a test-only knob in its own doc comment so a reader
+doesn't mistake it for a real runtime feature), not merely `pub(crate)`
+widened.
+
+## `FakeS3` is not internally `Arc`-shared — sharing one fake bucket across several independently-constructed store handles needs an external `Arc` plus a thin `Transport`-wrapping newtype
+
+`animus_s3::fake::FakeS3` holds its object state behind plain (non-`Arc`)
+interior mutability, so two separately-constructed `S3SegmentStore`
+instances built from two separate `FakeS3::new()` calls see two disjoint
+buckets — fine for a single-store test, wrong for S-05 PR 1's
+`dynamo_export.rs`, which needed every node in a 3-node cluster (each
+building its own `SegmentStoreHandle::S3`-shaped store via its own
+`ExportStoreFactory` call) plus the test's own verification reads to all
+observe the *same* bucket. The fix: wrap one `Arc<FakeS3>` the test owns in
+a local newtype (`SharedFakeS3(Arc<FakeS3>)`) implementing
+`animus_s3::client::Transport` by delegating `send()` to the inner
+`Arc`'s own `send()`, then hand a cheap clone of that newtype to every
+`S3SegmentStore` constructed anywhere in the test (one per node's factory
+call, plus a standalone one for the test's own `get_object` verification
+helper). **General form**: a fake/in-memory backend used to simulate a
+shared remote resource across multiple independently-constructed client
+handles needs either the fake itself to be internally `Arc`-shared, or the
+test to hold the one real `Arc` and thread clones of a thin wrapper into
+every handle — check which shape a fake actually has before assuming
+"construct one per caller" gives you the shared-state semantics the real
+remote service would.

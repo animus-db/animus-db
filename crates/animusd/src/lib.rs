@@ -3824,6 +3824,7 @@ fn spawn_common_tail(
     env: ProdEnv,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     tls: Option<TlsMaterial>,
+    export_s3: Option<ExportS3Config>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3853,6 +3854,7 @@ fn spawn_common_tail(
         data,
         segment_store,
         backup_store,
+        export_store_factory: Arc::new(Mutex::new(default_export_store_factory(export_s3))),
         backup_janitor_progress: Arc::new(Mutex::new(
             animus_node::backup_janitor::JanitorProgress::default(),
         )),
@@ -4175,6 +4177,7 @@ impl BoundNode {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4261,6 +4264,7 @@ impl BoundNode {
         throttle_write_units: Option<u64>,
         tablet_max_read_units: Option<u64>,
         tablet_max_write_units: Option<u64>,
+        export_s3: Option<ExportS3Config>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4503,6 +4507,7 @@ impl BoundNode {
             self.env.clone(),
             dynamo_auth,
             self.tls,
+            export_s3,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -4826,6 +4831,7 @@ impl BoundNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -4878,6 +4884,12 @@ pub struct Node {
     /// listener is never bound there (it hosts no CP-data tablet). See
     /// [`console_addr`](Self::console_addr)'s doc.
     console_addr: Option<SocketAddr>,
+    /// A clone of this node's own [`ExportStoreFactory`] slot (ADR 0068
+    /// §2) — the exact `Arc<Mutex<_>>` `spawn_common_tail` built, shared
+    /// with every clone of this node's `ClientCtx` (one per connection).
+    /// Reached only through [`Node::set_export_store_factory`]; production
+    /// code never reads it directly off `Node` itself.
+    export_store_factory: Arc<Mutex<ExportStoreFactory>>,
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
@@ -5105,6 +5117,26 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn ctx_for_test(&self) -> ClientCtx {
         self.test_ctx.clone()
+    }
+
+    /// Test hook (ADR 0068 §2, S-05): replace this node's S3 export
+    /// customer-bucket store factory — e.g. with one built over
+    /// `animus_s3::fake::FakeS3` instead of a real S3 endpoint, with no
+    /// real sockets. **Not `#[cfg(test)]`**, unlike [`ctx_for_test`]
+    /// (Self::ctx_for_test) above: an external `tests/*.rs` integration
+    /// binary links against this crate's plain (non-test-cfg) library, so
+    /// a `cfg(test)`-gated item is invisible there — this is a genuinely
+    /// public, always-compiled hook for exactly that caller. Affects every
+    /// export this node drives from the moment this call returns: the
+    /// swap lands in the shared `Arc<Mutex<_>>` every clone of this node's
+    /// `ClientCtx` (one per connection, including ones already handed to a
+    /// spawned listener task) reads through, and the export driver reads
+    /// the factory fresh at export start — it never caches it.
+    pub fn set_export_store_factory(&self, factory: ExportStoreFactory) {
+        *self
+            .export_store_factory
+            .lock()
+            .expect("export store factory lock") = factory;
     }
 
     /// Propose a control-plane [`MetaCommand`] on this node's control replica,
@@ -5611,6 +5643,10 @@ impl BoundControlNode {
             // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
             None,
             self.tls,
+            // A control-only node never binds the dynamo listener, so it
+            // never serves `ExportTableToPointInTime` either — nothing
+            // here would ever call `ClientCtx::export_store_factory`.
+            None,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5703,6 +5739,7 @@ impl BoundControlNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: None, // ADR 0052: a control-only node hosts no CP-data tablet.
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -6070,6 +6107,12 @@ impl BoundDataNode {
             self.env.clone(),
             dynamo_auth,
             self.tls,
+            // ADR 0068 §2: `--export-s3-endpoint`/`--export-s3-region` do
+            // not yet reach `animusd data` (a documented gap, mirroring
+            // `--segment-store`/`--backup-store`'s own partial CLI reach on
+            // this entry point) — a data-only node's own export factory
+            // stays the "not configured" default until this is wired.
+            None,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -6248,6 +6291,7 @@ impl BoundDataNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -6890,6 +6934,77 @@ fn s3_segment_store(
         config,
         s3.prefix.clone(),
     ))
+}
+
+// --- S3 export (ADR 0068, S-05) --------------------------------------------
+
+/// This node's cluster-level S3 connection parameters for the export
+/// **customer**-bucket store (ADR 0068 §2) — `--export-s3-endpoint`/
+/// `--export-s3-region`, reusing the exact same `--s3-credentials`/
+/// `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` credential
+/// resolution `--segment-store`/`--backup-store s3://` already established
+/// (S-04) rather than a second, independent credential source — ADR 0068's
+/// own "pick one, justify" design decision: an export target and this
+/// node's own backup/segment store are conceptually different buckets (a
+/// customer's own bucket vs. this cluster's operational store), but a node
+/// has exactly one S3 identity it authenticates as either way, so a second
+/// credential file/env pair would only add configuration surface with no
+/// real security or operational benefit. **Deliberately holds no
+/// bucket/prefix** — those arrive per-request on the wire
+/// (`ExportTableToPointInTime`'s `S3Bucket`/`S3Prefix`), unlike
+/// [`S3StoreConfig`] (whose bucket is this node's own, fixed at startup).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportS3Config {
+    /// `scheme://host[:port]`, no trailing slash.
+    pub endpoint: String,
+    pub region: String,
+    /// Mirrors [`S3StoreConfig::insecure_http`]'s exact gate — set only when
+    /// `main.rs`'s own loopback-or-`--allow-insecure-s3` check already
+    /// passed.
+    pub insecure_http: bool,
+    pub credentials: animus_s3::sigv4::Credentials,
+}
+
+/// A customer-bucket object-store factory for S3 export (ADR 0068 §2):
+/// given one export request's own `S3Bucket`/`S3Prefix`, builds (or fails to
+/// build) the [`animus_env::SegmentStore`] the leader-driven export job
+/// writes through. **`pub` and test-only-mutable through
+/// [`Node::set_export_store_factory`]** — the production default
+/// ([`default_export_store_factory`]) builds a real
+/// `S3SegmentStore<HyperRustlsTransport>` from this node's [`ExportS3Config`]
+/// (or a clear "not configured" error when the node has none); tests inject
+/// one built over `animus_s3::fake::FakeS3` instead, with no real sockets.
+pub type ExportStoreFactory = Arc<
+    dyn Fn(&str, Option<&str>) -> std::io::Result<Arc<dyn animus_env::SegmentStore>> + Send + Sync,
+>;
+
+/// Build this node's production [`ExportStoreFactory`] from its own
+/// (possibly absent) [`ExportS3Config`] — `spawn_common_tail`'s own
+/// construction point, and the one function [`Node::set_export_store_factory`]
+/// exists to let a test override wholesale. `None` produces a factory that
+/// always fails with a clear, wire-surfaceable message (`animusd::dynamo`'s
+/// `create_export` maps it to `ValidationException`) rather than a panic —
+/// a node with no `--export-s3-endpoint`/`--export-s3-region` configured
+/// simply cannot serve `ExportTableToPointInTime` yet.
+fn default_export_store_factory(export_s3: Option<ExportS3Config>) -> ExportStoreFactory {
+    Arc::new(move |bucket: &str, prefix: Option<&str>| {
+        let Some(cfg) = export_s3.as_ref() else {
+            return Err(std::io::Error::other(
+                "S3 export is not configured on this node (missing \
+                 --export-s3-endpoint/--export-s3-region)",
+            ));
+        };
+        let s3 = S3StoreConfig {
+            bucket: bucket.to_owned(),
+            prefix: prefix.map(str::to_owned),
+            endpoint: cfg.endpoint.clone(),
+            region: cfg.region.clone(),
+            insecure_http: cfg.insecure_http,
+            credentials: cfg.credentials.clone(),
+        };
+        let store: Arc<dyn animus_env::SegmentStore> = Arc::new(s3_segment_store(&s3)?);
+        Ok(store)
+    })
 }
 
 /// S-04 PR 2's own end-to-end proof that `SegmentStoreHandle::S3`/
@@ -8297,6 +8412,13 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// control-only one (W-10)** — see `segment_store`'s doc above for why
     /// this lives here rather than inside [`DataRole`].
     pub(crate) backup_store: BackupStoreHandle,
+    /// The S3 export **customer**-bucket store factory (ADR 0068 §2) — see
+    /// [`ExportStoreFactory`]'s own doc. `Arc<Mutex<_>>`, not a bare
+    /// `ExportStoreFactory`, so [`Node::set_export_store_factory`] can
+    /// replace it in place and have every clone of this `ClientCtx`
+    /// (one per connection) observe the swap — the same sharing shape
+    /// `client_route`/`intra_route` use, just for a factory instead of a map.
+    pub(crate) export_store_factory: Arc<Mutex<ExportStoreFactory>>,
     /// The on-demand backup janitor's own live progress (roadmap U-07,
     /// ADR 0059 §3) — `animus_node::backup_janitor::backup_janitor_loop`
     /// publishes into this through `ClientCtx`'s
@@ -12096,6 +12218,11 @@ async fn start_cluster_inner(
                 throttle_write_units,
                 tablet_max_read_units,
                 tablet_max_write_units,
+                // ADR 0068 §2: `--export-s3-endpoint`/`--export-s3-region`
+                // do not yet reach `--cluster N` (a documented gap) — use
+                // `Node::set_export_store_factory` to inject a test store
+                // on a node started this way.
+                None,
             )
             .await?;
         nodes.push(node);
@@ -12503,6 +12630,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -12547,6 +12675,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
+        None,
         None,
         None,
         None,
@@ -12600,6 +12729,7 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -12645,6 +12775,7 @@ pub async fn run_node_with_cluster_settings(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -12666,6 +12797,7 @@ pub async fn run_node_with_cluster_settings(
         throttle_write_units,
         tablet_max_read_units,
         tablet_max_write_units,
+        export_s3,
     )
     .await
 }
@@ -12720,6 +12852,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12795,6 +12928,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             throttle_write_units,
             tablet_max_read_units,
             tablet_max_write_units,
+            export_s3,
         )
         .await
 }
@@ -12832,6 +12966,7 @@ pub async fn run_node_with_ttl_sweep_interval(
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
         None,
         None,
         None,
@@ -15955,6 +16090,7 @@ mod simenv_client_ctx_tests {
             // real store or `ProdEnv` is needed just to satisfy the field.
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -16308,6 +16444,7 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -16377,6 +16514,7 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),

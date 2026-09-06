@@ -4311,6 +4311,112 @@ ADR itself for the full design/rationale.
   `tests/split_placing_completion.rs` stays green, unmodified, and is now
   a stronger proof than before: it demonstrates this loop actually firing
   under the corrected upstream mechanism.
+- **`dynamo.rs`'s `ExportTableToPointInTime`/`DescribeExport`/`ListExports`
+  (ADR 0068, S-05 PR 1)** — a single leader-driven **export job**, run once
+  on whichever node received the wire request (`create_export` proposes
+  `MetaCommand::BeginExport`, mints a `CREATE_EXPORT_ID_ATTEMPTS`-bounded
+  fresh `ExportId`/ARN via `wire::export_arn`, then `tokio::spawn`s
+  `run_export_job` — permitted here since `dynamo.rs` is **not** one of the
+  ten `#[deny(clippy::disallowed_methods)]` modules the root `CLAUDE.md`
+  lists), deliberately **not** the backup catalog's per-tablet
+  leader-side-capture-plus-completion-aggregator shape (ADR 0059 §4/§5) —
+  see ADR 0068 §1 for the full reasoning: an export's payload is
+  base-rows-only DynamoDB JSON with no restore-back-into-cluster need, and
+  `ctx.cp_scan` (the same primitive `Scan` itself uses) already fans out
+  across a table's tablets and tolerates a concurrent split transparently,
+  so one job needs no per-tablet progress catalog at all. **Known
+  residual, stated plainly rather than silently shipped**: this buys no
+  crash-resumability — a node crash mid-export leaves the row `InProgress`
+  forever (no janitor reclaims it in this PR; PR 2/3 territory).
+  `create_export`'s `ClientRequestToken` idempotency (`Metadata::
+  export_by_client_token`) returns the existing export's description on a
+  retried token rather than minting a second job. `validate_export_time`
+  checks an `ExportTime` request against `Metadata::pitr_restore_window`
+  (reused verbatim from the PITR restore validation, `InvalidExportTimeException`
+  outside the window or with no PITR history at all) — **but the export's
+  own content is always current-state, never actually replayed to that
+  point in time** (a true point-in-time replay would need adapting
+  `backup_restore.rs`'s PITR segment-replay machinery, out of scope for
+  this PR and named as ADR 0068 §9's "Known residual #2" rather than
+  silently shipped as if fully correct).
+
+  **`run_export_job_inner`'s object layout** (constants `EXPORT_MANIFEST_ROOT
+  = "AWSDynamoDB"`, `EXPORT_CHUNK_ROWS = 1000`, mirroring AWS's own real
+  export layout closely enough for the e2e test's own round-trip
+  assertions, not byte-for-byte AWS-identical): under
+  `AWSDynamoDB/<export-id-suffix>/`, a `_started` marker object (written
+  first, before any data — a crash-detection breadcrumb, unused by
+  anything in this PR itself), one gzip'd `data/NNNN.json.gz` object per
+  `EXPORT_CHUNK_ROWS`-row chunk (`{"Item": <DynamoDB JSON>}` lines,
+  `wire::encode_item`/`decode_stored_item` — a tombstone value decodes to
+  `None` and is skipped, never exported as a row), `manifest-files.json`
+  (one line per data file: `itemCount`/`md5Checksum`/`etag`/
+  `dataFileS3Key` — `md5Checksum`/`etag` are **CRC32 stand-ins**
+  (`crc32_hex`, reusing the already-present `crc32fast` workspace
+  dependency rather than adding a real MD5 crate for two fields nothing in
+  this PR itself re-verifies), a documented simplification, not a
+  correctness claim), and `manifest-summary.json` written **last** (after
+  every data file — durable-before-visible discipline: a reader should
+  never see a summary pointing at data files that might not exist yet).
+  `gzip_bytes` uses `flate2`'s pure-Rust `rust_backend`/miniz_oxide feature
+  (new workspace dependency, `Cargo.toml`'s own comment explains the
+  no-C-FFI choice mirrors the `lz4_flex` precedent for this workspace's
+  `unsafe_code = "forbid"` posture).
+
+  **Customer-bucket store configuration and injection**: `ExportS3Config`
+  (`endpoint`/`region`/`insecure_http`/`credentials`) is this node's own
+  resolved ability to *reach* S3 at all (from `--export-s3-endpoint`/
+  `--export-s3-region`, reusing the existing `--s3-credentials`/
+  `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` credential
+  resolution `--segment-store`/`--backup-store s3://...` already
+  established, S-04) — **not** which bucket a given export targets, which
+  is per-request (`S3Bucket`/`S3Prefix` on the wire call itself, the
+  "distinct wire model" ADR 0059 §1 deferred this whole feature over).
+  `ExportStoreFactory = Arc<dyn Fn(&str, Option<&str>) -> io::Result<
+  Arc<dyn animus_env::SegmentStore>> + Send + Sync>` is the seam: given a
+  bucket + optional prefix, build a store handle for it.
+  `default_export_store_factory(export_s3: Option<ExportS3Config>)` is the
+  production factory — `None` (no `--export-s3-endpoint`/`--export-s3-region`
+  configured on this node) makes every export attempt fail immediately
+  with a plain, named startup-shaped error ("S3 export is not configured on
+  this node"), never a panic. Stored on `ClientCtx::export_store_factory:
+  Arc<Mutex<ExportStoreFactory>>` (swappable in place, so every
+  already-cloned per-connection `ClientCtx` sharing the `Arc` sees a
+  replacement) and mirrored on `Node`, with a genuinely **`pub`** (not
+  `#[cfg(test)]`-gated) `Node::set_export_store_factory` — needed because
+  `ClientCtx` is `pub(crate)` and a `#[cfg(test)]`-gated field/method is
+  invisible to an external `tests/*.rs` integration binary (which links
+  against the plain, non-test-cfg library); this is the one production
+  method whose sole purpose is a test injection point, mirrored on `Node`
+  rather than reusing the existing `#[cfg(test)] test_ctx` pattern for
+  exactly that reason. **CLI reach is deliberately narrow, the same
+  documented-gap shape `--dynamo-auth`/`--segment-store` already have**:
+  `--export-s3-endpoint`/`--export-s3-region` thread through
+  `main.rs::resolve_export_s3` → `run_single` → `run_node_with_cluster_
+  settings` → `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
+  `BoundNode::start_with_growth` → `spawn_common_tail`'s trailing
+  `export_s3` parameter — reaching **only** `--config FILE --node I`;
+  every other entry point (`--cluster N`, `--cluster-control`/
+  `--cluster-data`, `animusd control`, `animusd data`, `animusd join`)
+  passes `None` and never provisions export capability via CLI at all
+  (`crates/animusd/tests/dynamo_export.rs` never needs the CLI path either
+  way — it injects a fake store factory directly via
+  `Node::set_export_store_factory`, bypassing CLI/S3 credentials
+  entirely).
+
+  Regression: `tests/dynamo_export.rs` — a shared `FakeS3` (wrapped in a
+  test-local `SharedFakeS3(Arc<FakeS3>)` `Transport` newtype, since
+  `animus_s3::fake::FakeS3` itself is not internally `Arc`-shared/`Clone`,
+  so every node's own factory call and the test's own verification reads
+  must share one externally-held `Arc` to see the same bucket) installed
+  on every node of a real 3-node cluster: a full export issued against a
+  **follower** node, with a real forced split mid-scan, converges to
+  `COMPLETED` and every one of 30 written items round-trips through the
+  gzip'd data files back to `animus_dynamo::wire::decode_item`; `ListExports`
+  with/without a `TableArn` filter; `ClientRequestToken` idempotency;
+  unknown-table/unknown-export errors; `ION`/`INCREMENTAL_EXPORT`
+  rejection; and an `ExportTime` request against a table with no PITR
+  history rejecting `InvalidExportTimeException`.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

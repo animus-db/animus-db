@@ -107,6 +107,14 @@ opentelemetry-otlp.workspace = true
 # feature set as `animus-env`'s own `tokio-rustls` dependency (one crypto
 # backend workspace-wide, ADR 0064 Decision 5).
 tokio-rustls = { workspace = true }
+# gzip encoding for the S3 export data files (ADR 0068, S-05) — this
+# crate's own export job driver is the sole caller.
+flate2.workspace = true
+# `manifest-files.json`'s `md5Checksum`/`etag` fields (ADR 0068 §1) — a
+# CRC32 stand-in, not a real MD5 (see `crc32_hex`'s own doc); already a
+# workspace dependency (`animus-storage`'s SSTable block checksums), so
+# this adds no new crate to the graph.
+crc32fast.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

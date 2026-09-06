@@ -111,6 +111,13 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::DescribeContinuousBackups { .. } => {
             ("DescribeContinuousBackups", OpClass::Backup)
         }
+
+        // S3 export (ADR 0068, S-05) — same `OpClass::Backup` class as the
+        // rest of the backup/restore family (ADR 0066 Decision 1's own
+        // table groups every backup-shaped operation together).
+        Operation::ExportTableToPointInTime { .. } => ("ExportTableToPointInTime", OpClass::Backup),
+        Operation::DescribeExport { .. } => ("DescribeExport", OpClass::Backup),
+        Operation::ListExports { .. } => ("ListExports", OpClass::Backup),
     }
 }
 
@@ -160,6 +167,27 @@ pub(crate) fn authorize_op(
             None => authorize_unscoped(ctx, principal, name, class),
         },
 
+        // S3 export (ADR 0068, S-05) — same shape as the backup family
+        // just above: `DescribeExport` resolves the checked table from the
+        // export's own recorded source table (`ExportRow::table`), `None`
+        // when the ARN doesn't resolve to a row (lets the request continue
+        // to its own `ExportNotFoundException`); `ListExports` with no
+        // `TableArn` filter is unscoped, exactly like `ListBackups`.
+        Operation::DescribeExport { export_arn } => {
+            let table = meta.export(export_arn).map(|row| row.table.as_str());
+            authorize(ctx, principal, name, class, table)
+        }
+        Operation::ListExports { table_arn, .. } => match table_arn {
+            Some(arn) => authorize(
+                ctx,
+                principal,
+                name,
+                class,
+                animus_dynamo::wire::parse_table_arn(arn),
+            ),
+            None => authorize_unscoped(ctx, principal, name, class),
+        },
+
         Operation::CreateTable { table, .. }
         | Operation::UpdateTable { table, .. }
         | Operation::DescribeTable { table, .. }
@@ -175,6 +203,7 @@ pub(crate) fn authorize_op(
         | Operation::UpdateContinuousBackups { table, .. }
         | Operation::DescribeContinuousBackups { table, .. }
         | Operation::CreateBackup { table, .. }
+        | Operation::ExportTableToPointInTime { table, .. }
         | Operation::TagResource { table, .. }
         | Operation::UntagResource { table, .. }
         | Operation::ListTagsOfResource { table, .. } => {

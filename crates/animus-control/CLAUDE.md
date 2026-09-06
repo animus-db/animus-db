@@ -798,6 +798,60 @@ per-tablet CP data plane (`animus-cp-data`).
     `meta::tests::
     pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`.
 
+- **The export catalog (ADR 0068, S-05 PR 1): `BeginExport`/
+  `CompleteExport`/`FailExport`.** `Metadata::exports: BTreeMap<ExportId,
+  ExportRow>` (`ExportId = String`, the export's own ARN — unlike
+  `BackupId`, which is an opaque mint, `wire::export_arn` mints this one
+  directly since AWS's own `ExportArn` shape is the natural identity and
+  there's no name-collision hazard a table drop/recreate could exploit the
+  way there would be for a name-keyed backup). Modelled directly on
+  `BeginBackup`/`CompleteBackup`/`FailBackup`'s own shape (one-shot
+  `Creating`/`InProgress`-style row, a terminal `Completed`/`Failed`), but
+  **deliberately simpler**: there is no per-tablet progress catalog
+  (`backup_tablet_progress`'s dual) and no `RecordExportTabletComplete`
+  command, because an export is one job run once on whichever node
+  received the wire request (`animusd::dynamo::run_export_job`, reusing
+  `ctx.cp_scan` — the same primitive `Scan` uses, which already fans out
+  across a table's tablets and tolerates a concurrent split transparently)
+  rather than a distributed per-tablet-leader capture with a completion
+  aggregator (see ADR 0068 §1 for the full reasoning and the trade-off this
+  buys: no crash-resumability, a named residual). `BeginExport` records the
+  export's own `s3_bucket`/`s3_prefix`/`format`/`export_type`/
+  `export_time_ms`/`client_token` at apply time — every field a plain,
+  already-agreed value the proposer supplies, no derivation from other
+  `Metadata` state the way `BeginBackup`'s manifest-stub derivation needs
+  (an export's own manifest is written by the job driver directly to the
+  customer bucket, never mirrored into `Metadata`). `ExportFormat`
+  (`DynamoDbJson`/`Ion` — only the former is actually reachable; the wire
+  decoder rejects `ION` up front) and `ExportType` (`Full`/`Incremental` —
+  only `Full` is reachable, `INCREMENTAL_EXPORT` rejected the same way) are
+  both modeled even though only one variant of each is currently
+  producible, so PR 2/3's own eventual `Incremental`/`Ion` support needs no
+  catalog-shape change, only a wire-decoder relaxation. `CompleteExport`
+  freezes `item_count`/`billed_size_bytes`/`export_manifest` (the
+  customer-bucket key of `manifest-summary.json`, not a byte payload — this
+  catalog never holds export content, only the pointer to where the job
+  driver wrote it); `FailExport` mirrors `FailBackup`'s idempotent-on-
+  identical-reason, rejects-a-terminal-contradiction shape exactly.
+  `Metadata::export_by_client_token(table, token)` is the
+  `ClientRequestToken` idempotency lookup `animusd::dynamo::create_export`
+  uses to make a retried `ExportTableToPointInTime` call return the
+  existing export rather than minting a second one — the identical
+  linear-scan-over-a-small-map shape `export_by_client_token`'s own doc
+  states plainly rather than indexing, since a table's export count is
+  expected to stay small. `syskv::EntityKind::Export`/`export_key` follow
+  the usual per-entity mirror conventions (`mirror.rs`'s `Put` arm for all
+  three commands, no `Delete` arm needed — an export row is never removed,
+  unlike a backup's janitor-driven reclaim); `is_relayable_command`
+  (`animus-node/src/wire.rs`) allows all three — **all three**, not just
+  `BeginExport`, since (unlike `CompleteBackup`/`FailBackup`, which the
+  control-plane leader's own completion aggregator proposes locally) the
+  export job runs on whichever node received the wire request, which may
+  be any node in the cluster, control-plane leader or not. See
+  `crates/animusd/CLAUDE.md`'s own ADR 0068 entry for the job driver, the
+  customer-bucket store configuration/injection seam, and the object
+  layout written.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

@@ -385,6 +385,14 @@ async fn run(args: &[String]) -> Result<(), String> {
     // `insecure_http=true` `s3://` endpoint needs — see `parse_s3_uri`'s own
     // doc. Never required for a loopback (MinIO/localstack dev) endpoint.
     let mut allow_insecure_s3 = false;
+    // `--export-s3-endpoint`/`--export-s3-region` (ADR 0068 §2, S-05): this
+    // node's S3 connection parameters for the export **customer**-bucket
+    // store — see `resolve_export_s3`'s own doc. Reaches `--config/--node`
+    // only (a documented gap on `--cluster N`/`--cluster-control`+
+    // `--cluster-data`/`control`/`data`/`join`, mirroring `--segment-store`/
+    // `--backup-store`'s own partial CLI reach).
+    let mut export_s3_endpoint: Option<String> = None;
+    let mut export_s3_region: Option<String> = None;
     // `--quiesce-after SECS` (ADR 0044 phase-1 PR7): opts every data-plane CP
     // group into quiescence once it has had no local activity for this long
     // — `0` disables it entirely. Defaults ON (`DEFAULT_QUIESCE_AFTER_SECS`)
@@ -495,6 +503,12 @@ async fn run(args: &[String]) -> Result<(), String> {
                 s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
             }
             "--allow-insecure-s3" => allow_insecure_s3 = true,
+            "--export-s3-endpoint" => {
+                export_s3_endpoint = Some(parse_next(&mut it, "--export-s3-endpoint")?);
+            }
+            "--export-s3-region" => {
+                export_s3_region = Some(parse_next(&mut it, "--export-s3-region")?);
+            }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
@@ -565,6 +579,12 @@ async fn run(args: &[String]) -> Result<(), String> {
         s3_credentials.as_ref(),
         allow_insecure_s3,
     )?;
+    let export_s3_config = resolve_export_s3(
+        export_s3_endpoint.as_deref(),
+        export_s3_region.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
     let quiesce_after = quiesce_after_duration(cli_cluster_settings.quiesce_after_secs);
     validate_quiesce_after(quiesce_after)?;
     let dynamo_auth_flag = dynamo_auth_path
@@ -621,6 +641,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 backup_store_config,
                 advertise_host,
                 tls_flag,
+                export_s3_config.clone(),
             )
             .await
         }
@@ -951,6 +972,61 @@ struct S3UriParts {
 fn is_loopback_host(host: &str) -> bool {
     let host_only = host.split(':').next().unwrap_or(host);
     host_only == "localhost" || host_only == "::1" || host_only.starts_with("127.")
+}
+
+/// Resolve `--export-s3-endpoint`/`--export-s3-region` (ADR 0068 §2) into
+/// this node's [`animusd::ExportS3Config`], reusing the identical scheme/
+/// loopback gate [`parse_s3_uri`] already enforces for `--segment-store`/
+/// `--backup-store s3://` endpoints, and the same resolved `s3_credentials`
+/// (`--s3-credentials`/`ANIMUS_S3_ACCESS_KEY_ID`+`ANIMUS_S3_SECRET_ACCESS_KEY`)
+/// both stores already use — see `ExportS3Config`'s own doc for why a
+/// second, independent credential source was rejected. `None` when neither
+/// flag is given (S3 export stays unconfigured on this node, and
+/// `ExportTableToPointInTime` fails with a clear message); both flags must
+/// be given together.
+fn resolve_export_s3(
+    endpoint: Option<&str>,
+    region: Option<&str>,
+    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    allow_insecure_s3: bool,
+) -> Result<Option<animusd::ExportS3Config>, String> {
+    let (endpoint, region) = match (endpoint, region) {
+        (None, None) => return Ok(None),
+        (Some(e), Some(r)) => (e, r),
+        _ => {
+            return Err(
+                "--export-s3-endpoint and --export-s3-region must be given together".into(),
+            );
+        }
+    };
+    let endpoint_is_http = endpoint.starts_with("http://");
+    let endpoint_is_https = endpoint.starts_with("https://");
+    if !endpoint_is_http && !endpoint_is_https {
+        return Err(format!(
+            "--export-s3-endpoint {endpoint:?} must start with http:// or https://"
+        ));
+    }
+    let insecure_http = endpoint_is_http;
+    if insecure_http {
+        let host = endpoint.split_once("://").map_or(endpoint, |(_, h)| h);
+        if !is_loopback_host(host) && !allow_insecure_s3 {
+            return Err(format!(
+                "--export-s3-endpoint {endpoint:?} is http:// against a non-loopback host — \
+                 refused unless --allow-insecure-s3 is also given"
+            ));
+        }
+    }
+    let credentials = s3_credentials.cloned().ok_or_else(|| {
+        "--export-s3-endpoint/--export-s3-region need S3 credentials — pass \
+         --s3-credentials PATH or set ANIMUS_S3_ACCESS_KEY_ID/ANIMUS_S3_SECRET_ACCESS_KEY"
+            .to_string()
+    })?;
+    Ok(Some(animusd::ExportS3Config {
+        endpoint: endpoint.to_string(),
+        region: region.to_string(),
+        insecure_http,
+        credentials,
+    }))
 }
 
 /// One S3 credential (S-04 PR 2): `access_key_id` plus exactly one of
@@ -1297,6 +1373,7 @@ async fn run_single(
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
+    export_s3: Option<animusd::ExportS3Config>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
@@ -1342,6 +1419,7 @@ async fn run_single(
         settings.throttle_write_units,
         settings.tablet_max_read_units,
         settings.tablet_max_write_units,
+        export_s3,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;

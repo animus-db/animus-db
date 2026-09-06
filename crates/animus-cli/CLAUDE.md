@@ -240,6 +240,30 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   these are Streams ops. `admin_request`'s own unit tests cover the happy
   path, a missing-argument error, and the `--disable`/`off` variants for
   every one of the six.
+- **`export-create`/`export-describe`/`export-list` (ADR 0068, S-05 PR 1)**
+  join the same dynamo-proxy group, one more `POST /admin/data/dynamo
+  {op, payload}` triple over the new `ExportTableToPointInTime`/
+  `DescribeExport`/`ListExports` wire operations:
+
+  ```
+  export-create <admin-addr> <table-arn> <s3-bucket> [s3-prefix]   # ExportTableToPointInTime
+  export-describe <admin-addr> <export-arn>                        # DescribeExport
+  export-list <admin-addr> [table-arn]                             # ListExports
+  ```
+
+  `export-create` takes a table **ARN**, not a bare table name, matching
+  the real `ExportTableToPointInTime` wire shape (`animus_dynamo::wire::
+  table_arn` mints one from a bare name if a caller has only that);
+  `s3-prefix` is optional, omitted from the payload entirely when absent
+  rather than sent as an empty string. No `ExportTime`/`ClientToken`
+  flags yet — this wrapper covers the common case (a fresh export to a
+  customer bucket, no idempotency token needed for a one-shot CLI
+  invocation); a fuller flag set is a natural follow-up once PR 2/3's own
+  import trio needs a comparable wrapper to mirror. Like the six wrappers
+  above, no proxy allow-list change was needed (none of these three are
+  Streams ops), and `admin_request`'s own unit tests cover the happy path,
+  the optional-prefix omission, and a missing-argument error for all
+  three.
 - **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per
