@@ -1916,16 +1916,30 @@ async fn admin_control_transfer_moves_leadership_to_the_named_node() {
         let target = (0..nodes.len()).find(|&i| i != leader).unwrap();
         let target_id = config.nodes[target].id.clone();
 
+        // Right after bootstrap the named target may not have caught up to
+        // the leader's log yet, and the route answers that transient with a
+        // 409 whose message says "retry" — so this is a converged-or-timeout
+        // poll on the POST itself (issue #671), never a one-shot assert on
+        // the first answer. Anything other than 200 or that retryable 409
+        // is a real failure and stops the poll immediately.
         let body = serde_json::json!({"to": target_id}).to_string();
-        let (status, resp) = admin(
-            nodes[leader].admin_addr(),
-            "POST",
-            "/admin/control/transfer",
-            Some(&body),
-        )
-        .await;
-        assert_eq!(status, 200, "transfer should be accepted: {resp}");
-        assert_eq!(resp["ok"], true, "response: {resp}");
+        let leader_admin = nodes[leader].admin_addr();
+        let accepted = timeout(Duration::from_secs(10), async {
+            loop {
+                let (status, resp) =
+                    admin(leader_admin, "POST", "/admin/control/transfer", Some(&body)).await;
+                match status {
+                    200 => return resp,
+                    409 if resp["error"].as_str().is_some_and(|e| e.contains("retry")) => {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                    _ => panic!("transfer should be accepted or retryable: {status} {resp}"),
+                }
+            }
+        })
+        .await
+        .expect("transfer was never accepted: the target never caught up within the bound");
+        assert_eq!(accepted["ok"], true, "response: {accepted}");
 
         timeout(Duration::from_secs(10), async {
             loop {
