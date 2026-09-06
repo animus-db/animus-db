@@ -80,6 +80,10 @@ on:
         description: "Seeds per cell (ANIMUS_SIMCLUSTER_SEEDS, ADR 0061 rung D1 SimCluster cycles/durability corpus)"
         required: false
         default: "25"
+      export_import_seeds:
+        description: "Seeds per scenario (ANIMUS_EXPORT_IMPORT_SEEDS, ADR 0068 S3 export/import fault corpus)"
+        required: false
+        default: "40"
 
 # One deep run at a time. The corpora are long-running and share the same
 # runner class as CI, so an on-demand `workflow_dispatch` queues behind a
@@ -343,6 +347,20 @@ jobs:
           ANIMUS_SIMCLUSTER_SEEDS: ${{ github.event.inputs.simcluster_seeds || '25' }}
         run: cargo test -p animusd --lib sim_cluster_corpus -- --nocapture
 
+      # ADR 0068's S3 export/import job driver + import driver: multi-tablet
+      # export content fidelity, concurrent writes racing the pin, bucket
+      # faults, a crash mid-export/mid-import (the ADR's own named
+      # crash-resumability residuals), malformed-item handling, a failed
+      # import's target-table rollback, and randomized catalog interleavings,
+      # scaled to depth. Each scenario is a pure function of its seed, so a
+      # failure names one scenario + seed and is replayable.
+      - name: deep S3 export/import corpus (ADR 0068)
+        id: export_import
+        continue-on-error: true
+        env:
+          ANIMUS_EXPORT_IMPORT_SEEDS: ${{ github.event.inputs.export_import_seeds || '40' }}
+        run: cargo test -p animus-test --test export_import_fault_corpus -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -373,10 +391,11 @@ jobs:
             [lsm_disk_fault]="${{ steps.lsm_disk_fault.outcome }}"
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
+            [export_import]="${{ steps.export_import.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner inplace_split backup pitr lsm_crash lsm_disk_fault control simcluster export_import; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

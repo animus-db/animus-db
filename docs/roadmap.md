@@ -26,8 +26,8 @@ record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
 W-08b's — all three landed 2026-09-05 and their roadmap sections are removed
 per this document's own maintenance rule above; 0068 is
 [S3 export and import](adr/0068-s3-export-import.md), S-05's design of
-record — PR 1/3 and PR 2/3 landed 2026-09-06, see that section below for
-what remains).
+record — all three PRs (export trio, import trio, the `SimEnv` corpus)
+landed 2026-09-06 and its roadmap section is removed the same way).
 
 ---
 
@@ -88,42 +88,6 @@ the still-true paragraph after the table.
 - **Depends:** was sequenced after S-02 specifically to avoid three crypto
   ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
   landed 2026-09-05, so this item is unblocked.
-
-### S-05 S3 export/import
-
-- **Gap:** deterministic simulation corpus coverage for the export/import
-  path absent (PR 3). `ExportTableToPointInTime`/`DescribeExport`/
-  `ListExports` **landed 2026-09-06** (PR 1 of 3) and `ImportTable`/
-  `DescribeImport`/`ListImports` **landed 2026-09-06** (PR 2 of 3) — see
-  [ADR 0068](adr/0068-s3-export-import.md) for the design (export: a single
-  leader-driven job per export, run on whichever node received the wire
-  request, reusing `ctx.cp_scan` rather than the backup catalog's
-  per-tablet capture-driver/aggregator machinery; import: a per-tablet,
-  leader-side, event-driven driver mirroring `backup_restore.rs`'s own
-  shape, sourcing from an arbitrary customer bucket via the shared
-  `ExportStoreFactory` seam and deriving each row's `KIND_BASE`/`KIND_LSI`
-  writes through the same `kind_writes_for_item` primitive PITR replay
-  uses) and its own "Known residuals"/PR 2 as-built sections for what's
-  deliberately deferred (no crash-resumability for either direction;
-  `ExportTime` is validated against the PITR window but content is always
-  current-state, not a true point-in-time replay; import has no `ION`/
-  `CSV`/`ZSTD` support and no `CancelImport`).
-- **Plan (remaining):** PR 3 extends `ANIMUS_BACKUP_SEEDS`/
-  `ANIMUS_PITR_SEEDS`-style fault-injection coverage to the export/import
-  path (`animus-test`).
-- **Tests:** `crates/animusd/tests/dynamo_export.rs` (PR 1, e2e: full
-  export flow with a real split mid-scan, idempotent `ClientRequestToken`,
-  format/type/time validation, unknown-table/export errors);
-  `crates/animusd/tests/dynamo_import.rs` (PR 2, e2e: a full export→import
-  round trip with exact item/error counts, a `NONE`-compressed hand-written
-  export, malformed-item skipping, `ImportConflictException`, pagination,
-  format/compression validation, idempotent `ClientRequestToken`).
-- **ADR:** [0068](adr/0068-s3-export-import.md), Accepted.
-- **PRs:** (1) export trio — **done**; (2) import trio — **done**; (3)
-  corpus. **Size:** L (PR 1/PR 2 each: M).
-- **Depends:** S-04, landed in full 2026-09-06 (`animus-s3`, `animus_env::
-  S3SegmentStore` + `s3:` URIs, and `animus-operator`'s `spec.s3` — see ADR
-  0059's amendments), so this item is unblocked.
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
@@ -287,7 +251,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04 landed 2026-09-06* → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04 and S-05 landed 2026-09-06* → S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

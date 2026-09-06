@@ -317,7 +317,9 @@ rejection, and an `ExportTime` with no PITR history rejected as
 (`crates/animus-control/src/meta.rs`) cover the catalog's own apply logic
 in isolation. **PR (3)'s planned `SimEnv` corpus** (reusing
 `ANIMUS_BACKUP_SEEDS`'s fault-injection shape against the object store) is
-not built in this PR.
+not built in this PR — landed 2026-09-06, see this ADR's own "As-built
+amendment (2026-09-06, S-05 PR 3 — the `SimEnv` corpus, S-05 complete)"
+section, below.
 
 **Named residuals, stated plainly rather than silently shipped:**
 
@@ -524,7 +526,9 @@ stuck-timeout) but genuinely a different job:
 5. **PR 3's planned `SimEnv` corpus** (reusing `ANIMUS_BACKUP_SEEDS`'s
    fault-injection shape) is not built in this PR, matching export's own
    PR 1 residual — `docs/roadmap.md`'s S-05 entry stays in place pointing
-   at it.
+   at it. **Closed 2026-09-06** — see this ADR's own "As-built amendment
+   (2026-09-06, S-05 PR 3 — the `SimEnv` corpus, S-05 complete)" section,
+   below; `docs/roadmap.md`'s S-05 entry is now marked complete.
 
 **Tests** (`crates/animusd/tests/dynamo_import.rs`, real `ProdEnv`
 sockets, no MinIO — reuses the S-04 `FakeS3` fake, the identical
@@ -541,3 +545,84 @@ target table name and a second import racing an already-claimed one;
 `ImportNotFoundException` for an unknown ARN; `ListImports` pagination
 and `TableArn` filtering; `ValidationException` for `ION`/`ZSTD`; and
 `ClientRequestToken` idempotency.
+
+## As-built amendment (2026-09-06, S-05 PR 3 — the `SimEnv` corpus, S-05 complete)
+
+§9's "PR (3)'s planned `SimEnv` corpus" and the PR 2 amendment's residual
+#5 are both closed: `crates/animus-test/tests/export_import_fault_
+corpus.rs`, depth knob `ANIMUS_EXPORT_IMPORT_SEEDS` (default 1, held at
+`=40` in `corpus-deep.yml`'s nightly tier). **This is the last piece of
+S-05** — the export trio (PR 1), the import trio (PR 2), and this
+deterministic corpus (PR 3) together complete the roadmap item;
+`docs/roadmap.md`'s S-05 entry is now marked complete.
+
+Follows the exact self-contained-reimplementation doctrine this repo's
+other `animusd`-logic corpora already established (`backup_fault_
+corpus.rs`/`pitr_fault_corpus.rs`): the export job's and import driver's
+own scan/encode/chunk and resolve/decode/seed *mechanics* are mirrored
+directly over `RaftKvNode`, a bare `Metadata`, and `animus-sim`'s
+`SimSegmentStore` standing in for the customer's own S3 bucket — but every
+DECISION function that lives in `animus-control`/`animus-item` is called
+for real: all six catalog commands
+(`BeginExport`/`CompleteExport`/`FailExport`/`BeginImport`/
+`CompleteImport`/`FailImport`) are genuine `Metadata::apply` calls, and an
+imported item's derived writes go through the real, pure
+`animus_item::derive_kind_writes` core (the identical function
+`animusd::dynamo::kind_writes_for_item` wraps in production) rather than a
+third independently-maintained copy.
+
+**What the corpus proves**: exact multi-tablet export content fidelity
+with no key ever double-counted across tablets (`animus_dynamo::wire::
+decode_item` is the real decoder used for verification, not a re-derived
+one); a genuinely staged, never-resolved transaction intent and a
+concurrent post-pin write both never leak into an export, via the real
+per-tablet snapshot-scan + intent-resolution primitive
+(`local_scan_kind_snapshot`); export's own no-retry design under a bucket
+fault either converges to a fully correct `COMPLETED` or a cleanly `FAILED`
+row with its never-set counts still at their defaults — never a torn
+`COMPLETED`; import's own uniform "every store fault is retryable" design
+converges to byte-identical final table content whether or not a transient
+bucket-unavailability window ever fired, for the same seed; a real
+`MAX_MALFORMED_ITEMS` overrun fails the import and rolls back the
+half-created target table's schema AND tablet, through the ordinary
+`DropTableSchema`/`DropTableTablets` path — matching real DynamoDB's own
+"a failed `ImportTable` rolls back the table" contract; and a bare-
+`Metadata` property cell proves catalog-wide invariants (ids never reused,
+a terminal row never re-accepts a second `Complete`, a row's frozen counts
+never drift after its own one terminal command) under randomized
+`Begin`/`Complete`/`Fail` interleavings, with `ListExports`/`ListImports`'
+real pagination/filtering functions (`animus_dynamo::wire::
+paginate_export_summaries`/`paginate_import_summaries`) reproducing the
+full catalog exactly.
+
+**What it deliberately pins as residual, not fixes**: §9 residual #1 (a
+crash mid-export leaves the row `InProgress` forever, no
+`manifest-summary.json` ever appearing) and the PR 2 amendment's residual
+#3 (a wedged import stays `InProgress` until the driver's own 600s stuck
+timeout, proven both that it does not fire early and that it does fire
+once crossed — driven entirely by the corpus's own virtual `env.now()`,
+never a real clock) are each pinned by a dedicated named cell
+(`export_leader_kill_mid_job_leaves_row_in_progress`/`import_leader_kill_
+mid_job_stuck_timeout_fails`) precisely so a future change that
+accidentally "fixes" either residual without updating this ADR first gets
+caught by a red corpus cell rather than a silent behavior change.
+
+**No production bug found.** Building the import mirror's own seed path
+did surface one corpus-harness-only mistake before this file was ever
+committed: a first draft pushed `derive_kind_writes`'s raw stored-item
+bytes straight into `SeedBatch` without re-wrapping them through
+`animus_cp_data::backup::encode_restored_value` first — the identical
+corrupt-engine-value hazard `backup_fault_corpus.rs`'s own restore-tick
+mirror already exists to close, missed here because the import driver's
+own seeding path was written fresh rather than adapted from that
+precedent. Caught immediately and deterministically on this file's very
+first depth-1 run (`animus-cp-data::txn::decode_envelope`'s "unknown
+envelope tag" panic, every seed) — never shipped as a false-negative-green
+corpus. See `docs/engineering-lessons.md`'s matching entry for the general
+lesson (`SeedBatch`'s merge always expects an envelope-wrapped value; any
+new seeder must re-wrap, not just derive).
+
+No CLAUDE.md-documented production API needed any visibility change for
+this corpus — every symbol it calls into production `animus-control`/
+`animus-item`/`animus-dynamo`/`animus-cp-data` code with was already
+`pub`.
