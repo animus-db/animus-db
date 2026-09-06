@@ -14,7 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // State assembled each refresh.
-let STATE = { status: null, backups: null, restores: null, nodes: [], peersErr: null };
+let STATE = { status: null, backups: null, restores: null, backupStore: null, nodes: [], peersErr: null };
 
 // ---- this node's own role (ADR 0035 PR7) ----
 // `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
@@ -522,6 +522,14 @@ async function loadAll() {
   try { backups = await getJSON(SEED, "/admin/backups"); } catch (e) { /* shown per-panel */ }
   let restores = null;
   try { restores = await getJSON(SEED, "/admin/restores"); } catch (e) { /* shown per-panel */ }
+  // `/admin/backup-store` (docs/roadmap.md U-07): this node's own backup
+  // store config/object counts/janitor progress — a single fetch against
+  // SEED like `backups`/`restores` just above, never a per-node fan-out
+  // (the janitor only ever runs on the control leader; a follower's own
+  // copy is a legitimate, honestly-idle answer, not a gap to paper over
+  // with a fan-out).
+  let backupStore = null;
+  try { backupStore = await getJSON(SEED, "/admin/backup-store"); } catch (e) { /* shown per-panel */ }
 
   const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
     : [SEED.replace(/^https?:\/\//, "")];
@@ -563,7 +571,7 @@ async function loadAll() {
     return node;
   }));
 
-  STATE = { status, backups, restores, nodes, peersErr: STATE.peersErr };
+  STATE = { status, backups, restores, backupStore, nodes, peersErr: STATE.peersErr };
   render();
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }

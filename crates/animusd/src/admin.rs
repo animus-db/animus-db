@@ -529,6 +529,9 @@ impl AdminHost for ClientCtx {
     async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value) {
         action_revoke_credential(self, body).await
     }
+    async fn backup_store_view(&self) -> Value {
+        backup_store_view(self).await
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
@@ -1499,6 +1502,80 @@ fn restores_view(ctx: &ClientCtx) -> Value {
         })
         .collect();
     json!({ "restores": restores })
+}
+
+/// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) — the template
+/// the next three U-07 observability routes (`/admin/ttl`, `/admin/gc`,
+/// `/admin/segment-store`) copy.
+///
+/// **Object counts are a live, bounded local scan, not a maintained
+/// counter** — `BackupStoreHandle` tracks no running count/byte total, and
+/// this is a debug-posture route, the same class `/admin/raftkv`'s own
+/// `?exact=1` materializing path already is (see that route's own "a
+/// polled observer must not materialize" doc note) — so a bounded scan is
+/// acceptable here specifically, unlike a route a dashboard polls on a
+/// tight interval by default. `count` is exact (one cheap
+/// [`animus_env::SegmentStore::list`] call, scoped to the whole
+/// `backup/` namespace — never load-bearing for correctness, only for this
+/// view); `bytes` sums each object's length via a **local-only** read
+/// ([`BackupStoreHandle::get_local`], never the cluster-fallback
+/// [`BackupStoreHandle::get_any`] — every id in this scan is already known
+/// to live here), capped at [`BACKUP_STORE_OBJECT_BYTES_SCAN_CAP`] objects;
+/// past that cap, `bytes` covers only the first
+/// `BACKUP_STORE_OBJECT_BYTES_SCAN_CAP` objects and `"truncated": true` says
+/// so — `count` itself is never truncated.
+///
+/// `store` is this node's own configured backup store: kind plus a
+/// credential-safe `location` (`redact_store_location`, `lib.rs` — the
+/// helper every future store-shaped admin view should reuse rather than
+/// re-deriving its own redaction; neither variant this node can be
+/// configured with today actually carries a credential, but the next PR to
+/// add an S3-backed store inherits the safety for free). `janitor` is the
+/// live `animus_node::backup_janitor::JanitorProgress` snapshot
+/// `animus_node::backup_janitor::backup_janitor_loop` maintains on this
+/// node (`ClientCtx::backup_janitor_progress`) — a non-leader's copy simply
+/// stays `Idle` forever, since the loop only ever advances it while
+/// `control_leader()` answers `Some`. `leader` reports this node's own
+/// current control-plane-leader belief (`ctx.control.is_leader()`) — the
+/// exact condition the janitor loop itself gates its whole tick on.
+const BACKUP_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
+
+async fn backup_store_view(ctx: &ClientCtx) -> Value {
+    let store = ctx.admin.backup_store.as_ref().map_or(Value::Null, |v| {
+        json!({
+            "kind": v.kind,
+            "location": v.path.as_deref().map(crate::redact_store_location),
+        })
+    });
+
+    let prefix = format!("{}/", animus_cp_data::backup::BACKUP_NAMESPACE);
+    let objects = match ctx.backup_store.list_local(&prefix).await {
+        Ok(ids) => {
+            let total = ids.len();
+            let truncated = total > BACKUP_STORE_OBJECT_BYTES_SCAN_CAP;
+            let scan = &ids[..total.min(BACKUP_STORE_OBJECT_BYTES_SCAN_CAP)];
+            let mut bytes: u64 = 0;
+            for id in scan {
+                if let Ok(Some(b)) = ctx.backup_store.get_local(id).await {
+                    bytes += b.len() as u64;
+                }
+            }
+            json!({"count": total, "bytes": bytes, "truncated": truncated})
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "admin backup-store: local object list failed");
+            Value::Null
+        }
+    };
+
+    let janitor = ctx.backup_janitor_progress.lock().unwrap().clone();
+
+    json!({
+        "store": store,
+        "objects": objects,
+        "janitor": janitor,
+        "leader": ctx.control.is_leader(),
+    })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

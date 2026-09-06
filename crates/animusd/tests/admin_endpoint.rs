@@ -140,6 +140,73 @@ async fn bring_up_with_streams_quiesce(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up_with_streams_quiesce`], but pins an explicit `fs:PATH`
+/// [`animusd::BackupStoreConfig`] (roadmap U-07's
+/// `admin_backup_store_reports_reclaim_progress_and_leader_state` needs a
+/// deterministic, per-node-local store to assert object counts against —
+/// the default `Cluster` variant's K-way replication would otherwise spread
+/// a backup's objects across nodes unpredictably for a 3-node test).
+async fn bring_up_with_fs_backup_store(
+    n: usize,
+    dir: &std::path::Path,
+    backup_store_dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
+                Duration::ZERO,
+                animusd::BackupStoreConfig::Fs(backup_store_dir.join(format!("attempt-{attempt}"))),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -2062,6 +2129,157 @@ async fn admin_storage_compact_action() {
         )
         .await;
         assert_eq!(s, 404, "compacting an unhosted tablet is refused: {err}");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) end to end on a
+/// real cluster with an `fs:` backup store: create a table, create an
+/// on-demand backup, delete it, and poll (converged-or-timeout) until the
+/// control-plane leader's own route shows the backup janitor having
+/// reclaimed every local object — plus a follower reports `leader: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_backup_store_reports_reclaim_progress_and_leader_state() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let backup_store_dir = dir.path().join("fs-backup-store");
+        let (nodes, _config) =
+            bring_up_with_fs_backup_store(3, dir.path(), &backup_store_dir).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let leader_addr = nodes[leader_idx].admin_addr();
+        let follower_addr = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| n.admin_addr())
+            .expect("a follower exists in a 3-node cluster");
+
+        // ---- baseline: an unconfigured/no-backups-yet leader is honestly
+        //      idle, and reports itself the control leader -------------------
+        let (s, baseline) = admin_get(leader_addr, "/admin/backup-store").await;
+        assert_eq!(s, 200, "GET /admin/backup-store on the leader: {baseline}");
+        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
+        assert_eq!(baseline["store"]["kind"], "fs", "the configured fs: store: {baseline}");
+        assert!(
+            baseline["objects"]["count"].as_u64().is_some(),
+            "objects.count is always present (even zero): {baseline}"
+        );
+        let baseline_count = baseline["objects"]["count"].as_u64().unwrap();
+
+        // ---- a follower never runs the janitor, and says so ----------------
+        let (s, follower_view) = admin_get(follower_addr, "/admin/backup-store").await;
+        assert_eq!(s, 200, "GET /admin/backup-store on a follower: {follower_view}");
+        assert_eq!(
+            follower_view["leader"], false,
+            "a follower reports leader: false: {follower_view}"
+        );
+        assert_eq!(
+            follower_view["janitor"]["phase"], "idle",
+            "a follower's own janitor never advances past idle: {follower_view}"
+        );
+
+        // ---- create a table, write a row, and take an on-demand backup
+        //      through the leader's own admin dynamo proxy -------------------
+        let (s, ct_body) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct_body}");
+        let (s, put_body) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"widgets","Item":{"id":{"S":"w1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put_body}");
+
+        let (s, created) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"CreateBackup","payload":{"TableName":"widgets","BackupName":"nightly"}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateBackup: {created}");
+        let backup_arn = created["BackupDetails"]["BackupArn"]
+            .as_str()
+            .expect("BackupArn")
+            .to_owned();
+
+        // ---- poll to AVAILABLE ----------------------------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, view) = admin_get(leader_addr, "/admin/backups").await;
+                assert_eq!(s, 200);
+                let row = view["backups"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|r| r["backup_id"] == backup_arn));
+                if row.is_some_and(|r| r["status"]["state"] == "AVAILABLE") {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("backup did not become AVAILABLE in 20s");
+
+        // ---- object count on the leader has grown past the baseline --------
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, v) = admin_get(leader_addr, "/admin/backup-store").await;
+                if v["objects"]["count"].as_u64().unwrap_or(0) > baseline_count {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the leader's own object count never grew past baseline after CreateBackup");
+
+        // ---- delete it, then poll converged-or-timeout until the janitor
+        //      has reclaimed it: object count back at baseline (or
+        //      objects_reclaimed > 0), on the LEADER's own route -------------
+        let (s, deleted) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(&format!(
+                r#"{{"op":"DeleteBackup","payload":{{"BackupArn":"{backup_arn}"}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(s, 200, "DeleteBackup: {deleted}");
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, v) = admin_get(leader_addr, "/admin/backup-store").await;
+                assert_eq!(s, 200, "GET /admin/backup-store: {v}");
+                let count = v["objects"]["count"].as_u64().unwrap_or(u64::MAX);
+                let reclaimed = v["janitor"]["objects_reclaimed"].as_u64().unwrap_or(0);
+                if count <= baseline_count && reclaimed > 0 {
+                    return v;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the backup janitor never reclaimed the deleted backup's objects in 20s");
 
         for node in &nodes {
             node.shutdown_graceful().await;

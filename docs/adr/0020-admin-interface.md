@@ -437,6 +437,61 @@ section** — every bullet across all five PRs has now landed. See
 mechanism and `tests/dashboard_endpoint.rs::
 dashboard_u05_control_member_actions` for the regression.
 
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/backup-store`
+
+The first of U-07's four new observability routes, and its own named
+template: `GET /admin/backup-store` (ADR 0059 §1/§3) surfaces this node's
+own configured backup store (kind + a credential-safe `location`), a
+bounded live scan of its local backup-object count/bytes, the on-demand
+backup janitor's own live phase/counters (a new
+`animus_node::backup_janitor::JanitorProgress`, published by
+`backup_janitor_loop` through a new narrow capability trait,
+`animus_node::host::BackupJanitorProgressHost`, into an
+`Arc<std::sync::Mutex<JanitorProgress>>` on `ClientCtx` — the same "plain
+`std::sync::Mutex`, short lock/mutate/drop, never held across an `.await`"
+shape `metrics_history` already uses), and whether this node currently
+believes it is the control-plane leader — the janitor only ever runs
+there, so a follower's own `janitor` field simply stays `Idle` forever, an
+honest answer rather than a gap.
+
+**Object counts are a live, bounded scan, not a maintained counter**
+(`BackupStoreHandle` tracks no running count/byte total today): `count` is
+one cheap `SegmentStore::list` call over the whole `backup/` namespace;
+`bytes` sums each object's length via a new `BackupStoreHandle::get_local`
+(local-only — every id already came from this node's own `list_local`, so
+there is no reason to fall through to the cluster-wide `get_any`), capped
+at 200 objects with `"truncated": true` reported past the cap. This is the
+identical "a polled observer must not materialize" judgment call this
+file's own 2026-08-19 amendment made for `/admin/raftkv` — acceptable here
+specifically because this route has no cheap alternative and nothing polls
+it on a tight interval by default.
+
+Wired through the full conventional stack: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+backup_store_view` method (`crates/animus-node/src/host.rs`) and its
+`FakeHost` stub/dispatch test, a handler in `crates/animusd/src/admin.rs`,
+`animus admin backup-store <admin-addr>` (`animus-cli`), and a new
+read-only "Backup store" card on the Backups tab
+(`dashboard_backups.js`/`dashboard.html`, fed from the tab's existing
+`loadAll()` poll — no new timer). A small new helper,
+`redact_store_location` (`crates/animusd/src/lib.rs`), strips a URI's
+userinfo and query string before a store location ever reaches this JSON —
+written now, once, so a future S3-backed store variant (and the next three
+U-07 routes) inherit the same safety rather than each re-deriving their
+own redaction; neither store variant this node can be configured with
+today actually carries a credential, so this is defense-in-depth, not a
+fix for an existing leak.
+
+Regression: `tests/admin_endpoint.rs::
+admin_backup_store_reports_reclaim_progress_and_leader_state` (a real
+3-node cluster with an `fs:` backup store — create a table, take an
+on-demand backup, delete it, and poll converged-or-timeout until the
+control-plane leader's own route shows the janitor's object count back at
+baseline with `objects_reclaimed > 0`; a follower reports `leader: false`
+and stays `Idle`), `tests/dashboard_endpoint.rs::
+dashboard_u07_backup_store_card`, and `animus_node::backup_janitor::tests`'
+own progress-reporting assertions.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

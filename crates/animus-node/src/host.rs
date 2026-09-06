@@ -90,6 +90,27 @@ pub trait BackupObjectStore: Send + Sync {
     async fn backup_delete_at(&self, replicas: &[NodeId], id: &str) -> Option<io::Result<()>>;
 }
 
+/// The on-demand backup janitor's own progress-reporting capability
+/// (roadmap U-07) — lets [`crate::backup_janitor::backup_janitor_loop`]
+/// publish its current phase/counters to a shared, admin-readable slot
+/// without dragging any admin-surface type into this crate. Not
+/// `async` — every implementation is a short, synchronous lock/mutate/drop
+/// (see [`crate::backup_janitor::JanitorProgress`]'s own doc), so there is
+/// nothing here for `async_trait` to buy.
+///
+/// `animusd::ClientCtx` backs this with an
+/// `Arc<std::sync::Mutex<JanitorProgress>>`, mirroring `metrics_history`'s
+/// own "plain `std::sync::Mutex` is fine, nothing here holds it across an
+/// `.await`" precedent in that crate.
+pub trait BackupJanitorProgressHost: Send + Sync {
+    /// Apply `update` to the shared
+    /// [`crate::backup_janitor::JanitorProgress`] under a short-held lock.
+    fn update_backup_janitor_progress(
+        &self,
+        update: &mut dyn FnMut(&mut crate::backup_janitor::JanitorProgress),
+    );
+}
+
 /// The TTL reaper's own narrow slice: a `Metadata` read, which tablets this
 /// node leads, a pure local non-waking scan, and the one conditional-delete
 /// write the reaper ever performs — see `ttl_reaper`'s module doc for the
@@ -344,4 +365,12 @@ pub trait AdminHost: Send + Sync {
     /// `POST /admin/credentials/revoke` (ADR 0066 §2) — revoke a credential
     /// outright.
     async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) — this
+    /// node's own configured backup store (redacted), a bounded live scan
+    /// of its local object count/bytes, the backup janitor's own live
+    /// [`crate::backup_janitor::JanitorProgress`], and whether this node is
+    /// currently the control-plane leader (the janitor only ever runs
+    /// there). The template the next three U-07 observability routes
+    /// (`/admin/ttl`, `/admin/gc`, `/admin/segment-store`) copy.
+    async fn backup_store_view(&self) -> Value;
 }

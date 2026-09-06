@@ -215,11 +215,12 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ### U-07 New observability routes
 
-- `GET /admin/backup-store`: store config, object counts (live `list`
-  scan, debug posture, or a maintained counter in `BackupStoreHandle`),
-  janitor phase via an `Arc<Mutex<JanitorProgress>>` on `ClientCtx`
-  updated by `animus_node::backup_janitor`. Size L. Do first as the
-  template.
+- **Landed 2026-09-06.** `GET /admin/backup-store`: store config, object
+  counts (a bounded live `list` scan, debug posture — `BackupStoreHandle`
+  maintains no counter), janitor phase via an `Arc<Mutex<JanitorProgress>>`
+  on `ClientCtx` updated by `animus_node::backup_janitor`. Renders on the
+  Backups tab. See ADR 0020's and ADR 0059's 2026-09-06 as-built notes and
+  `crates/animusd/CLAUDE.md`'s `backup_janitor.rs` entry.
 - `GET /admin/ttl`: reaper cursor and deletes per tick from
   `animus_node::ttl_reaper`. Size L.
 - `GET /admin/gc`: orphan-sweep phase from `segment_janitor_loop`

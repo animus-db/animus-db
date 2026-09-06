@@ -1055,6 +1055,73 @@ async fn dashboard_u02_backups_tab() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-07: the Backups tab's "Backup store" card, fed from
+/// `GET /admin/backup-store` — the template the next three U-07
+/// observability routes copy. Same render-only-markers-plus-live-round-trip
+/// structure as `dashboard_u02_backups_tab` just above; the actual janitor
+/// mechanics have their own coverage
+/// (`animus_node::backup_janitor::tests`, `admin_endpoint.rs`'s
+/// `admin_backup_store_reports_reclaim_progress_and_leader_state`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u07_backup_store_card() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new card beside the backup list ---------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="bk-store-card""#) && shell.contains(r#"id="bk-store-body""#),
+            "the shell carries the Backup store card: {shell}"
+        );
+
+        // ---- dashboard_backups.js renders it from the route's own shape ----
+        let (s, _, backups_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_backups.js").await;
+        assert_eq!(s, 200, "dashboard_backups.js is served");
+        assert!(
+            backups_js.contains("function renderBackupStore"),
+            "dashboard_backups.js renders the backup store card: {backups_js}"
+        );
+        assert!(
+            backups_js.contains("STATE.backupStore")
+                && backups_js.contains("bs.store")
+                && backups_js.contains("bs.objects")
+                && backups_js.contains("bs.janitor")
+                && backups_js.contains("bs.leader"),
+            "the card reads every field GET /admin/backup-store serves: {backups_js}"
+        );
+
+        // ---- dashboard_core.js fetches it alongside /admin/backups, not a
+        //      per-node fan-out (the janitor only ever runs on the control
+        //      leader; a follower's own answer is honestly idle) -----------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains("/admin/backup-store"),
+            "dashboard_core.js fetches the route once against SEED: {core_js}"
+        );
+
+        // ---- the route itself serves from a live node -----------------------
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/backup-store").await;
+        assert_eq!(s, 200, "GET /admin/backup-store: {body}");
+        let v: Value = serde_json::from_str(&body).expect("backup-store view is JSON");
+        assert!(v.get("store").is_some(), "carries \"store\": {body}");
+        assert!(v.get("objects").is_some(), "carries \"objects\": {body}");
+        assert!(v.get("janitor").is_some(), "carries \"janitor\": {body}");
+        assert!(
+            v.get("leader").and_then(Value::as_bool).is_some(),
+            "carries a boolean \"leader\": {body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
 /// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
 /// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The

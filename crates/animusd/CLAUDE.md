@@ -1132,6 +1132,22 @@ reusing the captured config is the point of the test.
   prompt has no natural home in a persistent form the way Create-backup's
   table+name pair does.
 
+  **docs/roadmap.md U-07** added a read-only "Backup store" card
+  (`#bk-store-card`/`#bk-store-body`, `renderBackupStore`) to this same
+  tab, above the backup list — store kind/location, a bounded object
+  count/byte total, and the backup janitor's own live phase/counters,
+  straight off `GET /admin/backup-store`'s response shape
+  (`{store, objects, janitor, leader}`; see `admin.rs`'s own
+  `backup_store_view` entry above and ADR 0020's matching as-built note
+  for the route itself). Fetched into `STATE.backupStore` alongside
+  `backups`/`restores` in `dashboard_core.js`'s existing `loadAll()`
+  — no new poll timer, no per-node fan-out. `last_tick_at_ms` renders via
+  `dashboard_streams.js`'s `monoDuration` (an `env.now()`-derived value,
+  never wall-clock — same rendering caveat as a stream shard's own
+  `seal_wall_ms`), so this file gained that one cross-file dependency,
+  documented in its own header comment. Read-only — no action to gate,
+  since this card mutates nothing.
+
   **docs/roadmap.md U-04** (`dashboard_browser.js`) added a `#br-dy-ttl`
   row beside `#br-dy-stream` (`renderTtlRow`, called from
   `renderDynamoFields` alongside `renderStreamRow`) — same shape as the
@@ -3864,7 +3880,31 @@ ADR itself for the full design/rationale.
   `segment_janitor.rs`/`backup_completion.rs` used to document is closed
   (W-10)**: object reclaim needs a `BackupStoreHandle`, which every node
   shape now provisions (`ClientCtx::backup_store`) — spawned on combined
-  and control-only nodes, never data-only.
+  and control-only nodes, never data-only. **Publishes its own progress
+  (roadmap U-07)**: the loop's own `animus_node::backup_janitor::
+  JanitorProgress` (phase — `Idle`/`Reclaiming`/`RemovingRow` — plus
+  `last_tick_at_ms`, cumulative `backups_seen`/`objects_reclaimed`,
+  `last_error`, and the backup id currently being worked) is published at
+  each phase transition through a new capability trait,
+  `animus_node::host::BackupJanitorProgressHost`, into
+  `ClientCtx::backup_janitor_progress: Arc<std::sync::Mutex<
+  JanitorProgress>>` (`client_ctx_host.rs`'s impl is the usual thin,
+  logic-free delegation — a short lock/mutate/drop, never held across an
+  `.await`, mirroring `metrics_history`'s own precedent). `GET
+  /admin/backup-store` (`admin.rs::backup_store_view`) reads it back out
+  alongside this node's own store config (redacted via the new
+  `redact_store_location` helper, `lib.rs`) and a bounded live
+  `list_local` scan for object count/bytes (`BackupStoreHandle::
+  get_local`, a new local-only sibling of `list_local`/`delete_local`,
+  capped at 200 objects with `"truncated"` past the cap) — see ADR 0020's
+  and ADR 0059's matching 2026-09-06 as-built notes for the full route
+  design. A non-leader's own progress simply stays `Idle` forever, since
+  the loop only ever advances it while `control_leader()` answers `Some`
+  — an honest answer, not a gap. Regression:
+  `tests/admin_endpoint.rs::
+  admin_backup_store_reports_reclaim_progress_and_leader_state`,
+  `tests/dashboard_endpoint.rs::dashboard_u07_backup_store_card`, and
+  `animus_node::backup_janitor::tests`' own progress assertions.
 - **`backup_restore.rs`** (ADR 0059 §7, Train 2; §10, Train 3 PR②) — the **restore driver**:
   a per-tablet, leader-side, event-driven loop (`backup_restore_loop`, the
   identical "run everywhere, self-gate per tablet on `group.is_leader()`"

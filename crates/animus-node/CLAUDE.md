@@ -520,6 +520,29 @@ sub-rungs below shipped.
   needed the four new arms too — the trait has no default methods, so a
   missing impl is a compile error here, not a silent gap.
 
+  **`AdminHost` gained a fifth method, `backup_store_view`, for roadmap
+  U-07 (2026-09-06)**: `GET /admin/backup-store` — added the identical way
+  (one method, the exact `Value` the route produces); `impl AdminHost for
+  ClientCtx` in `animusd::admin` delegates to that file's own
+  `backup_store_view` function. This is also the rung that added
+  **`host::BackupJanitorProgressHost`**, a small, non-`async` sibling of
+  `host`'s other capability traits: one method,
+  `update_backup_janitor_progress(&self, update: &mut dyn FnMut(&mut
+  backup_janitor::JanitorProgress))`, that
+  `backup_janitor::backup_janitor_loop`/`backup_janitor_tick` call at each
+  phase transition. Not `async_trait` — every implementation is a plain
+  synchronous lock/mutate/drop (`animusd::ClientCtx`'s is a
+  `std::sync::Mutex`), so there is nothing here for an async boundary to
+  buy; a `&mut dyn FnMut` parameter (rather than a generic `F: FnOnce`)
+  keeps the trait itself free of a type parameter while still letting a
+  caller mutate several fields in one lock acquisition. `backup_janitor`'s
+  own new `JanitorProgress`/`JanitorPhase` types (phase, last tick,
+  cumulative `backups_seen`/`objects_reclaimed`, the last error, and the
+  backup id currently being worked) are plain `serde`-derived data with no
+  `Env`/`ClientCtx` dependency, so this module needed no new visibility
+  widening to publish them. `admin::tests::FakeHost` and `dispatch`'s
+  routing table both needed the one new arm too.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an

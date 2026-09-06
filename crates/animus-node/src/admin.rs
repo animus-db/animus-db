@@ -73,6 +73,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/credentials") => host.action_put_credential(body).await,
         ("POST", "/admin/credentials/rotate") => host.action_rotate_credential(body).await,
         ("POST", "/admin/credentials/revoke") => host.action_revoke_credential(body).await,
+        ("GET", "/admin/backup-store") => (200, host.backup_store_view().await),
         // A known admin path with the wrong verb vs. an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => (
             404,
@@ -265,6 +266,9 @@ mod tests {
         async fn action_revoke_credential(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
+        async fn backup_store_view(&self) -> Value {
+            self.record()
+        }
     }
 
     #[test]
@@ -330,6 +334,15 @@ mod tests {
             b"the-body",
         ));
         assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn get_admin_backup_store_routes_to_backup_store_view() {
+        let host = FakeHost::new();
+        let (status, body) = block_on(dispatch(&host, "GET", "/admin/backup-store", "", b""));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"marker\""));
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     }
 

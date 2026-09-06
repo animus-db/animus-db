@@ -553,6 +553,9 @@ impl SimCluster {
                 backup_store: BackupStoreHandle::Fs(FsSegmentStore::new(format!(
                     "unused-backup-store-{i}"
                 ))),
+                backup_janitor_progress: Arc::new(Mutex::new(
+                    animus_node::backup_janitor::JanitorProgress::default(),
+                )),
                 client_route: Arc::new(Mutex::new(route.clone())),
                 intra_route: Arc::new(Mutex::new(route.clone())),
                 admin,

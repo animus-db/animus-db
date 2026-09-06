@@ -149,7 +149,7 @@ async fn maybe_tls_connect(
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
-    peers|txns|backups|restores|control-members|storage-control <admin-addr>\n    \
+    peers|txns|backups|restores|backup-store|control-members|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
@@ -322,6 +322,9 @@ fn admin_request(
         "txns" => ("GET", "/admin/txns".into(), None),
         "backups" => ("GET", "/admin/backups".into(), None),
         "restores" => ("GET", "/admin/restores".into(), None),
+        // `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07): store
+        // config, object counts, and the backup janitor's own live phase.
+        "backup-store" => ("GET", "/admin/backup-store".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
@@ -1114,6 +1117,7 @@ mod tests {
             ("txns", "/admin/txns"),
             ("backups", "/admin/backups"),
             ("restores", "/admin/restores"),
+            ("backup-store", "/admin/backup-store"),
             ("control-members", "/admin/control/members"),
             ("storage-control", "/admin/storage/control"),
         ];

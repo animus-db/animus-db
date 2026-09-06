@@ -2440,6 +2440,58 @@ pub(crate) struct StoreView {
     pub(crate) path: Option<String>,
 }
 
+/// Redact a store location string for admin-surface rendering (roadmap
+/// U-07) — strips a URI's query string (`?...`) and userinfo (`user:pass@`
+/// between `scheme://` and the host) before it ever reaches a JSON
+/// response. Neither variant [`StoreView`] describes today carries a
+/// credential in its location (a bare local/shared filesystem path), but
+/// this is written now, once, so every future store-shaped admin view
+/// (`GET /admin/segment-store`, roadmap U-07; a future S3-backed
+/// [`BackupStoreConfig`]/[`SegmentStoreConfig`] variant) inherits the same
+/// safety rather than re-deriving its own redaction. A bare path (today's
+/// only case) has no `://`/`@`/`?` and passes through byte-for-byte.
+pub(crate) fn redact_store_location(raw: &str) -> String {
+    let before_query = raw.split('?').next().unwrap_or(raw);
+    let Some(scheme_end) = before_query.find("://") else {
+        return before_query.to_owned();
+    };
+    let host_start = scheme_end + "://".len();
+    let (prefix, rest) = before_query.split_at(host_start);
+    match rest.find('@') {
+        Some(at) => format!("{prefix}{}", &rest[at + 1..]),
+        None => before_query.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod redact_store_location_tests {
+    use super::redact_store_location;
+
+    #[test]
+    fn a_bare_filesystem_path_is_unchanged() {
+        assert_eq!(
+            redact_store_location("/var/lib/animus/backups"),
+            "/var/lib/animus/backups"
+        );
+    }
+
+    #[test]
+    fn a_future_credentialed_uri_loses_its_userinfo_and_query() {
+        assert_eq!(
+            redact_store_location("s3://AKID:SECRET@my-bucket/prefix?X-Amz-Signature=abc"),
+            "s3://my-bucket/prefix"
+        );
+    }
+
+    #[test]
+    fn a_uri_with_no_userinfo_or_query_is_unchanged() {
+        assert_eq!(
+            redact_store_location("s3://my-bucket/prefix"),
+            "s3://my-bucket/prefix"
+        );
+    }
+}
+
 impl From<&SegmentStoreConfig> for StoreView {
     fn from(config: &SegmentStoreConfig) -> Self {
         match config {
@@ -3707,6 +3759,9 @@ fn spawn_common_tail(
         data,
         segment_store,
         backup_store,
+        backup_janitor_progress: Arc::new(Mutex::new(
+            animus_node::backup_janitor::JanitorProgress::default(),
+        )),
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -6805,6 +6860,21 @@ impl BackupStoreHandle {
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
         }
     }
+
+    /// Fetch a backup object's bytes from **this node's own local** backup
+    /// directory only (roadmap U-07's `GET /admin/backup-store` object-byte
+    /// scan) — the `get` sibling of [`list_local`](Self::list_local)/
+    /// [`delete_local`](Self::delete_local): every id that route sums bytes
+    /// over already came from this node's own `list_local`, so there is no
+    /// reason to fall through to [`get_any`](Self::get_any)'s cluster-wide
+    /// "ask any node" walk for an id already known to live here.
+    pub(crate) async fn get_local(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.local().get(id).await,
+            BackupStoreHandle::Fs(fs) => fs.get(id).await,
+        }
+    }
 }
 
 /// `--backup-store cluster|fs:PATH` CLI opt-in (ADR 0059 §1), defaulting to
@@ -7848,6 +7918,20 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// control-only one (W-10)** — see `segment_store`'s doc above for why
     /// this lives here rather than inside [`DataRole`].
     pub(crate) backup_store: BackupStoreHandle,
+    /// The on-demand backup janitor's own live progress (roadmap U-07,
+    /// ADR 0059 §3) — `animus_node::backup_janitor::backup_janitor_loop`
+    /// publishes into this through `ClientCtx`'s
+    /// [`animus_node::host::BackupJanitorProgressHost`] impl
+    /// (`client_ctx_host.rs`) at each phase transition; `GET
+    /// /admin/backup-store` reads it back out. **Provisioned on every node
+    /// shape**, mirroring `backup_store`'s own rationale above, even though
+    /// the loop itself only ever advances it while this node believes it
+    /// leads the control plane — a non-leader's copy simply stays at its
+    /// default `Idle` state forever, which is the correct thing for that
+    /// node to report. Plain `std::sync::Mutex`, matching
+    /// `metrics_history`'s own precedent: every access is a short
+    /// lock/mutate/drop, never held across an `.await`.
+    pub(crate) backup_janitor_progress: Arc<Mutex<animus_node::backup_janitor::JanitorProgress>>,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -15459,6 +15543,9 @@ mod simenv_client_ctx_tests {
             // real store or `ProdEnv` is needed just to satisfy the field.
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
@@ -15803,6 +15890,9 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
             // Node A never forwards outward in this test — empty routes.
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
@@ -15863,6 +15953,9 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(intra_route_b)),
             admin: admin_b,

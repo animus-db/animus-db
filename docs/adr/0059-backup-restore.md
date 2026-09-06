@@ -1328,3 +1328,22 @@ row — see its own updated doc).
   call sites — the atomicity is the point, and a "self-healing sweep" is a
   tell that the two-command design's own gap was already known to be real,
   not merely theoretical.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/backup-store`)
+
+A new observability route, `GET /admin/backup-store`, surfaces this
+subsystem's own store config, a bounded live object-count/byte scan, and
+the on-demand backup janitor's (§3) own live phase/counters — the first of
+docs/roadmap.md's U-07 batch, chosen deliberately as the template the
+other three (`/admin/ttl`, `/admin/gc`, `/admin/segment-store`) copy. The
+janitor loop (`animus_node::backup_janitor::backup_janitor_loop`) now
+publishes a small `JanitorProgress` snapshot (phase, last tick, cumulative
+`backups_seen`/`objects_reclaimed`, the last error, the backup id currently
+being worked) through a new capability trait,
+`animus_node::host::BackupJanitorProgressHost`, into an
+`Arc<std::sync::Mutex<JanitorProgress>>` `ClientCtx` holds — no change to
+the janitor's own reclaim decisions, only instrumentation layered on top of
+each existing phase transition. See ADR 0020's own matching as-built note
+for the full route design (redaction, the bounded-scan rationale, and the
+test references) — this amendment exists only to record that the route
+lives in this subsystem's own territory too.
