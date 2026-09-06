@@ -91,23 +91,22 @@ the still-true paragraph after the table.
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
-- **d. `controlNodes` growth via the CRD**: controller drives ADR 0037
-  `control/member/add` against a pod's admin port, mirroring
-  `drain_and_remove_node`; extend `scripts/e2e-kind.sh` with a
-  control-grow step. Size L.
 - **e. Admission webhook** validating the CRD. Needs a webhook TLS cert —
   the prerequisite this used to be sequenced behind is done: TLS on every
   port ([ADR 0064](adr/0064-tls-on-every-port.md)) shipped in full,
   including this crate's own cert-manager `Certificate` builder and CRD
   shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
   directly. No longer blocked; open to pick up on its own schedule. Size L.
-- **ADR:** d and e get their own section or a new number if the webhook
-  design grows. (Item b — `backupStore`/`segmentStore` CRD fields for the
-  non-S3 `cluster`/`fs:`/`dir:` forms — landed 2026-09-06, see ADR 0060's
-  own "Amendment (2026-09-06): S-07b" section; `spec.s3` already covers
-  the `s3://...` form, ADR 0060's S-04 PR 3 amendment. Item c —
-  quorum-derived `PodDisruptionBudget` builder, no CRD field added —
-  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07c"
+- **ADR:** e gets its own section or a new number if the webhook design
+  grows. (Item b — `backupStore`/`segmentStore` CRD fields for the non-S3
+  `cluster`/`fs:`/`dir:` forms — landed 2026-09-06, see ADR 0060's own
+  "Amendment (2026-09-06): S-07b" section; `spec.s3` already covers the
+  `s3://...` form, ADR 0060's S-04 PR 3 amendment. Item c — quorum-derived
+  `PodDisruptionBudget` builder, no CRD field added — landed 2026-09-06,
+  see ADR 0060's own "Amendment (2026-09-06): S-07c" section. Item d —
+  `controlNodes` growth via the CRD, driving ADR 0037 `control/member/add`
+  one voter at a time and a config-hash pod-template restart mechanism —
+  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07d"
   section.)
 
 ---
@@ -253,7 +252,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04, S-05, S-07b–c landed 2026-09-06* → S-07d, C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, S-07b–d landed 2026-09-06* → C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

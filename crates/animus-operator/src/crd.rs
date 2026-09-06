@@ -308,10 +308,19 @@ pub struct AnimusClusterSpec {
     /// How many of the leading pods (ordinals `0..controlNodes`) run the
     /// combined control+data role (`NodeRole::Both`); the rest run
     /// data-only (`NodeRole::Data`). Defaults to `min(3, nodes)`.
-    /// **Immutable after creation** — a later change is rejected (a status
-    /// condition is set; the field's original value keeps governing the
-    /// cluster) since there is no admission webhook in v1 to reject the
-    /// write itself.
+    /// **Grow-only since S-07d (ADR 0060's 2026-09-06 amendment)**: an
+    /// increase is honored — the controller drives ADR 0037's
+    /// `control/member/add` against the newly-promoted ordinals, one voter
+    /// at a time, resuming idempotently from `GET /admin/control/members`
+    /// truth across restarts (see `crate::controller`'s own growth
+    /// machinery doc). A **decrease** is still rejected outright (a status
+    /// condition, [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the
+    /// field's last-achieved value keeps governing the cluster) since there
+    /// is no admission webhook in v1 to reject the write itself and control
+    /// voters can only be removed one at a time through their own careful
+    /// quorum-loss checks (ADR 0037 §2), never inferred from a bare spec
+    /// edit. An increase above `spec.nodes` is rejected the same way a
+    /// `spec.nodes` decrease below `controlNodes` already is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_nodes: Option<i32>,
     /// Data volume configuration.
@@ -593,10 +602,21 @@ pub enum ConditionStatus {
     Unknown,
 }
 
-/// Condition type name used when a `spec.controlNodes` change is rejected
-/// (no admission webhook in v1 — see [`AnimusClusterSpec::control_nodes`]'s
-/// doc).
-pub const CONDITION_IMMUTABLE_FIELD_CHANGED: &str = "ImmutableFieldChanged";
+/// Condition type name used when a `spec.controlNodes` **decrease** is
+/// rejected (no admission webhook in v1 — see
+/// [`AnimusClusterSpec::control_nodes`]'s doc). Growth (an increase) is
+/// honored instead of rejected since S-07d — see
+/// [`CONDITION_CONTROL_NODES_GROWING`].
+pub const CONDITION_CONTROL_NODES_SHRINK_REJECTED: &str = "ControlNodesShrinkRejected";
+/// Condition type name reporting an in-progress `spec.controlNodes` growth
+/// (S-07d, ADR 0060's 2026-09-06 amendment): present with a `{achieved}/
+/// {target}` message while the controller is still adding voters, cleared
+/// once `GET /admin/control/members` confirms every ordinal `0..target` is
+/// a voter. A controller restart resumes correctly with or without this
+/// condition surviving — it is a cheap resume optimization (skip the live
+/// voter check once nothing is pending), never the source of truth, which
+/// is always the live control group itself.
+pub const CONDITION_CONTROL_NODES_GROWING: &str = "ControlNodesGrowing";
 /// Condition type name used when a scale-down below `controlNodes` is
 /// refused.
 pub const CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED: &str = "ScaleBelowControlNodesRefused";

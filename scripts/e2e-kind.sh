@@ -38,6 +38,15 @@
 # scale-invariant once nodes/controlNodes each reach the replication
 # factor, see ADR 0060's own "Amendment (2026-09-06): S-07c" section).
 #
+# S-07d: right after the nodes:3->4 scale-up, `spec.controlNodes` is grown
+# 3 -> 4 too (promoting the already-Ready ordinal-3 pod the scale-up just
+# added into a real control voter via the operator's own ADR 0037
+# `control/member/add` automation), polling `GET /admin/control/members`
+# for the new voter count, re-checking the PDB, and re-resolving/re-
+# forwarding the serving pod (the config-hash-triggered rolling restart may
+# have recycled it) before a final GetItem proves the wire still serves.
+# See ADR 0060's own "Control-voter growth (S-07d, 2026-09-06)" section.
+#
 # Issue #595: this smoke flaked twice with the identical signature — the
 # first `CreateTable` (issued once, immediately after the statefulset
 # reported 3/3 ready) failing with a 500 whose message is "CreateTable did
@@ -339,6 +348,22 @@ admin_health_ready() {
     [ "$code" = "200" ]
 }
 
+# S-07d: the number of control voters the group itself currently reports —
+# `GET /admin/control/members` is served by any node (`admin.rs`'s own
+# doc), so this can be polled through whichever pod the dynamo port-forward
+# currently targets, control-role or not.
+control_voters_count() {
+    curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/control/members" 2>/dev/null \
+        | jq -r '(.voters // []) | length' 2>/dev/null || echo 0
+}
+
+control_voters_equals() {
+    local want="$1" got
+    got="$(control_voters_count)"
+    [ -n "$got" ] && [ "$got" -eq "$want" ]
+}
+
 dynamo_call() {
     # dynamo_call TARGET BODY -> prints "STATUS\nRESPONSE_BODY"
     local target="$1" body="$2"
@@ -545,6 +570,15 @@ phase "run operator out-of-cluster"
 # above already had to work around with a belt-and-suspenders `pkill`.
 (
     export KUBECONFIG="$KIND_KUBECONFIG"
+    # `animus-operator run`'s `tracing_subscriber::fmt::init()` uses
+    # `EnvFilter::from_default_env()`, which defaults to ERROR-only when
+    # `RUST_LOG` is unset — every `reconcile`/growth `info!`/`warn!` this
+    # script's own diagnostics rely on was silently dropped, making a stuck
+    # reconcile indistinguishable from a hung process. `RUST_LOG=info`
+    # surfaces both without `kube`/`hyper`'s own `debug`-level noise. (This
+    # alone does not make the log useful if the operator hasn't started
+    # running yet — see the "build first" comment above.)
+    export RUST_LOG=info
     exec "$OPERATOR_BIN" run
 ) >"$OPERATOR_LOG" 2>&1 &
 OPERATOR_PID=$!
@@ -695,9 +729,10 @@ kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":
 wait_for "statefulset readyReplicas==4" 300 5 -- sts_ready_equals 4
 
 phase "check the PodDisruptionBudget is scale-invariant after scale-up (S-07c)"
-# controlNodes stays 3 (immutable) and the data-plane replication factor is
-# already plateaued at 3 nodes, so maxUnavailable must still be 1 — not
-# recomputed to something larger just because nodes grew.
+# controlNodes stays 3 here (this scale-up only touches spec.nodes) and the
+# data-plane replication factor is already plateaued at 3 nodes, so
+# maxUnavailable must still be 1 — not recomputed to something larger just
+# because nodes grew.
 PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
     -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
 [ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable to \
@@ -713,6 +748,71 @@ BODY="$(dynamo_body "$RESULT")"
 NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
 [ "$NOTE" = "hello from e2e" ] || fail "post-scale GetItem did not round-trip the item: ${BODY}"
 log "post-scale GetItem ok"
+
+# S-07d: grow spec.controlNodes 3 -> 4, promoting the already-Ready,
+# already-Data-role ordinal-3 pod (added by the nodes:3->4 scale-up above)
+# into a real control voter — chosen over a fresh 3->5 growth (which would
+# need an *additional* spec.nodes scale-up first, provisioning and waiting
+# on a brand-new pod/PVC on top of the voter-add sequence itself) so this
+# leg's own runtime stays reasonable: it's the smallest possible one-voter
+# growth step, reusing a pod this script already waited on.
+phase "grow spec.controlNodes from 3 to 4 (S-07d)"
+kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"controlNodes":4}}'
+# The generated ConfigMap's role split flips immediately, which (via the
+# S-07d config-hash pod-template annotation) triggers a StatefulSet rolling
+# restart of *every* pod, not just ordinal 3 (the annotation is shared
+# across the whole pod template) — highest ordinal first, one at a time,
+# same as any other pod-template change. `GET /admin/control/members` is
+# served by any node (`admin.rs`'s own doc), so this can still be polled
+# through the pre-growth port-forward while that restart is in flight.
+wait_for "control group reports 4 voters" 300 5 -- control_voters_equals 4
+log "control group now reports 4 voters"
+
+phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
+# nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,
+# still capped at the same value by the RF-plateaued data-plane term
+# (floor((min(4,3)-1)/2)=1) — the point of this check is that the operator
+# recomputed maxUnavailable from the *achieved* controlNodes (4), not that
+# the number itself moved.
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable=1 \
+after growing controlNodes to 4, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1 after growth"
+
+# The rolling restart above may well have recycled the exact pod this
+# script's port-forward targets (a `kubectl port-forward pod/...` dies the
+# moment that specific pod is deleted/recreated) — re-resolve and
+# re-forward the same way the original "resolve which pod .../wait for
+# readiness" phases did, rather than trusting the pre-growth forward is
+# still alive.
+phase "re-resolve and re-forward the serving pod after controlNodes growth"
+if [ -n "$PORT_FORWARD_PID" ]; then
+    kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+    wait "$PORT_FORWARD_PID" 2>/dev/null || true
+    PORT_FORWARD_PID=""
+fi
+wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint
+DYNAMO_POD="$(dynamo_endpoint_pod)"
+[ -n "$DYNAMO_POD" ] || fail "could not resolve a pod backing svc/${AC_NAME}-dynamo after growth"
+log "svc/${AC_NAME}-dynamo now routes to pod ${DYNAMO_POD}"
+kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
+    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
+    >"$PORT_FORWARD_LOG" 2>&1 &
+PORT_FORWARD_PID=$!
+wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready
+wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready
+wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
+
+phase "GetItem still returns the item after controlNodes growth"
+RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \
+    '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
+STATUS="$(dynamo_status "$RESULT")"
+BODY="$(dynamo_body "$RESULT")"
+[ "$STATUS" = "200" ] || fail "post-growth GetItem failed: status=${STATUS} body=${BODY}"
+NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
+[ "$NOTE" = "hello from e2e" ] || fail "post-growth GetItem did not round-trip the item: ${BODY}"
+log "post-growth GetItem ok — controlNodes growth left the DynamoDB wire serving"
 
 if [ "$E2E_S3" = "1" ]; then
     phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store)"

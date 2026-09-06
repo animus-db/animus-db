@@ -31,10 +31,10 @@ use tracing::{error, info, warn};
 use crate::admin_client::{AdminAccessMode, AdminOps, RealAdminClient};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
-    AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
-    ConditionStatus,
+    AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
+    CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_STORE_SPEC_INVALID,
+    CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 
@@ -86,6 +86,7 @@ async fn apply_children<C: ClusterApi>(
     cluster_api: &C,
     cluster: &AnimusCluster,
     ns: &str,
+    pdb_control_nodes: i32,
 ) -> Result<StatefulSet, ReconcileError> {
     let spec = &cluster.spec;
 
@@ -117,7 +118,25 @@ async fn apply_children<C: ClusterApi>(
     // spec (`spec.nodes`/`spec.controlNodes`), never the StatefulSet's
     // live replica count — see `desired::poddisruptionbudget`'s own
     // module doc for why.
-    let pdb = desired::poddisruptionbudget::build(cluster, spec);
+    //
+    // **S-07d**: `pdb_control_nodes` is `spec.control_nodes_or_default()`
+    // itself whenever no growth is in flight, but the *achieved* (live-
+    // confirmed) voter count while a growth is still catching up — using
+    // the full `spec.controlNodes` target here would grant a larger
+    // disruption budget than the control group can actually survive right
+    // now, since the newly-promoted ordinals are not yet real voters.
+    // Never affects the `ConfigMap`/`StatefulSet` below, which must always
+    // reflect the real `spec.controlNodes` target so the promoted ordinals
+    // restart into role `Both` in the first place.
+    let pdb_spec: std::borrow::Cow<'_, crate::crd::AnimusClusterSpec> =
+        if pdb_control_nodes == spec.control_nodes_or_default() {
+            std::borrow::Cow::Borrowed(spec)
+        } else {
+            let mut overridden = spec.clone();
+            overridden.control_nodes = Some(pdb_control_nodes);
+            std::borrow::Cow::Owned(overridden)
+        };
+    let pdb = desired::poddisruptionbudget::build(cluster, &pdb_spec);
     cluster_api.apply_poddisruptionbudget(ns, &pdb).await?;
 
     let sts = desired::statefulset::build(cluster, spec);
@@ -126,17 +145,26 @@ async fn apply_children<C: ClusterApi>(
     Ok(applied)
 }
 
-/// Whether `spec.controlNodes` (resolved against its own default) differs
-/// from the value the *previous* reconcile actually applied, as recorded on
-/// `status.conditions`. With no admission webhook in v1, the controller is
-/// the only thing that can catch this — so it is caught here, every
-/// reconcile, by comparing against the live `StatefulSet`'s replica count
-/// is not enough (that only tells us `nodes`, not `controlNodes`); instead
-/// this compares against a dedicated status annotation-free signal: the
-/// `ConfigMap`'s own already-applied config, which is cheap to read back
-/// (server-side apply already wrote it) and is the actual source of truth
-/// for which ordinals were minted `Both` vs `Data` last time.
-async fn control_nodes_changed<C: ClusterApi>(
+/// The `spec.controlNodes` value the *previous* reconcile actually applied
+/// (resolved against its own default at the time), or `None` on a fresh
+/// cluster with no applied `ConfigMap` yet. With no admission webhook in
+/// v1, the controller is the only thing that can catch a `controlNodes`
+/// edit — so it is caught here, every reconcile, by comparing against the
+/// live `StatefulSet`'s replica count is not enough (that only tells us
+/// `nodes`, not `controlNodes`); instead this reads a dedicated status
+/// annotation-free signal: the `ConfigMap`'s own already-applied config,
+/// which is cheap to read back (server-side apply already wrote it) and is
+/// the actual source of truth for which ordinals were minted `Both` vs
+/// `Data` last time.
+///
+/// **S-07d**: this used to also compare against the *desired* value and
+/// return `None` when unchanged (`control_nodes_changed`, hence the name);
+/// it now always returns the prior value on its own, since both the
+/// shrink-rejection check and the growth machinery below need it and
+/// growth additionally needs to keep observing it every reconcile while a
+/// growth is in flight, not just on the one reconcile where the spec edit
+/// first lands.
+async fn previous_applied_control_nodes<C: ClusterApi>(
     cluster_api: &C,
     ns: &str,
     cluster: &AnimusCluster,
@@ -156,16 +184,458 @@ async fn control_nodes_changed<C: ClusterApi>(
     let Ok(parsed) = serde_json::from_str::<desired::cluster_config::ClusterConfig>(json) else {
         return Ok(None);
     };
+    if parsed.nodes.is_empty() {
+        return Ok(None);
+    }
     let previous_control_nodes = parsed
         .nodes
         .iter()
         .take_while(|n| matches!(n.role, desired::cluster_config::NodeRole::Both))
         .count() as i32;
-    let desired_control_nodes = cluster.spec.control_nodes_or_default();
-    if previous_control_nodes != desired_control_nodes && !parsed.nodes.is_empty() {
-        Ok(Some(previous_control_nodes))
-    } else {
-        Ok(None)
+    Ok(Some(previous_control_nodes))
+}
+
+// ---- S-07d: spec.controlNodes growth --------------------------------------
+//
+// `controlNodes` may now only ever *increase* — a decrease is still
+// rejected outright (unchanged from the old "immutable" posture, just
+// renamed: `CONDITION_CONTROL_NODES_SHRINK_REJECTED`). Growth is driven
+// entirely from **live** `GET /admin/control/members` truth, one voter at a
+// time, never from anything held only in this process's memory: a
+// controller restart simply re-derives "which ordinal is next" from
+// whatever the control group itself currently reports, which is what makes
+// this resume-safe across a restart with no persisted growth state of its
+// own (the `ControlNodesGrowing` status condition is a resume
+// *optimization* — skip the live check once nothing is pending — never the
+// source of truth).
+//
+// The sequence per reconcile (at most one ordinal advanced per call, so a
+// single reconcile never blocks for the full multi-ordinal growth):
+//  1. Ask an already-established control ordinal (0, falling back through
+//     the rest) for its live voter set.
+//  2. `next_growth_ordinal`/`achieved_control_nodes` (pure, unit-tested)
+//     turn that into "how many of `0..target` are already confirmed".
+//  3. If the next ordinal's own `GET /admin/config` doesn't yet report
+//     `role: "combined"` (`animusd`'s own literal for a node running both
+//     roles — `AdminInfo.role`, never `"both"`, see `ordinal_reports_role_both`'s
+//     own doc for the pinned regression this once lacked), the promoted pod
+//     hasn't restarted yet (the config-hash annotation drives that, see
+//     `desired::statefulset`) — wait.
+//  4. Otherwise, resolve that ordinal's live `status.podIP` (via the
+//     Kubernetes API, not DNS — see `resolve_control_dial_addr`'s own doc
+//     for why, including the pre-existing `animusd` admin-API gap this
+//     works around) and `POST /admin/control/member/add` against each
+//     already-confirmed voter ordinal in turn until one accepts (mirroring
+//     "retry on the leader" — see `add_control_voter`'s own doc for why
+//     this, not a parsed error-message address hint, is how that's done
+//     here), then poll `GET /admin/control/members` (bounded) until the new
+//     ordinal shows up before this reconcile returns.
+//
+// `advance_control_growth` also returns the control-voter count
+// `apply_children`'s `PodDisruptionBudget` step should use this reconcile
+// — see that function's own call site in `reconcile` for why this must be
+// the *achieved*, not the *desired*, count while growth is still catching
+// up.
+
+/// The ordinal of the next control voter that still needs `POST
+/// /admin/control/member/add`, given `target` (`spec.controlNodes`) and the
+/// control group's own live voter-id set (`GET /admin/control/members`'s
+/// `"voters"` field) — `None` once every ordinal `0..target` is already a
+/// confirmed voter. A pure function of `(cluster_name, target, voters)`
+/// precisely so a controller restart resumes from this exact truth, never
+/// from anything held only in memory.
+fn next_growth_ordinal(
+    cluster_name: &str,
+    target: i32,
+    voters: &std::collections::BTreeSet<String>,
+) -> Option<i32> {
+    (0..target).find(|&i| !voters.contains(&desired::cluster_config::node_id(cluster_name, i)))
+}
+
+/// How many of the leading ordinals `0..target` are already confirmed
+/// voters — `target` itself once growth has fully caught up.
+fn achieved_control_nodes(
+    cluster_name: &str,
+    target: i32,
+    voters: &std::collections::BTreeSet<String>,
+) -> i32 {
+    next_growth_ordinal(cluster_name, target, voters).unwrap_or(target)
+}
+
+/// Parse a `GET /admin/control/members` response body into its `"voters"`
+/// set — `None` when the field is absent/`null` (a `Remote` handle that has
+/// never observed a voter set at all, `control_members_view`'s own
+/// documented "unknown vs. genuinely empty" distinction) or malformed,
+/// which callers treat identically to "could not reach this node" rather
+/// than "the group has zero voters".
+fn parse_voters(body: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
+    body["voters"].as_array().map(|vs| {
+        vs.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// `GET {admin_base_url(ordinal)}/admin/control/members`, parsed — `None`
+/// on any transport error or an unparseable/unknown response.
+async fn fetch_control_members<A: AdminOps>(
+    admin: &A,
+    name: &str,
+    ns: &str,
+    ordinal: i32,
+    admin_port: i32,
+    tls_ca: Option<&[u8]>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let base = admin_base_url(name, ns, ordinal, admin_port, tls_ca.is_some());
+    let body = admin
+        .get_json(&format!("{base}/admin/control/members"), tls_ca)
+        .await
+        .ok()?;
+    parse_voters(&body)
+}
+
+/// Ask each ordinal `0..target` in turn (stopping at the first that
+/// answers) for the control group's own live voter set — `GET
+/// /admin/control/members` is served on **any** node, control-voter or
+/// not, so even a not-yet-promoted ordinal answers honestly (`admin.rs`'s
+/// own doc on `control_members_view`). Bounded by `target`, which is the
+/// control-voter count specifically (small in practice, not `spec.nodes`).
+async fn discover_control_voters<A: AdminOps>(
+    admin: &A,
+    name: &str,
+    ns: &str,
+    target: i32,
+    admin_port: i32,
+    tls_ca: Option<&[u8]>,
+) -> Option<std::collections::BTreeSet<String>> {
+    for ordinal in 0..target {
+        if let Some(voters) =
+            fetch_control_members(admin, name, ns, ordinal, admin_port, tls_ca).await
+        {
+            return Some(voters);
+        }
+    }
+    None
+}
+
+/// Whether ordinal `ordinal`'s own `GET /admin/config` currently reports
+/// `role: "combined"` — the promoted pod has actually restarted into
+/// combined mode (driven by `desired::statefulset`'s config-hash annotation)
+/// and its own admin port is up enough to answer, regardless of
+/// control-plane leadership (`config_view`'s own doc: a static
+/// self-description, never gated on `is_leader`/`leader_recent`) — unlike
+/// `GET /admin/health`, which would never report ready here (a
+/// freshly-promoted, not-yet-a-voter control handle has no leader to be
+/// recent about, so gating on health would deadlock this exact step). Any
+/// transport error also reads `false` — the pod isn't ready to be added yet
+/// either way.
+///
+/// **The literal is `"combined"`, never `"both"`** — `animusd`'s own
+/// `AdminInfo.role` (`crates/animusd/src/admin.rs`'s `config_view`, stamped
+/// at assembly time in `crates/animusd/src/lib.rs`) only ever takes the
+/// values `"control"`/`"data"`/`"combined"`; pinned server-side by
+/// `crates/animusd/tests/dashboard_endpoint.rs`'s own
+/// `config_view["role"] == "combined"` assertion for a combined-mode node.
+/// `"both"` is a *different* JSON shape entirely — the generated
+/// `cluster.json`'s own per-node `role` field
+/// (`desired::cluster_config::NodeRole::Both`, this crate's own dispatch
+/// enum deciding which `animusd` subcommand a pod execs) — the two
+/// vocabularies happen to describe the same real-world state (a pod running
+/// both roles) but are unrelated fields on unrelated JSON documents; this
+/// function reads the *runtime* one. Checking the wrong literal here used to
+/// mean this always evaluated `false`, so growth waited forever for a
+/// restart signal that could never arrive — closed by pinning the fake's own
+/// literal to the same value in `crate::fakes::FakeAdminClient`, see that
+/// module's own doc.
+async fn ordinal_reports_role_both<A: AdminOps>(
+    admin: &A,
+    name: &str,
+    ns: &str,
+    ordinal: i32,
+    admin_port: i32,
+    tls_ca: Option<&[u8]>,
+) -> bool {
+    let base = admin_base_url(name, ns, ordinal, admin_port, tls_ca.is_some());
+    match admin
+        .get_json(&format!("{base}/admin/config"), tls_ca)
+        .await
+    {
+        Ok(v) => v["role"].as_str() == Some("combined"),
+        Err(_) => false,
+    }
+}
+
+/// Resolve ordinal `ordinal`'s **current** internal-Raft dial address to a
+/// literal `SocketAddr`, for `POST /admin/control/member/add`'s `addr`
+/// field.
+///
+/// **Works around a real, pre-existing `animusd` admin-API gap**: that
+/// field is typed `std::net::SocketAddr` server-side
+/// (`admin::AddControlMemberReq`), which can only ever deserialize a
+/// literal IP:port — never a DNS name. Every other address surface this
+/// operator or `animusd` itself uses for a Kubernetes pod
+/// (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`, the peer book
+/// `ProdEnv::merge_peer`/`ProdEnv::set_peers` populate) is deliberately
+/// string/hostname-typed for exactly the reason a pod's IP is not stable
+/// across a restart while its per-ordinal DNS name is. This reads the
+/// pod's *current* `status.podIP` via the Kubernetes API (never a DNS
+/// lookup — more immediately authoritative, and, unlike a raw
+/// `tokio::net::lookup_host` call, goes through the already-testable
+/// `ClusterApi` seam) purely as a one-time bootstrap value for the
+/// leader's very first dial: the promoted node's own startup self-
+/// registration (`spawn_common_tail`'s `register_node_addrs`,
+/// unconditional on every combined-mode boot, per `animusd::lib`'s own
+/// doc) republishes its real, DNS-name-based `advertised_addr` into the
+/// replicated `Metadata.node_addrs` moments later, which every node's own
+/// `peer_sync_loop` then adopts — so a resolved-IP staleness window here
+/// is self-healing within moments of this call, not a permanent address
+/// pin. See `crates/animus-operator/CLAUDE.md`'s S-07d section for the
+/// full account and the animusd-side fix this should eventually get
+/// (accepting a `String` addr the way `ProdEnv::merge_peer` already does).
+async fn resolve_control_dial_addr<C: ClusterApi>(
+    cluster_api: &C,
+    name: &str,
+    ns: &str,
+    ordinal: i32,
+    internal_port: i32,
+) -> Result<std::net::SocketAddr, String> {
+    let pod = desired::pod_name(name, ordinal);
+    let ip = cluster_api
+        .get_pod_ip(ns, &pod)
+        .await
+        .map_err(|e| format!("reading pod {pod}'s IP: {e}"))?
+        .ok_or_else(|| format!("pod {pod} has no status.podIP yet"))?;
+    format!("{ip}:{internal_port}")
+        .parse()
+        .map_err(|e| format!("pod {pod}'s podIP {ip:?} did not parse as an address: {e}"))
+}
+
+/// Add ordinal `ordinal` (already known to be missing from the live voter
+/// set) as a control voter: resolves its dial address, then tries
+/// `POST /admin/control/member/add` against each already-confirmed voter
+/// ordinal `0..ordinal` in turn until one accepts. `POST /admin/control/
+/// member/add` is **local-control-leader-only, not relayed**
+/// (`admin::action_add_control_member`'s own doc) — and a `Local` control
+/// handle's own `leader_addr_hint` is always `None` (unlike a `Remote`
+/// data-only node's), so there is no address to parse out of a "not
+/// leader" refusal the way a human operator's own runbook error message
+/// might suggest. Trying every already-confirmed voter in turn instead
+/// achieves the same "retry on the leader" outcome without needing one:
+/// at most one of them can accept (the real leader), and `admin_add_control_
+/// member`'s own doc states a retry of the whole call is always
+/// safe/idempotent, so trying the others first costs nothing but a
+/// harmless 409.
+///
+/// Returns `Ok(true)` once the group's own `GET /admin/control/members`
+/// confirms `ordinal` as a voter (bounded poll), `Ok(false)` if the add
+/// itself succeeded but confirmation didn't land within that bound (not a
+/// failure — the next reconcile re-checks live truth and either finds it
+/// already there or, since the add is idempotent, retries harmlessly), and
+/// `Err` only when no already-confirmed voter accepted the add at all (or
+/// the dial address couldn't be resolved).
+async fn add_control_voter<C: ClusterApi, A: AdminOps>(
+    ctx: &Context<C, A>,
+    name: &str,
+    ns: &str,
+    ordinal: i32,
+    admin_port: i32,
+    internal_port: i32,
+    tls_ca: Option<&[u8]>,
+) -> Result<bool, String> {
+    let node_id = desired::cluster_config::node_id(name, ordinal);
+    let addr =
+        resolve_control_dial_addr(&ctx.cluster_api, name, ns, ordinal, internal_port).await?;
+
+    let mut last_err = "no already-confirmed control voter ordinal to ask".to_string();
+    let mut added = false;
+    for voter_ordinal in 0..ordinal {
+        let base = admin_base_url(name, ns, voter_ordinal, admin_port, tls_ca.is_some());
+        match ctx
+            .admin
+            .post_json(
+                &format!("{base}/admin/control/member/add"),
+                &json!({"node": node_id, "addr": addr.to_string()}),
+                tls_ca,
+            )
+            .await
+        {
+            Ok(_) => {
+                added = true;
+                break;
+            }
+            Err(e) => last_err = format!("ordinal {voter_ordinal}: {e}"),
+        }
+    }
+    if !added {
+        return Err(format!("adding {node_id} as a control voter: {last_err}"));
+    }
+
+    const CONFIRM_POLLS: u32 = 15;
+    const CONFIRM_INTERVAL: Duration = Duration::from_secs(2);
+    for attempt in 0..CONFIRM_POLLS {
+        if let Some(voters) =
+            fetch_control_members(&ctx.admin, name, ns, 0, admin_port, tls_ca).await
+            && voters.contains(&node_id)
+        {
+            return Ok(true);
+        }
+        if attempt + 1 == CONFIRM_POLLS {
+            return Ok(false);
+        }
+        // ADR 0003 / ADR 0061 Decision 4 (rung B5): same real-wall-clock
+        // allowance `drain_and_remove_node`'s own poll loop already carries
+        // — this reconcile loop polls a real pod's admin port over a real
+        // network, outside the Env seam.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "animus-operator polls a real pod's admin port outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
+        )]
+        tokio::time::sleep(CONFIRM_INTERVAL).await;
+    }
+    Ok(false)
+}
+
+/// Advance `spec.controlNodes` growth by at most one ordinal this
+/// reconcile — see this module's own "S-07d: spec.controlNodes growth"
+/// section doc above for the full sequence. Returns the control-voter
+/// count `apply_children`'s `PodDisruptionBudget` step should use this
+/// reconcile: `target` once growth is confirmed complete, the live-
+/// confirmed `achieved` count while it's still catching up, or
+/// `previously_applied` (the last known-safe count) when live truth
+/// couldn't be observed at all this reconcile.
+#[allow(clippy::too_many_arguments)] // every argument is a distinct, already-resolved input; no natural grouping
+async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
+    ctx: &Context<C, A>,
+    name: &str,
+    ns: &str,
+    target: i32,
+    previously_applied: i32,
+    admin_port: i32,
+    internal_port: i32,
+    tls_ca: Option<&[u8]>,
+    status: &mut AnimusClusterStatus,
+) -> i32 {
+    // Record that a growth is in progress *before* the first admin call —
+    // a stall (this reconcile's own discovery/add call hanging, timing out,
+    // or failing every reconcile in a row) must be visible from `kubectl get
+    // animuscluster -o yaml` even if nothing below ever narrows the message
+    // further. Every branch below either overwrites this with a more
+    // specific message or clears the condition outright once growth
+    // completes — this call never survives as the final message on a
+    // reconcile that got further than this line.
+    set_condition(
+        status,
+        CONDITION_CONTROL_NODES_GROWING,
+        format!(
+            "growing spec.controlNodes: {previously_applied}/{target} voters confirmed as of \
+             the last successful check; discovering live control-voter truth"
+        ),
+    );
+    let Some(voters) =
+        discover_control_voters(&ctx.admin, name, ns, target, admin_port, tls_ca).await
+    else {
+        // Can't observe live truth this reconcile (every ordinal 0..target
+        // refused/timed out — still bootstrapping, or a transient blip):
+        // surface that a discovery attempt was made and failed, rather than
+        // leaving only the generic "discovering" message above, and fall
+        // back to the last confirmed-safe count for the PDB.
+        set_condition(
+            status,
+            CONDITION_CONTROL_NODES_GROWING,
+            format!(
+                "growing spec.controlNodes: {previously_applied}/{target} voters confirmed as \
+                 of the last successful check; could not reach any control ordinal in 0..{target} \
+                 to discover live voter truth this reconcile"
+            ),
+        );
+        return previously_applied;
+    };
+    let achieved = achieved_control_nodes(name, target, &voters);
+    if achieved >= target {
+        status
+            .conditions
+            .retain(|c| c.type_ != CONDITION_CONTROL_NODES_GROWING);
+        return target;
+    }
+    if !ordinal_reports_role_both(&ctx.admin, name, ns, achieved, admin_port, tls_ca).await {
+        set_condition(
+            status,
+            CONDITION_CONTROL_NODES_GROWING,
+            format!(
+                "growing spec.controlNodes: {achieved}/{target} voters confirmed; \
+                 waiting for pod ordinal {achieved} to restart into role \"combined\""
+            ),
+        );
+        return achieved;
+    }
+    match add_control_voter(ctx, name, ns, achieved, admin_port, internal_port, tls_ca).await {
+        Ok(true) => {
+            let now_achieved = achieved + 1;
+            if now_achieved >= target {
+                status
+                    .conditions
+                    .retain(|c| c.type_ != CONDITION_CONTROL_NODES_GROWING);
+            } else {
+                set_condition(
+                    status,
+                    CONDITION_CONTROL_NODES_GROWING,
+                    format!("growing spec.controlNodes: {now_achieved}/{target} voters confirmed"),
+                );
+            }
+            now_achieved
+        }
+        Ok(false) => {
+            set_condition(
+                status,
+                CONDITION_CONTROL_NODES_GROWING,
+                format!(
+                    "growing spec.controlNodes: added ordinal {achieved}, waiting for it to be \
+                     confirmed a voter ({achieved}/{target} confirmed so far)"
+                ),
+            );
+            achieved
+        }
+        Err(e) => {
+            warn!(
+                cluster = %name,
+                ordinal = achieved,
+                error = %e,
+                "control voter growth step failed; will retry next reconcile"
+            );
+            set_condition(
+                status,
+                CONDITION_CONTROL_NODES_GROWING,
+                format!(
+                    "growing spec.controlNodes: {achieved}/{target} voters confirmed; last \
+                     attempt to add ordinal {achieved} failed: {e}"
+                ),
+            );
+            achieved
+        }
+    }
+}
+
+/// Read `spec.tls`'s resolved cluster-CA `Secret` (if `spec.tls` is set),
+/// for `AdminOps::get_json`/`post_json`'s `ca_pem` — shared by both the
+/// scale-down drain sequence and S-07d's control-voter growth step, which
+/// each dial a pod's admin port the identical way.
+async fn resolve_tls_ca<C: ClusterApi>(
+    cluster_api: &C,
+    cluster: &AnimusCluster,
+    ns: &str,
+    name: &str,
+) -> Result<Option<Vec<u8>>, ReconcileError> {
+    match &cluster.spec.tls {
+        Some(tls) => {
+            let secret_name = tls.secret_name_or_default(name);
+            Ok(cluster_api
+                .get_secret(ns, &secret_name)
+                .await?
+                .and_then(|s| s.data)
+                .and_then(|d| d.get("ca.crt").cloned())
+                .map(|b| b.0))
+        }
+        None => Ok(None),
     }
 }
 
@@ -306,7 +776,8 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         set_condition(&mut status, CONDITION_TLS_SPEC_INVALID, e);
         let mut pinned = (*cluster).clone();
         pinned.spec.tls = None;
-        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+        let pdb_control_nodes = pinned.spec.control_nodes_or_default();
+        return finish_reconcile(&pinned, &ctx, &ns, status, pdb_control_nodes).await;
     }
     status
         .conditions
@@ -322,7 +793,8 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         set_condition(&mut status, CONDITION_S3_SPEC_INVALID, e);
         let mut pinned = (*cluster).clone();
         pinned.spec.s3 = None;
-        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+        let pdb_control_nodes = pinned.spec.control_nodes_or_default();
+        return finish_reconcile(&pinned, &ctx, &ns, status, pdb_control_nodes).await;
     }
     status
         .conditions
@@ -346,43 +818,87 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         let mut pinned = (*cluster).clone();
         pinned.spec.backup_store = None;
         pinned.spec.segment_store = None;
-        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+        let pdb_control_nodes = pinned.spec.control_nodes_or_default();
+        return finish_reconcile(&pinned, &ctx, &ns, status, pdb_control_nodes).await;
     }
     status
         .conditions
         .retain(|c| c.type_ != CONDITION_STORE_SPEC_INVALID);
 
-    // Refuse an immutable `controlNodes` change: set a condition, keep
-    // going (the rest of the spec — image, resources, scale — still
-    // deserves to converge), but never regenerate the config with the new
-    // value.
-    if let Some(prior) = control_nodes_changed(&ctx.cluster_api, &ns, &cluster).await? {
-        warn!(
-            cluster = %name,
-            prior_control_nodes = prior,
-            requested_control_nodes = cluster.spec.control_nodes_or_default(),
-            "refusing controlNodes change (immutable field)"
-        );
-        set_condition(
-            &mut status,
-            CONDITION_IMMUTABLE_FIELD_CHANGED,
-            format!(
-                "spec.controlNodes changed from {prior} to {} — ignored; \
-                 controlNodes is immutable after creation",
-                cluster.spec.control_nodes_or_default()
-            ),
-        );
-        // Reconcile with the *prior* control-node count so the running
-        // cluster's own role split never actually changes underneath it.
-        let mut pinned = (*cluster).clone();
-        pinned.spec.control_nodes = Some(prior);
-        return finish_reconcile(&pinned, &ctx, &ns, status).await;
-    }
+    // S-07d: `spec.controlNodes` may only ever *increase* — a decrease is
+    // still rejected outright (unchanged from the old "immutable" posture:
+    // set a condition, keep going with every other field, but never
+    // regenerate the config with the smaller value). An increase is
+    // instead driven forward, one voter at a time, by
+    // `advance_control_growth` — see this module's own "S-07d:
+    // spec.controlNodes growth" section doc above for the full design.
+    let target_control_nodes = cluster.spec.control_nodes_or_default();
+    let prior_control_nodes =
+        previous_applied_control_nodes(&ctx.cluster_api, &ns, &cluster).await?;
+    let pdb_control_nodes = match prior_control_nodes {
+        Some(prior) if target_control_nodes < prior => {
+            warn!(
+                cluster = %name,
+                prior_control_nodes = prior,
+                requested_control_nodes = target_control_nodes,
+                "refusing controlNodes decrease"
+            );
+            set_condition(
+                &mut status,
+                CONDITION_CONTROL_NODES_SHRINK_REJECTED,
+                format!(
+                    "spec.controlNodes decreased from {prior} to {target_control_nodes} — \
+                     ignored; controlNodes can grow but never shrink once a cluster is running"
+                ),
+            );
+            // Reconcile with the *prior* control-node count so the running
+            // cluster's own role split never actually changes underneath it.
+            let mut pinned = (*cluster).clone();
+            pinned.spec.control_nodes = Some(prior);
+            return finish_reconcile(&pinned, &ctx, &ns, status, prior).await;
+        }
+        Some(prior) => {
+            status
+                .conditions
+                .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
+            let already_growing = status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING);
+            if target_control_nodes > prior || already_growing {
+                let admin_port =
+                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+                let internal_port =
+                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
+                let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
+                advance_control_growth(
+                    &ctx,
+                    &name,
+                    &ns,
+                    target_control_nodes,
+                    prior,
+                    admin_port,
+                    internal_port,
+                    tls_ca.as_deref(),
+                    &mut status,
+                )
+                .await
+            } else {
+                target_control_nodes
+            }
+        }
+        None => {
+            status
+                .conditions
+                .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
+            target_control_nodes
+        }
+    };
 
     // Refuse scaling below `controlNodes` — every control-role pod must
     // stay present (the control-plane Raft group needs its full voter
     // set); a data-only pod may always be removed.
-    let control_nodes = cluster.spec.control_nodes_or_default();
+    let control_nodes = target_control_nodes;
     if cluster.spec.nodes < control_nodes {
         warn!(
             cluster = %name,
@@ -398,7 +914,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
                 cluster.spec.nodes
             ),
         );
-        return finish_reconcile(&cluster, &ctx, &ns, status).await;
+        return finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await;
     }
 
     // Scale-down: drain+remove every pod ordinal being dropped, highest
@@ -419,18 +935,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             // `DrainFailed` condition), retried on the next reconcile once
             // the `Secret` exists, rather than silently dialing plaintext
             // into a TLS listener.
-            let tls_ca: Option<Vec<u8>> = match &cluster.spec.tls {
-                Some(tls) => {
-                    let secret_name = tls.secret_name_or_default(&name);
-                    ctx.cluster_api
-                        .get_secret(&ns, &secret_name)
-                        .await?
-                        .and_then(|s| s.data)
-                        .and_then(|d| d.get("ca.crt").cloned())
-                        .map(|b| b.0)
-                }
-                None => None,
-            };
+            let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
             for ordinal in (target_replicas..current_replicas).rev() {
                 if let Err(e) = drain_and_remove_node(
                     &ctx.admin,
@@ -452,7 +957,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
                     // StatefulSet down past a pod that never finished
                     // draining, and don't attempt a lower ordinal either
                     // (they must go highest-first).
-                    return finish_reconcile(&cluster, &ctx, &ns, status).await;
+                    return finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await;
                 }
             }
             status
@@ -461,7 +966,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         }
     }
 
-    finish_reconcile(&cluster, &ctx, &ns, status).await
+    finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await
 }
 
 async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
@@ -469,9 +974,10 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     ctx: &Context<C, A>,
     ns: &str,
     mut status: AnimusClusterStatus,
+    pdb_control_nodes: i32,
 ) -> Result<Action, ReconcileError> {
     let name = cluster.name_any();
-    let applied_sts = apply_children(&ctx.cluster_api, cluster, ns).await?;
+    let applied_sts = apply_children(&ctx.cluster_api, cluster, ns, pdb_control_nodes).await?;
 
     let desired_replicas = cluster.spec.nodes;
     let ready = applied_sts
@@ -483,7 +989,7 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
 
     let has_blocking_condition = status.conditions.iter().any(|c| {
         c.type_ == CONDITION_DRAIN_FAILED
-            || c.type_ == CONDITION_IMMUTABLE_FIELD_CHANGED
+            || c.type_ == CONDITION_CONTROL_NODES_SHRINK_REJECTED
             || c.type_ == CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED
     });
     status.phase = Some(if has_blocking_condition && ready < desired_replicas {
@@ -574,7 +1080,7 @@ pub async fn run(client: Client, admin_access: AdminAccessMode) {
         .await;
 }
 
-/// ADR 0061 rung E1: `reconcile`/`control_nodes_changed`/
+/// ADR 0061 rung E1: `reconcile`/`previous_applied_control_nodes`/
 /// `drain_and_remove_node` exercised via `crate::fakes::{FakeClusterApi,
 /// FakeAdminClient}` — no live API server, no real socket. See that
 /// module's doc and `crates/animus-operator/CLAUDE.md`'s testing section
@@ -610,7 +1116,7 @@ mod tests {
 
     /// A `ConfigMap` shaped exactly like the one a previous reconcile would
     /// have applied for `spec`, for seeding `FakeClusterApi::seed_configmap`
-    /// in the `control_nodes_changed`/immutable-field tests.
+    /// in the `previous_applied_control_nodes`/shrink-rejection tests.
     fn prior_cluster_configmap(name: &str, ns: &str, spec: &AnimusClusterSpec) -> ConfigMap {
         let config = desired::cluster_config::build_cluster_config(name, ns, spec);
         let mut cm = ConfigMap::default();
@@ -684,10 +1190,10 @@ mod tests {
         assert_eq!(&second[6..], &first[..]);
     }
 
-    // --- (3) control_nodes_changed detects a change vs no change ---------
+    // --- (3) previous_applied_control_nodes reads the prior applied value -
 
     #[tokio::test]
-    async fn control_nodes_changed_detects_a_real_change() {
+    async fn previous_applied_control_nodes_reads_the_prior_configmaps_value() {
         let fake = FakeClusterApi::new();
         let prior_spec = AnimusClusterSpec {
             nodes: 5,
@@ -700,12 +1206,19 @@ mod tests {
         );
 
         let cluster = test_cluster("demo", "ns1", 5, Some(5));
-        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
+        let result = previous_applied_control_nodes(&fake, "ns1", &cluster)
+            .await
+            .unwrap();
         assert_eq!(result, Some(3));
     }
 
     #[tokio::test]
-    async fn control_nodes_changed_is_none_when_unchanged() {
+    async fn previous_applied_control_nodes_still_returns_the_value_when_unchanged() {
+        // S-07d: unlike the old `control_nodes_changed`, this no longer
+        // compares against the spec's own desired value at all — it always
+        // reports the prior applied value, changed or not, since the
+        // growth machinery needs to keep observing it every reconcile
+        // while a growth is in flight.
         let fake = FakeClusterApi::new();
         let prior_spec = AnimusClusterSpec {
             nodes: 5,
@@ -718,18 +1231,164 @@ mod tests {
         );
 
         let cluster = test_cluster("demo", "ns1", 5, Some(3));
-        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
-        assert_eq!(result, None);
+        let result = previous_applied_control_nodes(&fake, "ns1", &cluster)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(3));
     }
 
     #[tokio::test]
-    async fn control_nodes_changed_is_none_when_no_prior_configmap() {
+    async fn previous_applied_control_nodes_is_none_when_no_prior_configmap() {
         // A fresh cluster (nothing applied yet): nothing to compare
-        // against, so this must never look like an immutable-field change.
+        // against, so this must never look like a shrink attempt.
         let fake = FakeClusterApi::new();
         let cluster = test_cluster("demo", "ns1", 3, None);
-        let result = control_nodes_changed(&fake, "ns1", &cluster).await.unwrap();
+        let result = previous_applied_control_nodes(&fake, "ns1", &cluster)
+            .await
+            .unwrap();
         assert_eq!(result, None);
+    }
+
+    // --- S-07d: the pure growth-decision functions -------------------------
+
+    #[test]
+    fn next_growth_ordinal_finds_the_first_missing_voter() {
+        let voters: std::collections::BTreeSet<String> =
+            ["demo-0", "demo-1"].into_iter().map(String::from).collect();
+        assert_eq!(next_growth_ordinal("demo", 5, &voters), Some(2));
+    }
+
+    #[test]
+    fn next_growth_ordinal_is_none_once_every_ordinal_is_a_voter() {
+        let voters: std::collections::BTreeSet<String> = ["demo-0", "demo-1", "demo-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(next_growth_ordinal("demo", 3, &voters), None);
+    }
+
+    #[test]
+    fn next_growth_ordinal_ignores_an_unrelated_extra_voter() {
+        // A voter set that (impossibly, but defensively) contains an id
+        // this cluster never minted must not confuse the search — it looks
+        // for `node_id(name, i)` specifically, not just "any 3 entries".
+        let voters: std::collections::BTreeSet<String> = ["demo-0", "someone-else-7"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(next_growth_ordinal("demo", 3, &voters), Some(1));
+    }
+
+    #[test]
+    fn achieved_control_nodes_is_the_leading_confirmed_prefix() {
+        let voters: std::collections::BTreeSet<String> =
+            ["demo-0", "demo-1"].into_iter().map(String::from).collect();
+        assert_eq!(achieved_control_nodes("demo", 5, &voters), 2);
+    }
+
+    #[test]
+    fn achieved_control_nodes_is_the_target_once_fully_caught_up() {
+        let voters: std::collections::BTreeSet<String> = ["demo-0", "demo-1", "demo-2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(achieved_control_nodes("demo", 3, &voters), 3);
+    }
+
+    #[test]
+    fn achieved_control_nodes_is_zero_with_no_voters_observed() {
+        assert_eq!(
+            achieved_control_nodes("demo", 3, &std::collections::BTreeSet::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_voters_reads_the_voters_array() {
+        let body = serde_json::json!({"voters": ["demo-0", "demo-1"], "addrs": {}});
+        let voters = parse_voters(&body).expect("voters array present");
+        assert_eq!(
+            voters,
+            ["demo-0", "demo-1"].into_iter().map(String::from).collect()
+        );
+    }
+
+    #[test]
+    fn parse_voters_is_none_when_voters_is_null() {
+        // `control_members_view`'s own documented "unknown, not empty"
+        // shape for a `Remote` handle that has never observed a voter set.
+        let body = serde_json::json!({"voters": null, "addrs": {}});
+        assert_eq!(parse_voters(&body), None);
+    }
+
+    #[test]
+    fn parse_voters_is_none_when_voters_is_absent() {
+        let body = serde_json::json!({});
+        assert_eq!(parse_voters(&body), None);
+    }
+
+    // --- (3b) `ordinal_reports_role_both` checks the real `animusd` -------
+    // --- literal, never the unrelated `cluster.json` one ------------------
+
+    /// A minimal `AdminOps` that always answers `GET /admin/config` with a
+    /// fixed `role` value — used to pin exactly which JSON literal
+    /// `ordinal_reports_role_both` treats as "this pod has restarted into
+    /// combined mode", independent of `FakeAdminClient`'s own behavior
+    /// (which is a mock this crate maintains by hand and could drift from
+    /// `animusd`'s real shape the same way it once did — see this struct's
+    /// own regression note).
+    struct FixedRoleAdmin(&'static str);
+
+    #[async_trait::async_trait]
+    impl AdminOps for FixedRoleAdmin {
+        async fn post_json(
+            &self,
+            _url: &str,
+            _body: &serde_json::Value,
+            _ca_pem: Option<&[u8]>,
+        ) -> Result<serde_json::Value, String> {
+            unreachable!("this test never posts")
+        }
+        async fn get_json(
+            &self,
+            _url: &str,
+            _ca_pem: Option<&[u8]>,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "role": self.0 }))
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinal_reports_role_both_accepts_animusds_real_combined_literal() {
+        // Pinned against `AdminInfo.role`'s real value for a combined-mode
+        // node (`crates/animusd/src/lib.rs`'s `role: "combined"` assembly,
+        // server-side pinned by `crates/animusd/tests/dashboard_
+        // endpoint.rs`'s `config_view["role"] == "combined"` assertion).
+        // This is the literal comparison that once read `"both"` instead —
+        // a JSON-shape mismatch with the real `animusd` that made this
+        // function always return `false`, so growth waited forever for a
+        // restart signal that could never arrive (root cause of the S-07d
+        // e2e timeout this test closes).
+        let admin = FixedRoleAdmin("combined");
+        assert!(ordinal_reports_role_both(&admin, "demo", "ns1", 3, 14003, None).await);
+    }
+
+    #[tokio::test]
+    async fn ordinal_reports_role_both_rejects_the_unrelated_cluster_json_literal() {
+        // `"both"` is `desired::cluster_config::NodeRole::Both`'s own
+        // spelling on a *different* JSON document (the generated
+        // `cluster.json`, not the runtime `/admin/config` response) — it
+        // must never be mistaken for the real `animusd` role literal.
+        let admin = FixedRoleAdmin("both");
+        assert!(!ordinal_reports_role_both(&admin, "demo", "ns1", 3, 14003, None).await);
+    }
+
+    #[tokio::test]
+    async fn ordinal_reports_role_both_rejects_data_and_control() {
+        for role in ["data", "control"] {
+            let admin = FixedRoleAdmin(role);
+            assert!(!ordinal_reports_role_both(&admin, "demo", "ns1", 3, 14003, None).await);
+        }
     }
 
     // --- (4) drain_and_remove_node's sequence, including the bounded ------
@@ -887,14 +1546,15 @@ mod tests {
         assert!(!calls.iter().any(|(_, u)| u.contains("/member/remove")));
     }
 
-    // --- bonus: the immutable-controlNodes-change path end to end ---------
+    // --- controlNodes decrease is still refused (S-07d renamed this from
+    // --- "immutable" to "shrink-rejected"; growth is now honored instead) -
 
     #[tokio::test]
-    async fn reconcile_refuses_immutable_control_nodes_change() {
+    async fn reconcile_refuses_control_nodes_decrease() {
         let fake_cluster = FakeClusterApi::new();
         let prior_spec = AnimusClusterSpec {
             nodes: 5,
-            control_nodes: Some(3),
+            control_nodes: Some(5),
             ..Default::default()
         };
         fake_cluster.seed_configmap(
@@ -903,9 +1563,9 @@ mod tests {
         );
         let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
 
-        // The spec now asks for controlNodes: 5 — refused, since it
-        // previously applied as 3.
-        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        // The spec now asks for controlNodes: 3 — refused, since it
+        // previously applied as 5; a decrease is never honored.
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(3)));
         let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
         assert!(result.is_ok(), "{:?}", result.err());
 
@@ -914,11 +1574,19 @@ mod tests {
             status
                 .conditions
                 .iter()
-                .any(|c| c.type_ == CONDITION_IMMUTABLE_FIELD_CHANGED)
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_SHRINK_REJECTED)
+        );
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+            "a rejected decrease must never also look like a growth in progress"
         );
 
         // The re-applied ConfigMap must still reflect the *prior*
-        // controlNodes value (3 "both" roles), never the refused new one.
+        // controlNodes value (5 "both" roles), never the refused smaller
+        // one.
         let cm = ctx
             .cluster_api
             .configmap(&desired::config_map_name("demo"))
@@ -935,7 +1603,459 @@ mod tests {
             .iter()
             .filter(|n| matches!(n.role, desired::cluster_config::NodeRole::Both))
             .count();
-        assert_eq!(both_count, 3);
+        assert_eq!(both_count, 5);
+    }
+
+    // --- S-07d: spec.controlNodes growth, end to end via FakeAdminClient --
+
+    /// Seed everything a growth-in-progress test needs: a prior applied
+    /// `ConfigMap` recording `control_nodes: 3` for a 5-node cluster, and
+    /// the fake control group's own live voter set matching that same
+    /// prior shape (`demo-0..2`) — the steady state right before an
+    /// operator edits `spec.controlNodes` from 3 to 5.
+    fn seed_pre_growth_state(fake_cluster: &FakeClusterApi, fake_admin: &FakeAdminClient) {
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
+    }
+
+    #[tokio::test]
+    async fn reconcile_grows_regenerates_the_configmap_role_split_immediately() {
+        // The ConfigMap/StatefulSet role split must reflect the full
+        // *target* the moment the spec changes — the promoted ordinal
+        // can't restart into role "both" at all otherwise — even though no
+        // voter has actually caught up yet.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(
+            !ctx.cluster_api
+                .last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_SHRINK_REJECTED),
+            "growth must never be treated as a rejected shrink"
+        );
+
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("ConfigMap re-applied");
+        let json = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::CONFIG_FILE_NAME)
+            .unwrap();
+        let parsed: desired::cluster_config::ClusterConfig = serde_json::from_str(json).unwrap();
+        let both_count = parsed
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.role, desired::cluster_config::NodeRole::Both))
+            .count();
+        assert_eq!(
+            both_count, 5,
+            "the ConfigMap must already show the full growth target"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_waits_for_the_promoted_pod_before_adding_it() {
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        // Ordinal 3's own pod hasn't restarted into role "both" yet
+        // (`mark_ordinal_ready_both` is never called) — no add attempted.
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        assert!(
+            !ctx.admin
+                .calls()
+                .iter()
+                .any(|(m, u)| m == "POST" && u.contains("/admin/control/member/add")),
+            "must not attempt to add a voter before its pod reports role \"both\""
+        );
+        let status = ctx.cluster_api.last_status().unwrap();
+        let growing = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING)
+            .expect("ControlNodesGrowing condition present");
+        let msg = growing.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("3/5"), "{msg}");
+        assert!(msg.contains("ordinal 3"), "{msg}");
+
+        // The PDB must use the *achieved* count (3), not the full target
+        // (5), while growth is still pending.
+        let pdb = ctx
+            .cluster_api
+            .poddisruptionbudget(&desired::pod_disruption_budget_name("demo"))
+            .unwrap();
+        assert_eq!(
+            pdb.spec.unwrap().max_unavailable,
+            Some(IntOrString::Int(
+                desired::poddisruptionbudget::safe_max_unavailable(5, 3)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_adds_a_voter_once_its_pod_reports_role_both() {
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.mark_ordinal_ready_both(3);
+        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(
+            ctx.admin.control_voters().contains("demo-3"),
+            "ordinal 3 must have been added as a control voter"
+        );
+        let add_calls: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            add_calls,
+            vec![admin_url(
+                "demo",
+                "ns1",
+                0,
+                14003,
+                "/admin/control/member/add"
+            )],
+            "must try the first already-confirmed voter ordinal first"
+        );
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let growing = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING)
+            .expect("still growing — only one of two missing voters was added");
+        assert!(
+            growing
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("4/5"),
+            "{:?}",
+            growing.message
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_retries_a_different_voter_ordinal_when_the_first_refuses() {
+        // Mirrors "retry on the leader" without an address hint (a `Local`
+        // control handle's own `leader_addr_hint` is always `None`): every
+        // already-confirmed voter ordinal is tried in turn, so a
+        // not-currently-the-leader ordinal 0 doesn't block growth forever.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        // Three already-confirmed voters this time, so there's a genuine
+        // "second candidate" to fall back to.
+        let prior_spec = AnimusClusterSpec {
+            nodes: 6,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(3);
+        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
+        let ctx = make_ctx(fake_cluster, fake_admin);
+        ctx.admin.fail_add_control_member_for_ordinal(0);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 6, Some(4)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(ctx.admin.control_voters().contains("demo-3"));
+        let add_calls: Vec<String> = ctx
+            .admin
+            .calls()
+            .into_iter()
+            .filter(|(m, u)| m == "POST" && u.contains("/admin/control/member/add"))
+            .map(|(_, u)| u)
+            .collect();
+        assert_eq!(
+            add_calls,
+            vec![
+                admin_url("demo", "ns1", 0, 14003, "/admin/control/member/add"),
+                admin_url("demo", "ns1", 1, 14003, "/admin/control/member/add"),
+            ],
+            "ordinal 0 refused, so ordinal 1 must have been tried next"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_completes_and_clears_the_condition() {
+        // Live truth already shows every ordinal 0..5 as a confirmed
+        // voter (as if a prior reconcile finished the job) — growth must
+        // be recognized as complete and the PDB must use the full target.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.seed_control_voters(
+            ["demo-0", "demo-1", "demo-2", "demo-3", "demo-4"].map(String::from),
+        );
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+            "{:?}",
+            status.conditions
+        );
+        let pdb = ctx
+            .cluster_api
+            .poddisruptionbudget(&desired::pod_disruption_budget_name("demo"))
+            .unwrap();
+        assert_eq!(
+            pdb.spec.unwrap().max_unavailable,
+            Some(IntOrString::Int(
+                desired::poddisruptionbudget::safe_max_unavailable(5, 5)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_stall_is_visible_when_live_truth_is_unreachable() {
+        // Diagnosability regression: before this fix, `advance_control_growth`
+        // returning early on a failed `discover_control_voters` call left
+        // `status.conditions` untouched — a stalled growth (every control
+        // ordinal unreachable, every reconcile in a row) was invisible from
+        // `kubectl get animuscluster -o yaml`, indistinguishable from a
+        // reconcile that simply hadn't run yet. `CONDITION_CONTROL_NODES_
+        // GROWING` must now be present and say so.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.fail_control_members();
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(5)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        let growing = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING)
+            .expect("a stalled growth must still record ControlNodesGrowing");
+        let msg = growing.message.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("could not reach"),
+            "message should explain the stall: {msg}"
+        );
+
+        // The PDB must fall back to the last confirmed-safe count (3), not
+        // the unconfirmed full target (5).
+        let pdb = ctx
+            .cluster_api
+            .poddisruptionbudget(&desired::pod_disruption_budget_name("demo"))
+            .unwrap();
+        assert_eq!(
+            pdb.spec.unwrap().max_unavailable,
+            Some(IntOrString::Int(
+                desired::poddisruptionbudget::safe_max_unavailable(5, 3)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_grows_control_nodes_three_to_four_end_to_end() {
+        // Mirrors `scripts/e2e-kind.sh`'s own S-07d phase exactly: a
+        // 4-node cluster whose `controlNodes` is patched 3 -> 4. This is
+        // the scenario that timed out in CI (issue root-caused to
+        // `ordinal_reports_role_both` checking the wrong JSON literal,
+        // "both" instead of `animusd`'s real "combined") — a full,
+        // reconcile-level regression for that fix, independent of the
+        // narrower `ordinal_reports_role_both_*` unit tests above.
+        let fake_cluster = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 4,
+            control_nodes: Some(3),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("e2e"),
+            prior_cluster_configmap("e2e", "ns1", &prior_spec),
+        );
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.seed_control_voters(["e2e-0", "e2e-1", "e2e-2"].map(String::from));
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        // First reconcile after the patch: ordinal 3 hasn't restarted yet
+        // (still role "data") — the ConfigMap/StatefulSet regenerate to the
+        // full target immediately, but no add is attempted, and the stall
+        // is recorded.
+        let cluster = Arc::new(test_cluster("e2e", "ns1", 4, Some(4)));
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(
+            !ctx.admin
+                .calls()
+                .iter()
+                .any(|(m, u)| m == "POST" && u.contains("/admin/control/member/add")),
+            "must not add ordinal 3 before its pod actually reports role \"combined\""
+        );
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+        );
+
+        // The promoted pod finishes restarting into combined mode (the
+        // config-hash-triggered rolling restart, in the real cluster) —
+        // its own `GET /admin/config` now reports the real `animusd`
+        // literal.
+        ctx.admin.mark_ordinal_ready_both(3);
+        ctx.cluster_api.seed_pod_ip("e2e-3", "10.0.0.4");
+
+        // Second reconcile: a real watch would deliver the object with the
+        // status the first reconcile's own `patch_cluster_status` just
+        // wrote (carrying the `ControlNodesGrowing` condition
+        // `already_growing` needs, since the `ConfigMap` alone no longer
+        // distinguishes "still growing" from "already at target" once it
+        // regenerated to the full target on the first reconcile) — a fresh
+        // `AnimusCluster` built from the same spec plus that status
+        // reproduces that, unlike reusing `cluster` verbatim (an `Arc`'s
+        // own `.status` never mutates in place).
+        let mut cluster2 = test_cluster("e2e", "ns1", 4, Some(4));
+        cluster2.status = Some(status.clone());
+        reconcile(Arc::new(cluster2), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert!(ctx.admin.control_voters().contains("e2e-3"));
+        assert_eq!(ctx.admin.control_voters().len(), 4);
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_NODES_GROWING),
+            "growth must be recognized as complete: {:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_resumes_growth_from_live_truth_after_a_simulated_restart() {
+        // The ConfigMap already reflects the full target (as it would the
+        // reconcile right after the spec edit landed — S-07d's own "P
+        // becomes D the very next reconcile" property), so a bare
+        // prior-vs-desired comparison could no longer tell growth is still
+        // pending. What must carry it across is the `ControlNodesGrowing`
+        // status condition surviving on the object itself (etcd-durable,
+        // not this process's memory) — simulating exactly what a
+        // controller restart sees.
+        let fake_cluster = FakeClusterApi::new();
+        let prior_spec = AnimusClusterSpec {
+            nodes: 5,
+            control_nodes: Some(5),
+            ..Default::default()
+        };
+        fake_cluster.seed_configmap(
+            &desired::config_map_name("demo"),
+            prior_cluster_configmap("demo", "ns1", &prior_spec),
+        );
+        let fake_admin = FakeAdminClient::new();
+        fake_admin.seed_control_voters(["demo-0", "demo-1", "demo-2"].map(String::from));
+        fake_admin.mark_ordinal_ready_both(3);
+        fake_cluster.seed_pod_ip("demo-3", "10.0.0.4");
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let mut cluster = test_cluster("demo", "ns1", 5, Some(5));
+        cluster.status = Some(AnimusClusterStatus {
+            conditions: vec![ClusterCondition {
+                type_: CONDITION_CONTROL_NODES_GROWING.to_string(),
+                status: ConditionStatus::True,
+                reason: Some(CONDITION_CONTROL_NODES_GROWING.to_string()),
+                message: Some("growing spec.controlNodes: 3/5 voters confirmed".to_string()),
+                last_transition_time: None,
+            }],
+            ..Default::default()
+        });
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            ctx.admin.control_voters().contains("demo-3"),
+            "growth must resume from the surviving status condition, not stall forever \
+             just because the ConfigMap already matches the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_control_nodes_increase_above_nodes() {
+        // An increase above spec.nodes is rejected the same way a
+        // spec.nodes decrease below controlNodes already is.
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 5, Some(6)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED),
+            "{:?}",
+            status.conditions
+        );
+        assert!(
+            !ctx.admin
+                .calls()
+                .iter()
+                .any(|(m, u)| m == "POST" && u.contains("/admin/control/member/add")),
+        );
     }
 
     // --- (6) spec.tls (ADR 0064 commit 3) --------------------------------

@@ -19463,3 +19463,109 @@ loop is the wrong "pressure": it starves the test's own tokio runtime so
 hard that an unrelated bootstrap assertion fires first. Use a real,
 yielding contention source (another integration-test binary looping on
 the same pinned cores) to reach the code path under test.
+## A strictly-typed admin-API address field (`SocketAddr`) silently forecloses Kubernetes-native automation over it — check the field's own type, not just its wire shape (S-07d, `POST /admin/control/member/add`)
+
+Automating ADR 0037's control-voter-growth admin path from
+`animus-operator` (S-07d) hit a real, pre-existing gap only visible once
+an actual Kubernetes call site needed it: `POST /admin/control/
+member/add`'s request body (`admin::AddControlMemberReq`) types `addr` as
+`std::net::SocketAddr`, which `serde`'s `FromStr`-backed deserialization
+can only ever parse from a literal IP:port — never a DNS name. That is
+exactly the wrong shape for a Kubernetes pod, whose only *stable* identity
+across a restart is its per-ordinal DNS name (`RoleAddrs::
+advertise_host`); its IP is not stable at all. Every *other* address
+surface this same codebase already built for exactly this reason
+(`RoleAddrs`/`ClientResponse::JoinInfo`/`ProdEnv::merge_peer`/`set_peers`)
+is deliberately string-typed — `member/add`'s own `addr` field is the one
+outlier, because it was built for the bare-metal CLI's `animus admin
+control-add`, where a literal IP is exactly right (that deployment shape
+binds real host IPs, never `0.0.0.0`). Nothing about `member/add`'s own
+*doc comment* or its *wire shape* (a plain JSON string either way) hints
+at this — only reading the actual Rust field type on the server side
+(`SocketAddr`, not `String`) reveals it, and only because a Kubernetes
+call site's own address is a hostname.
+
+The workaround landed (`resolve_control_dial_addr`, reading the pod's live
+`status.podIP` via the Kubernetes API rather than resolving the hostname
+via DNS) is deliberately narrow and self-healing (the promoted node's own
+startup self-registration republishes its real, hostname-based address
+moments later — see ADR 0060's S-07d amendment for the full account), but
+it is a workaround, not a fix — the real fix (accepting a `String` addr
+the way `ProdEnv::merge_peer` already does) belongs in `animusd`, out of
+`animus-operator`'s own scope (that crate has no dependency on `animusd`).
+
+**General form**: before wiring a new automated caller (an operator, a
+controller, any Kubernetes-native client) against an *existing* admin/RPC
+API that predates that caller's own deployment shape, check every address
+field's actual Rust type on the server side, not just its JSON shape or
+its doc comment — a `SocketAddr` (or any other strictly-typed, IP-only
+field) is a signal the API was designed for a deployment shape where a
+literal IP is stable, which a Kubernetes pod's is not. Grep for the type,
+don't infer it from the wire.
+
+## A `Local` control/consensus handle's own "not leader" refusal carries no retry-able address — only a `Remote` mirror's does (S-07d, `POST /admin/control/member/add`)
+
+Designing S-07d's "retry a `member/add` call against the leader when the
+first-tried voter refuses" step, the natural instinct (mirroring a human
+operator's own runbook, or the admin dashboard's "not leader" message,
+which *does* carry a `leader_addr_hint`) was to parse an address out of
+the refusal and retry against it. That hint is populated from
+`ControlHandle::leader_addr_hint()`, which is **always `None` for
+`Local`** — a genuine control-plane voter has no separate notion of "the
+leader's own address" the way a `Remote` data-only node's mirror does
+(that method's own doc: "always `None` for `Local` — a genuine control
+voter has no separate notion of the leader's client address; callers that
+need one resolve it via `ClientCtx::route_addr` on `leader()`'s id").
+Every pod `member/add` is ever called against in this design (any
+already-confirmed voter ordinal) is genuinely `Local` — so the retry
+target this design needed simply has no address-hint mechanism available
+at all, despite one existing (and working) elsewhere in the same admin
+surface for a different node role.
+
+The fix that shipped (`add_control_voter`: try every already-confirmed
+voter ordinal in turn, stopping at the first 2xx, relying on the call's
+own documented idempotence to make trying the "wrong" ones first free) is
+simpler than address-hint parsing would have been anyway, but the lesson
+is the general one: **an admin/RPC action's "who do I retry against"
+answer can differ by which *role* is refusing** — a `Remote` mirror and a
+`Local` voter can both return the identical-looking "not leader" error
+text/shape while only one of them can name a next hop. Check the actual
+handle variant an automated caller will hit (not just the human-facing
+error message shape) before designing a retry strategy around an address
+hint.
+
+## A shared `StatefulSet` pod-template annotation restarts every pod, not just the ordinal a spec change was meant for — the pod template has no per-ordinal slot (S-07d, config-hash restart mechanism)
+
+S-07d needed *some* already-running pod to notice a `ConfigMap` content
+change and restart (role-promotion for control-voter growth is decided in
+`entrypoint.sh` at container start, never hot-reloaded) — the standard
+Kubernetes idiom for this is a content-hash annotation on the pod
+template, which turns a `ConfigMap` change into a `StatefulSet.spec.
+template` change the `StatefulSet` controller rolls out like any other
+pod-template edit. The point worth recording: **there is exactly one pod
+template per `StatefulSet`, shared by every ordinal** — an annotation
+placed there cannot be scoped to "just the ordinal(s) that actually need
+to restart." Adding this mechanism for `controlNodes` growth specifically
+therefore also restarts every *other* pod on *every* config-affecting
+spec change this operator already had (`spec.tls`, `spec.s3`, `spec.
+backupStore`/`segmentStore`, `spec.dynamoAuthSecretName`, `spec.
+quiesceAfterSecs`/`autoSplitBytes`; a `nodes`-only scale is deliberately
+*not* one of them — see the sibling entry on hashing only what a pod
+reads at boot) — fields that, before this change,
+silently sat unapplied on an already-running pod until it happened to
+restart for an unrelated reason. That silent-no-op behavior was arguably
+a latent bug in every one of those features' own delivery, only now
+surfaced (and fixed, as a side effect) by a mechanism built for a
+different field entirely.
+
+**General form**: a per-pod-template annotation/env-var/volume is a
+whole-`StatefulSet`-scoped lever, not a per-ordinal one — if a design
+needs to affect *only* certain ordinals (the way S-07d's own role
+promotion conceptually only needed to touch the newly-promoted ones), the
+pod template itself cannot express that; either accept the
+whole-set-restarts cost (as this change did, since there is no clean way
+to avoid it while every ordinal still shares one template) or reach for a
+mechanism that genuinely varies per-pod (e.g. a per-ordinal `ConfigMap`/
+`Secret`, or an `initContainer` reading its own ordinal at start) — never
+assume a template-level annotation change stays scoped to "the pods that
+actually needed it."

@@ -37,9 +37,7 @@ service.
 A larger cluster with a real control/data split — say 3 control-role pods
 plus 7 data-only pods — sets `nodes: 10` and `controlNodes: 3`: ordinals
 `0..3` run combined, `3..10` run data-only (`animusd data`). `controlNodes`
-is **immutable** after creation; a later change is rejected (a status
-condition, `ImmutableFieldChanged`, is set) rather than applied, since v1
-ships no admission webhook to reject the write itself.
+is **grow-only** since S-07d — see the dedicated section below.
 
 ## TLS (ADR 0064 commit 3)
 
@@ -251,9 +249,12 @@ maxUnavailable = min(
 ```
 
 For the operator's own default 3-node/3-`controlNodes` shape this is `1`;
-it stays `1` for any larger `nodes` count too, since `controlNodes` is
-immutable and the data-plane replication factor is capped — a scale-up/
-down within that range never needs the budget recomputed. A cluster
+it stays `1` for any larger `nodes` count too, as long as `controlNodes`
+doesn't also grow, since the data-plane replication factor is capped — a
+scale-up/down within that range never needs the budget recomputed. (While
+a `controlNodes` growth, S-07d, is still catching up, the budget is
+computed from the live-confirmed voter count, never the full target — see
+this file's own "Control-voter growth" section below.) A cluster
 smaller than its replication factor (`nodes < 3`), or with a single
 control voter (`controlNodes == 1`), computes `0` — **this correctly
 blocks every voluntary eviction**, since such a cluster cannot survive
@@ -261,6 +262,35 @@ losing its one and only copy of a control-plane or data-plane majority.
 See `crates/animus-operator/src/desired/poddisruptionbudget.rs`'s own
 module doc for the full reasoning, including why there is no CRD field to
 loosen or disable it.
+
+## Control-voter growth (S-07d)
+
+`spec.controlNodes` is **grow-only**: an increase is honored — the
+operator drives ADR 0037's `control/member/add` against the
+newly-promoted ordinals, one voter at a time, until the control group
+itself confirms each one (`GET /admin/control/members`), surfacing
+progress as a `ControlNodesGrowing` status condition while it's in
+flight. A **decrease** is still rejected (a status condition,
+`ControlNodesShrinkRejected`, is set) rather than applied, since v1 ships
+no admission webhook to reject the write itself and control voters can
+only be removed one at a time through their own careful quorum-loss
+checks (ADR 0037 §2), never inferred from a bare spec edit. See ADR
+0060's own "Control-voter growth (S-07d, 2026-09-06)" section for the
+full design (the live-truth-driven sequence, why role-promotion needs a
+restart, the `SocketAddr` gap this works around, and how a controller
+restart resumes).
+
+**Growing `controlNodes` restarts every pod, not just the promoted
+one.** Regenerating the config that drives the role split requires a
+config-affecting spec change to actually reach an already-running pod,
+which now happens via a pod-template config-hash annotation
+(`desired::statefulset::CONFIG_HASH_ANNOTATION`) that triggers a normal
+`StatefulSet` rolling restart, highest ordinal first, one at a time. This
+applies to *any* config-affecting field, not just `controlNodes` —
+`spec.tls`/`spec.s3`/`spec.backupStore`/`spec.segmentStore`/
+`spec.dynamoAuthSecretName`/`spec.quiesceAfterSecs`/`spec.autoSplitBytes`
+all now trigger a rolling restart when changed too, where they previously
+sat unapplied on already-running pods until an unrelated restart.
 
 ## Testing
 

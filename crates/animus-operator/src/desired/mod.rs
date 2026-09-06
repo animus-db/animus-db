@@ -132,3 +132,14 @@ pub fn pod_fqdn(name: &str, ns: &str, ordinal: i32) -> String {
         internal_service_name(name)
     )
 }
+
+/// The `Pod` object's own name for ordinal `ordinal` of cluster `name` —
+/// the `StatefulSet`'s standard `{name}-{ordinal}` pod naming convention
+/// (S-07d: used to look up a promoted ordinal's live `status.podIP` via the
+/// Kubernetes API for the one-time control-voter `member/add` dial address
+/// — see `crate::controller`'s growth machinery doc for why this goes
+/// through the Kubernetes API rather than a DNS lookup).
+#[must_use]
+pub fn pod_name(name: &str, ordinal: i32) -> String {
+    format!("{name}-{ordinal}")
+}

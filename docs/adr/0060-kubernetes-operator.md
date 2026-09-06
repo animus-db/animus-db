@@ -306,7 +306,7 @@ Spec (initial surface):
 |---|---|
 | `image` | The `animusd` image to run. |
 | `nodes` | Total pod/replica count. |
-| `controlNodes` | Control-voter count (default `3`); **immutable after creation**. Pods `0..controlNodes-1` run role `Both` (ADR 0035); the rest run role `Data`. |
+| `controlNodes` | Control-voter count (default `3`); **grow-only since S-07d** (a decrease is rejected; an increase is driven by the controller itself — see this ADR's own "Control-voter growth (S-07d, 2026-09-06)" section below). Pods `0..controlNodes-1` run role `Both` (ADR 0035); the rest run role `Data`. |
 | `storage.size`, `storage.storageClassName?`, `storage.ephemeral?` | Per-pod PVC sizing/class, or an ephemeral (no-PVC) mode for throwaway clusters. |
 | `resources?` | Pod resource requests/limits, passed through verbatim. |
 | `basePort` | Port-stride base (default `14000`, matching `animusd`'s own default). |
@@ -388,15 +388,16 @@ data-role node joining a live cluster.
 directly — drain, poll drain-status to convergence, then remove via the
 admin API — **before** deleting the corresponding pod and its PVC.
 Scaling below `controlNodes` is rejected outright by the operator's own
-validation (a `controlNodes`-immutable invariant with fewer live pods than
-control voters is not a state this design supports).
+validation (a smaller `controlNodes` than live control voters is not a
+state this design supports).
 
-**Growing the control voter set post-creation is explicitly out of
-scope** for this ADR — `controlNodes` is immutable after `AnimusCluster`
-creation. ADR 0037's admin API/CLI already exists for an operator (human,
-this time) to grow the control group manually if a cluster genuinely
-outgrows its original control-voter count; wiring that into
-`animus-operator` itself is a named follow-up, not part of this design.
+**Growing the control voter set post-creation was explicitly out of
+scope for this ADR's original design** — `controlNodes` was immutable
+after `AnimusCluster` creation, with ADR 0037's admin API/CLI as the
+manual escape hatch for an operator (human, this time) who needed to grow
+the control group by hand. **Closed 2026-09-06 (S-07d)**: see this ADR's
+own "Control-voter growth (S-07d, 2026-09-06)" section below for the
+grow-only design that replaced this.
 
 ### Reconciler style
 
@@ -448,8 +449,9 @@ job).
   Deployment/config; no `spec`-level passthrough is provided in this
   initial surface.
 - **PITR** — no CRD surface (depends on the backups wiring above).
-- **Control-voter growth** — `controlNodes` is immutable; ADR 0037's admin
-  path remains the manual escape hatch.
+- ~~**Control-voter growth** — `controlNodes` is immutable; ADR 0037's
+  admin path remains the manual escape hatch.~~ — closed 2026-09-06
+  (S-07d, see this ADR's own amendment below).
 - ~~**`PodDisruptionBudget` tuning** — the StatefulSet ships with none
   beyond Kubernetes defaults; a deliberately-tuned PDB is a follow-up.~~ —
   closed 2026-09-06 (S-07c, see this ADR's own amendment below).
@@ -958,3 +960,271 @@ error-mapping only, never a live proxied round trip; `scripts/e2e-kind.sh`
 already runs entirely out-of-cluster (this amendment's default `proxy`
 mode is exercised on every leg by construction, not as a special case),
 and closes the S-07d CI failure this amendment's own title names.
+## Amendment (2026-09-06): S-07d — Control-voter growth
+
+`docs/roadmap.md`'s S-07 item d is closed by this amendment, and it also
+closes this ADR's own "Not in v1" bullet on the topic and the "Growing the
+control voter set post-creation is explicitly out of scope" paragraph
+above: `spec.controlNodes` is now **grow-only**, replacing the earlier
+fully-immutable posture. A decrease is still rejected outright — the same
+behavior as before, just renamed from `ImmutableFieldChanged` to
+[`CONDITION_CONTROL_NODES_SHRINK_REJECTED`] to make room for the new,
+honored direction. An **increase** is driven forward by the controller
+itself, one voter at a time, by automating exactly the ADR 0037 admin path
+a human operator used to run by hand (`animus admin control-add`).
+
+### Design: live-truth-driven, not a stored plan
+
+Growth is driven entirely from **live** `GET /admin/control/members`
+truth, never from anything this process holds only in memory. Each
+reconcile that finds `spec.controlNodes` above the last value the
+`ConfigMap` recorded (or that finds a `ControlNodesGrowing` status
+condition already present — see "Resuming after a restart" below) does at
+most one step:
+
+1. Ask an already-established control ordinal (0, falling back through
+   the rest of `0..target`) for the control group's own live voter-id set.
+   `GET /admin/control/members` is served by **any** node, control-voter or
+   not (`admin.rs`'s own doc on `control_members_view`), so even a
+   not-yet-promoted ordinal answers honestly.
+2. `next_growth_ordinal`/`achieved_control_nodes` (pure, unit-tested
+   functions of `(cluster_name, target, voters)`) turn that live set into
+   "how many of `0..target` are already confirmed voters" and "which
+   ordinal is missing next".
+3. If the next ordinal's own `GET /admin/config` doesn't yet report
+   `role: "combined"` (`AdminInfo.role`'s real literal — never `"both"`,
+   which is an unrelated field on the generated `cluster.json`; see this
+   amendment's own "2026-09-06 correction" subsection below), its pod
+   hasn't restarted into combined mode yet — wait (a `ControlNodesGrowing`
+   status condition records the achieved/target counts and which ordinal is
+   pending).
+4. Otherwise, resolve that ordinal's live `status.podIP` (via the
+   Kubernetes API — see "The `SocketAddr` gap" below for why not DNS) and
+   `POST /admin/control/member/add` against each already-confirmed voter
+   ordinal in turn until one accepts, then poll `GET /admin/control/
+   members` (bounded, ~15 × 2s) until the new ordinal shows up before this
+   reconcile returns.
+
+This mirrors `drain_and_remove_node`'s own bounded-polling style (the same
+`#[allow(clippy::disallowed_methods, ...)]` real-wall-clock justification,
+ADR 0061 Decision 4) and, like it, never blocks a reconcile indefinitely:
+one ordinal advances per call at most, and an unfinished step is simply
+picked back up, from live truth, on the next reconcile (~30s later, or
+sooner on the next spec/status watch event).
+
+### Why role-promotion is a restart, not a config hot-reload
+
+The role split (`ordinal < controlNodes` → `Both`, else `Data`) is decided
+once, in `entrypoint.sh`, at container start — an already-running
+`animusd` process never re-reads `cluster.json`. Reaching a promoted
+ordinal therefore requires that pod to actually restart. The `ConfigMap`
+volume mount updates in place on the kubelet's own sync period, but
+nothing previously made a running pod *notice* — so this amendment adds a
+config-hash pod-template annotation
+(`desired::statefulset::CONFIG_HASH_ANNOTATION`, a content hash of the
+generated config's restart-relevant projection: per-ordinal roles from
+`controlNodes`, store flags, TLS, cluster settings — never the node list,
+so a `nodes`-only scale never rolls pods) that turns any such spec change into a
+`StatefulSet.spec.template` change, which the `StatefulSet` controller
+handles exactly like an image bump: a rolling restart, highest ordinal
+first, one at a time, gated on the existing readiness probe. **This
+restarts every pod, not just the newly-promoted one** — the annotation is
+shared across the one pod template every ordinal uses — a real, deliberate
+behavior change from the pre-S-07d posture where a config-affecting field
+(`spec.tls`, `spec.s3`, `spec.dynamoAuthSecretName`, …) silently sat
+unapplied on already-running pods until they happened to restart for an
+unrelated reason. See `crates/animus-operator/CLAUDE.md`'s own S-07d
+section for the full list of fields this now affects.
+
+### Why growth doesn't need genesis's own "sequential join" answer
+
+This ADR's own "Rejected alternative" above (pod-0 solo bootstrap, then
+sequential join, then admin-driven growth) rejected that shape for
+**cluster genesis** specifically because every pod's join and every
+voter's promotion would have to complete in order, with a real failure
+mode if a pod restarted mid-sequence before its own step committed.
+Growth doesn't reopen that: a promoted ordinal's own `animusd` process
+starts with `control_ids` derived from the full (already-committed)
+`cluster.json`, but `RaftNode::start_with_orphan_sweep_after` only treats
+that as a genesis bootstrap set when the node's own persisted control
+storage is empty — which a previously-`Data`-role ordinal's is, since it
+never ran a control `RaftCore` before. The resulting local "belief" is
+inert until the real leader's own `change_membership` actually admits it
+(pre-vote means it can never win an election against the established
+group's own far-ahead log in the meantime) — so a promoted ordinal
+restarting mid-growth, or the growth step itself failing and retrying, is
+exactly as safe as retrying `member/add` always is (see `admin_add_
+control_member`'s own doc: idempotent, safe to retry the whole call).
+
+### The `SocketAddr` gap (a real, pre-existing `animusd` limitation)
+
+`POST /admin/control/member/add`'s `addr` field is typed
+`std::net::SocketAddr` server-side (`admin::AddControlMemberReq`), which
+can only ever deserialize a literal IP:port — **never a DNS name**. Every
+other address surface this operator or `animusd` itself uses for a
+Kubernetes pod (`RoleAddrs::advertise_host`, `ClientResponse::JoinInfo`,
+the peer book `ProdEnv::merge_peer`/`set_peers` populate) is deliberately
+string/hostname-typed for exactly the reason a pod's IP is not stable
+across a restart while its per-ordinal DNS name is. This is a genuine
+pre-existing gap in the admin API (built for the bare-metal CLI's
+numeric-IP world, ADR 0037), not introduced by this amendment, and not
+fixed by it either — fixing `AddControlMemberReq.addr` to accept a
+`String` the way `ProdEnv::merge_peer` already does is a named follow-up
+for `animusd`, out of this crate's own scope (this crate does not depend
+on `animusd` — see its own `CLAUDE.md`).
+
+The operator works around it by reading the promoted ordinal's **current**
+`status.podIP` via the Kubernetes API (`ClusterApi::get_pod_ip`) — not a
+DNS lookup, which would bypass the already-testable `ClusterApi` seam and
+add a real-network dependency no fake could stand in for — purely as a
+one-time bootstrap value for the leader's very first dial. The promoted
+node's own startup self-registration (`spawn_common_tail`'s
+`register_node_addrs`, unconditional on every combined-mode boot)
+republishes its real, DNS-name-based `advertised_addr` into the replicated
+`Metadata.node_addrs` moments later, which every node's own
+`peer_sync_loop` then adopts — so the resolved-IP staleness window this
+introduces is self-healing within moments of the call, not a permanent
+address pin surviving a future pod restart.
+
+### "Retry on the leader" without a leader address hint
+
+`POST /admin/control/member/add` is **local-control-leader-only, not
+relayed** (`admin::action_add_control_member`'s own doc). The admin
+dashboard's usual "not leader" refusal carries a `leader_addr_hint` an
+operator can retry against — but that hint comes from `ControlHandle::
+leader_addr_hint`, which is always `None` for `Local` (a genuine control
+voter has no separate notion of "the leader's own address" — see that
+method's own doc). Every control-role pod the operator would call this
+against is `Local`, so there is never an address to parse out of a
+refusal here, unlike a `Remote` data-only node's own admin actions.
+`add_control_voter` instead tries every already-confirmed voter ordinal
+`0..achieved` in turn, stopping at the first that accepts: at most one of
+them can be the real leader, and the call's own documented idempotence
+(above) makes trying the others first cost nothing but a harmless 409.
+
+### Interaction with the PodDisruptionBudget (S-07c)
+
+`apply_children`'s `PodDisruptionBudget` step uses the **achieved** (live-
+confirmed) control-voter count while growth is still catching up, never
+the full `spec.controlNodes` target — using the target early would grant a
+larger disruption budget than the control group can actually survive,
+since the newly-promoted ordinals are not yet real voters. This never
+affects the `ConfigMap`/`StatefulSet`, which must always reflect the real
+target so the promoted ordinals restart into role `Both` in the first
+place; only the one `PodDisruptionBudget::build` call inside
+`apply_children` sees a locally-overridden `spec.controlNodes` when the
+two counts differ.
+
+### Resuming after a restart
+
+The `ControlNodesGrowing` status condition (`{achieved}/{target} voters
+confirmed`) is a resume **optimization** — it lets a steady-state
+reconcile skip the live `GET /admin/control/members` call entirely once
+nothing is pending — never the source of truth. The actual "which ordinal
+is next" decision is always re-derived from live voter truth
+(`next_growth_ordinal`), which is why a controller restart mid-growth
+needs no persisted plan of its own: the very next reconcile, seeing
+`spec.controlNodes` still above the `ConfigMap`'s prior recorded value (or
+the `ControlNodesGrowing` condition still present on the object — durable
+in etcd, not this process's memory), simply asks the group what it
+actually has and continues from there. A controller-level test
+(`reconcile_resumes_growth_from_live_truth_after_a_simulated_restart`)
+pins the specific case this optimization creates: once the `ConfigMap`
+already reflects the full target (which happens on the very first growth
+reconcile, before any voter has actually been added — the config
+regenerates in one step, not incrementally), a bare prior-vs-desired
+comparison can no longer tell growth is still pending, so the surviving
+status condition is what carries it forward.
+
+### 2026-09-06 correction: `ordinal_reports_role_both` checked the wrong
+JSON literal
+
+This amendment's own first CI run (`e2e-kind.sh`'s three legs — plain TCP,
+TLS, S3 — all identically) timed out at the `spec.controlNodes` 3 → 4
+growth phase: the script's own `GET /admin/control/members` poll never saw
+a fourth voter within 300s, even though the promoted pod (`e2e-3`) had
+genuinely restarted into combined mode (its own admin log line changed
+from `"data node 3/4 up"` to `"node 3/4 up (CP)"`, and it kept answering
+`GET /admin/health` throughout).
+
+Root cause: `ordinal_reports_role_both` (`crate::controller`) compared
+`GET /admin/config`'s `"role"` field against the literal `"both"` — but
+`animusd`'s own `AdminInfo.role` (`crates/animusd/src/admin.rs`'s
+`config_view`, stamped in `crates/animusd/src/lib.rs`'s combined-mode
+assembly) only ever takes the values `"control"`/`"data"`/`"combined"`,
+pinned server-side by `crates/animusd/tests/dashboard_endpoint.rs`'s own
+`config_view["role"] == "combined"` assertion for exactly this shape.
+`"both"` is a *different* JSON literal on a *different* document —
+`desired::cluster_config::NodeRole::Both`'s own spelling in the generated
+`cluster.json`'s per-node `role` field, the config-time dispatch enum
+deciding which `animusd` subcommand a pod execs — which happens to
+describe the same real-world fact ("this pod runs both roles") but is not
+the field this function reads. The comparison could therefore never match:
+`ordinal_reports_role_both` always returned `false`, so
+`advance_control_growth` waited forever for a restart signal that had, in
+fact, already happened, and growth could never place its one
+`POST /admin/control/member/add` call. This was invisible in the crate's
+own unit suite because `crate::fakes::FakeAdminClient` — a hand-maintained
+mock with no compiler tie to `animusd`'s real JSON shape — mirrored the
+same wrong literal (`mark_ordinal_ready_both`'s `GET /admin/config` stub
+answered `"both"` too), so every growth test passed against a fake that
+was self-consistently wrong rather than checked against the real shape.
+Fixed by comparing against `"combined"` and correcting the fake to match;
+`crates/animus-operator/CLAUDE.md`'s S-07d section and this ADR's own
+numbered sequence above are corrected to the real literal. A second,
+independent gap this run surfaced: the operator's own `tracing_subscriber::
+fmt::init()` uses `EnvFilter::from_default_env()`, which is ERROR-only
+with `RUST_LOG` unset — every diagnostic `info!`/`warn!` in `reconcile`
+and the growth path was silently dropped in CI, so the operator's own log
+showed nothing even for reconciles that had genuinely run; `scripts/
+e2e-kind.sh` now sets `RUST_LOG=info` for the out-of-cluster operator
+process. Separately, `advance_control_growth` used to leave
+`status.conditions` completely untouched whenever `discover_control_
+voters` itself failed to reach any control ordinal (a persistent stall
+from that specific cause would have been just as invisible as this bug
+was) — it now records `ControlNodesGrowing` with a "could not reach any
+control ordinal" message *before* that call, so a stall from any cause is
+visible from `kubectl get animuscluster -o yaml`, not only a role-restart
+wait. See `crates/animus-operator/src/controller.rs`'s `ordinal_reports_
+role_both`/`advance_control_growth` doc comments and
+`crates/animus-operator/CLAUDE.md`'s S-07d section for the pinned
+regression tests this fix added (a `FixedRoleAdmin` test double pinning
+the exact literal directly, a `fail_control_members` `FakeAdminClient`
+toggle for the stall-visibility path, and a reconcile-level 3 → 4 growth
+test mirroring the e2e scenario end to end).
+
+### Deliverable
+
+Two commits: (1) the config-hash pod-template restart mechanism
+(`desired::statefulset::CONFIG_HASH_ANNOTATION`/`restart_relevant_config_hash`, golden
++ change-detection tests) as an independently reviewable groundwork step;
+(2) the growth flow itself — `crate::controller`'s `next_growth_ordinal`/
+`achieved_control_nodes` (pure, unit-tested), `parse_voters`/
+`fetch_control_members`/`discover_control_voters`/
+`ordinal_reports_role_both`/`resolve_control_dial_addr`/
+`add_control_voter`/`advance_control_growth` (the async orchestration,
+exercised through `FakeAdminClient`/`FakeClusterApi`), `previous_applied_
+control_nodes` (renamed from `control_nodes_changed`, now unconditional),
+`ClusterApi::get_pod_ip` (+ `RealClusterApi`/`FakeClusterApi`
+implementors — `deploy/operator/rbac.yaml`'s pre-existing `pods: get/list/
+watch` grant already covers this, its first real consumer),
+`crd::CONDITION_CONTROL_NODES_SHRINK_REJECTED` (renamed)/
+`CONDITION_CONTROL_NODES_GROWING` (new), controller-level tests covering
+the shrink-still-rejected path, immediate config regeneration, waiting for
+pod readiness, a successful add plus its retry-on-refusal, growth
+completion, restart-resume, and controlNodes-above-nodes rejection; this
+ADR, `crates/animus-operator/CLAUDE.md`, `deploy/operator/README.md`,
+`website/docs.html`'s known-limits example, and `docs/roadmap.md`'s S-07
+item d removed. No CRD field was added beyond the doc-comment update to
+`control_nodes` itself (schema `description` text is generated from Rust
+doc comments, so `deploy/operator/crd.yaml` was regenerated and
+`crd_manifest_pinned` re-pinned against it even though no field/type
+changed). `scripts/e2e-kind.sh` grows `controlNodes` 3 → 4 right after the
+existing `nodes` 3 → 4 scale-up (reusing the pod that scale-up already
+provisioned and waited on, rather than a fresh 3 → 5 growth needing a
+*second* pod/PVC to come up first), polling `GET /admin/control/members`
+for the new voter count, re-checking the PDB, and re-resolving/re-
+forwarding the serving pod (the config-hash-triggered rolling restart may
+have recycled the one the script's port-forward was already attached to)
+before a final `GetItem` proves the DynamoDB wire still serves. No new CI
+job.
