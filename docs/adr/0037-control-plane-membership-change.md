@@ -417,3 +417,27 @@ node at a time and still ship a silent stranding hazard.
 and Consequences "Update" paragraphs above, and `docs/engineering-lessons.md`'s
 matching closure notes on its "id-space mismatch" and "resulting count only"
 entries.
+
+## As-built (2026-09-05, roadmap U-05) — a standalone `POST /admin/control/transfer`
+
+Until this date `transfer_leadership` (§"`RaftNode` wrappers (PR1)" above)
+was only ever armed from inside `admin_remove_control_member`'s own
+leader-self-removal branch (this doc's route table row above) — there was
+no way to move control-plane leadership without also removing a voter, and
+`GET /admin/raft`'s `transfer_target` field (ADR 0020) was read-only. The
+roadmap's U-05 audit named this gap explicitly and it was verified against
+the code (no route, no CLI arm) before adding one.
+
+`POST /admin/control/transfer {"to": <node id>}` (`ClientCtx::
+admin_transfer_control_leadership`, `crates/animusd/src/admin.rs`) is a
+standalone sibling, same local-control-leader-only/not-relayed discipline
+as `control/member/add`/`control/member/remove`: idempotent success if
+`to` already leads, a refusal if `to` is not a current voter, otherwise
+arms `transfer_leadership(to)` and polls (bounded by the same
+`CONTROL_TRANSFER_POLL_TIMEOUT` the self-removal branch already used) for
+this node to step down. `animus admin control-transfer <admin-addr>
+<node-id>` is the CLI form. See ADR 0020's own matching as-built note for
+the full route contract and the `AdminHost`-stack wiring (host trait
+method, dispatch match arm, `FakeHost` stub, handler) — this ADR is the
+one that owns `transfer_leadership` itself and the self-removal arm this
+route sits beside.

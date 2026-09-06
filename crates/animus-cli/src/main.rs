@@ -171,7 +171,8 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     control-add <leader-admin-addr> <new-node-admin-addr>                    (self-minted id)\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>         (operator-supplied id)\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
-    control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]";
+    control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]\n    \
+    control-transfer <leader-admin-addr> <node-id>";
 
 async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -322,6 +323,18 @@ fn admin_request(
         "backups" => ("GET", "/admin/backups".into(), None),
         "restores" => ("GET", "/admin/restores".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
+        // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
+        // a single request/response, unlike `control-add`/`control-remove`/
+        // `control-grow` above — the server itself does the bounded arm-
+        // and-poll, so this is a flat one-shot route like `remove`/`drain`,
+        // not `run_admin`'s own multi-step orchestration. Still targets the
+        // leader's own admin address (local-control-leader-only, not
+        // relayed), same as every other `control-*` action here.
+        "control-transfer" => {
+            let node = arg(2).ok_or("control-transfer needs <node-id>")?;
+            let body = serde_json::json!({"to": node}).to_string();
+            ("POST", "/admin/control/transfer".into(), Some(body))
+        }
         "storage-control" => ("GET", "/admin/storage/control".into(), None),
         "lsm" => ("GET", format!("/admin/storage/lsm{}", tablet_q(2)), None),
         "wal" => ("GET", format!("/admin/storage/wal{}", tablet_q(2)), None),
@@ -1167,6 +1180,19 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_an_error() {
         assert!(admin_request("no-such-thing", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn control_transfer_builds_a_post_naming_the_target_node() {
+        let (method, path, body) = admin_request("control-transfer", &args(&["n2"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/control/transfer");
+        assert_eq!(body, Some(r#"{"to":"n2"}"#.to_string()));
+    }
+
+    #[test]
+    fn control_transfer_needs_a_node_id() {
+        assert!(admin_request("control-transfer", &args(&[])).is_err());
     }
 
     #[test]

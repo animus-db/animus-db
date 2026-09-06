@@ -312,6 +312,12 @@ pub trait AdminHost: Send + Sync {
     async fn action_add_control_member(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/control/member/remove`.
     async fn action_remove_control_member(&self, body: &[u8]) -> (u16, Value);
+    /// `POST /admin/control/transfer` (ADR 0020/0037, roadmap U-05) —
+    /// transfer control-plane leadership to another live voter. Standalone
+    /// sibling of `admin_remove_control_member`'s own internal self-removal
+    /// transfer arm — this route lets an operator move leadership without
+    /// also removing anyone.
+    async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/data/dynamo` — the admin dashboard's `execute_routed`
     /// proxy (ADR 0021); reaches `dynamo.rs`, unmoved, unmodified.
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value);

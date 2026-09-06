@@ -450,7 +450,7 @@
 <span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
 
 <span class="c"># control-plane membership</span>
-<span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow &lt;leader-admin-addr&gt; …</span></pre>
+<span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span></pre>
       </div>
     </section>
 
@@ -506,8 +506,9 @@
       <h3>Changing the control quorum</h3>
       <p>
         The control group's voters can be changed at runtime — added, removed or replaced — with
-        <code>control-add</code>, <code>control-remove</code> and <code>control-grow</code>, plus
-        leadership transfer. You do not have to rebuild the cluster to move the control plane.
+        <code>control-add</code>, <code>control-remove</code> and <code>control-grow</code>, plus a
+        standalone <code>control-transfer</code> to move leadership without removing anyone. You do
+        not have to rebuild the cluster to move the control plane.
       </p>
       <h3>Dropping a table</h3>
       <p>

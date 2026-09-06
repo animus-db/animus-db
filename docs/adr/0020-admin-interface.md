@@ -316,6 +316,38 @@ Regression: `animus-control/tests/leader_within_hysteresis.rs` (a one-sided
 partition inside the grace, then held past it, across 12 seeds). See
 `docs/engineering-lessons.md`'s matching entry for the general lesson.
 
+## As-built (2026-09-05, roadmap U-05) — `POST /admin/control/transfer`
+
+The roadmap's U-05 audit found no standalone leadership-transfer route:
+`GET /admin/raft`'s `transfer_target` (ADR 0037's escape-valve field) is
+read-only, and the only place this codebase ever armed a transfer was
+buried inside `admin_remove_control_member`'s self-removal arm (ADR 0037) —
+an operator who wanted to move leadership *without* also removing a voter
+had no route to ask for it. Added `POST /admin/control/transfer {"to":
+<node id>}`, beside the existing `control/member/add`/`control/member/remove`
+pair — like those two, documented in ADR 0037 rather than duplicated in
+this file's own design-time route table above, since all three are ADR
+0037-shaped control-plane-membership actions.
+
+Same discipline as every other `control/member/*` action: **local-control-
+leader-only, not relayed** (`RaftCore::transfer_leadership` is a call on
+this node's own in-process `RaftNode` handle, not a `MetaCommand`
+proposal — a follower refuses with the ordinary not-the-leader error). The
+handler (`ClientCtx::admin_transfer_control_leadership`) is idempotent if
+`to` already names the current leader, refuses outright if `to` is not a
+current voter, and otherwise arms the transfer and polls (bounded by the
+same `CONTROL_TRANSFER_POLL_TIMEOUT` the self-removal arm already used) for
+this node to step down — success means this node confirmed stepping down,
+not a confirmed new leader elsewhere (the caller retries against the new
+leader exactly as every other post-transfer caller in this codebase already
+does). Wired through the full `AdminHost` stack
+(`crates/animus-node/src/host.rs`'s trait method, `admin.rs`'s dispatch
+match arm and `FakeHost` stub, `crates/animusd/src/admin.rs`'s handler) and
+`animus admin control-transfer <admin-addr> <node-id>`. Regression:
+`tests/admin_endpoint.rs::
+admin_control_transfer_moves_leadership_to_the_named_node`/
+`admin_control_transfer_on_a_follower_is_refused`.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

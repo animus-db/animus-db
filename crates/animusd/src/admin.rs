@@ -502,6 +502,9 @@ impl AdminHost for ClientCtx {
     async fn action_remove_control_member(&self, body: &[u8]) -> (u16, Value) {
         action_remove_control_member(self, body).await
     }
+    async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
+        action_transfer_control_leadership(self, body).await
+    }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo(self, body).await
     }
@@ -1687,6 +1690,17 @@ struct RemoveControlMemberReq {
     force: bool,
 }
 
+/// `POST /admin/control/transfer` request body (ADR 0020/0037, roadmap
+/// U-05): `to` is the control-plane voter id leadership should move to. Named
+/// `to` rather than `node` — every other control-member request body's
+/// `node` names the member the action targets directly, whereas this one
+/// names a *destination*, so a distinct field name avoids reading "remove
+/// this node" and "hand leadership to this node" the same way at a glance.
+#[derive(Deserialize)]
+struct TransferControlLeadershipReq {
+    to: NodeId,
+}
+
 async fn action_split(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: SplitReq = match parse_body(body) {
         Ok(r) => r,
@@ -2023,6 +2037,26 @@ async fn action_remove_control_member(ctx: &ClientCtx, body: &[u8]) -> (u16, Val
             200,
             json!({"ok": true, "node": req.node, "warning": outcome.warning}),
         ),
+        Err(e) => (409, json!({"error": e})),
+    }
+}
+
+/// `POST /admin/control/transfer {to}` — move control-plane leadership to
+/// another live voter (ADR 0020/0037, roadmap U-05). **Local-control-leader-
+/// only, not relayed** — see [`crate::ClientCtx::admin_transfer_control_leadership`]'s
+/// doc for the full rationale and its idempotent-if-already-leader/refuse-if-
+/// not-a-voter/bounded-timeout contract. Mirrors
+/// `action_remove_control_member`'s response shape (`{"ok": true, ...}` on
+/// success, `409 {"error": ...}` on any refusal, including a timed-out
+/// transfer) for the same reason every other control-member action here
+/// does — a uniform shape for the dashboard/CLI to render.
+async fn action_transfer_control_leadership(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
+    let req: TransferControlLeadershipReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match ctx.admin_transfer_control_leadership(req.to.clone()).await {
+        Ok(()) => (200, json!({"ok": true, "to": req.to})),
         Err(e) => (409, json!({"error": e})),
     }
 }

@@ -4077,6 +4077,20 @@ ADR itself for the full design/rationale.
   `crates/animus-control/CLAUDE.md`'s "Leadership transfer" entry and
   `docs/engineering-lessons.md`'s issue #405 entry for the full mechanism
   and `tests/heartbeat_live_destinations.rs`'s fix.
+- **`POST /admin/control/transfer {"to": <node id>}` (ADR 0020/0037,
+  roadmap U-05, 2026-09-05)** — a standalone leadership-transfer route,
+  beside `admin_remove_control_member`'s own internal self-removal transfer
+  arm above: `ClientCtx::admin_transfer_control_leadership` lets an
+  operator move control-plane leadership without also removing a voter.
+  Same local-control-leader-only, not-relayed discipline as every other
+  `control/member/*` action; idempotent if `to` already leads, refused if
+  `to` isn't a current voter, otherwise arms `RaftCore::transfer_leadership`
+  and polls (bounded by the same `CONTROL_TRANSFER_POLL_TIMEOUT` the
+  self-removal arm uses) for this node to step down. `animus admin
+  control-transfer <admin-addr> <node-id>` is the CLI form. Regression:
+  `tests/admin_endpoint.rs::
+  admin_control_transfer_moves_leadership_to_the_named_node`/
+  `admin_control_transfer_on_a_follower_is_refused`.
 - **The CP group is durable by default** — and since ADR 0050 Train B rung
   1, **each hosted tablet gets its OWN private `LsmEngine`** (filename
   prefix `tablet_lsm_prefix(t)` = `db-t{t}-`; the trailing `-` keeps

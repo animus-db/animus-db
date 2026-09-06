@@ -8947,13 +8947,86 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ),
         }
     }
+
+    /// `POST /admin/control/transfer` (ADR 0020/0037, roadmap U-05) — move
+    /// control-plane leadership to another live voter, with no other side
+    /// effect. Standalone sibling of
+    /// [`admin_remove_control_member`](Self::admin_remove_control_member)'s
+    /// own internal self-removal transfer arm (the only place this codebase
+    /// armed a leadership transfer before this route existed, ADR 0037's
+    /// leader-self-removal case) — that arm is unchanged; this method exists
+    /// for an operator who wants to move leadership *without* also removing
+    /// anyone.
+    ///
+    /// **Local-control-leader-only, not relayed** — the identical discipline
+    /// [`admin_add_control_member`](Self::admin_add_control_member)/
+    /// [`admin_remove_control_member`](Self::admin_remove_control_member)
+    /// already use: `RaftCore::transfer_leadership` is a call on this node's
+    /// own in-process `RaftNode` handle, not a `MetaCommand` proposal, so
+    /// only a genuine control-group leader can serve this at all — a
+    /// follower refuses with [`not_leader_error`](Self::not_leader_error),
+    /// naming the current leader hint (if known) for the caller to retry
+    /// against.
+    ///
+    /// Refusals, before ever touching Raft:
+    /// - `target` is already the leader: idempotent success (mirrors
+    ///   `admin_add_control_member`'s already-a-voter idempotence).
+    /// - `target` is not currently a live voter (`self.control.config()`):
+    ///   refused outright — there is nothing to transfer to.
+    ///
+    /// Bounded by [`CONTROL_TRANSFER_POLL_TIMEOUT`], the identical budget
+    /// `admin_remove_control_member`'s own self-removal arm polls against —
+    /// a transfer that never completes in time surfaces as its own,
+    /// distinct timeout error rather than a bare "not the leader" refusal.
+    pub(crate) async fn admin_transfer_control_leadership(
+        &self,
+        target: NodeId,
+    ) -> Result<(), String> {
+        let Some(leader) = self.edge.leader_handle() else {
+            return Err(self.not_leader_error());
+        };
+        let my_id = leader.env().node_id();
+        if target == my_id {
+            // Already the leader: nothing to do.
+            return Ok(());
+        }
+        let current = self.control.config().unwrap_or_default();
+        if !current.contains(&target) {
+            return Err(format!(
+                "cannot transfer control leadership to {target}: not a current \
+                 control voter"
+            ));
+        }
+        if !leader.transfer_leadership(target.clone()) {
+            return Err(format!(
+                "could not arm a leadership transfer to node {target} (already \
+                 mid-transfer, or {target} has not caught up); retry"
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + CONTROL_TRANSFER_POLL_TIMEOUT;
+        loop {
+            if !leader.is_leader() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "leadership transfer to node {target} did not complete within \
+                     {}s; retry",
+                    CONTROL_TRANSFER_POLL_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
 }
 
-/// How long [`ClientCtx::admin_remove_control_member`] polls for a self-removal's
-/// leadership transfer to complete before giving up with an honest timeout error
-/// — generous relative to the default 150ms election timeout (several rounds of
-/// pre-vote + real vote + `TimeoutNow` under real scheduling jitter), mirroring
-/// the other bounded admin polls in this file (e.g. [`SCHEMA_COMMIT_TIMEOUT`]).
+/// How long a leadership transfer's own poll waits before giving up with an
+/// honest timeout error — shared by [`ClientCtx::admin_remove_control_member`]'s
+/// self-removal transfer arm and [`ClientCtx::admin_transfer_control_leadership`]'s
+/// standalone one — generous relative to the default 150ms election timeout
+/// (several rounds of pre-vote + real vote + `TimeoutNow` under real
+/// scheduling jitter), mirroring the other bounded admin polls in this file
+/// (e.g. [`SCHEMA_COMMIT_TIMEOUT`]).
 const CONTROL_TRANSFER_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The result of a successful [`ClientCtx::admin_remove_control_member`] call —

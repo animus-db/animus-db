@@ -1802,3 +1802,93 @@ async fn admin_credentials_put_on_a_follower_is_relayed_to_the_leader() {
     .await
     .expect("test timed out");
 }
+
+/// `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05) moves
+/// control-plane leadership to another live voter — a standalone route
+/// alongside the leadership-transfer arm `control/member/remove`'s own
+/// self-removal path already had internally. Posts the transfer to the
+/// **current leader's** own admin address (local-control-leader-only, not
+/// relayed, mirroring every other `control/member/*` action), then polls
+/// (converged-or-timeout, per this crate's own testing discipline — never a
+/// fixed sleep) until the named target reports itself the control leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_control_transfer_moves_leadership_to_the_named_node() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let target = (0..nodes.len()).find(|&i| i != leader).unwrap();
+        let target_id = config.nodes[target].id.clone();
+
+        let body = serde_json::json!({"to": target_id}).to_string();
+        let (status, resp) = admin(
+            nodes[leader].admin_addr(),
+            "POST",
+            "/admin/control/transfer",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, 200, "transfer should be accepted: {resp}");
+        assert_eq!(resp["ok"], true, "response: {resp}");
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if nodes[target].is_control_leader() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("control leadership never moved to the named target");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A follower's admin port refuses the transfer (not the control leader) —
+/// mirroring every other `control/member/*` action's own not-relayed,
+/// local-leader-only discipline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_control_transfer_on_a_follower_is_refused() {
+    timeout(Duration::from_secs(30), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+        let other = (0..nodes.len())
+            .find(|&i| i != leader && i != follower)
+            .unwrap();
+        let target_id = config.nodes[other].id.clone();
+
+        let body = serde_json::json!({"to": target_id}).to_string();
+        let (status, resp) = admin(
+            nodes[follower].admin_addr(),
+            "POST",
+            "/admin/control/transfer",
+            Some(&body),
+        )
+        .await;
+        assert_ne!(status, 200, "a follower should refuse the transfer: {resp}");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
