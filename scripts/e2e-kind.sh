@@ -27,6 +27,16 @@
 # `spec.s3.backupStore` — the two backup-store fields together would be a
 # rejected conflict).
 #
+# S-07c: the operator applies a `{name}-pdb` PodDisruptionBudget for every
+# cluster now (`crate::desired::poddisruptionbudget`), with `maxUnavailable`
+# derived from `nodes`/`controlNodes` rather than a constant. This manifest's
+# own 3-node/3-controlNodes shape computes exactly 1
+# (floor((3-1)/2) for both the control-plane and RF-capped data-plane
+# terms) — checked once right after the initial 3/3-ready wait, and again
+# after the scale-up to 4 nodes below (pinning that the value is
+# scale-invariant once nodes/controlNodes each reach the replication
+# factor, see ADR 0060's own "Amendment (2026-09-06): S-07c" section).
+#
 # Issue #595: this smoke flaked twice with the identical signature — the
 # first `CreateTable` (issued once, immediately after the statefulset
 # reported 3/3 ready) failing with a 500 whose message is "CreateTable did
@@ -513,6 +523,13 @@ log "operator running as PID ${OPERATOR_PID}, logging to ${OPERATOR_LOG}"
 phase "wait for 3/3 ready replicas"
 wait_for "statefulset readyReplicas==3" 300 5 -- sts_ready_equals 3
 
+phase "check the quorum-derived PodDisruptionBudget (S-07c)"
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable=1 \
+for nodes=3/controlNodes=3, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1"
+
 if [ "$E2E_TLS" = "1" ]; then
     phase "wait for the cert-manager Certificate to be issued"
     kubectl wait "certificate/${AC_NAME}-tls" -n "$NAMESPACE" \
@@ -646,6 +663,16 @@ log "GetItem ok — item round-tripped"
 phase "scale AnimusCluster to 4 nodes"
 kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"nodes":4}}'
 wait_for "statefulset readyReplicas==4" 300 5 -- sts_ready_equals 4
+
+phase "check the PodDisruptionBudget is scale-invariant after scale-up (S-07c)"
+# controlNodes stays 3 (immutable) and the data-plane replication factor is
+# already plateaued at 3 nodes, so maxUnavailable must still be 1 — not
+# recomputed to something larger just because nodes grew.
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable to \
+stay 1 after scaling to 4 nodes, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb still reports maxUnavailable=1 after scale-up"
 
 phase "GetItem still returns the item after scale-up"
 RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \

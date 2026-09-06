@@ -57,6 +57,11 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
     it through `Api::namespaced_with`. `dns_names` computes the SAN list:
     every pod's own stable per-ordinal FQDN plus both Services (headless
     internal + client-facing `dynamo`), short and fully-qualified.
+  - `poddisruptionbudget.rs` (S-07c) — the `{name}-pdb`
+    `PodDisruptionBudget` builder: `maxUnavailable` is derived from
+    `spec.nodes`/`spec.controlNodes` and a fixed data-plane replication
+    factor mirror, never a constant and never CRD-overridable — see this
+    file's own "PodDisruptionBudget" section below.
   - `configmap.rs`/`services.rs`/`statefulset.rs`/`networkpolicy.rs` — one
     builder module per child kind. `statefulset.rs` mounts `spec.tls`'s
     resolved `Secret` (ADR 0064 commit 3) read-only at `/etc/animus/tls`,
@@ -452,10 +457,77 @@ with `allowInsecureHttp: true`, then exercises `CreateBackup`/
 `bash -n`-checked, never run end to end anywhere — treat a first real CI
 failure on the `e2e-kind-s3` job as this leg finding its first real bug.
 
+## PodDisruptionBudget (S-07c, closes `docs/roadmap.md`'s S-07 item c and
+this crate's own ADR 0060 deferred-list bullet)
+
+`crate::desired::poddisruptionbudget::build` produces a `{name}-pdb`
+`PodDisruptionBudget` for every `AnimusCluster`, owner-referenced and
+selecting `selector_labels(name)` like every other child, applied
+unconditionally in `apply_children` (after the `NetworkPolicy`, before the
+`StatefulSet`) — a **required** child, not an optional one the way
+`spec.tls.certManager`'s `Certificate` is.
+
+`maxUnavailable` is computed, never a constant and never
+CRD-overridable:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),                         # control-plane quorum
+  floor((min(nodes, MAX_REPLICATION_FACTOR) - 1) / 2),    # data-plane tablet RF
+)
+```
+
+`MAX_REPLICATION_FACTOR = 3` mirrors `animusd::MAX_REPLICATION_FACTOR`
+(`crates/animusd/src/lib.rs`) by hand as `desired::poddisruptionbudget::
+DATA_PLANE_MAX_REPLICATION_FACTOR` — this crate has no dependency on
+`animusd` (this file's own note above), and there is no `spec`-level
+replication-factor override today, so this is the same manual-sync
+posture `desired::cluster_config`'s `ClusterConfig`/`RoleAddrs` JSON
+mirror already established (grep `crates/animusd/src/lib.rs`'s own
+`MAX_REPLICATION_FACTOR` before touching either side). `nodes`/
+`control_nodes` are each clamped to at least `1` first, so `safe_max_
+unavailable` is a total function that never panics or goes negative even
+on a not-yet-valid spec.
+
+**Degenerate shapes all compute `0` — correctly, not as a bug**:
+`nodes == 1`, `controlNodes == 1`, and `nodes < MAX_REPLICATION_FACTOR`
+each block every voluntary eviction outright, because such a cluster
+cannot survive losing its one live copy of a control-plane or data-plane
+majority. Once `nodes` and `controlNodes` each reach `3` (this operator's
+own default), the value plateaus at `1` for any larger `nodes` — this is
+*why* the builder uses `maxUnavailable` rather than `minAvailable`
+(mutually exclusive on a `PodDisruptionBudgetSpec`): `minAvailable` would
+have to be re-derived as `nodes - maxUnavailable` on every scale event,
+while `maxUnavailable` is scale-invariant across the entire range that
+matters in practice. `apply_children` still re-derives and re-applies it
+every reconcile regardless (the same unconditional-re-apply posture every
+other required child has), always from the **desired** spec (`spec.
+nodes`/`spec.controlNodes`), never the `StatefulSet`'s live replica
+count — a scale-down transition test (`controller::tests`) pins that a
+cluster previously scaled to 5 replicas immediately gets the *new*,
+stricter budget on a reconcile to a smaller `nodes`/`controlNodes`, not
+the stale prior shape's looser one.
+
+**No CRD field was added.** The safe value is already a pure, fully
+determined function of two existing spec fields; an override could only
+loosen it (unsafe, must be rejected), tighten it (already achievable via
+`spec.nodes`/`spec.controlNodes` directly), or disable it outright, which
+would make this the first required child this operator ever stops
+applying once a spec says so — there is no finalizer or deletion path
+(`crate::controller`'s own "no finalizer in v1" doc) for a child that
+used to be desired and no longer is. See ADR 0060's own 2026-09-06
+amendment for the full reasoning, including what a future override would
+need to answer first (its own deletion story) before being added.
+
+`deploy/operator/rbac.yaml` grants the `policy` API group's
+`poddisruptionbudgets` the same full verb set as every other owned kind;
+`run()` watches it via `.owns(Api::<PodDisruptionBudget>::all(..))` like
+the other four typed child kinds.
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (159 tests total as of S-07b's landing):
+own `#[cfg(test)] mod tests` (177 tests total as of S-07c's landing):
 golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
 `ConfigMap` contents (including the no-port-striding invariant, a
 scale-up byte-for-byte-preserves-existing-entries regression, and, since
@@ -463,10 +535,15 @@ S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags, and since
 S-07b, the non-S3 `backupStore`/`segmentStore` flag emission and its
 "whichever of `spec.s3` or the top-level field is set" precedence),
 `Service` port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable
-storage shape (plus the `spec.s3` `Secret` mount), and `NetworkPolicy`
+storage shape (plus the `spec.s3` `Secret` mount), `NetworkPolicy`
 selector/ingress/egress rule structure (including the S-04 PR 3 egress
 additions: baseline intra+DNS on every cluster, an S3 rule only when
-`spec.s3` is set). **No cluster is needed** — every test constructs an
+`spec.s3` is set), and, since S-07c, `PodDisruptionBudget`
+`maxUnavailable` arithmetic covering every degenerate shape (`nodes == 1`,
+`controlNodes == 1`, `nodes < MAX_REPLICATION_FACTOR`, a larger
+`controlNodes` capped by the data-plane term and vice versa, scale
+invariance once past the replication factor) plus a golden-JSON shape
+test. **No cluster is needed** — every test constructs an
 `AnimusCluster` via `test_support::test_cluster` and asserts on the
 returned typed object or its JSON, never against a live API server.
 `s3_uri::tests` covers the standalone URI parser (`src/s3_uri.rs`)
@@ -490,7 +567,7 @@ directly.
   the admin-port client is deliberately not built on `kube::Client`, so a
   `kube`-specific mock would only ever cover half of it).
   `controller::tests` (in `src/controller.rs`) covers: a fresh cluster's
-  reconcile applying all five children in the right order; that an
+  reconcile applying all six children in the right order; that an
   unchanged cluster's reconcile still re-applies every child (pinned as the
   actual, deliberate behavior — `apply_children` never diffs against
   previously-applied state, so this is an idempotent re-apply, not a
@@ -502,12 +579,12 @@ directly.
   scale-down sequencing, both the highest-ordinal-first happy path and
   stop-on-first-drain-failure; the immutable-`controlNodes`-change
   refusal end to end; since ADR 0064 commit 3, `spec.tls`: a
-  `Certificate` applied as a sixth child for the `certManager` shape and
+  `Certificate` applied as a seventh child for the `certManager` shape and
   none for `secretName`; both/neither shapes set rejected with
   `TlsSpecInvalid`; and the scale-down drain sequence reading a seeded
   `Secret`'s `ca.crt` and dialing `https://` once `spec.tls` is set; and,
-  since S-04 PR 3, `spec.s3`: a valid spec applies the same five children
-  (no sixth child, unlike `spec.tls.certManager`) with the `Secret` mount/
+  since S-04 PR 3, `spec.s3`: a valid spec applies the same six children
+  (no seventh child, unlike `spec.tls.certManager`) with the `Secret` mount/
   entrypoint flags/egress rule all present (`FakeClusterApi::
   networkpolicy`, a new accessor this PR added alongside the pre-existing
   `configmap`/`get_statefulset`); each `S3StoreSpec::validate` rejection
@@ -516,12 +593,19 @@ directly.
   and strips `spec.s3` for that reconcile; and a cluster with no `spec.s3`
   still gets the new baseline egress (intra + DNS) with no `s3` volume;
   and, since S-07b, `spec.backupStore`/`spec.segmentStore`: a valid
-  non-S3 spec applies the same five children with the entrypoint flag
+  non-S3 spec applies the same six children with the entrypoint flag
   present and no S3 credentials wiring; `validate_store_spec` rejections
   (`segmentStore: "cluster"`, a path outside `DATA_DIR`, a conflict with
   `spec.s3`'s own store field) surface `StoreSpecInvalid` and strip both
   fields for that reconcile; and a cluster with neither field set emits
-  no `--backup-store`/`--segment-store` flag at all.
+  no `--backup-store`/`--segment-store` flag at all; and, since S-07c,
+  `PodDisruptionBudget`: applied once per reconcile with an owner
+  reference and a selector matching the *actual* `statefulset::build`
+  output's own pod-template labels (`FakeClusterApi::poddisruptionbudget`,
+  a new accessor this PR added), and a scale-down transition
+  (`nodes: 5` → `nodes: 2, controlNodes: 2`) recomputing `maxUnavailable`
+  from the new desired spec rather than inheriting the prior shape's
+  looser value.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership

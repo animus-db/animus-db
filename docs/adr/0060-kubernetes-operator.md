@@ -345,6 +345,9 @@ conventional Kubernetes controller status shape, nothing bespoke.
   the cluster's own pods (plus the operator itself, for its own admin-API
   reconciliation reads) — the concrete enforcement of the trusted-network
   posture Part 1 restates rather than changes.
+- A **PodDisruptionBudget** (S-07c, see this ADR's own 2026-09-06
+  amendment below) bounding simultaneous voluntary evictions to whatever
+  the cluster's own control-plane and data-plane quorum math allows.
 
 ### Bootstrap: static generated config, not imperative sequencing
 
@@ -447,8 +450,9 @@ job).
 - **PITR** — no CRD surface (depends on the backups wiring above).
 - **Control-voter growth** — `controlNodes` is immutable; ADR 0037's admin
   path remains the manual escape hatch.
-- **`PodDisruptionBudget` tuning** — the StatefulSet ships with none
-  beyond Kubernetes defaults; a deliberately-tuned PDB is a follow-up.
+- ~~**`PodDisruptionBudget` tuning** — the StatefulSet ships with none
+  beyond Kubernetes defaults; a deliberately-tuned PDB is a follow-up.~~ —
+  closed 2026-09-06 (S-07c, see this ADR's own amendment below).
 - **S3 `SegmentStore` backend** — ADR 0059 §1 already scoped this as its
   own follow-up trait-swap; this ADR doesn't touch it.
 - **Admission/conversion webhooks** — the CRD ships with no webhook of any
@@ -716,3 +720,128 @@ over `backupStore` specifically so it composes with the pre-existing
 `segmentStore` here avoids a same-reconcile conflict between the two
 legs when both are enabled) and checks `GET /admin/segment-store` reports
 `"kind":"fs"`.
+
+## Amendment (2026-09-06): S-07c — PodDisruptionBudget
+
+`docs/roadmap.md`'s S-07 item c is closed by this amendment, and it also
+closes this ADR's own "Not in v1" bullet on the topic: every
+`AnimusCluster` now gets a `{name}-pdb` `PodDisruptionBudget`
+(`crate::desired::poddisruptionbudget`), applied unconditionally alongside
+the other five children (`ConfigMap`/`Service` x2/`NetworkPolicy`/
+`StatefulSet`), never a sixth *optional* child the way `spec.tls.
+certManager`'s `Certificate` is.
+
+**The budget is derived from the cluster's own quorum math, never a
+constant.** Two independent things must each keep a majority alive under
+a voluntary eviction:
+
+- **The control-plane Raft group** — exactly `spec.controlNodes` pods
+  (ordinals `0..controlNodes-1`) are voters (this ADR's own spec table
+  above), tolerating `floor((controlNodes - 1) / 2)` simultaneous losses.
+- **Every data-plane tablet group** — `animusd` places each tablet on the
+  first `min(N, MAX_REPLICATION_FACTOR)` `Active` members it sees, where
+  `MAX_REPLICATION_FACTOR = 3` (`crates/animusd/src/lib.rs`) is a fixed
+  constant today, not a `spec`-level knob. This crate has no dependency on
+  `animusd` (this crate's own `CLAUDE.md`), so the constant is mirrored by
+  hand (`desired::poddisruptionbudget::DATA_PLANE_MAX_REPLICATION_FACTOR`)
+  — the identical manual-sync posture `desired::cluster_config`'s
+  `ClusterConfig`/`RoleAddrs` JSON mirror already established. The
+  operator cannot see *which* pods actually hold any given tablet's
+  replicas (placement is the data plane's own runtime decision), so the
+  safe assumption is the worst case: any of the cluster's `nodes` pods
+  could be asked to host one, capped at the target replication factor —
+  effective RF `= min(nodes, MAX_REPLICATION_FACTOR)`, tolerating
+  `floor((rf - 1) / 2)` simultaneous replica losses.
+
+`maxUnavailable` is the smaller of the two:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),
+  floor((min(nodes, MAX_REPLICATION_FACTOR) - 1) / 2),
+)
+```
+
+A single global `PodDisruptionBudget` selecting every one of the
+cluster's own pods (`selector_labels`) caps *simultaneous* voluntary
+evictions cluster-wide regardless of which specific pods a scheduler
+picks, which is exactly what bounds both risks at once with one budget —
+no need for two separate PDBs scoped to disjoint pod subsets.
+
+**Degenerate shapes, handled explicitly (with tests)**: `nodes == 1`,
+`controlNodes == 1`, and `nodes < MAX_REPLICATION_FACTOR` (2, since RF is
+fixed at 3) all compute `maxUnavailable = 0` — **blocking every voluntary
+eviction outright, which is the correct, intended outcome, not a bug**: a
+single-voter control plane or a tablet group with only one live replica
+cannot survive losing its one copy, voluntarily or otherwise. A larger
+`controlNodes` than the data-plane budget allows is capped by the
+data-plane term (e.g. `nodes=10, controlNodes=7` still computes `1`, from
+the RF-capped data term, not the control term's own `3`); a larger data
+capacity than `controlNodes` allows is capped the other way
+(`nodes=10, controlNodes=1` computes `0`). Every input is clamped to at
+least `1` before the arithmetic runs, so the function never panics or
+returns a negative budget even on a not-yet-valid or momentarily
+inconsistent spec (`spec.nodes >= 1`/`controlNodes <= nodes` are each
+pre-existing, and separately enforced/documented, invariants this
+builder does not re-validate).
+
+**Expressed as `maxUnavailable`, never `minAvailable`.** The two are
+mutually exclusive on a `PodDisruptionBudgetSpec` and can express the
+identical constraint against a *known* total pod count, but
+`minAvailable` would be `nodes - maxUnavailable` — recomputed on every
+`spec.nodes` change. `maxUnavailable` itself is scale-invariant across
+the range that matters in practice: once `nodes` and `controlNodes` each
+reach `3` (this operator's own default), the value stays `1` for any
+larger `nodes`, since `controlNodes` is immutable after creation and the
+effective replication factor plateaus at `MAX_REPLICATION_FACTOR`. A
+scale-up/down within that range needs no PDB change at all — though
+`apply_children` re-derives and re-applies it every reconcile regardless
+(the same unconditional-re-apply posture every other required child
+already has), always from the *desired* spec (`spec.nodes`/
+`spec.controlNodes`), **never** the `StatefulSet`'s live/current replica
+count, which would make the budget momentarily wrong mid-scale. A
+dedicated controller-level test drives this through `FakeClusterApi`: a
+cluster previously scaled to 5 replicas (RF-plateaued budget of `1`)
+reconciled down to `nodes: 2, controlNodes: 2` immediately gets the
+stricter `0`, not the stale 5-node shape's `1`.
+
+**No CRD field for this.** An override could only ever be asked to (a)
+loosen the computed value, which is unsafe by construction and would have
+to be rejected anyway, (b) tighten it, which a smaller `spec.nodes`/
+`spec.controlNodes` already achieves directly, or (c) disable the budget
+outright — which would make this the *first* required child this
+operator ever stops applying once a spec says so; every other required
+child is applied unconditionally forever, and there is no finalizer or
+deletion path (this ADR's own "no finalizer in v1" decision) for a child
+that used to be desired and no longer is. Since the safe value is already
+a pure, fully-determined function of two existing spec fields, there is
+nothing left for a CRD field to usefully express today. If a real need
+for an override surfaces later, add it then, with its own deletion story
+(what happens to a previously-applied PDB when a later spec disables it)
+worked out at the same time — don't reach for delete-on-toggle without
+that answered first.
+
+**RBAC**: `deploy/operator/rbac.yaml` grants the `policy` API group's
+`poddisruptionbudgets` the same full verb set (`get/list/watch/create/
+update/patch/delete`) as every other owned kind.
+
+**Deliverable**: `crate::desired::poddisruptionbudget` (builder + golden
+JSON test + arithmetic unit tests covering every degenerate shape),
+`crate::desired::mod`'s `pod_disruption_budget_name` helper,
+`crate::cluster_api::ClusterApi::apply_poddisruptionbudget` (+
+`RealClusterApi`/`FakeClusterApi` implementors), `crate::controller::
+apply_children` (ordering) and `run()`'s `.owns(Api::<PodDisruptionBudget>
+::all(..))` watch wiring, controller-level tests through
+`FakeClusterApi` (applied once per reconcile, owner reference set,
+selector matching the *actual* `statefulset::build` output's pod-template
+labels, and the scale-down-recomputes-from-desired-spec transition),
+`deploy/operator/rbac.yaml`, `deploy/operator/README.md`'s owned-resources
+list and a new "PodDisruptionBudget" section, this ADR, this crate's own
+`CLAUDE.md`, and `docs/roadmap.md`'s S-07 item c removed. No CRD field was
+added, so `deploy/operator/crd.yaml` is unchanged and `crd_manifest_
+pinned` needed no regeneration. `scripts/e2e-kind.sh`'s plain-TCP leg
+additionally asserts `kubectl get pdb` reports `maxUnavailable: 1` for the
+smoke's own 3-node/3-`controlNodes` shape, both right after the initial
+3/3-ready wait and again after the scale-up to 4 nodes (pinning the
+scale-invariance claim above against a real cluster, not just the unit
+corpus).

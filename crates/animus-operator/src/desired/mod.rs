@@ -11,6 +11,7 @@ pub mod certificate;
 pub mod cluster_config;
 pub mod configmap;
 pub mod networkpolicy;
+pub mod poddisruptionbudget;
 pub mod services;
 pub mod statefulset;
 #[cfg(test)]
@@ -84,6 +85,12 @@ pub fn config_map_name(name: &str) -> String {
 #[must_use]
 pub fn network_policy_name(name: &str) -> String {
     format!("{name}-internal-only")
+}
+
+/// The `PodDisruptionBudget`'s name for cluster `name` (S-07c).
+#[must_use]
+pub fn pod_disruption_budget_name(name: &str) -> String {
+    format!("{name}-pdb")
 }
 
 /// A single owner reference pointing at `cluster`, `controller: true` (so

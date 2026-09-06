@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetStatus};
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::core::DynamicObject;
 use serde_json::Value;
 
@@ -30,6 +31,7 @@ pub enum AppliedKind {
     ConfigMap,
     Service,
     NetworkPolicy,
+    PodDisruptionBudget,
     StatefulSet,
     Certificate,
 }
@@ -47,6 +49,7 @@ pub struct FakeClusterApi {
     status_patches: Mutex<Vec<AnimusClusterStatus>>,
     secrets: Mutex<BTreeMap<String, Secret>>,
     networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
+    poddisruptionbudgets: Mutex<BTreeMap<String, PodDisruptionBudget>>,
 }
 
 impl FakeClusterApi {
@@ -128,6 +131,16 @@ impl FakeClusterApi {
     pub fn networkpolicy(&self, name: &str) -> Option<NetworkPolicy> {
         self.networkpolicies.lock().unwrap().get(name).cloned()
     }
+
+    /// The `PodDisruptionBudget` currently stored under `name` (the most
+    /// recently applied one) — used to assert on the computed
+    /// `maxUnavailable`/selector from a `reconcile`-level test (S-07c),
+    /// the same way `configmap`/`networkpolicy` let a test inspect other
+    /// applied children.
+    #[must_use]
+    pub fn poddisruptionbudget(&self, name: &str) -> Option<PodDisruptionBudget> {
+        self.poddisruptionbudgets.lock().unwrap().get(name).cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -165,6 +178,23 @@ impl ClusterApi for FakeClusterApi {
             .lock()
             .unwrap()
             .insert(name, np.clone());
+        Ok(())
+    }
+
+    async fn apply_poddisruptionbudget(
+        &self,
+        _ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError> {
+        let name = pdb.metadata.name.clone().unwrap();
+        self.applies
+            .lock()
+            .unwrap()
+            .push((AppliedKind::PodDisruptionBudget, name.clone()));
+        self.poddisruptionbudgets
+            .lock()
+            .unwrap()
+            .insert(name, pdb.clone());
         Ok(())
     }
 

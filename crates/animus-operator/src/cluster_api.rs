@@ -17,6 +17,7 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client};
@@ -43,6 +44,16 @@ pub trait ClusterApi: Send + Sync {
     /// Server-side-apply `np`.
     async fn apply_networkpolicy(&self, ns: &str, np: &NetworkPolicy)
     -> Result<(), ReconcileError>;
+    /// Server-side-apply `pdb` (S-07c) — the quorum-derived
+    /// `PodDisruptionBudget`, applied unconditionally on every reconcile
+    /// like every other required child (never optional the way `spec.tls.
+    /// certManager`'s `Certificate` is — see `desired::poddisruptionbudget`'s
+    /// own module doc for why there is no toggle for this one).
+    async fn apply_poddisruptionbudget(
+        &self,
+        ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError>;
     /// Server-side-apply `sts`, returning the object the API server stored
     /// (its `status.readyReplicas` is what `finish_reconcile` computes
     /// `AnimusClusterStatus.phase` from).
@@ -136,6 +147,21 @@ impl ClusterApi for RealClusterApi {
                 np.metadata.name.as_deref().unwrap(),
                 &apply_params(),
                 &Patch::Apply(np),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_poddisruptionbudget(
+        &self,
+        ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError> {
+        Api::<PodDisruptionBudget>::namespaced(self.client.clone(), ns)
+            .patch(
+                pdb.metadata.name.as_deref().unwrap(),
+                &apply_params(),
+                &Patch::Apply(pdb),
             )
             .await?;
         Ok(())

@@ -189,6 +189,32 @@ credentials, so the pod's already-mounted data volume is all that's
 involved. Reaches only **combined-role pods**, the same pre-existing
 `animusd` gap `spec.s3` documents above.
 
+## PodDisruptionBudget (S-07c)
+
+Every `AnimusCluster` gets a `{name}-pdb` `PodDisruptionBudget` selecting
+the cluster's own pods, with no `spec`-level opt-out or override —
+`maxUnavailable` is always computed from `spec.nodes`/`spec.controlNodes`,
+never a constant and never user-supplied:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),                       # control-plane quorum
+  floor((min(nodes, 3) - 1) / 2),                       # data-plane tablet RF (fixed at 3 today)
+)
+```
+
+For the operator's own default 3-node/3-`controlNodes` shape this is `1`;
+it stays `1` for any larger `nodes` count too, since `controlNodes` is
+immutable and the data-plane replication factor is capped — a scale-up/
+down within that range never needs the budget recomputed. A cluster
+smaller than its replication factor (`nodes < 3`), or with a single
+control voter (`controlNodes == 1`), computes `0` — **this correctly
+blocks every voluntary eviction**, since such a cluster cannot survive
+losing its one and only copy of a control-plane or data-plane majority.
+See `crates/animus-operator/src/desired/poddisruptionbudget.rs`'s own
+module doc for the full reasoning, including why there is no CRD field to
+loosen or disable it.
+
 ## Testing
 
 `cargo test -p animus-operator` is the pure `desired`-builder unit suite —
@@ -202,9 +228,10 @@ e2e section for what it does and does not prove.
 
 - **No finalizer** — deleting an `AnimusCluster` relies on Kubernetes
   garbage collection following the owner references every child object
-  (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`) carries. There is
-  nothing else to clean up (no external backup store, no DNS record) so
-  this is a deliberate v1 scope cut, not a known gap.
+  (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`/
+  `PodDisruptionBudget`) carries. There is nothing else to clean up (no
+  external backup store, no DNS record) so this is a deliberate v1 scope
+  cut, not a known gap.
 - ~~The operator's own container image is not yet built/published~~ —
   closed 2026-09-02 (S-07a). The root `Dockerfile`'s `runtime-operator`
   stage builds it, and `.github/workflows/image.yml`'s `animus-operator`
