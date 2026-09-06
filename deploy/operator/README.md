@@ -99,6 +99,61 @@ lets this work identically whether the operator runs in-cluster
 run` against a local kubeconfig (the `scripts/e2e-kind.sh` shape): both
 paths reach the API server, neither needs a filesystem mount of its own.
 
+## S3 backup/segment stores (S-04 PR 3)
+
+`spec.s3` wires the cluster's backup and/or stream-segment store onto a
+real S3-compatible bucket, closing `docs/roadmap.md`'s S-04 item:
+
+```yaml
+spec:
+  s3:
+    backupStore: "s3://my-backups-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
+    # segmentStore: "s3://my-streams-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
+    credentialsSecretName: my-s3-credentials   # keys: access_key_id, secret_access_key
+    allowInsecureHttp: false                   # true only for a plain-http:// dev endpoint (MinIO/localstack)
+    egressCidrs: ["0.0.0.0/0"]                 # NARROW to your object store's real CIDR range
+```
+
+At least one of `backupStore`/`segmentStore` must be set, and the URI
+shape is the identical `s3://<bucket>[/<prefix>]?endpoint=<scheme://
+host[:port]>&region=<region>[&insecure_http=true]` `animusd`'s own
+`--backup-store`/`--segment-store` flags accept (see ADR 0059's own S-04
+amendment). `credentialsSecretName` names a **pre-existing** `Secret`
+(same namespace, keys `access_key_id`/`secret_access_key`) this operator
+only ever mounts read-only at `/etc/animus/s3` — it never creates or
+writes one, mirroring `spec.tls`'s own `secretName` precedent. The secret
+value never reaches the `ConfigMap`/`cluster.json`: a combined-role pod's
+own generated `entrypoint.sh` reads both files at container-start time and
+writes a scratch `--s3-credentials` JSON file naming only the *path* to
+`secret_access_key`. **Combined-role pods only** — `animusd data --config`
+accepts no S3-store flags today (a pre-existing `animusd` gap, not
+introduced here; see `crates/animus-operator/CLAUDE.md`'s CLI-flag-support
+table).
+
+Setting `spec.s3` also adds an `Egress` section to the generated
+`NetworkPolicy` (every cluster now gets one, `spec.s3` or not — see below):
+a third rule, scoped to `egressCidrs`, opens the configured store URIs' own
+`endpoint=` port(s). **`NetworkPolicy` cannot express a hostname
+allowlist** — only IP blocks — so this operator has no way to resolve an
+endpoint's hostname into the right CIDR for you; `egressCidrs` defaults to
+`["0.0.0.0/0"]` (open to any destination on that port) and **should be
+narrowed to your object store's real address range** in any environment
+where that egress must be restricted.
+
+Invalid specs (neither store set, an empty `credentialsSecretName`, a
+malformed store URI, or `insecure_http=true` without `allowInsecureHttp`)
+are rejected: the controller sets an `S3SpecInvalid` status condition and
+reconciles the rest of the spec as if `s3` were absent, the same posture
+`TlsSpecInvalid` uses above.
+
+**Every cluster's `NetworkPolicy` egress, S3 or not**: before this PR the
+generated policy set no `Egress` in `policyTypes` at all, which leaves
+Kubernetes egress **completely unrestricted by omission** regardless of
+anything else the policy says — `docs/roadmap.md`'s S-04 item named this
+exactly. Every cluster now gets an explicit `Egress` section with two
+baseline rules (intra-cluster on the `internal`/`intra` ports, and DNS to
+`kube-system`'s `kube-dns`/CoreDNS pods) whether or not `spec.s3` is set.
+
 ## Testing
 
 `cargo test -p animus-operator` is the pure `desired`-builder unit suite —

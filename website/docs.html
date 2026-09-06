@@ -486,14 +486,18 @@
         <code>Service</code> plus a <code>NetworkPolicy</code> for node-to-node traffic — Raft,
         forwarding, metadata mirroring, seed and join — and a separate client-facing
         <code>Service</code> for the DynamoDB edge, the only one meant to be reachable outside
-        the cluster. Scaling a cluster is a spec edit (<code>kubectl patch</code> its
-        <code>nodes</code> field); deleting the custom resource tears down everything it owns
-        through ordinary Kubernetes garbage collection. A CI-gated smoke test exercises a real
-        <code>kind</code> cluster end-to-end — create, bootstrap, scale, delete — on every change
-        to this surface. The operator's own container image isn't published yet, so today it
-        runs out-of-cluster or from a locally built image. Kubernetes' own rolling update
-        replaces pods one at a time on an image change, but AnimusDB gives no format-compatibility
-        guarantee between revisions, so an upgrade still means recreating the cluster in practice.
+        the cluster. The <code>NetworkPolicy</code> restricts both ingress and egress:
+        inbound, only the cluster's own pods (plus the operator, for admin polling) and the
+        DynamoDB port from anywhere; outbound, the cluster's own pods on the Raft/RPC ports
+        plus DNS by default, and — only when an S3-compatible backup/segment store is
+        configured (<code>spec.s3</code>) — that store's own endpoint port, scoped to an
+        explicit, operator-set CIDR list. Scaling a cluster is a spec edit (<code>kubectl
+        patch</code> its <code>nodes</code> field); deleting the custom resource tears down
+        everything it owns through ordinary Kubernetes garbage collection. A CI-gated smoke
+        test exercises a real <code>kind</code> cluster end-to-end — create, bootstrap, scale,
+        delete — on every change to this surface. Kubernetes' own rolling update replaces pods
+        one at a time on an image change, but AnimusDB gives no format-compatibility guarantee
+        between revisions, so an upgrade still means recreating the cluster in practice.
       </p>
     </section>
 
@@ -598,11 +602,10 @@
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
           history and PITR coverage both outlive the table if it's later dropped.</li>
         <li><strong>Tablets never merge</strong>, so a table that shrinks keeps its tablet count.</li>
-        <li><strong>The Kubernetes operator is new and unpublished</strong> — its own container
-          image isn't built/published yet (run it out-of-cluster, or build the image locally),
-          and it ships no admission webhook, so an invalid spec edit (e.g. changing
-          <code>controlNodes</code> after creation) is caught by the controller after the fact,
-          not rejected up front.</li>
+        <li><strong>The Kubernetes operator ships no admission webhook</strong> — an invalid spec
+          edit (e.g. changing <code>controlNodes</code> after creation, or a malformed
+          <code>spec.s3</code>) is caught by the controller after the fact, surfaced as a status
+          condition, not rejected up front.</li>
         <li><strong>Not benchmarked at scale.</strong> No performance claims are made here for a
           reason.</li>
       </ul>

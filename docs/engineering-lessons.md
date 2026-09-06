@@ -18693,3 +18693,66 @@ free space before assuming the harness's own storage is a separate,
 unrelated resource — on a single-disk sandbox it usually isn't, and the
 real fix lives in the repo's build output, not in anything the harness
 itself controls.
+
+## A `NetworkPolicy` with no `Egress` in `policyTypes` leaves egress completely open, regardless of what an `egress:` list would say
+
+Writing S-04 PR 3's egress rules for `animus-operator`'s generated
+`NetworkPolicy` (`desired/networkpolicy.rs`) was a reminder that
+Kubernetes `NetworkPolicy` semantics are per-*direction*, not per-object:
+a policy that never names `Egress` in `spec.policyTypes` is a no-op for
+egress traffic on that pod selector, full stop — it doesn't matter whether
+`spec.egress` is present, empty, or omitted, and it doesn't matter how
+restrictive `spec.ingress` is. This repo's own operator had exactly that
+shape for a long time (`policyTypes: [Ingress]` only, since the policy was
+originally written before egress was ever a concern), which is precisely
+what `docs/roadmap.md`'s S-04 item flagged as "egress unrestricted by
+omission." **The generalizable check**: when adding an egress rule to an
+existing `NetworkPolicy` builder (here or anywhere else), verify
+`policyTypes` names `Egress` in the same change — a rule appended to
+`spec.egress` alone silently does nothing if that list update is missed,
+and nothing in the API server, `kubectl apply`, or a type-checked
+`k8s-openapi` struct catches the omission; only a real cluster (or reading
+the NetworkPolicy semantics doc closely) reveals it.
+
+## Reading a JSON response's actual field nesting from source beats inferring it from a route's own doc-comment summary
+
+Writing S-04 PR 3's (unverified, no-`kind`-available-sandbox) e2e leg, the
+task brief said to check `GET /admin/backup-store` for `"kind": "s3"`. The
+route's own doc comment says exactly that phrase ("`store` is this node's
+own configured backup store: kind plus a credential-safe `location`"), and
+it would have been easy to write `jq -r '.kind'` straight from that
+sentence. The actual handler (`admin.rs::backup_store_view`) nests it
+one level down: the top-level response is `{"store": {"kind": ...,
+"location": ...}, "objects": ..., "janitor": ..., "leader": ...}`, so the
+correct query is `.store.kind`, not `.kind`. **General form**: for any
+script or test that asserts on a JSON wire/admin response shape, read the
+actual serializer/handler function, not just its module doc comment or a
+task description's paraphrase of it — a doc comment describes intent and
+can (correctly) omit the wrapper object it's nested inside, and a
+paraphrase one level removed from the code compounds that gap. This
+matters more, not less, when the assertion can't be run in this sandbox
+(no `kind`) — there is no test failure to catch the mistake before it
+reaches a real CI run.
+
+## A CRD-generated shell script must single-quote every operator-controlled string value that becomes a command-line argument
+
+`animus-operator`'s `entrypoint.sh` generator (`desired::cluster_config::
+entrypoint_script`) started passing `s3://...` URIs (`spec.s3.backupStore`/
+`segmentStore`, S-04 PR 3) as literal `--backup-store`/`--segment-store`
+arguments in the generated POSIX `sh` script. An S3 URI's own query string
+always contains `&` (separating query parameters) and usually `?`/`=` —
+every one of `&`, `?` unquoted in `sh` is either a metacharacter (`&`
+backgrounds the preceding command entirely, silently turning `exec
+animusd ... --backup-store s3://bucket?a=1&b=2` into two separate
+commands) or at minimum a portability risk. Every other flag value this
+generator already emitted (paths, ports) happened to be safe unquoted, so
+this was the first flag value here that actually needed it. **General
+form**: any generator that interpolates a user- or spec-controlled string
+into a shell script (not just this one) must single-quote (with the
+standard `'...'` → `'\''` embedded-quote escape) every such value at the
+point of interpolation, not just the values that are "obviously" URLs or
+paths — the generator has no way to know in advance which future field
+will be the first one containing a shell metacharacter, and getting this
+wrong doesn't fail at generation time, only at container start, in a
+place `bash -n` (syntax-only) also won't catch since `&` is syntactically
+valid shell, just semantically wrong here.

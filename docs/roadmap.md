@@ -86,33 +86,6 @@ the still-true paragraph after the table.
   ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
   landed 2026-09-05, so this item is unblocked.
 
-### S-04 S3 `SegmentStore` backend (ADR 0059 deferred)
-
-- **Gap:** `parse_segment_store`/`parse_backup_store`
-  (`main.rs:575-601`) know only `dir:`, `fs:`, `cluster`.
-- **Plan:** see the amendment in
-  [`docs/adr/0059-backup-restore.md`](adr/0059-backup-restore.md#amendment-2026-09-06-s-04--s3-segmentstore-backend--design)
-  ("S-04: S3 `SegmentStore` backend — design," 2026-09-06, plus the
-  "As-built (2026-09-06): PR 2" amendment) for the full three-PR write-up:
-  object layout, consistency assumptions, credential sourcing, region/
-  endpoint, TLS, and testing. **PR (1) — a new `animus-s3` crate (pure
-  SigV4 signer + a minimal S3 client over a `Transport` seam, no
-  `SegmentStore` impl yet, no `animus-env` dependency) — is done. PR (2) —
-  `animus_env::S3SegmentStore` behind the `prod` feature and `s3:` URIs on
-  both `--segment-store`/`--backup-store` (plus `--s3-credentials PATH`/
-  `--allow-insecure-s3`) — is done.** The operator egress/credential-secret
-  work (`desired/networkpolicy.rs:99`, currently ingress-only, egress
-  unrestricted by omission) (PR 3) remains.
-- **Tests:** `assert_segment_store_contract` against `animus_s3::fake::
-  FakeS3` (load-bearing, no network) and, opt-in, a real MinIO/localstack
-  endpoint (`crates/animus-env/tests/s3_segment_store_minio.rs`,
-  `ANIMUS_S3_TEST_ENDPOINT` — done, PR 2). PR 1's own signer/client tests
-  are in `crates/animus-s3/CLAUDE.md`.
-- **ADR:** amended 0059 in place 2026-09-06 (it reserves this exact
-  follow-up; PR 2 landed with an as-built amendment of its own).
-- **PRs:** (1) client — done; (2) backend + flags — done; (3) operator
-  egress + secrets. **Size:** L. **Blocks:** S-05.
-
 ### S-05 S3 export/import
 
 - **Gap:** `ExportTableToPointInTime`, `DescribeExport`, `ListExports`,
@@ -123,7 +96,9 @@ the still-true paragraph after the table.
 - **Tests:** extend `ANIMUS_BACKUP_SEEDS`/`ANIMUS_PITR_SEEDS` corpora.
 - **ADR:** **yes** (0059 defers it as needing "a distinct wire model").
 - **PRs:** (1) export trio; (2) import trio; (3) corpus. **Size:** L.
-- **Depends:** S-04.
+- **Depends:** S-04, landed in full 2026-09-06 (`animus-s3`, `animus_env::
+  S3SegmentStore` + `s3:` URIs, and `animus-operator`'s `spec.s3` — see ADR
+  0059's amendments), so this item is unblocked.
 
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
@@ -287,7 +262,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04 landed 2026-09-06* → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

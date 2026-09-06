@@ -149,6 +149,125 @@ impl IssuerRef {
     }
 }
 
+/// `spec.s3` — S3-compatible object-store wiring for the cluster's backup
+/// and/or stream-segment stores (S-04 PR 3, closing `docs/roadmap.md`'s
+/// S-04 item; ADR 0059's 2026-09-06 amendment / "As-built: PR 2" note).
+/// Mirrors [`TlsSpec`]'s own precedent — a CRD section that only
+/// *references* a pre-existing `Secret` an operator user manages, never one
+/// this operator creates or writes to.
+///
+/// Either or both of `backupStore`/`segmentStore` may independently be set
+/// to an `s3://...` URI — the identical shape `animusd`'s own
+/// `--backup-store`/`--segment-store` flags accept
+/// (`crates/animusd/src/main.rs`'s `parse_s3_uri`, ADR 0059's As-built PR 2
+/// note). This crate does not depend on `animusd` (see this crate's own
+/// `CLAUDE.md`), so [`S3StoreSpec::validate`] only re-checks a minimal
+/// syntactic subset of that parser via [`crate::s3_uri::parse`] — see that
+/// module's own doc for exactly what is, and is not, re-verified here. At
+/// least one of the two store fields must be set.
+///
+/// Reaches only **combined-role** pods (`animusd --config FILE --node I`) —
+/// a **pre-existing** `animusd` gap, not introduced here: `animusd data
+/// --config FILE --node I` accepts neither `--backup-store`,
+/// `--segment-store`, `--s3-credentials`, nor `--allow-insecure-s3` today
+/// (see `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table and
+/// `crates/animusd/src/main.rs::run_data_config`'s own "same documented gap
+/// as `--backup-store`" comment).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct S3StoreSpec {
+    /// `--backup-store` value for every combined-role pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_store: Option<String>,
+    /// `--segment-store` value for every combined-role pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_store: Option<String>,
+    /// Name of a pre-existing `Secret` (same namespace) holding two keys,
+    /// `access_key_id`/`secret_access_key` — this operator only ever
+    /// *references* it (mounted read-only at `/etc/animus/s3` on every
+    /// pod, `crate::desired::statefulset::build`), never creates or writes
+    /// one. A combined-role pod's own generated `entrypoint.sh` reads both
+    /// files at container-start time and writes a small `--s3-credentials`
+    /// JSON file naming only the *path* to `secret_access_key`
+    /// (`crate::desired::cluster_config::entrypoint_script`) — the secret
+    /// value itself is never copied into the `ConfigMap` or `cluster.json`,
+    /// only read out of the mounted `Secret` at runtime, inside the pod.
+    pub credentials_secret_name: String,
+    /// Whether a plain-`http://` `endpoint=` (`insecure_http=true` in
+    /// either store URI's own query string) is allowed. Defaults to
+    /// `false`; a URI setting `insecure_http=true` while this is `false` is
+    /// rejected by [`Self::validate`] — the same two-flag deliberate-opt-in
+    /// posture `animusd`'s own `--allow-insecure-s3` establishes
+    /// (`parse_s3_uri`'s "refused unless `--allow-insecure-s3` is also
+    /// given"), mirrored here since this field's only job is to become
+    /// that flag on the generated `entrypoint.sh`.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// CIDRs the generated `NetworkPolicy`'s egress section allows toward
+    /// the S3 endpoint's own port, in addition to the cluster's baseline
+    /// intra-cluster + DNS egress (`crate::desired::networkpolicy`).
+    /// Defaults to `["0.0.0.0/0"]`.
+    ///
+    /// **`NetworkPolicy` cannot express a hostname allowlist** — only IP
+    /// blocks — so this operator has no way to resolve `endpoint=...`'s
+    /// hostname into the right CIDR for you. **Narrow this list to your
+    /// object store's actual address range in any environment where
+    /// open-to-any-destination egress on that port is unacceptable** — see
+    /// `deploy/operator/example.yaml`'s own commented `s3:` section.
+    #[serde(default = "S3StoreSpec::default_egress_cidrs")]
+    pub egress_cidrs: Vec<String>,
+}
+
+impl S3StoreSpec {
+    #[must_use]
+    pub fn default_egress_cidrs() -> Vec<String> {
+        vec!["0.0.0.0/0".to_string()]
+    }
+
+    /// `Ok(())` iff: at least one of `backupStore`/`segmentStore` is set;
+    /// `credentialsSecretName` is non-empty; every set store URI has the
+    /// minimal shape [`crate::s3_uri::parse`] requires; and no set URI's
+    /// `insecure_http=true` without `allowInsecureHttp` also being `true`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backup_store.is_none() && self.segment_store.is_none() {
+            return Err(
+                "spec.s3: at least one of backupStore/segmentStore must be set".to_string(),
+            );
+        }
+        if self.credentials_secret_name.trim().is_empty() {
+            return Err("spec.s3.credentialsSecretName must not be empty".to_string());
+        }
+        for (field, value) in [
+            ("backupStore", &self.backup_store),
+            ("segmentStore", &self.segment_store),
+        ] {
+            if let Some(uri) = value {
+                let info =
+                    crate::s3_uri::parse(uri).map_err(|e| format!("spec.s3.{field}: {e}"))?;
+                if info.insecure_http && !self.allow_insecure_http {
+                    return Err(format!(
+                        "spec.s3.{field} {uri:?}: insecure_http=true requires \
+                         spec.s3.allowInsecureHttp=true"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for S3StoreSpec {
+    fn default() -> Self {
+        Self {
+            backup_store: None,
+            segment_store: None,
+            credentials_secret_name: String::new(),
+            allow_insecure_http: false,
+            egress_cidrs: Self::default_egress_cidrs(),
+        }
+    }
+}
+
 /// The client-facing `dynamo` port's `Service` configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientServiceSpec {
@@ -242,6 +361,14 @@ pub struct AnimusClusterSpec {
     /// shapes and how the resolved `Secret` is mounted/wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSpec>,
+    /// S3-compatible object-store wiring for the cluster's backup and/or
+    /// stream-segment stores (S-04 PR 3). `None` (default) leaves both
+    /// stores at their pre-existing default (`cluster`/`ClusterSegmentStore`)
+    /// or whatever a future non-S3 CRD surface sets (S-07b, not this PR).
+    /// See [`S3StoreSpec`]'s own doc for the two mutually-independent store
+    /// fields, the referenced credential `Secret`, and the egress CIDRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3StoreSpec>,
 }
 
 impl AnimusClusterSpec {
@@ -330,6 +457,10 @@ pub const CONDITION_DRAIN_FAILED: &str = "DrainFailed";
 /// Condition type name used when `spec.tls` sets both or neither of
 /// `secretName`/`certManager` — see [`TlsSpec::validate`].
 pub const CONDITION_TLS_SPEC_INVALID: &str = "TlsSpecInvalid";
+/// Condition type name used when `spec.s3` fails [`S3StoreSpec::validate`]
+/// (neither store set, an empty `credentialsSecretName`, a malformed store
+/// URI, or `insecure_http=true` without `allowInsecureHttp`).
+pub const CONDITION_S3_SPEC_INVALID: &str = "S3SpecInvalid";
 
 #[cfg(test)]
 mod tests {
@@ -422,5 +553,99 @@ mod tests {
         let json = serde_json::json!({ "name": "my-issuer" });
         let issuer_ref: IssuerRef = serde_json::from_value(json).unwrap();
         assert_eq!(issuer_ref.kind, "Issuer");
+    }
+
+    // --- S3StoreSpec (S-04 PR 3) ------------------------------------------
+
+    fn valid_s3_spec() -> S3StoreSpec {
+        S3StoreSpec {
+            backup_store: Some(
+                "s3://my-bucket/backups?endpoint=https://s3.example.com".to_string(),
+            ),
+            segment_store: None,
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: false,
+            egress_cidrs: S3StoreSpec::default_egress_cidrs(),
+        }
+    }
+
+    #[test]
+    fn s3_spec_valid_when_backup_store_alone_is_set() {
+        assert!(valid_s3_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_valid_when_segment_store_alone_is_set() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = None;
+        s3.segment_store = Some("s3://bucket?endpoint=https://s3.example.com".to_string());
+        assert!(s3.validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_rejects_neither_store_set() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = None;
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("backupStore/segmentStore"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_empty_credentials_secret_name() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = String::new();
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("credentialsSecretName"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_blank_credentials_secret_name() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = "   ".to_string();
+        assert!(s3.validate().is_err());
+    }
+
+    #[test]
+    fn s3_spec_rejects_malformed_store_uri() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = Some("not-an-s3-uri".to_string());
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("backupStore"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_insecure_http_without_allow_insecure_http() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store =
+            Some("s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string());
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("allowInsecureHttp"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_accepts_insecure_http_when_allowed() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store =
+            Some("s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string());
+        s3.allow_insecure_http = true;
+        assert!(s3.validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_default_egress_cidrs_is_open_to_any_destination() {
+        assert_eq!(S3StoreSpec::default_egress_cidrs(), vec!["0.0.0.0/0"]);
+        assert_eq!(S3StoreSpec::default().egress_cidrs, vec!["0.0.0.0/0"]);
+    }
+
+    #[test]
+    fn s3_spec_json_round_trip_defaults_allow_insecure_http_and_egress_cidrs() {
+        let json = serde_json::json!({
+            "backupStore": "s3://bucket?endpoint=https://s3.example.com",
+            "credentialsSecretName": "creds"
+        });
+        let s3: S3StoreSpec = serde_json::from_value(json).unwrap();
+        assert!(!s3.allow_insecure_http);
+        assert_eq!(s3.egress_cidrs, vec!["0.0.0.0/0"]);
+        assert!(s3.validate().is_ok());
     }
 }

@@ -46,6 +46,7 @@ pub struct FakeClusterApi {
     statefulsets: Mutex<BTreeMap<String, StatefulSet>>,
     status_patches: Mutex<Vec<AnimusClusterStatus>>,
     secrets: Mutex<BTreeMap<String, Secret>>,
+    networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
 }
 
 impl FakeClusterApi {
@@ -118,6 +119,15 @@ impl FakeClusterApi {
             .unwrap()
             .insert(name.to_string(), secret);
     }
+
+    /// The `NetworkPolicy` currently stored under `name` (the most recently
+    /// applied one) — used to assert on the generated egress rules from a
+    /// `reconcile`-level test (S-04 PR 3), the same way `configmap`/
+    /// `get_statefulset` let a test inspect other applied children.
+    #[must_use]
+    pub fn networkpolicy(&self, name: &str) -> Option<NetworkPolicy> {
+        self.networkpolicies.lock().unwrap().get(name).cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -150,7 +160,11 @@ impl ClusterApi for FakeClusterApi {
         self.applies
             .lock()
             .unwrap()
-            .push((AppliedKind::NetworkPolicy, name));
+            .push((AppliedKind::NetworkPolicy, name.clone()));
+        self.networkpolicies
+            .lock()
+            .unwrap()
+            .insert(name, np.clone());
         Ok(())
     }
 

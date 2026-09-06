@@ -544,3 +544,77 @@ config-gated (a cluster with no `spec.tls` is unchanged), but a cluster
 that turns it on gets mutual cluster-membership authentication on the
 internal/intra ports and server-only TLS elsewhere — not a NetworkPolicy
 replacement, a second, independent layer underneath it.
+
+## Amendment (2026-09-06): S-04 PR 3 — `spec.s3`, egress policy
+
+`docs/roadmap.md`'s S-04 item ("operator egress/credential-secret work")
+is closed by this amendment, landing `AnimusClusterSpec.s3: Option
+<S3StoreSpec>` (`crd.rs`) — the CRD-level surface the "Not in v1" list
+above deferred under "Backups wiring," narrowed to exactly the S3 case ADR
+0059's own S-04 design amendment scoped: `fs:`/`cluster`/`dir:` stores
+still have no CRD surface (S-07b, unaffected by this amendment).
+
+**`spec.s3` mirrors `spec.tls`'s own precedent** — a CRD section that only
+*references* a pre-existing `Secret` (`credentialsSecretName`, keys
+`access_key_id`/`secret_access_key`), never one this operator creates or
+writes. `backupStore`/`segmentStore` are the literal `s3://...` URI values
+`animusd`'s own `--backup-store`/`--segment-store` flags accept (ADR
+0059's As-built PR 2 note); at least one must be set. Since this crate
+does not depend on `animusd` (this file's own "does not depend on
+`animusd`" note, restated in `crates/animus-operator/CLAUDE.md`), `crate::
+s3_uri::parse` re-checks only a minimal syntactic subset of `animusd`'s
+own `parse_s3_uri` (bucket present, `endpoint=` query key present, scheme
+`http://`/`https://`) — enough to catch an obviously malformed URI at
+reconcile time (`S3StoreSpec::validate`, same "no admission webhook in v1"
+posture as `TlsSpec::validate`) rather than letting it reach a pod and
+crash-loop; the real credential/region/loopback-vs-`--allow-insecure-s3`
+logic stays exactly where it already lived, node-side in `animusd`.
+
+**The credential never leaves the `Secret` mount.** Every pod mounts
+`credentialsSecretName` read-only at `/etc/animus/s3` (the same idiom as
+`/etc/animus/dynamo-auth`/`/etc/animus/tls`); a combined-role pod's own
+generated `entrypoint.sh` reads both files (`access_key_id`/
+`secret_access_key`) **at container-start time** and writes a scratch
+`--s3-credentials` JSON file (`/tmp/animus-s3-credentials.json`) naming
+only the *path* to `secret_access_key` — the secret value itself never
+appears in the `ConfigMap`, `cluster.json`, a log line, or a CR status.
+**Combined-role only**: `animusd data --config` accepts none of
+`--backup-store`/`--segment-store`/`--s3-credentials`/
+`--allow-insecure-s3` today (a **pre-existing** `animusd` gap, not
+introduced here — see `crates/animusd/src/main.rs::run_data_config`'s own
+"same documented gap as `--backup-store`" comment) — a data-only pod
+mounts the `Secret` like every other pod but never reads it.
+
+**Egress, closing the roadmap's own "egress unrestricted by omission"
+line.** `desired::networkpolicy::build` now sets `policyTypes: [Ingress,
+Egress]` unconditionally and adds two baseline `Egress` rules to *every*
+cluster, `spec.s3` or not: intra-cluster (this cluster's own pods, the
+`internal`+`intra` ports node-to-node Raft/RPC actually uses) and DNS to
+`kube-system`'s `kube-dns`/CoreDNS pods (UDP+TCP 53) — without the DNS
+rule, in-cluster name resolution itself (including an S3 endpoint's own
+hostname) would break the moment egress stopped being wide-open by
+omission. A third rule is added **only when `spec.s3` is set**: the
+configured store URIs' own `endpoint=` port(s) (deduplicated; 443/80
+default by scheme when the URI names no explicit port), scoped to
+`spec.s3.egressCidrs` (`["0.0.0.0/0"]` by default). `NetworkPolicy` cannot
+express a hostname allowlist — only IP blocks — so this operator has no
+way to resolve an endpoint's hostname into the right CIDR itself;
+`egressCidrs` exists precisely so an operator user can narrow it to their
+object store's real address range, and both the CRD field's own doc and
+`deploy/operator/example.yaml`'s commented `s3:` section say so plainly.
+A cluster with no `spec.s3` gets exactly the two baseline rules, nothing
+S3-specific.
+
+**e2e**: `scripts/e2e-kind.sh --E2E_S3=1` (`.github/workflows/
+e2e-kind.yml`'s `e2e-kind-s3` job) deploys a single-pod MinIO + Service
+into the kind cluster, creates its bucket via a throwaway `minio/mc` pod,
+creates the credentials `Secret`, applies an `AnimusCluster` with
+`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+(`allowInsecureHttp: true` — a loopback-to-the-cluster MinIO dev target,
+never a real deployment shape), then exercises `CreateBackup`/
+`DescribeBackup` over the DynamoDB wire and checks `GET
+/admin/backup-store` reports `"kind":"s3"`. **UNVERIFIED in this
+sandbox** — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see
+`crates/animus-operator/CLAUDE.md`'s e2e section): written carefully and
+`bash -n`-checked, never run end to end anywhere. Treat a first real CI
+failure on `e2e-kind-s3` as this leg finding its first real bug.

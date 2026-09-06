@@ -27,9 +27,18 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 
 - `src/crd.rs` — the `AnimusCluster` type (`kube::CustomResource` derive):
   `AnimusClusterSpec`/`AnimusClusterStatus`/`StorageSpec`/
-  `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`. Pure data + a
-  handful of `_or_default()` helpers; no k8s API calls, no logic that needs
-  a live object beyond its own fields.
+  `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`/`TlsSpec`/
+  `S3StoreSpec` (S-04 PR 3, see this file's own S3 section below). Pure
+  data + a handful of `_or_default()`/`validate()` helpers; no k8s API
+  calls, no logic that needs a live object beyond its own fields.
+- `src/s3_uri.rs` — a small, deliberately minimal syntax-only check of an
+  `s3://...` store URI (S-04 PR 3): bucket present, `endpoint=` query key
+  present, `http://`/`https://` scheme. **Not** a reimplementation of
+  `animusd::main::parse_s3_uri` (this crate has no dependency on
+  `animusd` — see this file's own note above); see this module's own doc
+  for exactly what it does and does not re-verify. Used by
+  `crd::S3StoreSpec::validate` and `desired::networkpolicy`'s port
+  extraction.
 - `src/desired/` — **pure builder functions**, `(name, ns, spec) -> a typed
   k8s-openapi object`, no cluster access. This is where almost all of this
   crate's tests live:
@@ -49,10 +58,13 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   - `configmap.rs`/`services.rs`/`statefulset.rs`/`networkpolicy.rs` — one
     builder module per child kind. `statefulset.rs` mounts `spec.tls`'s
     resolved `Secret` (ADR 0064 commit 3) read-only at `/etc/animus/tls`,
-    the same mount for either `TlsSpec` shape; `networkpolicy.rs` is
-    unaffected by TLS (its own module doc explains why: TLS is a mode a
-    port's listener can be configured into, not a change to which pods may
-    reach which port).
+    the same mount for either `TlsSpec` shape, and (S-04 PR 3)
+    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`
+    on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
+    doc explains why: TLS is a mode a port's listener can be configured
+    into, not a change to which pods may reach which port) but **is**
+    affected by `spec.s3` (S-04 PR 3) — see this file's own S3 section
+    below for the egress rules it now always adds.
   - `mod.rs` — shared label/name helpers (`common_labels`/
     `selector_labels`/`owner_reference`/`pod_fqdn`/the `*_name` functions)
     every builder module uses, so every child's naming/labeling convention
@@ -162,6 +174,15 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   | `--dir` | yes | yes |
   | `--ephemeral` | yes | yes |
   | `--dynamo-auth` | yes | yes |
+  | `--backup-store`/`--segment-store`/`--s3-credentials`/`--allow-insecure-s3` (S-04 PR 3, `spec.s3`) | yes | **no** |
+
+  **The S-04 PR 3 row's "no" on the data branch is a pre-existing
+  `animusd` gap, not introduced here**: `run_data_config` (`main.rs`)
+  accepts none of those four flags — see that function's own "same
+  documented gap as `--backup-store`" comment. A data-only pod still
+  mounts `spec.s3.credentialsSecretName`'s `Secret` at `/etc/animus/s3`
+  like every other pod (`desired::statefulset::build` doesn't condition
+  the mount on role), it just never reads it.
 
   **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
   flags on either branch (S-06)** — both now reach `animusd` through
@@ -299,18 +320,103 @@ written carefully and `bash -n`-checked, but never run end to end. Treat a
 first real CI failure on the `e2e-kind-tls` job as this path finding its
 first real bug, not as this note being wrong.
 
+## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
+
+`AnimusClusterSpec.s3: Option<S3StoreSpec>` (`crd.rs`) mirrors `TlsSpec`'s
+own precedent — a CRD section that only *references* a pre-existing
+`Secret`, never one this operator creates or writes. `backupStore`/
+`segmentStore` are literal `s3://...` URI values (at least one must be
+set); `credentialsSecretName` names a `Secret` holding `access_key_id`/
+`secret_access_key`; `allowInsecureHttp` (default `false`) must be `true`
+for either store URI to set `insecure_http=true`; `egressCidrs` (default
+`["0.0.0.0/0"]`) scopes the generated `NetworkPolicy`'s S3 egress rule.
+`S3StoreSpec::validate` (called from `crate::controller::reconcile`, same
+"no admission webhook in v1" posture as `TlsSpec::validate`) rejects:
+neither store set, an empty `credentialsSecretName`, a URI `crate::
+s3_uri::parse` can't make sense of, or `insecure_http=true` without
+`allowInsecureHttp` — a `S3SpecInvalid` status condition, `spec.s3`
+stripped for the rest of that reconcile, same as an invalid `spec.tls`.
+
+**`crate::s3_uri`, not `animusd`'s own `parse_s3_uri`.** This crate
+doesn't depend on `animusd` (this file's own "does not depend on
+`animusd`" note above), so `S3StoreSpec::validate` and `desired::
+networkpolicy`'s port-extraction both go through a small, deliberately
+narrower syntactic check (`crate::s3_uri::parse`: bucket present,
+`endpoint=` query key present, `http://`/`https://` scheme) — see that
+module's own doc for exactly what it does and does not re-verify. The
+real credential/region/loopback-vs-`--allow-insecure-s3` logic is
+`animusd`'s own, at node startup, unchanged.
+
+Downstream wiring:
+
+- `desired::statefulset::build` mounts `credentialsSecretName`'s `Secret`
+  read-only at `/etc/animus/s3` on **every** pod, combined or data-role
+  alike (the same "one shared Secret, every pod" shape `dynamo-auth`/`tls`
+  already use) — even though only a combined-role pod's own
+  `entrypoint.sh` branch reads it (see the flag-support table above for
+  why: `animusd data --config` accepts no S3-store flags today).
+- `desired::cluster_config::entrypoint_script` adds, **only on the
+  combined branch**: a preamble (before the `exec`) that reads the
+  mounted `Secret`'s two files at container-start time and writes
+  `/tmp/animus-s3-credentials.json` — `{"access_key_id": "<read from the
+  mount>", "secret_access_key_file": "/etc/animus/s3/secret_access_key"}`
+  — followed by `--s3-credentials /tmp/animus-s3-credentials.json`,
+  `--allow-insecure-s3` (when `allowInsecureHttp`), and `--backup-store`/
+  `--segment-store` (each single-quoted via `shell_single_quote` — an
+  `s3://...` URI's own query string contains `&`/`?`, shell-special
+  characters that would otherwise be misinterpreted, `&` in particular
+  backgrounding the `exec`). **The `Secret`'s value never appears in the
+  generated `ConfigMap`** — only a shell command that reads it at
+  container-start time, inside the pod, and a *path* to
+  `secret_access_key`; `access_key_id` gets the identical treatment even
+  though it's the less sensitive of the two.
+- `desired::networkpolicy::build` — see the egress paragraph below.
+
+**Egress, closing the roadmap's own "egress unrestricted by omission"
+line.** The generated `NetworkPolicy` now sets `policyTypes: [Ingress,
+Egress]` unconditionally, with two baseline `Egress` rules on *every*
+cluster (`spec.s3` or not): intra-cluster (this cluster's own pods, the
+`internal`+`intra` ports only) and DNS to `kube-system`'s `kube-dns`/
+CoreDNS pods (UDP+TCP 53 — without this, in-cluster name resolution
+itself breaks the moment egress stops being wide open). A third rule
+is added only when `spec.s3` is set: the configured store URIs'
+`endpoint=` port(s) (deduplicated via `desired::networkpolicy::
+s3_endpoint_ports`; 443/80 default by scheme absent an explicit port),
+scoped to `spec.s3.egressCidrs`. **`NetworkPolicy` cannot express a
+hostname allowlist** — this operator has no way to resolve an endpoint's
+hostname into the right CIDR itself, which is exactly why `egressCidrs`
+exists and defaults open (`["0.0.0.0/0"]`): narrow it to your object
+store's real address range — `deploy/operator/example.yaml`'s commented
+`s3:` section says so inline.
+
+**`scripts/e2e-kind.sh`'s `E2E_S3=1` leg is UNVERIFIED in this sandbox**
+— same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see the e2e
+section below): it deploys a single-pod MinIO + Service, creates the
+bucket via a throwaway `minio/mc` pod and the credentials `Secret`,
+applies `spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+with `allowInsecureHttp: true`, then exercises `CreateBackup`/
+`DescribeBackup` over the DynamoDB wire and checks `GET
+/admin/backup-store` reports `"kind":"s3"`. Written carefully and
+`bash -n`-checked, never run end to end anywhere — treat a first real CI
+failure on the `e2e-kind-s3` job as this leg finding its first real bug.
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (51 tests total as of ADR 0061 rung E1's
-landing): golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
-`ConfigMap` contents (including the no-port-striding invariant and a
-scale-up byte-for-byte-preserves-existing-entries regression), `Service`
+own `#[cfg(test)] mod tests` (131 tests total as of S-04 PR 3's landing):
+golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
+`ConfigMap` contents (including the no-port-striding invariant, a
+scale-up byte-for-byte-preserves-existing-entries regression, and, since
+S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags), `Service`
 port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable storage
-shape, and `NetworkPolicy` selector/rule structure. **No cluster is
-needed** — every test constructs an `AnimusCluster` via `test_support::
-test_cluster` and asserts on the returned typed object or its JSON, never
-against a live API server.
+shape (plus the `spec.s3` `Secret` mount), and `NetworkPolicy`
+selector/ingress/egress rule structure (including the S-04 PR 3 egress
+additions: baseline intra+DNS on every cluster, an S3 rule only when
+`spec.s3` is set). **No cluster is needed** — every test constructs an
+`AnimusCluster` via `test_support::test_cluster` and asserts on the
+returned typed object or its JSON, never against a live API server.
+`s3_uri::tests` covers the standalone URI parser (`src/s3_uri.rs`)
+directly.
 
 - **`src/controller.rs` has its own fake-kube-client harness now** (ADR
   0061 rung E1, `crate::fakes`, `#[cfg(test)]` only). `controller.rs`'s two
@@ -341,11 +447,20 @@ against a live API server.
   x 5s poll budget without real wall-clock wait); reconcile-level
   scale-down sequencing, both the highest-ordinal-first happy path and
   stop-on-first-drain-failure; the immutable-`controlNodes`-change
-  refusal end to end; and, since ADR 0064 commit 3, `spec.tls`: a
+  refusal end to end; since ADR 0064 commit 3, `spec.tls`: a
   `Certificate` applied as a sixth child for the `certManager` shape and
   none for `secretName`; both/neither shapes set rejected with
   `TlsSpecInvalid`; and the scale-down drain sequence reading a seeded
-  `Secret`'s `ca.crt` and dialing `https://` once `spec.tls` is set.
+  `Secret`'s `ca.crt` and dialing `https://` once `spec.tls` is set; and,
+  since S-04 PR 3, `spec.s3`: a valid spec applies the same five children
+  (no sixth child, unlike `spec.tls.certManager`) with the `Secret` mount/
+  entrypoint flags/egress rule all present (`FakeClusterApi::
+  networkpolicy`, a new accessor this PR added alongside the pre-existing
+  `configmap`/`get_statefulset`); each `S3StoreSpec::validate` rejection
+  (neither store set, empty `credentialsSecretName`, malformed URI,
+  `insecure_http` without `allowInsecureHttp`) surfaces `S3SpecInvalid`
+  and strips `spec.s3` for that reconcile; and a cluster with no `spec.s3`
+  still gets the new baseline egress (intra + DNS) with no `s3` volume.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership
@@ -419,6 +534,22 @@ section's own `CAP_SYS_RESOURCE` note below), so the TLS additions have
 been written carefully and `bash -n`-checked but have not been run end to
 end anywhere; the first real `e2e-kind-tls` CI run is this path's first
 real test.
+
+**`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
+plus a `spec.s3.backupStore` leg**: deploys a single-pod MinIO + Service
+into the kind cluster (the well-known `minio/minio` image), creates its
+bucket via a throwaway `minio/mc` pod, creates the `access_key_id`/
+`secret_access_key` credentials `Secret`, applies the `AnimusCluster` with
+`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+(`allowInsecureHttp: true` — a loopback-to-the-cluster dev target, never a
+real deployment shape), then exercises `CreateBackup`/`DescribeBackup`
+over the DynamoDB wire and checks `GET /admin/backup-store` reports
+`"kind":"s3"`; the plain-TCP path (`E2E_S3` unset) is byte-for-byte
+unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
+**UNVERIFIED in this repository's sandboxed dev environment**, same
+`CAP_SYS_RESOURCE` reason as `E2E_TLS` above — written carefully and
+`bash -n`-checked but never run end to end anywhere; the first real
+`e2e-kind-s3` CI run is this leg's first real test.
 
 **A sandboxed dev/build host can be structurally unable to run this at
 all — not a bug in this script or the operator.** `kind`'s own control

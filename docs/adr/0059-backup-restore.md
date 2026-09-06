@@ -1581,3 +1581,21 @@ PR 2 landed as designed above, with the following as-built specifics:
   already project through that one type.
 - **PR 3 (operator egress + credential secret)** remains, unchanged in
   scope from the plan above.
+
+### As-built (2026-09-06): PR 3 — operator egress + credential secret (closes S-04)
+
+PR 3 landed as designed, closing `docs/roadmap.md`'s S-04 item entirely
+(all three PRs now done — see that file's own maintenance rule: the S-04
+section is removed from the roadmap in the same change). The full
+as-built account lives in [ADR 0060](0060-kubernetes-operator.md)'s own
+"Amendment (2026-09-06): S-04 PR 3" (`animus-operator`'s crate, not this
+one) — this note only records the piece that touches this ADR's own
+scope: `AnimusClusterSpec.s3`'s two store fields are the identical
+`s3://...` URI shape this ADR's PR 2 amendment specified for
+`--backup-store`/`--segment-store`, unchanged; the operator only *routes*
+that string onto the flag (plus a generated `--s3-credentials` file
+pointing at a mounted `Secret`) rather than reinterpreting it. Nothing
+about capture, the catalog, restore, or the `S3SegmentStore`/`S3StoreConfig`
+shapes PR 2 built changed to accommodate this — the operator is a pure
+consumer of the same command-line contract every other deployment shape
+(bare-metal `--config FILE --node I`, `animusd control`) already used.
