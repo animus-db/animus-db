@@ -215,29 +215,36 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
         })
         .collect();
 
-    // S-06: the two knobs the CRD exposes today map straight onto the
-    // generated config's own `cluster_settings` section — this is what
-    // makes both of them reach *every* pod (combined and data-role alike),
-    // closing the `--quiesce-after`/`--auto-split-bytes` gaps
-    // `AnimusClusterSpec`'s own field docs used to describe (both flags
-    // only ever reached combined-role pods, or nothing at all). Left
-    // entirely absent (not an empty `{}` object) when the spec sets
-    // neither, so an unchanged spec's generated `cluster.json` stays
-    // byte-identical to before this section existed.
-    let cluster_settings = ClusterSettings {
+    ClusterConfig {
+        nodes,
+        cluster_settings: cluster_settings_or_none(spec),
+    }
+}
+
+/// The `cluster_settings` section [`build_cluster_config`] embeds in the
+/// generated config — factored out (S-07d) so [`super::statefulset`]'s
+/// restart-relevant config-hash projection can reuse the exact same "empty
+/// means absent" rule without duplicating it.
+///
+/// S-06: the two knobs the CRD exposes today map straight onto the
+/// generated config's own `cluster_settings` section — this is what makes
+/// both of them reach *every* pod (combined and data-role alike), closing
+/// the `--quiesce-after`/`--auto-split-bytes` gaps `AnimusClusterSpec`'s own
+/// field docs used to describe (both flags only ever reached combined-role
+/// pods, or nothing at all). Returns `None` (not an empty `{}` object) when
+/// the spec sets neither, so an unchanged spec's generated `cluster.json`
+/// stays byte-identical to before this section existed.
+#[must_use]
+pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSettings> {
+    let settings = ClusterSettings {
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
         ..ClusterSettings::default()
     };
-    let cluster_settings = if cluster_settings.is_empty() {
+    if settings.is_empty() {
         None
     } else {
-        Some(cluster_settings)
-    };
-
-    ClusterConfig {
-        nodes,
-        cluster_settings,
+        Some(settings)
     }
 }
 

@@ -235,6 +235,58 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   cluster_config`'s tests for the regression coverage (every `--flag`
   token the script emits is checked against an explicit allowlist of what
   `main.rs` actually accepts).
+- **The `StatefulSet` pod template carries a config-hash restart annotation
+  (`desired::statefulset::CONFIG_HASH_ANNOTATION`, S-07d groundwork,
+  2026-09-06) — hashed from a *restart-relevant projection*, never the raw
+  generated `ConfigMap`.** A mounted `ConfigMap` volume's content updates in
+  place on the kubelet's own sync period, but nothing makes an
+  already-running `animusd` process re-read it — `cluster.json` is a
+  startup-time config file, not hot-reloaded — so a config-affecting spec
+  change (`spec.tls`, `spec.s3`/`backupStore`/`segmentStore`,
+  `spec.dynamoAuthSecretName`, `spec.quiesceAfterSecs`/`autoSplitBytes`, or
+  a `spec.controlNodes` role-split change) used to sit unapplied on running
+  pods until they happened to restart for an unrelated reason. Baking a
+  hash into the pod template turns such a change into a `spec.template`
+  change, which the `StatefulSet` controller rolls exactly like an image
+  bump.
+  **The rule for what goes into the hash: hash exactly what a running pod
+  read once at boot and cannot pick up live — never the node list, its
+  length, or any per-node address/id/`advertise_host`.** The first cut of
+  this (this same commit's original version) hashed the entire generated
+  `ConfigMap` `data` map, which put `cluster.json`'s whole `nodes` array —
+  including every *existing* node's unchanged entry — into the hash; a
+  plain `spec.nodes` scale-up/down (which only appends/removes a trailing
+  `RoleAddrs` entry, per `scale_up_config_append_preserves_existing_
+  entries_byte_for_byte`) therefore rolled every already-running pod for no
+  reason, even though a running `animusd` never rereads that array — it
+  learns of new/changed peers through replicated `Metadata` (ADR 0030
+  self-registration) only. This broke `e2e-kind-tls`: the scale phase's
+  3 → 4 node growth rolled `e2e-0`/`e2e-1`/`e2e-2` out from under the
+  script's own `kubectl port-forward`, failing the post-scale `GetItem`.
+  Fixed by hashing `desired::statefulset::restart_relevant_projection`
+  instead — a small typed struct built straight from `AnimusClusterSpec`
+  (not by string-munging the generated JSON): the `control_nodes`
+  role-split threshold and the full `entrypoint.sh` text (both already
+  independent of `spec.nodes` — `entrypoint_script` takes only `spec`),
+  `cluster_settings` (`cluster_settings_or_none`, the same "empty means
+  absent" rule `build_cluster_config` uses), and whether TLS is wired at
+  all (`spec.tls.is_some()` plus the fixed `tls_section()` mount paths).
+  **A `spec.controlNodes` increase still changes this hash and rolls every
+  pod** — role is purely `ordinal < control_nodes`, so raising the
+  threshold can flip an *existing* ordinal's role even though no node
+  address changed, and that pod needs a restart to pick up its new
+  subcommand/flags; this is exactly the case S-07d's growth flow expects to
+  restart pods for. Hashed with FNV-1a 64 (inline, no new dependency) over
+  the projection's JSON encoding — deliberately **not**
+  `std::collections::hash_map::DefaultHasher`, which carries no
+  cross-Rust-release stability guarantee and would risk rolling every
+  deployed cluster's pods on a routine operator toolchain bump. See
+  `desired::statefulset`'s own module doc and
+  `restart_relevant_projection`'s doc for the full field-by-field in/out
+  list, and `docs/engineering-lessons.md`'s S-07d entries for the general
+  lesson ("a shared `StatefulSet` pod-template annotation restarts every
+  pod — hash only what a running pod cannot pick up live, never the thing
+  that changes on every routine scale").
 - **`control_nodes_changed` reads the *previous* `ConfigMap`'s own applied
   `cluster.json` back to detect an immutable-field change**, rather than a
   status annotation the controller would have to remember to write and keep
