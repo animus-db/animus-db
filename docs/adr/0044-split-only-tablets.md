@@ -243,3 +243,62 @@ rebalance/merge replica-divergence interaction is now moot),
 an over-eager split reversible — nothing is), and
 [ADR 0042](0042-dynamo-streams.md)/[ADR 0043](0043-stream-shard-subsystem.md)
 (the F1 stopgap and its escape-hatch language are both retired).
+
+## Amendment (2026-09-06): phase 2 investigation (C-02 PR 1)
+
+Investigation only, no decision change: `docs/design/heartbeat-send-sites.md`
+maps every heartbeat send site named by the cheap-groups roadmap's
+follow-up 2 ("Heartbeat amortization," above) ahead of building it. Summary
+of its findings:
+
+- **Two, unrelated, identically-named "heartbeat" mechanisms exist.**
+  `animus_control::RaftCore::heartbeat_interval` (50ms) is the Raft
+  protocol's own empty-`AppendEntries` heartbeat, instantiated once
+  cluster-wide by the control plane and once **per hosted tablet group** by
+  `animus_cp_data::RaftKvNode` (ADR 0016/0017) — this is the actual C-02
+  target, since it multiplies with a node's own led-tablet-group count `G`.
+  `animus_control::node::HEARTBEAT_INTERVAL` (100ms) is the unrelated ADR
+  0012 node-liveness ping, already scoped **per node**, not per group — it
+  does not multiply with `G` and needs no amortization. The roadmap's own
+  "`HEARTBEAT_INTERVAL` users" phrasing names the second, but the cost
+  problem this phase describes is entirely about the first.
+- **The roadmap's "`animus-cp-data`'s host module" pointer is corrected**:
+  the per-group send site is `animus_cp_data::lib.rs`'s per-group `drive`
+  loop (one independent async task per hosted group), not `host.rs` (the
+  ADR 0031 reconciler, which decides what to host but sends no Raft
+  message itself).
+- **Cost model**: a node leading `G` groups at RF 3 (`P = 2` peers/group)
+  sends `≈ 40 × G` outbound `AppendEntries`/sec purely from heartbeat
+  cadence, before any real write. In a `--cluster 3`/RF-3 default (every
+  node pair co-hosts every tablet), this is **linear in total tablet count
+  `T`** per node pair (`≈ 80T/3` msgs/sec) today, for a fixed node-pair
+  count (3 pairs) — the map's own baseline test
+  (`crates/animus-cp-data/tests/heartbeat_cost.rs`) measures this directly
+  via `Metric::CpAppendEntriesSent` (5 co-hosted groups ≈ 5x 1 group's
+  traffic, seed-reproducible: 234 vs. 1166 sends over an identical window,
+  ratio ≈ 4.98). ADR 0048 quiescence already zeros the *idle* term; this
+  phase targets the *active* term quiescence cannot touch.
+- **The crux (per-group vs. per-node-pair)**: a heartbeat's *arrival*
+  resets that group's own election timer — this is inherently per-group,
+  since every tablet group is an independent `RaftCore` (this is also this
+  plane's *entire* failure-detection mechanism — there is no ADR-0012-style
+  liveness ping for CP-data groups, unlike the control plane). What IS
+  already per-node-pair and needs no new work is the **transport**
+  (`ProdEnv` already pools one TCP connection per destination address,
+  `crates/animus-env/src/prod.rs`). What is NOT amortized is the **frame
+  count**: `G` separate `send_stream` calls (one per co-hosted group) still
+  write `G` separate frames onto that one shared connection every interval,
+  instead of one combined frame a receiver demuxes back into `G` per-group
+  deliveries.
+- **Candidate shape for PR 2** (sketch only): a per-node
+  `HeartbeatBatcher` inside `animus-cp-data`, below the per-group
+  `RaftCore::tick`, coalescing every co-hosted group's small per-tick
+  payload into one frame per destination per interval on a reserved stream
+  id, demuxed at the receiver back into per-group `RaftCore::handle` calls
+  — preserving every per-group semantic (§3 of the map) while amortizing
+  only the wire framing. Gated behind a flag, off by default, mirroring
+  `enable_quiescence`'s own additive-default shape.
+
+See the document itself for the full per-message-type map, the exact
+`file:line` citations, the test-plan cell list (seed knob
+`ANIMUS_HEARTBEAT_SEEDS`), and the open questions PR 2 inherits.

@@ -115,15 +115,37 @@ the still-true paragraph after the table.
 
 ### C-02 Heartbeat amortization (ADR 0044 phase 2)
 
+- **PR (1) map landed 2026-09-06**: `docs/design/heartbeat-send-sites.md`
+  — every `RaftCore::heartbeat_interval` (50ms; the per-**group** Raft
+  heartbeat, one `RaftCore` instance per hosted tablet group,
+  `animus-cp-data::lib.rs`'s own per-group `drive` loop — **not**
+  `animus-cp-data::host` as this entry used to say; `host.rs` is the ADR
+  0031 reconciler, which never sends a Raft message itself) send site,
+  plus `animus_control::node::HEARTBEAT_INTERVAL` (100ms, the unrelated,
+  already-per-node ADR 0012 liveness ping this entry's own former wording
+  conflated with the target above — confirmed **not** a C-02 target).
+  Cost model: `≈ 40 × G` outbound `AppendEntries`/sec per node leading `G`
+  groups at RF 3; `≈ 80T/3` msgs/sec per node pair for `T` total tablets in
+  a `--cluster 3` default — linear in `T` today, for a fixed node-pair
+  count. Baseline `SimEnv` measurement landed alongside it
+  (`crates/animus-cp-data/tests/heartbeat_cost.rs`): 5 co-hosted groups
+  send ≈ 5x 1 group's `Metric::CpAppendEntriesSent` traffic (234 vs. 1166,
+  seed-reproducible). See ADR 0044's own "Amendment (2026-09-06): phase 2
+  investigation (C-02 PR 1)" for the summary and the map document for the
+  full per-message-type breakdown, the per-group-vs-per-node-pair crux, the
+  candidate batcher shape, and the open questions PR (2) inherits.
 - **Plan:** a per-node-pair heartbeat batcher below each `RaftCore` tick
-  (precedent: `ProdEnv` pools one TCP connection per destination). First
-  PR is investigation only: map every heartbeat send site
-  (`HEARTBEAT_INTERVAL` users across `animus-control`'s driver and
-  `animus-cp-data`'s host module).
-- **Tests:** a `SimEnv` corpus asserting heartbeat count scales with
-  node pairs, not groups.
-- **ADR:** amendment on 0044. **PRs:** (1) map; (2) batcher behind a
-  flag; (3) cutover. **Size:** L.
+  (precedent: `ProdEnv` pools one TCP connection per destination) → (2)
+  batcher behind a flag → (3) cutover, flipping PR (1)'s baseline test's
+  own assertion to "flat in `G`, scales with node pairs only."
+- **Tests:** a `SimEnv` corpus (depth knob `ANIMUS_HEARTBEAT_SEEDS`) —
+  see the map's own §6 for the seven planned scenario cells, including
+  per-group semantics staying intact under batching (a targeted partition
+  of one co-hosted group's traffic must not perturb a sibling's own
+  election timer) and quiescence interacting correctly with a mixed
+  quiesced/active batch.
+- **ADR:** amendment on 0044 (landed with PR 1). **PRs:** (1) map — done;
+  (2) batcher behind a flag; (3) cutover. **Size:** L.
 
 ### C-03 Log-only replicas (ADR 0044 phase 3)
 
@@ -252,7 +274,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | *S-04, S-05, S-07b–d landed 2026-09-06* → C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, S-07b–d landed 2026-09-06; C-02 PR (1) landed 2026-09-06* → C-02 PR (2)/(3), C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
