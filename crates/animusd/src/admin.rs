@@ -57,6 +57,10 @@
 //! - `POST /admin/credentials`         — `{id, secret, policy?, enabled?}` — create/redefine a credential (ADR 0066 §1/§2)
 //! - `POST /admin/credentials/rotate`  — `{id, new_secret, grace_secs}` — rotate a credential's secret with a dual-secret grace window
 //! - `POST /admin/credentials/revoke`  — `{id}` — revoke a credential outright
+//! - `GET  /admin/backup-store`        — this node's configured backup store (redacted), a bounded local object count/bytes, and the backup janitor's own live phase (ADR 0059 §1/§3, roadmap U-07)
+//! - `GET  /admin/ttl`                 — this node's own TTL reaper phase/cursor/counters, every TTL-enabled table, and the tablets this node leads of one (ADR 0051, roadmap U-07)
+//! - `GET  /admin/gc`                  — the DynamoDB Streams segment janitor's own live phase/counters (ADR 0042 §10/ADR 0043 §A9, roadmap U-07)
+//! - `GET  /admin/segment-store`       — this node's configured stream-segment store (redacted), the shard→replica placement it sees (`cluster` kind only), and a bounded local object count/bytes (ADR 0043 §A7b, roadmap U-07)
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -67,6 +71,7 @@ use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::Clock;
+use animus_env::Env;
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_node::host::AdminHost;
@@ -537,6 +542,9 @@ impl AdminHost for ClientCtx {
     }
     async fn gc_view(&self) -> Value {
         gc_view(self)
+    }
+    async fn segment_store_view(&self) -> Value {
+        segment_store_view(self).await
     }
 }
 
@@ -1350,6 +1358,13 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
                 Err(_) => Value::Null,
             }
         }
+        // An `ExportRow` (ADR 0068 §3) — same JSON passthrough convention
+        // as `Backup`/`Restore`/etc. above (no secret to redact — an S3
+        // bucket name/prefix is not a credential).
+        syskv::EntityKind::Export => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
+        // An `ImportRow` (ADR 0068 §6, S-05 PR 2) — the identical
+        // passthrough convention `Export` just above uses.
+        syskv::EntityKind::Import => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
     }
 }
 
@@ -1680,6 +1695,101 @@ fn gc_view(ctx: &ClientCtx) -> Value {
     json!({
         "janitor": janitor,
         "leader": ctx.control.is_leader(),
+    })
+}
+
+/// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07) — the fourth
+/// and last of U-07's observability routes, copying `backup_store_view`'s
+/// own template (cab41a8) with one addition on top of the store-config/
+/// bounded-local-object-scan shape every earlier U-07 route already
+/// established: the shard→replica **placement** every stream shard was
+/// given, which the route's own name promises and which the roadmap notes
+/// is "already inside `ClusterSegmentStore`" — a shard's replica set is
+/// decided exactly once, at seal time, by
+/// [`animus_cp_data::cluster_segment_store::ClusterSegmentStore::
+/// put_replicated`]'s own placement selection, and recorded durably right
+/// there in [`animus_control::StreamShardRow::replicas`] — so this route
+/// reads that already-agreed record rather than recomputing placement a
+/// second way.
+///
+/// `store` is this node's own configured segment store (same redaction/
+/// control-only-node-absence convention as `backup_store_view`'s `store`
+/// field — see [`crate::AdminInfo::segment_store`]'s own doc). `shards` is
+/// `null` for the single-shared-directory `fs` opt-in — every node already
+/// reads the identical directory there, so there is no per-node replica
+/// concept to report (the exact "empty `replicas`, ask any node" signal
+/// [`crate::SegmentStoreHandle::put_sealed`]'s own doc describes) — and
+/// otherwise one entry per row in the replicated `stream_shards` catalog
+/// (identical on every node, ADR 0038): `shard` rendered via
+/// [`animus_cp_data::segment::shard_id`] (`shardId-<tablet>-<epoch>`, the
+/// same wire id ADR 0042 §2 defines), `replicas` the recorded node ids
+/// (already sorted, `ClusterSegmentStore::put_replicated`'s own doc), and
+/// `local` whether this node's own id is among them. `local_objects` is a
+/// bounded live local scan
+/// ([`crate::SegmentStoreHandle::list_local`]/[`crate::
+/// SegmentStoreHandle::get_local`] — this store's own local building
+/// block, never the cluster-fallback `get_from`/`get_sealed` read path),
+/// mirroring `backup_store_view`'s identical object-count/byte scan (same
+/// cap, same truncation flag). Segment ids carry no fixed top-level
+/// namespace the way a backup object's `backup/` prefix does (`animus_
+/// cp_data::segment::segment_id`'s own doc: `{table}/{label}/{tablet}/
+/// {epoch}/...`), so this scan lists the store's WHOLE local directory —
+/// safe because that directory (`dir.join("segments")`) is already
+/// disjoint from the backup store's own (`dir.join("backups")`), never
+/// mixing the two stores' objects.
+const SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
+
+async fn segment_store_view(ctx: &ClientCtx) -> Value {
+    let store = ctx.admin.segment_store.as_ref().map_or(Value::Null, |v| {
+        json!({
+            "kind": v.kind,
+            "location": v.path.as_deref().map(crate::redact_store_location),
+        })
+    });
+    let is_cluster = matches!(ctx.admin.segment_store.as_ref(), Some(v) if v.kind == "cluster");
+
+    let shards = if is_cluster {
+        let meta = ctx.effective_metadata();
+        let self_id = ctx.env.node_id();
+        let rows: Vec<Value> = meta
+            .stream_shards
+            .iter()
+            .map(|((tablet, epoch), row)| {
+                json!({
+                    "shard": animus_cp_data::segment::shard_id(tablet.0, *epoch),
+                    "replicas": row.replicas.iter().map(NodeId::to_string).collect::<Vec<_>>(),
+                    "local": row.replicas.contains(&self_id),
+                })
+            })
+            .collect();
+        Value::Array(rows)
+    } else {
+        Value::Null
+    };
+
+    let local_objects = match ctx.segment_store.list_local("").await {
+        Ok(ids) => {
+            let total = ids.len();
+            let truncated = total > SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP;
+            let scan = &ids[..total.min(SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP)];
+            let mut bytes: u64 = 0;
+            for id in scan {
+                if let Ok(Some(b)) = ctx.segment_store.get_local(id).await {
+                    bytes += b.len() as u64;
+                }
+            }
+            json!({"count": total, "bytes": bytes, "truncated": truncated})
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "admin segment-store: local object list failed");
+            Value::Null
+        }
+    };
+
+    json!({
+        "store": store,
+        "shards": shards,
+        "local_objects": local_objects,
     })
 }
 

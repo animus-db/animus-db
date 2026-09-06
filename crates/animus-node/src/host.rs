@@ -421,4 +421,18 @@ pub trait AdminHost: Send + Sync {
     /// can capture), so there is no new type to name here at all, only
     /// this one more `Value`-returning route method.
     async fn gc_view(&self) -> Value;
+    /// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07) — the
+    /// fourth and last of U-07's observability routes: this node's own
+    /// configured DynamoDB Streams segment store (redacted, same
+    /// convention as `backup_store_view`'s `store` field), the
+    /// shard→replica placement it currently sees for the `cluster` store
+    /// kind (`null` for the single-shared-directory `fs` opt-in, which has
+    /// no per-node replica concept), and a bounded live scan of this
+    /// node's own local object count/bytes. Unlike `backup_store_view`'s
+    /// `objects`/`ttl_view`'s `reaper`, this route publishes no janitor/
+    /// reaper progress of its own — the segment janitor's progress is
+    /// already `gc_view`'s job, and the placement this route reports is a
+    /// durable catalog fact (`Metadata::stream_shards`), not a live loop's
+    /// phase.
+    async fn segment_store_view(&self) -> Value;
 }

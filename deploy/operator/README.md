@@ -99,6 +99,122 @@ lets this work identically whether the operator runs in-cluster
 run` against a local kubeconfig (the `scripts/e2e-kind.sh` shape): both
 paths reach the API server, neither needs a filesystem mount of its own.
 
+## S3 backup/segment stores (S-04 PR 3)
+
+`spec.s3` wires the cluster's backup and/or stream-segment store onto a
+real S3-compatible bucket, closing `docs/roadmap.md`'s S-04 item:
+
+```yaml
+spec:
+  s3:
+    backupStore: "s3://my-backups-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
+    # segmentStore: "s3://my-streams-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
+    credentialsSecretName: my-s3-credentials   # keys: access_key_id, secret_access_key
+    allowInsecureHttp: false                   # true only for a plain-http:// dev endpoint (MinIO/localstack)
+    egressCidrs: ["0.0.0.0/0"]                 # NARROW to your object store's real CIDR range
+```
+
+At least one of `backupStore`/`segmentStore` must be set, and the URI
+shape is the identical `s3://<bucket>[/<prefix>]?endpoint=<scheme://
+host[:port]>&region=<region>[&insecure_http=true]` `animusd`'s own
+`--backup-store`/`--segment-store` flags accept (see ADR 0059's own S-04
+amendment). `credentialsSecretName` names a **pre-existing** `Secret`
+(same namespace, keys `access_key_id`/`secret_access_key`) this operator
+only ever mounts read-only at `/etc/animus/s3` — it never creates or
+writes one, mirroring `spec.tls`'s own `secretName` precedent. The secret
+value never reaches the `ConfigMap`/`cluster.json`: a combined-role pod's
+own generated `entrypoint.sh` reads both files at container-start time and
+writes a scratch `--s3-credentials` JSON file naming only the *path* to
+`secret_access_key`. **Combined-role pods only** — `animusd data --config`
+accepts no S3-store flags today (a pre-existing `animusd` gap, not
+introduced here; see `crates/animus-operator/CLAUDE.md`'s CLI-flag-support
+table).
+
+Setting `spec.s3` also adds an `Egress` section to the generated
+`NetworkPolicy` (every cluster now gets one, `spec.s3` or not — see below):
+a third rule, scoped to `egressCidrs`, opens the configured store URIs' own
+`endpoint=` port(s). **`NetworkPolicy` cannot express a hostname
+allowlist** — only IP blocks — so this operator has no way to resolve an
+endpoint's hostname into the right CIDR for you; `egressCidrs` defaults to
+`["0.0.0.0/0"]` (open to any destination on that port) and **should be
+narrowed to your object store's real address range** in any environment
+where that egress must be restricted.
+
+Invalid specs (neither store set, an empty `credentialsSecretName`, a
+malformed store URI, or `insecure_http=true` without `allowInsecureHttp`)
+are rejected: the controller sets an `S3SpecInvalid` status condition and
+reconciles the rest of the spec as if `s3` were absent, the same posture
+`TlsSpecInvalid` uses above.
+
+**Every cluster's `NetworkPolicy` egress, S3 or not**: before this PR the
+generated policy set no `Egress` in `policyTypes` at all, which leaves
+Kubernetes egress **completely unrestricted by omission** regardless of
+anything else the policy says — `docs/roadmap.md`'s S-04 item named this
+exactly. Every cluster now gets an explicit `Egress` section with two
+baseline rules (intra-cluster on the `internal`/`intra` ports, and DNS to
+`kube-system`'s `kube-dns`/CoreDNS pods) whether or not `spec.s3` is set.
+
+## Non-S3 backup/segment stores (S-07b)
+
+`spec.backupStore`/`spec.segmentStore` are the CRD surface for the
+*non-S3* forms `spec.s3` above doesn't cover — pinning `--backup-store
+cluster|fs:<path>` or `--segment-store dir:<path>` from the spec instead of
+configuring it by hand, closing `docs/roadmap.md`'s S-07 item b:
+
+```yaml
+spec:
+  backupStore: "fs:/var/lib/animus/backups"   # or "cluster" (the default, spelled out)
+  segmentStore: "dir:/var/lib/animus/segments" # --segment-store has no "cluster" keyword
+```
+
+Each field accepts exactly the literal forms named above — a malformed
+value, a `segmentStore: "cluster"` (rejected: `--segment-store` has no such
+keyword at all; omit the field to select its default instead), or an
+`s3://...` URI (rejected, pointing at `spec.s3` — only that section
+supplies the credentials an S3 store needs) sets a `StoreSpecInvalid`
+status condition and reconciles the rest of the spec with both fields
+stripped, the same posture `TlsSpecInvalid`/`S3SpecInvalid` use above.
+Setting the same store in both `spec.s3` and the matching top-level field
+(e.g. both `spec.s3.backupStore` and `spec.backupStore`) is also rejected,
+naming both fields.
+
+**The `fs:`/`dir:` path must live under the pod's own data volume**
+(`/var/lib/animus` by default — a `PersistentVolumeClaim`, or an
+`emptyDir` when `spec.storage.ephemeral` is set) — a path elsewhere on the
+container filesystem is never a sensible place to point a store, and a
+path equal to that root itself is rejected too (that's where `animusd
+--dir` puts its own on-disk files). Unlike `spec.s3`, **no new volume or
+`Secret` is mounted for this** — `cluster`/`fs:`/`dir:` need no
+credentials, so the pod's already-mounted data volume is all that's
+involved. Reaches only **combined-role pods**, the same pre-existing
+`animusd` gap `spec.s3` documents above.
+
+## PodDisruptionBudget (S-07c)
+
+Every `AnimusCluster` gets a `{name}-pdb` `PodDisruptionBudget` selecting
+the cluster's own pods, with no `spec`-level opt-out or override —
+`maxUnavailable` is always computed from `spec.nodes`/`spec.controlNodes`,
+never a constant and never user-supplied:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),                       # control-plane quorum
+  floor((min(nodes, 3) - 1) / 2),                       # data-plane tablet RF (fixed at 3 today)
+)
+```
+
+For the operator's own default 3-node/3-`controlNodes` shape this is `1`;
+it stays `1` for any larger `nodes` count too, since `controlNodes` is
+immutable and the data-plane replication factor is capped — a scale-up/
+down within that range never needs the budget recomputed. A cluster
+smaller than its replication factor (`nodes < 3`), or with a single
+control voter (`controlNodes == 1`), computes `0` — **this correctly
+blocks every voluntary eviction**, since such a cluster cannot survive
+losing its one and only copy of a control-plane or data-plane majority.
+See `crates/animus-operator/src/desired/poddisruptionbudget.rs`'s own
+module doc for the full reasoning, including why there is no CRD field to
+loosen or disable it.
+
 ## Testing
 
 `cargo test -p animus-operator` is the pure `desired`-builder unit suite —
@@ -112,9 +228,10 @@ e2e section for what it does and does not prove.
 
 - **No finalizer** — deleting an `AnimusCluster` relies on Kubernetes
   garbage collection following the owner references every child object
-  (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`) carries. There is
-  nothing else to clean up (no external backup store, no DNS record) so
-  this is a deliberate v1 scope cut, not a known gap.
+  (`ConfigMap`/`Service`/`StatefulSet`/`NetworkPolicy`/
+  `PodDisruptionBudget`) carries. There is nothing else to clean up (no
+  external backup store, no DNS record) so this is a deliberate v1 scope
+  cut, not a known gap.
 - ~~The operator's own container image is not yet built/published~~ —
   closed 2026-09-02 (S-07a). The root `Dockerfile`'s `runtime-operator`
   stage builds it, and `.github/workflows/image.yml`'s `animus-operator`

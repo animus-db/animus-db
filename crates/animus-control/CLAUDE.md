@@ -798,6 +798,118 @@ per-tablet CP data plane (`animus-cp-data`).
     `meta::tests::
     pitr_replay_segments_still_finds_a_dropped_never_split_tablets_own_segments`.
 
+- **The export catalog (ADR 0068, S-05 PR 1): `BeginExport`/
+  `CompleteExport`/`FailExport`.** `Metadata::exports: BTreeMap<ExportId,
+  ExportRow>` (`ExportId = String`, the export's own ARN — unlike
+  `BackupId`, which is an opaque mint, `wire::export_arn` mints this one
+  directly since AWS's own `ExportArn` shape is the natural identity and
+  there's no name-collision hazard a table drop/recreate could exploit the
+  way there would be for a name-keyed backup). Modelled directly on
+  `BeginBackup`/`CompleteBackup`/`FailBackup`'s own shape (one-shot
+  `Creating`/`InProgress`-style row, a terminal `Completed`/`Failed`), but
+  **deliberately simpler**: there is no per-tablet progress catalog
+  (`backup_tablet_progress`'s dual) and no `RecordExportTabletComplete`
+  command, because an export is one job run once on whichever node
+  received the wire request (`animusd::dynamo::run_export_job`, reusing
+  `ctx.cp_scan` — the same primitive `Scan` uses, which already fans out
+  across a table's tablets and tolerates a concurrent split transparently)
+  rather than a distributed per-tablet-leader capture with a completion
+  aggregator (see ADR 0068 §1 for the full reasoning and the trade-off this
+  buys: no crash-resumability, a named residual). `BeginExport` records the
+  export's own `s3_bucket`/`s3_prefix`/`format`/`export_type`/
+  `export_time_ms`/`client_token` at apply time — every field a plain,
+  already-agreed value the proposer supplies, no derivation from other
+  `Metadata` state the way `BeginBackup`'s manifest-stub derivation needs
+  (an export's own manifest is written by the job driver directly to the
+  customer bucket, never mirrored into `Metadata`). `ExportFormat`
+  (`DynamoDbJson`/`Ion` — only the former is actually reachable; the wire
+  decoder rejects `ION` up front) and `ExportType` (`Full`/`Incremental` —
+  only `Full` is reachable, `INCREMENTAL_EXPORT` rejected the same way) are
+  both modeled even though only one variant of each is currently
+  producible, so PR 2/3's own eventual `Incremental`/`Ion` support needs no
+  catalog-shape change, only a wire-decoder relaxation. `CompleteExport`
+  freezes `item_count`/`billed_size_bytes`/`export_manifest` (the
+  customer-bucket key of `manifest-summary.json`, not a byte payload — this
+  catalog never holds export content, only the pointer to where the job
+  driver wrote it); `FailExport` mirrors `FailBackup`'s idempotent-on-
+  identical-reason, rejects-a-terminal-contradiction shape exactly.
+  `Metadata::export_by_client_token(table, token)` is the
+  `ClientRequestToken` idempotency lookup `animusd::dynamo::create_export`
+  uses to make a retried `ExportTableToPointInTime` call return the
+  existing export rather than minting a second one — the identical
+  linear-scan-over-a-small-map shape `export_by_client_token`'s own doc
+  states plainly rather than indexing, since a table's export count is
+  expected to stay small. `syskv::EntityKind::Export`/`export_key` follow
+  the usual per-entity mirror conventions (`mirror.rs`'s `Put` arm for all
+  three commands, no `Delete` arm needed — an export row is never removed,
+  unlike a backup's janitor-driven reclaim); `is_relayable_command`
+  (`animus-node/src/wire.rs`) allows all three — **all three**, not just
+  `BeginExport`, since (unlike `CompleteBackup`/`FailBackup`, which the
+  control-plane leader's own completion aggregator proposes locally) the
+  export job runs on whichever node received the wire request, which may
+  be any node in the cluster, control-plane leader or not. See
+  `crates/animusd/CLAUDE.md`'s own ADR 0068 entry for the job driver, the
+  customer-bucket store configuration/injection seam, and the object
+  layout written.
+
+- **The import catalog (ADR 0068 §6, S-05 PR 2): `BeginImport`/
+  `CompleteImport`/`FailImport`.** `Metadata::imports: BTreeMap<ImportId,
+  ImportRow>` (`ImportId = String`, the import's own ARN —
+  `<TableArn-of-the-freshly-created-target>/import/<id>`,
+  `wire::import_arn` — the identical "the id is its own ARN" shape
+  `exports` already uses, since real DynamoDB's `ImportArn` is likewise a
+  natural client-visible identity with no name-collision hazard to avoid).
+  Modelled on **both** existing catalogs: `exports`' identity/no-delete
+  shape (no `RecordImportTabletComplete`/aggregator — an import is one
+  job, on whichever node hosts/leads the destination tablet, not a
+  distributed per-tablet capture), and `restores`' target-provisioning
+  shape (`BeginImport` mints exactly **one** fresh `Building` destination
+  tablet directly, mirroring `BeginRestore`'s own mint — the mechanism
+  that keeps a normal client write/read refused until the import driver
+  activates it, reused rather than inventing a new tablet state; GSIs are
+  resolved into `gsi_defs: Vec<IndexDef>` at `IndexStatus::Creating` but
+  not declared on the schema until `CompleteImport`, the identical
+  `RestoreRow::gsi_defs` backfill-race-avoidance reasoning). `BeginImport`
+  additionally carries `base_schema: Box<TableSchema>` (boxed —
+  `TableSchema` is by far this variant's largest field, and an unboxed
+  copy would make the whole `MetaCommand` enum's in-memory size balloon to
+  fit it, `clippy::large_enum_variant`'s own complaint) and `key_types`/
+  `throughput`, recorded purely so `DescribeImport`'s echoed
+  `TableCreationParameters` can render the original request's own
+  declared shape — the wire edge (`animusd::dynamo::
+  provision_import_target`) already committed the identical schema via an
+  ordinary `CreateTableSchema` proposal *before* ever proposing
+  `BeginImport`, so this apply arm performs no schema validation of its
+  own, only the tablet mint + row insert.
+
+  **`CompleteImport` activates the tablet** (`Building` → `Active`, epoch
+  bumped — the identical `CompleteRestore` shape) **and freezes**
+  `processed_item_count`/`imported_item_count`/`error_count`/
+  `processed_size_bytes`. **`FailImport` deliberately leaves the tablet
+  `Building` forever, exactly like `FailRestore`** — this apply arm never
+  touches the tablet map on failure; the actual target-table cleanup (see
+  below) is the import **driver**'s own separate, best-effort follow-up
+  call through the ordinary `DropTableSchema`/`DropTableTablets` path, not
+  something this pure state machine does atomically with the fail
+  transition (dropping a table is itself a multi-step commit sequence).
+  This is the one deliberate divergence from `restores`' own "leave it for
+  manual `DeleteTable`" stance: real DynamoDB's own `ImportTable` rolls
+  back a failed import's target table automatically, so `animusd::import`
+  does too — but that rollback is driver-orchestrated, not catalog-time.
+  `Metadata::import_by_client_token(token)` is the `ClientRequestToken`
+  idempotency lookup — **not** scoped by table the way
+  `export_by_client_token(table, token)` is, since a retried `ImportTable`
+  call names the same target table by construction (a different name
+  would already collide with the just-created target's own schema before
+  the token lookup could matter), so a bare token match is enough.
+  `syskv::EntityKind::Import`/`import_key` follow the usual per-entity
+  mirror conventions (no `Delete` arm needed, the identical `Export`
+  reasoning); `is_relayable_command` allows all three, the identical
+  `BeginExport`/`CompleteExport`/`FailExport` reasoning (the import job
+  may run on any node). See `crates/animusd/CLAUDE.md`'s own ADR 0068 PR 2
+  entry for the driver, the item→row derivation, and the object-resolution
+  mechanics.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

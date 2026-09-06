@@ -19,7 +19,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::cluster_config::{
-    CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENTRYPOINT_FILE_NAME, TLS_MOUNT_DIR,
+    CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR,
+    TLS_MOUNT_DIR,
 };
 use super::{
     common_labels, config_map_name, internal_service_name, owner_reference, selector_labels,
@@ -65,6 +66,7 @@ const CONFIG_VOLUME: &str = "config";
 const DATA_VOLUME: &str = "data";
 const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
 const TLS_VOLUME: &str = "tls";
+const S3_VOLUME: &str = "s3";
 
 /// `tls_enabled` mirrors `spec.tls.is_some()`: admin is server-only TLS
 /// (ADR 0064), so when it's on the probe's `GET /admin/health` must speak
@@ -192,6 +194,34 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         volume_mounts.push(VolumeMount {
             name: TLS_VOLUME.to_string(),
             mount_path: TLS_MOUNT_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    // S-04 PR 3: `spec.s3`'s credential `Secret` (never created or written
+    // by this operator, only referenced — same idiom as `spec.tls` above),
+    // mounted read-only on **every** pod even though only a combined-role
+    // pod's own `entrypoint.sh` branch actually reads it (see
+    // `cluster_config::entrypoint_script`'s own doc for the data-role
+    // gap) — mounting it everywhere keeps this builder's volume/mount logic
+    // identical to `dynamo-auth`/`tls`'s own "one shared Secret, every pod"
+    // shape, rather than conditioning the mount itself on pod role (which
+    // this builder has no ordinal to do per-pod anyway — see this crate's
+    // own "no per-pod port striding" doc for why every pod's spec here is
+    // otherwise identical).
+    if let Some(s3) = &spec.s3 {
+        volumes.push(Volume {
+            name: S3_VOLUME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(s3.credentials_secret_name.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: S3_VOLUME.to_string(),
+            mount_path: S3_MOUNT_DIR.to_string(),
             read_only: Some(true),
             ..Default::default()
         });
@@ -530,6 +560,53 @@ mod tests {
         let sts = build(&cluster, &cluster.spec);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "tls"));
+    }
+
+    // --- `s3` (S-04 PR 3) --------------------------------------------------
+
+    fn test_s3_spec() -> crate::crd::S3StoreSpec {
+        crate::crd::S3StoreSpec {
+            backup_store: Some("s3://bucket?endpoint=https://s3.example.com".to_string()),
+            segment_store: None,
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: false,
+            egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
+        }
+    }
+
+    #[test]
+    fn s3_credentials_secret_mounted_read_only_when_s3_set() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.s3 = Some(test_s3_spec());
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod_spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "s3")
+            .expect("s3 volume present");
+        assert_eq!(
+            vol.secret.unwrap().secret_name.as_deref(),
+            Some("my-s3-creds")
+        );
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "s3")
+            .expect("s3 mount present");
+        assert_eq!(mount.mount_path, "/etc/animus/s3");
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn no_s3_volume_when_s3_unset() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
     }
 
     #[test]

@@ -60,6 +60,12 @@ async-trait.workspace = true
 # `animusd` is the real node process — it's the one place that actually
 # constructs a `ProdEnv` (ADR 0061 rung C0 gates it behind this feature).
 animus-env = { workspace = true, features = ["prod"] }
+# S-04 PR 2: `s3:` URIs on `--segment-store`/`--backup-store` construct a
+# real `animus_s3::prod::HyperRustlsTransport` (this crate is the one real
+# process boundary, same reasoning as `animus-env`'s own `prod` feature
+# above) wrapped in `animus_env::S3SegmentStore`. `animusd` never touches
+# `animus_s3::client`/`sigv4` directly beyond that construction site.
+animus-s3 = { workspace = true, features = ["prod"] }
 # The `E: Env`-generic node core (ADR 0061 Phase C carve-out) this crate
 # re-exports its wire types/`topology`/`decide` from at the crate root.
 animus-node.workspace = true
@@ -101,6 +107,14 @@ opentelemetry-otlp.workspace = true
 # feature set as `animus-env`'s own `tokio-rustls` dependency (one crypto
 # backend workspace-wide, ADR 0064 Decision 5).
 tokio-rustls = { workspace = true }
+# gzip encoding for the S3 export data files (ADR 0068, S-05) — this
+# crate's own export job driver is the sole caller.
+flate2.workspace = true
+# `manifest-files.json`'s `md5Checksum`/`etag` fields (ADR 0068 §1) — a
+# CRC32 stand-in, not a real MD5 (see `crc32_hex`'s own doc); already a
+# workspace dependency (`animus-storage`'s SSTable block checksums), so
+# this adds no new crate to the graph.
+crc32fast.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
@@ -140,6 +154,13 @@ animus-sim.workspace = true
 # as a dev-dependency; no cycle — `animus-test`'s own `Cargo.toml` does not
 # depend on `animusd`).
 animus-test.workspace = true
+# S-04 PR 2's own in-crate `s3_store_tests` (`lib.rs`): exercises the
+# `SegmentStoreConfig::S3`/`BackupStoreHandle::S3` wiring against
+# `animus_s3::fake::FakeS3` — no real sockets. The normal (non-dev)
+# `animus-s3` dependency above already brings the `prod` feature; this adds
+# `fake` on top for test builds only (Cargo unifies both onto the one
+# `animus-s3` instance when building this crate's test targets).
+animus-s3 = { workspace = true, features = ["fake"] }
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
     "gen-tonic-messages",
     "trace",

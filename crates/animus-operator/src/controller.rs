@@ -21,6 +21,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
@@ -31,8 +32,9 @@ use crate::admin_client::{AdminClient, AdminOps};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_DRAIN_FAILED, CONDITION_IMMUTABLE_FIELD_CHANGED,
-    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_TLS_SPEC_INVALID, ClusterCondition,
-    ClusterPhase, ConditionStatus,
+    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
+    ConditionStatus,
 };
 use crate::desired;
 
@@ -72,10 +74,14 @@ pub struct Context<C: ClusterApi, A: AdminOps> {
 /// Apply every desired child for `cluster`, in a fixed order (`ConfigMap`
 /// before `StatefulSet`, so a rolling pod never briefly reads a
 /// `StatefulSet`-implied config that its `ConfigMap` doesn't have yet).
-/// Every child is applied unconditionally on every call — there is no diff
-/// against the previously-applied object, so a reconcile of an otherwise
-/// unchanged cluster still re-applies all five children (an idempotent
-/// re-apply, not a no-op; `crate::controller::tests` pins this).
+/// Every required child is applied unconditionally on every call — there
+/// is no diff against the previously-applied object, so a reconcile of an
+/// otherwise unchanged cluster still re-applies every one of them (an
+/// idempotent re-apply, not a no-op; `crate::controller::tests` pins
+/// this). `Certificate` (ADR 0064 commit 3) is the one *optional* child,
+/// applied only for `spec.tls.certManager`; `PodDisruptionBudget` (S-07c)
+/// is required like the rest — see `desired::poddisruptionbudget`'s own
+/// module doc for why it carries no such toggle.
 async fn apply_children<C: ClusterApi>(
     cluster_api: &C,
     cluster: &AnimusCluster,
@@ -102,6 +108,17 @@ async fn apply_children<C: ClusterApi>(
 
     let netpol = desired::networkpolicy::build(cluster, spec);
     cluster_api.apply_networkpolicy(ns, &netpol).await?;
+
+    // S-07c: the quorum-derived PodDisruptionBudget, after the
+    // NetworkPolicy and before the StatefulSet — a PDB that exists before
+    // any pod does is harmless, and this keeps the ordering "things pods
+    // depend on first, the StatefulSet itself last" that every other
+    // child already follows. Applied unconditionally, from the *desired*
+    // spec (`spec.nodes`/`spec.controlNodes`), never the StatefulSet's
+    // live replica count — see `desired::poddisruptionbudget`'s own
+    // module doc for why.
+    let pdb = desired::poddisruptionbudget::build(cluster, spec);
+    cluster_api.apply_poddisruptionbudget(ns, &pdb).await?;
 
     let sts = desired::statefulset::build(cluster, spec);
     let applied = cluster_api.apply_statefulset(ns, &sts).await?;
@@ -284,6 +301,46 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         .conditions
         .retain(|c| c.type_ != CONDITION_TLS_SPEC_INVALID);
 
+    // Validate `spec.s3` (S-04 PR 3): same "no admission webhook in v1"
+    // posture as `spec.tls` above — set a condition and reconcile the rest
+    // of the spec with `s3` stripped rather than getting stuck entirely.
+    if let Some(s3) = &cluster.spec.s3
+        && let Err(e) = s3.validate()
+    {
+        warn!(cluster = %name, error = %e, "refusing invalid spec.s3");
+        set_condition(&mut status, CONDITION_S3_SPEC_INVALID, e);
+        let mut pinned = (*cluster).clone();
+        pinned.spec.s3 = None;
+        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_S3_SPEC_INVALID);
+
+    // Validate `spec.backupStore`/`spec.segmentStore` (S-07b): same "no
+    // admission webhook in v1" posture as `spec.tls`/`spec.s3` above — set a
+    // condition and reconcile the rest of the spec with both fields
+    // stripped rather than getting stuck entirely. Checked *after*
+    // `spec.s3` above (not before): an invalid `spec.s3` already returned
+    // early, so by this point `cluster.spec.s3` is either `None` or valid,
+    // which is what lets `validate_store_spec`'s own conflict check trust
+    // it.
+    if let Err(e) = cluster.spec.validate_store_spec() {
+        warn!(
+            cluster = %name,
+            error = %e,
+            "refusing invalid spec.backupStore/spec.segmentStore"
+        );
+        set_condition(&mut status, CONDITION_STORE_SPEC_INVALID, e);
+        let mut pinned = (*cluster).clone();
+        pinned.spec.backup_store = None;
+        pinned.spec.segment_store = None;
+        return finish_reconcile(&pinned, &ctx, &ns, status).await;
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_STORE_SPEC_INVALID);
+
     // Refuse an immutable `controlNodes` change: set a condition, keep
     // going (the rest of the spec — image, resources, scale — still
     // deserves to converge), but never regenerate the config with the new
@@ -449,10 +506,11 @@ fn error_policy<C: ClusterApi, A: AdminOps>(
 }
 
 /// Run the controller loop against `client` forever (until the process is
-/// asked to stop). Watches `AnimusCluster` plus its four owned child kinds
-/// so an out-of-band edit to a child (e.g. `kubectl edit statefulset`)
-/// triggers a reconcile that reverts the drift, not just a spec change on
-/// the parent.
+/// asked to stop). Watches `AnimusCluster` plus its five owned, typed
+/// child kinds (the cert-manager `Certificate` is a `DynamicObject`, not
+/// watched here) so an out-of-band edit to a child (e.g. `kubectl edit
+/// statefulset`) triggers a reconcile that reverts the drift, not just a
+/// spec change on the parent.
 pub async fn run(client: Client) {
     let clusters = Api::<AnimusCluster>::all(client.clone());
     let ctx = Arc::new(Context {
@@ -474,7 +532,11 @@ pub async fn run(client: Client) {
             watcher::Config::default(),
         )
         .owns(
-            Api::<NetworkPolicy>::all(client),
+            Api::<NetworkPolicy>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .owns(
+            Api::<PodDisruptionBudget>::all(client),
             watcher::Config::default(),
         )
         .run(
@@ -505,9 +567,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use k8s_openapi::api::core::v1::ConfigMap;
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     use super::*;
-    use crate::crd::{AnimusClusterSpec, CertManagerSpec, IssuerRef, TlsSpec};
+    use crate::crd::{AnimusClusterSpec, CertManagerSpec, IssuerRef, S3StoreSpec, TlsSpec};
     use crate::desired::test_support::test_cluster;
     use crate::fakes::{AppliedKind, FakeAdminClient, FakeClusterApi};
 
@@ -545,7 +608,7 @@ mod tests {
     // --- (1) a fresh cluster reconcile creates the expected children -----
 
     #[tokio::test]
-    async fn reconcile_fresh_cluster_applies_all_five_children_in_order() {
+    async fn reconcile_fresh_cluster_applies_all_six_children_in_order() {
         let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
         let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
 
@@ -561,6 +624,10 @@ mod tests {
                 (
                     AppliedKind::NetworkPolicy,
                     desired::network_policy_name("demo")
+                ),
+                (
+                    AppliedKind::PodDisruptionBudget,
+                    desired::pod_disruption_budget_name("demo")
                 ),
                 (AppliedKind::StatefulSet, "demo".to_string()),
             ]
@@ -578,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_of_unchanged_cluster_reapplies_every_child_again() {
         // `apply_children` never diffs against what's already applied —
-        // every reconcile unconditionally re-applies all five children, an
+        // every reconcile unconditionally re-applies all six children, an
         // idempotent re-apply rather than a no-op. This test pins that
         // choice so a future change to the behavior is a deliberate,
         // visible diff here, not a silent regression.
@@ -589,15 +656,15 @@ mod tests {
             .await
             .unwrap();
         let first = ctx.cluster_api.applies();
-        assert_eq!(first.len(), 5);
+        assert_eq!(first.len(), 6);
 
         reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
             .await
             .unwrap();
         let second = ctx.cluster_api.applies();
-        assert_eq!(second.len(), 10);
-        assert_eq!(&second[..5], &first[..]);
-        assert_eq!(&second[5..], &first[..]);
+        assert_eq!(second.len(), 12);
+        assert_eq!(&second[..6], &first[..]);
+        assert_eq!(&second[6..], &first[..]);
     }
 
     // --- (3) control_nodes_changed detects a change vs no change ---------
@@ -881,7 +948,7 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.err());
 
         let applies = ctx.cluster_api.applies();
-        assert_eq!(applies.len(), 6, "{applies:?}");
+        assert_eq!(applies.len(), 7, "{applies:?}");
         assert_eq!(
             applies[1],
             (AppliedKind::Certificate, "demo-tls".to_string())
@@ -902,7 +969,7 @@ mod tests {
             .unwrap();
 
         let applies = ctx.cluster_api.applies();
-        assert_eq!(applies.len(), 5, "{applies:?}");
+        assert_eq!(applies.len(), 6, "{applies:?}");
         assert!(!applies.iter().any(|(k, _)| *k == AppliedKind::Certificate));
     }
 
@@ -1012,6 +1079,529 @@ mod tests {
                 admin_url("demo", "ns1", 3, 14003, "/admin/drain")
                     .replacen("http://", "https://", 1),
             ]
+        );
+    }
+
+    // --- (7) spec.s3 (S-04 PR 3) ------------------------------------------
+
+    fn valid_s3() -> S3StoreSpec {
+        S3StoreSpec {
+            backup_store: Some(
+                "s3://my-bucket/backups?endpoint=https://s3.example.com".to_string(),
+            ),
+            segment_store: None,
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: false,
+            egress_cidrs: S3StoreSpec::default_egress_cidrs(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_the_same_six_children_with_a_valid_spec_s3() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(valid_s3());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        // No new child kind — spec.s3 only changes the content of the
+        // pre-existing ConfigMap/StatefulSet/NetworkPolicy, never adds a
+        // seventh applied object the way spec.tls.certManager's
+        // Certificate does.
+        assert_eq!(
+            ctx.cluster_api.applies(),
+            vec![
+                (AppliedKind::ConfigMap, desired::config_map_name("demo")),
+                (AppliedKind::Service, desired::internal_service_name("demo")),
+                (AppliedKind::Service, desired::client_service_name("demo")),
+                (
+                    AppliedKind::NetworkPolicy,
+                    desired::network_policy_name("demo")
+                ),
+                (
+                    AppliedKind::PodDisruptionBudget,
+                    desired::pod_disruption_budget_name("demo")
+                ),
+                (AppliedKind::StatefulSet, "demo".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_spec_s3_mounts_the_secret_and_sets_the_flags() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(valid_s3());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        // StatefulSet: the s3 Secret volume/mount is present.
+        let sts = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("statefulset applied");
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod_spec
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "s3")
+            .expect("s3 volume present");
+        assert_eq!(
+            vol.secret.unwrap().secret_name.as_deref(),
+            Some("my-s3-creds")
+        );
+
+        // ConfigMap: the entrypoint script carries the flags and the
+        // credentials-JSON-writing preamble, never a literal secret value.
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(script.contains("--s3-credentials /tmp/animus-s3-credentials.json"));
+        assert!(
+            script.contains(
+                "--backup-store 's3://my-bucket/backups?endpoint=https://s3.example.com'"
+            )
+        );
+        assert!(script.contains("$(cat /etc/animus/s3/access_key_id)"));
+        assert!(!script.contains("--allow-insecure-s3"));
+
+        // NetworkPolicy: the S3 egress rule (443, the default CIDR) is
+        // present alongside the two baseline rules.
+        let np = ctx
+            .cluster_api
+            .networkpolicy(&desired::network_policy_name("demo"))
+            .expect("networkpolicy applied");
+        let egress = np.spec.unwrap().egress.unwrap();
+        assert_eq!(egress.len(), 3, "{egress:?}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_s3_spec_with_neither_store_set() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(S3StoreSpec {
+            backup_store: None,
+            segment_store: None,
+            ..valid_s3()
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_S3_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+        // Reconciled as if spec.s3 were unset: no s3 volume mounted.
+        let sts = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("statefulset applied");
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_s3_spec_with_empty_credentials_secret_name() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(S3StoreSpec {
+            credentials_secret_name: String::new(),
+            ..valid_s3()
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_S3_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_s3_spec_with_insecure_http_not_allowed() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(S3StoreSpec {
+            backup_store: Some(
+                "s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string(),
+            ),
+            ..valid_s3()
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_S3_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_s3_spec_with_malformed_store_uri() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(S3StoreSpec {
+            backup_store: Some("not-a-valid-uri".to_string()),
+            ..valid_s3()
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_S3_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_insecure_http_s3_spec_when_allowed() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.s3 = Some(S3StoreSpec {
+            backup_store: Some(
+                "s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string(),
+            ),
+            allow_insecure_http: true,
+            ..valid_s3()
+        });
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_S3_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(script.contains("--allow-insecure-s3"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_spec_s3_still_applies_baseline_egress_and_no_s3_volume() {
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let np = ctx
+            .cluster_api
+            .networkpolicy(&desired::network_policy_name("demo"))
+            .expect("networkpolicy applied");
+        let egress = np.spec.unwrap().egress.unwrap();
+        assert_eq!(egress.len(), 2, "baseline-only egress: intra + DNS");
+
+        let sts = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .expect("statefulset applied");
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
+    }
+
+    // --- (8) spec.backupStore / spec.segmentStore (S-07b) ------------------
+
+    #[tokio::test]
+    async fn reconcile_applies_the_same_six_children_with_a_valid_non_s3_store_spec() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        let result = reconcile(Arc::new(cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert_eq!(
+            ctx.cluster_api.applies(),
+            vec![
+                (AppliedKind::ConfigMap, desired::config_map_name("demo")),
+                (AppliedKind::Service, desired::internal_service_name("demo")),
+                (AppliedKind::Service, desired::client_service_name("demo")),
+                (
+                    AppliedKind::NetworkPolicy,
+                    desired::network_policy_name("demo")
+                ),
+                (
+                    AppliedKind::PodDisruptionBudget,
+                    desired::pod_disruption_budget_name("demo")
+                ),
+                (AppliedKind::StatefulSet, "demo".to_string()),
+            ]
+        );
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(script.contains("--backup-store 'fs:/var/lib/animus/backups'"));
+        // No S3 credentials machinery for a non-S3 backupStore.
+        assert!(!script.contains("--s3-credentials"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_segment_store_cluster_literal() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.segment_store = Some("cluster".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+        // Reconciled as if segmentStore were unset: no --segment-store flag.
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(!script.contains("--segment-store"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_backup_store_path_outside_data_dir() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("fs:/tmp/backups".to_string());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_backup_store_conflicting_with_spec_s3() {
+        let mut cluster = test_cluster("demo", "ns1", 3, None);
+        cluster.spec.backup_store = Some("cluster".to_string());
+        cluster.spec.s3 = Some(valid_s3());
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_store_spec_still_applies_no_store_flags() {
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_STORE_SPEC_INVALID)
+        );
+        let cm = ctx
+            .cluster_api
+            .configmap(&desired::config_map_name("demo"))
+            .expect("configmap applied");
+        let script = cm
+            .data
+            .as_ref()
+            .unwrap()
+            .get(desired::cluster_config::ENTRYPOINT_FILE_NAME)
+            .unwrap();
+        assert!(!script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
+    }
+
+    // --- (9) PodDisruptionBudget (S-07c) -----------------------------------
+
+    #[tokio::test]
+    async fn reconcile_applies_a_poddisruptionbudget_owned_and_selecting_the_clusters_pods() {
+        let cluster = test_cluster("demo", "ns1", 3, None);
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::new(cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let pdb = ctx
+            .cluster_api
+            .poddisruptionbudget(&desired::pod_disruption_budget_name("demo"))
+            .expect("poddisruptionbudget applied");
+
+        let owner = &pdb.metadata.owner_references.as_ref().unwrap()[0];
+        assert_eq!(owner.name, "demo");
+        assert!(owner.controller.unwrap_or(false));
+
+        // The default 3-node/3-controlNode shape tolerates exactly 1.
+        let pdb_spec = pdb.spec.clone().unwrap();
+        assert_eq!(
+            pdb_spec.max_unavailable,
+            Some(IntOrString::Int(1)),
+            "{pdb_spec:?}"
+        );
+        assert_eq!(pdb_spec.min_available, None);
+
+        // Selector matches the *actual* StatefulSet builder's own pod
+        // template labels, not a second, independent call to the same
+        // label helper.
+        let cluster2 = test_cluster("demo", "ns1", 3, None);
+        let sts = desired::statefulset::build(&cluster2, &cluster2.spec);
+        let pod_labels = sts.spec.unwrap().template.metadata.unwrap().labels.unwrap();
+        let pdb_selector = pdb_spec.selector.unwrap().match_labels.unwrap();
+        for (k, v) in &pdb_selector {
+            assert_eq!(pod_labels.get(k), Some(v), "selector key {k:?} mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_exactly_one_poddisruptionbudget_per_reconcile() {
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+
+        let pdb_applies: Vec<_> = ctx
+            .cluster_api
+            .applies()
+            .into_iter()
+            .filter(|(k, _)| *k == AppliedKind::PodDisruptionBudget)
+            .collect();
+        assert_eq!(
+            pdb_applies.len(),
+            2,
+            "one per reconcile, re-applied each time"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_scale_down_recomputes_the_poddisruptionbudget_from_the_desired_spec() {
+        // A previous reconcile scaled this cluster to 5 replicas (RF
+        // plateaus at 3, so its own PDB would have carried
+        // maxUnavailable=1). Scaling down to 2 nodes/2 controlNodes — below
+        // MAX_REPLICATION_FACTOR — must recompute a *stricter* budget (0)
+        // from the new desired spec, never leave the stale, unsafe value
+        // the old (higher) node count would have implied.
+        let fake_cluster = FakeClusterApi::new();
+        fake_cluster.seed_statefulset("demo", 5, 5);
+        let ctx = make_ctx(fake_cluster, FakeAdminClient::new());
+
+        let cluster = Arc::new(test_cluster("demo", "ns1", 2, Some(2)));
+        let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let pdb = ctx
+            .cluster_api
+            .poddisruptionbudget(&desired::pod_disruption_budget_name("demo"))
+            .expect("poddisruptionbudget applied");
+        assert_eq!(
+            pdb.spec.unwrap().max_unavailable,
+            Some(IntOrString::Int(0)),
+            "a 2-node/2-controlNode cluster must block every voluntary eviction, \
+             not inherit the prior 5-node shape's budget"
         );
     }
 }

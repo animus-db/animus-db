@@ -1253,6 +1253,73 @@ async fn dashboard_u07_gc_card() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-07 (fourth and last route): the Storage tab's
+/// "Segment store" card, fed from each node's own `GET /admin/segment-store`
+/// — same render-only-markers-plus-live-round-trip structure as the earlier
+/// U-07 cards above. Like `/admin/ttl` (and unlike `/admin/backup-store`/
+/// `/admin/gc`), this route is genuinely per-node (its own `local_objects`/
+/// `local` fields differ per node), so this card is fed from
+/// `dashboard_core.js`'s existing PER-NODE fan-out
+/// (`STATE.nodes[*].segmentStore`), not a single SEED-only fetch. The
+/// actual placement/local-scan mechanics have their own coverage
+/// (`admin_endpoint.rs`'s
+/// `admin_segment_store_reports_shard_placement_and_local_objects`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u07_segment_store_card() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new card beside the GC card -------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="seg-store-card""#) && shell.contains(r#"id="seg-store-body""#),
+            "the shell carries the Segment store card: {shell}"
+        );
+
+        // ---- dashboard_storage.js renders it from the route's own shape ----
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        assert!(
+            storage_js.contains("function renderSegmentStore"),
+            "dashboard_storage.js renders the Segment store card: {storage_js}"
+        );
+        assert!(
+            storage_js.contains("n.segmentStore")
+                && storage_js.contains("segmentStore.shards")
+                && storage_js.contains("s.local_objects"),
+            "the card reads every field GET /admin/segment-store serves: {storage_js}"
+        );
+
+        // ---- dashboard_core.js fans it out per node, not a single SEED-only
+        //      fetch (this route's own local scan differs per node) --------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains(r#"getJSON(base, "/admin/segment-store")"#),
+            "dashboard_core.js fetches /admin/segment-store per node (base, not SEED): {core_js}"
+        );
+
+        // ---- the route itself serves from a live node -----------------------
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/segment-store").await;
+        assert_eq!(s, 200, "GET /admin/segment-store: {body}");
+        let v: Value = serde_json::from_str(&body).expect("segment-store view is JSON");
+        assert!(v.get("store").is_some(), "carries \"store\": {body}");
+        assert!(v.get("shards").is_some(), "carries \"shards\": {body}");
+        assert!(
+            v.get("local_objects").is_some(),
+            "carries \"local_objects\": {body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
 /// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
 /// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The

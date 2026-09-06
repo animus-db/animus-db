@@ -323,12 +323,52 @@ the production implementation; the deterministic implementation lives in
   orphaned, so a debug/sweep caller never mistakes a half-written temp file
   for a real segment.
 - **`assert_segment_store_contract` (`test_support.rs`) is the one place the
-  `SegmentStore` trait contract is pinned**, exercised against both
-  `FsSegmentStore` (this crate's own `#[tokio::test]`, real temp dir) and
+  `SegmentStore` trait contract is pinned**, exercised against
+  `FsSegmentStore` (this crate's own `#[tokio::test]`, real temp dir),
   `animus-sim`'s `SimSegmentStore` (a `#[test]` driven through the
-  simulator). Every id it writes is scoped under `"contract-test/"` and
+  simulator), and `S3SegmentStore` (below, against a fake transport — no
+  network). Every id it writes is scoped under `"contract-test/"` and
   cleaned up before returning, so it composes with a store a caller has
   already put other data into.
+- **`S3SegmentStore<T: animus_s3::client::Transport>` (`s3_store.rs`, S-04
+  PR 2, ADR 0059's 2026-09-06 amendment) is `FsSegmentStore`'s S3-backed
+  sibling** — opt-in via `--segment-store`/`--backup-store
+  s3://bucket[/prefix]?endpoint=...` (wired by `animusd`, a later PR at the
+  time this crate's own PR 1 shipped, done as of PR 2). Generic over
+  `T: Transport` (not concretely typed to `animus_s3::prod::
+  HyperRustlsTransport`) so the identical store type is exercised against
+  `animus_s3::fake::FakeS3` in this crate's own tests and the real
+  transport in production — `animusd` is the only crate that ever
+  constructs the concrete `S3SegmentStore<HyperRustlsTransport>` (the real
+  process boundary; this crate never touches a real S3 socket itself).
+  Gated behind the same `prod` feature as `FsSegmentStore`, pulling in
+  `animus-s3` as an optional dependency (with none of *its* own `fake`/
+  `prod` features — this crate needs only `animus_s3::client`'s
+  `Transport`-generic pieces; the `fake`/`prod` features are dev-dependency-
+  only, for this crate's own tests). **Object layout**: `[prefix/]{id}`
+  verbatim, no escaping — every character a production id can legally
+  contain is already a literal-safe S3 key byte, and `animus_s3::client::
+  S3Client` percent-encodes the wire/signing forms independently and
+  exactly once already (see that crate's own "Encode exactly once" doc).
+  **Write-once**, matching `FsSegmentStore::put`'s own shape exactly: a
+  `GET`-then-compare-then-`PUT` (real S3 has no built-in "put only if
+  absent" this client sends) — an identical-content re-put is a safe no-op
+  skipping the network `PUT`; a differing-content re-put is a hard `Err`
+  leaving the stored bytes untouched. **Retry**: a small, fixed, non-
+  configurable bounded retry (3 attempts, linear 100ms/attempt backoff) on
+  a transport failure or a `5xx` — never on a `4xx`/`NotFound`/
+  `AccessDenied`. **Not `Env`-generic** (mirrors `FsSegmentStore`'s own
+  concrete shape, deliberately — this store answers to no one component's
+  `Env`), so the retry backoff is a plain `tokio::time::sleep` and the
+  SigV4 request timestamp a plain `SystemTime::now()`, both under this
+  file's own module-level `#[allow(clippy::disallowed_methods)]` — the
+  identical real-I/O-boundary justification `prod.rs`'s own module-level
+  allow carries. `list` paginates via `ListObjectsV2`'s own continuation
+  token, capped at `LIST_PAGE_CAP` (10,000 pages) as a safety backstop
+  against a misbehaving endpoint, never truncating silently within that
+  bound. See `crates/animusd/CLAUDE.md`'s own S-04 entry for the `s3:` URI
+  shape, credential sourcing, and the insecure-HTTP gate `animusd`'s
+  `main.rs` enforces before this store is ever constructed.
 - **`Disk::link(src, dst)` (ADR 0058 rung 2) is a hard link, not a copy** —
   added specifically for `animus-storage`'s `LsmEngine::clone_to`, which
   needs to share an immutable SSTable file between a source engine and a
@@ -531,3 +571,18 @@ server_acceptor` imposes no client-cert requirement, unlike `acceptor`
 (mutual) on the exact same cert/key. `animusd`'s own `tests/tls_e2e.rs` is
 the real end-to-end regression net for this acceptor actually serving the
 client/dynamo/admin/console ports — see that crate's `CLAUDE.md`.
+
+**S-04 PR 2** adds `s3_store::tests` (also `prod`-feature-gated, also part
+of the same `cargo test -p animus-env --all-features` run): the load-bearing
+`contract_holds_against_the_fake_transport`/`contract_holds_with_a_
+configured_prefix` (`assert_segment_store_contract` against
+`S3SegmentStore<animus_s3::fake::FakeS3>` — no network at all) and
+`list_paginates_across_more_than_one_page` (a `FakeS3::with_page_size(2)`
+five-object list, proving this store's own `list` loop follows
+`next_continuation_token` rather than truncating at the first page).
+`tests/s3_segment_store_minio.rs` is the opt-in real-endpoint counterpart,
+mirroring `animus-s3`'s own `tests/minio_real_endpoint.rs` down to the exact
+`ANIMUS_S3_TEST_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`
+environment variables — unset, it prints a skip line and does nothing (never
+`#[ignore]`d), so this crate's own gates stay green with no MinIO/localstack
+infrastructure.

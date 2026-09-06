@@ -281,6 +281,22 @@ pub const DYNAMO_AUTH_FILE_NAME: &str = "credentials.json";
 /// requires).
 pub const TLS_MOUNT_DIR: &str = "/etc/animus/tls";
 
+/// The absolute in-container path `spec.s3`'s `credentialsSecretName`
+/// `Secret` is mounted at, read-only (S-04 PR 3) — carries two keys,
+/// `access_key_id`/`secret_access_key`, as separate files. Every pod mounts
+/// it, but only a combined-role pod's own `entrypoint.sh` branch reads it
+/// (see [`entrypoint_script`]'s own doc for why: `animusd data --config`
+/// accepts no S3-store flags today).
+pub const S3_MOUNT_DIR: &str = "/etc/animus/s3";
+/// The `--s3-credentials` JSON file `entrypoint.sh` writes at container
+/// start (S-04 PR 3) — a scratch path, not part of any mounted volume: it
+/// is built fresh from [`S3_MOUNT_DIR`]'s two files every time the
+/// container starts, never persisted, and never written by the operator
+/// itself (only the *script text* that builds it lives in the `ConfigMap`
+/// — the secret value itself is read out of the mounted `Secret` at
+/// runtime, inside the pod, see `crate::crd::S3StoreSpec`'s own doc).
+pub const S3_CREDENTIALS_RUNTIME_PATH: &str = "/tmp/animus-s3-credentials.json";
+
 /// The [`RoleAddrs::tls`] section every node gets when `spec.tls` is set —
 /// every field points into [`TLS_MOUNT_DIR`], the one `Secret` mounted
 /// identically on every pod.
@@ -306,9 +322,36 @@ pub fn tls_section() -> TlsSection {
 /// not just its usage-string doc comment — see this crate's `CLAUDE.md` for
 /// the full support table):
 /// - combined role (`animusd --config FILE --node I`, ordinals
-///   `< control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth`.
+///   `< control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth`,
+///   `--backup-store`/`--segment-store`/`--s3-credentials`/
+///   `--allow-insecure-s3` (S-04 PR 3, when `spec.s3` is set).
 /// - data role (`animusd data --config FILE --node I`, ordinals
 ///   `>= control_nodes`): `--dir`, `--ephemeral`, `--dynamo-auth`.
+///
+/// **`spec.s3` (S-04 PR 3) only ever reaches the combined branch** — a
+/// **pre-existing** `animusd` gap, not introduced here: `animusd data
+/// --config` accepts none of `--backup-store`/`--segment-store`/
+/// `--s3-credentials`/`--allow-insecure-s3` (see
+/// `crates/animusd/src/main.rs::run_data_config`'s own "same documented gap
+/// as `--backup-store`" comment). When set, the combined branch also gets a
+/// short preamble (before the `exec`) that reads `spec.s3`'s mounted
+/// `Secret` (`crate::crd::S3StoreSpec::credentials_secret_name`, mounted at
+/// [`S3_MOUNT_DIR`]) and writes a `--s3-credentials` JSON file at
+/// [`S3_CREDENTIALS_RUNTIME_PATH`] naming only the *path* to
+/// `secret_access_key` — the secret value itself never appears in this
+/// generated script, only a shell command that reads it at container-start
+/// time, inside the pod. `access_key_id` is read out of the same mount at
+/// runtime rather than baked into the `ConfigMap`, for the same reason,
+/// even though it's the less sensitive of the two (AWS access key ids are
+/// `[A-Za-z0-9]+`, so no JSON-escaping surprises from a well-formed one).
+///
+/// **`spec.backupStore`/`spec.segmentStore` (S-07b) — the non-S3
+/// `cluster`/`fs:`/`dir:` forms — share the same `--backup-store`/
+/// `--segment-store` flag emission as `spec.s3`'s own two fields above (see
+/// this function's body), same combined-branch-only reach, but need no
+/// credentials preamble and no new volume: a `fs:`/`dir:` path is required
+/// (`AnimusClusterSpec::validate_store_spec`) to live under
+/// [`DATA_DIR`], which every pod already has mounted.
 ///
 /// **No `--split-mode` flag is emitted on either branch**: the flag and the
 /// copy-based split workflow it selected were deleted outright
@@ -339,6 +382,7 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
 
     let mut both_flags = String::new();
     let mut data_flags = String::new();
+    let mut both_preamble = String::new();
 
     if ephemeral {
         both_flags.push_str(" --ephemeral");
@@ -349,6 +393,52 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
         both_flags.push_str(&flag);
         data_flags.push_str(&flag);
     }
+    if let Some(s3) = &spec.s3 {
+        // Read the mounted Secret's own two files at container-start time
+        // and write them into the small JSON file `--s3-credentials`
+        // wants. This keeps `secret_access_key`'s value out of the
+        // ConfigMap entirely (only a file path is embedded here);
+        // `access_key_id` is likewise read out of the mount at runtime,
+        // never baked into this generated script by the operator — see
+        // this function's own doc.
+        both_preamble.push_str(&format!(
+            "\x20\x20printf '{{\"access_key_id\":\"%s\",\"secret_access_key_file\":\"{S3_MOUNT_DIR}/secret_access_key\"}}' \"$(cat {S3_MOUNT_DIR}/access_key_id)\" > {S3_CREDENTIALS_RUNTIME_PATH}\n"
+        ));
+        both_flags.push_str(&format!(" --s3-credentials {S3_CREDENTIALS_RUNTIME_PATH}"));
+        if s3.allow_insecure_http {
+            both_flags.push_str(" --allow-insecure-s3");
+        }
+    }
+    // S-07b: `--backup-store`/`--segment-store`'s value comes from whichever
+    // of `spec.s3.{backup,segment}Store` (the `s3://...` form, credentials
+    // wired above) or the plain top-level `spec.{backup,segment}Store` (the
+    // non-S3 `cluster`/`fs:`/`dir:` forms, no credentials needed — the
+    // existing data-volume mount is all a `fs:`/`dir:` path needs) is set.
+    // The two are mutually exclusive per store, enforced by
+    // `AnimusClusterSpec::validate_store_spec` at reconcile time, so this
+    // function only ever sees at most one `Some` for each store.
+    let backup_store_value = spec
+        .s3
+        .as_ref()
+        .and_then(|s3| s3.backup_store.as_deref())
+        .or(spec.backup_store.as_deref());
+    if let Some(backup_store) = backup_store_value {
+        both_flags.push_str(&format!(
+            " --backup-store {}",
+            shell_single_quote(backup_store)
+        ));
+    }
+    let segment_store_value = spec
+        .s3
+        .as_ref()
+        .and_then(|s3| s3.segment_store.as_deref())
+        .or(spec.segment_store.as_deref());
+    if let Some(segment_store) = segment_store_value {
+        both_flags.push_str(&format!(
+            " --segment-store {}",
+            shell_single_quote(segment_store)
+        ));
+    }
 
     format!(
         "#!/bin/sh\n\
@@ -358,11 +448,24 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
          ord=\"${{HOSTNAME##*-}}\"\n\
          cfg=\"{CONFIG_MOUNT_DIR}/{CONFIG_FILE_NAME}\"\n\
          if [ \"$ord\" -lt {control_nodes} ]; then\n\
+         {both_preamble}\
          \x20\x20exec animusd --config \"$cfg\" --node \"$ord\" --dir {DATA_DIR}{both_flags}\n\
          else\n\
          \x20\x20exec animusd data --config \"$cfg\" --node \"$ord\" --dir {DATA_DIR}{data_flags}\n\
          fi\n"
     )
+}
+
+/// Single-quote `s` for safe embedding as one `sh` word — every
+/// `--backup-store`/`--segment-store` value is an operator-supplied
+/// `s3://...` URI whose own query string contains shell-special characters
+/// (`&`, `?`) that would otherwise be misinterpreted (`&` in particular
+/// would background the `exec` command). Escapes an embedded `'` the
+/// standard POSIX-shell way (`'\''`: close the quote, an escaped literal
+/// quote, reopen the quote) even though a well-formed S3 URI/query never
+/// contains one.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// The `dynamo_auth` field is intentionally absent from [`ClusterConfig`]
@@ -743,6 +846,11 @@ mod tests {
         "--seed",
         "--id",
         "--base-port",
+        // S-04 PR 3: `--s3-credentials`/`--allow-insecure-s3` reach only
+        // the combined branch, same as `--segment-store`/`--backup-store`
+        // above (see this function's own doc for the data-role gap).
+        "--s3-credentials",
+        "--allow-insecure-s3",
     ];
 
     #[test]
@@ -755,6 +863,16 @@ mod tests {
         s.dynamo_auth_secret_name = Some("my-dynamo-creds".to_string());
         s.quiesce_after_secs = Some(7);
         s.auto_split_bytes = Some(1_000_000);
+        s.s3 = Some(crate::crd::S3StoreSpec {
+            backup_store: Some(
+                "s3://bucket/backups?endpoint=http://minio.ns.svc:9000&insecure_http=true"
+                    .to_string(),
+            ),
+            segment_store: Some("s3://bucket/streams?endpoint=https://s3.example.com".to_string()),
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: true,
+            egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
+        });
         let script = entrypoint_script(&s);
 
         let mut unknown = Vec::new();
@@ -797,6 +915,209 @@ mod tests {
     fn entrypoint_omits_dynamo_auth_flag_when_secret_absent() {
         let script = entrypoint_script(&spec(3));
         assert!(!script.contains("--dynamo-auth"));
+    }
+
+    // --- `s3` (S-04 PR 3) --------------------------------------------------
+
+    fn s3_spec(
+        backup: Option<&str>,
+        segment: Option<&str>,
+        allow_insecure: bool,
+    ) -> crate::crd::S3StoreSpec {
+        crate::crd::S3StoreSpec {
+            backup_store: backup.map(str::to_string),
+            segment_store: segment.map(str::to_string),
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: allow_insecure,
+            egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
+        }
+    }
+
+    #[test]
+    fn entrypoint_omits_s3_credentials_and_store_flags_when_s3_unset() {
+        let script = entrypoint_script(&spec(3));
+        assert!(!script.contains("--s3-credentials"));
+        assert!(!script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
+        assert!(!script.contains("--allow-insecure-s3"));
+        assert!(!script.contains("/etc/animus/s3"));
+    }
+
+    #[test]
+    fn entrypoint_s3_flags_only_on_the_combined_branch() {
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket/backups?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        let script = entrypoint_script(&s);
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        assert!(both_branch.contains("--s3-credentials /tmp/animus-s3-credentials.json"));
+        assert!(both_branch.contains("--backup-store"));
+        assert!(
+            !data_branch.contains("--s3-credentials"),
+            "the data branch must never get an S3 flag — animusd data --config accepts none: {data_branch}"
+        );
+        assert!(!data_branch.contains("--backup-store"));
+    }
+
+    #[test]
+    fn entrypoint_writes_credentials_json_reading_the_mounted_secret_at_runtime() {
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        let script = entrypoint_script(&s);
+        // The generated script never contains a literal secret value — only
+        // shell commands that read the mounted Secret's own files at
+        // container-start time, and a *path* to the secret file.
+        assert!(script.contains("$(cat /etc/animus/s3/access_key_id)"));
+        assert!(script.contains("\"secret_access_key_file\":\"/etc/animus/s3/secret_access_key\""));
+        assert!(script.contains("> /tmp/animus-s3-credentials.json"));
+        // Never an inline secret_access_key value anywhere in the script.
+        assert!(!script.contains("secret_access_key\":\""));
+    }
+
+    #[test]
+    fn entrypoint_backup_and_segment_store_flags_are_shell_single_quoted() {
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket/backups?endpoint=https://s3.example.com&region=us-east-1"),
+            Some("s3://bucket/streams?endpoint=http://minio.ns.svc:9000&insecure_http=true"),
+            true,
+        ));
+        let script = entrypoint_script(&s);
+        assert!(script.contains(
+            "--backup-store 's3://bucket/backups?endpoint=https://s3.example.com&region=us-east-1'"
+        ));
+        assert!(script.contains(
+            "--segment-store 's3://bucket/streams?endpoint=http://minio.ns.svc:9000&insecure_http=true'"
+        ));
+    }
+
+    #[test]
+    fn entrypoint_allow_insecure_s3_flag_tracks_the_spec_field() {
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        assert!(!entrypoint_script(&s).contains("--allow-insecure-s3"));
+
+        s.s3.as_mut().unwrap().allow_insecure_http = true;
+        assert!(entrypoint_script(&s).contains("--allow-insecure-s3"));
+    }
+
+    #[test]
+    fn entrypoint_omits_backup_or_segment_store_flag_when_that_field_is_unset() {
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        let script = entrypoint_script(&s);
+        assert!(script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
+    }
+
+    // --- `backupStore`/`segmentStore` (S-07b) ------------------------------
+
+    #[test]
+    fn entrypoint_emits_backup_store_cluster_literal_on_combined_branch_only() {
+        let mut s = spec(3);
+        s.backup_store = Some("cluster".to_string());
+        let script = entrypoint_script(&s);
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        assert!(both_branch.contains("--backup-store 'cluster'"));
+        assert!(!data_branch.contains("--backup-store"));
+    }
+
+    #[test]
+    fn entrypoint_emits_backup_store_fs_path() {
+        let mut s = spec(3);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let script = entrypoint_script(&s);
+        assert!(script.contains("--backup-store 'fs:/var/lib/animus/backups'"));
+    }
+
+    #[test]
+    fn entrypoint_emits_segment_store_dir_path() {
+        let mut s = spec(3);
+        s.segment_store = Some("dir:/var/lib/animus/segments".to_string());
+        let script = entrypoint_script(&s);
+        assert!(script.contains("--segment-store 'dir:/var/lib/animus/segments'"));
+    }
+
+    #[test]
+    fn entrypoint_omits_backup_and_segment_store_flags_when_both_unset() {
+        let script = entrypoint_script(&spec(3));
+        assert!(!script.contains("--backup-store"));
+        assert!(!script.contains("--segment-store"));
+    }
+
+    #[test]
+    fn entrypoint_non_s3_backup_store_never_emits_s3_credentials_wiring() {
+        // A plain `fs:`/`cluster` backupStore needs no credentials Secret,
+        // no --s3-credentials flag, and no preamble reading /etc/animus/s3
+        // — only spec.s3 (a distinct field) triggers that machinery.
+        let mut s = spec(3);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        let script = entrypoint_script(&s);
+        assert!(!script.contains("--s3-credentials"));
+        assert!(!script.contains("--allow-insecure-s3"));
+        assert!(!script.contains("/etc/animus/s3"));
+    }
+
+    #[test]
+    fn entrypoint_prefers_spec_s3_store_value_over_top_level_field_when_only_s3_is_set() {
+        // Pure-builder sanity: this function has no knowledge of the
+        // controller-enforced mutual exclusion, so when only spec.s3 sets a
+        // store it alone drives the flag — the ordinary spec.s3 case,
+        // unaffected by the existence of the top-level field.
+        let mut s = spec(3);
+        s.s3 = Some(s3_spec(
+            Some("s3://bucket/backups?endpoint=https://s3.example.com"),
+            None,
+            false,
+        ));
+        let script = entrypoint_script(&s);
+        assert!(
+            script.contains("--backup-store 's3://bucket/backups?endpoint=https://s3.example.com'")
+        );
+    }
+
+    #[test]
+    fn entrypoint_backup_and_segment_store_flags_from_top_level_fields_are_accepted_by_animusd() {
+        let mut s = spec(4);
+        s.control_nodes = Some(2);
+        s.backup_store = Some("fs:/var/lib/animus/backups".to_string());
+        s.segment_store = Some("dir:/var/lib/animus/segments".to_string());
+        let script = entrypoint_script(&s);
+
+        let mut unknown = Vec::new();
+        for line in script.lines() {
+            for token in line.split_whitespace() {
+                if token.starts_with("--") && !ANIMUSD_ACCEPTED_FLAGS.contains(&token) {
+                    unknown.push(token.to_string());
+                }
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
+             script:\n{script}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_an_embedded_single_quote() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_single_quote("plain"), "'plain'");
     }
 
     // --- `tls` (ADR 0064 commit 3) ---------------------------------------

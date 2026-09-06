@@ -149,6 +149,125 @@ impl IssuerRef {
     }
 }
 
+/// `spec.s3` — S3-compatible object-store wiring for the cluster's backup
+/// and/or stream-segment stores (S-04 PR 3, closing `docs/roadmap.md`'s
+/// S-04 item; ADR 0059's 2026-09-06 amendment / "As-built: PR 2" note).
+/// Mirrors [`TlsSpec`]'s own precedent — a CRD section that only
+/// *references* a pre-existing `Secret` an operator user manages, never one
+/// this operator creates or writes to.
+///
+/// Either or both of `backupStore`/`segmentStore` may independently be set
+/// to an `s3://...` URI — the identical shape `animusd`'s own
+/// `--backup-store`/`--segment-store` flags accept
+/// (`crates/animusd/src/main.rs`'s `parse_s3_uri`, ADR 0059's As-built PR 2
+/// note). This crate does not depend on `animusd` (see this crate's own
+/// `CLAUDE.md`), so [`S3StoreSpec::validate`] only re-checks a minimal
+/// syntactic subset of that parser via [`crate::s3_uri::parse`] — see that
+/// module's own doc for exactly what is, and is not, re-verified here. At
+/// least one of the two store fields must be set.
+///
+/// Reaches only **combined-role** pods (`animusd --config FILE --node I`) —
+/// a **pre-existing** `animusd` gap, not introduced here: `animusd data
+/// --config FILE --node I` accepts neither `--backup-store`,
+/// `--segment-store`, `--s3-credentials`, nor `--allow-insecure-s3` today
+/// (see `crates/animus-operator/CLAUDE.md`'s CLI-flag-support table and
+/// `crates/animusd/src/main.rs::run_data_config`'s own "same documented gap
+/// as `--backup-store`" comment).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct S3StoreSpec {
+    /// `--backup-store` value for every combined-role pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_store: Option<String>,
+    /// `--segment-store` value for every combined-role pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_store: Option<String>,
+    /// Name of a pre-existing `Secret` (same namespace) holding two keys,
+    /// `access_key_id`/`secret_access_key` — this operator only ever
+    /// *references* it (mounted read-only at `/etc/animus/s3` on every
+    /// pod, `crate::desired::statefulset::build`), never creates or writes
+    /// one. A combined-role pod's own generated `entrypoint.sh` reads both
+    /// files at container-start time and writes a small `--s3-credentials`
+    /// JSON file naming only the *path* to `secret_access_key`
+    /// (`crate::desired::cluster_config::entrypoint_script`) — the secret
+    /// value itself is never copied into the `ConfigMap` or `cluster.json`,
+    /// only read out of the mounted `Secret` at runtime, inside the pod.
+    pub credentials_secret_name: String,
+    /// Whether a plain-`http://` `endpoint=` (`insecure_http=true` in
+    /// either store URI's own query string) is allowed. Defaults to
+    /// `false`; a URI setting `insecure_http=true` while this is `false` is
+    /// rejected by [`Self::validate`] — the same two-flag deliberate-opt-in
+    /// posture `animusd`'s own `--allow-insecure-s3` establishes
+    /// (`parse_s3_uri`'s "refused unless `--allow-insecure-s3` is also
+    /// given"), mirrored here since this field's only job is to become
+    /// that flag on the generated `entrypoint.sh`.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// CIDRs the generated `NetworkPolicy`'s egress section allows toward
+    /// the S3 endpoint's own port, in addition to the cluster's baseline
+    /// intra-cluster + DNS egress (`crate::desired::networkpolicy`).
+    /// Defaults to `["0.0.0.0/0"]`.
+    ///
+    /// **`NetworkPolicy` cannot express a hostname allowlist** — only IP
+    /// blocks — so this operator has no way to resolve `endpoint=...`'s
+    /// hostname into the right CIDR for you. **Narrow this list to your
+    /// object store's actual address range in any environment where
+    /// open-to-any-destination egress on that port is unacceptable** — see
+    /// `deploy/operator/example.yaml`'s own commented `s3:` section.
+    #[serde(default = "S3StoreSpec::default_egress_cidrs")]
+    pub egress_cidrs: Vec<String>,
+}
+
+impl S3StoreSpec {
+    #[must_use]
+    pub fn default_egress_cidrs() -> Vec<String> {
+        vec!["0.0.0.0/0".to_string()]
+    }
+
+    /// `Ok(())` iff: at least one of `backupStore`/`segmentStore` is set;
+    /// `credentialsSecretName` is non-empty; every set store URI has the
+    /// minimal shape [`crate::s3_uri::parse`] requires; and no set URI's
+    /// `insecure_http=true` without `allowInsecureHttp` also being `true`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backup_store.is_none() && self.segment_store.is_none() {
+            return Err(
+                "spec.s3: at least one of backupStore/segmentStore must be set".to_string(),
+            );
+        }
+        if self.credentials_secret_name.trim().is_empty() {
+            return Err("spec.s3.credentialsSecretName must not be empty".to_string());
+        }
+        for (field, value) in [
+            ("backupStore", &self.backup_store),
+            ("segmentStore", &self.segment_store),
+        ] {
+            if let Some(uri) = value {
+                let info =
+                    crate::s3_uri::parse(uri).map_err(|e| format!("spec.s3.{field}: {e}"))?;
+                if info.insecure_http && !self.allow_insecure_http {
+                    return Err(format!(
+                        "spec.s3.{field} {uri:?}: insecure_http=true requires \
+                         spec.s3.allowInsecureHttp=true"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for S3StoreSpec {
+    fn default() -> Self {
+        Self {
+            backup_store: None,
+            segment_store: None,
+            credentials_secret_name: String::new(),
+            allow_insecure_http: false,
+            egress_cidrs: Self::default_egress_cidrs(),
+        }
+    }
+}
+
 /// The client-facing `dynamo` port's `Service` configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientServiceSpec {
@@ -242,6 +361,38 @@ pub struct AnimusClusterSpec {
     /// shapes and how the resolved `Secret` is mounted/wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSpec>,
+    /// S3-compatible object-store wiring for the cluster's backup and/or
+    /// stream-segment stores (S-04 PR 3). `None` (default) leaves both
+    /// stores at their pre-existing default (`cluster`/`ClusterSegmentStore`)
+    /// or whatever `backupStore`/`segmentStore` below set instead.
+    /// See [`S3StoreSpec`]'s own doc for the two mutually-independent store
+    /// fields, the referenced credential `Secret`, and the egress CIDRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3StoreSpec>,
+    /// The **non-S3** `--backup-store` value for every combined-role pod
+    /// (S-07b, closing `docs/roadmap.md`'s S-07 item b — `spec.s3` above is
+    /// the CRD surface for an `s3://...` URI specifically). Accepts exactly
+    /// `"cluster"` (the default K-replicated store, spelled out — the same
+    /// literal keyword `animusd`'s own `--backup-store cluster` accepts) or
+    /// `"fs:<absolute path>"`, where `<path>` must live under the pod's own
+    /// data volume (`crate::desired::cluster_config::DATA_DIR`) to persist
+    /// — see [`AnimusClusterSpec::validate_store_spec`]. `None` (default)
+    /// leaves `--backup-store` unset, i.e. `animusd`'s own default
+    /// (`cluster`) — byte-for-byte the pre-S-07b behavior. Mutually
+    /// exclusive with `spec.s3.backupStore`: set at most one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_store: Option<String>,
+    /// The **non-S3** `--segment-store` value for every combined-role pod
+    /// (S-07b). Accepts only `"dir:<absolute path>"` with the same
+    /// under-`DATA_DIR` rule `backupStore` above uses — **`animusd`'s own
+    /// `--segment-store` has no `"cluster"` keyword at all** (omitting the
+    /// flag is the only way to select its default), so a literal
+    /// `"cluster"` here is rejected by [`Self::validate_store_spec`] rather
+    /// than silently treated as "omit the flag". `None` (default) leaves
+    /// `--segment-store` unset. Mutually exclusive with
+    /// `spec.s3.segmentStore`: set at most one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_store: Option<String>,
 }
 
 impl AnimusClusterSpec {
@@ -262,6 +413,130 @@ impl AnimusClusterSpec {
     #[must_use]
     pub fn control_nodes_or_default(&self) -> i32 {
         self.control_nodes.unwrap_or_else(|| self.nodes.min(3))
+    }
+
+    /// `Ok(())` iff `backupStore`/`segmentStore` (S-07b — the CRD surface
+    /// for the *non-S3* store forms `spec.s3` doesn't cover) are each
+    /// either unset or one of the literal values `animusd`'s own CLI
+    /// grammar accepts for that flag (`crates/animusd/src/main.rs`'s
+    /// `parse_backup_store`/`parse_segment_store`). This crate does not
+    /// depend on `animusd` (see this crate's own `CLAUDE.md`), so — same
+    /// posture as [`S3StoreSpec::validate`]/`crate::s3_uri::parse` — this
+    /// only re-checks the syntax those two parsers require, never their
+    /// full behavior:
+    ///
+    /// - `backupStore` accepts exactly `"cluster"` or `"fs:<path>"`.
+    /// - `segmentStore` accepts only `"dir:<path>"` — **`animusd`'s own
+    ///   `--segment-store` has no `"cluster"` keyword at all**
+    ///   (`parse_segment_store`'s own doc: omitting the flag is the *only*
+    ///   way to select its default), so a literal `"cluster"` here is
+    ///   rejected rather than silently treated as "omit the flag" — a
+    ///   copy-paste from `backupStore` fails loudly at reconcile time
+    ///   instead of at pod startup.
+    /// - Either field's `<path>` must be an absolute path under
+    ///   [`crate::desired::cluster_config::DATA_DIR`] — the one directory
+    ///   every pod actually has mounted (a `PersistentVolumeClaim` or,
+    ///   when `spec.storage.ephemeral` is set, an `emptyDir`); a path
+    ///   elsewhere on the container filesystem is never a sensible place
+    ///   to point a backup/segment store. **No new volume is mounted for
+    ///   this** — unlike `spec.s3`, `cluster`/`fs:`/`dir:` need no
+    ///   credentials, so the existing data-volume mount is the only one
+    ///   involved.
+    /// - An `s3://...` value in either field is rejected with a message
+    ///   pointing at `spec.s3` instead — only that section carries the
+    ///   credentials an S3 store needs.
+    /// - Setting the same store in both `spec.s3` and the corresponding
+    ///   top-level field is rejected as a conflict naming both.
+    pub fn validate_store_spec(&self) -> Result<(), String> {
+        Self::validate_backup_store(self.backup_store.as_deref())?;
+        Self::validate_segment_store(self.segment_store.as_deref())?;
+        if let Some(s3) = &self.s3 {
+            if s3.backup_store.is_some() && self.backup_store.is_some() {
+                return Err(
+                    "spec.backupStore and spec.s3.backupStore are both set — set only one \
+                     (spec.s3.backupStore for an s3:// URI, spec.backupStore for \
+                     `cluster`/`fs:<path>`)"
+                        .to_string(),
+                );
+            }
+            if s3.segment_store.is_some() && self.segment_store.is_some() {
+                return Err(
+                    "spec.segmentStore and spec.s3.segmentStore are both set — set only one \
+                     (spec.s3.segmentStore for an s3:// URI, spec.segmentStore for \
+                     `dir:<path>`)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_backup_store(value: Option<&str>) -> Result<(), String> {
+        let Some(v) = value else {
+            return Ok(());
+        };
+        if v == "cluster" {
+            return Ok(());
+        }
+        if v.starts_with("s3://") {
+            return Err(format!(
+                "spec.backupStore {v:?}: s3:// URIs go through spec.s3.backupStore, which \
+                 supplies the required credentials — this field only accepts `cluster` or \
+                 `fs:<path>`"
+            ));
+        }
+        match v.strip_prefix("fs:") {
+            Some(path) => Self::validate_store_path("backupStore", "fs:", v, path),
+            None => Err(format!(
+                "spec.backupStore {v:?}: must be exactly `cluster` or `fs:<absolute path>`"
+            )),
+        }
+    }
+
+    fn validate_segment_store(value: Option<&str>) -> Result<(), String> {
+        let Some(v) = value else {
+            return Ok(());
+        };
+        if v == "cluster" {
+            return Err(
+                "spec.segmentStore \"cluster\": --segment-store has no `cluster` keyword — \
+                 omit spec.segmentStore entirely to select the default cluster-replicated store"
+                    .to_string(),
+            );
+        }
+        if v.starts_with("s3://") {
+            return Err(format!(
+                "spec.segmentStore {v:?}: s3:// URIs go through spec.s3.segmentStore, which \
+                 supplies the required credentials — this field only accepts `dir:<path>`"
+            ));
+        }
+        match v.strip_prefix("dir:") {
+            Some(path) => Self::validate_store_path("segmentStore", "dir:", v, path),
+            None => Err(format!(
+                "spec.segmentStore {v:?}: must be exactly `dir:<absolute path>`"
+            )),
+        }
+    }
+
+    /// A `fs:`/`dir:` path must be absolute and live strictly under the
+    /// pod's own data volume ([`crate::desired::cluster_config::DATA_DIR`])
+    /// — never `DATA_DIR` itself, which is where `animusd --dir` puts the
+    /// storage engine's own on-disk files; a backup/segment store sharing
+    /// that exact root would mix its own objects in among them.
+    fn validate_store_path(field: &str, prefix: &str, raw: &str, path: &str) -> Result<(), String> {
+        if path.is_empty() || !path.starts_with('/') {
+            return Err(format!(
+                "spec.{field} {raw:?}: `{prefix}` must be followed by a non-empty absolute path"
+            ));
+        }
+        let data_dir_prefix = format!("{}/", crate::desired::cluster_config::DATA_DIR);
+        if !path.starts_with(&data_dir_prefix) {
+            return Err(format!(
+                "spec.{field} {raw:?}: path must be under the pod's data volume \
+                 ({data_dir_prefix}...) to persist — got {path:?}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -330,6 +605,16 @@ pub const CONDITION_DRAIN_FAILED: &str = "DrainFailed";
 /// Condition type name used when `spec.tls` sets both or neither of
 /// `secretName`/`certManager` — see [`TlsSpec::validate`].
 pub const CONDITION_TLS_SPEC_INVALID: &str = "TlsSpecInvalid";
+/// Condition type name used when `spec.s3` fails [`S3StoreSpec::validate`]
+/// (neither store set, an empty `credentialsSecretName`, a malformed store
+/// URI, or `insecure_http=true` without `allowInsecureHttp`).
+pub const CONDITION_S3_SPEC_INVALID: &str = "S3SpecInvalid";
+/// Condition type name used when `spec.backupStore`/`spec.segmentStore`
+/// fails [`AnimusClusterSpec::validate_store_spec`] (S-07b: a malformed
+/// value, a `segmentStore: "cluster"` literal, an `s3://...` value that
+/// belongs in `spec.s3` instead, or a conflict with `spec.s3`'s own store
+/// field).
+pub const CONDITION_STORE_SPEC_INVALID: &str = "StoreSpecInvalid";
 
 #[cfg(test)]
 mod tests {
@@ -422,5 +707,261 @@ mod tests {
         let json = serde_json::json!({ "name": "my-issuer" });
         let issuer_ref: IssuerRef = serde_json::from_value(json).unwrap();
         assert_eq!(issuer_ref.kind, "Issuer");
+    }
+
+    // --- S3StoreSpec (S-04 PR 3) ------------------------------------------
+
+    fn valid_s3_spec() -> S3StoreSpec {
+        S3StoreSpec {
+            backup_store: Some(
+                "s3://my-bucket/backups?endpoint=https://s3.example.com".to_string(),
+            ),
+            segment_store: None,
+            credentials_secret_name: "my-s3-creds".to_string(),
+            allow_insecure_http: false,
+            egress_cidrs: S3StoreSpec::default_egress_cidrs(),
+        }
+    }
+
+    #[test]
+    fn s3_spec_valid_when_backup_store_alone_is_set() {
+        assert!(valid_s3_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_valid_when_segment_store_alone_is_set() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = None;
+        s3.segment_store = Some("s3://bucket?endpoint=https://s3.example.com".to_string());
+        assert!(s3.validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_rejects_neither_store_set() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = None;
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("backupStore/segmentStore"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_empty_credentials_secret_name() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = String::new();
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("credentialsSecretName"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_blank_credentials_secret_name() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = "   ".to_string();
+        assert!(s3.validate().is_err());
+    }
+
+    #[test]
+    fn s3_spec_rejects_malformed_store_uri() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store = Some("not-an-s3-uri".to_string());
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("backupStore"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_insecure_http_without_allow_insecure_http() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store =
+            Some("s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string());
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("allowInsecureHttp"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_accepts_insecure_http_when_allowed() {
+        let mut s3 = valid_s3_spec();
+        s3.backup_store =
+            Some("s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true".to_string());
+        s3.allow_insecure_http = true;
+        assert!(s3.validate().is_ok());
+    }
+
+    #[test]
+    fn s3_spec_default_egress_cidrs_is_open_to_any_destination() {
+        assert_eq!(S3StoreSpec::default_egress_cidrs(), vec!["0.0.0.0/0"]);
+        assert_eq!(S3StoreSpec::default().egress_cidrs, vec!["0.0.0.0/0"]);
+    }
+
+    #[test]
+    fn s3_spec_json_round_trip_defaults_allow_insecure_http_and_egress_cidrs() {
+        let json = serde_json::json!({
+            "backupStore": "s3://bucket?endpoint=https://s3.example.com",
+            "credentialsSecretName": "creds"
+        });
+        let s3: S3StoreSpec = serde_json::from_value(json).unwrap();
+        assert!(!s3.allow_insecure_http);
+        assert_eq!(s3.egress_cidrs, vec!["0.0.0.0/0"]);
+        assert!(s3.validate().is_ok());
+    }
+
+    // --- backupStore/segmentStore (S-07b) ---------------------------------
+
+    fn spec_with_stores(backup: Option<&str>, segment: Option<&str>) -> AnimusClusterSpec {
+        AnimusClusterSpec {
+            nodes: 3,
+            backup_store: backup.map(str::to_string),
+            segment_store: segment.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn store_spec_unset_is_valid() {
+        assert!(
+            AnimusClusterSpec {
+                nodes: 3,
+                ..Default::default()
+            }
+            .validate_store_spec()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn store_spec_accepts_backup_store_cluster_literal() {
+        assert!(
+            spec_with_stores(Some("cluster"), None)
+                .validate_store_spec()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn store_spec_accepts_backup_store_fs_path_under_data_dir() {
+        assert!(
+            spec_with_stores(Some("fs:/var/lib/animus/backups"), None)
+                .validate_store_spec()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn store_spec_accepts_segment_store_dir_path_under_data_dir() {
+        assert!(
+            spec_with_stores(None, Some("dir:/var/lib/animus/segments"))
+                .validate_store_spec()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn store_spec_rejects_segment_store_cluster_literal() {
+        let err = spec_with_stores(None, Some("cluster"))
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("no `cluster` keyword"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_backup_store_malformed_value() {
+        let err = spec_with_stores(Some("nope"), None)
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("spec.backupStore"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_segment_store_malformed_value() {
+        let err = spec_with_stores(None, Some("nope"))
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("spec.segmentStore"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_backup_store_path_not_absolute() {
+        let err = spec_with_stores(Some("fs:relative/path"), None)
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_backup_store_path_outside_data_dir() {
+        let err = spec_with_stores(Some("fs:/tmp/backups"), None)
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("data volume"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_backup_store_path_equal_to_data_dir_root() {
+        // Must be a subdirectory, not animusd --dir's own root.
+        let err = spec_with_stores(Some("fs:/var/lib/animus"), None)
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("data volume"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_segment_store_path_outside_data_dir() {
+        let err = spec_with_stores(None, Some("dir:/tmp/segments"))
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("data volume"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_s3_uri_in_backup_store_pointing_at_spec_s3() {
+        let err = spec_with_stores(Some("s3://bucket?endpoint=https://s3.example.com"), None)
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("spec.s3"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_s3_uri_in_segment_store_pointing_at_spec_s3() {
+        let err = spec_with_stores(None, Some("s3://bucket?endpoint=https://s3.example.com"))
+            .validate_store_spec()
+            .unwrap_err();
+        assert!(err.contains("spec.s3"), "{err}");
+    }
+
+    #[test]
+    fn store_spec_rejects_conflict_with_spec_s3_backup_store() {
+        let mut spec = spec_with_stores(Some("cluster"), None);
+        spec.s3 = Some(valid_s3_spec());
+        let err = spec.validate_store_spec().unwrap_err();
+        assert!(
+            err.contains("spec.backupStore") && err.contains("spec.s3.backupStore"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn store_spec_rejects_conflict_with_spec_s3_segment_store() {
+        let mut spec = spec_with_stores(None, Some("dir:/var/lib/animus/segments"));
+        spec.s3 = Some(S3StoreSpec {
+            backup_store: None,
+            segment_store: Some("s3://bucket?endpoint=https://s3.example.com".to_string()),
+            ..valid_s3_spec()
+        });
+        let err = spec.validate_store_spec().unwrap_err();
+        assert!(
+            err.contains("spec.segmentStore") && err.contains("spec.s3.segmentStore"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn store_spec_allows_backup_store_alongside_spec_s3_segment_store_only() {
+        // No conflict: spec.s3 only sets segmentStore, the top-level field
+        // only sets backupStore — different stores, no overlap.
+        let mut spec = spec_with_stores(Some("cluster"), None);
+        spec.s3 = Some(S3StoreSpec {
+            backup_store: None,
+            segment_store: Some("s3://bucket?endpoint=https://s3.example.com".to_string()),
+            ..valid_s3_spec()
+        });
+        assert!(spec.validate_store_spec().is_ok());
     }
 }

@@ -34,6 +34,21 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              backupStore:
+                description: |-
+                  The **non-S3** `--backup-store` value for every combined-role pod
+                  (S-07b, closing `docs/roadmap.md`'s S-07 item b — `spec.s3` above is
+                  the CRD surface for an `s3://...` URI specifically). Accepts exactly
+                  `"cluster"` (the default K-replicated store, spelled out — the same
+                  literal keyword `animusd`'s own `--backup-store cluster` accepts) or
+                  `"fs:<absolute path>"`, where `<path>` must live under the pod's own
+                  data volume (`crate::desired::cluster_config::DATA_DIR`) to persist
+                  — see [`AnimusClusterSpec::validate_store_spec`]. `None` (default)
+                  leaves `--backup-store` unset, i.e. `animusd`'s own default
+                  (`cluster`) — byte-for-byte the pre-S-07b behavior. Mutually
+                  exclusive with `spec.s3.backupStore`: set at most one.
+                nullable: true
+                type: string
               basePort:
                 description: |-
                   The first of the six-port stride every pod binds
@@ -135,6 +150,83 @@ spec:
                     description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
+              s3:
+                description: |-
+                  S3-compatible object-store wiring for the cluster's backup and/or
+                  stream-segment stores (S-04 PR 3). `None` (default) leaves both
+                  stores at their pre-existing default (`cluster`/`ClusterSegmentStore`)
+                  or whatever `backupStore`/`segmentStore` below set instead.
+                  See [`S3StoreSpec`]'s own doc for the two mutually-independent store
+                  fields, the referenced credential `Secret`, and the egress CIDRs.
+                nullable: true
+                properties:
+                  allowInsecureHttp:
+                    default: false
+                    description: |-
+                      Whether a plain-`http://` `endpoint=` (`insecure_http=true` in
+                      either store URI's own query string) is allowed. Defaults to
+                      `false`; a URI setting `insecure_http=true` while this is `false` is
+                      rejected by [`Self::validate`] — the same two-flag deliberate-opt-in
+                      posture `animusd`'s own `--allow-insecure-s3` establishes
+                      (`parse_s3_uri`'s "refused unless `--allow-insecure-s3` is also
+                      given"), mirrored here since this field's only job is to become
+                      that flag on the generated `entrypoint.sh`.
+                    type: boolean
+                  backupStore:
+                    description: '`--backup-store` value for every combined-role pod.'
+                    nullable: true
+                    type: string
+                  credentialsSecretName:
+                    description: |-
+                      Name of a pre-existing `Secret` (same namespace) holding two keys,
+                      `access_key_id`/`secret_access_key` — this operator only ever
+                      *references* it (mounted read-only at `/etc/animus/s3` on every
+                      pod, `crate::desired::statefulset::build`), never creates or writes
+                      one. A combined-role pod's own generated `entrypoint.sh` reads both
+                      files at container-start time and writes a small `--s3-credentials`
+                      JSON file naming only the *path* to `secret_access_key`
+                      (`crate::desired::cluster_config::entrypoint_script`) — the secret
+                      value itself is never copied into the `ConfigMap` or `cluster.json`,
+                      only read out of the mounted `Secret` at runtime, inside the pod.
+                    type: string
+                  egressCidrs:
+                    default:
+                    - 0.0.0.0/0
+                    description: |-
+                      CIDRs the generated `NetworkPolicy`'s egress section allows toward
+                      the S3 endpoint's own port, in addition to the cluster's baseline
+                      intra-cluster + DNS egress (`crate::desired::networkpolicy`).
+                      Defaults to `["0.0.0.0/0"]`.
+
+                      **`NetworkPolicy` cannot express a hostname allowlist** — only IP
+                      blocks — so this operator has no way to resolve `endpoint=...`'s
+                      hostname into the right CIDR for you. **Narrow this list to your
+                      object store's actual address range in any environment where
+                      open-to-any-destination egress on that port is unacceptable** — see
+                      `deploy/operator/example.yaml`'s own commented `s3:` section.
+                    items:
+                      type: string
+                    type: array
+                  segmentStore:
+                    description: '`--segment-store` value for every combined-role pod.'
+                    nullable: true
+                    type: string
+                required:
+                - credentialsSecretName
+                type: object
+              segmentStore:
+                description: |-
+                  The **non-S3** `--segment-store` value for every combined-role pod
+                  (S-07b). Accepts only `"dir:<absolute path>"` with the same
+                  under-`DATA_DIR` rule `backupStore` above uses — **`animusd`'s own
+                  `--segment-store` has no `"cluster"` keyword at all** (omitting the
+                  flag is the only way to select its default), so a literal
+                  `"cluster"` here is rejected by [`Self::validate_store_spec`] rather
+                  than silently treated as "omit the flag". `None` (default) leaves
+                  `--segment-store` unset. Mutually exclusive with
+                  `spec.s3.segmentStore`: set at most one.
+                nullable: true
+                type: string
               storage:
                 default: {}
                 description: Data volume configuration.

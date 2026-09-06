@@ -62,7 +62,9 @@ deliberately did **not** get one — its replica-repair phase is real
 placement/membership orchestration (a live `tokio::time::sleep`), not a
 thin delegation — and stays under the package-level allow along with
 `admin`, `backup_capture`, `backup_restore`, `client_ctx_host`, `console`,
-`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, and `http`. Ten
+`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, `http`, and
+`import` (ADR 0068 §6, S-05 PR 2 — a real per-tablet `tokio::time::sleep`
+loop, `backup_restore`'s own twin, not a thin delegation either). Ten
 modules now carry the narrower `#[deny(...)]`: the original five (`schema`,
 `read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus these five.
 
@@ -762,6 +764,32 @@ reusing the captured config is the point of the test.
   card, `#gc-card`/`#gc-body`, fed from `STATE.gc` — a single SEED-only
   fetch like `/admin/backup-store`'s own card, since this janitor is
   control-plane-leader-only too, never `/admin/ttl`'s per-node fan-out).
+  **A sibling route, `GET /admin/segment-store` (ADR 0043 §A7b, roadmap
+  U-07's fourth and last route), reports the STORE's own state rather than
+  this janitor's** — this node's configured segment store (redacted), the
+  shard→replica placement every sealed `stream_shards` row was given
+  (`StreamShardRow::replicas`, populated once, at seal time, by
+  `ClusterSegmentStore::put_replicated`'s own placement selection — `null`
+  for the single-shared-directory `fs` opt-in, which has no per-node
+  replica concept), and a bounded live local object-count/byte scan
+  (`SegmentStoreHandle::list_local`/`get_local`, mirroring `/admin/
+  backup-store`'s own scan). No new progress type or capability trait —
+  `admin.rs::segment_store_view` (`animus_node::host::AdminHost::
+  segment_store_view`) reads durable replicated state plus a local scan,
+  never a loop's own phase. Renders on the Storage tab beside the TTL
+  reaper and GC cards (`dashboard_storage.js`'s "Segment store" card,
+  `#seg-store-card`/`#seg-store-body`), fed from `dashboard_core.js`'s
+  existing PER-NODE `loadAll()` fan-out (`STATE.nodes[*].segmentStore`) —
+  like `/admin/ttl`, since this route's own `local_objects`/`local` fields
+  are genuinely per-node facts. **This closes docs/roadmap.md's whole
+  U-07 section.** Regression: `tests/admin_endpoint.rs::
+  admin_segment_store_reports_shard_placement_and_local_objects` (a real
+  3-node cluster with the default `cluster` store — create a streamed
+  table, write, wait for the write to seal, poll converged-or-timeout
+  until some node's own route shows `local_objects.count >= 1`, then until
+  every node reports the identical, non-empty shard→replica placement) and
+  `admin_segment_store_reports_null_shards_for_the_fs_kind`, plus
+  `tests/dashboard_endpoint.rs::dashboard_u07_segment_store_card`.
   Regression: `tests/admin_endpoint.rs::
   admin_gc_reports_segment_janitor_progress_and_leader_state` (a real
   3-node streamed cluster with a generous 600s retention — proving the
@@ -1747,6 +1775,18 @@ flag) is a hard startup error (`apply_dynamo_auth_flag`) — never a silent
 precedence rule. Not accepted by `join`/`control` (a control-only node never
 binds the dynamo listener). Omitted (the default), auth stays disabled —
 byte-identical to pre-ADR-0057 behavior.
+
+**`--segment-store`/`--backup-store s3://bucket[/prefix]?endpoint=...&region=...
+[&path_style=true][&insecure_http=true]` (S-04 PR 2)** — an S3-compatible
+bucket in place of the default `cluster`/`fs:PATH` opt-ins; see this file's
+own Gotchas entry (grep "S-04 PR 2") for the full design. Needs
+`--s3-credentials PATH` (a standalone JSON credentials file — never a
+`ClusterConfig` field) or the `ANIMUS_S3_ACCESS_KEY_ID`/
+`ANIMUS_S3_SECRET_ACCESS_KEY` environment variables; a plaintext
+`insecure_http=true` endpoint needs `--allow-insecure-s3` too unless it's
+loopback. Reaches `run` (`--config`/`--node` and `--cluster N`) and
+`run_control` — the same two entry points `--segment-store`/
+`--backup-store` themselves already reached before this PR.
 
 **`--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01 commit
 2)** — this **one process's own** TLS material: all three or none (the
@@ -3879,6 +3919,111 @@ ADR itself for the full design/rationale.
   (W-10)**: `--segment-store`/`--backup-store` now thread through it
   exactly as they do through `--config`/`--node` and `--cluster N`
   (`main.rs`'s `run_control` → `run_node_control_with_stores`).
+- **Both stores gained a real S3 backend (S-04 PR 2, ADR 0059's 2026-09-06
+  amendment)** — `SegmentStoreConfig`/`BackupStoreConfig` each gained an
+  `S3(S3StoreConfig)` variant (`lib.rs`), selected by `--segment-store`/
+  `--backup-store s3://bucket[/prefix]?endpoint=scheme://host[:port]
+  &region=region[&path_style=true][&insecure_http=true]`
+  (`main.rs`'s `parse_s3_uri`, shared verbatim by `parse_segment_store`/
+  `parse_backup_store`). `SegmentStoreHandle`/`BackupStoreHandle`'s own new
+  `S3` variant holds `Arc<dyn animus_env::SegmentStore>` — a trait object,
+  not the concrete `animus_env::S3SegmentStore<animus_s3::prod::
+  HyperRustlsTransport>` production actually constructs (`s3_segment_store`,
+  `lib.rs`) — specifically so an in-crate test (`s3_store_handle_tests`,
+  below) can build the identical variant over `animus_s3::fake::FakeS3`
+  with no change to either enum's shape; every other variant (`Cluster`/
+  `Fs`) is handled identically for `S3` in every method (no per-node
+  replica concept — "ask any node," the same signal `Fs` already sends).
+  `build_segment_store`/`build_backup_store` became fallible
+  (`std::io::Result<..>`, `?`-propagated at their 3 call sites in `lib.rs`)
+  purely for the `S3` arm's own `HyperRustlsTransport::new()`/
+  `new_allow_insecure_http()` construction, which can fail only if a
+  *different* rustls crypto provider is already installed process-wide
+  (never actually possible in this process — nothing else in `animusd`
+  installs one — but propagated rather than `.expect()`ed, per this repo's
+  no-panic-on-a-remote-possibility discipline).
+
+  **Credentials are deliberately NOT a `ClusterConfig` field** — see this
+  file's own `config.rs` entry above for why a new field there means a
+  compiler-enumerated ~55-60-call-site `error[E0063]` fan-out across every
+  `ClusterConfig { .. }` literal in `src/`+`tests/`; a feature whose own ADR
+  already specifies "static, file/env-sourced, no cluster-wide semantics"
+  credentials had no reason to pay that cost. Instead: `--s3-credentials
+  PATH` (a standalone JSON file, `main.rs::S3CredentialsFile` —
+  `{"access_key_id": "...", "secret_access_key_file": "..."}` or
+  `{"access_key_id": "...", "secret_access_key_env": "VAR"}`, exactly one
+  of the two secret sources, mirroring ADR 0064's `tls` section's own
+  cert/key-**path** precedent rather than `dynamo_auth`'s in-`ClusterConfig`
+  static-map one), falling back to the `ANIMUS_S3_ACCESS_KEY_ID`/
+  `ANIMUS_S3_SECRET_ACCESS_KEY` environment variables
+  (`main.rs::resolve_s3_credentials`) when the flag is omitted. Resolved
+  **once** per process (`run`/`run_control`, before either
+  `parse_segment_store`/`parse_backup_store` call) and passed to both —
+  an `s3://` store with no credential resolvable anywhere is a startup
+  error naming both sourcing options, never a panic; a process with
+  neither store set to `s3://` never even attempts resolution's own
+  fs/env reads to fail on. `--s3-credentials`/`--allow-insecure-s3` (next
+  paragraph) reach `run` (`--config`/`--node` and `--cluster N`) and
+  `run_control` — the same two entry points `--segment-store`/
+  `--backup-store` themselves reach; not `run_data`/`join`/
+  `--cluster-control`+`--cluster-data`, the identical documented gap those
+  two flags already have on those entry points.
+
+  **The insecure-HTTP gate is enforced entirely inside `parse_s3_uri`,
+  at parse time**: `endpoint`'s own `http://`/`https://` prefix must agree
+  with the URI's `insecure_http` query key (an `http://` endpoint always
+  needs `insecure_http=true` and vice versa — this never infers a TLS
+  decision from the scheme string alone, so a copy-pasted `http://` can't
+  silently downgrade a production config), and `insecure_http=true` against
+  a non-loopback host (`is_loopback_host` — a conservative literal
+  `localhost`/`127.0.0.0/8`/`::1` match, never a DNS resolution) is refused
+  unless `--allow-insecure-s3` is also given. `path_style=false`
+  (virtual-hosted addressing) is rejected as unimplemented — this client
+  only ever addresses path-style — rather than silently ignored.
+
+  **Admin surface**: `GET /admin/segment-store`/`GET /admin/backup-store`
+  render `"kind": "s3"` with a `location` of `s3://bucket[/prefix]@host`
+  (host only — no query string, no credentials, ever) through the
+  pre-existing `StoreView`/`redact_store_location` machinery — the `S3` arm
+  of `StoreView`'s two `From` impls (`s3_store_location`/`s3_endpoint_host`,
+  `lib.rs`) is the only admin-side code this needed, since both routes
+  already project every store kind through that one type.
+
+  **Testing**: `main.rs`'s own `tests` module gained the URI-shape/
+  credential/insecure-http-gate matrix (accepted-well-formed, missing
+  endpoint/bucket/credentials, http-without-insecure_http, insecure_http
+  against loopback vs. non-loopback with/without `--allow-insecure-s3`,
+  `path_style=false`, an unknown query key, and `S3CredentialsFile`'s own
+  file/env resolution) directly on `parse_segment_store`/`parse_backup_store`/
+  `resolve_s3_credentials`. `lib.rs`'s own `s3_store_view_tests` (in-crate,
+  needs no private access — could have lived in `tests/` but sits beside
+  `redact_store_location_tests` for locality) asserts the admin-surface
+  rendering never leaks the credential, string-searching the rendered
+  location the same way `admin_config_reports_auth_state_and_never_
+  serves_the_secret` does. **`lib.rs`'s own `s3_store_handle_tests`
+  is this PR's end-to-end proof, deliberately scoped smaller than a live-
+  node e2e** — it needs `BackupStoreHandle`/`SegmentStoreHandle`'s
+  `pub(crate)` visibility (no external `tests/*.rs` file can reach them,
+  the identical reason `simenv_client_ctx_tests` lives here too), and
+  builds a real `BackupStoreHandle::S3`/`SegmentStoreHandle::S3` directly
+  over `animus_s3::fake::FakeS3` (no real sockets, `animus-s3`'s `fake`
+  feature — this crate's own `[dev-dependencies]` entry), then drives the
+  exact `put`/`put_sealed`/`list_local`/`get_local`/`get_any`/`delete_local`
+  methods `backup_capture.rs`/`backup_janitor.rs`/`admin.rs` call in
+  production. **What this deliberately does NOT do**: stand up a full
+  running `Node` with an injected transport and drive `CreateBackup`/
+  `DeleteBackup` over the real DynamoDB wire — that would need either
+  widening `BackupStoreHandle`'s visibility to `pub` (a public-API change
+  this PR didn't need) or a second, parallel node-construction entry point
+  accepting a pre-built handle instead of a `BackupStoreConfig` (a
+  materially larger change to `spawn_common_tail`'s own call chain); a
+  live-node fake-transport e2e is a reasonable follow-up, not required for
+  this PR's own correctness claim, which rests on the handle-level proof
+  above being the identical code path the wire-level operations call
+  through. See `crates/animus-env/CLAUDE.md`'s own `S3SegmentStore` entry
+  for the store's own object-layout/write-once/retry design and
+  `docs/adr/0059-backup-restore.md`'s "As-built: PR 2" amendment for the
+  full account.
 - **`backup_capture.rs`** (ADR 0059 §4/§5/§6, Train 1 PR③) — the on-demand
   backup **capture driver**: a per-tablet, leader-side, event-driven loop
   (`backup_capture_loop`, the same "run everywhere, self-gate per tablet on
@@ -4168,6 +4313,258 @@ ADR itself for the full design/rationale.
   `tests/split_placing_completion.rs` stays green, unmodified, and is now
   a stronger proof than before: it demonstrates this loop actually firing
   under the corrected upstream mechanism.
+- **`dynamo.rs`'s `ExportTableToPointInTime`/`DescribeExport`/`ListExports`
+  (ADR 0068, S-05 PR 1)** — a single leader-driven **export job**, run once
+  on whichever node received the wire request (`create_export` proposes
+  `MetaCommand::BeginExport`, mints a `CREATE_EXPORT_ID_ATTEMPTS`-bounded
+  fresh `ExportId`/ARN via `wire::export_arn`, then `tokio::spawn`s
+  `run_export_job` — permitted here since `dynamo.rs` is **not** one of the
+  ten `#[deny(clippy::disallowed_methods)]` modules the root `CLAUDE.md`
+  lists), deliberately **not** the backup catalog's per-tablet
+  leader-side-capture-plus-completion-aggregator shape (ADR 0059 §4/§5) —
+  see ADR 0068 §1 for the full reasoning: an export's payload is
+  base-rows-only DynamoDB JSON with no restore-back-into-cluster need, and
+  `ctx.cp_scan` (the same primitive `Scan` itself uses) already fans out
+  across a table's tablets and tolerates a concurrent split transparently,
+  so one job needs no per-tablet progress catalog at all. **Known
+  residual, stated plainly rather than silently shipped**: this buys no
+  crash-resumability — a node crash mid-export leaves the row `InProgress`
+  forever (no janitor reclaims it in this PR; PR 2/3 territory).
+  `create_export`'s `ClientRequestToken` idempotency (`Metadata::
+  export_by_client_token`) returns the existing export's description on a
+  retried token rather than minting a second job. `validate_export_time`
+  checks an `ExportTime` request against `Metadata::pitr_restore_window`
+  (reused verbatim from the PITR restore validation, `InvalidExportTimeException`
+  outside the window or with no PITR history at all) — **but the export's
+  own content is always current-state, never actually replayed to that
+  point in time** (a true point-in-time replay would need adapting
+  `backup_restore.rs`'s PITR segment-replay machinery, out of scope for
+  this PR and named as ADR 0068 §9's "Known residual #2" rather than
+  silently shipped as if fully correct).
+
+  **`run_export_job_inner`'s object layout** (constants `EXPORT_MANIFEST_ROOT
+  = "AWSDynamoDB"`, `EXPORT_CHUNK_ROWS = 1000`, mirroring AWS's own real
+  export layout closely enough for the e2e test's own round-trip
+  assertions, not byte-for-byte AWS-identical): under
+  `AWSDynamoDB/<export-id-suffix>/`, a `_started` marker object (written
+  first, before any data — a crash-detection breadcrumb, unused by
+  anything in this PR itself), one gzip'd `data/NNNN.json.gz` object per
+  `EXPORT_CHUNK_ROWS`-row chunk (`{"Item": <DynamoDB JSON>}` lines,
+  `wire::encode_item`/`decode_stored_item` — a tombstone value decodes to
+  `None` and is skipped, never exported as a row), `manifest-files.json`
+  (one line per data file: `itemCount`/`md5Checksum`/`etag`/
+  `dataFileS3Key` — `md5Checksum`/`etag` are **CRC32 stand-ins**
+  (`crc32_hex`, reusing the already-present `crc32fast` workspace
+  dependency rather than adding a real MD5 crate for two fields nothing in
+  this PR itself re-verifies), a documented simplification, not a
+  correctness claim), and `manifest-summary.json` written **last** (after
+  every data file — durable-before-visible discipline: a reader should
+  never see a summary pointing at data files that might not exist yet).
+  `gzip_bytes` uses `flate2`'s pure-Rust `rust_backend`/miniz_oxide feature
+  (new workspace dependency, `Cargo.toml`'s own comment explains the
+  no-C-FFI choice mirrors the `lz4_flex` precedent for this workspace's
+  `unsafe_code = "forbid"` posture).
+
+  **Customer-bucket store configuration and injection**: `ExportS3Config`
+  (`endpoint`/`region`/`insecure_http`/`credentials`) is this node's own
+  resolved ability to *reach* S3 at all (from `--export-s3-endpoint`/
+  `--export-s3-region`, reusing the existing `--s3-credentials`/
+  `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` credential
+  resolution `--segment-store`/`--backup-store s3://...` already
+  established, S-04) — **not** which bucket a given export targets, which
+  is per-request (`S3Bucket`/`S3Prefix` on the wire call itself, the
+  "distinct wire model" ADR 0059 §1 deferred this whole feature over).
+  `ExportStoreFactory = Arc<dyn Fn(&str, Option<&str>) -> io::Result<
+  Arc<dyn animus_env::SegmentStore>> + Send + Sync>` is the seam: given a
+  bucket + optional prefix, build a store handle for it.
+  `default_export_store_factory(export_s3: Option<ExportS3Config>)` is the
+  production factory — `None` (no `--export-s3-endpoint`/`--export-s3-region`
+  configured on this node) makes every export attempt fail immediately
+  with a plain, named startup-shaped error ("S3 export is not configured on
+  this node"), never a panic. Stored on `ClientCtx::export_store_factory:
+  Arc<Mutex<ExportStoreFactory>>` (swappable in place, so every
+  already-cloned per-connection `ClientCtx` sharing the `Arc` sees a
+  replacement) and mirrored on `Node`, with a genuinely **`pub`** (not
+  `#[cfg(test)]`-gated) `Node::set_export_store_factory` — needed because
+  `ClientCtx` is `pub(crate)` and a `#[cfg(test)]`-gated field/method is
+  invisible to an external `tests/*.rs` integration binary (which links
+  against the plain, non-test-cfg library); this is the one production
+  method whose sole purpose is a test injection point, mirrored on `Node`
+  rather than reusing the existing `#[cfg(test)] test_ctx` pattern for
+  exactly that reason. **CLI reach is deliberately narrow, the same
+  documented-gap shape `--dynamo-auth`/`--segment-store` already have**:
+  `--export-s3-endpoint`/`--export-s3-region` thread through
+  `main.rs::resolve_export_s3` → `run_single` → `run_node_with_cluster_
+  settings` → `run_node_with_streams_quiesce_and_ttl_sweep_interval` →
+  `BoundNode::start_with_growth` → `spawn_common_tail`'s trailing
+  `export_s3` parameter — reaching **only** `--config FILE --node I`;
+  every other entry point (`--cluster N`, `--cluster-control`/
+  `--cluster-data`, `animusd control`, `animusd data`, `animusd join`)
+  passes `None` and never provisions export capability via CLI at all
+  (`crates/animusd/tests/dynamo_export.rs` never needs the CLI path either
+  way — it injects a fake store factory directly via
+  `Node::set_export_store_factory`, bypassing CLI/S3 credentials
+  entirely).
+
+  Regression: `tests/dynamo_export.rs` — a shared `FakeS3` (wrapped in a
+  test-local `SharedFakeS3(Arc<FakeS3>)` `Transport` newtype, since
+  `animus_s3::fake::FakeS3` itself is not internally `Arc`-shared/`Clone`,
+  so every node's own factory call and the test's own verification reads
+  must share one externally-held `Arc` to see the same bucket) installed
+  on every node of a real 3-node cluster: a full export issued against a
+  **follower** node, with a real forced split mid-scan, converges to
+  `COMPLETED` and every one of 30 written items round-trips through the
+  gzip'd data files back to `animus_dynamo::wire::decode_item`; `ListExports`
+  with/without a `TableArn` filter; `ClientRequestToken` idempotency;
+  unknown-table/unknown-export errors; `ION`/`INCREMENTAL_EXPORT`
+  rejection; and an `ExportTime` request against a table with no PITR
+  history rejecting `InvalidExportTimeException`.
+- **`dynamo.rs`'s `ImportTable`/`DescribeImport`/`ListImports` +
+  `import.rs`'s driver (ADR 0068 §6, S-05 PR 2)** — the mirror-image data
+  flow of the export trio just above: reads a customer S3 bucket's
+  DynamoDB JSON export layout (this adapter's own, or real AWS's) back
+  into a **brand-new** table. Modeled on **both** the export catalog (an
+  ARN-shaped `ImportId`, no delete/reclaim command, `is_relayable_command`
+  for all three `MetaCommand`s since the job may run on any node) and the
+  restore driver (`crate::backup_restore`, a per-tablet leader-side
+  event-driven loop, `KvCommand::SeedBatch`, a single `Building`
+  destination tablet that keeps the target unroutable to an ordinary
+  client write until the import completes — the same mechanism a restore
+  target uses, reused rather than inventing a new tablet state, GSIs
+  resolved at `IndexStatus::Creating` but declared only at completion).
+  **Deliberately not folded into `backup_restore.rs` itself** — see
+  `import.rs`'s own module doc for why it's a sibling module instead (a
+  different source shape needing real item→row *derivation*
+  (`kind_writes_for_item`, the identical primitive PITR replay uses)
+  rather than restore's own "re-wrap already-physical captured bytes"
+  merge, and a fixed constant seed version rather than a captured
+  real one).
+
+  `dynamo::create_import` (ADR 0068 §6): `ClientToken` idempotency first
+  (`Metadata::import_by_client_token` — **not** scoped by table, unlike
+  export's `(table, token)` pair, since a retried `ImportTable` names the
+  same target table by construction), then `provision_import_target`
+  commits the target schema through the **identical** `CreateTable`
+  decode/validation helpers (`decode_key_schema`/`decode_attribute_types`/
+  `decode_indexes`/`decode_create_table_throughput`/
+  `check_attribute_definitions`, via the new
+  `wire::TableCreationParameters` type) so schema validation, GSIs, and
+  throughput behave identically to an ordinary `CreateTable` — a name
+  already registered (a real pre-existing table, **or** another import
+  already claiming it, since `BeginImport` proposes this same
+  `CreateTableSchema` before minting its own row) is
+  `ImportConflictException`, real DynamoDB's own code for both cases, and
+  this is the entire "one import per target name at a time" enforcement
+  (no separate concurrency check). `finish_import_kickoff` then mints the
+  destination tablet + `BeginImport` row and returns immediately —
+  asynchronous, like restore.
+
+  `import.rs`'s `import_tick` (once per `IMPORT_TICK_INTERVAL` per led
+  tablet, no durable cursor — safe to re-sweep on retry because every
+  seeded row carries the fixed `IMPORT_SEED_VERSION`, and
+  `SeedBatch`'s merge-at-carried-version only applies a *strictly newer*
+  version, `animus-storage`'s own `merge` contract): resolves
+  `manifest-summary.json` via `ctx.export_store_factory` (the identical
+  seam the export job uses — kept as one shared name rather than renamed,
+  a deliberate no-op decision), supporting **both** of DynamoDB's own
+  `S3KeyPrefix` shapes (the level above the export's own `AWSDynamoDB/<id>/`
+  folder, listed; or the export folder itself, direct — `rebase_recorded_key`
+  rewrites the manifest's own recorded keys in the second case, since this
+  adapter's own export writes them relative to whatever store *it* was
+  built over, never a bucket-absolute key), streams each data file
+  (gunzip when `GZIP`), decodes each `{"Item": ...}` line via
+  `animus_dynamo::wire::decode_item`, validates key attributes against the
+  target's declared `AttributeDefinitions` (presence + `S`/`N`/`B` type
+  match — a mismatch increments `ErrorCount` and is skipped, up to
+  `MAX_MALFORMED_ITEMS` (10,000), past which the import fails immediately
+  — malformed content can't be fixed by retrying, unlike every I/O fault
+  here, which is retried until `IMPORT_STUCK_TIMEOUT`, 10 minutes), derives
+  `KIND_BASE`/`KIND_LSI` writes via `crate::dynamo::kind_writes_for_item`
+  (never trusts captured physical bytes the way restore's base-chunk sweep
+  does — an import's source is customer text, not this cluster's own
+  previously-captured rows), and batches them into bounded `SeedBatch`
+  proposes (`IMPORT_SEED_BATCH_ROWS`, 500) on this node's own leader
+  handle. On full success: `CompleteImport` (freezing
+  `ProcessedItemCount`/`ImportedItemCount`/`ErrorCount`/
+  `ProcessedSizeBytes`) then declares every resolved GSI, the identical
+  restore-driver ordering. **On failure — unlike a failed restore, which
+  leaves its target table in place for manual cleanup — the driver also
+  drops the half-created target table** (`ClientCtx::drop_table`,
+  best-effort: a drop failure here is logged, not retried, since the
+  target stays a clean, state-agnostic `DeleteTable` away from full
+  cleanup either way), matching real DynamoDB's own "a failed
+  `ImportTable` rolls back the table it was creating" contract —
+  `ImportRow`/`ImportStatus::Failed`'s own doc has the full reasoning.
+
+  Spawned on combined and data-only nodes only, both existing
+  `backup_restore::backup_restore_loop` spawn sites (mirrors that driver's
+  own scope exactly — no control-plane-leader dependency, and a
+  control-only node hosts no CP-data tablet to seed).
+
+  Regression: `tests/dynamo_import.rs` — reuses the S-04 `FakeS3`/
+  `SharedFakeS3` harness `dynamo_export.rs` established (duplicated, not
+  shared — this repo's own per-`tests/dynamo_*.rs`-file convention): a
+  full export→import round trip (source table force-split, import issued
+  against a follower-connected node) converging to `COMPLETED` with exact
+  `ProcessedItemCount`/`ImportedItemCount`/`ErrorCount` and every item
+  reading back through `GetItem`/`Scan`; a `NONE`-compressed export
+  written by hand (an input shape this adapter's own export job never
+  produces); two deliberately malformed items counted in `ErrorCount`
+  with the rest still imported; `ImportConflictException` for both an
+  existing table name and a name-collision with an in-flight import;
+  `ImportNotFoundException`; `ListImports` pagination/`TableArn`
+  filtering; `ION`/`ZSTD` rejection; and `ClientRequestToken` idempotency.
+  **Testing gotcha found building this suite, recorded in
+  `docs/engineering-lessons.md`**: a test helper's own default request
+  shape (compression) silently diverging from what its paired fixture
+  helper actually wrote produced no error at all — just an import stuck
+  `IN_PROGRESS` forever, since every fault in this driver is deliberately
+  retried rather than surfaced — until the outer test's own
+  converged-or-timeout poll finally gave up.
+  **A second, real production bug found the same way (CI flake,
+  2026-09-06, fixed)**: `dynamo::finish_import_kickoff`'s destination-
+  tablet replica pick — the identical "first `min(N, MAX_REPLICATION_
+  FACTOR)` `Active` members" snapshot `ClientCtx::provision_tablet` also
+  takes — had no guard against that snapshot coming back **empty** (every
+  member transiently `Down`, a real-thread failure-detector false positive
+  under CPU-starved contention, ADR 0012 — not a `SimEnv`-provable race).
+  `provision_tablet`'s own `CreateTablet` tolerates this because its
+  tablet mints `Active`, so `reconcile_placement`'s ordinary policy-driven
+  self-heal can still grow an under-shot set later; this tablet mints
+  `Building` and stays placement-frozen for its whole seeding lifetime
+  (`reconcile_placement`'s own `TabletState::Active` gate,
+  `animus-control`'s `meta.rs`) — a `Building` tablet with `replicas: []`
+  can never become `Active` (hosting requires a nonempty replica set in
+  the first place), so it never self-heals: `import_loop` polls "not
+  hosted here yet" forever and the wire caller's own terminal-state poll
+  times out. Fixed with the same guard `provision_tablet` already
+  established — wait (bounded by the existing `SCHEMA_COMMIT_TIMEOUT` per
+  attempt) for at least one `Active` member before computing `replicas`,
+  and skip proposing `BeginImport` (retry with a fresh id) if the wait
+  still ends empty. Reproduced with a foreground loop of the standalone
+  test binary run under contention from three sibling `animusd`
+  integration-test binaries (50-150 iterations, ~5-9% failure rate before
+  the fix, 0/250+ after); see `docs/engineering-lessons.md` for the full
+  diagnosis. **`dynamo::finish_restore_kickoff` (issue #657, the kickoff
+  half): fixed with the identical guard.** The twin gap this entry
+  originally flagged as not-yet-fixed is closed — `finish_restore_kickoff`
+  (shared by both `RestoreTableFromBackup`'s and `RestoreTableToPointInTime`'s
+  own wire handlers, since both route through it) now calls the same shared
+  `await_active_metadata_for_new_tablet` wait/retry helper `finish_import_kickoff`
+  was factored to use, so both `Building`-minting kickoffs wait (bounded by
+  their own per-attempt `SCHEMA_COMMIT_TIMEOUT`) for at least one `Active`
+  member before computing `replicas` via the same `active_replicas_for_new_tablet`,
+  and both skip their propose (retrying with a fresh id) if the wait still
+  ends empty. Regression: `active_replicas_tests` gained a restore-specific
+  pin (`restore_kickoff_shares_the_import_kickoffs_selection`,
+  `restore_kickoff_sees_no_replicas_when_every_member_is_down`) — the async
+  wait/retry shape itself stays untested the same way `finish_import_kickoff`'s
+  own is, for the identical reason (real-thread liveness only, `dynamo.rs`
+  is not generic over `E: Env`, out of scope for this fix). Issue #657's
+  second half — `backup_restore.rs`'s own missing propose-side patience and
+  confirm-timeout logging, the `import.rs`-inherited issue #268 amplification
+  shape this same investigation found but did not fix — **remains open, its
+  own separate PR.**
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

@@ -19,12 +19,15 @@ How to maintain this file:
 - "PRs" is the suggested `gh-stack` shape. Anything with more than one
   reviewable step stacks by default.
 
-The next free ADR number at the time of writing is **0068** (0065 is
+The next free ADR number at the time of writing is **0069** (0065 is
 [Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
 record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
 0067 is [Throughput-derived minimum tablet count](adr/0067-throughput-derived-minimum-tablet-count.md),
-W-08b's. All three landed 2026-09-05 and their roadmap sections are removed
-per this document's own maintenance rule above).
+W-08b's — all three landed 2026-09-05 and their roadmap sections are removed
+per this document's own maintenance rule above; 0068 is
+[S3 export and import](adr/0068-s3-export-import.md), S-05's design of
+record — all three PRs (export trio, import trio, the `SimEnv` corpus)
+landed 2026-09-06 and its roadmap section is removed the same way).
 
 ---
 
@@ -86,40 +89,8 @@ the still-true paragraph after the table.
   ADRs in review at once; S-02 ([ADR 0066](adr/0066-sigv4-hardening.md))
   landed 2026-09-05, so this item is unblocked.
 
-### S-04 S3 `SegmentStore` backend (ADR 0059 deferred)
-
-- **Gap:** `parse_segment_store`/`parse_backup_store`
-  (`main.rs:575-601`) know only `dir:`, `fs:`, `cluster`.
-- **Plan:** spike whether `sigv4.rs`'s signing-key chain can be exposed as
-  a `sign_request` for a minimal PUT/GET/DELETE/LIST client (no
-  `aws-sdk-s3` in tree today); `S3SegmentStore` behind the `prod` feature;
-  `s3:` URIs on both flags; operator: document/restrict egress in
-  `desired/networkpolicy.rs:99` (currently ingress-only, egress
-  unrestricted by omission) plus credential secret.
-- **Tests:** `assert_segment_store_contract` against minio, real-thread,
-  `prod`-gated.
-- **ADR:** amend 0059 in place (it reserves this exact follow-up).
-- **PRs:** (1) client; (2) backend + flags; (3) operator egress +
-  secrets. **Size:** L. **Blocks:** S-05.
-
-### S-05 S3 export/import
-
-- **Gap:** `ExportTableToPointInTime`, `DescribeExport`, `ListExports`,
-  `ImportTable`, `DescribeImport`, `ListImports` absent.
-- **Plan:** reuse the capture driver (`backup_restore.rs`, `dynamo.rs`
-  `create_backup` ~1328, restore ~1672/~1978) against a customer
-  `S3SegmentStore` handle; new wire handlers and manifest shape.
-- **Tests:** extend `ANIMUS_BACKUP_SEEDS`/`ANIMUS_PITR_SEEDS` corpora.
-- **ADR:** **yes** (0059 defers it as needing "a distinct wire model").
-- **PRs:** (1) export trio; (2) import trio; (3) corpus. **Size:** L.
-- **Depends:** S-04.
-
 ### S-07 Operator hardening (ADR 0060 deferred list)
 
-- **b. `backupStore`/`segmentStore` CRD fields** mirrored into the
-  ConfigMap/entrypoint. Size M. (S-06 landed 2026-09-04.)
-- **c. `PodDisruptionBudget` builder** (`desired/poddisruptionbudget.rs`,
-  pure-builder pattern + golden test). Size S.
 - **d. `controlNodes` growth via the CRD**: controller drives ADR 0037
   `control/member/add` against a pod's admin port, mirroring
   `drain_and_remove_node`; extend `scripts/e2e-kind.sh` with a
@@ -130,8 +101,14 @@ the still-true paragraph after the table.
   including this crate's own cert-manager `Certificate` builder and CRD
   shape (`spec.tls.certManager`) a webhook's own cert-issuance can reuse
   directly. No longer blocked; open to pick up on its own schedule. Size L.
-- **ADR:** amend 0060 for a–c; d and e get their own section or a new
-  number if the webhook design grows.
+- **ADR:** d and e get their own section or a new number if the webhook
+  design grows. (Item b — `backupStore`/`segmentStore` CRD fields for the
+  non-S3 `cluster`/`fs:`/`dir:` forms — landed 2026-09-06, see ADR 0060's
+  own "Amendment (2026-09-06): S-07b" section; `spec.s3` already covers
+  the `s3://...` form, ADR 0060's S-04 PR 3 amendment. Item c —
+  quorum-derived `PodDisruptionBudget` builder, no CRD field added —
+  landed 2026-09-06, see ADR 0060's own "Amendment (2026-09-06): S-07c"
+  section.)
 
 ---
 
@@ -166,8 +143,15 @@ the still-true paragraph after the table.
   auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
-  2026-09-04 amendment). E2 (`animus-cli` coverage) stays folded into
-  U-08's trailing PRs.
+  2026-09-04 amendment). **E2 not yet fully closed**, even though U-08 (its
+  own planned home) landed in full 2026-09-06: U-08(i)'s eight flat GET
+  arms and U-08(ii)'s six dynamo-proxy wrappers all now have their own
+  `admin_request` unit tests, but several pre-existing one-shot mutating
+  arms predating both — `drain`/`drain-status`/`remove`/`reconfigure`/
+  `flush`/`compact`/`stream-grow` — still have none, so ADR 0061's own
+  "741 currently-untested lines" framing isn't fully retired. A follow-up
+  PR adding `admin_request` tests for exactly those arms (same shape as
+  every test U-08 already added) would close it; not sized here.
 - **ADR:** amendment notes on 0061.
 
 ### C-05 `SharedWal` (built, unwired): keep, wire later
@@ -213,44 +197,14 @@ tests: `admin_endpoint.rs`. CLI arg parsing is unit-tested via `admin_request`
 mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 `window.confirm` guard.
 
-### U-07 New observability routes
-
-- **Landed 2026-09-06.** `GET /admin/backup-store`: store config, object
-  counts (a bounded live `list` scan, debug posture — `BackupStoreHandle`
-  maintains no counter), janitor phase via an `Arc<Mutex<JanitorProgress>>`
-  on `ClientCtx` updated by `animus_node::backup_janitor`. Renders on the
-  Backups tab. See ADR 0020's and ADR 0059's 2026-09-06 as-built notes and
-  `crates/animusd/CLAUDE.md`'s `backup_janitor.rs` entry.
-- **Landed 2026-09-06.** `GET /admin/ttl`: reaper phase/cursor/deletes per
-  tick from `animus_node::ttl_reaper`, via a new
-  `Arc<Mutex<TtlReaperProgress>>` on `ClientCtx` — unlike the backup
-  janitor, published by every node (the reaper is leader-gated per
-  tablet, not control-plane-leader-gated), plus every TTL-enabled table
-  and this node's own `leader_tablets` count. Renders on the Storage tab.
-  See ADR 0020's and ADR 0051's 2026-09-06 as-built notes and
-  `crates/animusd/CLAUDE.md`'s `ttl_reaper.rs` entry.
-- **Landed 2026-09-06.** `GET /admin/gc`: the DynamoDB Streams segment
-  janitor's own orphan-sweep phase and counters from `segment_janitor_loop`
-  (ADR 0042 §10/ADR 0043 §A9 — not ADR 0024/0040 as originally scoped
-  here: those cover the *drop-table* reconciler GC, a different subsystem
-  the segment janitor doesn't touch), via a `SegmentJanitorProgress` on
-  `ClientCtx` mutated directly by the loop (it never moved to
-  `animus-node`, so no capability trait was needed). Renders on the
-  Storage tab beside the TTL reaper card. See ADR 0020's and ADR 0043's
-  2026-09-06 as-built notes and `crates/animusd/CLAUDE.md`'s
-  `segment_janitor.rs` entry.
-- `GET /admin/segment-store`: placement per shard (already inside
-  `ClusterSegmentStore`) plus counts. Size M.
-- Each renders on the Backups tab (landed with U-02) or Storage tab.
-
-### U-08 CLI parity
-
-- **(i) landed 2026-09-04** (`admin_request` pure arg parser + eight flat
-  GET arms in `animus-cli`).
-- **(ii) Dynamo-proxy wrappers:** `backup create|delete`, `restore`,
-  `pitr enable|disable`, `ttl`, `stream`, each a `run_*` helper posting
-  to `/admin/data/dynamo`. Size M.
-- Trailing PRs add coverage for U-07's routes as they land.
+U-08 CLI parity landed in full 2026-09-06: (i) landed 2026-09-04
+(`admin_request` pure arg parser + eight flat GET arms in `animus-cli`);
+(ii) landed 2026-09-06 (six dynamo-proxy wrappers — `backup-create`/
+`backup-delete`/`restore`/`pitr-enable`/`pitr-disable`/`ttl`/`stream`,
+each an `admin_request` arm posting `{op, payload}` to `/admin/data/dynamo`
+with the exact wire shapes the dashboard already sends for these actions;
+see ADR 0020's matching 2026-09-06 as-built note). Nothing outstanding
+here.
 
 ---
 
@@ -297,9 +251,9 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
 | — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
-| 3 | *U-05 landed 2026-09-06*; U-07, U-08(ii) | No ordering constraint remains |
+| 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
-| 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
+| 5 | *S-04, S-05, S-07b–c landed 2026-09-06* → S-07d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

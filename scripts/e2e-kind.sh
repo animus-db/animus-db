@@ -17,6 +17,26 @@
 #
 # Assumes: docker, kind, kubectl on PATH, and a docker daemon reachable.
 #
+# S-07b: the AnimusCluster manifest always sets `spec.segmentStore:
+# dir:<data-mount>/segments` (the non-S3 store CRD surface), and the plain
+# path checks `GET /admin/segment-store` reports `store.kind: "fs"` right
+# after the pod readiness wait — no separate CI job, no gating env var,
+# since a `dir:` path needs no external dependency the way MinIO (E2E_S3)
+# or cert-manager (E2E_TLS) do. `segmentStore`, not `backupStore`, so this
+# composes with the pre-existing E2E_S3=1 leg below (which sets
+# `spec.s3.backupStore` — the two backup-store fields together would be a
+# rejected conflict).
+#
+# S-07c: the operator applies a `{name}-pdb` PodDisruptionBudget for every
+# cluster now (`crate::desired::poddisruptionbudget`), with `maxUnavailable`
+# derived from `nodes`/`controlNodes` rather than a constant. This manifest's
+# own 3-node/3-controlNodes shape computes exactly 1
+# (floor((3-1)/2) for both the control-plane and RF-capped data-plane
+# terms) — checked once right after the initial 3/3-ready wait, and again
+# after the scale-up to 4 nodes below (pinning that the value is
+# scale-invariant once nodes/controlNodes each reach the replication
+# factor, see ADR 0060's own "Amendment (2026-09-06): S-07c" section).
+#
 # Issue #595: this smoke flaked twice with the identical signature — the
 # first `CreateTable` (issued once, immediately after the statefulset
 # reported 3/3 ready) failing with a 500 whose message is "CreateTable did
@@ -63,6 +83,27 @@
 #                       end anywhere yet. Treat a first real CI failure here
 #                       as "the TLS e2e found its first bug," not as this
 #                       comment lying.
+#   E2E_S3           - "1" adds an S-04 PR 3 leg on top of the plain-TCP
+#                       path (mutually independent of E2E_TLS — either, both,
+#                       or neither may be set): deploys a single-pod MinIO
+#                       (the well-known `minio/minio` image) + Service into
+#                       the kind cluster, creates its bucket via a throwaway
+#                       `minio/mc` pod, creates the `access_key_id`/
+#                       `secret_access_key` credentials Secret
+#                       `spec.s3.credentialsSecretName` names, applies the
+#                       AnimusCluster with `spec.s3.backupStore` pointing at
+#                       `http://minio.<ns>.svc:9000` (`allowInsecureHttp:
+#                       true` — a loopback-to-the-cluster MinIO dev target,
+#                       never a real deployment shape), then exercises
+#                       `CreateBackup`/`DescribeBackup` over the DynamoDB
+#                       wire and checks `GET /admin/backup-store` reports
+#                       `"kind":"s3"`. Default "0" (unset) leaves the smoke
+#                       byte-for-byte unchanged. UNVERIFIED in this sandbox,
+#                       same `CAP_SYS_RESOURCE` reason `E2E_TLS` is above —
+#                       written carefully and `bash -n`-checked, never run
+#                       end to end anywhere; treat a first real CI failure
+#                       on the `e2e-kind-s3` job as this leg finding its
+#                       first real bug.
 #
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
 # always tears down the kind cluster and background processes it started,
@@ -75,10 +116,24 @@ KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
 CLUSTER_ISSUER_NAME="e2e-selfsigned"
+E2E_S3="${E2E_S3:-0}"
+MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+MINIO_MC_IMAGE="${MINIO_MC_IMAGE:-minio/mc:latest}"
+# Throwaway kind-cluster-local credentials — never anything real, and never
+# reused outside this one ephemeral cluster's lifetime.
+MINIO_ACCESS_KEY="e2eaccesskey"
+MINIO_SECRET_KEY="e2esecretkey123"
+S3_BUCKET="e2e-backups"
+S3_CREDS_SECRET_NAME="e2e-s3-creds"
 
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
 AC_NAME="e2e"
+# S-07b: the pod's own data volume mount path — must match
+# crates/animus-operator/src/desired/cluster_config.rs's DATA_DIR constant.
+# spec.segmentStore's dir:<path> below is required (AnimusClusterSpec::
+# validate_store_spec) to live under this exact prefix.
+DATA_MOUNT_DIR="/var/lib/animus"
 DYNAMO_LOCAL_PORT="18100"
 DYNAMO_REMOTE_PORT="14002" # base_port(14000) + PORT_DYNAMO(2), the CRD's own default base port.
 ADMIN_LOCAL_PORT="18101"
@@ -356,6 +411,77 @@ EOF
         kind: ClusterIssuer"
 fi
 
+S3_SPEC_YAML=""
+if [ "$E2E_S3" = "1" ]; then
+    phase "deploy MinIO (S-04 PR 3)"
+    kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: minio}
+  template:
+    metadata:
+      labels: {app: minio}
+    spec:
+      containers:
+        - name: minio
+          image: ${MINIO_IMAGE}
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "${MINIO_ACCESS_KEY}"
+            - name: MINIO_ROOT_PASSWORD
+              value: "${MINIO_SECRET_KEY}"
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: 9000}
+            periodSeconds: 2
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  selector: {app: minio}
+  ports:
+    - port: 9000
+      targetPort: 9000
+EOF
+    kubectl -n "$NAMESPACE" rollout status deployment/minio --timeout=120s
+
+    phase "create the MinIO bucket"
+    # A throwaway in-cluster `minio/mc` pod is the simplest way to reach the
+    # ClusterIP Service without a port-forward of its own — real S3/MinIO
+    # never auto-creates a bucket on first PUT, so this has to happen before
+    # any backup capture can succeed.
+    kubectl run mc-mb --rm -i --restart=Never -n "$NAMESPACE" \
+        --image="$MINIO_MC_IMAGE" --command -- \
+        sh -c "mc alias set local http://minio.${NAMESPACE}.svc:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} && mc mb local/${S3_BUCKET}"
+
+    phase "create the S3 credentials Secret"
+    # access_key_id/secret_access_key are the two keys crate::desired::
+    # statefulset::build mounts at /etc/animus/s3 and entrypoint.sh reads at
+    # container-start time (crate::desired::cluster_config::
+    # entrypoint_script) — never written into the ConfigMap/cluster.json.
+    kubectl create secret generic "$S3_CREDS_SECRET_NAME" -n "$NAMESPACE" \
+        --from-literal=access_key_id="$MINIO_ACCESS_KEY" \
+        --from-literal=secret_access_key="$MINIO_SECRET_KEY" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    S3_SPEC_YAML="  s3:
+    backupStore: \"s3://${S3_BUCKET}?endpoint=http://minio.${NAMESPACE}.svc:9000&insecure_http=true\"
+    credentialsSecretName: ${S3_CREDS_SECRET_NAME}
+    allowInsecureHttp: true"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -369,7 +495,14 @@ spec:
   controlNodes: 3
   storage:
     ephemeral: true
+  # S-07b: the non-S3 store CRD surface, exercised unconditionally (not
+  # gated on E2E_S3) — segmentStore rather than backupStore specifically so
+  # this composes with the E2E_S3=1 leg below, which already sets
+  # spec.s3.backupStore (spec.backupStore/spec.s3.backupStore both set is a
+  # rejected conflict; segmentStore has no such overlap here).
+  segmentStore: "dir:${DATA_MOUNT_DIR}/segments"
 ${TLS_SPEC_YAML}
+${S3_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
@@ -389,6 +522,13 @@ log "operator running as PID ${OPERATOR_PID}, logging to ${OPERATOR_LOG}"
 
 phase "wait for 3/3 ready replicas"
 wait_for "statefulset readyReplicas==3" 300 5 -- sts_ready_equals 3
+
+phase "check the quorum-derived PodDisruptionBudget (S-07c)"
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable=1 \
+for nodes=3/controlNodes=3, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1"
 
 if [ "$E2E_TLS" = "1" ]; then
     phase "wait for the cert-manager Certificate to be issued"
@@ -455,6 +595,13 @@ phase "wait for that pod's own readiness (GET /admin/health == 200)"
 # not a replacement for it.
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
+phase "check GET /admin/segment-store reports the S-07b dir: store (kind: fs)"
+RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+    "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/segment-store")"
+KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
+[ "$KIND" = "fs" ] || fail "GET /admin/segment-store did not report store.kind \"fs\": ${RESULT}"
+log "admin/segment-store reports store.kind=fs (spec.segmentStore: dir:${DATA_MOUNT_DIR}/segments)"
+
 phase "exercise DynamoDB wire: CreateTable"
 # Issue #595: a bounded converged-or-timeout retry, scoped narrowly to the
 # one transient failure this issue is about (the control-plane commit-wait
@@ -517,6 +664,16 @@ phase "scale AnimusCluster to 4 nodes"
 kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"nodes":4}}'
 wait_for "statefulset readyReplicas==4" 300 5 -- sts_ready_equals 4
 
+phase "check the PodDisruptionBudget is scale-invariant after scale-up (S-07c)"
+# controlNodes stays 3 (immutable) and the data-plane replication factor is
+# already plateaued at 3 nodes, so maxUnavailable must still be 1 — not
+# recomputed to something larger just because nodes grew.
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable to \
+stay 1 after scaling to 4 nodes, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb still reports maxUnavailable=1 after scale-up"
+
 phase "GetItem still returns the item after scale-up"
 RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \
     '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
@@ -526,6 +683,35 @@ BODY="$(dynamo_body "$RESULT")"
 NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
 [ "$NOTE" = "hello from e2e" ] || fail "post-scale GetItem did not round-trip the item: ${BODY}"
 log "post-scale GetItem ok"
+
+if [ "$E2E_S3" = "1" ]; then
+    phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store)"
+    RESULT="$(dynamo_call "DynamoDB_20120810.CreateBackup" \
+        '{"TableName":"E2EItems","BackupName":"e2e-s3-backup"}')"
+    STATUS="$(dynamo_status "$RESULT")"
+    BODY="$(dynamo_body "$RESULT")"
+    [ "$STATUS" = "200" ] || fail "CreateBackup failed: status=${STATUS} body=${BODY}"
+    BACKUP_ARN="$(jq -r '.BackupDetails.BackupArn // empty' <<<"$BODY")"
+    [ -n "$BACKUP_ARN" ] || fail "CreateBackup response missing BackupDetails.BackupArn: ${BODY}"
+    log "CreateBackup ok — ${BACKUP_ARN}"
+
+    phase "exercise DynamoDB wire: DescribeBackup"
+    RESULT="$(dynamo_call "DynamoDB_20120810.DescribeBackup" \
+        "$(jq -n --arg arn "$BACKUP_ARN" '{BackupArn: $arn}')")"
+    STATUS="$(dynamo_status "$RESULT")"
+    BODY="$(dynamo_body "$RESULT")"
+    [ "$STATUS" = "200" ] || fail "DescribeBackup failed: status=${STATUS} body=${BODY}"
+    DESCRIBED_ARN="$(jq -r '.BackupDescription.BackupDetails.BackupArn // empty' <<<"$BODY")"
+    [ "$DESCRIBED_ARN" = "$BACKUP_ARN" ] || fail "DescribeBackup returned a different BackupArn: ${BODY}"
+    log "DescribeBackup ok"
+
+    phase "check GET /admin/backup-store reports kind: s3"
+    RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/backup-store")"
+    KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
+    [ "$KIND" = "s3" ] || fail "GET /admin/backup-store did not report store.kind \"s3\": ${RESULT}"
+    log "admin/backup-store reports store.kind=s3 (${RESULT})"
+fi
 
 phase "delete AnimusCluster and verify GC"
 kubectl delete animuscluster "$AC_NAME" -n "$NAMESPACE"

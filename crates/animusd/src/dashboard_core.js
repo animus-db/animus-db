@@ -570,7 +570,12 @@ async function loadAll() {
       // reaper runs on EVERY node (self-gated per tablet), not just the
       // control leader, so a per-node fan-out is the only way to see every
       // node's own reaper activity.
-      const [config, raft, raftkv, txns, health, metrics, ttl] = await Promise.all([
+      // `segmentStore` (`/admin/segment-store`, docs/roadmap.md U-07's
+      // fourth and last route) fans out per-node for the identical reason
+      // `ttl` does — each node reports its own local object count/bytes and
+      // its own `local` flag per shard, which a single SEED-only fetch
+      // could never show for any node but SEED itself.
+      const [config, raft, raftkv, txns, health, metrics, ttl, segmentStore] = await Promise.all([
         getJSON(base, "/admin/config"),
         getJSON(base, "/admin/raft").catch(() => null),
         getJSON(base, "/admin/raftkv").catch(() => null),
@@ -578,8 +583,11 @@ async function loadAll() {
         getJSON(base, "/admin/health").catch(() => null),
         getJSON(base, "/admin/metrics").catch(() => null),
         getJSON(base, "/admin/ttl").catch(() => null),
+        getJSON(base, "/admin/segment-store").catch(() => null),
       ]);
-      Object.assign(node, { config, raft, raftkv, txns, health, metrics, ttl, ok: true });
+      Object.assign(node, {
+        config, raft, raftkv, txns, health, metrics, ttl, segmentStore, ok: true,
+      });
     } catch (e) {
       node.error = String(e);
     }

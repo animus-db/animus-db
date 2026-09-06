@@ -345,6 +345,9 @@ conventional Kubernetes controller status shape, nothing bespoke.
   the cluster's own pods (plus the operator itself, for its own admin-API
   reconciliation reads) — the concrete enforcement of the trusted-network
   posture Part 1 restates rather than changes.
+- A **PodDisruptionBudget** (S-07c, see this ADR's own 2026-09-06
+  amendment below) bounding simultaneous voluntary evictions to whatever
+  the cluster's own control-plane and data-plane quorum math allows.
 
 ### Bootstrap: static generated config, not imperative sequencing
 
@@ -447,8 +450,9 @@ job).
 - **PITR** — no CRD surface (depends on the backups wiring above).
 - **Control-voter growth** — `controlNodes` is immutable; ADR 0037's admin
   path remains the manual escape hatch.
-- **`PodDisruptionBudget` tuning** — the StatefulSet ships with none
-  beyond Kubernetes defaults; a deliberately-tuned PDB is a follow-up.
+- ~~**`PodDisruptionBudget` tuning** — the StatefulSet ships with none
+  beyond Kubernetes defaults; a deliberately-tuned PDB is a follow-up.~~ —
+  closed 2026-09-06 (S-07c, see this ADR's own amendment below).
 - **S3 `SegmentStore` backend** — ADR 0059 §1 already scoped this as its
   own follow-up trait-swap; this ADR doesn't touch it.
 - **Admission/conversion webhooks** — the CRD ships with no webhook of any
@@ -544,3 +548,300 @@ config-gated (a cluster with no `spec.tls` is unchanged), but a cluster
 that turns it on gets mutual cluster-membership authentication on the
 internal/intra ports and server-only TLS elsewhere — not a NetworkPolicy
 replacement, a second, independent layer underneath it.
+
+## Amendment (2026-09-06): S-04 PR 3 — `spec.s3`, egress policy
+
+`docs/roadmap.md`'s S-04 item ("operator egress/credential-secret work")
+is closed by this amendment, landing `AnimusClusterSpec.s3: Option
+<S3StoreSpec>` (`crd.rs`) — the CRD-level surface the "Not in v1" list
+above deferred under "Backups wiring," narrowed to exactly the S3 case ADR
+0059's own S-04 design amendment scoped: `fs:`/`cluster`/`dir:` stores
+still have no CRD surface (S-07b, unaffected by this amendment).
+
+**`spec.s3` mirrors `spec.tls`'s own precedent** — a CRD section that only
+*references* a pre-existing `Secret` (`credentialsSecretName`, keys
+`access_key_id`/`secret_access_key`), never one this operator creates or
+writes. `backupStore`/`segmentStore` are the literal `s3://...` URI values
+`animusd`'s own `--backup-store`/`--segment-store` flags accept (ADR
+0059's As-built PR 2 note); at least one must be set. Since this crate
+does not depend on `animusd` (this file's own "does not depend on
+`animusd`" note, restated in `crates/animus-operator/CLAUDE.md`), `crate::
+s3_uri::parse` re-checks only a minimal syntactic subset of `animusd`'s
+own `parse_s3_uri` (bucket present, `endpoint=` query key present, scheme
+`http://`/`https://`) — enough to catch an obviously malformed URI at
+reconcile time (`S3StoreSpec::validate`, same "no admission webhook in v1"
+posture as `TlsSpec::validate`) rather than letting it reach a pod and
+crash-loop; the real credential/region/loopback-vs-`--allow-insecure-s3`
+logic stays exactly where it already lived, node-side in `animusd`.
+
+**The credential never leaves the `Secret` mount.** Every pod mounts
+`credentialsSecretName` read-only at `/etc/animus/s3` (the same idiom as
+`/etc/animus/dynamo-auth`/`/etc/animus/tls`); a combined-role pod's own
+generated `entrypoint.sh` reads both files (`access_key_id`/
+`secret_access_key`) **at container-start time** and writes a scratch
+`--s3-credentials` JSON file (`/tmp/animus-s3-credentials.json`) naming
+only the *path* to `secret_access_key` — the secret value itself never
+appears in the `ConfigMap`, `cluster.json`, a log line, or a CR status.
+**Combined-role only**: `animusd data --config` accepts none of
+`--backup-store`/`--segment-store`/`--s3-credentials`/
+`--allow-insecure-s3` today (a **pre-existing** `animusd` gap, not
+introduced here — see `crates/animusd/src/main.rs::run_data_config`'s own
+"same documented gap as `--backup-store`" comment) — a data-only pod
+mounts the `Secret` like every other pod but never reads it.
+
+**Egress, closing the roadmap's own "egress unrestricted by omission"
+line.** `desired::networkpolicy::build` now sets `policyTypes: [Ingress,
+Egress]` unconditionally and adds two baseline `Egress` rules to *every*
+cluster, `spec.s3` or not: intra-cluster (this cluster's own pods, the
+`internal`+`intra` ports node-to-node Raft/RPC actually uses) and DNS to
+`kube-system`'s `kube-dns`/CoreDNS pods (UDP+TCP 53) — without the DNS
+rule, in-cluster name resolution itself (including an S3 endpoint's own
+hostname) would break the moment egress stopped being wide-open by
+omission. A third rule is added **only when `spec.s3` is set**: the
+configured store URIs' own `endpoint=` port(s) (deduplicated; 443/80
+default by scheme when the URI names no explicit port), scoped to
+`spec.s3.egressCidrs` (`["0.0.0.0/0"]` by default). `NetworkPolicy` cannot
+express a hostname allowlist — only IP blocks — so this operator has no
+way to resolve an endpoint's hostname into the right CIDR itself;
+`egressCidrs` exists precisely so an operator user can narrow it to their
+object store's real address range, and both the CRD field's own doc and
+`deploy/operator/example.yaml`'s commented `s3:` section say so plainly.
+A cluster with no `spec.s3` gets exactly the two baseline rules, nothing
+S3-specific.
+
+**e2e**: `scripts/e2e-kind.sh --E2E_S3=1` (`.github/workflows/
+e2e-kind.yml`'s `e2e-kind-s3` job) deploys a single-pod MinIO + Service
+into the kind cluster, creates its bucket via a throwaway `minio/mc` pod,
+creates the credentials `Secret`, applies an `AnimusCluster` with
+`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+(`allowInsecureHttp: true` — a loopback-to-the-cluster MinIO dev target,
+never a real deployment shape), then exercises `CreateBackup`/
+`DescribeBackup` over the DynamoDB wire and checks `GET
+/admin/backup-store` reports `"kind":"s3"`. **UNVERIFIED in this
+sandbox** — same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see
+`crates/animus-operator/CLAUDE.md`'s e2e section): written carefully and
+`bash -n`-checked, never run end to end anywhere. Treat a first real CI
+failure on `e2e-kind-s3` as this leg finding its first real bug.
+
+## Amendment (2026-09-06): S-07b — non-S3 store CRD surface
+
+`docs/roadmap.md`'s S-07 item b is closed by this amendment: the previous
+S-04 PR 3 amendment above left `fs:`/`cluster`/`dir:` stores with no CRD
+surface at all — an operator user wanting a plain filesystem-backed backup
+store (no S3 bucket, no credentials) had to configure it by hand outside
+the CRD. This amendment adds exactly that surface, alongside `spec.s3`,
+never replacing it.
+
+**Shape**: two plain top-level fields, not a sub-object —
+`AnimusClusterSpec.backup_store: Option<String>` and `.segment_store:
+Option<String>` (`crd.rs`) — carrying the literal `--backup-store`/
+`--segment-store` flag value verbatim: `"cluster"` or `"fs:<path>"` for
+`backupStore`, `"dir:<path>"` only for `segmentStore`. A plain `String`
+was chosen over a `StoreSpec` enum (`Cluster`/`Fs(String)`) because the
+value *is* the CLI flag's own text, unparsed, the same posture `spec.s3`'s
+own `backupStore`/`segmentStore` fields already established for the
+`s3://...` form — inventing a typed enum here would just be a second
+representation of the identical three-way choice `animusd`'s own parser
+already makes, for a section with no sub-fields (no credentials, no CIDR
+list) to justify a struct the way `S3StoreSpec` earns one.
+
+**Validation** (`AnimusClusterSpec::validate_store_spec`, called from
+`crate::controller::reconcile` right after `spec.s3`'s own validation —
+same "no admission webhook in v1" posture as `TlsSpec`/`S3StoreSpec`):
+
+- `backupStore` accepts exactly `"cluster"` or `"fs:<path>"`.
+- `segmentStore` accepts only `"dir:<path>"` — **`animusd`'s own
+  `--segment-store` has no `"cluster"` keyword at all**
+  (`crates/animusd/src/main.rs::parse_segment_store`'s own doc comment:
+  omitting the flag is the *only* way to select its default). A literal
+  `"cluster"` in `segmentStore` is rejected rather than silently
+  remapped to "omit the flag" — this is the one place the two fields'
+  grammars are *not* symmetric, and getting it wrong would otherwise
+  surface as a live pod-startup failure (`animusd` rejecting an unknown
+  value) instead of a reconcile-time status condition.
+- `<path>` must be an absolute path strictly under
+  `desired::cluster_config::DATA_DIR` (`/var/lib/animus`) — **the pod's
+  own data volume, and the only directory this operator can vouch is
+  actually mounted**: a `PersistentVolumeClaim`, or an `emptyDir` when
+  `spec.storage.ephemeral` is set. Never `DATA_DIR` itself (that root is
+  where `animusd --dir` puts the storage engine's own on-disk files — a
+  store sharing it exactly would mix its own objects in among them; a
+  subdirectory is required). A path outside `DATA_DIR` is rejected
+  outright rather than silently accepted and left to fail at pod startup
+  with a permissions or missing-directory error — the same "catch it at
+  reconcile time, not at container start" motivation `S3StoreSpec::
+  validate` already has for a malformed URI.
+- An `s3://...` value in either field is rejected, pointing at `spec.s3`
+  instead: only that section supplies the credentials an S3 store needs,
+  so an `s3://...` string in the non-S3 field is always a copy-paste
+  error, never a valid configuration.
+- Setting the same store in both `spec.s3` and the matching top-level
+  field (e.g. both `spec.s3.backupStore` and `spec.backupStore`) is
+  rejected as a conflict naming both — there is no sensible "last one
+  wins" semantics here, and picking one silently would make the
+  generated `entrypoint.sh` depend on write order in a way nothing in
+  the spec exposes.
+
+Any rejection sets a `StoreSpecInvalid` status condition and reconciles
+the rest of the spec with both fields stripped (never getting stuck
+entirely on one bad field) — the identical posture `TlsSpecInvalid`/
+`S3SpecInvalid` already use.
+
+**No new volume, no new `Secret`, no `desired::statefulset` change at
+all** — this is the detail that makes this surface materially smaller
+than `spec.s3`'s: `cluster`/`fs:`/`dir:` need no credentials, so the
+pod's already-mounted data volume is the only thing an `fs:`/`dir:` path
+can point at, and the `DATA_DIR`-prefix validation rule above is what
+makes that true by construction rather than by convention. `desired::
+cluster_config::entrypoint_script` emits `--backup-store`/
+`--segment-store` from whichever of `spec.s3.{backup,segment}Store` (the
+`s3://...` form, its own credentials preamble unchanged from the S-04 PR
+3 amendment) or the new top-level `spec.{backup,segment}Store` is set —
+mutually exclusive per store by the validation above, so the builder
+itself is a plain `.or()` between the two `Option<&str>`s. Both single-
+quoted via the pre-existing `shell_single_quote`, same as every other
+operator-controlled string this generator interpolates into the `sh`
+script. Reaches only **combined-role pods** — the identical pre-existing
+`animusd` gap (`animusd data --config` accepts none of these flags) the
+S-04 PR 3 amendment already documents; a data-role pod's data volume is
+mounted the same way, it just has no `entrypoint.sh` branch that would
+ever read these fields.
+
+**Deliverable**: `crd.rs` (fields + `validate_store_spec` + unit tests),
+`desired::cluster_config` (flag emission + golden tests),
+`controller.rs` (the validation call + fake-harness tests),
+`deploy/operator/crd.yaml` regenerated (`crd_manifest_pinned` green),
+`deploy/operator/example.yaml`/`README.md` updated, this ADR, this
+crate's own `CLAUDE.md`, and `docs/roadmap.md`'s S-07 item b removed.
+`scripts/e2e-kind.sh`'s plain-TCP leg additionally sets
+`spec.segmentStore: dir:<data-mount>/segments` unconditionally (chosen
+over `backupStore` specifically so it composes with the pre-existing
+`E2E_S3=1` leg, which already sets `spec.s3.backupStore` — using
+`segmentStore` here avoids a same-reconcile conflict between the two
+legs when both are enabled) and checks `GET /admin/segment-store` reports
+`"kind":"fs"`.
+
+## Amendment (2026-09-06): S-07c — PodDisruptionBudget
+
+`docs/roadmap.md`'s S-07 item c is closed by this amendment, and it also
+closes this ADR's own "Not in v1" bullet on the topic: every
+`AnimusCluster` now gets a `{name}-pdb` `PodDisruptionBudget`
+(`crate::desired::poddisruptionbudget`), applied unconditionally alongside
+the other five children (`ConfigMap`/`Service` x2/`NetworkPolicy`/
+`StatefulSet`), never a sixth *optional* child the way `spec.tls.
+certManager`'s `Certificate` is.
+
+**The budget is derived from the cluster's own quorum math, never a
+constant.** Two independent things must each keep a majority alive under
+a voluntary eviction:
+
+- **The control-plane Raft group** — exactly `spec.controlNodes` pods
+  (ordinals `0..controlNodes-1`) are voters (this ADR's own spec table
+  above), tolerating `floor((controlNodes - 1) / 2)` simultaneous losses.
+- **Every data-plane tablet group** — `animusd` places each tablet on the
+  first `min(N, MAX_REPLICATION_FACTOR)` `Active` members it sees, where
+  `MAX_REPLICATION_FACTOR = 3` (`crates/animusd/src/lib.rs`) is a fixed
+  constant today, not a `spec`-level knob. This crate has no dependency on
+  `animusd` (this crate's own `CLAUDE.md`), so the constant is mirrored by
+  hand (`desired::poddisruptionbudget::DATA_PLANE_MAX_REPLICATION_FACTOR`)
+  — the identical manual-sync posture `desired::cluster_config`'s
+  `ClusterConfig`/`RoleAddrs` JSON mirror already established. The
+  operator cannot see *which* pods actually hold any given tablet's
+  replicas (placement is the data plane's own runtime decision), so the
+  safe assumption is the worst case: any of the cluster's `nodes` pods
+  could be asked to host one, capped at the target replication factor —
+  effective RF `= min(nodes, MAX_REPLICATION_FACTOR)`, tolerating
+  `floor((rf - 1) / 2)` simultaneous replica losses.
+
+`maxUnavailable` is the smaller of the two:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),
+  floor((min(nodes, MAX_REPLICATION_FACTOR) - 1) / 2),
+)
+```
+
+A single global `PodDisruptionBudget` selecting every one of the
+cluster's own pods (`selector_labels`) caps *simultaneous* voluntary
+evictions cluster-wide regardless of which specific pods a scheduler
+picks, which is exactly what bounds both risks at once with one budget —
+no need for two separate PDBs scoped to disjoint pod subsets.
+
+**Degenerate shapes, handled explicitly (with tests)**: `nodes == 1`,
+`controlNodes == 1`, and `nodes < MAX_REPLICATION_FACTOR` (2, since RF is
+fixed at 3) all compute `maxUnavailable = 0` — **blocking every voluntary
+eviction outright, which is the correct, intended outcome, not a bug**: a
+single-voter control plane or a tablet group with only one live replica
+cannot survive losing its one copy, voluntarily or otherwise. A larger
+`controlNodes` than the data-plane budget allows is capped by the
+data-plane term (e.g. `nodes=10, controlNodes=7` still computes `1`, from
+the RF-capped data term, not the control term's own `3`); a larger data
+capacity than `controlNodes` allows is capped the other way
+(`nodes=10, controlNodes=1` computes `0`). Every input is clamped to at
+least `1` before the arithmetic runs, so the function never panics or
+returns a negative budget even on a not-yet-valid or momentarily
+inconsistent spec (`spec.nodes >= 1`/`controlNodes <= nodes` are each
+pre-existing, and separately enforced/documented, invariants this
+builder does not re-validate).
+
+**Expressed as `maxUnavailable`, never `minAvailable`.** The two are
+mutually exclusive on a `PodDisruptionBudgetSpec` and can express the
+identical constraint against a *known* total pod count, but
+`minAvailable` would be `nodes - maxUnavailable` — recomputed on every
+`spec.nodes` change. `maxUnavailable` itself is scale-invariant across
+the range that matters in practice: once `nodes` and `controlNodes` each
+reach `3` (this operator's own default), the value stays `1` for any
+larger `nodes`, since `controlNodes` is immutable after creation and the
+effective replication factor plateaus at `MAX_REPLICATION_FACTOR`. A
+scale-up/down within that range needs no PDB change at all — though
+`apply_children` re-derives and re-applies it every reconcile regardless
+(the same unconditional-re-apply posture every other required child
+already has), always from the *desired* spec (`spec.nodes`/
+`spec.controlNodes`), **never** the `StatefulSet`'s live/current replica
+count, which would make the budget momentarily wrong mid-scale. A
+dedicated controller-level test drives this through `FakeClusterApi`: a
+cluster previously scaled to 5 replicas (RF-plateaued budget of `1`)
+reconciled down to `nodes: 2, controlNodes: 2` immediately gets the
+stricter `0`, not the stale 5-node shape's `1`.
+
+**No CRD field for this.** An override could only ever be asked to (a)
+loosen the computed value, which is unsafe by construction and would have
+to be rejected anyway, (b) tighten it, which a smaller `spec.nodes`/
+`spec.controlNodes` already achieves directly, or (c) disable the budget
+outright — which would make this the *first* required child this
+operator ever stops applying once a spec says so; every other required
+child is applied unconditionally forever, and there is no finalizer or
+deletion path (this ADR's own "no finalizer in v1" decision) for a child
+that used to be desired and no longer is. Since the safe value is already
+a pure, fully-determined function of two existing spec fields, there is
+nothing left for a CRD field to usefully express today. If a real need
+for an override surfaces later, add it then, with its own deletion story
+(what happens to a previously-applied PDB when a later spec disables it)
+worked out at the same time — don't reach for delete-on-toggle without
+that answered first.
+
+**RBAC**: `deploy/operator/rbac.yaml` grants the `policy` API group's
+`poddisruptionbudgets` the same full verb set (`get/list/watch/create/
+update/patch/delete`) as every other owned kind.
+
+**Deliverable**: `crate::desired::poddisruptionbudget` (builder + golden
+JSON test + arithmetic unit tests covering every degenerate shape),
+`crate::desired::mod`'s `pod_disruption_budget_name` helper,
+`crate::cluster_api::ClusterApi::apply_poddisruptionbudget` (+
+`RealClusterApi`/`FakeClusterApi` implementors), `crate::controller::
+apply_children` (ordering) and `run()`'s `.owns(Api::<PodDisruptionBudget>
+::all(..))` watch wiring, controller-level tests through
+`FakeClusterApi` (applied once per reconcile, owner reference set,
+selector matching the *actual* `statefulset::build` output's pod-template
+labels, and the scale-down-recomputes-from-desired-spec transition),
+`deploy/operator/rbac.yaml`, `deploy/operator/README.md`'s owned-resources
+list and a new "PodDisruptionBudget" section, this ADR, this crate's own
+`CLAUDE.md`, and `docs/roadmap.md`'s S-07 item c removed. No CRD field was
+added, so `deploy/operator/crd.yaml` is unchanged and `crd_manifest_
+pinned` needed no regeneration. `scripts/e2e-kind.sh`'s plain-TCP leg
+additionally asserts `kubectl get pdb` reports `maxUnavailable: 1` for the
+smoke's own 3-node/3-`controlNodes` shape, both right after the initial
+3/3-ready wait and again after the scale-up to 4 nodes (pinning the
+scale-invariance claim above against a real cluster, not just the unit
+corpus).

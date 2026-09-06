@@ -182,7 +182,7 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, MaybeTlsStream, Metric, Rng};
+use animus_env::{Clock, Env, MaybeTlsStream, Metric, NodeId, Rng};
 use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -1231,6 +1231,59 @@ async fn run_operation(
             backup_type,
         ),
         Operation::DeleteBackup { backup_arn } => delete_backup(ctx, &backup_arn).await,
+        Operation::ExportTableToPointInTime {
+            table,
+            table_arn,
+            s3_bucket,
+            s3_prefix,
+            export_time_ms,
+            client_token,
+        } => {
+            create_export(
+                ctx,
+                &table,
+                &table_arn,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                export_time_ms,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeExport { export_arn } => describe_export(meta, &export_arn),
+        Operation::ListExports {
+            table_arn,
+            max_results,
+            next_token,
+        } => list_exports(
+            meta,
+            table_arn.as_deref(),
+            max_results,
+            next_token.as_deref(),
+        ),
+        Operation::ImportTable {
+            s3_bucket,
+            s3_prefix,
+            input_compression,
+            table_creation_params,
+            client_token,
+        } => {
+            create_import(
+                ctx,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                input_compression,
+                &table_creation_params,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeImport { import_arn } => describe_import(meta, &import_arn),
+        Operation::ListImports {
+            table_arn,
+            page_size,
+            next_token,
+        } => list_imports(meta, table_arn.as_deref(), page_size, next_token.as_deref()),
         Operation::RestoreTableFromBackup {
             backup_arn,
             target_table_name,
@@ -1939,6 +1992,893 @@ async fn delete_backup(ctx: &ClientCtx, backup_arn: &str) -> Result<String, Wire
     }
 }
 
+// --- S3 export (ADR 0068, S-05) --------------------------------------------
+
+/// How many fresh-id retries [`create_export`] attempts before giving up —
+/// mirrors [`CREATE_BACKUP_ID_ATTEMPTS`]'s own reasoning exactly.
+const CREATE_EXPORT_ID_ATTEMPTS: u32 = 3;
+
+/// `ExportTableToPointInTime` (ADR 0068 §1/§3/§4): begin a leader-driven
+/// export of `table`'s data into the customer's own S3 bucket, in
+/// DynamoDB's JSON export layout. Validates the table exists
+/// (`TableNotFoundException`), resolves `ClientToken` idempotency (a
+/// repeated call with the same token **and table** resolves back to the
+/// existing export's description rather than minting a second one — ADR
+/// 0068 §5), and — when `export_time_ms` is given — validates it against
+/// the table's own PITR restore window
+/// (`InvalidExportTimeException`/mirroring
+/// [`restore_table_to_point_in_time`]'s identical validation, see
+/// [`validate_export_time`]). Mints a fresh opaque export identity as an
+/// ARN ([`wire::export_arn`]) — the ARN itself **is** the catalog's
+/// `ExportId` key, exactly like [`wire::backup_arn`] — stamped with
+/// `env.wall_now()`, proposes `MetaCommand::BeginExport`, and commit-waits
+/// only for the row to **appear** — never for `COMPLETED`. The export job
+/// (`run_export_job`) then runs asynchronously **on this same node** — see
+/// that function's own doc for why this is a deliberate, named
+/// simplification against the on-demand backup train's per-tablet-leader-
+/// driven, crash-resumable design (ADR 0059 §4).
+#[allow(clippy::too_many_arguments)] // mirrors every other DDL-shaped handler's full request shape
+async fn create_export(
+    ctx: &ClientCtx,
+    table: &str,
+    table_arn: &str,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    export_time_ms: Option<u64>,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    let meta = metadata_fresh(ctx).await;
+    if !meta.has_table_schema(table) {
+        return Err(WireError {
+            code: "TableNotFoundException",
+            message: format!("table `{table}` does not exist"),
+            reasons: None,
+        });
+    }
+
+    if let Some(token) = client_token
+        && let Some(existing_id) = meta.export_by_client_token(table, token).cloned()
+        && let Some(row) = meta.export(&existing_id)
+    {
+        return Ok(wire::export_description_response(&export_details_from_row(
+            &existing_id,
+            row,
+        )));
+    }
+
+    if let Some(export_time_ms) = export_time_ms {
+        validate_export_time(ctx, &meta, table, export_time_ms)?;
+    }
+
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err = internal(
+        "ExportTableToPointInTime did not commit to the control plane in time (no leader \
+         reachable?)",
+    );
+    for _ in 0..CREATE_EXPORT_ID_ATTEMPTS {
+        let export_id = wire::export_arn(table, &format!("{:016x}", ctx.env.next_u64()));
+        ctx.propose_schema(&MetaCommand::BeginExport {
+            export_id: export_id.clone(),
+            table: table.to_owned(),
+            table_arn: table_arn.to_owned(),
+            s3_bucket: s3_bucket.to_owned(),
+            s3_prefix: s3_prefix.map(str::to_owned),
+            format: animus_control::ExportFormat::DynamoDbJson,
+            export_type: animus_control::ExportType::Full,
+            export_time_ms,
+            client_token: client_token.map(str::to_owned),
+            created_wall_ms,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.export(&export_id) {
+                let details = export_details_from_row(&export_id, row);
+                tokio::spawn(run_export_job(
+                    ctx.clone(),
+                    export_id.clone(),
+                    table.to_owned(),
+                    s3_bucket.to_owned(),
+                    s3_prefix.map(str::to_owned),
+                ));
+                return Ok(wire::export_description_response(&details));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Either a (vanishingly unlikely) id collision rejected this
+                // attempt outright, or the propose itself never reached a
+                // leader — mint a fresh id and retry, mirroring
+                // `create_backup`'s own identical reasoning.
+                break;
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// Validate a requested `ExportTime` against `table`'s currently
+/// restorable point-in-time window — the identical check
+/// [`restore_table_to_point_in_time`] performs for `RestoreDateTime`, ADR
+/// 0068 §1's own "served through the PITR machinery" clause. `None` PITR
+/// history at all is `InvalidExportTimeException` here (unlike
+/// `RestoreTableToPointInTime`'s `PointInTimeRecoveryUnavailableException`)
+/// — real DynamoDB uses this single exception for every `ExportTime`
+/// validation failure on `ExportTableToPointInTime`, never a second code
+/// for "PITR was never enabled at all."
+fn validate_export_time(
+    ctx: &ClientCtx,
+    meta: &Metadata,
+    table: &str,
+    export_time_ms: u64,
+) -> Result<(), WireError> {
+    let Some(window) = meta.pitr_restore_window(table) else {
+        return Err(WireError {
+            code: "InvalidExportTimeException",
+            message: format!(
+                "`ExportTime` was requested but point-in-time recovery is not enabled (or has \
+                 no history yet) for table `{table}`"
+            ),
+            reasons: None,
+        });
+    };
+    let now_ms = ctx.env.wall_now().0;
+    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let floor_ms = now_ms.saturating_sub(retention_ms);
+    let earliest_ms = window.earliest_ms.max(floor_ms);
+    let latest_ms = window.latest_ms.max(earliest_ms);
+    if export_time_ms < earliest_ms || export_time_ms > latest_ms {
+        return Err(WireError {
+            code: "InvalidExportTimeException",
+            message: format!(
+                "`ExportTime` ({export_time_ms}ms) is outside the currently restorable window \
+                 [{earliest_ms}ms, {latest_ms}ms] for table `{table}`"
+            ),
+            reasons: None,
+        });
+    }
+    Ok(())
+}
+
+/// Build an [`wire::ExportDetails`] from one catalog row — shared by
+/// [`create_export`]/[`describe_export`]/[`list_exports`]'s own per-summary
+/// detail (mirrors [`backup_description_json`]'s identical role for
+/// backups).
+fn export_details_from_row(
+    export_id: &str,
+    row: &animus_control::ExportRow,
+) -> wire::ExportDetails {
+    let (status, failure_code, failure_message) = match &row.status {
+        animus_control::ExportStatus::InProgress => ("IN_PROGRESS", None, None),
+        animus_control::ExportStatus::Completed => ("COMPLETED", None, None),
+        animus_control::ExportStatus::Failed { reason } => (
+            "FAILED",
+            Some("ExportFailed".to_owned()),
+            Some(reason.clone()),
+        ),
+    };
+    wire::ExportDetails {
+        export_arn: export_id.to_owned(),
+        table_arn: row.table_arn.clone(),
+        status,
+        s3_bucket: row.s3_bucket.clone(),
+        s3_prefix: row.s3_prefix.clone(),
+        client_token: row.client_token.clone(),
+        start_wall_ms: row.created_wall_ms,
+        end_wall_ms: row.completed_wall_ms,
+        export_time_ms: row.export_time_ms,
+        item_count: row.item_count,
+        billed_size_bytes: row.billed_size_bytes,
+        export_manifest: row.export_manifest.clone(),
+        failure_code,
+        failure_message,
+    }
+}
+
+/// An export row visible at the wire — every export row is visible forever
+/// (unlike a backup, ADR 0068 §3: there is no delete/reclaim command, so
+/// there is no "already gone" state to filter, unlike
+/// [`visible_backup`]'s own filter).
+fn visible_export<'a>(
+    meta: &'a Metadata,
+    export_arn: &str,
+) -> Result<&'a animus_control::ExportRow, WireError> {
+    meta.export(export_arn).ok_or_else(|| WireError {
+        code: "ExportNotFoundException",
+        message: format!("export `{export_arn}` does not exist"),
+        reasons: None,
+    })
+}
+
+/// `DescribeExport` (ADR 0068 §3): a pure read of one export's catalog row
+/// by its ARN.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_export(meta: &Metadata, export_arn: &str) -> Result<String, WireError> {
+    let row = visible_export(meta, export_arn)?;
+    Ok(wire::export_description_response(&export_details_from_row(
+        export_arn, row,
+    )))
+}
+
+/// `ListExports` (ADR 0068 §3): paginated export summaries in ascending-ARN
+/// order — `Metadata::exports`' own `BTreeMap<ExportId, _>` iteration
+/// order, which is exactly the order [`wire::paginate_export_summaries`]
+/// relies on, since an `ExportId` **is** its own ARN
+/// ([`wire::export_arn`]'s doc).
+fn list_exports(
+    meta: &Metadata,
+    table_arn: Option<&str>,
+    max_results: Option<usize>,
+    next_token: Option<&str>,
+) -> Result<String, WireError> {
+    let candidates: Vec<wire::ExportSummary> = meta
+        .exports
+        .iter()
+        .filter(|(_, row)| table_arn.is_none_or(|t| row.table_arn == t))
+        .map(|(export_id, row)| wire::ExportSummary {
+            export_arn: export_id.clone(),
+            status: match &row.status {
+                animus_control::ExportStatus::InProgress => "IN_PROGRESS",
+                animus_control::ExportStatus::Completed => "COMPLETED",
+                animus_control::ExportStatus::Failed { .. } => "FAILED",
+            },
+        })
+        .collect();
+    let (page, next) = wire::paginate_export_summaries(&candidates, next_token, max_results);
+    Ok(wire::list_exports_response(&page, next.as_deref()))
+}
+
+/// DynamoDB's own export-manifest root segment (ADR 0068 §1) — every
+/// object [`run_export_job`] writes lives at `[S3Prefix/]AWSDynamoDB/<export
+/// id suffix>/...` inside the customer's bucket. `S3Prefix`, if any, is
+/// already baked into the [`animus_env::SegmentStore`] handle by
+/// [`ClientCtx::export_store_factory`] — this job's own object ids never
+/// repeat it.
+const EXPORT_MANIFEST_ROOT: &str = "AWSDynamoDB";
+
+/// Items per gzip-compressed data file — a deliberate row-count budget,
+/// mirroring the on-demand backup capture driver's own `CHUNK_ROWS`
+/// simplification against a byte budget (`backup_capture.rs`'s own doc;
+/// ADR 0068 §1).
+const EXPORT_CHUNK_ROWS: usize = 1000;
+
+/// The bare export id (the random hex suffix [`create_export`] minted) from
+/// its own ARN — the last `/`-separated segment ([`wire::export_arn`]
+/// never lets that suffix itself contain a `/`).
+fn export_id_suffix(export_id: &str) -> &str {
+    export_id.rsplit('/').next().unwrap_or(export_id)
+}
+
+/// One rendered data file's own `manifest-files.json` entry.
+struct ExportDataFile {
+    item_count: u64,
+    checksum_hex: String,
+    data_file_s3_key: String,
+}
+
+/// The leader-driven S3 export job (ADR 0068 §1/§4): runs **once**, on
+/// whichever node's wire edge received the `ExportTableToPointInTime` call
+/// that spawned it (`create_export`'s own `tokio::spawn`) — a deliberate,
+/// **named simplification** against the on-demand backup train's per-
+/// tablet-leader-driven, crash-resumable design (ADR 0059 §4): if this node
+/// crashes mid-export, the row is left permanently `InProgress` with no
+/// janitor yet built to time it out (a follow-up, tracked in ADR 0068's own
+/// "Known residuals" section, not a silently-accepted gap). Reuses the
+/// native quorum range scan ([`ClientCtx::cp_scan`], the same primitive a
+/// plain `Scan` itself uses via [`native_scan`]) to sweep `table`'s current
+/// committed state (read-through-intent-resolution — the identical
+/// consistency `cp_scan` already gives every other reader, ADR 0018 §2) —
+/// [`ClientCtx::export_store_factory`]'s customer-bucket store is where
+/// every object lands. **Content fidelity for a validated `ExportTime` is a
+/// second named residual**: `create_export`/`validate_export_time` reject a
+/// request outside the table's PITR window, but the payload this job
+/// actually renders is always the table's *current* committed state, never
+/// a true point-in-time reconstruction as of the requested instant — a
+/// real gap against ADR 0068 §1's own "served through the PITR machinery"
+/// design intent, tracked as a follow-up rather than silently claimed.
+async fn run_export_job(
+    ctx: ClientCtx,
+    export_id: String,
+    table: String,
+    s3_bucket: String,
+    s3_prefix: Option<String>,
+) {
+    match run_export_job_inner(&ctx, &export_id, &table, &s3_bucket, s3_prefix.as_deref()).await {
+        Ok((item_count, billed_size_bytes, export_manifest)) => {
+            let completed_wall_ms = ctx.env.wall_now().0;
+            ctx.propose_schema(&MetaCommand::CompleteExport {
+                export_id,
+                item_count,
+                billed_size_bytes,
+                export_manifest,
+                completed_wall_ms,
+            })
+            .await;
+        }
+        Err(reason) => {
+            tracing::warn!(export_id = %export_id, error = %reason, "S3 export job failed");
+            let completed_wall_ms = ctx.env.wall_now().0;
+            ctx.propose_schema(&MetaCommand::FailExport {
+                export_id,
+                reason,
+                completed_wall_ms,
+            })
+            .await;
+        }
+    }
+}
+
+/// [`run_export_job`]'s actual work — factored out so the caller can turn
+/// any `Err` into a `FailExport` proposal uniformly. Returns `(item_count,
+/// billed_size_bytes, export_manifest_s3_key)` on success.
+async fn run_export_job_inner(
+    ctx: &ClientCtx,
+    export_id: &str,
+    table: &str,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+) -> Result<(u64, u64, String), String> {
+    let build_store = ctx
+        .export_store_factory
+        .lock()
+        .expect("export store factory lock")
+        .clone();
+    let store =
+        build_store(s3_bucket, s3_prefix).map_err(|e| format!("building S3 export store: {e}"))?;
+
+    let root = format!("{EXPORT_MANIFEST_ROOT}/{}", export_id_suffix(export_id));
+    store
+        .put(&format!("{root}/_started"), b"")
+        .await
+        .map_err(|e| format!("writing _started marker: {e}"))?;
+
+    let mut item_count: u64 = 0;
+    let mut billed_size_bytes: u64 = 0;
+    let mut data_files: Vec<ExportDataFile> = Vec::new();
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut file_index: u64 = 0;
+    loop {
+        let pairs = ctx
+            .cp_scan(
+                table,
+                cursor.clone(),
+                None,
+                Some(EXPORT_CHUNK_ROWS),
+                false,
+                ReadConsistency::Strong,
+            )
+            .await
+            .map_err(|e| format!("scanning table `{table}`: {e}"))?;
+        let exhausted = pairs.len() < EXPORT_CHUNK_ROWS;
+        let last_key = pairs.last().map(|(k, _)| k.clone());
+
+        let mut lines = String::new();
+        let mut chunk_items: u64 = 0;
+        for (_, value) in &pairs {
+            let Some(item) = wire::decode_stored_item(value)
+                .map_err(|e| format!("decoding stored item: {e:?}"))?
+            else {
+                continue; // a DynamoDB tombstone value — never exported
+            };
+            let line = serde_json::json!({ "Item": wire::encode_item(&item) });
+            lines.push_str(&serde_json::to_string(&line).expect("json serializes"));
+            lines.push('\n');
+            chunk_items += 1;
+        }
+        if chunk_items > 0 {
+            let gz = gzip_bytes(lines.as_bytes());
+            let data_key = format!("{root}/data/{file_index:04}.json.gz");
+            store
+                .put(&data_key, &gz)
+                .await
+                .map_err(|e| format!("writing data file: {e}"))?;
+            data_files.push(ExportDataFile {
+                item_count: chunk_items,
+                checksum_hex: crc32_hex(&gz),
+                data_file_s3_key: data_key,
+            });
+            item_count += chunk_items;
+            billed_size_bytes += lines.len() as u64;
+            file_index += 1;
+        }
+
+        if exhausted {
+            break;
+        }
+        let mut next = last_key.expect("non-exhausted scan returned pairs");
+        next.push(0x00);
+        cursor = next;
+    }
+
+    let mut files_lines = String::new();
+    for f in &data_files {
+        let line = serde_json::json!({
+            "itemCount": f.item_count,
+            "md5Checksum": f.checksum_hex,
+            "etag": f.checksum_hex,
+            "dataFileS3Key": f.data_file_s3_key,
+        });
+        files_lines.push_str(&serde_json::to_string(&line).expect("json serializes"));
+        files_lines.push('\n');
+    }
+    let files_key = format!("{root}/manifest-files.json");
+    store
+        .put(&files_key, files_lines.as_bytes())
+        .await
+        .map_err(|e| format!("writing manifest-files.json: {e}"))?;
+
+    // `manifest-summary.json` is written LAST — a reader (this export's own
+    // `DescribeExport`, or real AWS export/import tooling) must never see a
+    // partial export as complete (ADR 0068 §1's durable-before-visible
+    // rule, mirroring ADR 0059 §4's identical rule for on-demand backups).
+    let summary = serde_json::json!({
+        "version": "2020-06-30",
+        "exportArn": export_id,
+        "s3Bucket": s3_bucket,
+        "s3Prefix": s3_prefix,
+        "manifestFilesS3Key": files_key,
+        "itemCount": item_count,
+        "billedSizeBytes": billed_size_bytes,
+        "outputFormat": "DYNAMODB_JSON",
+    });
+    let summary_key = format!("{root}/manifest-summary.json");
+    store
+        .put(
+            &summary_key,
+            serde_json::to_string(&summary)
+                .expect("json serializes")
+                .as_bytes(),
+        )
+        .await
+        .map_err(|e| format!("writing manifest-summary.json: {e}"))?;
+
+    Ok((item_count, billed_size_bytes, summary_key))
+}
+
+/// gzip-compress `bytes` at the default compression level — the `.json.gz`
+/// data-file format DynamoDB's own S3 export layout expects (ADR 0068 §1).
+fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("an in-memory gzip write never fails");
+    encoder
+        .finish()
+        .expect("an in-memory gzip finish never fails")
+}
+
+/// A stand-in for AWS's own MD5-based `md5Checksum`/`etag` fields (ADR 0068
+/// §1) — this adapter uses CRC32 (already a workspace dependency,
+/// `animus-storage`'s SSTable block checksums) rather than a true MD5,
+/// documented here rather than left for a reader to discover by diffing
+/// against real AWS output: a consumer that specifically re-verifies these
+/// hashes against a real MD5 of the object bytes needs this closed as a
+/// follow-up.
+fn crc32_hex(bytes: &[u8]) -> String {
+    format!("{:08x}", crc32fast::hash(bytes))
+}
+
+// --- S3 import (ADR 0068 §6, S-05 PR 2) ------------------------------------
+
+/// How many fresh-id retries [`create_import`]/[`finish_import_kickoff`]
+/// attempt before giving up — mirrors [`CREATE_EXPORT_ID_ATTEMPTS`]'s own
+/// reasoning exactly.
+const CREATE_IMPORT_ID_ATTEMPTS: u32 = 3;
+
+/// `ImportTable` (ADR 0068 §6): begin a leader-driven import of a customer
+/// S3 bucket's DynamoDB JSON export layout into a brand-new table, created
+/// from `params`.
+///
+/// `ClientToken` idempotency is resolved first (ADR 0068 §5's identical
+/// contract, minus the table scoping — `Metadata::import_by_client_token`'s
+/// own doc has the reason): a retried call with the same token returns the
+/// existing import's description rather than starting a second job.
+/// Otherwise:
+///
+/// 1. [`provision_import_target`] commits the target table's schema (+ any
+///    GSIs, resolved but not yet declared — mirroring
+///    [`RestoreRow::gsi_defs`](animus_control::RestoreRow::gsi_defs)'s own
+///    "declare only once the tablet is fully seeded" reasoning) through the
+///    identical `CreateTable` validation/commit-wait path. A name already
+///    registered — a genuinely pre-existing table, **or** another import
+///    already targeting it, since `BeginImport` proposes this SAME
+///    `CreateTableSchema` before ever minting its own row — is
+///    `ImportConflictException`, real DynamoDB's own code for both cases;
+///    this is also what enforces "one import per target table name at a
+///    time" with no separate concurrency check needed.
+/// 2. [`finish_import_kickoff`] proposes `MetaCommand::BeginImport` — mints
+///    the single `Building` destination tablet (mirrors
+///    `RestoreTableFromBackup`'s own `BeginRestore`), so a normal client
+///    write/read is refused until the import driver (`crate::import`)
+///    activates it — the identical mechanism a restore's target uses,
+///    reused rather than inventing a new status.
+/// 3. Returns immediately — **asynchronous**, unlike `create_table`'s own
+///    blocking wait: the import driver does the actual read/seed/activate
+///    sequence in the background, so `DescribeTable` reports `CREATING`
+///    ([`table_status`]) until it converges.
+async fn create_import(
+    ctx: &ClientCtx,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    input_compression: animus_control::InputCompressionType,
+    params: &wire::TableCreationParameters,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    if let Some(token) = client_token
+        && let Some(existing_id) = metadata_fresh(ctx)
+            .await
+            .import_by_client_token(token)
+            .cloned()
+        && let Some(row) = metadata_fresh(ctx).await.import(&existing_id)
+    {
+        return Ok(wire::import_description_response(&import_details_from_row(
+            &existing_id,
+            row,
+        )));
+    }
+
+    let provision = provision_import_target(ctx, params).await?;
+    finish_import_kickoff(
+        ctx,
+        s3_bucket,
+        s3_prefix,
+        input_compression,
+        &provision,
+        client_token,
+    )
+    .await
+}
+
+/// The GSI/schema half of an import's own setup — [`provision_import_target`]'s
+/// resolved shape, shared with [`finish_import_kickoff`].
+struct ImportProvision {
+    /// The freshly-committed target table name (== `params.table_name`).
+    target_table: String,
+    /// The target table's synthetic ARN.
+    target_table_arn: String,
+    /// The already-committed base (indexes-free) control schema.
+    base_schema: animus_control::TableSchema,
+    /// The declared `(AttributeName, AttributeType)` pairs.
+    key_types: Vec<(String, String)>,
+    /// This import's own resolved GSI plan — **not yet** declared on the
+    /// schema; see [`ImportRow::gsi_defs`](animus_control::ImportRow::gsi_defs)'s
+    /// own doc for why.
+    gsi_defs: Vec<IndexDef>,
+    /// The target table's requested provisioned throughput, if any.
+    throughput: Option<animus_control::ProvisionedThroughput>,
+}
+
+async fn provision_import_target(
+    ctx: &ClientCtx,
+    params: &wire::TableCreationParameters,
+) -> Result<ImportProvision, WireError> {
+    let target_table = params.table_name.clone();
+    if animus_control::syskv::is_reserved_name(&target_table) {
+        return Err(WireError::validation(format!(
+            "table name `{target_table}` collides with the reserved system namespace"
+        )));
+    }
+    if metadata_fresh(ctx).await.has_table_schema(&target_table) {
+        return Err(WireError {
+            code: "ImportConflictException",
+            message: format!(
+                "table `{target_table}` already exists, or an import is already in progress \
+                 for it"
+            ),
+            reasons: None,
+        });
+    }
+
+    let mut base_schema = schema_bridge::to_control(&params.schema, &params.key_types);
+    base_schema.throughput = params.throughput;
+
+    // Every GSI is resolved now (`IndexStatus::Creating`, the identical
+    // restore-target convention) but deliberately not declared on the
+    // schema yet — declaring it before the tablet is seeded would let the
+    // backfill seeder observe an empty range, mark it backfilled, and then
+    // silently miss every row this import seeds afterward.
+    let gsi_defs: Vec<IndexDef> = params
+        .indexes
+        .iter()
+        .map(|idx| {
+            let mut def = schema_bridge::index_to_control(
+                idx,
+                &params.schema.partition_key,
+                &params.key_types,
+            );
+            def.status = IndexStatus::Creating;
+            def
+        })
+        .collect();
+
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: target_table.clone(),
+            schema: base_schema.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx).await.has_table_schema(&target_table) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "ImportTable did not commit its target schema in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+
+    Ok(ImportProvision {
+        target_table_arn: wire::table_arn(&target_table),
+        target_table,
+        base_schema,
+        key_types: params.key_types.clone(),
+        gsi_defs,
+        throughput: params.throughput,
+    })
+}
+
+/// The first `min(N, MAX_REPLICATION_FACTOR)` `Active` members of `meta` —
+/// [`finish_import_kickoff`]'s and [`finish_restore_kickoff`]'s shared
+/// replica pick, factored out to a pure function purely so the one property
+/// that matters (an empty `Metadata`, or one with no `Active` member at all,
+/// yields an **empty** `Vec`, never a panic or a garbage placeholder) is
+/// unit-testable without a real cluster. See either kickoff's own doc for
+/// why its caller must never propose its `Begin*` command with an empty
+/// result from this function — unlike
+/// [`provision_tablet`](ClientCtx::provision_tablet)'s own identical
+/// selection for `CreateTablet`, both of these feed a tablet minted
+/// `Building`, which `reconcile_placement` can never later repair.
+fn active_replicas_for_new_tablet(meta: &Metadata) -> Vec<NodeId> {
+    let mut replicas: Vec<NodeId> = meta
+        .members
+        .iter()
+        .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+        .map(|(id, _)| id.clone())
+        .collect();
+    replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+    replicas
+}
+
+/// Wait, bounded by [`SCHEMA_COMMIT_TIMEOUT`], for a fresh `Metadata` read
+/// whose [`active_replicas_for_new_tablet`] is non-empty, returning the
+/// freshest snapshot seen either way (empty, if the deadline expired first).
+/// Shared by [`finish_import_kickoff`] and [`finish_restore_kickoff`] — both
+/// mint a tablet in `Building`, a state [`reconcile_placement`] never
+/// repairs (see [`active_replicas_for_new_tablet`]'s own doc), so both must
+/// give a transient every-member-`Down` false positive (ADR 0012's failure
+/// detector under real-thread CPU contention, not a `SimEnv`-provable race)
+/// a chance to clear before minting rather than commit an unhostable
+/// `replicas: []` tablet outright. The caller still owns the "still empty
+/// after waiting → skip this propose, retry with a fresh id" decision — this
+/// helper only waits and logs, it never itself decides to give up.
+async fn await_active_metadata_for_new_tablet(ctx: &ClientCtx) -> Metadata {
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        let candidate = metadata_fresh(ctx).await;
+        if !active_replicas_for_new_tablet(&candidate).is_empty() {
+            return candidate;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "no Active member observed while provisioning a new tablet's \
+                 initial replica set; proceeding, caller will retry with a \
+                 fresh id if still empty"
+            );
+            return candidate;
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// Mint the single destination tablet + propose `MetaCommand::BeginImport`
+/// (mirrors [`restore_table_from_backup`]'s own [`finish_restore_kickoff`]).
+/// The replica set follows [`provision_tablet`](ClientCtx::provision_tablet)'s
+/// own convention — the first `min(N, MAX_REPLICATION_FACTOR)` `Active`
+/// members ([`active_replicas_for_new_tablet`]). Returns immediately once
+/// the row commits — **asynchronous**; the import driver (`crate::import`)
+/// does the actual seeding in the background.
+///
+/// **Never proposes `BeginImport` with an empty replica set** (issue found
+/// on a CI shard running several `animusd` integration-test binaries under
+/// heavy contention, 2026-09-06; `docs/engineering-lessons.md` has the full
+/// diagnosis): every member transiently `Down` — a real-thread failure-
+/// detector false positive under CPU-starved scheduling, ADR 0012, not a
+/// `SimEnv`-provable race — used to commit a `Building` tablet with
+/// `replicas: []`, which no node's tablet-host reconciler can ever host
+/// (`plan_join_host`'s own `replicas.contains(&base_id)` check) and which
+/// `reconcile_placement`'s ordinary self-heal can never repair either
+/// (its own `TabletState::Active` gate — this tablet stays `Building`
+/// until it is fully seeded, a state it can now never reach): a permanent,
+/// silent dead end, not a slow recovery. Fixed by waiting (bounded by this
+/// function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`]) for at least one
+/// `Active` member before minting, and skipping the propose (retrying with
+/// a fresh id) if the wait still ends empty.
+async fn finish_import_kickoff(
+    ctx: &ClientCtx,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    input_compression: animus_control::InputCompressionType,
+    provision: &ImportProvision,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err =
+        internal("ImportTable did not commit its import row in time (no leader reachable?)");
+    for _ in 0..CREATE_IMPORT_ID_ATTEMPTS {
+        let import_id = wire::import_arn(
+            &provision.target_table,
+            &format!("{:016x}", ctx.env.next_u64()),
+        );
+        // A synthetic per-table identity (`ImportRow::table_id`'s own doc)
+        // — a fresh random hex string, never interpreted, purely for the
+        // `TableId` field real `ImportTableDescription` responses carry.
+        let table_id = format!("{:032x}", ctx.env.next_u64());
+        // Wait (bounded) for at least one `Active` member before minting
+        // this import's destination tablet. Unlike `provision_tablet`'s own
+        // `CreateTablet` — whose tablet is minted `Active` and so stays
+        // reachable by `reconcile_placement`'s ordinary self-heal even if
+        // its own initial replica pick under-shoots — this tablet is minted
+        // `Building` and stays placement-frozen for as long as it is
+        // (`reconcile_placement`'s own `TabletState::Active` gate,
+        // `animus-control`'s `meta.rs`), so a `BeginImport` committed with
+        // an **empty** replica set (every member transiently `Down` under
+        // real-thread scheduling pressure — ADR 0012's failure detector, not
+        // a `SimEnv`-provable race) can never self-heal once committed: no
+        // node ever hosts it, `import_loop` polls "not hosted" forever, and
+        // the wire caller's own terminal-state poll times out. Mirrors
+        // `ClientCtx::provision_tablet`'s own `!replicas.is_empty()` gate
+        // (`schema.rs`) — never propose a destination this cluster cannot
+        // yet route to.
+        let fresh = await_active_metadata_for_new_tablet(ctx).await;
+        let tablet = fresh.next_free_tablet_id();
+        let replicas = active_replicas_for_new_tablet(&fresh);
+        if replicas.is_empty() {
+            // Still nothing `Active` after waiting out the deadline above —
+            // mint a fresh id and retry rather than commit a tablet no node
+            // will ever host.
+            continue;
+        }
+        ctx.propose_schema(&MetaCommand::BeginImport {
+            import_id: import_id.clone(),
+            target_table: provision.target_table.clone(),
+            target_table_arn: provision.target_table_arn.clone(),
+            table_id: table_id.clone(),
+            s3_bucket: s3_bucket.to_owned(),
+            s3_prefix: s3_prefix.map(str::to_owned),
+            input_format: animus_control::InputFormat::DynamoDbJson,
+            input_compression,
+            base_schema: Box::new(provision.base_schema.clone()),
+            key_types: provision.key_types.clone(),
+            gsi_defs: provision.gsi_defs.clone(),
+            throughput: provision.throughput,
+            tablet,
+            replicas,
+            client_token: client_token.map(str::to_owned),
+            created_wall_ms,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.import(&import_id) {
+                return Ok(wire::import_description_response(&import_details_from_row(
+                    &import_id, row,
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break; // mint a fresh id and retry
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// Build a [`wire::ImportDetails`] from one catalog row — shared by
+/// [`create_import`]/[`describe_import`]/[`list_imports`]'s own per-summary
+/// detail (mirrors [`export_details_from_row`]'s identical role).
+fn import_details_from_row(
+    import_id: &str,
+    row: &animus_control::ImportRow,
+) -> wire::ImportDetails {
+    let (status, failure_code, failure_message) = match &row.status {
+        animus_control::ImportStatus::InProgress => ("IN_PROGRESS", None, None),
+        animus_control::ImportStatus::Completed => ("COMPLETED", None, None),
+        animus_control::ImportStatus::Failed { reason } => (
+            "FAILED",
+            Some("ImportFailed".to_owned()),
+            Some(reason.clone()),
+        ),
+    };
+    wire::ImportDetails {
+        import_arn: import_id.to_owned(),
+        table_arn: row.target_table_arn.clone(),
+        table_id: row.table_id.clone(),
+        status,
+        s3_bucket: row.s3_bucket.clone(),
+        s3_prefix: row.s3_prefix.clone(),
+        input_compression: match row.input_compression {
+            animus_control::InputCompressionType::Gzip => "GZIP",
+            // `Zstd` never reaches a committed `ImportRow` (rejected at
+            // wire-decode time, ADR 0068 §6) — matched explicitly rather
+            // than `unreachable!()`, the usual defense-in-depth.
+            animus_control::InputCompressionType::None
+            | animus_control::InputCompressionType::Zstd => "NONE",
+        },
+        table_creation_params: wire::TableCreationParameters {
+            table_name: row.target_table.clone(),
+            schema: schema_bridge::to_dynamo(&row.base_schema),
+            key_types: row.key_types.clone(),
+            indexes: schema_bridge::indexes_to_dynamo(&row.gsi_defs),
+            throughput: row.throughput,
+        },
+        client_token: row.client_token.clone(),
+        start_wall_ms: row.created_wall_ms,
+        end_wall_ms: row.completed_wall_ms,
+        processed_item_count: row.processed_item_count,
+        imported_item_count: row.imported_item_count,
+        error_count: row.error_count,
+        processed_size_bytes: row.processed_size_bytes,
+        failure_code,
+        failure_message,
+    }
+}
+
+/// An import row visible at the wire — every import row is visible forever
+/// (unlike a backup, ADR 0068 §6: there is no delete/reclaim command, the
+/// identical [`visible_export`]'s own reasoning).
+fn visible_import<'a>(
+    meta: &'a Metadata,
+    import_arn: &str,
+) -> Result<&'a animus_control::ImportRow, WireError> {
+    meta.import(import_arn).ok_or_else(|| WireError {
+        code: "ImportNotFoundException",
+        message: format!("import `{import_arn}` does not exist"),
+        reasons: None,
+    })
+}
+
+/// `DescribeImport` (ADR 0068 §6): a pure read of one import's catalog row
+/// by its ARN.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_import(meta: &Metadata, import_arn: &str) -> Result<String, WireError> {
+    let row = visible_import(meta, import_arn)?;
+    Ok(wire::import_description_response(&import_details_from_row(
+        import_arn, row,
+    )))
+}
+
+/// `ListImports` (ADR 0068 §6): paginated import summaries in ascending-ARN
+/// order — `Metadata::imports`' own `BTreeMap<ImportId, _>` iteration order,
+/// which is exactly the order [`wire::paginate_import_summaries`] relies
+/// on, since an `ImportId` **is** its own ARN.
+fn list_imports(
+    meta: &Metadata,
+    table_arn: Option<&str>,
+    page_size: Option<usize>,
+    next_token: Option<&str>,
+) -> Result<String, WireError> {
+    let candidates: Vec<wire::ImportSummary> = meta
+        .imports
+        .iter()
+        .filter(|(_, row)| table_arn.is_none_or(|t| row.target_table_arn == t))
+        .map(|(import_id, row)| wire::ImportSummary {
+            import_arn: import_id.clone(),
+            status: match &row.status {
+                animus_control::ImportStatus::InProgress => "IN_PROGRESS",
+                animus_control::ImportStatus::Completed => "COMPLETED",
+                animus_control::ImportStatus::Failed { .. } => "FAILED",
+            },
+            table_arn: row.target_table_arn.clone(),
+            start_wall_ms: row.created_wall_ms,
+            end_wall_ms: row.completed_wall_ms,
+        })
+        .collect();
+    let (page, next) = wire::paginate_import_summaries(&candidates, next_token, page_size);
+    Ok(wire::list_imports_response(&page, next.as_deref()))
+}
+
 /// How many fresh-id retries [`restore_table_from_backup`] attempts before
 /// giving up — mirrors [`CREATE_BACKUP_ID_ATTEMPTS`]'s own reasoning
 /// exactly (a restore id collision is vanishingly unlikely; a repeated
@@ -2189,19 +3129,34 @@ async fn provision_restore_target(
 /// [`restore_table_to_point_in_time`] — the only difference between the two
 /// callers is `backup_id` (a client-named ARN vs. the chosen PITR base
 /// snapshot's own ARN) and `pitr` (`None` vs. `Some` the resolved
-/// [`animus_control::PitrRestorePlan`]). The replica set mirrors
+/// [`animus_control::PitrRestorePlan`]). The replica set follows
 /// `provision_tablet`'s own convention — the first `min(N,
-/// MAX_REPLICATION_FACTOR)` `Active` members, best-effort under-sized if the
-/// cluster is still bootstrapping (nothing here self-heals an under-sized
-/// set the way `reconcile_placement` does for an ordinary tablet's recorded
-/// RF policy, a named residual: this restore tablet gets no
-/// `SetTabletPolicy` at all, so it is never a `reconcile_placement`/
-/// `rebalance_placement` candidate — a smaller follow-up, not a correctness
-/// gap, since restore still succeeds with fewer replicas than the target
-/// RF). Returns immediately once the row commits — **asynchronous**, unlike
-/// `create_table`'s own blocking `await_table_serveable` wait: the restore
-/// driver (`crate::backup_restore`) seeds and activates the tablet in the
-/// background.
+/// MAX_REPLICATION_FACTOR)` `Active` members ([`active_replicas_for_new_tablet`]),
+/// best-effort under-sized if the cluster is still bootstrapping (nothing
+/// here self-heals an under-sized *but non-empty* set the way
+/// `reconcile_placement` does for an ordinary tablet's recorded RF policy, a
+/// named residual: this restore tablet gets no `SetTabletPolicy` at all, so
+/// it is never a `reconcile_placement`/`rebalance_placement` candidate — a
+/// smaller follow-up, not a correctness gap, since restore still succeeds
+/// with fewer replicas than the target RF). Returns immediately once the row
+/// commits — **asynchronous**, unlike `create_table`'s own blocking
+/// `await_table_serveable` wait: the restore driver (`crate::
+/// backup_restore`) seeds and activates the tablet in the background.
+///
+/// **Never proposes `BeginRestore` with an empty replica set** — the twin of
+/// [`finish_import_kickoff`]'s own identical guard (issue #657, twin of the
+/// import fix; see `docs/engineering-lessons.md`'s entry on the original
+/// `dynamo_import.rs` CI flake for the full diagnosis, which this kickoff
+/// shares byte-for-byte): `BeginRestore` mints its destination tablet
+/// `Building`, a state [`reconcile_placement`] never repairs, so an
+/// every-member-transiently-`Down` false positive (ADR 0012's failure
+/// detector under real-thread CPU contention, not a `SimEnv`-provable race)
+/// landing at this snapshot would otherwise commit a permanently-unhostable
+/// tablet exactly like the import kickoff's own. Fixed with the same shared
+/// wait/retry shape ([`await_active_metadata_for_new_tablet`]): wait,
+/// bounded by this function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`], for
+/// at least one `Active` member before minting, and skip the propose
+/// (retrying with a fresh id) if the wait still ends empty.
 async fn finish_restore_kickoff(
     ctx: &ClientCtx,
     backup_id: &str,
@@ -2214,15 +3169,19 @@ async fn finish_restore_kickoff(
         internal("restore did not commit its restore row in time (no leader reachable?)");
     for _ in 0..RESTORE_ID_ATTEMPTS {
         let restore_id = format!("restore-{:016x}", ctx.env.next_u64());
-        let fresh = metadata_fresh(ctx).await;
+        // Wait (bounded) for at least one `Active` member before minting
+        // this restore's destination tablet — see this function's own doc
+        // and `finish_import_kickoff`'s identical guard for why a
+        // `Building`-minting kickoff can never propose an empty replica set.
+        let fresh = await_active_metadata_for_new_tablet(ctx).await;
         let tablet = fresh.next_free_tablet_id();
-        let mut replicas: Vec<_> = fresh
-            .members
-            .iter()
-            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
-            .map(|(id, _)| id.clone())
-            .collect();
-        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        let replicas = active_replicas_for_new_tablet(&fresh);
+        if replicas.is_empty() {
+            // Still nothing `Active` after waiting out the deadline above —
+            // mint a fresh id and retry rather than commit a tablet no node
+            // will ever host.
+            continue;
+        }
         ctx.propose_schema(&MetaCommand::BeginRestore {
             restore_id: restore_id.clone(),
             backup_id: backup_id.to_owned(),
@@ -8323,5 +9282,125 @@ mod list_backups_tests {
         )
         .expect("list_backups");
         assert_eq!(arns(&body), vec!["arn-a", "arn-b", "arn-c"]);
+    }
+}
+
+/// Regression for the 2026-09-06 CI flake (`docs/engineering-lessons.md`)
+/// and its issue #657 restore twin: [`active_replicas_for_new_tablet`] must
+/// never manufacture a nonempty result out of nothing, and must never
+/// include a non-`Active` member — the exact property whose absence let
+/// `finish_import_kickoff` (and, before the #657 fix, `finish_restore_kickoff`)
+/// commit a `Building` tablet with `replicas: []` when every member was
+/// transiently `Down`. Both kickoffs call this identical free function for
+/// their replica pick, so every test below pins both call sites at once;
+/// `restore_kickoff_shares_the_import_kickoffs_selection` additionally pins
+/// that fact itself — a future edit reintroducing a bespoke selection at
+/// either kickoff's own call site rather than reusing this function would
+/// not by itself fail the tests above, only this one. Pure `Metadata::apply`
+/// — no cluster, no `ClientCtx`, no timing.
+#[cfg(test)]
+mod active_replicas_tests {
+    use animus_control::{MetaCommand, NodeStatus};
+
+    use super::*;
+
+    fn upsert(meta: &mut Metadata, node: NodeId, status: NodeStatus) {
+        meta.apply(&MetaCommand::UpsertMember {
+            node,
+            labels: Default::default(),
+            status,
+        });
+    }
+
+    #[test]
+    fn an_empty_metadata_yields_no_replicas() {
+        let meta = Metadata::default();
+        assert!(active_replicas_for_new_tablet(&meta).is_empty());
+    }
+
+    #[test]
+    fn every_member_down_yields_no_replicas() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Joining);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Leaving);
+        assert!(
+            active_replicas_for_new_tablet(&meta).is_empty(),
+            "no member is Active — this must read as \"not ready\", never as a \
+             valid (empty) replica set to commit"
+        );
+    }
+
+    #[test]
+    fn a_single_active_member_among_down_ones_is_picked() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Down);
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta),
+            vec![crate::config::node_id(1)]
+        );
+    }
+
+    #[test]
+    fn truncates_to_the_replication_factor() {
+        let mut meta = Metadata::default();
+        for i in 0..(crate::MAX_REPLICATION_FACTOR + 3) {
+            upsert(&mut meta, crate::config::node_id(i), NodeStatus::Active);
+        }
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta).len(),
+            crate::MAX_REPLICATION_FACTOR
+        );
+    }
+
+    /// Issue #657 (the restore twin of the import fix): `finish_restore_kickoff`
+    /// (`BeginRestore`) must derive its initial replica set the identical way
+    /// `finish_import_kickoff` (`BeginImport`) does — both call this same
+    /// [`active_replicas_for_new_tablet`] function rather than each keeping
+    /// its own selection, which is what let the two drift out of sync with
+    /// the import kickoff's own guard in the first place (the restore
+    /// kickoff used to inline a byte-for-byte copy of the pre-fix, unguarded
+    /// selection). Pinned against a mixed-status fixture exercising every
+    /// property that matters for a restore's own kickoff: a `Down` member is
+    /// excluded, an `Active` one is kept in encounter order, and a
+    /// `Joining` one (a status a restore's target cluster can plausibly be
+    /// mid-growth under, unlike the plain up/down mix the tests above use)
+    /// is excluded too.
+    #[test]
+    fn restore_kickoff_shares_the_import_kickoffs_selection() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(2), NodeStatus::Active);
+        upsert(&mut meta, crate::config::node_id(3), NodeStatus::Joining);
+        assert_eq!(
+            active_replicas_for_new_tablet(&meta),
+            vec![crate::config::node_id(1), crate::config::node_id(2)],
+            "finish_restore_kickoff's BeginRestore and finish_import_kickoff's \
+             BeginImport must pick the identical Active-only, RF-truncated \
+             replica set from the identical Metadata snapshot"
+        );
+    }
+
+    /// Issue #657's own failure mode, restated for the restore kickoff
+    /// specifically (the import twin is `every_member_down_yields_no_replicas`
+    /// above): every member transiently `Down` — the exact real-thread
+    /// failure-detector false positive `docs/engineering-lessons.md`'s CI
+    /// flake entry diagnoses — must still read as "not ready" for a
+    /// `BeginRestore` kickoff, never as a valid empty set it would have
+    /// minted a permanently-unhostable `Building` tablet from before this
+    /// fix.
+    #[test]
+    fn restore_kickoff_sees_no_replicas_when_every_member_is_down() {
+        let mut meta = Metadata::default();
+        upsert(&mut meta, crate::config::node_id(0), NodeStatus::Down);
+        upsert(&mut meta, crate::config::node_id(1), NodeStatus::Down);
+        assert!(
+            active_replicas_for_new_tablet(&meta).is_empty(),
+            "every member Down must never be read as a mintable (empty) \
+             BeginRestore replica set"
+        );
     }
 }

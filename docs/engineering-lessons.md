@@ -18432,3 +18432,774 @@ which ADR it cites BEFORE trusting a task brief's or roadmap's citation of
 the same mechanism, especially when the citation is being asked to anchor
 new documentation of your own — propagating a wrong citation into a new
 as-built note makes the mistake harder to unwind later, not easier.
+
+## "The replicated catalog is identical everywhere" is a converged fact, not an instantaneous one — comparing it across nodes right after a write still needs its own poll (docs/roadmap.md U-07, `GET /admin/segment-store`)
+
+`GET /admin/segment-store`'s own regression test creates a streamed table,
+writes an item, waits for the write to seal into a `Metadata::
+stream_shards` row, then asserts every node's own `/admin/segment-store`
+response carries the identical `shards` array — true in the converged
+state, since `Metadata` is Raft-replicated (ADR 0038) and every combined
+node in the test runs its own full local control `RaftCore`. The first
+draft of this assertion read every node's view **once**, in a single pass,
+immediately after confirming (on the LEADER's own metadata) that the row
+existed — and failed intermittently: one follower's own `effective_
+metadata()` (`control.metadata_cached()`, a purely local read with no
+network round trip) still showed `stream_shards` empty, because that
+replica's own log hadn't yet applied the `SealStreamShard` entry the
+leader had already committed and applied moments earlier. The node in
+question had, in the same instant, already received and stored the
+segment's physical *bytes* (`ClusterSegmentStore::put_replicated` pushes
+data directly to its chosen replicas over the network, independently of
+the metadata proposal that records the placement) — so `local_objects.
+count` was already `1` there while `shards` was still `[]`: two different
+facts about the same event, propagating on two different channels
+(direct replication vs. Raft-committed metadata), at two different
+speeds.
+
+The fix was not to change what the route reports (both facts are
+correctly, independently true at the instant each was read) but to change
+how the TEST compares them: a `timeout(..)` loop re-fetching every node's
+view on each iteration and only returning once every node's `shards`
+array is simultaneously non-empty AND pairwise equal — the same
+converged-or-timeout idiom this codebase already uses for the leader's
+own commit visibility, applied here to a cross-node **comparison**
+instead of a single node's own state.
+
+The generalizable rule: "every node mirrors the identical replicated
+`Metadata`" is a true statement about the CONVERGED cluster, never a
+promise that two nodes read at the same wall-clock instant already agree
+— especially when a test's own setup step confirms a fact on one node
+(the leader) and then immediately fans out to read every node including
+followers whose local apply has its own independent lag. Any assertion of
+the form "node A's view equals node B's view" needs the identical
+converged-or-timeout discipline this codebase already applies to "did my
+own write show up yet" — a bare one-shot snapshot comparison across
+nodes is exactly as flaky as a bare one-shot snapshot of a single node's
+own eventual state, for the same underlying reason.
+
+## A pure request signer must encode from RAW input exactly once per purpose, never re-encode an already-encoded string (S-04 PR 1, `animus-s3`)
+
+Building `animus-s3`'s SigV4 signer/client, the first draft percent-encoded
+an S3 object key at the client's own call site (`format!("/{bucket}/{}",
+encode_key_path(key))`, building a wire-ready path up front) and then
+handed that already-escaped string to `sigv4::RequestToSign::uri`, which
+the canonical-request builder (`canonical_uri_s3`) percent-encodes AGAIN
+internally. A key containing a space would sign against `%2520` (the `%`
+of a real `%20` re-escaped) while the actual wire path sent `%20` —
+guaranteed signature mismatch for any key needing escaping at all,
+silently correct only for keys made entirely of unreserved characters
+(exactly the case every early hand-written test happened to use). The
+identical bug existed for the query string half (a hand-built,
+already-percent-encoded query string handed to a function whose contract
+is "raw in, canonical out"). Caught by adding one test with a key
+containing a space, `+`, and parentheses (`a_key_containing_special_
+characters_round_trips` in `crates/animus-s3/tests/client_fake.rs`) — no
+existing test exercised anything but alphanumeric keys.
+
+**The fix, and the general rule**: thread the RAW (unescaped) string all
+the way from construction (`client::S3Client`'s own methods) to the
+signer's input type, and derive each of the two representations that
+actually need percent-encoding — the wire URI/query, and the signed
+canonical form — **independently, by calling the encoding function once
+each on the same raw input**, never by feeding one encoded output into the
+other's encoder. This composes correctly by construction (the function is
+pure and deterministic, so two independent calls on the same input always
+agree) and needs no "is this string already encoded?" bookkeeping anywhere.
+The mirror-image version of the same bug shows up on a **verifier** (this
+crate's own `fake::FakeS3`, which receives an already-canonical wire
+URI/query and must reconstruct the canonical form to check a signature
+against): the fix there is `percent_decode` once, recovering a raw string,
+before handing it to the same canonicalization function real signing uses
+— never re-canonicalizing the wire bytes directly. Any code that both
+signs/builds a request AND independently reconstructs/verifies one (which
+describes every SigV4 signer-plus-verifier pair, and generalizes to any
+"canonicalize a string for one purpose, transmit a related-but-different
+representation of it for another" design) should state, in one place,
+which representation ("raw" vs. "canonical") each function's input/output
+contract expects — and grep every call site for a mismatch before trusting
+a test suite that happens to only exercise inputs where the bug is
+invisible (plain ASCII, no reserved characters).
+
+## Don't hardcode an external "known answer" test value you cannot independently verify — a wrong memorized constant is a worse oracle than no test at all (S-04 PR 1, `animus-s3`)
+
+The task brief for `animus-s3`'s SigV4 signer named a specific known-answer
+case to include: AWS's own published S3 "GetObject" SigV4 worked example
+(`GET /test.txt`, access key `AKIAIOSFODNN7EXAMPLE`), with a specific
+expected final `Signature` value. Reconstructing the exact request that
+example signs from memory alone (no network access in this sandbox, no
+vendored copy of that specific worked example anywhere in the local
+toolchain or registry cache) — several independently plausible
+byte-for-byte reconstructions (with/without a `Range` header, with/without
+`x-amz-content-sha256` in the signed-header set) — none reproduced the
+stated signature, even though the same HMAC chain independently reproduces
+every vendored `aws-sig-v4-test-suite` vector byte-for-byte (proving the
+*algorithm* is correct) and independently reproduces the worked example's
+own commonly-quoted intermediate `StringToSign` hash. The conclusion: the
+exact canonical request bytes for that specific example were misremembered
+somewhere in the reconstruction, not that the code was wrong — but there
+was no way to tell which, without an authoritative source to check against.
+
+**The decision made instead of guessing**: drop the hardcoded external
+constant rather than ship a test asserting a value that cannot be
+independently verified in the environment building it. Pinning a
+plausible-but-unverified memorized value as a "known answer" regression
+test is actively worse than not having one — a future mismatch would say
+nothing about whether the *code* regressed, only whether the *test's own
+memorized oracle* was ever right in the first place, and a lucky
+coincidental match would prove nothing either. The test that shipped
+instead checks what's actually self-verifiable without an external
+oracle: the request's own `SignedHeaders` shape, and that the signer's own
+output round-trips through the same crate's own independent verifier
+function — plus a cross-crate equivalence test against `animus_dynamo`'s
+already-shipped, independently-implemented SigV4 chain (which *is*
+verified, against the vendored AWS test suite, in that crate's own test
+suite). Both are documented in place as deliberate, with the reasoning for
+why, rather than silently substituting a weaker test with no explanation.
+
+**General form**: when a task brief hands you a specific external
+"known-good" value to test against and you cannot independently verify the
+exact input that produces it (no network access, no vendored fixture, no
+authoritative local copy) — reconstructing it from memory and asserting
+equality anyway is a coin flip dressed as a regression test. Verify what
+you can with tools you actually have (vendored fixtures, independently-
+reimplemented cross-checks, self-consistency round-trips), state plainly
+what you could not verify and why, and let the person who can reach a
+network/the authoritative source fill in the one assertion you couldn't
+make honestly.
+
+## A `#[cfg(any(test, feature = "X"))]` module is invisible to an integration test without a self dev-dependency enabling that feature
+
+`animus-s3`'s in-process fake transport (`fake.rs`) is gated
+`#[cfg(any(test, feature = "fake"))]` — the intent being "always available
+to this crate's own tests, and to anyone else's tests via an explicit
+feature." That gate alone does NOT make `fake` visible to an integration
+test under `tests/`: `#[cfg(test)]` is only active for the crate's own
+lib/bin compiled *as a test binary* (`cargo test`'s unittest target); an
+integration test in `tests/` links against the crate's plain,
+non-`cfg(test)` `rlib` — the same one a normal downstream dependent would
+get. Without the `fake` feature explicitly on, `tests/client_fake.rs` got
+`error[E0432]: unresolved import` with `note: found an item that was
+configured out`, even though `cargo test -p animus-s3` (no `--features`)
+was clearly running "this crate's own tests."
+
+**The fix**: add the crate as its own `[dev-dependencies]` entry with the
+feature turned on (`animus-s3 = { path = ".", features = ["fake"] }`) —
+Cargo's standard, documented idiom for "this optional/test-only module
+should be available to every test target of this crate without requiring
+`--features` on the command line." Cargo's newer feature resolver unifies
+a package's dev-dependency features into the build specifically when
+building dev targets (tests/benches/examples) in the same invocation, so a
+plain `cargo build -p foo` (no test targets) still doesn't pull the
+feature in — exactly the boundary this crate wants (`prod`/`fake` off by
+default for a plain library consumer, on automatically the moment any test
+target of the crate itself is built).
+
+## A handle enum's variant should hold a trait object, not a concrete generic type, when only production needs the concrete type (S-04 PR 2, `animusd`)
+
+`SegmentStoreHandle`/`BackupStoreHandle` (`animusd::lib.rs`) each gained a
+third variant for the new S3-backed store (ADR 0059's 2026-09-06
+amendment). The store itself, `animus_env::S3SegmentStore<T: animus_s3::
+client::Transport>`, is generic over its transport specifically so it can
+be tested against `animus_s3::fake::FakeS3` (no sockets) while production
+uses `animus_s3::prod::HyperRustlsTransport` — the identical shape
+`animus_s3::client::S3Client<T>` itself already uses (S-04 PR 1). The
+naive way to add the variant would be `S3(animus_env::S3SegmentStore
+<animus_s3::prod::HyperRustlsTransport>)` — concretely typed, mirroring
+how `Cluster`/`Fs` are concretely typed today. That would have made an
+in-crate test wanting to exercise the `S3` variant over `FakeS3` impossible
+without also making the *enum itself* generic over a transport type
+parameter — a much bigger, more invasive change purely to serve a test.
+
+**The fix**: `S3(Arc<dyn animus_env::SegmentStore>)` — a trait object.
+`SegmentStore` is already `#[async_trait]` (boxes its futures), so it's
+dyn-compatible for free; `Arc` makes the variant cheaply `Clone` regardless
+of which concrete transport backs it. Production still constructs the
+concrete `S3SegmentStore<HyperRustlsTransport>` and stores it behind the
+same `Arc<dyn ..>` coercion; a test builds the identical variant over
+`S3SegmentStore<FakeS3>` with zero changes to either enum's shape, and
+every other match arm in both `impl` blocks treats `S3` exactly like `Fs`
+(no per-node replica concept) without ever needing to know or care which
+concrete transport is underneath. **General form**: when a handle enum's
+variant wraps a value that is generic purely so it can be swapped for a
+test double, and the enum's own consumers never need to be generic over
+that same parameter, a trait object at the variant boundary buys the
+testability without forcing genericity onto everything that touches the
+enum — reach for this before genericizing an enum (or a struct built
+around one) that has no other reason to carry a type parameter.
+
+## Avoid a new `ClusterConfig` field for a knob whose ADR already specifies "static, file/env-sourced" scope — the `error[E0063]` fan-out cost isn't worth paying twice (S-04 PR 2, `animusd`)
+
+This crate's own history already names the cost of adding a field to
+`ClusterConfig`: `dynamo_auth` and `cluster_settings` each triggered a
+compiler-enumerated ~55-60-call-site `error[E0063]: missing field` fan-out
+across every `ClusterConfig { .. }` struct literal in `src/`+`tests/`
+(`crates/animusd/CLAUDE.md`'s `config.rs` entry has the blow-by-blow). S-04
+PR 2 needed a place for S3 credentials to live and could have followed
+`dynamo_auth`'s own precedent (an `Option<S3CredentialsConfig>` field on
+`ClusterConfig`, populated from a config file's own section or a CLI flag
+merged in with a "one way, not both" conflict check) — but the ADR
+amendment this PR implements had already specified the credential-sourcing
+posture in full: static access-key-id/secret pair, from a config file or
+environment variable, mirroring ADR 0057's own `dynamo_auth` static map.
+Nothing about that posture needs `ClusterConfig`'s own per-node array
+shape or its "one config file describes the whole cluster" semantics — a
+set of S3 credentials is either process-global or, at most, per-invocation,
+never something a `ClusterConfig`'s per-node `nodes[]` entries need to vary
+independently.
+
+**The decision**: skip `ClusterConfig` entirely. `--s3-credentials PATH`
+names a **standalone** JSON file (`main.rs::S3CredentialsFile`), parsed and
+resolved independently of any `ClusterConfig` load, with an environment-
+variable fallback when the flag is omitted. This is a deliberate departure
+from the `dynamo_auth` precedent this codebase would otherwise reach for
+by pattern-matching — worth stating explicitly, since "make it look like
+the existing similar feature" is usually the right instinct and was
+wrong here specifically because the *scope* of the two features differs
+(a per-cluster credential *map*, keyed by access key id, genuinely
+benefits from living in the cluster-wide config a `dynamo_auth` section
+already is; a single static credential *pair* for one external system
+does not). **General form**: before reaching for an existing sibling
+feature's storage shape as a template, check whether its own scope
+(per-node vs. per-cluster vs. per-process) actually matches the new
+feature's — matching the pattern when the scope differs just imports that
+pattern's own cost (here, a `ClusterConfig` field's mechanical fan-out) for
+no benefit, and a real ADR that already specifies a narrower scope is
+license to use a narrower, cheaper mechanism instead.
+
+## `df -h /` reading near-zero and every Bash call failing with "the temp filesystem is full" can be the SAME root cause, not two problems
+
+Mid-session, every `Bash` tool call started failing with "Command output
+was lost: the temp filesystem at /tmp/claude-0/.../tasks is full (0MB
+free)" — including a bare `echo done > file`, which made it look like the
+harness's own tmpfs (unrelated to the repo) had filled up independently of
+anything this session was doing. It hadn't: `df -h /` (once a command
+finally got through) showed the **root filesystem itself** at 140K free —
+the harness's task-output tmpfs and `/home/user/animus-db/target` share the
+same underlying disk, so a 28GB `target/debug/deps` (accumulated across a
+long session's worth of `cargo build`/`test` invocations, many of them
+recompiling the same crates under slightly different feature combinations
+and leaving old-hash duplicate `.rlib`/test-binary artifacts behind) had
+quietly starved the whole filesystem, harness tmp included.
+
+**The fix**: exactly the prune this repo's own task instructions already
+describe for this situation — group `target/debug/deps/*` by basename
+(strip the trailing `-<16 hex>` build-hash suffix) and delete every file
+in a group except the newest by mtime, which recovered 17GB here. **The
+lesson worth generalizing**: when a sandboxed harness's own bookkeeping
+(temp files, output capture, anything **not** the actual task) starts
+failing with a space/quota-shaped error, check the *whole* filesystem's
+free space before assuming the harness's own storage is a separate,
+unrelated resource — on a single-disk sandbox it usually isn't, and the
+real fix lives in the repo's build output, not in anything the harness
+itself controls.
+
+## A `NetworkPolicy` with no `Egress` in `policyTypes` leaves egress completely open, regardless of what an `egress:` list would say
+
+Writing S-04 PR 3's egress rules for `animus-operator`'s generated
+`NetworkPolicy` (`desired/networkpolicy.rs`) was a reminder that
+Kubernetes `NetworkPolicy` semantics are per-*direction*, not per-object:
+a policy that never names `Egress` in `spec.policyTypes` is a no-op for
+egress traffic on that pod selector, full stop — it doesn't matter whether
+`spec.egress` is present, empty, or omitted, and it doesn't matter how
+restrictive `spec.ingress` is. This repo's own operator had exactly that
+shape for a long time (`policyTypes: [Ingress]` only, since the policy was
+originally written before egress was ever a concern), which is precisely
+what `docs/roadmap.md`'s S-04 item flagged as "egress unrestricted by
+omission." **The generalizable check**: when adding an egress rule to an
+existing `NetworkPolicy` builder (here or anywhere else), verify
+`policyTypes` names `Egress` in the same change — a rule appended to
+`spec.egress` alone silently does nothing if that list update is missed,
+and nothing in the API server, `kubectl apply`, or a type-checked
+`k8s-openapi` struct catches the omission; only a real cluster (or reading
+the NetworkPolicy semantics doc closely) reveals it.
+
+## Reading a JSON response's actual field nesting from source beats inferring it from a route's own doc-comment summary
+
+Writing S-04 PR 3's (unverified, no-`kind`-available-sandbox) e2e leg, the
+task brief said to check `GET /admin/backup-store` for `"kind": "s3"`. The
+route's own doc comment says exactly that phrase ("`store` is this node's
+own configured backup store: kind plus a credential-safe `location`"), and
+it would have been easy to write `jq -r '.kind'` straight from that
+sentence. The actual handler (`admin.rs::backup_store_view`) nests it
+one level down: the top-level response is `{"store": {"kind": ...,
+"location": ...}, "objects": ..., "janitor": ..., "leader": ...}`, so the
+correct query is `.store.kind`, not `.kind`. **General form**: for any
+script or test that asserts on a JSON wire/admin response shape, read the
+actual serializer/handler function, not just its module doc comment or a
+task description's paraphrase of it — a doc comment describes intent and
+can (correctly) omit the wrapper object it's nested inside, and a
+paraphrase one level removed from the code compounds that gap. This
+matters more, not less, when the assertion can't be run in this sandbox
+(no `kind`) — there is no test failure to catch the mistake before it
+reaches a real CI run.
+
+## A CRD-generated shell script must single-quote every operator-controlled string value that becomes a command-line argument
+
+`animus-operator`'s `entrypoint.sh` generator (`desired::cluster_config::
+entrypoint_script`) started passing `s3://...` URIs (`spec.s3.backupStore`/
+`segmentStore`, S-04 PR 3) as literal `--backup-store`/`--segment-store`
+arguments in the generated POSIX `sh` script. An S3 URI's own query string
+always contains `&` (separating query parameters) and usually `?`/`=` —
+every one of `&`, `?` unquoted in `sh` is either a metacharacter (`&`
+backgrounds the preceding command entirely, silently turning `exec
+animusd ... --backup-store s3://bucket?a=1&b=2` into two separate
+commands) or at minimum a portability risk. Every other flag value this
+generator already emitted (paths, ports) happened to be safe unquoted, so
+this was the first flag value here that actually needed it. **General
+form**: any generator that interpolates a user- or spec-controlled string
+into a shell script (not just this one) must single-quote (with the
+standard `'...'` → `'\''` embedded-quote escape) every such value at the
+point of interpolation, not just the values that are "obviously" URLs or
+paths — the generator has no way to know in advance which future field
+will be the first one containing a shell metacharacter, and getting this
+wrong doesn't fail at generation time, only at container start, in a
+place `bash -n` (syntax-only) also won't catch since `&` is syntactically
+valid shell, just semantically wrong here.
+
+## A committed generated manifest is only as current as the last hand run of its generator — pin it with a test that regenerates and compares (`deploy/operator/crd.yaml`, S-04 PR 3, 2026-09-06)
+
+`deploy/operator/crd.yaml` is what `scripts/e2e-kind.sh` and every operator
+user apply to a real API server, and it is *generated* from the Rust spec
+type by `animus-operator crd`. S-04 PR 3 added `spec.s3` to
+`AnimusClusterSpec`, added the field to the e2e's sample cluster, ran every
+Rust gate green — and the first real `kind` run failed at `kubectl apply`
+with `strict decoding error: unknown field "spec.s3"`, because nobody had
+re-run the generator and nothing checked. The unit tests could not catch it:
+they exercise the Rust type, never the committed YAML, and the only consumer
+of the YAML is an e2e that cannot run in this sandbox. **Rule**: any file
+that is checked in *and* generated from code gets a test that regenerates
+it in-process and asserts byte equality with the committed copy (here
+`crates/animus-operator/tests/crd_manifest_pinned.rs`), with the refresh
+command in the assertion message — so a spec change fails `cargo test`
+locally, not the one CI job that needs a cluster. The general form: the
+gate that guards a generated artifact must live in the same gate set as
+the change that invalidates it.
+## A `#[cfg(test)]`-gated field or method is invisible to an external `tests/*.rs` integration binary — a test-only injection point needs a genuinely `pub` hook
+
+Building S-05 PR 1's `dynamo_export.rs` e2e suite, the natural instinct was
+to reuse the crate's existing `#[cfg(test)] test_ctx` pattern (`animusd`'s
+`Node` already carries one, gated behind `#[cfg(test)]`, for other
+in-crate test needs) to inject a fake S3 store factory into a running
+`Node`. That doesn't work for a file under `tests/`: each file there
+compiles as its own separate integration-test crate linked against the
+*library* crate built without `--cfg test` (only the harness binary itself
+gets `cfg(test)`), so any item gated `#[cfg(test)]` in the library simply
+doesn't exist from an integration test's point of view — not a visibility
+error, a "no such field" compile error that looks like a typo until you
+remember the two are different compilation units. The fix was a genuinely
+public, always-compiled method whose only real-world purpose is a test
+injection point: `Node::set_export_store_factory(&self, factory:
+ExportStoreFactory)`, storing the factory behind `Arc<Mutex<..>>` so
+swapping it in place is visible to every already-cloned per-connection
+`ClientCtx` sharing that `Arc`. **General form**: when a `tests/*.rs` file
+needs to inject or override library-internal state, `#[cfg(test)]` is not
+available to you at all — the hook must be unconditionally compiled (and
+named/documented as a test-only knob in its own doc comment so a reader
+doesn't mistake it for a real runtime feature), not merely `pub(crate)`
+widened.
+
+## `FakeS3` is not internally `Arc`-shared — sharing one fake bucket across several independently-constructed store handles needs an external `Arc` plus a thin `Transport`-wrapping newtype
+
+`animus_s3::fake::FakeS3` holds its object state behind plain (non-`Arc`)
+interior mutability, so two separately-constructed `S3SegmentStore`
+instances built from two separate `FakeS3::new()` calls see two disjoint
+buckets — fine for a single-store test, wrong for S-05 PR 1's
+`dynamo_export.rs`, which needed every node in a 3-node cluster (each
+building its own `SegmentStoreHandle::S3`-shaped store via its own
+`ExportStoreFactory` call) plus the test's own verification reads to all
+observe the *same* bucket. The fix: wrap one `Arc<FakeS3>` the test owns in
+a local newtype (`SharedFakeS3(Arc<FakeS3>)`) implementing
+`animus_s3::client::Transport` by delegating `send()` to the inner
+`Arc`'s own `send()`, then hand a cheap clone of that newtype to every
+`S3SegmentStore` constructed anywhere in the test (one per node's factory
+call, plus a standalone one for the test's own `get_object` verification
+helper). **General form**: a fake/in-memory backend used to simulate a
+shared remote resource across multiple independently-constructed client
+handles needs either the fake itself to be internally `Arc`-shared, or the
+test to hold the one real `Arc` and thread clones of a thin wrapper into
+every handle — check which shape a fake actually has before assuming
+"construct one per caller" gives you the shared-state semantics the real
+remote service would.
+
+## A driver whose every fault is "retry forever" turns a test-fixture mismatch into a silent hang, not a clear failure (ADR 0068 §6, S-05 PR 2 import driver)
+
+Building `dynamo_import.rs`'s real-item test cases (a full export→import
+round trip; a hand-written data file with two malformed items), both
+initially failed with nothing more informative than "import did not reach
+a terminal state in 30s" — no error body, no rejected request, just a row
+stuck `IN_PROGRESS` forever. The instinct at that point is to suspect the
+production code (the new `import.rs` driver, freshly written and never
+proven against a real multi-item payload). It wasn't: the bug was in the
+*test*'s own `import_table()` helper, which built an `ImportTable` request
+with no `InputCompressionType` field at all — decoding to this adapter's
+own default, `NONE` — while the paired fixture helper
+(`write_hand_export`/a real `ExportTableToPointInTime` call) always wrote
+`GZIP`-compressed data. The driver received real gzip bytes, tried to
+treat them as plain UTF-8 text (per the request's own, wrongly-defaulted
+compression), got binary garbage, logged `"data file is not utf8"` at
+`WARN`, and — correctly, by this driver's own design (see the module doc:
+every I/O/content-shape fault here is deliberately *retryable*, since a
+customer bucket can be transiently unreachable or still finishing a write)
+— just tried again next tick, forever, with no forward progress and no
+terminal state to report. The fix was two lines in the test file (default
+the shared helper to `GZIP`, matching what its own paired fixture always
+produces); nothing in `import.rs` itself was wrong.
+
+**Diagnosis, not just the fix**: the failure looked identical to a real
+production bug from the outside (a hung poll, a generic timeout panic) —
+distinguishing "test fixture mismatch" from "driver bug" needed actually
+reading the driver's own log output, which required a temporary
+`tracing_subscriber::fmt().with_env_filter("debug").try_init()` at the top
+of the *specific failing test* (this workspace's test binaries carry no
+default subscriber) and re-running that one test alone with `--nocapture`
+— the moment the same `WARN` line printed once per tick, the root cause
+was obvious. **General form**: (1) a background driver built on the
+"every fault is retryable, only a bounded few are terminal" philosophy
+(the same shape `backup_restore.rs`'s restore driver, and now
+`import.rs`, both use) makes a stuck `IN_PROGRESS`/`Seeding`/`Creating`
+row the *symptom* for an entire class of distinct root causes — content
+mismatch, a wrong prefix, a transient store fault, a genuine driver bug —
+so "it's stuck" alone is never enough signal to start editing production
+code; reach for the driver's own `tracing` output on the *one* failing
+test first. (2) When a test brings up a fixture through one helper and
+issues the request that consumes it through a second, sibling helper, the
+two must agree on every field that changes interpretation (here:
+compression) — a shared default in one helper is only safe if every
+caller of the *other* helper is guaranteed to match it; consider a single
+helper that builds both, or an explicit parameter, once more than one
+fixture shape (`GZIP` vs `NONE`) is in play.
+
+## A `Copy`-carrying `MetaCommand` variant added to a large enum needs its own biggest field boxed up front, not discovered via `clippy::large_enum_variant` (ADR 0068 §6, S-05 PR 2)
+
+Adding `MetaCommand::BeginImport` (mirroring `BeginRestore`'s own shape,
+plus a full `TableCreationParameters`-derived schema) pushed `MetaCommand`'s
+in-memory size past clippy's `large_enum_variant` threshold: every other
+variant stays small, so the *whole enum* — sized to its largest member,
+Rust's ordinary tagged-union layout — grew to fit this one, at a real
+per-value cost paid by every `MetaCommand` anywhere in the system,
+including the thousands that are `NoOp`/`CasTabletReplicas`/etc. The fix
+(boxing the schema field, `base_schema: Box<TableSchema>`) is mechanical
+once found, but finding it required a `cargo clippy --all-targets
+--all-features` pass — a plain `cargo build`/`cargo test` never surfaces
+this lint at all, so a large new variant landing between clippy runs would
+have shipped its size-bloat undetected until CI. **General form**: when
+adding a variant to an already-large, already-established enum
+(`MetaCommand`, `Operation`, `ClientRequest`, any command/message enum
+with many small variants) and the new variant carries a whole nested
+struct (a schema, a plan, a manifest) rather than a handful of scalars,
+run clippy on it *before* considering the shape done — box the field
+`clippy::large_enum_variant` names as the outlier immediately, rather than
+letting review or CI catch it later. A closely related trap in the same
+change: cloning an `Option<T>` field where `T: Copy` (`clippy::
+clone_on_copy`) compiles and passes every test, so it's easy to write by
+habit (matching the `.clone()` every *non-`Copy`* sibling field in the same
+struct literal needs) and never notice — clippy catches it, but only if
+run.
+
+## A `Building`-minted tablet has no self-heal path — an empty initial replica set is permanent, not merely under-replicated (`dynamo_import.rs` CI flake, `prod-liveness-animusd` shard 3/4, 2026-09-06)
+
+A single flaky CI run (`import_skips_malformed_items_and_counts_them`
+timing out its 30s "import did not reach a terminal state" poll, on a
+2-vCPU shard running four `animusd` integration-test binaries
+concurrently) turned out to have nothing to do with the import driver
+(`import.rs`) a prior read-only analysis had suspected — a hypothesized
+"no propose-side patience causes duplicate `SeedBatch`/`CompleteImport`
+re-proposes" shape, the issue #268 amplification family. That shape would
+still show the driver *doing* something every tick (malformed-item decode
+debug lines, at minimum, since decoding runs before any propose); the
+actual failure showed the driver doing **nothing at all** for the full 30s
+— `import_loop`'s "not hosted here yet" branch fired on every single
+200ms tick from the first to the last, never once transitioning.
+
+**Reproduction**: a foreground loop of the standalone `dynamo_import` test
+binary (`cargo build -p animusd --test dynamo_import`, then `timeout 45
+target/debug/deps/dynamo_import-* --exact
+import_skips_malformed_items_and_counts_them` repeated 50-150×) run
+alongside three sibling `animusd` integration-test binaries
+(`dynamo_txn`/`dynamo_streams`/`streams_e2e`) looping continuously in the
+background on the same 4-core host — reproduced at a ~5-9% rate (4-7
+failures per 50-100 iterations), matching the described CI shard's
+contention shape closely enough to trust. Zero reproductions running the
+same test alone.
+
+**Diagnosis**: this workspace's test binaries carry no default `tracing`
+subscriber, so a `--nocapture` run of even a failing test showed nothing
+by default — the general lesson this doc already has an entry for
+("reach for the driver's own tracing output on the *one* failing test
+first"), but this investigation needed one step further: since the
+failure signature (zero driver activity, not "stuck retrying") pointed
+*upstream* of `import.rs` entirely, the useful instrumentation wasn't in
+the suspected driver at all. `tracing::debug!` added to
+`tablet_host_reconciler_loop`'s own per-tick view (temporary, reverted
+before commit) confirmed the destination tablet's `Metadata` row read
+`replicas: []` for the tablet's entire recorded lifetime; a second,
+`tracing::debug!` added to `dynamo::finish_import_kickoff`'s own member
+snapshot (also temporary, reverted) caught the exact moment: `members =
+[("n0", Down)]` — the single node's own control-plane failure detector
+(ADR 0012) had marked it `Down` (a false positive from a delayed
+self-heartbeat under real CPU contention — the "SimEnv proves logic,
+ProdEnv proves real-thread liveness" class of bug, not reproducible any
+other way) at the exact instant `finish_import_kickoff` filtered
+`Metadata.members` to `Active` for its replica pick, netting zero
+candidates.
+
+**Why this is permanent, not merely slow to recover**: `ClientCtx::
+provision_tablet`'s identical "first `min(N, MAX_REPLICATION_FACTOR)`
+`Active` members" replica pick (`schema.rs`) already has a guard for
+exactly this race — `if !replicas.is_empty() && ...` — added for the
+issue #268-era hardening. It works there because `CreateTablet` mints an
+`Active` tablet: even an under-shot initial replica set is later grown by
+`reconcile_placement`'s ordinary policy-driven self-heal
+(`SetTabletPolicy` + `CasTabletReplicas`, `animus-control/src/meta.rs`).
+`finish_import_kickoff` (ADR 0068 §6, S-05 PR 2) copied the *selection*
+but not the *guard* — and worse, `reconcile_placement` only repairs a
+tablet whose `state == TabletState::Active`
+(`crates/animus-control/src/meta.rs`, `reconcile_placement`'s own filter,
+predating this feature) — `BeginImport` mints its destination tablet
+`Building`, and it stays `Building` for its entire seeding lifetime by
+design (only `CompleteImport` activates it). A `Building` tablet with an
+empty replica set can therefore never self-heal by any existing mechanism:
+`plan_join_host`'s `replicas.contains(&base_id)` check trivially fails for
+every node against `[]`, so no reconciler on any node ever hosts it, the
+tablet can never seed, and it can never reach the `Active` state that
+would make it eligible for repair in the first place — a structural dead
+end, not a slow recovery. The reproduction bore this out exactly: every
+failing run showed the identical "not hosted" tick firing for the *entire*
+30-second window with no recovery, not an occasional slow one that
+eventually succeeded.
+
+**Fix** (`crates/animusd/src/dynamo.rs`, `finish_import_kickoff`): wait,
+bounded by the function's own existing per-attempt `SCHEMA_COMMIT_TIMEOUT`,
+for at least one `Active` member before computing `replicas`; skip
+proposing `BeginImport` (mint a fresh id, retry) if the wait still ends
+empty. The same guard shape `provision_tablet` already uses, applied to
+the one call site that had regressed the lesson. Proven: the identical
+50-150-iteration contention loop, 0 failures across 250+ post-fix
+iterations (versus a consistent 5-9% failure rate pre-fix); `cargo test -p
+animusd --test dynamo_import` green ×3.
+
+**Twin defect, confirmed but NOT fixed here (own PR, per this repo's
+incidental-bug convention)**: `dynamo::finish_restore_kickoff`
+(`RestoreTableFromBackup`'s kickoff, same file) has the byte-for-byte
+identical unguarded replica computation feeding the byte-for-byte
+identical `Building`-state freeze (`BeginRestore` mints its own
+destination tablet `Building` too) — not yet observed failing live, but
+the code shape is proven vulnerable to the identical race by this
+investigation and should get the identical fix.
+
+**Update (issue #657, 2026-09-06): fixed.** `finish_restore_kickoff` now
+calls the identical `await_active_metadata_for_new_tablet` wait/retry
+helper `finish_import_kickoff` was refactored to use (the two loops had
+become byte-for-byte identical, so this fix factored them into one shared
+function rather than pasting a second copy) — both kickoffs wait, bounded
+by their own per-attempt `SCHEMA_COMMIT_TIMEOUT`, for at least one `Active`
+member before computing `replicas` via the shared
+`active_replicas_for_new_tablet`, and both skip their propose (retrying
+with a fresh id) if the wait still ends empty. Since `finish_restore_kickoff`
+is shared by both `RestoreTableFromBackup` and `RestoreTableToPointInTime`,
+fixing the one function closes the gap for both wire entry points at once.
+Regression is a `Metadata`-only pin (`active_replicas_tests`'s
+`restore_kickoff_shares_the_import_kickoffs_selection`/
+`restore_kickoff_sees_no_replicas_when_every_member_is_down`), the same
+"pure selection is unit-testable, the async wait/retry shape itself is
+real-thread-liveness-only and stays untested" split this entry's own fix
+already established — no new general lesson beyond what this entry already
+records, since it's the identical mechanism applied to the identical twin.
+Issue #657's second half (`backup_restore.rs`'s own missing propose-side
+patience/confirm-timeout logging, described two paragraphs below) is
+unrelated to this kickoff-guard half and remains open in its own PR.
+
+**A separate, real defect family found along the way while chasing the
+original (wrong) hypothesis, also NOT fixed here**: `backup_restore.rs`'s
+restore driver (`propose_local`, confirming a `SeedBatch` propose by
+applied index; `complete_restore`, discarding its own `CompleteRestore`
+propose's accepted/rejected result) has zero propose-side patience and
+zero logging on a bare confirm-timeout or discarded-reject — the exact
+issue #268 retry-amplification shape `ClientCtx::provision_tablet` was
+hardened against, inherited unmodified by `import.rs`'s own `propose_
+local`/`complete_import` when that driver was built from `backup_
+restore.rs`'s template (ADR 0068 §6 PR 2's own doc says as much: "mirrors
+[`backup_restore::propose_local`]"). This investigation added `tracing::
+warn!` to `import.rs`'s own confirm-timeout branch (kept, since a silent
+`NoProgress` is indistinguishable from "driver never ticked at all" — this
+bug's own signature — without it); `backup_restore.rs`'s identical branches
+(`propose_local` around its `while ... { sleep }` loop's fallthrough,
+`complete_restore`'s `let _ = ctx.propose_schema(...)`) still have none.
+Neither the amplification itself nor the missing logging is fixed in
+`backup_restore.rs` here.
+
+**General form**: (1) **A newly-minted tablet's placement state, not just
+its replica count, decides whether it can ever self-heal.** A tablet
+minted `Active` (however under-replicated) is reachable by the ordinary
+policy-driven convergence machinery; a tablet minted `Building` (or any
+other non-`Active` state `reconcile_placement` excludes) is not, and never
+will be until something *else* first gets it hosted and active — which an
+empty replica set structurally prevents. Any new hand-rolled "pick N
+`Active` members" replica selection feeding a `Building`-minting (or
+otherwise placement-frozen) `MetaCommand` needs its own non-empty guard;
+it cannot borrow `reconcile_placement`'s eventual repair the way an
+`Active`-minting one can. Grep for the pattern (`NodeStatus::Active` +
+`.truncate(MAX_REPLICATION_FACTOR)` or similar) before adding a new
+propose site that mints a tablet in any state other than the default
+`Active`. (2) **A background driver's fully-silent no-progress path makes
+two very different bugs look identical from the outside**: "the driver is
+retrying forever, wastefully" (issue #268's shape — visible if instrumented,
+since something proposes repeatedly) and "the driver never got to run a
+single real tick" (this bug's shape — invisible even instrumented, if the
+instrumentation lives only in the driver itself, since the driver's own
+tracing never fires). Distinguishing them needs tracing at the tick's own
+entry gate (hosted? leader?), not just inside the tick body — see this
+doc's existing "reach for the driver's own tracing output" entry, extended:
+when a "stuck, no logs at all" symptom doesn't even show a driver's own
+per-item logging that should be unconditional (decoding, in this case),
+suspect a failure to ever reach the driver at all, not a retry loop within
+it.
+
+## Pruning stale duplicate `target/debug/deps` binaries under `if disk < 4 GB` must never run while a build using that same target directory is in flight
+
+A workspace build (`cargo build --workspace --all-targets`) ran the target
+directory down to ~300 MB free mid-build; the documented mitigation
+("prune stale duplicate test binaries in `target/debug/deps`, newest per
+basename only") was applied *while that same build was still running*,
+filtering candidates by "not modified in the last 20 seconds" to avoid
+touching anything the active build might still be writing. This was not
+enough: cargo had already **finished** producing several dependency
+`.rlib` files earlier in the build (their mtimes were long past the
+20-second window) but had not yet reached the later link steps that
+`open()` them — deleting the "stale" duplicate copy of one such rlib is
+indistinguishable, from mtime alone, from deleting a genuinely-orphaned
+one, and the running build's own linker immediately failed with `cannot
+open .../libserde_json-*.rlib: No such file or directory` for several
+targets, wasting that portion of the build. **General form**: an mtime
+threshold answers "was this file recently *written*," never "is this file
+still *needed*" — a file a build produced minutes ago can still be read
+minutes later, at a link step far downstream of its own compile step; a
+running build's target directory is not a safe pruning target *at all*
+while that build is in flight, however old the candidate files look. The
+correct sequence is: let the build finish or fail on its own, prune
+afterward, then retry the build — never prune concurrently with the build
+whose own output directory is being pruned. (The retry after this
+particular incident succeeded once free space was restored, so no lasting
+harm — but the same race with a less patient CI timeout could have turned
+one disk-pressure warning into a build failure needing a second attempt
+regardless.)
+## A restored/imported value must go back through the SAME envelope-wrap primitive its store's read side expects, every time this pattern is repeated (ADR 0068, S-05 PR 3 `SimEnv` corpus)
+
+Building `export_import_fault_corpus.rs`'s import-side mirror
+(`import_tick_mirror`, standing in for `animusd::import::import_tick`), the
+first draft pushed `animus_item::derive_kind_writes`'s raw stored-item
+bytes straight into `KvCommand::SeedBatch` — every derived write was a
+byte-identical shape to what production's own driver derives, but without
+production's own trailing step: `backup_codec::encode_restored_value`,
+which re-wraps a physical value in the 1-byte transaction envelope tag
+`animus-cp-data`'s apply path expects every merged value to carry
+(`Envelope::Committed`/`Intent`, `crates/animus-cp-data/src/txn.rs`).
+`SeedBatch`'s own merge writes the bytes it's given verbatim, with no
+validation — so the corpus didn't get a "wrong content" failure, it got a
+"corrupt engine value" panic the very next time *anything* read the row
+back (`decode_envelope`'s `unknown envelope tag N`), on the very first
+depth-1 run, every seed.
+
+**This is the second time this exact hazard has been hit and fixed in this
+same file family** — `backup_fault_corpus.rs`'s own restore-tick mirror
+(`crates/animus-test/tests/backup_fault_corpus.rs`) already documents
+finding and fixing it for the on-demand-backup restore path (ADR 0059 §7),
+with its own doc comment naming `encode_restored_value`'s call as
+load-bearing precisely for this reason. The import mirror didn't reuse
+that lesson because its seed-derivation path (`derive_kind_writes`, a
+different producer than backup's own captured-physical-bytes path) was
+written fresh rather than adapted from the restore-tick precedent sitting
+in a sibling file in the same crate.
+
+**General form**: any code that constructs a `SeedRow`/calls
+`propose_seed_batch` — present or future, in production or in a corpus
+mirror — must re-wrap every value through `encode_restored_value` (or
+whatever the current envelope-wrap primitive is named) before merging,
+regardless of where the value came from (a captured physical byte string,
+or freshly derived from decoded item content). `SeedBatch`'s own contract
+gives no structural guarantee here — nothing type-checks a raw value
+against an enveloped one, since both are `Option<Vec<u8>>` — so grep every
+`propose_seed_batch`/`SeedRow` construction site when adding a new one, the
+same "grep every gating match site" discipline this repo's root `CLAUDE.md`
+already states for a replicated/forwarded command enum gaining a variant.
+The failure mode when this is missed is maximally loud (an immediate hard
+panic on first read, not a silent wrong value), which is exactly why it
+was caught before the corpus was ever committed rather than shipping as a
+false-negative-green test — but "loud when reached" is not the same as
+"reached promptly": a producer whose own path happens not to be read back
+in the same test run would have shipped silently broken until something
+else finally decoded the row.
+
+## Two CLI flags that look like a matched pair can have asymmetric grammars — verify each one's own parser, not the sibling's doc comment (S-07b, `--backup-store`/`--segment-store`)
+
+Adding `animus-operator`'s CRD surface for `animusd`'s non-S3
+`--backup-store`/`--segment-store` flags (S-07b), the natural assumption
+from reading `--backup-store cluster|fs:PATH` was that `--segment-store`
+would accept the identical `cluster|dir:PATH` shape — the two flags are
+documented side by side, configure the same kind of thing (a
+`SegmentStore`-shaped trait object), and `parse_backup_store`'s own doc
+comment even says `fs:`/`dir:` are "the same forms `parse_segment_store`
+accepts." Reading `parse_segment_store`'s actual `match` arms
+(`crates/animusd/src/main.rs`) showed otherwise: it has no `"cluster"` arm
+at all — `None` (omitting the flag) is the *only* way to select its
+default, and a literal `"cluster"` value falls through to the `dir:`
+match arm and gets rejected as malformed. `parse_backup_store`'s own doc
+comment names this precisely as one thing `--segment-store` does
+differently, but it would have been easy to skip re-reading that comment
+because "the same forms" reads as symmetry at a glance. The CRD's
+`AnimusClusterSpec::validate_store_spec` had to encode this asymmetry
+explicitly — `segmentStore: "cluster"` is a rejected value, not silently
+accepted or remapped to "omit the field" — otherwise a spec written by
+analogy with `backupStore: "cluster"` would pass CRD validation and then
+fail at pod startup when `animusd`'s own parser rejected the flag.
+**General form**: when building a second, independent syntax-checking
+layer over an existing CLI parser (this crate deliberately doesn't depend
+on `animusd`, so it re-implements a narrower check of the same grammar —
+see `crd::S3StoreSpec::validate`'s identical posture for the `s3://` form),
+never infer one flag's accepted-values grammar from a sibling flag's
+`match` arms or from a comment describing them as parallel — read that
+flag's own parser function directly, arm by arm. Two CLI options that look
+like a matched pair from their names and shared doc prose can still differ
+in exactly the one place that matters (which literal keywords each
+accepts), and the mismatch only surfaces as a runtime rejection at
+container start, never a compile error or a CRD-validation failure, unless
+the second layer's own test suite explicitly pins the asymmetric case (see
+`crd::tests::store_spec_rejects_segment_store_cluster_literal`).
+
+## A full-object JSON golden test against a `k8s-openapi` typed resource must include `apiVersion`/`kind` — its `Serialize` impl always injects them (S-07c, `PodDisruptionBudget`)
+
+Writing `desired::poddisruptionbudget`'s golden shape test by copying the
+existing full-object JSON-golden pattern from `desired::cluster_config`'s
+`three_node_golden_config` (`serde_json::to_value(&built)` compared
+against a `serde_json::json!{...}` literal via `assert_eq!`), the first
+run failed on a diff that had nothing to do with the field under test:
+the serialized value carried `"apiVersion": "policy/v1"` and `"kind":
+"PodDisruptionBudget"` that the hand-written `expected` literal never
+mentioned. `cluster_config`'s own golden test never hits this because
+`ClusterConfig` is a hand-rolled, `#[derive(Serialize)]` plain struct with
+no such fields — it was the wrong precedent to copy from for a test that,
+this time, serializes an actual `k8s-openapi` top-level resource type
+(`PodDisruptionBudget`, `NetworkPolicy`, `StatefulSet`, …) rather than a
+crate-local mirror type. Every `k8s-openapi` resource implementing
+`Resource` hand-writes its own `Serialize` (not `#[derive(Serialize)]`)
+specifically to always emit `apiVersion`/`kind` from
+`<Self as Resource>::{API_VERSION,KIND}` ahead of `metadata`/`spec`/
+`status` — this is why every *other* builder test in this crate
+(`networkpolicy.rs`, `statefulset.rs`, `services.rs`) asserts on individual
+typed fields (`np.spec.unwrap().ingress`, …) rather than a full
+`serde_json::to_value` diff: doing so sidesteps this entirely, at the cost
+of not pinning the object's complete shape in one place.
+
+**General form**: before writing a full-object JSON/YAML golden test
+against any `k8s-openapi` (or other library-owned, hand-serialized)
+top-level type, either (a) check that type's own `Serialize` impl for
+extra always-emitted fields the value's own Rust struct doesn't obviously
+suggest (`apiVersion`/`kind` here; a real API server also injects fields
+like `metadata.creationTimestamp` on `Deserialize` that a locally-built,
+never-sent object simply won't carry, so those don't bite a *build-side*
+golden test the way `apiVersion`/`kind` do), or (b) follow this crate's
+own dominant pattern instead — assert on the specific typed fields under
+test, not the whole serialized object — which is both immune to this
+class of surprise and, per `crates/animus-operator/CLAUDE.md`'s own
+"pure builder" design, usually what the test actually needs to pin.
