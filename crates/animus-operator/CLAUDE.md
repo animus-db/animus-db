@@ -146,9 +146,9 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   pushed by `.github/workflows/image.yml`'s `animus-operator` matrix entry
   on the same tag/push rules as `animusd`; `deploy/operator/deployment.yaml`
   references it as a real image, not a placeholder. This doesn't change how
-  `scripts/e2e-kind.sh` runs the controller (still out-of-cluster via
-  `cargo run`, deliberately — see the e2e section below) or how local
-  development works.
+  `scripts/e2e-kind.sh` runs the controller (still out-of-cluster via a
+  `cargo`-built binary, deliberately — see the e2e section below) or how
+  local development works.
 - **BTreeMap-only, same as every other crate (ADR 0003's determinism rule,
   lint-enforced via `clippy.toml`)** — even though this crate has no `Env`
   seam and nothing here is sim-tested (see the next bullet), the workspace
@@ -691,8 +691,11 @@ the script/workflow itself) is the `kind`-cluster-driven end-to-end
 complement `src/controller.rs`'s own unit-test gap above calls for: it
 creates a real `kind` cluster, loads a locally built `animusd` image into
 it, applies the CRD and an `AnimusCluster`, runs the controller **out of
-cluster** (`cargo run -p animus-operator -- run` against the kind
-kubeconfig — in-cluster deployment of the operator's own image, per
+cluster** — `cargo build -p animus-operator` synchronously, then the
+already-compiled binary is `exec`ed directly (`animus-operator run`
+against the kind kubeconfig, not backgrounded via `cargo run` — see
+"Building the operator binary before backgrounding it" below) — in-cluster
+deployment of the operator's own image, per
 `deploy/operator/deployment.yaml`, is exercised in production, not by this
 smoke), waits for the `StatefulSet` to reach 3/3 ready, resolves which specific
 pod `svc/{name}-dynamo` currently routes to (via that Service's own
@@ -716,6 +719,33 @@ TLS-intercepting egress proxy that can't reach Docker Hub's blob CDN (see
 the Dockerfile's own header) — CI and an ordinary developer machine just
 run `docker build -t animusd:e2e .` with `KIND_NODE_IMAGE` unset (kind
 picks its own pinned default).
+
+**Building the operator binary before backgrounding it (issue #661,
+S-07d).** The "run operator out-of-cluster" phase used to background
+`exec cargo run -p animus-operator -- run` directly, with nothing earlier
+in the script warming the build cache — `animus-operator` is the *only*
+`cargo` invocation in the whole script, so `kube-rs`'s dependency tree
+(`rustls`/`hyper`/`k8s-openapi`/`kube-runtime`) compiled from cold right
+there, easily a minute or more. Every line landing in `$OPERATOR_LOG`
+during that window was `cargo`'s own `Compiling ...` chatter — a process
+still compiling is indistinguishable, from the log alone, from one that's
+stuck, which is exactly what made a real bug (see this file's own S-07d
+growth entries and `docs/engineering-lessons.md`'s issue #661 entry on
+`ProdEnv::send_stream`) hard to diagnose from the log alone. The phase now
+runs `cargo build -p animus-operator --bin animus-operator` synchronously
+first (its own output goes straight to the terminal), resolves the
+compiled binary's path the same way cargo itself would
+(`${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/animus-operator`), and
+*then* backgrounds an `exec` of that binary directly. Every line that can
+land in `$OPERATOR_LOG` from this point on is genuine runtime tracing —
+confirmed `EnvFilter::from_default_env()` with `RUST_LOG=info` set does
+correctly enable `animus-operator::controller`'s own `info!` lines (e.g.
+`"reconciling AnimusCluster"`); the missing-tracing-lines symptom was
+never an `EnvFilter`/`fmt::init()` semantics bug. Side benefit: `exec`ing
+the binary directly means `$OPERATOR_PID` (from `$!`) is the real process,
+not a `cargo run` supervisor — `cleanup()`'s pre-existing belt-and-
+suspenders `pkill -f "animus-operator run"` is now clearly redundant
+(kept anyway, harmless).
 
 **Two script-side hardenings for a flake this smoke hit twice with the
 identical signature (issue #595)**, on top of the actual root-cause fix

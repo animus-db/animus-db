@@ -7,9 +7,10 @@
 # actually schedules a real 3-node AnimusDB cluster that bootstraps, serves
 # the DynamoDB wire, and survives a scale-up.
 #
-# The operator itself runs OUT of the kind cluster for this smoke (`cargo run
-# -p animus-operator -- run`, talking to the kind cluster's own API server via
-# a scoped kubeconfig) — in-cluster deployment of the operator's own container
+# The operator itself runs OUT of the kind cluster for this smoke (built with
+# `cargo build -p animus-operator`, then run directly — `animus-operator
+# run` — against the kind cluster's own API server via a scoped kubeconfig)
+# — in-cluster deployment of the operator's own container
 # image (`deploy/operator/deployment.yaml`) is exercised in production, not
 # here; this script only proves the reconcile logic against a real API
 # server + real kubelets/kube-controller-manager, which is the part no unit
@@ -234,9 +235,12 @@ cleanup() {
     if [ -n "$OPERATOR_PID" ]; then
         kill "$OPERATOR_PID" >/dev/null 2>&1 || true
         wait "$OPERATOR_PID" 2>/dev/null || true
-        # `cargo run` execs the built binary as a child process it should
-        # forward signals to, but be belt-and-suspenders about a stray
-        # survivor rather than leak a background `animus-operator run`.
+        # `$OPERATOR_PID` is the already-built binary's own PID directly
+        # (execed in place of a `cargo run` supervisor — see the "run
+        # operator out-of-cluster" phase's own doc), so the `kill` above
+        # already reaches the real process; kept as belt-and-suspenders
+        # against a stray survivor rather than leak a background
+        # `animus-operator run`.
         pkill -9 -f "target/[^ ]*/animus-operator run" >/dev/null 2>&1 || true
     fi
     if [ "$KIND_CLUSTER_UP" = "true" ]; then
@@ -507,15 +511,41 @@ EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
 
-phase "run operator out-of-cluster"
+phase "build operator (out-of-cluster)"
 (
     cd "$REPO_ROOT"
     # A caller-provided CARGO_TARGET_DIR is respected; otherwise cargo's own
     # default applies. Incremental compilation and debuginfo are off — a
     # smoke run never reuses this build, so smaller/faster wins.
     export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+    cargo build -p animus-operator --bin animus-operator
+)
+# Resolve the just-built binary's path the same way cargo itself would
+# (`$CARGO_TARGET_DIR/debug/animus-operator`, or `target/debug/animus-operator`
+# under the repo root when that env var is unset — cargo's own default).
+OPERATOR_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/animus-operator"
+[ -x "$OPERATOR_BIN" ] || {
+    log "FATAL: expected operator binary at ${OPERATOR_BIN} after the build above"
+    exit 1
+}
+
+phase "run operator out-of-cluster"
+# Built synchronously above (not `cargo run` backgrounded directly): kube-rs's
+# own dependency tree (rustls/hyper/k8s-openapi and friends) is compiled here
+# for the very first time in this script, nothing else warms the cache first,
+# and a cold build of it is easily minutes long. `cargo run` in the
+# background used to fold that entire compile into `$OPERATOR_LOG` itself —
+# every reconcile/growth `info!`/`warn!` this script's diagnostics rely on
+# ("operator log (tail 200): ...") could genuinely not have been logged yet
+# by the time anything went looking, making a merely-still-compiling process
+# indistinguishable from a stuck one. Building first, then execing the
+# already-compiled binary directly, means every line that ever lands in
+# `$OPERATOR_LOG` is real runtime tracing output, and — as a side benefit —
+# removes the `cargo run` supervisor indirection `cleanup()`'s own comment
+# above already had to work around with a belt-and-suspenders `pkill`.
+(
     export KUBECONFIG="$KIND_KUBECONFIG"
-    exec cargo run -p animus-operator -- run
+    exec "$OPERATOR_BIN" run
 ) >"$OPERATOR_LOG" 2>&1 &
 OPERATOR_PID=$!
 log "operator running as PID ${OPERATOR_PID}, logging to ${OPERATOR_LOG}"
