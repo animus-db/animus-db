@@ -166,8 +166,15 @@ the still-true paragraph after the table.
   auto-split/GC/join/backup-janitor).
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
-  2026-09-04 amendment). E2 (`animus-cli` coverage) stays folded into
-  U-08's trailing PRs.
+  2026-09-04 amendment). **E2 not yet fully closed**, even though U-08 (its
+  own planned home) landed in full 2026-09-06: U-08(i)'s eight flat GET
+  arms and U-08(ii)'s six dynamo-proxy wrappers all now have their own
+  `admin_request` unit tests, but several pre-existing one-shot mutating
+  arms predating both — `drain`/`drain-status`/`remove`/`reconfigure`/
+  `flush`/`compact`/`stream-grow` — still have none, so ADR 0061's own
+  "741 currently-untested lines" framing isn't fully retired. A follow-up
+  PR adding `admin_request` tests for exactly those arms (same shape as
+  every test U-08 already added) would close it; not sized here.
 - **ADR:** amendment notes on 0061.
 
 ### C-05 `SharedWal` (built, unwired): keep, wire later
@@ -213,13 +220,14 @@ tests: `admin_endpoint.rs`. CLI arg parsing is unit-tested via `admin_request`
 mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 `window.confirm` guard.
 
-### U-08 CLI parity
-
-- **(i) landed 2026-09-04** (`admin_request` pure arg parser + eight flat
-  GET arms in `animus-cli`).
-- **(ii) Dynamo-proxy wrappers:** `backup create|delete`, `restore`,
-  `pitr enable|disable`, `ttl`, `stream`, each a `run_*` helper posting
-  to `/admin/data/dynamo`. Size M.
+U-08 CLI parity landed in full 2026-09-06: (i) landed 2026-09-04
+(`admin_request` pure arg parser + eight flat GET arms in `animus-cli`);
+(ii) landed 2026-09-06 (six dynamo-proxy wrappers — `backup-create`/
+`backup-delete`/`restore`/`pitr-enable`/`pitr-disable`/`ttl`/`stream`,
+each an `admin_request` arm posting `{op, payload}` to `/admin/data/dynamo`
+with the exact wire shapes the dashboard already sends for these actions;
+see ADR 0020's matching 2026-09-06 as-built note). Nothing outstanding
+here.
 
 ---
 
@@ -266,7 +274,7 @@ wave are independent and can run in parallel.
 | — | *landed 2026-09-05* (W-09) | Closed ADR 0034's deferred bullet ahead of wave 3 |
 | — | *landed 2026-09-05* (W-08) | Per-table throttling (ADR 0065), all four steps |
 | — | *landed 2026-09-05* (W-08b) | Throughput-derived minimum tablet count (ADR 0067), a direct W-08 follow-up |
-| 3 | *U-05, U-07 landed 2026-09-06*; U-08(ii) | No ordering constraint remains |
+| 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | S-04 → S-05, S-07b–d, C-02, C-05 | S-05 strictly after S-04 |
 | 6 | S-03, S-07e, W-07, C-03 | XL or gated on earlier waves (S-07e's webhook-TLS prerequisite is satisfied now that S-01 landed; no longer a hard gate, just unscheduled) |

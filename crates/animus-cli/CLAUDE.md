@@ -209,6 +209,37 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   `run_control_add`'s own operator-supplied form is unchanged except that
   the id is now re-validated via `NodeId::propose` and the old
   "`ALLOC_ID_BASE`-range" refusal is gone (no ranges exist anymore).
+- **Dynamo-proxy wrappers** (roadmap U-08(ii)): `backup-create`/
+  `backup-delete`/`restore`/`pitr-enable`/`pitr-disable`/`ttl`/`stream` are
+  the last flat mutating group — each a thin `POST /admin/data/dynamo
+  {op, payload}` (ADR 0021), reusing the exact wire shapes the dashboard
+  already sends for these same actions (`dashboard_backups.js`'s
+  `createBackup`/`deleteBackup`/`restoreBackup`/`togglePitr`,
+  `dashboard_browser.js`'s `enableTtl`/`disableTtl`/the stream row's
+  enable/disable calls) rather than inventing a second wire contract for
+  the same six DynamoDB operations:
+
+  ```
+  backup-create <admin-addr> <table> <backup-name>       # CreateBackup
+  backup-delete <admin-addr> <backup-arn>                # DeleteBackup
+  restore <admin-addr> <backup-arn> <target-table>        # RestoreTableFromBackup
+  pitr-enable|pitr-disable <admin-addr> <table>           # UpdateContinuousBackups
+  ttl <admin-addr> <table> <attribute> [--disable]        # UpdateTimeToLive
+  stream <admin-addr> <table> <VIEW_TYPE|off>             # UpdateTable{StreamSpecification}
+  ```
+
+  `ttl` (bare) was deliberately left unclaimed by `ttl-reaper`'s own GET
+  route (see that arm's own comment in `admin_request`) for exactly this
+  wrapper. `stream`'s `<VIEW_TYPE>` is one of DynamoDB's four real
+  `StreamViewType`s (`NEW_IMAGE`/`OLD_IMAGE`/`NEW_AND_OLD_IMAGES`/
+  `KEYS_ONLY`) or the literal `off` to disable — validated client-side
+  (an unknown view type is a plain CLI error, not a round trip that comes
+  back a wire-level `ValidationException`). None of these six ops needed
+  a proxy allow-list change — `animusd::admin::action_data_dynamo` has
+  none beyond the bare-name Streams-vs-item disambiguation, and none of
+  these are Streams ops. `admin_request`'s own unit tests cover the happy
+  path, a missing-argument error, and the `--disable`/`off` variants for
+  every one of the six.
 - **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per
@@ -232,7 +263,19 @@ behavior have no tests of their own here; they're covered end-to-end by
 (`tests/decommission.rs` among others). `main.rs` does carry a `#[cfg(test)]`
 module (`cargo test -p animus-cli`) for `admin_request` — the pure
 `(subcommand, args) -> (method, path, body)` step of `run_admin`'s flat GET
-dispatch — and its `flag_value` helper; it opens no sockets. Also
+**and POST** dispatch (every mutating one-shot route, including the U-08(ii)
+dynamo-proxy wrappers above, builds its request through this same function)
+— and its `flag_value` helper; it opens no sockets. No `animusd`
+integration test exercises the real `animus` binary end to end — `animusd`
+has no dependency on `animus-cli` at all (`tests/control_membership_admin.rs`
+mirrors `internal_addr_from_admin_config`'s key path rather than calling
+it) — so these parser-level unit tests are this crate's only coverage of
+the six new wrappers; the underlying `/admin/data/dynamo` route itself is
+exercised by `animusd`'s existing dashboard-action tests
+(`dashboard_endpoint.rs`'s U-02/U-04 cases) and the DynamoDB wire suites
+those ops already have (`dynamo_backup.rs`, `dynamo_restore.rs`,
+`dynamo_pitr_restore.rs`, `dynamo_ttl.rs`, `dynamo_streams.rs`), unrelated
+to this crate. Also
 `extract_tls_ca` (found anywhere in args / absent / trailing with no
 value) and `build_tls_connector` (rejects a missing file and a file with
 no certificates) — pure/local-filesystem-only, no socket, no live TLS

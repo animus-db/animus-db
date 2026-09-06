@@ -450,7 +450,15 @@
 <span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
 
 <span class="c"># control-plane membership</span>
-<span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span></pre>
+<span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span>
+
+<span class="c"># backup, restore, PITR, TTL, streams</span>
+<span class="p">$</span> <span class="k">animus admin backup-create &lt;admin-addr&gt; &lt;table&gt; &lt;backup-name&gt;</span>
+<span class="p">$</span> <span class="k">animus admin backup-delete &lt;admin-addr&gt; &lt;backup-arn&gt;</span>
+<span class="p">$</span> <span class="k">animus admin restore &lt;admin-addr&gt; &lt;backup-arn&gt; &lt;target-table&gt;</span>
+<span class="p">$</span> <span class="k">animus admin pitr-enable|pitr-disable &lt;admin-addr&gt; &lt;table&gt;</span>
+<span class="p">$</span> <span class="k">animus admin ttl &lt;admin-addr&gt; &lt;table&gt; &lt;attribute&gt; [--disable]</span>
+<span class="p">$</span> <span class="k">animus admin stream &lt;admin-addr&gt; &lt;table&gt; &lt;view-type|off&gt;</span></pre>
       </div>
     </section>
 

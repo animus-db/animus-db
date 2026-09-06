@@ -172,7 +172,13 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>         (operator-supplied id)\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]\n    \
-    control-transfer <leader-admin-addr> <node-id>";
+    control-transfer <leader-admin-addr> <node-id>\n    \
+    backup-create <admin-addr> <table> <backup-name>\n    \
+    backup-delete <admin-addr> <backup-arn>\n    \
+    restore <admin-addr> <backup-arn> <target-table>\n    \
+    pitr-enable|pitr-disable <admin-addr> <table>\n    \
+    ttl <admin-addr> <table> <attribute> [--disable]\n    \
+    stream <admin-addr> <table> <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>";
 
 async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -513,6 +519,108 @@ fn admin_request(
             let id = arg(2).ok_or("credentials-revoke needs <id>")?;
             let body = serde_json::json!({"id": id}).to_string();
             ("POST", "/admin/credentials/revoke".into(), Some(body))
+        }
+        // Dynamo-proxy wrappers (roadmap U-08(ii)): each is a thin POST to
+        // `/admin/data/dynamo` (`{op, payload}`, ADR 0021) reusing the exact
+        // wire shapes `animusd`'s own dashboard already sends for these same
+        // actions (`dashboard_backups.js`/`dashboard_browser.js`) — no new
+        // route and no proxy allow-list change (`animusd::admin::
+        // action_data_dynamo` has none beyond the bare-name Streams-vs-item
+        // disambiguation, and none of these six ops are Streams ops).
+        "backup-create" => {
+            let table = arg(2).ok_or("backup-create needs <table>")?;
+            let name = arg(3).ok_or("backup-create needs <backup-name>")?;
+            let body = serde_json::json!({
+                "op": "CreateBackup",
+                "payload": {"TableName": table, "BackupName": name},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "backup-delete" => {
+            let arn = arg(2).ok_or("backup-delete needs <backup-arn>")?;
+            let body = serde_json::json!({
+                "op": "DeleteBackup",
+                "payload": {"BackupArn": arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "restore" => {
+            let arn = arg(2).ok_or("restore needs <backup-arn>")?;
+            let target = arg(3).ok_or("restore needs <target-table>")?;
+            let body = serde_json::json!({
+                "op": "RestoreTableFromBackup",
+                "payload": {"TargetTableName": target, "BackupArn": arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `pitr-enable`/`pitr-disable` share one arm — both build the
+        // identical `UpdateContinuousBackups` shape, differing only in the
+        // boolean (mirroring the dashboard's own `togglePitr`).
+        "pitr-enable" | "pitr-disable" => {
+            let table = arg(2).ok_or_else(|| format!("{sub} needs <table>"))?;
+            let enabled = sub == "pitr-enable";
+            let body = serde_json::json!({
+                "op": "UpdateContinuousBackups",
+                "payload": {
+                    "TableName": table,
+                    "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": enabled},
+                },
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `ttl` (bare — `ttl-reaper` above claimed the diagnostic GET's own
+        // name for exactly this reason): enables by default; `--disable`
+        // (a fourth, positional-flag arg, mirroring `--force`/
+        // `--force-control-remove` elsewhere in this file) disables. AWS
+        // requires `AttributeName` on a disable call too (naming the
+        // attribute being disabled), so this CLI form takes it either way
+        // rather than trying to look up the current one over a second round
+        // trip.
+        "ttl" => {
+            let table = arg(2).ok_or("ttl needs <table>")?;
+            let attr = arg(3).ok_or("ttl needs <attribute>")?;
+            let disable = arg(4) == Some("--disable");
+            let body = serde_json::json!({
+                "op": "UpdateTimeToLive",
+                "payload": {
+                    "TableName": table,
+                    "TimeToLiveSpecification": {"Enabled": !disable, "AttributeName": attr},
+                },
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `stream`: `off` disables (no `StreamViewType` — mirrors the
+        // dashboard's own `disableStream`); any of DynamoDB's four real view
+        // types enables/changes it. Validated client-side so a typo becomes
+        // a clear CLI error instead of a wire-level `ValidationException`.
+        "stream" => {
+            let table = arg(2).ok_or("stream needs <table>")?;
+            let view = arg(3)
+                .ok_or("stream needs <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>")?;
+            let spec = if view == "off" {
+                serde_json::json!({"StreamEnabled": false})
+            } else {
+                const VIEW_TYPES: &[&str] =
+                    &["NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES", "KEYS_ONLY"];
+                if !VIEW_TYPES.contains(&view) {
+                    return Err(format!(
+                        "stream view type must be one of NEW_IMAGE|OLD_IMAGE|\
+                         NEW_AND_OLD_IMAGES|KEYS_ONLY|off, got `{view}`"
+                    ));
+                }
+                serde_json::json!({"StreamEnabled": true, "StreamViewType": view})
+            };
+            let body = serde_json::json!({
+                "op": "UpdateTable",
+                "payload": {"TableName": table, "StreamSpecification": spec},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
         }
         other => return Err(format!("unknown admin subcommand `{other}`")),
     })
@@ -1435,6 +1543,176 @@ mod tests {
         assert_eq!(method, "POST");
         assert_eq!(path, "/admin/credentials/revoke");
         assert_eq!(body, Some(r#"{"id":"AKID1"}"#.to_string()));
+    }
+
+    // --- Dynamo-proxy wrappers (roadmap U-08(ii)) -------------------------
+
+    #[test]
+    fn backup_create_posts_the_real_create_backup_shape() {
+        let (method, path, body) =
+            admin_request("backup-create", &args(&["orders", "nightly-1"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "CreateBackup");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TableName": "orders", "BackupName": "nightly-1"})
+        );
+    }
+
+    #[test]
+    fn backup_create_needs_table_and_name() {
+        assert!(admin_request("backup-create", &args(&[])).is_err());
+        assert!(admin_request("backup-create", &args(&["orders"])).is_err());
+    }
+
+    #[test]
+    fn backup_delete_posts_the_real_delete_backup_shape() {
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/01234";
+        let (method, path, body) = admin_request("backup-delete", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DeleteBackup");
+        assert_eq!(v["payload"], serde_json::json!({"BackupArn": arn}));
+    }
+
+    #[test]
+    fn backup_delete_needs_a_backup_arn() {
+        assert!(admin_request("backup-delete", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn restore_posts_the_real_restore_table_from_backup_shape() {
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/01234";
+        let (method, path, body) =
+            admin_request("restore", &args(&[arn, "orders-restored"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "RestoreTableFromBackup");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TargetTableName": "orders-restored", "BackupArn": arn})
+        );
+    }
+
+    #[test]
+    fn restore_needs_backup_arn_and_target_table() {
+        assert!(admin_request("restore", &args(&[])).is_err());
+        assert!(admin_request("restore", &args(&["arn:aws:..."])).is_err());
+    }
+
+    #[test]
+    fn pitr_enable_posts_update_continuous_backups_true() {
+        let (method, path, body) = admin_request("pitr-enable", &args(&["orders"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateContinuousBackups");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": true},
+            })
+        );
+    }
+
+    #[test]
+    fn pitr_disable_posts_update_continuous_backups_false() {
+        let (_, _, body) = admin_request("pitr-disable", &args(&["orders"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"]["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn pitr_enable_and_disable_need_a_table() {
+        assert!(admin_request("pitr-enable", &args(&[])).is_err());
+        assert!(admin_request("pitr-disable", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn ttl_enable_posts_update_time_to_live_true() {
+        let (method, path, body) = admin_request("ttl", &args(&["orders", "expiresAt"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateTimeToLive");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "expiresAt"},
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_disable_flag_posts_enabled_false_with_the_same_attribute() {
+        let (_, _, body) =
+            admin_request("ttl", &args(&["orders", "expiresAt", "--disable"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "TimeToLiveSpecification": {"Enabled": false, "AttributeName": "expiresAt"},
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_needs_table_and_attribute() {
+        assert!(admin_request("ttl", &args(&[])).is_err());
+        assert!(admin_request("ttl", &args(&["orders"])).is_err());
+    }
+
+    #[test]
+    fn stream_enable_posts_update_table_with_stream_specification() {
+        let (method, path, body) =
+            admin_request("stream", &args(&["orders", "NEW_AND_OLD_IMAGES"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateTable");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+            })
+        );
+    }
+
+    #[test]
+    fn stream_off_disables_with_no_view_type() {
+        let (_, _, body) = admin_request("stream", &args(&["orders", "off"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "StreamSpecification": {"StreamEnabled": false},
+            })
+        );
+    }
+
+    #[test]
+    fn stream_rejects_an_unknown_view_type() {
+        let err = admin_request("stream", &args(&["orders", "NOT_A_REAL_VIEW"]))
+            .expect_err("an invalid view type must be rejected client-side");
+        assert!(err.contains("NOT_A_REAL_VIEW"), "{err}");
+    }
+
+    #[test]
+    fn stream_needs_table_and_view_type() {
+        assert!(admin_request("stream", &args(&[])).is_err());
+        assert!(admin_request("stream", &args(&["orders"])).is_err());
     }
 
     #[test]

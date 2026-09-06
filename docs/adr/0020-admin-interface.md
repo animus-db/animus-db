@@ -705,6 +705,46 @@ shards_for_the_fs_kind` (a single node configured with the `fs:` opt-in
 reports `shards: null`), plus `tests/dashboard_endpoint.rs::
 dashboard_u07_segment_store_card`.
 
+## As-built (2026-09-06, roadmap U-08(ii)) — dynamo-proxy CLI wrappers, closing U-08
+
+The last piece of CLI parity: six `animus admin` subcommands
+(`backup-create`, `backup-delete`, `restore`, `pitr-enable`/`pitr-disable`,
+`ttl`, `stream`) over the pre-existing `POST /admin/data/dynamo` proxy
+(this ADR's own Surface section) — no new route, and no change to
+`animusd::admin::action_data_dynamo`'s allow-list (it has none beyond the
+bare-name Streams-vs-item disambiguation, and none of these six ops are
+Streams ops). Each is a thin `admin_request` arm building `{op, payload}`
+from the exact DynamoDB operation shape the dashboard already sends for
+the identical action (`CreateBackup`/`DeleteBackup`/
+`RestoreTableFromBackup`/`UpdateContinuousBackups` from
+`dashboard_backups.js`, `UpdateTimeToLive`/`UpdateTable{
+StreamSpecification}` from `dashboard_browser.js`) — the CLI and the
+dashboard are now two clients of one already-proven wire contract, not two
+independently-invented ones. `ttl` (bare) was reserved for this by
+U-07's own `ttl-reaper` GET arm, which claimed the diagnostic name instead
+so this wrapper could take the natural one; `stream`'s view-type argument
+is validated client-side against DynamoDB's four real `StreamViewType`s
+(or the literal `off` to disable) so a typo is a plain CLI error rather
+than a round trip that comes back a wire-level `ValidationException`.
+**This closes docs/roadmap.md's whole U-08 section** — both (i)'s flat GET
+arms and (ii)'s dynamo-proxy wrappers have now landed.
+
+Coverage is `admin_request`'s own unit tests (happy path, a
+missing-argument error, and the `--disable`/`off` variants) for all six —
+per this crate's own `docs/roadmap.md` §4 convention ("CLI arg parsing is
+unit-tested via `admin_request`; nothing opens a socket"), since `animusd`
+has no dependency on `animus-cli` at all and so cannot drive the real
+binary end to end; the `/admin/data/dynamo` route and the six underlying
+DynamoDB operations already have their own real-cluster coverage
+elsewhere (`dynamo_backup.rs`/`dynamo_restore.rs`/
+`dynamo_pitr_restore.rs`/`dynamo_ttl.rs`/`dynamo_streams.rs`,
+`dashboard_endpoint.rs`'s U-02/U-04 cases), unrelated to this CLI crate.
+This does not by itself close ADR 0061 rung C-04's E2 (`animus-cli`
+argument/dispatch coverage) — several pre-existing one-shot arms
+(`drain`/`drain-status`/`remove`/`reconfigure`/`flush`/`compact`/
+`stream-grow`) still have no `admin_request` unit test of their own; see
+`docs/roadmap.md`'s matching note.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.
