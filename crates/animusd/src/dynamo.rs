@@ -1261,6 +1261,29 @@ async fn run_operation(
             max_results,
             next_token.as_deref(),
         ),
+        Operation::ImportTable {
+            s3_bucket,
+            s3_prefix,
+            input_compression,
+            table_creation_params,
+            client_token,
+        } => {
+            create_import(
+                ctx,
+                &s3_bucket,
+                s3_prefix.as_deref(),
+                input_compression,
+                &table_creation_params,
+                client_token.as_deref(),
+            )
+            .await
+        }
+        Operation::DescribeImport { import_arn } => describe_import(meta, &import_arn),
+        Operation::ListImports {
+            table_arn,
+            page_size,
+            next_token,
+        } => list_imports(meta, table_arn.as_deref(), page_size, next_token.as_deref()),
         Operation::RestoreTableFromBackup {
             backup_arn,
             target_table_name,
@@ -2433,6 +2456,342 @@ fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
 /// follow-up.
 fn crc32_hex(bytes: &[u8]) -> String {
     format!("{:08x}", crc32fast::hash(bytes))
+}
+
+// --- S3 import (ADR 0068 §6, S-05 PR 2) ------------------------------------
+
+/// How many fresh-id retries [`create_import`]/[`finish_import_kickoff`]
+/// attempt before giving up — mirrors [`CREATE_EXPORT_ID_ATTEMPTS`]'s own
+/// reasoning exactly.
+const CREATE_IMPORT_ID_ATTEMPTS: u32 = 3;
+
+/// `ImportTable` (ADR 0068 §6): begin a leader-driven import of a customer
+/// S3 bucket's DynamoDB JSON export layout into a brand-new table, created
+/// from `params`.
+///
+/// `ClientToken` idempotency is resolved first (ADR 0068 §5's identical
+/// contract, minus the table scoping — `Metadata::import_by_client_token`'s
+/// own doc has the reason): a retried call with the same token returns the
+/// existing import's description rather than starting a second job.
+/// Otherwise:
+///
+/// 1. [`provision_import_target`] commits the target table's schema (+ any
+///    GSIs, resolved but not yet declared — mirroring
+///    [`RestoreRow::gsi_defs`](animus_control::RestoreRow::gsi_defs)'s own
+///    "declare only once the tablet is fully seeded" reasoning) through the
+///    identical `CreateTable` validation/commit-wait path. A name already
+///    registered — a genuinely pre-existing table, **or** another import
+///    already targeting it, since `BeginImport` proposes this SAME
+///    `CreateTableSchema` before ever minting its own row — is
+///    `ImportConflictException`, real DynamoDB's own code for both cases;
+///    this is also what enforces "one import per target table name at a
+///    time" with no separate concurrency check needed.
+/// 2. [`finish_import_kickoff`] proposes `MetaCommand::BeginImport` — mints
+///    the single `Building` destination tablet (mirrors
+///    `RestoreTableFromBackup`'s own `BeginRestore`), so a normal client
+///    write/read is refused until the import driver (`crate::import`)
+///    activates it — the identical mechanism a restore's target uses,
+///    reused rather than inventing a new status.
+/// 3. Returns immediately — **asynchronous**, unlike `create_table`'s own
+///    blocking wait: the import driver does the actual read/seed/activate
+///    sequence in the background, so `DescribeTable` reports `CREATING`
+///    ([`table_status`]) until it converges.
+async fn create_import(
+    ctx: &ClientCtx,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    input_compression: animus_control::InputCompressionType,
+    params: &wire::TableCreationParameters,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    if let Some(token) = client_token
+        && let Some(existing_id) = metadata_fresh(ctx)
+            .await
+            .import_by_client_token(token)
+            .cloned()
+        && let Some(row) = metadata_fresh(ctx).await.import(&existing_id)
+    {
+        return Ok(wire::import_description_response(&import_details_from_row(
+            &existing_id,
+            row,
+        )));
+    }
+
+    let provision = provision_import_target(ctx, params).await?;
+    finish_import_kickoff(
+        ctx,
+        s3_bucket,
+        s3_prefix,
+        input_compression,
+        &provision,
+        client_token,
+    )
+    .await
+}
+
+/// The GSI/schema half of an import's own setup — [`provision_import_target`]'s
+/// resolved shape, shared with [`finish_import_kickoff`].
+struct ImportProvision {
+    /// The freshly-committed target table name (== `params.table_name`).
+    target_table: String,
+    /// The target table's synthetic ARN.
+    target_table_arn: String,
+    /// The already-committed base (indexes-free) control schema.
+    base_schema: animus_control::TableSchema,
+    /// The declared `(AttributeName, AttributeType)` pairs.
+    key_types: Vec<(String, String)>,
+    /// This import's own resolved GSI plan — **not yet** declared on the
+    /// schema; see [`ImportRow::gsi_defs`](animus_control::ImportRow::gsi_defs)'s
+    /// own doc for why.
+    gsi_defs: Vec<IndexDef>,
+    /// The target table's requested provisioned throughput, if any.
+    throughput: Option<animus_control::ProvisionedThroughput>,
+}
+
+async fn provision_import_target(
+    ctx: &ClientCtx,
+    params: &wire::TableCreationParameters,
+) -> Result<ImportProvision, WireError> {
+    let target_table = params.table_name.clone();
+    if animus_control::syskv::is_reserved_name(&target_table) {
+        return Err(WireError::validation(format!(
+            "table name `{target_table}` collides with the reserved system namespace"
+        )));
+    }
+    if metadata_fresh(ctx).await.has_table_schema(&target_table) {
+        return Err(WireError {
+            code: "ImportConflictException",
+            message: format!(
+                "table `{target_table}` already exists, or an import is already in progress \
+                 for it"
+            ),
+            reasons: None,
+        });
+    }
+
+    let mut base_schema = schema_bridge::to_control(&params.schema, &params.key_types);
+    base_schema.throughput = params.throughput;
+
+    // Every GSI is resolved now (`IndexStatus::Creating`, the identical
+    // restore-target convention) but deliberately not declared on the
+    // schema yet — declaring it before the tablet is seeded would let the
+    // backfill seeder observe an empty range, mark it backfilled, and then
+    // silently miss every row this import seeds afterward.
+    let gsi_defs: Vec<IndexDef> = params
+        .indexes
+        .iter()
+        .map(|idx| {
+            let mut def = schema_bridge::index_to_control(
+                idx,
+                &params.schema.partition_key,
+                &params.key_types,
+            );
+            def.status = IndexStatus::Creating;
+            def
+        })
+        .collect();
+
+    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+    loop {
+        ctx.propose_schema(&MetaCommand::CreateTableSchema {
+            table: target_table.clone(),
+            schema: base_schema.clone(),
+        })
+        .await;
+        if metadata_fresh(ctx).await.has_table_schema(&target_table) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(internal(
+                "ImportTable did not commit its target schema in time (no leader reachable?)",
+            ));
+        }
+        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+
+    Ok(ImportProvision {
+        target_table_arn: wire::table_arn(&target_table),
+        target_table,
+        base_schema,
+        key_types: params.key_types.clone(),
+        gsi_defs,
+        throughput: params.throughput,
+    })
+}
+
+/// Mint the single destination tablet + propose `MetaCommand::BeginImport`
+/// (mirrors [`restore_table_from_backup`]'s own [`finish_restore_kickoff`]).
+/// The replica set follows [`provision_tablet`](ClientCtx::provision_tablet)'s
+/// own convention — the first `min(N, MAX_REPLICATION_FACTOR)` `Active`
+/// members. Returns immediately once the row commits — **asynchronous**;
+/// the import driver (`crate::import`) does the actual seeding in the
+/// background.
+async fn finish_import_kickoff(
+    ctx: &ClientCtx,
+    s3_bucket: &str,
+    s3_prefix: Option<&str>,
+    input_compression: animus_control::InputCompressionType,
+    provision: &ImportProvision,
+    client_token: Option<&str>,
+) -> Result<String, WireError> {
+    let created_wall_ms = ctx.env.wall_now().0;
+    let timeout_err =
+        internal("ImportTable did not commit its import row in time (no leader reachable?)");
+    for _ in 0..CREATE_IMPORT_ID_ATTEMPTS {
+        let import_id = wire::import_arn(
+            &provision.target_table,
+            &format!("{:016x}", ctx.env.next_u64()),
+        );
+        // A synthetic per-table identity (`ImportRow::table_id`'s own doc)
+        // — a fresh random hex string, never interpreted, purely for the
+        // `TableId` field real `ImportTableDescription` responses carry.
+        let table_id = format!("{:032x}", ctx.env.next_u64());
+        let fresh = metadata_fresh(ctx).await;
+        let tablet = fresh.next_free_tablet_id();
+        let mut replicas: Vec<_> = fresh
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        replicas.truncate(crate::MAX_REPLICATION_FACTOR);
+        ctx.propose_schema(&MetaCommand::BeginImport {
+            import_id: import_id.clone(),
+            target_table: provision.target_table.clone(),
+            target_table_arn: provision.target_table_arn.clone(),
+            table_id: table_id.clone(),
+            s3_bucket: s3_bucket.to_owned(),
+            s3_prefix: s3_prefix.map(str::to_owned),
+            input_format: animus_control::InputFormat::DynamoDbJson,
+            input_compression,
+            base_schema: Box::new(provision.base_schema.clone()),
+            key_types: provision.key_types.clone(),
+            gsi_defs: provision.gsi_defs.clone(),
+            throughput: provision.throughput,
+            tablet,
+            replicas,
+            client_token: client_token.map(str::to_owned),
+            created_wall_ms,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
+        loop {
+            if let Some(row) = metadata_fresh(ctx).await.import(&import_id) {
+                return Ok(wire::import_description_response(&import_details_from_row(
+                    &import_id, row,
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break; // mint a fresh id and retry
+            }
+            tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+    Err(timeout_err)
+}
+
+/// Build a [`wire::ImportDetails`] from one catalog row — shared by
+/// [`create_import`]/[`describe_import`]/[`list_imports`]'s own per-summary
+/// detail (mirrors [`export_details_from_row`]'s identical role).
+fn import_details_from_row(
+    import_id: &str,
+    row: &animus_control::ImportRow,
+) -> wire::ImportDetails {
+    let (status, failure_code, failure_message) = match &row.status {
+        animus_control::ImportStatus::InProgress => ("IN_PROGRESS", None, None),
+        animus_control::ImportStatus::Completed => ("COMPLETED", None, None),
+        animus_control::ImportStatus::Failed { reason } => (
+            "FAILED",
+            Some("ImportFailed".to_owned()),
+            Some(reason.clone()),
+        ),
+    };
+    wire::ImportDetails {
+        import_arn: import_id.to_owned(),
+        table_arn: row.target_table_arn.clone(),
+        table_id: row.table_id.clone(),
+        status,
+        s3_bucket: row.s3_bucket.clone(),
+        s3_prefix: row.s3_prefix.clone(),
+        input_compression: match row.input_compression {
+            animus_control::InputCompressionType::Gzip => "GZIP",
+            // `Zstd` never reaches a committed `ImportRow` (rejected at
+            // wire-decode time, ADR 0068 §6) — matched explicitly rather
+            // than `unreachable!()`, the usual defense-in-depth.
+            animus_control::InputCompressionType::None
+            | animus_control::InputCompressionType::Zstd => "NONE",
+        },
+        table_creation_params: wire::TableCreationParameters {
+            table_name: row.target_table.clone(),
+            schema: schema_bridge::to_dynamo(&row.base_schema),
+            key_types: row.key_types.clone(),
+            indexes: schema_bridge::indexes_to_dynamo(&row.gsi_defs),
+            throughput: row.throughput,
+        },
+        client_token: row.client_token.clone(),
+        start_wall_ms: row.created_wall_ms,
+        end_wall_ms: row.completed_wall_ms,
+        processed_item_count: row.processed_item_count,
+        imported_item_count: row.imported_item_count,
+        error_count: row.error_count,
+        processed_size_bytes: row.processed_size_bytes,
+        failure_code,
+        failure_message,
+    }
+}
+
+/// An import row visible at the wire — every import row is visible forever
+/// (unlike a backup, ADR 0068 §6: there is no delete/reclaim command, the
+/// identical [`visible_export`]'s own reasoning).
+fn visible_import<'a>(
+    meta: &'a Metadata,
+    import_arn: &str,
+) -> Result<&'a animus_control::ImportRow, WireError> {
+    meta.import(import_arn).ok_or_else(|| WireError {
+        code: "ImportNotFoundException",
+        message: format!("import `{import_arn}` does not exist"),
+        reasons: None,
+    })
+}
+
+/// `DescribeImport` (ADR 0068 §6): a pure read of one import's catalog row
+/// by its ARN.
+#[allow(clippy::unnecessary_wraps)] // matches every other operation handler's `Result` shape
+fn describe_import(meta: &Metadata, import_arn: &str) -> Result<String, WireError> {
+    let row = visible_import(meta, import_arn)?;
+    Ok(wire::import_description_response(&import_details_from_row(
+        import_arn, row,
+    )))
+}
+
+/// `ListImports` (ADR 0068 §6): paginated import summaries in ascending-ARN
+/// order — `Metadata::imports`' own `BTreeMap<ImportId, _>` iteration order,
+/// which is exactly the order [`wire::paginate_import_summaries`] relies
+/// on, since an `ImportId` **is** its own ARN.
+fn list_imports(
+    meta: &Metadata,
+    table_arn: Option<&str>,
+    page_size: Option<usize>,
+    next_token: Option<&str>,
+) -> Result<String, WireError> {
+    let candidates: Vec<wire::ImportSummary> = meta
+        .imports
+        .iter()
+        .filter(|(_, row)| table_arn.is_none_or(|t| row.target_table_arn == t))
+        .map(|(import_id, row)| wire::ImportSummary {
+            import_arn: import_id.clone(),
+            status: match &row.status {
+                animus_control::ImportStatus::InProgress => "IN_PROGRESS",
+                animus_control::ImportStatus::Completed => "COMPLETED",
+                animus_control::ImportStatus::Failed { .. } => "FAILED",
+            },
+            table_arn: row.target_table_arn.clone(),
+            start_wall_ms: row.created_wall_ms,
+            end_wall_ms: row.completed_wall_ms,
+        })
+        .collect();
+    let (page, next) = wire::paginate_import_summaries(&candidates, next_token, page_size);
+    Ok(wire::list_imports_response(&page, next.as_deref()))
 }
 
 /// How many fresh-id retries [`restore_table_from_backup`] attempts before

@@ -44,9 +44,10 @@ pub use detector::{FailureDetector, Liveness};
 pub use meta::{
     AccessKeyId, ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow,
     BackupStatus, BackupTabletProgress, CredentialRow, ExportFormat, ExportId, ExportRow,
-    ExportStatus, ExportType, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, OpClass,
-    PitrReplaySegmentRef, PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow, Policy,
-    PreviousSecret, RestoreId, RestoreRow, RestoreStatus, SecretKey, StreamShardRow, TableMatch,
+    ExportStatus, ExportType, ImportId, ImportRow, ImportStatus, InputCompressionType, InputFormat,
+    Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, OpClass, PitrReplaySegmentRef,
+    PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow, Policy, PreviousSecret, RestoreId,
+    RestoreRow, RestoreStatus, SecretKey, StreamShardRow, TableMatch,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{

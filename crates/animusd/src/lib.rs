@@ -100,6 +100,7 @@ mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
+mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
 #[deny(clippy::disallowed_methods)]
@@ -4723,6 +4724,15 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The S3 import driver (ADR 0068 §6, S-05 PR 2): seeds an
+        // `InProgress` import's single `Building` tablet from a customer S3
+        // bucket's DynamoDB JSON export layout, then activates it. Same
+        // "run everywhere, self-gate per tablet on leadership" shape as the
+        // restore driver immediately above (its own module doc calls out
+        // the one structural difference — an arbitrary customer bucket as
+        // the source, not this cluster's own backup store).
+        tasks.push(tokio::spawn(import::import_loop(ctx.clone())));
+
         // The in-place split directed-Placing completion loop (ADR 0062
         // §3): reports a child tablet's own local Raft convergence to the
         // control-plane catalog. Same "run everywhere, self-gate per
@@ -4888,7 +4898,10 @@ pub struct Node {
     /// §2) — the exact `Arc<Mutex<_>>` `spawn_common_tail` built, shared
     /// with every clone of this node's `ClientCtx` (one per connection).
     /// Reached only through [`Node::set_export_store_factory`]; production
-    /// code never reads it directly off `Node` itself.
+    /// code never reads it directly off `Node` itself. **Shared verbatim
+    /// with `ImportTable`'s own driver (ADR 0068 §6, S-05 PR 2)** — the
+    /// mirror-image data flow reaches the identical customer-bucket store
+    /// through this one factory rather than a second, duplicate seam.
     export_store_factory: Arc<Mutex<ExportStoreFactory>>,
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
@@ -5127,11 +5140,13 @@ impl Node {
     /// binary links against this crate's plain (non-test-cfg) library, so
     /// a `cfg(test)`-gated item is invisible there — this is a genuinely
     /// public, always-compiled hook for exactly that caller. Affects every
-    /// export this node drives from the moment this call returns: the
-    /// swap lands in the shared `Arc<Mutex<_>>` every clone of this node's
-    /// `ClientCtx` (one per connection, including ones already handed to a
-    /// spawned listener task) reads through, and the export driver reads
-    /// the factory fresh at export start — it never caches it.
+    /// export **and import** (ADR 0068 §6, S-05 PR 2 — the identical seam,
+    /// not a second one) this node drives from the moment this call
+    /// returns: the swap lands in the shared `Arc<Mutex<_>>` every clone of
+    /// this node's `ClientCtx` (one per connection, including ones already
+    /// handed to a spawned listener task) reads through, and both the
+    /// export job and the import driver read the factory fresh at
+    /// export/import start — neither caches it.
     pub fn set_export_store_factory(&self, factory: ExportStoreFactory) {
         *self
             .export_store_factory
@@ -6250,6 +6265,10 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(backup_restore::backup_restore_loop(
             ctx.clone(),
         )));
+
+        // The S3 import driver (ADR 0068 §6, S-05 PR 2) — same shape/
+        // reasoning as the restore driver just above.
+        tasks.push(tokio::spawn(import::import_loop(ctx.clone())));
 
         // The in-place split directed-Placing completion loop (ADR 0062
         // §3) — same shape/reasoning as the backup capture/restore drivers

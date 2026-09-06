@@ -215,7 +215,7 @@
         <li>Node failure: replicas re-created automatically, no operator action</li>
         <li>On-demand backup and restore to a new table (DynamoDB's own <code>CreateBackup</code>/<code>RestoreTableFromBackup</code>)</li>
         <li>Continuous backups (point-in-time recovery to any second, <code>UpdateContinuousBackups</code>/<code>RestoreTableToPointInTime</code>)</li>
-        <li>Export a table's data to a customer-named S3 bucket in DynamoDB's own JSON layout (<code>ExportTableToPointInTime</code>); import back is not yet built</li>
+        <li>Export a table's data to a customer-named S3 bucket in DynamoDB's own JSON layout (<code>ExportTableToPointInTime</code>), and import it back into a brand-new table (<code>ImportTable</code>) — either this adapter's own export, or real AWS's identical layout</li>
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>

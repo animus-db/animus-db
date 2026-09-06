@@ -181,7 +181,11 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     stream <admin-addr> <table> <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>\n    \
     export-create <admin-addr> <table-arn> <s3-bucket> [s3-prefix]\n    \
     export-describe <admin-addr> <export-arn>\n    \
-    export-list <admin-addr> [table-arn]";
+    export-list <admin-addr> [table-arn]\n    \
+    import-create <admin-addr> <table> <s3-bucket> [s3-prefix] [--gzip|--none] \
+    --pk name:TYPE [--sk name:TYPE]\n    \
+    import-describe <admin-addr> <import-arn>\n    \
+    import-list <admin-addr> [table-arn]";
 
 async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -667,6 +671,90 @@ fn admin_request(
             }
             let body = serde_json::json!({
                 "op": "ListExports",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // S3 import (ADR 0068 §6, S-05 PR 2) — the mirror-image trio of the
+        // export group above, over `ImportTable`/`DescribeImport`/
+        // `ListImports`. `import-create` takes a bare **table name** (not
+        // an ARN, unlike `export-create`) since the target table does not
+        // exist yet — there is no ARN to name it by until this call
+        // creates it — and builds a minimal `TableCreationParameters` from
+        // `--pk NAME:TYPE`/`--sk NAME:TYPE` (no GSI/throughput flags yet;
+        // this wrapper covers the common single-key-schema case, matching
+        // `export-create`'s own "common case, not every field" scope note).
+        "import-create" => {
+            let table = arg(2).ok_or("import-create needs <table>")?;
+            let bucket = arg(3).ok_or("import-create needs <s3-bucket>")?;
+            // `[<prefix>]` is positional (mirrors `export-create`), but
+            // this subcommand also has bare flags after it — an arg
+            // starting with `--` here means the prefix was omitted.
+            let prefix = arg(4).filter(|a| !a.starts_with("--"));
+            let gzip = !args.iter().any(|a| a == "--none");
+            let pk = flag_value(args, "--pk")
+                .ok_or("import-create needs --pk NAME:TYPE (e.g. --pk id:S)")?;
+            let (pk_name, pk_type) = pk
+                .split_once(':')
+                .ok_or("--pk must be NAME:TYPE (e.g. id:S)")?;
+            let mut attribute_definitions = vec![serde_json::json!({
+                "AttributeName": pk_name, "AttributeType": pk_type,
+            })];
+            let mut key_schema = vec![serde_json::json!({
+                "AttributeName": pk_name, "KeyType": "HASH",
+            })];
+            if let Some(sk) = flag_value(args, "--sk") {
+                let (sk_name, sk_type) = sk
+                    .split_once(':')
+                    .ok_or("--sk must be NAME:TYPE (e.g. ts:N)")?;
+                attribute_definitions.push(serde_json::json!({
+                    "AttributeName": sk_name, "AttributeType": sk_type,
+                }));
+                key_schema.push(serde_json::json!({
+                    "AttributeName": sk_name, "KeyType": "RANGE",
+                }));
+            }
+            let mut source = serde_json::json!({"S3Bucket": bucket});
+            if let Some(prefix) = prefix {
+                source["S3KeyPrefix"] = serde_json::Value::String(prefix.to_string());
+            }
+            let payload = serde_json::json!({
+                "S3BucketSource": source,
+                "InputFormat": "DYNAMODB_JSON",
+                "InputCompressionType": if gzip { "GZIP" } else { "NONE" },
+                "TableCreationParameters": {
+                    "TableName": table,
+                    "AttributeDefinitions": attribute_definitions,
+                    "KeySchema": key_schema,
+                },
+            });
+            let body = serde_json::json!({
+                "op": "ImportTable",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "import-describe" => {
+            let import_arn = arg(2).ok_or("import-describe needs <import-arn>")?;
+            let body = serde_json::json!({
+                "op": "DescribeImport",
+                "payload": {"ImportArn": import_arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "import-list" => {
+            let mut payload = serde_json::Map::new();
+            if let Some(table_arn) = arg(2) {
+                payload.insert(
+                    "TableArn".to_string(),
+                    serde_json::Value::String(table_arn.to_string()),
+                );
+            }
+            let body = serde_json::json!({
+                "op": "ListImports",
                 "payload": payload,
             })
             .to_string();
@@ -1843,6 +1931,120 @@ mod tests {
     fn export_list_with_a_table_arn_filters_by_it() {
         let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
         let (_, _, body) = admin_request("export-list", &args(&[table_arn])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["payload"], serde_json::json!({"TableArn": table_arn}));
+    }
+
+    // --- S3 import (ADR 0068 §6, S-05 PR 2) --------------------------------
+
+    #[test]
+    fn import_create_posts_the_real_import_table_shape() {
+        let (method, path, body) = admin_request(
+            "import-create",
+            &args(&["orders", "my-bucket", "--pk", "id:S"]),
+        )
+        .unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ImportTable");
+        assert_eq!(v["payload"]["S3BucketSource"]["S3Bucket"], "my-bucket");
+        assert!(v["payload"]["S3BucketSource"].get("S3KeyPrefix").is_none());
+        assert_eq!(v["payload"]["InputFormat"], "DYNAMODB_JSON");
+        assert_eq!(v["payload"]["InputCompressionType"], "GZIP");
+        assert_eq!(
+            v["payload"]["TableCreationParameters"],
+            serde_json::json!({
+                "TableName": "orders",
+                "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            })
+        );
+    }
+
+    #[test]
+    fn import_create_includes_an_optional_prefix_and_sort_key_and_none_compression() {
+        let (_, _, body) = admin_request(
+            "import-create",
+            &args(&[
+                "orders",
+                "my-bucket",
+                "exports/orders",
+                "--none",
+                "--pk",
+                "id:S",
+                "--sk",
+                "ts:N",
+            ]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"]["S3BucketSource"]["S3KeyPrefix"],
+            "exports/orders"
+        );
+        assert_eq!(v["payload"]["InputCompressionType"], "NONE");
+        assert_eq!(
+            v["payload"]["TableCreationParameters"],
+            serde_json::json!({
+                "TableName": "orders",
+                "AttributeDefinitions": [
+                    {"AttributeName": "id", "AttributeType": "S"},
+                    {"AttributeName": "ts", "AttributeType": "N"},
+                ],
+                "KeySchema": [
+                    {"AttributeName": "id", "KeyType": "HASH"},
+                    {"AttributeName": "ts", "KeyType": "RANGE"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn import_create_needs_table_bucket_and_pk() {
+        assert!(admin_request("import-create", &args(&[])).is_err());
+        assert!(admin_request("import-create", &args(&["orders"])).is_err());
+        assert!(admin_request("import-create", &args(&["orders", "my-bucket"])).is_err());
+        assert!(
+            admin_request(
+                "import-create",
+                &args(&["orders", "my-bucket", "--pk", "id"])
+            )
+            .is_err(),
+            "a malformed --pk (no `:TYPE`) must be rejected"
+        );
+    }
+
+    #[test]
+    fn import_describe_posts_the_real_describe_import_shape() {
+        let arn = "arn:aws:dynamodb:animus:0:table/orders/import/01234";
+        let (method, path, body) = admin_request("import-describe", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DescribeImport");
+        assert_eq!(v["payload"], serde_json::json!({"ImportArn": arn}));
+    }
+
+    #[test]
+    fn import_describe_needs_an_import_arn() {
+        assert!(admin_request("import-describe", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn import_list_with_no_filter_posts_an_empty_payload() {
+        let (method, path, body) = admin_request("import-list", &args(&[])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ListImports");
+        assert_eq!(v["payload"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn import_list_with_a_table_arn_filters_by_it() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request("import-list", &args(&[table_arn])).unwrap();
         let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
         assert_eq!(v["payload"], serde_json::json!({"TableArn": table_arn}));
     }

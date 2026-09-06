@@ -906,6 +906,16 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         | MetaCommand::BeginRestore { .. }
         | MetaCommand::CompleteRestore { .. }
         | MetaCommand::FailRestore { .. }
+        // S3 import workflow (ADR 0068 §6, S-05 PR 2): `ImportTable`
+        // (`animusd::dynamo::create_import`) may land on any node, exactly
+        // like `RestoreTableFromBackup`; the import driver
+        // (`animusd::import`) proposes `CompleteImport`/`FailImport` from
+        // wherever the destination tablet's own leader happens to run —
+        // the identical relay reasoning as `BeginRestore`/`CompleteRestore`/
+        // `FailRestore` immediately above.
+        | MetaCommand::BeginImport { .. }
+        | MetaCommand::CompleteImport { .. }
+        | MetaCommand::FailImport { .. }
         // PITR (ADR 0059 §9, Train 3): `UpdateContinuousBackups` (the
         // wire operation's own catalog toggle) may land on any node,
         // exactly like `UpdateTimeToLive` — schema-catalog class, same
@@ -1411,6 +1421,44 @@ mod tests {
             MetaCommand::FailRestore {
                 restore_id: "r1".to_string(),
                 reason: "x".to_string(),
+            },
+            MetaCommand::BeginImport {
+                import_id: "i1".to_string(),
+                target_table: "t3".to_string(),
+                target_table_arn: "arn:aws:dynamodb:animus:0:table/t3".to_string(),
+                table_id: "table-id-1".to_string(),
+                s3_bucket: "bucket".to_string(),
+                s3_prefix: None,
+                input_format: animus_control::InputFormat::DynamoDbJson,
+                input_compression: animus_control::InputCompressionType::Gzip,
+                base_schema: Box::new(animus_control::schema::TableSchema::simple(
+                    "id",
+                    animus_control::schema::ColumnType::String,
+                )),
+                key_types: vec![],
+                gsi_defs: vec![],
+                throughput: None,
+                tablet: TabletId(2),
+                replicas: vec![],
+                client_token: None,
+                created_wall_ms: 0,
+            },
+            MetaCommand::CompleteImport {
+                import_id: "i1".to_string(),
+                processed_item_count: 0,
+                imported_item_count: 0,
+                error_count: 0,
+                processed_size_bytes: 0,
+                completed_wall_ms: 0,
+            },
+            MetaCommand::FailImport {
+                import_id: "i1".to_string(),
+                reason: "x".to_string(),
+                processed_item_count: 0,
+                imported_item_count: 0,
+                error_count: 0,
+                processed_size_bytes: 0,
+                completed_wall_ms: 0,
             },
             MetaCommand::UpdateContinuousBackups {
                 table: table.clone(),

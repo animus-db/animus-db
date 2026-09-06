@@ -62,7 +62,9 @@ deliberately did **not** get one — its replica-repair phase is real
 placement/membership orchestration (a live `tokio::time::sleep`), not a
 thin delegation — and stays under the package-level allow along with
 `admin`, `backup_capture`, `backup_restore`, `client_ctx_host`, `console`,
-`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, and `http`. Ten
+`control_handle`, `dashboard`, `dynamo`, `dynamo_streams`, `http`, and
+`import` (ADR 0068 §6, S-05 PR 2 — a real per-tablet `tokio::time::sleep`
+loop, `backup_restore`'s own twin, not a thin delegation either). Ten
 modules now carry the narrower `#[deny(...)]`: the original five (`schema`,
 `read_path`, `write_path`, `txn_coordinator`, `forwarding`) plus these five.
 
@@ -4417,6 +4419,108 @@ ADR itself for the full design/rationale.
   unknown-table/unknown-export errors; `ION`/`INCREMENTAL_EXPORT`
   rejection; and an `ExportTime` request against a table with no PITR
   history rejecting `InvalidExportTimeException`.
+- **`dynamo.rs`'s `ImportTable`/`DescribeImport`/`ListImports` +
+  `import.rs`'s driver (ADR 0068 §6, S-05 PR 2)** — the mirror-image data
+  flow of the export trio just above: reads a customer S3 bucket's
+  DynamoDB JSON export layout (this adapter's own, or real AWS's) back
+  into a **brand-new** table. Modeled on **both** the export catalog (an
+  ARN-shaped `ImportId`, no delete/reclaim command, `is_relayable_command`
+  for all three `MetaCommand`s since the job may run on any node) and the
+  restore driver (`crate::backup_restore`, a per-tablet leader-side
+  event-driven loop, `KvCommand::SeedBatch`, a single `Building`
+  destination tablet that keeps the target unroutable to an ordinary
+  client write until the import completes — the same mechanism a restore
+  target uses, reused rather than inventing a new tablet state, GSIs
+  resolved at `IndexStatus::Creating` but declared only at completion).
+  **Deliberately not folded into `backup_restore.rs` itself** — see
+  `import.rs`'s own module doc for why it's a sibling module instead (a
+  different source shape needing real item→row *derivation*
+  (`kind_writes_for_item`, the identical primitive PITR replay uses)
+  rather than restore's own "re-wrap already-physical captured bytes"
+  merge, and a fixed constant seed version rather than a captured
+  real one).
+
+  `dynamo::create_import` (ADR 0068 §6): `ClientToken` idempotency first
+  (`Metadata::import_by_client_token` — **not** scoped by table, unlike
+  export's `(table, token)` pair, since a retried `ImportTable` names the
+  same target table by construction), then `provision_import_target`
+  commits the target schema through the **identical** `CreateTable`
+  decode/validation helpers (`decode_key_schema`/`decode_attribute_types`/
+  `decode_indexes`/`decode_create_table_throughput`/
+  `check_attribute_definitions`, via the new
+  `wire::TableCreationParameters` type) so schema validation, GSIs, and
+  throughput behave identically to an ordinary `CreateTable` — a name
+  already registered (a real pre-existing table, **or** another import
+  already claiming it, since `BeginImport` proposes this same
+  `CreateTableSchema` before minting its own row) is
+  `ImportConflictException`, real DynamoDB's own code for both cases, and
+  this is the entire "one import per target name at a time" enforcement
+  (no separate concurrency check). `finish_import_kickoff` then mints the
+  destination tablet + `BeginImport` row and returns immediately —
+  asynchronous, like restore.
+
+  `import.rs`'s `import_tick` (once per `IMPORT_TICK_INTERVAL` per led
+  tablet, no durable cursor — safe to re-sweep on retry because every
+  seeded row carries the fixed `IMPORT_SEED_VERSION`, and
+  `SeedBatch`'s merge-at-carried-version only applies a *strictly newer*
+  version, `animus-storage`'s own `merge` contract): resolves
+  `manifest-summary.json` via `ctx.export_store_factory` (the identical
+  seam the export job uses — kept as one shared name rather than renamed,
+  a deliberate no-op decision), supporting **both** of DynamoDB's own
+  `S3KeyPrefix` shapes (the level above the export's own `AWSDynamoDB/<id>/`
+  folder, listed; or the export folder itself, direct — `rebase_recorded_key`
+  rewrites the manifest's own recorded keys in the second case, since this
+  adapter's own export writes them relative to whatever store *it* was
+  built over, never a bucket-absolute key), streams each data file
+  (gunzip when `GZIP`), decodes each `{"Item": ...}` line via
+  `animus_dynamo::wire::decode_item`, validates key attributes against the
+  target's declared `AttributeDefinitions` (presence + `S`/`N`/`B` type
+  match — a mismatch increments `ErrorCount` and is skipped, up to
+  `MAX_MALFORMED_ITEMS` (10,000), past which the import fails immediately
+  — malformed content can't be fixed by retrying, unlike every I/O fault
+  here, which is retried until `IMPORT_STUCK_TIMEOUT`, 10 minutes), derives
+  `KIND_BASE`/`KIND_LSI` writes via `crate::dynamo::kind_writes_for_item`
+  (never trusts captured physical bytes the way restore's base-chunk sweep
+  does — an import's source is customer text, not this cluster's own
+  previously-captured rows), and batches them into bounded `SeedBatch`
+  proposes (`IMPORT_SEED_BATCH_ROWS`, 500) on this node's own leader
+  handle. On full success: `CompleteImport` (freezing
+  `ProcessedItemCount`/`ImportedItemCount`/`ErrorCount`/
+  `ProcessedSizeBytes`) then declares every resolved GSI, the identical
+  restore-driver ordering. **On failure — unlike a failed restore, which
+  leaves its target table in place for manual cleanup — the driver also
+  drops the half-created target table** (`ClientCtx::drop_table`,
+  best-effort: a drop failure here is logged, not retried, since the
+  target stays a clean, state-agnostic `DeleteTable` away from full
+  cleanup either way), matching real DynamoDB's own "a failed
+  `ImportTable` rolls back the table it was creating" contract —
+  `ImportRow`/`ImportStatus::Failed`'s own doc has the full reasoning.
+
+  Spawned on combined and data-only nodes only, both existing
+  `backup_restore::backup_restore_loop` spawn sites (mirrors that driver's
+  own scope exactly — no control-plane-leader dependency, and a
+  control-only node hosts no CP-data tablet to seed).
+
+  Regression: `tests/dynamo_import.rs` — reuses the S-04 `FakeS3`/
+  `SharedFakeS3` harness `dynamo_export.rs` established (duplicated, not
+  shared — this repo's own per-`tests/dynamo_*.rs`-file convention): a
+  full export→import round trip (source table force-split, import issued
+  against a follower-connected node) converging to `COMPLETED` with exact
+  `ProcessedItemCount`/`ImportedItemCount`/`ErrorCount` and every item
+  reading back through `GetItem`/`Scan`; a `NONE`-compressed export
+  written by hand (an input shape this adapter's own export job never
+  produces); two deliberately malformed items counted in `ErrorCount`
+  with the rest still imported; `ImportConflictException` for both an
+  existing table name and a name-collision with an in-flight import;
+  `ImportNotFoundException`; `ListImports` pagination/`TableArn`
+  filtering; `ION`/`ZSTD` rejection; and `ClientRequestToken` idempotency.
+  **Testing gotcha found building this suite, recorded in
+  `docs/engineering-lessons.md`**: a test helper's own default request
+  shape (compression) silently diverging from what its paired fixture
+  helper actually wrote produced no error at all — just an import stuck
+  `IN_PROGRESS` forever, since every fault in this driver is deliberately
+  retried rather than surfaced — until the outer test's own
+  converged-or-timeout poll finally gave up.
 - **`ClientRequest::ForceSeal { tablet }`** and **`ClientRequest::
   StreamHotRead { tablet, from_position, limit }`** are the two
   internal-only streams RPCs (F12-b's disable-triggered final seal, and

@@ -118,6 +118,12 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::ExportTableToPointInTime { .. } => ("ExportTableToPointInTime", OpClass::Backup),
         Operation::DescribeExport { .. } => ("DescribeExport", OpClass::Backup),
         Operation::ListExports { .. } => ("ListExports", OpClass::Backup),
+
+        // S3 import (ADR 0068 §6, S-05 PR 2) — same `OpClass::Backup` class
+        // as the export/restore family just above.
+        Operation::ImportTable { .. } => ("ImportTable", OpClass::Backup),
+        Operation::DescribeImport { .. } => ("DescribeImport", OpClass::Backup),
+        Operation::ListImports { .. } => ("ListImports", OpClass::Backup),
     }
 }
 
@@ -221,6 +227,36 @@ pub(crate) fn authorize_op(
             class,
             Some(target_table_name.as_str()),
         ),
+
+        // S3 import (ADR 0068 §6, S-05 PR 2) — `ImportTable` targets its
+        // brand-new table, named inside `TableCreationParameters` (the
+        // identical "the table about to exist" reasoning
+        // `RestoreTableFromBackup` above already has); `DescribeImport`/
+        // `ListImports` mirror `DescribeExport`/`ListExports` exactly.
+        Operation::ImportTable {
+            table_creation_params,
+            ..
+        } => authorize(
+            ctx,
+            principal,
+            name,
+            class,
+            Some(table_creation_params.table_name.as_str()),
+        ),
+        Operation::DescribeImport { import_arn } => {
+            let table = meta.import(import_arn).map(|row| row.target_table.as_str());
+            authorize(ctx, principal, name, class, table)
+        }
+        Operation::ListImports { table_arn, .. } => match table_arn {
+            Some(arn) => authorize(
+                ctx,
+                principal,
+                name,
+                class,
+                animus_dynamo::wire::parse_table_arn(arn),
+            ),
+            None => authorize_unscoped(ctx, principal, name, class),
+        },
     }
 }
 
@@ -593,6 +629,39 @@ mod tests {
                     next_token: None,
                 },
                 "ListExports",
+                OpClass::Backup,
+            ),
+            (
+                Operation::ImportTable {
+                    s3_bucket: "bucket".to_string(),
+                    s3_prefix: None,
+                    input_compression: animus_control::InputCompressionType::None,
+                    table_creation_params: animus_dynamo::wire::TableCreationParameters {
+                        table_name: table(),
+                        schema: TableSchema::simple("pk"),
+                        key_types: vec![],
+                        indexes: vec![],
+                        throughput: None,
+                    },
+                    client_token: None,
+                },
+                "ImportTable",
+                OpClass::Backup,
+            ),
+            (
+                Operation::DescribeImport {
+                    import_arn: "arn".to_string(),
+                },
+                "DescribeImport",
+                OpClass::Backup,
+            ),
+            (
+                Operation::ListImports {
+                    table_arn: None,
+                    page_size: None,
+                    next_token: None,
+                },
+                "ListImports",
                 OpClass::Backup,
             ),
             (

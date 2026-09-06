@@ -1362,6 +1362,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // as `Backup`/`Restore`/etc. above (no secret to redact — an S3
         // bucket name/prefix is not a credential).
         syskv::EntityKind::Export => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
+        // An `ImportRow` (ADR 0068 §6, S-05 PR 2) — the identical
+        // passthrough convention `Export` just above uses.
+        syskv::EntityKind::Import => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
     }
 }
 

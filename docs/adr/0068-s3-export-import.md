@@ -37,11 +37,13 @@ startup, credentials resolved once at startup. S-05's job is to reuse that
 same client/store machinery for a **per-request**, customer-named bucket
 instead, and to define the DynamoDB wire surface and object layout on top.
 
-This ADR covers the S-05 PR (1) scope only — the export trio
-(`ExportTableToPointInTime`/`DescribeExport`/`ListExports`). The import trio
-(`ImportTable`/`DescribeImport`/`ListImports`, PR (2)) and the deterministic
-simulation corpus (PR (3)) are sketched in §6/§8 but not implemented here;
-`docs/roadmap.md`'s S-05 entry stays in place until both land.
+This ADR originally covered the S-05 PR (1) scope only — the export trio
+(`ExportTableToPointInTime`/`DescribeExport`/`ListExports`). **The import
+trio (`ImportTable`/`DescribeImport`/`ListImports`, PR (2)) landed
+2026-09-06 too** — see this ADR's own "As-built amendment (2026-09-06, S-05
+PR 2 — the import trio)" section, below §9, for what §6's sketch became.
+The deterministic simulation corpus (PR (3)) is still sketched in §8 only;
+`docs/roadmap.md`'s S-05 entry stays in place until it lands.
 
 ## Decision
 
@@ -231,19 +233,20 @@ mints a genuinely new export — there is no cross-table token collision
 handling, since a token is only ever compared within the scope of the table
 it named.
 
-### 6. Import (PR (2), sketched only — not implemented here)
+### 6. Import (PR (2) — landed 2026-09-06, see this ADR's own as-built amendment below §9)
 
-`ImportTable` would read the identical layout §7 defines back into this
-adapter through the ADR 0059 restore driver's own `KvCommand::SeedBatch`
-merge primitive — the same "restore always creates a brand-new table"
-discipline ADR 0059 §7 already established for `RestoreTableFromBackup`,
-just sourcing rows from a customer-supplied S3 prefix (this adapter's own
-export layout, or real AWS's identical one) instead of this cluster's own
-backup catalog. `DescribeImport`/`ListImports` would mirror
-`DescribeExport`/`ListExports`'s own read shape over a new, symmetric
-`Metadata::imports` catalog. Left entirely to that PR — no `ImportRow`/
-`MetaCommand` exists yet, and `docs/roadmap.md`'s S-05 entry stays in place
-pointing at it.
+`ImportTable` reads the identical layout §7 defines back into this adapter
+through the ADR 0059 restore driver's own `KvCommand::SeedBatch` merge
+primitive — the same "restore always creates a brand-new table" discipline
+ADR 0059 §7 already established for `RestoreTableFromBackup`, sourcing rows
+from a customer-supplied S3 prefix (this adapter's own export layout, or
+real AWS's identical one) instead of this cluster's own backup catalog.
+`DescribeImport`/`ListImports` mirror `DescribeExport`/`ListExports`'s own
+read shape over a new, symmetric `Metadata::imports` catalog. This section
+is left as the original sketch (below) for historical context; the "As-built
+amendment (2026-09-06, S-05 PR 2 — the import trio)" section near the end of
+this document is the current, authoritative account of what actually
+shipped — read that one first.
 
 ### 7. Object layout
 
@@ -378,3 +381,163 @@ not built in this PR.
   conflates two conceptually distinct buckets (this cluster's own
   operational store vs. an arbitrary customer target) behind one flag pair
   that happens to share a shape.
+
+## As-built amendment (2026-09-06, S-05 PR 2 — the import trio)
+
+§6's sketch is now built: `ImportTable`/`DescribeImport`/`ListImports`,
+reading the identical DynamoDB-JSON export layout §7 defines (this
+adapter's own, or real AWS's) back into a **brand-new** table. The shape
+that shipped follows the sketch's own "reuse the restore driver's
+`KvCommand::SeedBatch` primitive" instruction, but the *orchestration*
+around it is a new, dedicated driver rather than a literal reuse of
+`backup_restore.rs`'s existing loop — see below for why.
+
+### The import catalog: `Metadata::imports`, modeled on both `exports` and `restores`
+
+`ImportRow`/`MetaCommand::{BeginImport, CompleteImport, FailImport}` (all
+three on the `is_relayable_command` allowlist, the identical §3 reasoning:
+the import driver runs on whichever node hosts/leads the destination
+tablet, not necessarily the control-plane leader) borrow from **both**
+existing catalogs, deliberately:
+
+- **From `exports`**: the identity is the import's own ARN
+  (`<TableArn-of-the-freshly-created-target>/import/<id>`,
+  [`wire::import_arn`]) — unlike a restore's opaque internally-minted id,
+  real DynamoDB's `ImportTable` has an `ImportArn` a client can
+  `DescribeImport`/`ListImports` by by name, so the ARN itself is the
+  catalog key, `export_arn`'s exact precedent. No delete/reclaim command —
+  real DynamoDB's `ImportTable` has no `DeleteImport` API either, and (like
+  an export row) an import row is a small, permanent record of "this table
+  was imported from here."
+- **From `restores`**: the target-table provisioning shape — exactly one
+  fresh `Building` destination tablet (`BeginImport` mints it directly,
+  the identical `BeginRestore` convention), GSIs resolved at
+  `IndexStatus::Creating` but recorded on the row rather than declared
+  until `CompleteImport` (the identical backfill-race avoidance
+  `RestoreRow::gsi_defs` documents), and — the one deliberate departure
+  from restore — **a failed import drops its own half-created target
+  table** (`FailImport`'s own doc) rather than leaving it for manual
+  cleanup, matching real DynamoDB's documented "a failed `ImportTable`
+  rolls back the table it was creating" contract. This is the reason
+  `FailImport`'s apply arm freezes the observed counts but never touches
+  the tablet map itself — the table drop is the import **driver**'s own
+  follow-up call (`ClientCtx::drop_table`, the ordinary path, best-effort:
+  a drop failure is logged, not retried, since the target stays a clean,
+  state-agnostic `DeleteTable` away from full cleanup either way), not
+  something the pure state machine could safely do atomically with the
+  fail transition (the drop is itself a multi-step commit sequence, not a
+  single `MetaCommand`).
+- **`TableCreationParameters` support is real `CreateTable`-shaped, not a
+  stub**: `KeySchema`/`AttributeDefinitions`/`GlobalSecondaryIndexes`/
+  `BillingMode`+`ProvisionedThroughput` decode through the **identical**
+  helpers `CreateTable` itself uses (`decode_key_schema`/
+  `decode_attribute_types`/`decode_indexes`/
+  `decode_create_table_throughput`/`check_attribute_definitions`), so
+  schema validation and throughput behave identically — and once the
+  target activates, the ordinary throughput-derived min-tablet-count
+  auto-split trigger (ADR 0067) picks it up exactly like any other
+  provisioned table, with no import-specific logic needed for that at all
+  (min-tablet sizing is a background auto-split concern, never part of the
+  synchronous create path, so nothing about a `Building`-then-`Active`
+  target changes that). **`LocalSecondaryIndexes` is rejected outright** —
+  real DynamoDB's own `TableCreationParameters` object has no such field.
+
+### The import driver: `animusd::import`, `backup_restore.rs`'s twin — not a literal reuse
+
+§6's own sketch imagined this landing inside the *existing* restore
+driver; it shipped as a **new, sibling module** (`crates/animusd/src/
+import.rs`) instead, structurally identical (same "run everywhere,
+self-gate per tablet on `group.is_leader()`" discovery, same "no durable
+cursor — re-sweep the whole thing every tick" resumability, same bounded
+stuck-timeout) but genuinely a different job:
+
+- **Every seeded row carries a fixed, constant version**
+  (`IMPORT_SEED_VERSION = 1`), not a captured-at-real-version number the
+  way a backup's own data objects do — an import's source is DynamoDB JSON
+  text with no native version concept at all, and a constant is exactly
+  as idempotent under `SeedBatch`'s merge-at-carried-version semantics as
+  a real one (`animus-storage`'s `merge` applies only strictly-newer
+  versions, so a re-seeded, already-applied row at the same version is a
+  verified no-op, not merely "probably fine").
+- **Item → row derivation reuses `kind_writes_for_item`** (the same
+  function a live write's leader-side evaluation, and PITR segment replay,
+  already call) rather than trusting captured physical bytes verbatim the
+  way restore's own base-chunk sweep does — an import's source rows are
+  customer-supplied DynamoDB JSON *text*, not this cluster's own
+  previously-captured `KIND_BASE`/`KIND_LSI` physical values, so they have
+  to be derived, not merely re-wrapped. `KIND_FOOTPRINT`/`KIND_CHANGE` are
+  never produced, the identical PITR-replay/restore convention (a GSI is
+  rebuilt fresh by the post-activation backfill regardless of how base
+  content arrived; an imported table's own change log starts empty).
+- **Key-schema validation, and a bounded malformed-item budget**: each
+  decoded item's key attributes are checked against the target's declared
+  `AttributeDefinitions` (presence + `S`/`N`/`B` type match); a failure
+  increments `ErrorCount` and is skipped, up to
+  [`MAX_MALFORMED_ITEMS`] (10,000) — crossing it fails the import
+  immediately (never retried: malformed content can't be fixed by trying
+  again, unlike every I/O fault in this driver, which is retried until the
+  stuck-timeout).
+- **Object resolution supports both of DynamoDB's own `S3KeyPrefix`
+  shapes**: a prefix naming the level directly above the export's own
+  `AWSDynamoDB/<id>/` folder (list `AWSDynamoDB/*/manifest-summary.json`
+  under it), or a prefix naming the export folder itself
+  (`manifest-summary.json` at the resolved store's own root). The second
+  shape needs a path rewrite (`rebase_recorded_key`) — this adapter's own
+  export job writes every recorded `manifestFilesS3Key`/`dataFileS3Key`
+  relative to whatever store *it* was built over (ADR 0068 §1's own
+  simplification, not a bucket-absolute key), so a caller resolving the
+  manifest one level deeper than the export job's own prefix has to strip
+  the now-redundant leading `AWSDynamoDB/<id>/` segment before using those
+  recorded keys against its own, more-narrowly-scoped store.
+- **`ClientRequestToken` idempotency is table-unscoped** (unlike export's
+  `(table, token)` pair): a repeated `ImportTable` call with the same
+  token always names the same target table by construction (a different
+  name would already collide with the just-created target's own schema
+  before the token lookup could ever matter), so `Metadata::
+  import_by_client_token` matches on the token alone.
+- **The customer-bucket seam is shared verbatim with export, not
+  duplicated**: `ClientCtx::export_store_factory`/`ExportStoreFactory`
+  (the name kept as-is rather than renamed to something export/import-
+  neutral — a rename was considered and rejected as churn with no
+  behavioral benefit for a field only ever spelled out inside this crate)
+  is reused directly by the import driver to reach the identical
+  per-request `S3SegmentStore`-over-`--export-s3-*`-credentials
+  construction §2 already built.
+
+### Named residuals (PR 2), stated plainly
+
+1. **`ION`/`CSV` input formats and `ZSTD` compression are not
+   implemented** — rejected with `ValidationException` at wire-decode
+   time, the identical §4 treatment `ExportFormat::Ion`/
+   `ExportType::Incremental` already get.
+2. **No `CancelImport`** — real DynamoDB's `ImportTable` can be
+   cancelled mid-flight; this adapter has no such command, and
+   `ImportStatus` never produces `CANCELLING`/`CANCELLED`.
+3. **No crash-resumability**, the identical §9 residual #1 for export: a
+   node crash mid-import leaves the row `InProgress` until the driver's
+   own stuck-timeout (10 minutes) fails it — there is no per-chunk durable
+   cursor.
+4. **`TableId` is a synthetic, freshly-minted hex string**, not a real
+   DynamoDB-shaped GUID — this adapter never needed a `TableId` concept
+   before `ImportTableDescription`'s own echoed field asked for one, and a
+   hex string is diagnostic-only, never interpreted.
+5. **PR 3's planned `SimEnv` corpus** (reusing `ANIMUS_BACKUP_SEEDS`'s
+   fault-injection shape) is not built in this PR, matching export's own
+   PR 1 residual — `docs/roadmap.md`'s S-05 entry stays in place pointing
+   at it.
+
+**Tests** (`crates/animusd/tests/dynamo_import.rs`, real `ProdEnv`
+sockets, no MinIO — reuses the S-04 `FakeS3` fake, the identical
+`ExportStoreFactory` injection seam PR 1's own test harness established):
+a full export→import round trip (a real forced split on the source table,
+import issued against a follower-connected node) converging to
+`COMPLETED` with exact `ProcessedItemCount`/`ImportedItemCount`/
+`ErrorCount` and every item reading back through `GetItem`/`Scan`; a
+`NONE`-compressed export written by hand (an input shape this adapter's
+own export job never produces, but real DynamoDB export tooling can);
+two deliberately malformed items counted in `ErrorCount` with the rest
+still imported; `ImportConflictException` for both an already-existing
+target table name and a second import racing an already-claimed one;
+`ImportNotFoundException` for an unknown ARN; `ListImports` pagination
+and `TableArn` filtering; `ValidationException` for `ION`/`ZSTD`; and
+`ClientRequestToken` idempotency.

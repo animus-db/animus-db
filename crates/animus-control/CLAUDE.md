@@ -852,6 +852,64 @@ per-tablet CP data plane (`animus-cp-data`).
   customer-bucket store configuration/injection seam, and the object
   layout written.
 
+- **The import catalog (ADR 0068 §6, S-05 PR 2): `BeginImport`/
+  `CompleteImport`/`FailImport`.** `Metadata::imports: BTreeMap<ImportId,
+  ImportRow>` (`ImportId = String`, the import's own ARN —
+  `<TableArn-of-the-freshly-created-target>/import/<id>`,
+  `wire::import_arn` — the identical "the id is its own ARN" shape
+  `exports` already uses, since real DynamoDB's `ImportArn` is likewise a
+  natural client-visible identity with no name-collision hazard to avoid).
+  Modelled on **both** existing catalogs: `exports`' identity/no-delete
+  shape (no `RecordImportTabletComplete`/aggregator — an import is one
+  job, on whichever node hosts/leads the destination tablet, not a
+  distributed per-tablet capture), and `restores`' target-provisioning
+  shape (`BeginImport` mints exactly **one** fresh `Building` destination
+  tablet directly, mirroring `BeginRestore`'s own mint — the mechanism
+  that keeps a normal client write/read refused until the import driver
+  activates it, reused rather than inventing a new tablet state; GSIs are
+  resolved into `gsi_defs: Vec<IndexDef>` at `IndexStatus::Creating` but
+  not declared on the schema until `CompleteImport`, the identical
+  `RestoreRow::gsi_defs` backfill-race-avoidance reasoning). `BeginImport`
+  additionally carries `base_schema: Box<TableSchema>` (boxed —
+  `TableSchema` is by far this variant's largest field, and an unboxed
+  copy would make the whole `MetaCommand` enum's in-memory size balloon to
+  fit it, `clippy::large_enum_variant`'s own complaint) and `key_types`/
+  `throughput`, recorded purely so `DescribeImport`'s echoed
+  `TableCreationParameters` can render the original request's own
+  declared shape — the wire edge (`animusd::dynamo::
+  provision_import_target`) already committed the identical schema via an
+  ordinary `CreateTableSchema` proposal *before* ever proposing
+  `BeginImport`, so this apply arm performs no schema validation of its
+  own, only the tablet mint + row insert.
+
+  **`CompleteImport` activates the tablet** (`Building` → `Active`, epoch
+  bumped — the identical `CompleteRestore` shape) **and freezes**
+  `processed_item_count`/`imported_item_count`/`error_count`/
+  `processed_size_bytes`. **`FailImport` deliberately leaves the tablet
+  `Building` forever, exactly like `FailRestore`** — this apply arm never
+  touches the tablet map on failure; the actual target-table cleanup (see
+  below) is the import **driver**'s own separate, best-effort follow-up
+  call through the ordinary `DropTableSchema`/`DropTableTablets` path, not
+  something this pure state machine does atomically with the fail
+  transition (dropping a table is itself a multi-step commit sequence).
+  This is the one deliberate divergence from `restores`' own "leave it for
+  manual `DeleteTable`" stance: real DynamoDB's own `ImportTable` rolls
+  back a failed import's target table automatically, so `animusd::import`
+  does too — but that rollback is driver-orchestrated, not catalog-time.
+  `Metadata::import_by_client_token(token)` is the `ClientRequestToken`
+  idempotency lookup — **not** scoped by table the way
+  `export_by_client_token(table, token)` is, since a retried `ImportTable`
+  call names the same target table by construction (a different name
+  would already collide with the just-created target's own schema before
+  the token lookup could matter), so a bare token match is enough.
+  `syskv::EntityKind::Import`/`import_key` follow the usual per-entity
+  mirror conventions (no `Delete` arm needed, the identical `Export`
+  reasoning); `is_relayable_command` allows all three, the identical
+  `BeginExport`/`CompleteExport`/`FailExport` reasoning (the import job
+  may run on any node). See `crates/animusd/CLAUDE.md`'s own ADR 0068 PR 2
+  entry for the driver, the item→row derivation, and the object-resolution
+  mechanics.
+
 ## What's non-obvious
 
 - **The sync/driver split is deliberate.** All consensus logic is in the sync

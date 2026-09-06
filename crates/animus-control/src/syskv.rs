@@ -209,6 +209,11 @@ pub enum EntityKind {
     /// identity discipline [`Backup`](Self::Backup) uses. The value is the
     /// JSON-encoded `ExportRow`, same convention as `Backup`/`Restore`/etc.
     Export,
+    /// An S3 import catalog row (`Metadata::imports`, ADR 0068 §6, S-05 PR
+    /// 2), keyed by its opaque `ImportId` string ([`import_key`]) — the
+    /// identical identity discipline [`Export`](Self::Export) uses. The
+    /// value is the JSON-encoded `ImportRow`.
+    Import,
 }
 
 impl EntityKind {
@@ -238,6 +243,7 @@ impl EntityKind {
             EntityKind::PitrBaseBackup => "pitr_base_backup",
             EntityKind::Credential => "credential",
             EntityKind::Export => "export",
+            EntityKind::Import => "import",
         }
     }
 
@@ -268,6 +274,7 @@ impl EntityKind {
             b"pitr_base_backup" => EntityKind::PitrBaseBackup,
             b"credential" => EntityKind::Credential,
             b"export" => EntityKind::Export,
+            b"import" => EntityKind::Import,
             _ => return None,
         })
     }
@@ -547,6 +554,12 @@ pub fn restore_key(restore_id: &str) -> Vec<u8> {
 #[must_use]
 pub fn export_key(export_id: &str) -> Vec<u8> {
     entity_key(EntityKind::Export, export_id.as_bytes())
+}
+
+/// An import id's key under [`EntityKind::Import`] (ADR 0068 §6, S-05 PR 2).
+#[must_use]
+pub fn import_key(import_id: &str) -> Vec<u8> {
+    entity_key(EntityKind::Import, import_id.as_bytes())
 }
 
 /// An access key id's key under [`EntityKind::Credential`] (ADR 0066 §1).

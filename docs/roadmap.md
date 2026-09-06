@@ -26,7 +26,8 @@ record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
 W-08b's — all three landed 2026-09-05 and their roadmap sections are removed
 per this document's own maintenance rule above; 0068 is
 [S3 export and import](adr/0068-s3-export-import.md), S-05's design of
-record — PR 1/3 landed 2026-09-06, see that section below for what remains).
+record — PR 1/3 and PR 2/3 landed 2026-09-06, see that section below for
+what remains).
 
 ---
 
@@ -90,28 +91,36 @@ the still-true paragraph after the table.
 
 ### S-05 S3 export/import
 
-- **Gap:** `ImportTable`, `DescribeImport`, `ListImports` absent.
-  `ExportTableToPointInTime`/`DescribeExport`/`ListExports` **landed
-  2026-09-06** (PR 1 of 3) — see [ADR 0068](adr/0068-s3-export-import.md)
-  for the design (a single leader-driven job per export, run on whichever
-  node received the wire request, reusing `ctx.cp_scan` rather than the
-  backup catalog's per-tablet capture-driver/aggregator machinery) and its
-  own "Known residuals" section for what's deliberately deferred (no
-  crash-resumability; `ExportTime` is validated against the PITR window
-  but content is always current-state, not a true point-in-time replay).
-- **Plan (remaining):** the import trio, against the export's own
-  DynamoDB-JSON object layout (`AWSDynamoDB/<id>/data/*.json.gz` +
-  `manifest-summary.json`/`manifest-files.json`) — new wire handlers,
-  reusing `backup_restore.rs`'s per-tablet seeding shape for the actual
-  row-materialization step. PR 3 extends `ANIMUS_BACKUP_SEEDS`/
+- **Gap:** deterministic simulation corpus coverage for the export/import
+  path absent (PR 3). `ExportTableToPointInTime`/`DescribeExport`/
+  `ListExports` **landed 2026-09-06** (PR 1 of 3) and `ImportTable`/
+  `DescribeImport`/`ListImports` **landed 2026-09-06** (PR 2 of 3) — see
+  [ADR 0068](adr/0068-s3-export-import.md) for the design (export: a single
+  leader-driven job per export, run on whichever node received the wire
+  request, reusing `ctx.cp_scan` rather than the backup catalog's
+  per-tablet capture-driver/aggregator machinery; import: a per-tablet,
+  leader-side, event-driven driver mirroring `backup_restore.rs`'s own
+  shape, sourcing from an arbitrary customer bucket via the shared
+  `ExportStoreFactory` seam and deriving each row's `KIND_BASE`/`KIND_LSI`
+  writes through the same `kind_writes_for_item` primitive PITR replay
+  uses) and its own "Known residuals"/PR 2 as-built sections for what's
+  deliberately deferred (no crash-resumability for either direction;
+  `ExportTime` is validated against the PITR window but content is always
+  current-state, not a true point-in-time replay; import has no `ION`/
+  `CSV`/`ZSTD` support and no `CancelImport`).
+- **Plan (remaining):** PR 3 extends `ANIMUS_BACKUP_SEEDS`/
   `ANIMUS_PITR_SEEDS`-style fault-injection coverage to the export/import
   path (`animus-test`).
 - **Tests:** `crates/animusd/tests/dynamo_export.rs` (PR 1, e2e: full
   export flow with a real split mid-scan, idempotent `ClientRequestToken`,
-  format/type/time validation, unknown-table/export errors).
+  format/type/time validation, unknown-table/export errors);
+  `crates/animusd/tests/dynamo_import.rs` (PR 2, e2e: a full export→import
+  round trip with exact item/error counts, a `NONE`-compressed hand-written
+  export, malformed-item skipping, `ImportConflictException`, pagination,
+  format/compression validation, idempotent `ClientRequestToken`).
 - **ADR:** [0068](adr/0068-s3-export-import.md), Accepted.
-- **PRs:** (1) export trio — **done**; (2) import trio; (3) corpus.
-  **Size:** L (PR 1 alone: M).
+- **PRs:** (1) export trio — **done**; (2) import trio — **done**; (3)
+  corpus. **Size:** L (PR 1/PR 2 each: M).
 - **Depends:** S-04, landed in full 2026-09-06 (`animus-s3`, `animus_env::
   S3SegmentStore` + `s3:` URIs, and `animus-operator`'s `spec.s3` — see ADR
   0059's amendments), so this item is unblocked.
