@@ -23,8 +23,8 @@ use std::time::Duration;
 use animus_control::{ApplyOutcome, ColumnType, MetaCommand, Metadata, TableSchema, TtlSpec};
 use animus_dynamo::{AttributeValue, wire};
 use animus_env::{EnvExt, nid};
-use animus_node::host::TtlScanHost;
-use animus_node::ttl_reaper::ttl_reaper_loop;
+use animus_node::host::{TtlReaperProgressHost, TtlScanHost};
+use animus_node::ttl_reaper::{TtlReaperProgress, ttl_reaper_loop};
 use animus_sim::Simulator;
 use animus_tablet::{KeyRange, TabletId};
 use async_trait::async_trait;
@@ -41,12 +41,19 @@ struct Inner {
     /// partition key)` — lets a test assert *what* was deleted, not just
     /// that the tablet's row count dropped.
     delete_calls: Mutex<Vec<(TabletId, String, AttributeValue)>>,
+    /// The loop's own published progress (roadmap U-07) — lets this fixture
+    /// double as a proof that `ttl_reaper_loop` actually publishes through
+    /// [`TtlReaperProgressHost`], not just that it deletes the right rows.
+    progress: Mutex<TtlReaperProgress>,
 }
 
 /// A synthetic [`TtlScanHost`] — no `CpGroup`, no Raft, no `ClientCtx`.
 /// "Deleting" an item is a plain map removal keyed by the item's own
 /// storage-key bytes (`animus_dynamo::storage_key`, the same function the
-/// real write path derives a base row's key from).
+/// real write path derives a base row's key from). Also backs
+/// [`TtlReaperProgressHost`] with its own `TtlReaperProgress` slot (roadmap
+/// U-07), so this double can drive and observe the progress-reporting
+/// mechanism too.
 #[derive(Clone)]
 struct FakeTtlHost(std::sync::Arc<Inner>);
 
@@ -56,6 +63,7 @@ impl FakeTtlHost {
             meta,
             tablets: Mutex::new(tablets),
             delete_calls: Mutex::new(Vec::new()),
+            progress: Mutex::new(TtlReaperProgress::default()),
         }))
     }
 
@@ -70,6 +78,16 @@ impl FakeTtlHost {
 
     fn delete_calls(&self) -> Vec<(TabletId, String, AttributeValue)> {
         self.0.delete_calls.lock().unwrap().clone()
+    }
+
+    fn progress(&self) -> TtlReaperProgress {
+        self.0.progress.lock().unwrap().clone()
+    }
+}
+
+impl TtlReaperProgressHost for FakeTtlHost {
+    fn update_ttl_reaper_progress(&self, update: &mut dyn FnMut(&mut TtlReaperProgress)) {
+        update(&mut self.0.progress.lock().unwrap());
     }
 }
 
@@ -234,6 +252,22 @@ fn an_expired_item_is_reaped_while_a_future_item_is_left_alone() {
             .any(|(_, _, pk)| *pk == AttributeValue::S("future-one".to_owned())),
         "the loop must never attempt to delete the not-yet-expired item (seed={seed})"
     );
+
+    // Roadmap U-07: the published progress snapshot reflects the reap —
+    // one item deleted cumulatively, at least one expired item observed,
+    // one TTL-enabled table, and no error. `deleted_last_tick` is
+    // deliberately NOT asserted here: it resets to 0 at the start of every
+    // tick (see `TtlReaperProgress::deleted_last_tick`'s own doc) and this
+    // sim runs for 2 real-world seconds' worth of 10ms ticks — by the run's
+    // end, many idle ticks have elapsed since the one tick that actually
+    // deleted the row, so `deleted_last_tick` has long since settled back
+    // to 0, exactly as designed.
+    let progress = host.progress();
+    assert_eq!(progress.deleted_total, 1, "seed={seed}");
+    assert!(progress.expired_seen_total >= 1, "seed={seed}");
+    assert_eq!(progress.tables_with_ttl, 1, "seed={seed}");
+    assert_eq!(progress.last_error, None, "seed={seed}");
+    assert!(progress.last_tick_at_ms.is_some(), "seed={seed}");
 }
 
 #[test]
@@ -270,4 +304,12 @@ fn a_table_with_no_expired_rows_never_calls_delete() {
         host.delete_calls().is_empty(),
         "nothing expired — no delete should ever have been attempted (seed={seed})"
     );
+
+    // Roadmap U-07: an idle sweep still reports honestly — the table is
+    // counted, but nothing was seen expired or deleted.
+    let progress = host.progress();
+    assert_eq!(progress.deleted_total, 0, "seed={seed}");
+    assert_eq!(progress.expired_seen_total, 0, "seed={seed}");
+    assert_eq!(progress.tables_with_ttl, 1, "seed={seed}");
+    assert_eq!(progress.last_error, None, "seed={seed}");
 }

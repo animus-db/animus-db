@@ -250,3 +250,38 @@ produces carry it; records from a client `DeleteItem` do not.
   guaranteed to drift from the real one (§4).
 - **Delete unconditionally**, without re-checking the observed expiry. Rejected:
   it races every TTL refresh, which is the single most common TTL workload (§4).
+
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/ttl`
+
+The reaper (moved to `animus_node::ttl_reaper` by ADR 0061 rung C2, see
+that crate's own `CLAUDE.md`) now publishes its own progress — phase
+(`idle`/`scanning`/`deleting`, mirroring the loop's real per-tablet control
+flow), the last tick, a JSON-safe hex-truncated projection of its own
+driver-local resume cursor (never raw key bytes), and cumulative
+deleted/expired-seen/tables-with-TTL counters — through a new
+`animus_node::host::TtlReaperProgressHost` capability trait, at each phase
+transition, mirroring the on-demand backup janitor's own
+`BackupJanitorProgressHost`/`JanitorProgress` precedent (ADR 0059's
+matching 2026-09-06 as-built note) exactly. `animusd::ClientCtx` backs it
+with an `Arc<std::sync::Mutex<TtlReaperProgress>>`, provisioned on every
+node shape and read by the new `GET /admin/ttl` route.
+
+**The one deliberate difference from the backup-janitor precedent**: the
+TTL reaper is not control-plane-leader-gated — it runs on every node,
+self-gated per tablet on `TtlScanHost::led_tablets` — so every node's own
+`TtlReaperProgress` is a genuinely live, independently meaningful answer,
+never a stand-in for "not the leader." `GET /admin/ttl` additionally
+reports `leader_tablets`, the count of this node's own hosted tablets that
+are both this node's own Raft leader and belong to a TTL-enabled table —
+the tablets this node's reaper is actually reaping right now — and
+`tables`, every TTL-enabled table in the replicated catalog. See ADR
+0020's matching 2026-09-06 as-built note for the full route/wire-up design
+and the `animus admin ttl-reaper` CLI naming rationale (roadmap U-08(ii)'s
+planned `ttl` dynamo-proxy wrapper claims the bare `ttl` subcommand name
+instead).
+
+Regression: `tests/admin_endpoint.rs::
+admin_ttl_reports_reaper_progress_and_ttl_tables`,
+`tests/dashboard_endpoint.rs::dashboard_u07_ttl_reaper_card`, and
+`animus-node`'s `tests/ttl_reaper_sim.rs` (extended with progress
+assertions on its existing `SimEnv`-driven scenarios).

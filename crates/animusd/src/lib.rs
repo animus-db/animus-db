@@ -3762,6 +3762,9 @@ fn spawn_common_tail(
         backup_janitor_progress: Arc::new(Mutex::new(
             animus_node::backup_janitor::JanitorProgress::default(),
         )),
+        ttl_reaper_progress: Arc::new(Mutex::new(
+            animus_node::ttl_reaper::TtlReaperProgress::default(),
+        )),
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -7932,6 +7935,20 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// `metrics_history`'s own precedent: every access is a short
     /// lock/mutate/drop, never held across an `.await`.
     pub(crate) backup_janitor_progress: Arc<Mutex<animus_node::backup_janitor::JanitorProgress>>,
+    /// The TTL reaper's own live progress (roadmap U-07, ADR 0051) —
+    /// `animus_node::ttl_reaper::ttl_reaper_loop` publishes into this
+    /// through `ClientCtx`'s
+    /// [`animus_node::host::TtlReaperProgressHost`] impl
+    /// (`client_ctx_host.rs`) at each phase transition; `GET /admin/ttl`
+    /// reads it back out. **Provisioned on every node shape**, mirroring
+    /// `backup_janitor_progress`'s own rationale above — but unlike that
+    /// field, every node's own copy is a genuinely live answer: the TTL
+    /// reaper runs on *every* node (self-gated per tablet on
+    /// `TtlScanHost::led_tablets`), never only on the control leader.
+    /// Plain `std::sync::Mutex`, matching `metrics_history`'s own
+    /// precedent: every access is a short lock/mutate/drop, never held
+    /// across an `.await`.
+    pub(crate) ttl_reaper_progress: Arc<Mutex<animus_node::ttl_reaper::TtlReaperProgress>>,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -15546,6 +15563,9 @@ mod simenv_client_ctx_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
@@ -15893,6 +15913,9 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
             // Node A never forwards outward in this test — empty routes.
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
@@ -15955,6 +15978,9 @@ mod two_node_relay_tests {
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(intra_route_b)),

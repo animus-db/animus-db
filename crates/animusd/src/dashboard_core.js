@@ -556,15 +556,21 @@ async function loadAll() {
       // `raftkv` the same way `metrics` does — `.catch(() => null)` so one
       // unreachable/older node degrades to "no txn view for this node"
       // rather than failing the whole fan-out.
-      const [config, raft, raftkv, txns, health, metrics] = await Promise.all([
+      // `ttl` (docs/roadmap.md U-07) fans out per-node too, unlike
+      // `/admin/backup-store`'s single SEED-only fetch above — the TTL
+      // reaper runs on EVERY node (self-gated per tablet), not just the
+      // control leader, so a per-node fan-out is the only way to see every
+      // node's own reaper activity.
+      const [config, raft, raftkv, txns, health, metrics, ttl] = await Promise.all([
         getJSON(base, "/admin/config"),
         getJSON(base, "/admin/raft").catch(() => null),
         getJSON(base, "/admin/raftkv").catch(() => null),
         getJSON(base, "/admin/txns").catch(() => null),
         getJSON(base, "/admin/health").catch(() => null),
         getJSON(base, "/admin/metrics").catch(() => null),
+        getJSON(base, "/admin/ttl").catch(() => null),
       ]);
-      Object.assign(node, { config, raft, raftkv, txns, health, metrics, ok: true });
+      Object.assign(node, { config, raft, raftkv, txns, health, metrics, ttl, ok: true });
     } catch (e) {
       node.error = String(e);
     }

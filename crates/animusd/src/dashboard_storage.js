@@ -8,9 +8,64 @@
 // now, so it moved to the Data Browser's DynamoDB panel,
 // `dashboard_browser.js`.) Depends on `dashboard_core.js` (STATE, $, esc,
 // pill, getJSON, bytes, nodeIdOf, syncStorageUrl,
-// applyPendingStorageParams, pendingStorageParams).
+// applyPendingStorageParams, pendingStorageParams) and
+// `dashboard_streams.js` (monoDuration — the TTL reaper card's own
+// `last_tick_at_ms` renderer; see that function's own doc for why an
+// `env.now()`-derived value can only ever render as a relative duration,
+// never an absolute time).
+//
+// docs/roadmap.md U-07: a read-only "TTL reaper" card fed from each node's
+// own `GET /admin/ttl` (`STATE.nodes[*].ttl`, `dashboard_core.js`'s
+// existing per-node loadAll() fan-out — unlike `/admin/backup-store`
+// (control-leader-only, one SEED fetch), the TTL reaper runs on EVERY
+// node, self-gated per tablet, so this card is genuinely per-node, not a
+// single shared answer).
+
+// docs/roadmap.md U-07: the "TTL reaper" card — every TTL-enabled table
+// (from any node that answered, since the catalog is identical everywhere)
+// plus one row per reachable node showing its own reaper phase, resume
+// cursor, counters, and last error, straight off `GET /admin/ttl`'s
+// response shape (`{reaper, tables, leader_tablets}`).
+function renderTtlReaper() {
+  const el = $("ttl-body");
+  if (!el) return;
+  const nodes = STATE.nodes.filter((n) => n.ok);
+  if (!nodes.length) { el.innerHTML = `<div class="empty">unavailable</div>`; return; }
+  const withTtl = nodes.find((n) => n.ttl);
+  const tables = (withTtl && withTtl.ttl.tables) || [];
+  const tableRows = tables.length
+    ? tables.map((t) => `<div class="list-row"><span class="detail">${esc(t.name)}</span><span class="status-text mono">${esc(t.attribute)}</span></div>`).join("")
+    : `<div class="list-row"><span class="detail">no TTL-enabled tables</span></div>`;
+  const nodeRows = nodes.map((n) => {
+    const t = n.ttl;
+    if (!t) {
+      return `<div class="list-row"><span class="id">${esc(n.addr)}</span><span class="muted">unavailable</span></div>`;
+    }
+    const r = t.reaper || {};
+    const phase = r.phase || "idle";
+    const cursor = r.cursor
+      ? `${esc(r.cursor.table)} · tablet ${esc(r.cursor.tablet_id)}${r.cursor.key_hex ? " · " + esc(r.cursor.key_hex) : ""}`
+      : "—";
+    const errRow = r.last_error
+      ? `<div class="list-row"><span class="detail">&nbsp;&nbsp;last error</span><span class="err-line">${esc(r.last_error)}</span></div>`
+      : "";
+    return `
+      <div class="list-row">
+        <span class="id">${esc(n.addr)}</span>
+        <span>${pill(phase === "idle" ? "forming" : "ok", phase.toUpperCase())}</span>
+        <span class="muted">leads ${esc(t.leader_tablets)} tablet(s)</span>
+      </div>
+      <div class="list-row"><span class="detail">&nbsp;&nbsp;last tick</span><span class="status-text mono">${r.last_tick_at_ms != null ? "t+" + monoDuration(r.last_tick_at_ms) : "—"}</span></div>
+      <div class="list-row"><span class="detail">&nbsp;&nbsp;cursor</span><span class="status-text mono">${cursor}</span></div>
+      <div class="list-row"><span class="detail">&nbsp;&nbsp;deleted (tick / total) · expired seen</span><span class="status-text mono">${esc(r.deleted_last_tick ?? 0)} / ${esc(r.deleted_total ?? 0)} · ${esc(r.expired_seen_total ?? 0)}</span></div>
+      ${errRow}
+    `;
+  }).join("");
+  el.innerHTML = tableRows + nodeRows;
+}
 
 function renderStorageSelectors() {
+  renderTtlReaper();
   const status = STATE.status;
   const tablets = status && status.tablets ? Object.keys(status.tablets).map(Number).sort((a, b) => a - b) : [1];
   const tsel = $("st-tablet");

@@ -1122,6 +1122,72 @@ async fn dashboard_u07_backup_store_card() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-07 (second route): the Storage tab's "TTL reaper"
+/// card, fed from each node's own `GET /admin/ttl` — same render-only-
+/// markers-plus-live-round-trip structure as `dashboard_u07_backup_store_
+/// card` just above. Unlike that route (control-leader-only, one SEED
+/// fetch), the TTL reaper runs on EVERY node, so this card is fed from
+/// `dashboard_core.js`'s existing PER-NODE fan-out (`STATE.nodes[*].ttl`),
+/// not a single shared fetch. The actual reaper mechanics have their own
+/// coverage (`animus_node::ttl_reaper_sim`, `admin_endpoint.rs`'s
+/// `admin_ttl_reports_reaper_progress_and_ttl_tables`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u07_ttl_reaper_card() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries the new card on the Storage tab -------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        assert!(
+            shell.contains(r#"id="ttl-card""#) && shell.contains(r#"id="ttl-body""#),
+            "the shell carries the TTL reaper card: {shell}"
+        );
+
+        // ---- dashboard_storage.js renders it from the route's own shape ----
+        let (s, _, storage_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_storage.js").await;
+        assert_eq!(s, 200, "dashboard_storage.js is served");
+        assert!(
+            storage_js.contains("function renderTtlReaper"),
+            "dashboard_storage.js renders the TTL reaper card: {storage_js}"
+        );
+        assert!(
+            storage_js.contains("n.ttl")
+                && storage_js.contains("t.reaper")
+                && storage_js.contains("t.leader_tablets"),
+            "the card reads the fields GET /admin/ttl serves: {storage_js}"
+        );
+
+        // ---- dashboard_core.js fans it out per node, not a single SEED-only
+        //      fetch (the reaper runs on every node, unlike the backup
+        //      janitor) -------------------------------------------------------
+        let (s, _, core_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_core.js").await;
+        assert_eq!(s, 200, "dashboard_core.js is served");
+        assert!(
+            core_js.contains(r#"getJSON(base, "/admin/ttl")"#),
+            "dashboard_core.js fetches /admin/ttl per node (base, not SEED): {core_js}"
+        );
+
+        // ---- the route itself serves from a live node -----------------------
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/ttl").await;
+        assert_eq!(s, 200, "GET /admin/ttl: {body}");
+        let v: Value = serde_json::from_str(&body).expect("ttl view is JSON");
+        assert!(v.get("reaper").is_some(), "carries \"reaper\": {body}");
+        assert!(v.get("tables").is_some(), "carries \"tables\": {body}");
+        assert!(
+            v.get("leader_tablets").and_then(Value::as_u64).is_some(),
+            "carries a numeric \"leader_tablets\": {body}"
+        );
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// docs/roadmap.md U-04 (PR 1): the Data Browser's `#br-dy-ttl` row, beside
 /// `#br-dy-stream` — same render-only-markers-plus-live-round-trip structure
 /// as `dashboard_u01_render_only_fixes`/`dashboard_u02_backups_tab`. The

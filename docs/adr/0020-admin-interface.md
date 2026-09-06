@@ -492,6 +492,67 @@ and stays `Idle`), `tests/dashboard_endpoint.rs::
 dashboard_u07_backup_store_card`, and `animus_node::backup_janitor::tests`'
 own progress-reporting assertions.
 
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/ttl`
+
+The second of U-07's four observability routes, copying `/admin/backup-
+store`'s own template (above) with one deliberate difference: the TTL
+reaper (ADR 0051) runs on **every** node, self-gated per tablet
+(`TtlScanHost::led_tablets`), never only on the control leader — so every
+node's own `reaper` field is a genuinely live answer, never a stand-in for
+"not the leader" the way a follower's `janitor` field on `/admin/backup-
+store` is.
+
+`GET /admin/ttl` returns `{reaper: TtlReaperProgress, tables: [{name,
+attribute, enabled}...], leader_tablets: N}`. `reaper` is a new
+`animus_node::ttl_reaper::TtlReaperProgress` — `phase`
+(`idle`/`scanning`/`deleting`, mirroring the loop's real per-tablet control
+flow), `last_tick_at_ms`, a `cursor` (the reaper's own driver-local resume
+position: table + tablet id + a hex-encoded, `TTL_REAPER_CURSOR_KEY_CAP`
+(24-byte)-truncated resume key — **never** the raw key bytes),
+`deleted_last_tick`/`deleted_total`, `expired_seen_total`,
+`tables_with_ttl`, and `last_error` — published at each phase transition
+through a new capability trait mirroring `BackupJanitorProgressHost`
+exactly, `animus_node::host::TtlReaperProgressHost`, into
+`ClientCtx::ttl_reaper_progress: Arc<std::sync::Mutex<TtlReaperProgress>>`
+(provisioned on every node shape, `client_ctx_host.rs`). `tables` is every
+TTL-enabled table in the replicated catalog (a disabled table carries no
+`TtlSpec` at all and so never appears — `enabled` is therefore always
+`true` here, kept as a field for shape symmetry and future extension, not
+because a `false` case exists today). `leader_tablets` counts this node's
+own currently-hosted tablets that are (a) this node's own Raft leader and
+(b) belong to a TTL-enabled table — the tablets this node's reaper is
+*actually* reaping right now, a **per-tablet** fact distinct from the
+control-plane leadership `/admin/backup-store`'s own `leader` field
+reports.
+
+Wired through the identical conventional stack `/admin/backup-store`
+established: a match arm in `crates/animus-node/src/admin.rs`'s dispatch
+table, the `AdminHost::ttl_view` method (`crates/animus-node/src/host.rs`)
+and its `FakeHost` stub/dispatch test, a handler in
+`crates/animusd/src/admin.rs`, and `animus admin ttl-reaper <admin-addr>`
+(`animus-cli`) — named `ttl-reaper`, not the bare `ttl` its route would
+suggest, since roadmap U-08(ii) plans a `ttl` *dynamo-proxy* wrapper
+(`UpdateTimeToLive`/`DescribeTimeToLive` via `/admin/data/dynamo`) in the
+same `admin_request` subcommand namespace and this GET arm must not claim
+that name first. Renders on the **Storage** tab (`dashboard_storage.js`'s
+new "TTL reaper" card, `#ttl-card`/`#ttl-body`) rather than Backups — this
+route's per-node semantics (every node answers about its own reaper) don't
+fit the Backups tab's existing "one shared answer" fetch shape, so
+`dashboard_core.js`'s existing **per-node** `loadAll()` fan-out
+(`STATE.nodes[*].ttl`) feeds it instead of a second single-fetch-against-
+SEED call.
+
+Regression: `tests/admin_endpoint.rs::
+admin_ttl_reports_reaper_progress_and_ttl_tables` (a real 3-node cluster —
+`UpdateTimeToLive` on a table, `PutItem` an already-expired item, and poll
+converged-or-timeout until some node's own route shows `deleted_total >=
+1`; every node's own `tables` list carries the TTL-enabled table since the
+catalog replicates everywhere; a node leading none of that table's
+tablets still answers its own honest counters rather than erroring),
+`tests/dashboard_endpoint.rs::dashboard_u07_ttl_reaper_card`, and
+`animus_node`'s `tests/ttl_reaper_sim.rs` (extended with progress
+assertions on the existing `SimEnv`-driven reap/no-op scenarios).
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

@@ -903,7 +903,28 @@ reusing the captured config is the point of the test.
   outcome, and the stream `userIdentity`); the follower-relay regression
   for `UpdateTimeToLive` (`MetaCommand::SetTableTtl` on the
   `is_relayable_command` allowlist) lives in `tests/schema_ddl_relay.rs`,
-  alongside its sibling DDL-relay tests.
+  alongside its sibling DDL-relay tests. **Publishes its own progress
+  (roadmap U-07)**: the loop's own `animus_node::ttl_reaper::
+  TtlReaperProgress` (phase — `Idle`/`Scanning`/`Deleting` — plus
+  `last_tick_at_ms`, a JSON-safe hex-truncated projection of the loop's own
+  driver-local resume cursor, `deleted_last_tick`/`deleted_total`,
+  `expired_seen_total`, `tables_with_ttl`, and `last_error`) is published
+  at each phase transition through a new capability trait,
+  `animus_node::host::TtlReaperProgressHost`, into
+  `ClientCtx::ttl_reaper_progress: Arc<std::sync::Mutex<
+  TtlReaperProgress>>` (`client_ctx_host.rs`'s impl is the usual thin,
+  logic-free delegation — a short lock/mutate/drop, never held across an
+  `.await`). `GET /admin/ttl` (`admin.rs::ttl_view`) reads it back out
+  alongside every TTL-enabled table in the replicated catalog and how many
+  of this node's own hosted tablets it currently leads of one — see ADR
+  0020's and ADR 0051's matching 2026-09-06 as-built notes for the full
+  route design. **Unlike the backup janitor (control-plane-leader-only)**,
+  this loop runs on every node, so every node's own progress is a
+  genuinely live answer, not an honest-idle placeholder. Regression:
+  `tests/admin_endpoint.rs::admin_ttl_reports_reaper_progress_and_ttl_
+  tables`, `tests/dashboard_endpoint.rs::dashboard_u07_ttl_reaper_card`,
+  and `animus-node`'s `tests/ttl_reaper_sim.rs` (extended with progress
+  assertions).
 - **`admin.rs`** (~58 KB) — the admin/debug HTTP-JSON endpoint (ADR 0020):
   read-only `GET` views + gated `POST` actions + the dashboard's data-write
   surface; also serves the SPA static assets. **The `(method, path)`
@@ -1147,6 +1168,29 @@ reusing the captured config is the point of the test.
   `seal_wall_ms`), so this file gained that one cross-file dependency,
   documented in its own header comment. Read-only — no action to gate,
   since this card mutates nothing.
+
+  **docs/roadmap.md U-07's second route** (`dashboard_storage.js`) added a
+  read-only "TTL reaper" card (`#ttl-card`/`#ttl-body`, `renderTtlReaper`,
+  called from `renderStorageSelectors`) to the **Storage** tab, not
+  Backups — a deliberate departure from `/admin/backup-store`'s own
+  placement, since this route's semantics don't fit that tab's "one shared
+  answer" shape: the TTL reaper runs on **every** node (self-gated per
+  tablet), so `GET /admin/ttl` is genuinely per-node, unlike the backup
+  janitor's control-leader-only progress. Fed from `dashboard_core.js`'s
+  existing **per-node** `loadAll()` fan-out (`STATE.nodes[*].ttl`, a new
+  entry in the same `Promise.all` that already fetches
+  `config`/`raft`/`raftkv`/`txns`/`health`/`metrics` per node) rather than
+  a second single-fetch-against-SEED call — no new poll timer either way.
+  The card renders every TTL-enabled table (from whichever node answered
+  first — the catalog is identical everywhere) plus one row per reachable
+  node showing its own reaper phase, resume cursor, deleted/expired
+  counters, and last error, straight off `GET /admin/ttl`'s response shape
+  (`{reaper, tables, leader_tablets}`; see `admin.rs`'s own `ttl_view`
+  entry below and ADR 0020's/ADR 0051's matching 2026-09-06 as-built notes
+  for the route itself). `last_tick_at_ms` renders via
+  `dashboard_streams.js`'s `monoDuration`, the identical cross-file
+  dependency the Backup store card above already established. Read-only —
+  no action to gate.
 
   **docs/roadmap.md U-04** (`dashboard_browser.js`) added a `#br-dy-ttl`
   row beside `#br-dy-stream` (`renderTtlRow`, called from

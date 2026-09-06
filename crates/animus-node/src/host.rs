@@ -166,6 +166,31 @@ pub trait TtlScanHost {
     ) -> Result<bool, String>;
 }
 
+/// The TTL reaper's own progress-reporting capability (roadmap U-07) — the
+/// `TtlScanHost`-driven sibling of [`BackupJanitorProgressHost`]: lets
+/// [`crate::ttl_reaper::ttl_reaper_loop`] publish its own phase/cursor/
+/// counters to a shared, admin-readable slot without dragging any
+/// admin-surface type into this crate. Not `async` for the identical reason
+/// `BackupJanitorProgressHost` isn't — every implementation is a short,
+/// synchronous lock/mutate/drop (see [`crate::ttl_reaper::TtlReaperProgress`]'s
+/// own doc), so there is nothing here for `async_trait` to buy.
+///
+/// `animusd::ClientCtx` backs this with an
+/// `Arc<std::sync::Mutex<TtlReaperProgress>>`, the identical
+/// `BackupJanitorProgressHost`/`metrics_history` precedent — **unlike** the
+/// backup janitor (control-plane-leader-only, so only one node's progress
+/// is ever meaningful), the TTL reaper runs on *every* node, self-gated
+/// per tablet, so every node's own progress is a genuine, independently
+/// meaningful answer.
+pub trait TtlReaperProgressHost: Send + Sync {
+    /// Apply `update` to the shared
+    /// [`crate::ttl_reaper::TtlReaperProgress`] under a short-held lock.
+    fn update_ttl_reaper_progress(
+        &self,
+        update: &mut dyn FnMut(&mut crate::ttl_reaper::TtlReaperProgress),
+    );
+}
+
 /// A synchronous call/await RPC to another node's client API (ADR 0061 rung
 /// C3b, the third 2026-08-28 amendment) — the capability behind
 /// `control_handle::RemoteControlClient::metadata_fresh`'s leader-directed
@@ -373,4 +398,12 @@ pub trait AdminHost: Send + Sync {
     /// there). The template the next three U-07 observability routes
     /// (`/admin/ttl`, `/admin/gc`, `/admin/segment-store`) copy.
     async fn backup_store_view(&self) -> Value;
+    /// `GET /admin/ttl` (ADR 0051, roadmap U-07) — this node's own live
+    /// [`crate::ttl_reaper::TtlReaperProgress`] (unlike the backup janitor,
+    /// the TTL reaper runs on *every* node, self-gated per tablet, so
+    /// every node answers about its own reaper, never a control-leader-
+    /// only view), every TTL-enabled table in the replicated catalog
+    /// (`{name, attribute, enabled}`), and how many tablets this node
+    /// currently leads of a TTL-enabled table.
+    async fn ttl_view(&self) -> Value;
 }

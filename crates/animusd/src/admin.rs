@@ -532,6 +532,9 @@ impl AdminHost for ClientCtx {
     async fn backup_store_view(&self) -> Value {
         backup_store_view(self).await
     }
+    async fn ttl_view(&self) -> Value {
+        ttl_view(self)
+    }
 }
 
 // ---- read-only views ----------------------------------------------------
@@ -1575,6 +1578,66 @@ async fn backup_store_view(ctx: &ClientCtx) -> Value {
         "objects": objects,
         "janitor": janitor,
         "leader": ctx.control.is_leader(),
+    })
+}
+
+/// `GET /admin/ttl` (ADR 0051, roadmap U-07) — the second of U-07's
+/// observability routes, copying `backup_store_view`'s own template above
+/// with one deliberate difference: the TTL reaper runs on **every** node
+/// (self-gated per tablet, `TtlScanHost::led_tablets`), never only on the
+/// control leader — so every node's own `reaper` field is a genuinely live
+/// answer, not a stand-in for "not the leader" the way a follower's own
+/// `janitor` field on `/admin/backup-store` is.
+///
+/// `reaper` is this node's own live
+/// `animus_node::ttl_reaper::TtlReaperProgress` snapshot
+/// (`ClientCtx::ttl_reaper_progress`, published by `ttl_reaper_loop`
+/// through the `TtlReaperProgressHost` impl in `client_ctx_host.rs`) — its
+/// own `cursor` field is already a JSON-safe, hex-truncated projection of
+/// the loop's real driver-local resume key (never raw bytes). `tables` is
+/// every TTL-enabled table in the replicated catalog
+/// (`{name, attribute, enabled}` — `enabled` is always `true` here since a
+/// disabled table carries no `TtlSpec` at all and so never appears,
+/// mirroring `DescribeTimeToLive`'s own `ENABLED`/`TtlSpec::is_some`
+/// convention). `leader_tablets` counts this node's own currently-hosted
+/// tablets (`ctx.edge.hosted_groups()`) that are (a) this node's own
+/// leader and (b) belong to a TTL-enabled table — the tablets this node's
+/// reaper is actually reaping right now, distinct from control-plane
+/// leadership (which the backup janitor's own `leader` field reports).
+fn ttl_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let tables: Vec<Value> = meta
+        .schemas
+        .iter()
+        .filter_map(|(name, schema)| {
+            schema.ttl.as_ref().map(|ttl| {
+                json!({
+                    "name": name,
+                    "attribute": ttl.attribute_name,
+                    "enabled": true,
+                })
+            })
+        })
+        .collect();
+    let leader_tablets = ctx
+        .edge
+        .hosted_groups()
+        .into_iter()
+        .filter(|(tablet, group)| {
+            group.is_leader()
+                && meta
+                    .tablets
+                    .get(tablet)
+                    .and_then(|t| t.table.as_ref())
+                    .is_some_and(|table| meta.table_ttl(table).is_some())
+        })
+        .count();
+    let reaper = ctx.ttl_reaper_progress.lock().unwrap().clone();
+
+    json!({
+        "reaper": reaper,
+        "tables": tables,
+        "leader_tablets": leader_tablets,
     })
 }
 

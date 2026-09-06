@@ -207,6 +207,72 @@ async fn bring_up_with_fs_backup_store(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up`], but pins a fast TTL reaper sweep interval (roadmap
+/// U-07's `admin_ttl_reports_reaper_progress_and_ttl_tables` needs the
+/// reaper to actually reap an already-expired item within the test's own
+/// budget — this codebase's own testing discipline never waits out the
+/// real production sweep interval, `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`,
+/// on the order of a minute; mirrors `tests/dynamo_ttl.rs`'s own
+/// `TEST_TTL_SWEEP_INTERVAL`/`start_single_node_fast_ttl`, generalized to
+/// an `n`-node cluster via `run_node_with_ttl_sweep_interval`, which — like
+/// `bring_up_with_fs_backup_store`'s own `run_node_with_streams_quiesce_
+/// and_backup_store` — already takes a full multi-node `config` + `index`).
+async fn bring_up_with_fast_ttl(
+    n: usize,
+    dir: &std::path::Path,
+    ttl_sweep_interval: Duration,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_ttl_sweep_interval(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                ttl_sweep_interval,
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -2280,6 +2346,143 @@ async fn admin_backup_store_reports_reclaim_progress_and_leader_state() {
         })
         .await
         .expect("the backup janitor never reclaimed the deleted backup's objects in 20s");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/ttl` (ADR 0051, roadmap U-07) end to end on a real cluster:
+/// `UpdateTimeToLive` on a table, `PutItem` an already-expired item, and
+/// poll converged-or-timeout until *some* node's own reaper reports it
+/// deleted the row — every node's own `tables` list shows the TTL-enabled
+/// table (the replicated catalog is identical everywhere), and a node
+/// leading none of that table's tablets still answers about its own
+/// (honestly idle) counters rather than erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) =
+            bring_up_with_fast_ttl(3, dir.path(), Duration::from_millis(200)).await;
+        await_bootstrap(&nodes).await;
+
+        let any_addr = nodes[0].admin_addr();
+
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+
+        let (s, upd) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "UpdateTimeToLive: {upd}");
+
+        // ---- poll converged-or-timeout: every node's own catalog view
+        //      lists the TTL-enabled table — under contention, a follower's
+        //      own replicated-Metadata apply can lag briefly behind the
+        //      admin call's own leader-side commit-wait, so a single
+        //      immediate check here is a real (observed) flake, not just a
+        //      theoretical one. Also captures each node's own
+        //      "reaper"/"leader_tablets" fields on the converged pass, used
+        //      by the checks right after (leadership is settled well before
+        //      the catalog write above even committed, since `CreateTable`
+        //      itself blocks on `await_table_serveable`). ------------------
+        let mut leader_tablets_by_node: Vec<u64> = Vec::new();
+        timeout(Duration::from_secs(20), async {
+            loop {
+                leader_tablets_by_node.clear();
+                let mut all_ready = true;
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/ttl").await;
+                    assert_eq!(s, 200, "GET /admin/ttl: {v}");
+                    assert!(v.get("reaper").is_some(), "carries \"reaper\": {v}");
+                    let tables = v["tables"].as_array().expect("tables is an array");
+                    let has_widgets = tables.iter().any(|t| {
+                        t["name"] == "widgets"
+                            && t["attribute"] == "expiresAt"
+                            && t["enabled"] == true
+                    });
+                    if !has_widgets {
+                        all_ready = false;
+                    }
+                    leader_tablets_by_node.push(
+                        v["leader_tablets"]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("carries a numeric \"leader_tablets\": {v}")),
+                    );
+                }
+                if all_ready {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "not every node's own catalog converged to show widgets as \
+             TTL-enabled within 20s",
+        );
+
+        // ---- a node leading none of `widgets`' tablets (RF 3 on a 3-node
+        //      cluster means at least two of the three) still answered with
+        //      its own honest counters above, never an error ----------------
+        assert!(
+            leader_tablets_by_node.contains(&0),
+            "a 3-node, RF-3 cluster's single tablet has exactly one leader — \
+             at least one other node should lead none of it: \
+             {leader_tablets_by_node:?}"
+        );
+
+        // ---- put an already-expired item -----------------------------------
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs()
+            - 3600;
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(&format!(
+                r#"{{"op":"PutItem","payload":{{"TableName":"widgets","Item":{{"id":{{"S":"w1"}},"expiresAt":{{"N":"{past}"}}}}}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- poll converged-or-timeout: some node's own reaper eventually
+        //      deletes it and reports so on its own GET /admin/ttl ----------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/ttl").await;
+                    assert_eq!(s, 200, "GET /admin/ttl: {v}");
+                    if v["reaper"]["deleted_total"].as_u64().unwrap_or(0) >= 1 {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no node's TTL reaper ever reported a delete within 20s");
 
         for node in &nodes {
             node.shutdown_graceful().await;

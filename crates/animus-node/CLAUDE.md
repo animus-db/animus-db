@@ -543,6 +543,31 @@ sub-rungs below shipped.
   widening to publish them. `admin::tests::FakeHost` and `dispatch`'s
   routing table both needed the one new arm too.
 
+  **`AdminHost` gained a sixth method, `ttl_view`, for roadmap U-07's
+  second route (2026-09-06)**: `GET /admin/ttl` — added the identical way
+  again; `impl AdminHost for ClientCtx` in `animusd::admin` delegates to
+  that file's own `ttl_view` function. This rung also added
+  **`host::TtlReaperProgressHost`**, the `TtlScanHost`-driven sibling of
+  `BackupJanitorProgressHost` (same shape: one method,
+  `update_ttl_reaper_progress(&self, update: &mut dyn FnMut(&mut
+  ttl_reaper::TtlReaperProgress))`, not `async_trait`, called by
+  `ttl_reaper::ttl_reaper_loop`/`ttl_sweep_one_tablet` at each phase
+  transition). **The one deliberate difference from
+  `BackupJanitorProgressHost`**: the TTL reaper is not control-plane-
+  leader-gated — it runs on every node, self-gated per tablet
+  (`TtlScanHost::led_tablets`) — so every node's own `TtlReaperProgress` is
+  a genuinely live, independently meaningful answer, never a stand-in for
+  "not the leader" the way a non-leader's `JanitorProgress` is.
+  `ttl_reaper`'s own new `TtlReaperProgress`/`TtlReaperPhase`/
+  `TtlReaperCursor` types (phase, last tick, a JSON-safe hex-truncated
+  resume-cursor projection — never raw key bytes — and cumulative
+  deleted/expired-seen/tables-with-TTL counters) are plain `serde`-derived
+  data with no `Env`/`ClientCtx` dependency, so no new visibility widening
+  was needed to publish them. `admin::tests::FakeHost` and `dispatch`'s
+  routing table both needed the one new arm too;
+  `tests/ttl_reaper_sim.rs`'s existing synthetic `FakeTtlHost` gained the
+  new trait impl plus progress assertions on its existing scenarios.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an
