@@ -23,14 +23,40 @@
 // and in the detail panel's per-replica meta line; this view never fetches
 // it specially, since `CpRaftView` already carries it in the same payload
 // `key_count`/`byte_size` come from.
+//
+// Split lineage/placing panel (docs/roadmap.md U-05): a second, sibling
+// detail card, `#tb-lineage`, keyed by the same `tbSelectedId` as the Raft/
+// storage detail card above. It reads `GET /admin/system-table?kind=
+// split_lineage` (ADR 0050 fork F9) and `?kind=split_placing` (ADR 0062 §2)
+// — the control plane's own replicated provenance, not anything derived
+// from `status.tablets` (a retired split parent has no tablet-map row left
+// at all; its lineage only lives here). Neither kind can be filtered by
+// tablet id server-side (the route's only filters are `kind`/`after`/
+// `limit`, per its own doc in `admin.rs`), and finding a tablet's ancestors
+// needs a parent-id point lookup while finding its children needs the
+// REVERSE lookup (which row's `parent` equals this tablet) — no single
+// point read answers either, so `loadTabletLineage` fetches the whole kind
+// (paginating via `next_after`) and builds both directions client-side,
+// capped at `LINEAGE_FETCH_PAGE_CAP` pages as a safety bound (see that
+// constant's own doc). Fetched from `SEED` (the node this console is
+// attached to): `split_lineage`/`split_placing` are ordinary replicated
+// `Metadata` collections mirrored identically on every control-role node's
+// own system keyspace (ADR 0038), the same "any control-role node answers
+// alike, no per-node fan-out" reasoning `controlMembers`
+// (`dashboard_core.js`) already documents — and the Tablets tab itself is
+// only ever shown on a control-role node (`ROLE_TABS`), so this never hits
+// a data-only node's `{"available": false}` in practice (handled anyway).
+// Refetched on selection change AND on this tab's existing `loadAll()` poll
+// cadence (`renderTablets()` runs on every tick) — no dedicated timer.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, dot, idSpan, getJSON,
-// humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
+// SEED, humanBytes, nodeIdOf, cpGroupsByTablet, autoSplitThresholds,
 // tabletStatus, tokenBound, gotoStorage, splitHiddenTable).
 
 let tbTableFilter = "all";
 let tbStatusFilter = "all";
 let tbSelectedId = null;
 let tbDetailStorage = null; // { tablet, data } | { tablet, error } | null
+let tbLineage = null; // { tablet, ancestors, childrenOf, placing, unavailable } | { tablet, error } | null
 
 function renderTablets() {
   const status = STATE.status;
@@ -108,6 +134,13 @@ function renderTablets() {
     tr.addEventListener("click", () => selectTablet(Number(tr.dataset.id))));
 
   renderTabletDetail(tablets, groups);
+  renderTabletLineage();
+  // This tab's existing poll cadence (`loadAll()`'s `setInterval`, dashboard.html)
+  // drives `renderTablets()` every tick regardless of which panel is open — so
+  // re-fetching the lineage panel's data here, unconditionally on a selection,
+  // refreshes it on that same cadence with no dedicated timer of its own.
+  // Fire-and-forget: `loadTabletLineage` re-renders itself once it resolves.
+  if (tbSelectedId != null) loadTabletLineage(tbSelectedId);
 }
 
 // A hidden GSI materialization table (`orders$by_status`) renders as
@@ -123,11 +156,15 @@ function tableCellHtml(name) {
 }
 
 function selectTablet(id) {
-  if (tbSelectedId === id) { tbSelectedId = null; tbDetailStorage = null; renderTablets(); return; }
+  if (tbSelectedId === id) {
+    tbSelectedId = null; tbDetailStorage = null; tbLineage = null; renderTablets(); return;
+  }
   tbSelectedId = id;
   tbDetailStorage = null;
+  tbLineage = null;
   renderTablets();
   loadTabletDetailStorage(id);
+  loadTabletLineage(id);
 }
 
 function renderTabletDetail(tablets, groups) {
@@ -201,7 +238,9 @@ function renderTabletDetail(tablets, groups) {
       <button id="tb-open-storage">Open in Storage →</button>
     </div>`;
   $("tb-detail").style.display = "";
-  $("tb-detail-close").addEventListener("click", () => { tbSelectedId = null; tbDetailStorage = null; renderTablets(); });
+  $("tb-detail-close").addEventListener("click", () => {
+    tbSelectedId = null; tbDetailStorage = null; tbLineage = null; renderTablets();
+  });
   $("tb-open-storage").addEventListener("click", () => gotoStorage(tbSelectedId, lead ? lead.node.base : null));
 }
 
@@ -218,4 +257,171 @@ async function loadTabletDetailStorage(id) {
     tbDetailStorage = { tablet: id, error: String(e) };
   }
   renderTabletDetail(STATE.status.tablets, cpGroupsByTablet());
+}
+
+// ---- Split lineage / directed placing panel (docs/roadmap.md U-05) ----
+
+// Safety bound on how many `/admin/system-table?kind=split_lineage`/
+// `split_placing` pages `fetchSystemTableAll` will walk before giving up —
+// each page is the route's own max `limit` (1000), so this caps a single
+// panel load at 20,000 rows of either kind. There is no id-scoped filter on
+// this route (its own doc in `admin.rs`: only `kind`/`after`/`limit`), and
+// answering "what are this tablet's ancestors/children" needs to see every
+// row either way (an ancestor lookup is a point read by id, but a children
+// lookup is the REVERSE — which rows name this tablet as `parent` — so
+// nothing short of the whole kind answers it). A real cluster's total split
+// count is normally small next to this bound; if it's ever exceeded, the
+// panel silently works from a partial view rather than hanging the tab on
+// an unbounded fetch — a `truncated` flag would be the natural follow-up
+// if that ever becomes a real limitation, not attempted here.
+const LINEAGE_FETCH_PAGE_CAP = 20;
+
+// Fetch every row of one `EntityKind` from `GET /admin/system-table`,
+// walking `next_after` until the route reports no more pages or
+// `LINEAGE_FETCH_PAGE_CAP` is hit. Returns `{available, rows}` — `available:
+// false` mirrors the route's own honest-absence shape for a data-only node
+// (`ctx.control_storage` is `None`), which the Tablets tab should never
+// actually hit (`ROLE_TABS` never shows it there) but is handled rather than
+// assumed away.
+async function fetchSystemTableAll(base, kind) {
+  const rows = [];
+  let after = null;
+  for (let page = 0; page < LINEAGE_FETCH_PAGE_CAP; page++) {
+    let qs = "/admin/system-table?kind=" + encodeURIComponent(kind) + "&limit=1000";
+    if (after) qs += "&after=" + encodeURIComponent(after);
+    const r = await getJSON(base, qs);
+    if (!r.available) return { available: false, rows: [] };
+    rows.push(...(r.items || []));
+    if (!r.truncated || !r.next_after) break;
+    after = r.next_after;
+  }
+  return { available: true, rows };
+}
+
+// Loads (or reloads) the lineage panel's data for `id`: this tablet's
+// upward ancestor chain (from `split_lineage`, walking `child -> parent`
+// one hop at a time until a tablet with no lineage row of its own is
+// reached — the root of the chain), its downward children (the REVERSE of
+// that same map — every row whose own `parent` field equals `id`), and its
+// `split_placing` row, if any. Ignores a stale response if the selection
+// moved on while the fetch was in flight, the same discipline
+// `loadTabletDetailStorage` uses above.
+async function loadTabletLineage(id) {
+  try {
+    const [lineage, placing] = await Promise.all([
+      fetchSystemTableAll(SEED, "split_lineage"),
+      fetchSystemTableAll(SEED, "split_placing"),
+    ]);
+    if (tbSelectedId !== id) return;
+    if (!lineage.available) { tbLineage = { tablet: id, unavailable: true }; renderTabletLineage(); return; }
+
+    const byChild = new Map(); // child tablet id (string) -> its own split_lineage row value
+    const childrenOf = new Map(); // parent tablet id (string) -> [child id, ...]
+    for (const row of lineage.rows) {
+      const childId = String(row.id);
+      const v = row.value || {};
+      byChild.set(childId, v);
+      const parentId = String(v.parent);
+      if (!childrenOf.has(parentId)) childrenOf.set(parentId, []);
+      childrenOf.get(parentId).push(childId);
+    }
+    const placingByTablet = new Map();
+    for (const row of placing.rows) placingByTablet.set(String(row.id), row.value);
+
+    // Walk upward one hop per `split_lineage` row. Bounded by the row count
+    // plus one (`split_lineage` is a tree keyed child -> parent, written
+    // once per cutover — a cycle should never occur, but this walks
+    // client-rendered data from a live system, so bound it defensively
+    // rather than trust an `Array`-shaped `while (true)`).
+    const ancestors = [];
+    let cur = String(id);
+    const seenAncestors = new Set([cur]);
+    for (let i = 0; i <= lineage.rows.length; i++) {
+      const entry = byChild.get(cur);
+      if (!entry) break;
+      const parentId = String(entry.parent);
+      ancestors.push({
+        parent: parentId,
+        child: cur,
+        cutover_wall_ms: entry.cutover_wall_ms,
+        parents_final_epoch: entry.parents_final_epoch,
+      });
+      if (seenAncestors.has(parentId)) break;
+      seenAncestors.add(parentId);
+      cur = parentId;
+    }
+
+    tbLineage = { tablet: id, ancestors, childrenOf, placing: placingByTablet.get(String(id)) || null };
+  } catch (e) {
+    if (tbSelectedId !== id) return;
+    tbLineage = { tablet: id, error: String(e) };
+  }
+  renderTabletLineage();
+}
+
+// Renders the descendant subtree rooted at `id` (NOT including `id` itself)
+// as a nested list — every generation `childrenOf` records, however many
+// splits deep. Returns "" for a childless tablet so a caller can fall back
+// to an empty-state message.
+function renderLineageDescendants(id, childrenOf) {
+  const kids = childrenOf.get(String(id)) || [];
+  if (!kids.length) return "";
+  return `<ul class="lineage-tree">` + kids.map((k) =>
+    `<li>${idSpan(k, "mono")}${renderLineageDescendants(k, childrenOf)}</li>`
+  ).join("") + `</ul>`;
+}
+
+function renderTabletLineage() {
+  const el = $("tb-lineage");
+  if (tbSelectedId == null) { el.style.display = "none"; return; }
+  el.style.display = "";
+
+  if (!tbLineage || tbLineage.tablet !== tbSelectedId) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="empty">loading…</div>`;
+    return;
+  }
+  if (tbLineage.error) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="err-line">${esc(tbLineage.error)}</div>`;
+    return;
+  }
+  if (tbLineage.unavailable) {
+    el.innerHTML = `<h3>Split lineage</h3><div class="empty">no control-plane system keyspace reachable</div>`;
+    return;
+  }
+
+  // Ancestry, nearest first: this tablet's immediate parent, then that
+  // parent's own parent, and so on as far as `split_lineage` goes.
+  const ancestorsHtml = tbLineage.ancestors.length
+    ? tbLineage.ancestors.map((a) => `<div class="replica-row">
+        ${idSpan(a.parent, "mono")}<span class="muted">→</span>${idSpan(a.child, "mono")}
+        <span class="meta">cutover ${esc(a.cutover_wall_ms != null ? new Date(a.cutover_wall_ms).toLocaleString() : "—")}${
+          a.parents_final_epoch != null ? `, parent's final stream epoch ${esc(a.parents_final_epoch)}` : ""
+        }</span>
+      </div>`).join("")
+    : `<div class="empty">no lineage (never split)</div>`;
+
+  const childrenTree = renderLineageDescendants(tbSelectedId, tbLineage.childrenOf);
+  const childrenHtml = childrenTree || `<div class="empty">no children</div>`;
+
+  const p = tbLineage.placing;
+  let placingHtml;
+  if (!p) {
+    placingHtml = `<div class="empty">no pending placing</div>`;
+  } else {
+    const target = p.target && p.target.length
+      ? p.target.map((n) => idSpan(n, "mono")).join(" ")
+      : `<span class="muted">unsatisfiable at cutover</span>`;
+    placingHtml = `<div class="replica-row">
+      <span class="meta">target:</span> ${target}
+      ${pill(p.done ? "healthy" : "forming", p.done ? "done" : "pending")}
+    </div>`;
+  }
+
+  el.innerHTML = `
+    <h3>Ancestry</h3>
+    <div style="margin-bottom:18px">${ancestorsHtml}</div>
+    <h3>Children</h3>
+    <div style="margin-bottom:18px">${childrenHtml}</div>
+    <h3>Directed placing</h3>
+    ${placingHtml}`;
 }

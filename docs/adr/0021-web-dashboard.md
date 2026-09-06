@@ -445,3 +445,35 @@ later U-05 PRs this one is a prerequisite for. See
 `crates/animusd/CLAUDE.md`'s matching `dashboard_node.js` entry for the
 full mechanism and `tests/dashboard_endpoint.rs::
 dashboard_u05_control_members_panel` for the regression.
+
+## Amendment (2026-09-06, roadmap U-05) — split lineage and directed-placing panel on the Tablets tab
+
+The Tablets tab's per-tablet detail panel (`#tb-detail`) gained a sibling
+card, `#tb-lineage`, keyed by the same selected tablet: a read-only render
+of `GET /admin/system-table?kind=split_lineage` (ADR 0050 fork F9) and
+`?kind=split_placing` (ADR 0062 §2) — this tablet's upward ancestor chain
+(parent, grandparent, … as far as `split_lineage` goes, each hop's own
+cutover time and the parent's final stream epoch), its downward children
+(recursively, however many splits deep), and its directed-Placing target/
+`done` state if any. Explicit empty states for both — "no lineage (never
+split)" and "no pending placing" — rather than a blank card. Fetched on
+tablet selection and re-fetched on this tab's existing `loadAll()` poll
+cadence (`renderTablets()` runs every tick regardless of which card is
+open) — no dedicated timer, no new admin route.
+
+**The system-table route has no per-tablet filter** (only `kind`/`after`/
+`limit`) and answering "who are this tablet's ancestors" is a point lookup
+by id while "who are its children" is the REVERSE lookup (which row names
+this tablet as `parent`) — no single query answers both, so the panel
+fetches the WHOLE `split_lineage`/`split_placing` kind (paginating via
+`next_after`, capped at 20 pages of 1000 rows each) and builds both
+directions client-side. A real cluster's total split count is normally
+small next to that bound; see `crates/animusd/src/dashboard_tablets.js`'s
+own module doc for the full reasoning and what a future per-tablet filter
+route would look like if this bound is ever hit in practice.
+
+See `crates/animusd/CLAUDE.md`'s matching `dashboard_tablets.js` entry for
+the full mechanism, `tests/dashboard_endpoint.rs::dashboard_u05_lineage_panel`
+for the dashboard-wiring regression, and `tests/admin_endpoint.rs::
+admin_system_table_split_lineage_after_a_real_split` for the real-cluster
+proof that a completed split actually populates the row this panel parses.

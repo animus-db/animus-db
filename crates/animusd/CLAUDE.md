@@ -1197,6 +1197,50 @@ reusing the captured config is the point of the test.
   wiring needed — both `dashboard_node.js` and `dashboard_core.js` already
   load on every role that shows the Node tab. Test:
   `tests/dashboard_endpoint.rs::dashboard_u05_control_members_panel`.
+  **docs/roadmap.md U-05's second slice** (`dashboard_tablets.js`) added a
+  split-lineage/directed-placing panel to the Tablets tab, `#tb-lineage`, a
+  sibling card next to the existing per-tablet detail card (`#tb-detail`),
+  keyed by the same `tbSelectedId`: `renderTabletLineage` renders this
+  tablet's upward ancestor chain from `GET /admin/system-table?kind=
+  split_lineage` (ADR 0050 fork F9 — parent, grandparent, … as far as the
+  chain goes, each hop's own cutover time and the parent's final stream
+  epoch) and its downward children (the same kind's rows, walked in
+  REVERSE — every row whose own `parent` field names this tablet, however
+  many generations deep) plus its directed-Placing target/`done` state from
+  `?kind=split_placing` (ADR 0062 §2). Explicit "no lineage (never split)"/
+  "no pending placing" empty states rather than a blank card. **The
+  system-table route has no per-tablet filter** (only `kind`/`after`/
+  `limit`, per its own doc in `admin.rs`), and an ancestor lookup (point
+  read by id) and a children lookup (the reverse — which row names this id
+  as `parent`) need to see different things no single query can both
+  answer — so `fetchSystemTableAll`/`loadTabletLineage` fetch the WHOLE
+  kind (paginating `next_after`, `LINEAGE_FETCH_PAGE_CAP` = 20 pages of
+  1000 rows each — a real cluster's total split count is normally far
+  below that bound) and build both directions client-side rather than
+  asking the route for a filter it doesn't have. Fetched from `SEED` (the
+  node this console is attached to) — `split_lineage`/`split_placing` are
+  ordinary replicated `Metadata` collections mirrored identically on every
+  control-role node's own system keyspace (ADR 0038), the same "any
+  control-role node answers alike" reasoning `controlMembers`
+  (`dashboard_core.js`, above) already relies on, and the Tablets tab is
+  itself only ever shown on a control-role node (`ROLE_TABS`). **Refreshed
+  on selection change AND on this tab's existing `loadAll()` poll cadence**
+  (`renderTablets()` triggers a re-fetch unconditionally on every tick a
+  tablet is selected, since it already runs every tick regardless of which
+  card is open) — no dedicated timer of its own, matching the task's own
+  "reuse the existing poll idiom" instruction (unlike the Raft/storage
+  detail card beside it, `loadTabletDetailStorage`, which fetches once per
+  selection only — this panel's data can change out from under an open
+  selection via a background split, so it needed the extra per-tick
+  refresh the storage card didn't). No action buttons (read-only, later PRs
+  per the roadmap), no new admin route. Tests:
+  `tests/dashboard_endpoint.rs::dashboard_u05_lineage_panel` (shell/script
+  markers plus a live round trip against both kinds on a cluster that has
+  never split) and `tests/admin_endpoint.rs::
+  admin_system_table_split_lineage_after_a_real_split` (a real 3-node
+  cluster split through to cutover, asserting the `split_lineage` kind
+  actually carries the `{id, value: {parent, ...}}` shape this panel
+  parses for both children).
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

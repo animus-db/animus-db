@@ -231,7 +231,12 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .placement-card .foot { display: flex; gap: 12px; margin-top: 4px; padding-top: 11px; border-top: 1px solid var(--ink-16); font: 400 11.5px var(--font-ui); color: var(--text2); }
 
 /* ---- Tablets ---- */
-.tablets-layout { display: flex; gap: 24px; align-items: flex-start; width: 100%; }
+/* `flex-wrap: wrap` (docs/roadmap.md U-05, the lineage panel): with the
+   detail panel AND the lineage panel both open (two fixed-320px columns
+   beside the flexible list), a narrower viewport wraps the lineage panel
+   onto its own row instead of forcing the whole layout wider than the
+   viewport. */
+.tablets-layout { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; width: 100%; }
 .tablets-list { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
 .tablet-detail { width: 320px; flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: 18px; position: sticky; top: 0; }
 .tablet-detail .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
@@ -245,6 +250,10 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .tablet-detail .storage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; font: 400 12px var(--font-ui); color: var(--text2); margin-bottom: 4px; }
 .tablet-detail .storage-grid.loading { color: var(--text3); font-style: italic; }
 .replica-dots { display: inline-flex; gap: 3px; }
+/* Split lineage panel's descendant subtree (docs/roadmap.md U-05) — a plain
+   nested list, one `<ul>` per generation of children. */
+.lineage-tree { list-style: none; margin: 6px 0 0; padding-left: 16px; border-left: 1px solid var(--ink-16); }
+.lineage-tree li { margin-bottom: 6px; }
 
 /* ---- Streams ---- */
 .streams-layout { display: flex; gap: 24px; align-items: flex-start; width: 100%; }

@@ -215,8 +215,6 @@ mutation idiom is `postJSON("/admin/data/dynamo", {op, payload})` with a
 
 ### U-05 Control-plane visibility, lineage, and infrastructure actions
 
-- Lineage panel on the Tablets tab from `system-table?kind=split_lineage`
-  / `split_placing`, keyed by the selected tablet. Size M.
 - Gated buttons over existing POST routes: split/flush/compact/reconfigure
   on the tablet detail; drain/decommission/member add-remove on Node;
   control member add-remove on the new members panel. Document that the

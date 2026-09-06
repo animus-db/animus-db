@@ -1373,3 +1373,88 @@ async fn dashboard_u05_control_members_panel() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's second slice: a lineage/directed-placing panel on
+/// the Tablets tab, keyed by the currently selected tablet. Same structure
+/// as `dashboard_u05_control_members_panel` above: shell markers proving
+/// the new card sits beside the existing detail card, `dashboard_tablets.js`
+/// markers proving it renders from `GET /admin/system-table?kind=
+/// split_lineage`/`split_placing` (the two kinds it walks client-side, since
+/// that route has no per-tablet filter — see the file's own module doc), and
+/// a live round trip against those two routes. **The route's own end-to-end
+/// proof — a real split populating a `split_lineage` row with the shape this
+/// panel parses — lives in `admin_endpoint.rs::
+/// admin_system_table_split_lineage_after_a_real_split`** (that file already
+/// has split-cluster fixtures this one doesn't); this test only proves the
+/// dashboard wiring on top of it, against a cluster that has never split
+/// (the panel's own "no lineage (never split)"/"no pending placing" empty
+/// states).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_lineage_panel() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #tb-lineage beside #tb-detail ---------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let detail_pos = shell
+            .find(r#"id="tb-detail""#)
+            .expect("shell carries #tb-detail");
+        let lineage_pos = shell
+            .find(r#"id="tb-lineage""#)
+            .expect("shell carries #tb-lineage");
+        assert!(
+            lineage_pos > detail_pos && lineage_pos - detail_pos < 200,
+            "#tb-lineage sits immediately beside #tb-detail: {shell}"
+        );
+
+        // ---- dashboard_tablets.js renders it from the system-table route ---
+        let (s, _, tablets_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_tablets.js").await;
+        assert_eq!(s, 200, "dashboard_tablets.js is served");
+        assert!(
+            tablets_js.contains("function loadTabletLineage")
+                && tablets_js.contains("function renderTabletLineage")
+                && tablets_js.contains("tb-lineage"),
+            "dashboard_tablets.js defines the lineage panel's load + render functions: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("\"split_lineage\"") && tablets_js.contains("\"split_placing\""),
+            "the panel fetches both system-table kinds it renders: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("no lineage (never split)") && tablets_js.contains("no pending placing"),
+            "the panel states both empty conditions explicitly: {tablets_js}"
+        );
+        assert!(
+            tablets_js.contains("loadTabletLineage(id)")
+                && tablets_js.contains("if (tbSelectedId != null) loadTabletLineage"),
+            "the panel refreshes on selection AND on renderTablets()'s own poll-cadence call: {tablets_js}"
+        );
+
+        // ---- the routes it reads are live, on a cluster that never split ---
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/system-table?kind=split_lineage").await;
+        assert_eq!(s, 200, "GET /admin/system-table?kind=split_lineage: {body}");
+        let lineage: Value = serde_json::from_str(&body).expect("split_lineage is JSON");
+        assert_eq!(lineage["available"], Value::Bool(true));
+        assert_eq!(
+            lineage["items"].as_array().map(Vec::len),
+            Some(0),
+            "no tablet has ever split on this fresh cluster: {lineage}"
+        );
+
+        let (s, _, body) = raw(admin_addr, "GET", "/admin/system-table?kind=split_placing").await;
+        assert_eq!(s, 200, "GET /admin/system-table?kind=split_placing: {body}");
+        let placing: Value = serde_json::from_str(&body).expect("split_placing is JSON");
+        assert_eq!(placing["available"], Value::Bool(true));
+        assert_eq!(placing["items"].as_array().map(Vec::len), Some(0));
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}

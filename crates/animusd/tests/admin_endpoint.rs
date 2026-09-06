@@ -1495,6 +1495,97 @@ async fn admin_split_in_place_children_inherit_the_parents_own_replicas() {
     .expect("test timed out");
 }
 
+/// docs/roadmap.md U-05's lineage panel on the Tablets tab
+/// (`dashboard_tablets.js`) reads `GET /admin/system-table?kind=
+/// split_lineage`/`?kind=split_placing`, keyed by tablet id off the item's
+/// own `id`/`value` shape. This is the real-cluster proof that a
+/// COMPLETED in-place split (ADR 0058 Train 2 rung 3 — cutover, not just
+/// kickoff) actually populates the `split_lineage` kind the panel's
+/// ancestor/child walk depends on, with the exact `{id, value: {parent,
+/// ...}}` shape the dashboard's `loadTabletLineage` parses, and that the
+/// `split_placing` kind stays an ordinary (if empty) `200` rather than
+/// erroring — a 3-node/RF-3 cluster's children inherit exactly the whole
+/// cluster, which already satisfies policy, so no directed-Placing entry
+/// is expected here (the panel's own "no pending placing" empty state).
+/// Rides the identical split recipe
+/// `admin_raftkv_key_count_is_scoped_per_tablet_after_split` above already
+/// proves end to end for a different surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_system_table_split_lineage_after_a_real_split() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        let mut stream = TcpStream::connect(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        for i in 0..10u32 {
+            let key = format!("key{i:02}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            put(&mut stream, "kv", key, value).await;
+        }
+
+        let (s, split) = admin(
+            admin_addr,
+            "POST",
+            "/admin/tablet/split",
+            Some(r#"{"tablet":1,"split_key":"key05"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "split committed: {split}");
+
+        // Wait for cutover to actually complete — `split_lineage` is written
+        // by `CutoverSplit`'s own apply, not by the fork alone, so the
+        // parent must be genuinely gone (not merely outnumbered mid-workflow).
+        let children: Vec<String> = timeout(Duration::from_secs(15), async {
+            loop {
+                let (_, status) = admin_get(admin_addr, "/admin/status").await;
+                let tablets = status["tablets"].as_object().cloned().unwrap_or_default();
+                if !tablets.contains_key("1") && tablets.len() == 2 {
+                    return tablets.keys().cloned().collect();
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("split did not cut over to two children");
+        assert_eq!(children.len(), 2, "exactly two children after cutover");
+
+        // Both children now carry a `split_lineage` row naming tablet 1 as
+        // their parent — the exact shape `loadTabletLineage`
+        // (dashboard_tablets.js) walks (`id` a decimal string, `value.parent`
+        // a plain JSON number — `TabletId`'s newtype serialization).
+        let (s, body) = admin_get(admin_addr, "/admin/system-table?kind=split_lineage").await;
+        assert_eq!(s, 200, "system-table split_lineage: {body}");
+        assert_eq!(body["available"], Value::Bool(true));
+        let items = body["items"].as_array().expect("items array");
+        for child in &children {
+            let row = items
+                .iter()
+                .find(|it| it["id"].as_str() == Some(child.as_str()))
+                .unwrap_or_else(|| panic!("no split_lineage row for child {child}: {body}"));
+            assert_eq!(
+                row["value"]["parent"],
+                Value::from(1),
+                "child {child}'s lineage row names tablet 1 as parent: {row}"
+            );
+        }
+
+        // `split_placing` stays a normal, available route even with no rows.
+        let (s, body) = admin_get(admin_addr, "/admin/system-table?kind=split_placing").await;
+        assert_eq!(s, 200, "system-table split_placing: {body}");
+        assert_eq!(body["available"], Value::Bool(true));
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// Bring up a single node with a `dynamo_auth` section (ADR 0057), retrying
 /// the port-TOCTOU race exactly like [`bring_up`] does — this file's own
 /// copy since `bring_up` always builds a config with `dynamo_auth: None`,
