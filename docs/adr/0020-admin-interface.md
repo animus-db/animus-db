@@ -399,6 +399,45 @@ either way) and ADR 0021's matching amendment for the dashboard's own
 side. The control-members panel's own add/remove/transfer buttons
 (`/admin/control/member/{add,remove}`) remain the final PR of this series.
 
+## As-built (2026-09-06, roadmap U-05, closing) — the control-members panel's own action buttons
+
+The fifth and last PR of this series closes the one bullet the two notes
+above deferred: the control-plane members panel itself
+(`#nd-control-members`, landed read-only by an earlier PR in this series)
+gained per-row **Transfer leadership here** and **Remove** buttons, plus a
+sibling `#nd-control-actions` card for **Add**, over three routes that all
+already existed — `POST /admin/control/transfer {to}` (this ADR's own
+2026-09-05 entry above), `POST /admin/control/member/remove {node}`, and
+`POST /admin/control/member/add {node?, addr}` (ADR 0037 PR3). No new
+admin route. Same `postJSON` + `window.confirm` idiom, and the identical
+statement applies unchanged a third time: these buttons are not a second
+gate on this ADR's "no auth — bind to a trusted interface" posture, only a
+convenience for an operator already inside the trusted network — anyone
+who can reach the admin port can already call any of the three routes
+directly. Transfer is hidden on a member's own row while it already leads
+(nothing to transfer to itself); Remove surfaces the server's own
+`warning`/refusal verbatim, including the quorum-loss guard ADR 0037 §2
+describes, never auto-retrying with `force`. Add's body needs the new
+voter's own internal control-Raft address, not just its id (`animus admin
+control-add`'s own CLI form resolves that by fetching the new node's
+`/admin/config` first — see `crates/animusd/CLAUDE.md`'s `dashboard_node.js`
+entry for a pre-existing bug found while confirming this: that CLI helper
+reads a `cfg["control"]` field `/admin/config` hasn't served under that
+name since the ADR 0040 PR1 identity merge, so the 3-argument
+operator-supplied-id form of `control-add` currently always fails —
+reported, not fixed here, since it's a `animus-cli`-only defect this
+slice's own scope doesn't touch), so this panel asks the operator for the
+address directly rather than attempting a cross-origin fetch of another
+node's admin port. There is **no separate `grow` route** to wire — `animus
+admin control-grow` is a purely client-side loop of the same
+`control/member/add` call (`animus-cli`'s own `run_control_grow`), not a
+distinct server endpoint, so "Add," called as many times as needed, is
+already the whole feature. **This closes docs/roadmap.md's whole U-05
+section** — every bullet across all five PRs has now landed. See
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism and `tests/dashboard_endpoint.rs::
+dashboard_u05_control_member_actions` for the regression.
+
 ### Follow-up work
 
 - Auth in front of the admin port before any non-localhost exposure.

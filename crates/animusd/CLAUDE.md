@@ -1327,6 +1327,63 @@ reusing the captured config is the point of the test.
   `tests/seed_join*.rs`, `tests/control_membership_admin.rs`) — no new
   `admin_endpoint.rs` test was needed, only the dashboard-wiring one:
   `tests/dashboard_endpoint.rs::dashboard_u05_node_actions`.
+  **docs/roadmap.md U-05's fifth and LAST slice, the CONTROL-MEMBERS action
+  family (2026-09-06)** — gated add/remove/transfer buttons on the
+  control-plane members panel itself: `renderNodeControlMembers`'s per-row
+  template gained a **Transfer leadership here** button (hidden on a
+  member's own row while it already leads) and a **Remove** button, over
+  the pre-existing `POST /admin/control/transfer {to}` (fa41fcb) and
+  `POST /admin/control/member/remove {node}` (ADR 0037 PR3) routes; a new
+  sibling card, `#nd-control-actions`, gained an **Add** control over the
+  third pre-existing route, `POST /admin/control/member/add {node?, addr}`
+  — no new admin route anywhere in this slice. Same house style as every
+  earlier U-05 family: `window.confirm` naming the node id and the action →
+  `postJSON` → the response/error in `#nd-control-msg` → `loadAll()`
+  refresh on success only; Remove's response surfaces the server's own
+  `warning` field verbatim (ADR 0037 §2's quorum-loss cases), never
+  swallowed and never auto-retried with `force`. **All three target
+  `ndControlLeaderBase()`** (ae0ad02's own resolver, reused unchanged) —
+  every one of the three routes is local-control-leader-only and
+  deliberately not relayed (`ClientCtx::admin_transfer_control_leadership`/
+  `admin_remove_control_member`/`admin_add_control_member`'s own docs), the
+  same reasoning that already put Drain/Remove on this resolver on the
+  `#nd-actions` card beside it — unlike that card's own relayed Add member,
+  every control-member action here needs the leader specifically.
+  **Add's body needs an address, not just an id** — unlike the data-plane
+  `/admin/member/add` (a joining node registers its own address
+  separately), `/admin/control/member/add`'s wire body wants the new
+  voter's own **internal control-Raft** listen address directly. `animus
+  admin control-add`'s CLI form (`run_control_add`, `animus-cli`) resolves
+  this by fetching the new node's own `/admin/config` first and reading its
+  `control` field — **which no longer exists under that name**: ADR 0040
+  PR1 merged the old `control`/`raftkv` address pair into one
+  `addrs.internal` field, and nothing updated this one runtime JSON lookup
+  to match, so that 3-argument (operator-supplied-id) form of `control-add`
+  has been silently broken since that merge — a real, pre-existing
+  `animus-cli` bug found while grounding this slice against the CLI as
+  instructed, reported here rather than fixed (out of this slice's own
+  scope; no test in this crate or `animus-cli` ever exercised that code
+  path, so nothing caught it). This dashboard control sidesteps the whole
+  problem rather than reproducing the CLI's broken shortcut: it asks the
+  operator for the new voter's internal address directly (two inputs, node
+  id optional/blank-self-mints and address required, both persisted across
+  this tab's poll cadence via `ndCtlAddNode`/`ndCtlAddAddr` — the same
+  "don't clobber an in-flight edit" module-level-variable discipline
+  `ndActionNode`/`tbReconfigureVoters` already use) rather than attempting
+  a cross-origin fetch of another node's admin port, which this admin
+  surface advertises no CORS support for anyway. **There is no separate
+  `grow` route to wire** — `animus admin control-grow` is a purely
+  client-side loop of the same `control/member/add` call, one pair at a
+  time (`run_control_grow`, `animus-cli`), never a distinct server
+  endpoint, so a "Grow" button would just be "Add" invoked repeatedly and
+  adds no real capability this one control doesn't already offer — per the
+  task's own instruction to skip and say so when a would-be second route
+  turns out not to exist, this family is three actions (Transfer, Remove,
+  Add), not four. **This closes docs/roadmap.md's whole U-05 section** —
+  every bullet across all five PRs in the series has now landed; see ADR
+  0020's and ADR 0021's own matching 2026-09-06 closing amendments.
+  Regression: `tests/dashboard_endpoint.rs::
+  dashboard_u05_control_member_actions`.
 - **`console.rs`** + **`console.html`** + **`console.css`** + **`console.js`**
   — animusd console (ADR 0052's "AnimusDB Data Console"): a DynamoDB-shaped data app for
   application developers, on its own dedicated port (`RoleAddrs.console`) —

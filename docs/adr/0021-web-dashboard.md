@@ -521,3 +521,32 @@ recomputed every render. See ADR 0020's matching amendment for the same
 `crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
 mechanism. The control-members panel's own add/remove/transfer buttons
 remain the final PR of this series.
+
+## Amendment (2026-09-06, roadmap U-05, closing) — Actions: the control-members panel's own family
+
+The fifth and final PR of this series closes the deferral both amendments
+above named: the control-plane members panel (`#nd-control-members`)
+gained per-row **Transfer leadership here** and **Remove** buttons over
+`POST /admin/control/transfer`/`POST /admin/control/member/remove`, and a
+new sibling card, `#nd-control-actions`, gained an **Add** control over
+`POST /admin/control/member/add` — three pre-existing routes, no new one.
+Same idiom as the tablet and Node families: `window.confirm`, `postJSON`,
+an inline status line (`#nd-control-msg`), `loadAll()` on success only,
+and all three post to the resolved control leader (none of the three is
+relayed server-side). Two design points worth recording: Transfer is
+omitted from a member's own row while it already leads, since transferring
+leadership to the current leader is a no-op the button would only invite
+someone to click by mistake; and Add's two inputs (node id, optional; the
+new voter's internal control-Raft address, required) mirror the route's
+actual wire body rather than a single node-id field, since — unlike the
+data-plane `Add member` action on `#nd-actions`, which only ever needs an
+id — the control plane genuinely has no address for an unregistered node
+to look up, and the CLI's own way of avoiding that keystroke (fetching the
+new node's `/admin/config` first) isn't reproducible from the browser
+without a cross-origin fetch this admin surface doesn't advertise CORS
+support for. **This is the last PR of the whole U-05 series** — see ADR
+0020's matching closing amendment for the "not a second auth layer"
+statement and the pre-existing `animus-cli` bug this slice found (but did
+not fix) while confirming the Add route's wire shape, and
+`crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
+mechanism.

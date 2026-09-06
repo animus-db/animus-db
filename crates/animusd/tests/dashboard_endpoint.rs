@@ -1627,3 +1627,115 @@ async fn dashboard_u05_node_actions() {
     .await
     .expect("test timed out");
 }
+
+/// docs/roadmap.md U-05's fifth and last slice (the CONTROL-MEMBERS action
+/// family): gated buttons on the members panel itself (`#nd-control-members`,
+/// landed by `dashboard_u05_control_members_panel` above as read-only) plus
+/// a sibling `#nd-control-actions` card for Add — over the pre-existing
+/// `POST /admin/control/transfer {to}` (fa41fcb), `POST
+/// /admin/control/member/remove {node}`, and `POST
+/// /admin/control/member/add {node?, addr}` routes (ADR 0037 PR3; no new
+/// admin route). Same structure as every other U-05 slice above: the
+/// per-row Transfer/Remove buttons only ever exist in client-rendered JS
+/// (`renderNodeControlMembers`'s own per-member template), not the static
+/// shell, so this proves the served JS defines the button classes, the
+/// route paths it posts to, and the `window.confirm` guard on each — the
+/// wire-level round trip of all three routes is already covered by
+/// `tests/control_membership_admin.rs` and `admin_endpoint.rs`'s
+/// `admin_control_transfer_*` tests (fa41fcb), so this test adds no new
+/// admin-route coverage, only the dashboard-wiring proof plus a live check
+/// that all three routes exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_u05_control_member_actions() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up(1, dir.path()).await;
+        await_bootstrap(&nodes).await;
+        let admin_addr = nodes[0].admin_addr();
+
+        // ---- the shell carries #nd-control-actions beside #nd-control-
+        // members and #nd-actions -------------------------------------------
+        let (s, _, shell) = raw(admin_addr, "GET", "/").await;
+        assert_eq!(s, 200);
+        let members_pos = shell
+            .find(r#"id="nd-control-members""#)
+            .expect("shell carries #nd-control-members");
+        let ctl_actions_pos = shell
+            .find(r#"id="nd-control-actions""#)
+            .expect("shell carries #nd-control-actions");
+        let actions_pos = shell
+            .find(r#"id="nd-actions""#)
+            .expect("shell carries #nd-actions");
+        assert!(
+            members_pos < ctl_actions_pos && ctl_actions_pos < actions_pos,
+            "#nd-control-actions sits between #nd-control-members and #nd-actions: {shell}"
+        );
+
+        // ---- dashboard_node.js defines the gated control-member actions ---
+        let (s, _, node_js) = raw(admin_addr, "GET", "/admin/ui/dashboard_node.js").await;
+        assert_eq!(s, 200, "dashboard_node.js is served");
+        for marker in [
+            "nd-cm-transfer-btn",
+            "nd-cm-remove-btn",
+            "nd-ctl-add-btn",
+            "function ndTransferControlLeadership",
+            "function ndRemoveControlMember",
+            "function ndAddControlMember",
+        ] {
+            assert!(
+                node_js.contains(marker),
+                "dashboard_node.js defines {marker}: {node_js}"
+            );
+        }
+        for route in [
+            "/admin/control/transfer",
+            "/admin/control/member/remove",
+            "/admin/control/member/add",
+        ] {
+            assert!(
+                node_js.contains(route),
+                "dashboard_node.js posts to the real route {route}: {node_js}"
+            );
+        }
+        assert!(
+            node_js.matches("window.confirm(").count() >= 6,
+            "every action (three pre-existing plus three new) is guarded by window.confirm: {node_js}"
+        );
+        assert!(
+            node_js.contains("postJSON(") && node_js.contains("await loadAll()"),
+            "actions use postJSON + the existing loadAll() refresh: {node_js}"
+        );
+        // Every one of the three is local-control-leader-only, not relayed
+        // — all target `ndControlLeaderBase()`, the same resolver the
+        // pre-existing Drain/Remove data-plane actions already use.
+        assert!(
+            node_js.contains(r#"postJSON(base, "/admin/control/transfer""#)
+                && node_js.contains(r#"postJSON(base, "/admin/control/member/remove""#)
+                && node_js.contains(r#"postJSON(base, "/admin/control/member/add""#),
+            "control-member actions target the resolved control leader base: {node_js}"
+        );
+        // Add's node-id input is optional (blank self-mints) and its addr
+        // input persists across poll ticks the same "don't clobber an
+        // in-flight edit" way ndActionNode/tbSplitKeyInput already do.
+        assert!(
+            node_js.contains("ndCtlAddNode") && node_js.contains("ndCtlAddAddr"),
+            "the Add control's inputs are persisted module-level state: {node_js}"
+        );
+
+        // ---- the three routes it posts to are real and live ---------------
+        for route in [
+            "/admin/control/transfer",
+            "/admin/control/member/remove",
+            "/admin/control/member/add",
+        ] {
+            let (s, _) = raw_post(admin_addr, route, "", "{}").await;
+            assert_ne!(s, 404, "{route} exists");
+        }
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
