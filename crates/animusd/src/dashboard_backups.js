@@ -9,9 +9,16 @@
 // data-only node has no local control-plane Raft state to read the
 // replicated `Metadata.backups`/`restores`/`schemas[*].pitr` catalogs from.
 // Depends on `dashboard_core.js` (STATE, $, esc, pill, postJSON, loadAll,
-// humanBytes) and `dashboard_browser.js` (dynamoTables — the table picker
-// for Create backup + the PITR table list, reusing the Data Browser's own
-// table source rather than a second fetch).
+// humanBytes), `dashboard_browser.js` (dynamoTables — the table picker for
+// Create backup + the PITR table list, reusing the Data Browser's own table
+// source rather than a second fetch), and `dashboard_streams.js`
+// (monoDuration — the backup store card's own `last_tick_at_ms` renderer;
+// see that function's own doc for why an `env.now()`-derived value can only
+// ever render as a relative duration, never an absolute time).
+//
+// docs/roadmap.md U-07: a read-only "Backup store" card fed from
+// `GET /admin/backup-store` (STATE.backupStore, dashboard_core.js's
+// existing loadAll() poll — no new timer).
 
 // `created_wall_ms`/`enabled_wall_ms` are real epoch milliseconds
 // (`env.wall_now()`-stamped, ADR 0051), unlike the mono `env.now()`-based
@@ -49,8 +56,47 @@ function renderBackupCreateTableOptions() {
   $("bk-create-submit").disabled = !names.length;
 }
 
+// docs/roadmap.md U-07: the "Backup store" card — store config/location,
+// a bounded live object count/byte total, and the backup janitor's own
+// live phase, straight off `GET /admin/backup-store`'s response shape
+// (`{store, objects, janitor, leader}`).
+function renderBackupStore() {
+  const el = $("bk-store-body");
+  if (!el) return;
+  const bs = STATE.backupStore;
+  if (!bs) { el.innerHTML = `<div class="empty">unavailable</div>`; return; }
+  const store = bs.store;
+  const objects = bs.objects;
+  const j = bs.janitor || {};
+  const phase = j.phase || "idle";
+  const rows = [
+    `<div class="list-row"><span class="detail">store</span><span class="status-text mono">${
+      store ? esc(store.kind) + (store.location ? " · " + esc(store.location) : "") : "—"
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">objects</span><span class="status-text mono">${
+      objects
+        ? `${esc(objects.count)}${objects.truncated ? "+" : ""} obj · ${esc(humanBytes(objects.bytes))}${objects.truncated ? " (partial)" : ""}`
+        : "—"
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">janitor</span><span>${
+      pill(phase === "idle" ? "forming" : "ok", phase.replace("_", " ").toUpperCase())
+    }${bs.leader ? "" : ` <span class="muted">(not control leader)</span>`}</span></div>`,
+    `<div class="list-row"><span class="detail">last tick</span><span class="status-text mono">${
+      j.last_tick_at_ms != null ? "t+" + monoDuration(j.last_tick_at_ms) : "—"
+    }</span></div>`,
+    `<div class="list-row"><span class="detail">backups seen / objects reclaimed</span><span class="status-text mono">${
+      esc(j.backups_seen ?? 0)} / ${esc(j.objects_reclaimed ?? 0)
+    }</span></div>`,
+  ];
+  if (j.last_error) {
+    rows.push(`<div class="list-row"><span class="detail">last error</span><span class="err-line">${esc(j.last_error)}</span></div>`);
+  }
+  el.innerHTML = rows.join("");
+}
+
 function renderBackups() {
   renderBackupCreateTableOptions();
+  renderBackupStore();
 
   const backups = (STATE.backups && STATE.backups.backups) || [];
   $("bk-summary").textContent = `${backups.length} backup${backups.length === 1 ? "" : "s"}`;

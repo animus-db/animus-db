@@ -25,6 +25,7 @@ animus-placement = { path = "crates/animus-placement" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-item = { path = "crates/animus-item" }
 animus-dynamo = { path = "crates/animus-dynamo" }
+animus-s3 = { path = "crates/animus-s3" }
 animus-test = { path = "crates/animus-test" }
 animus-node = { path = "crates/animus-node" }
 animusd = { path = "crates/animusd" }
@@ -62,6 +63,12 @@ lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
     "std",
 ] }
+# gzip encoding for the DynamoDB JSON export layout's data files (ADR 0068,
+# S-05) — `animusd` only. MIT OR Apache-2.0; `rust_backend` selects the
+# pure-Rust `miniz_oxide` backend (no C/FFI), the identical no-unsafe/
+# no-C-dependency posture `lz4_flex` above already established for this
+# workspace's `unsafe_code = "forbid"` lint.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 rand = "0.8"
 rand_chacha = "0.3"
 proptest = "1"

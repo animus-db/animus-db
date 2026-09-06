@@ -1,0 +1,94 @@
+[package]
+name = "animus-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB S3 client: pure SigV4 request signing and a minimal S3 client over a transport seam (S-04 PR 1)."
+
+[lints]
+workspace = true
+
+# Off by default (mirrors animus-env's own `prod` feature, ADR 0061 rung
+# C0): gates `prod.rs` — `HyperRustlsTransport`, the crate's only real
+# socket/TLS/tokio-spawn implementation. The `sigv4`/`client`/`xml` modules
+# (the pure signer, the `Transport`-generic client, and the tolerant XML
+# extractor) need none of this and stay available unconditionally, so a
+# consumer that depends on this crate with `default-features = false`
+# genuinely has no real I/O in its build. See `CLAUDE.md` for the full
+# breakdown and why this PR deliberately carries no `animus-env` dependency
+# at all (that seam is PR 2's job, once a `SegmentStore` impl wraps this
+# client with an `Env`-supplied clock).
+[features]
+prod = [
+    "dep:tokio",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pki-types",
+    "dep:rustls-native-certs",
+    "dep:tracing",
+]
+# An in-process fake S3 (`fake.rs`) implementing `Transport` directly, with
+# real SigV4 signature verification — used by this crate's own tests
+# unconditionally (`#[cfg(any(test, feature = "fake"))]`) and available to a
+# downstream crate's own tests too (e.g. a future `SegmentStore` contract
+# test) via this feature. Pulls in no extra dependency: everything it needs
+# (`async-trait`, `BTreeMap`) is already unconditional.
+fake = []
+
+[dependencies]
+# Unconditional: the pure SigV4 signer (`sigv4.rs`) and the `Transport`-
+# generic client (`client.rs`)/XML extractor (`xml.rs`) need only these.
+async-trait.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+
+# `prod`-only: a real S3 endpoint over TCP + optional rustls TLS, using
+# hyper's low-level HTTP/1 client directly (one connection per request, no
+# pooling — see `prod.rs`'s own doc). Versions pinned to what's already
+# resolved in the workspace lockfile via `animus-operator`/`kube`'s own
+# `hyper`/`hyper-rustls` dependency chain, so this adds no new package
+# versions to `Cargo.lock`.
+tokio = { workspace = true, optional = true }
+hyper = { version = "1.11.1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1.20", default-features = false, features = ["client", "http1", "tokio"], optional = true }
+http-body-util = { version = "0.1.5", optional = true }
+bytes = { version = "1.12.1", optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+# Root-CA trust store for verifying a real S3-compatible endpoint's server
+# certificate — already resolved in the workspace lockfile at this exact
+# version via `hyper-rustls` (itself pulled in by `animus-operator`'s `kube`
+# dependency), so this adds no new package version.
+rustls-native-certs = { version = "0.8.4", optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The signing-key-chain equivalence proof (`tests/sigv4_chain_matches_
+# dynamo.rs`, S-04 PR 1's own spike write-up — see CLAUDE.md): this crate
+# copies animus-dynamo's HMAC chain rather than depending on it in
+# production code (wrong layering direction — a generic S3 client has no
+# business depending on a DynamoDB wire adapter), but a dev-dependency-only
+# test proves the two chains agree byte-for-byte on the same inputs.
+animus-dynamo.workspace = true
+# `#[tokio::test]` for `client::S3Client`'s async round-trip tests over
+# `fake::FakeS3` — a plain dev-dependency (not gated on `prod`) since these
+# tests never touch a real socket.
+tokio = { workspace = true }
+# A self dev-dependency enabling this crate's own `fake` feature for every
+# test target (`tests/client_fake.rs` included) — the standard Cargo idiom
+# for "this module is `#[cfg(any(test, feature = "fake"))]`, and I want it
+# available to integration tests too, without requiring `--features fake`
+# on every `cargo test` invocation." `pub mod fake`'s own `#[cfg(test)]`
+# half only covers unit tests compiled *inside* this crate — an integration
+# test in `tests/` links against the crate's plain (non-`cfg(test)`) rlib,
+# so without this it would need `--all-features` to see `fake` at all.
+animus-s3 = { path = ".", features = ["fake"] }

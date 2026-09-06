@@ -82,6 +82,12 @@
 //!   (promotion, not a conflict — see that test's own doc for why this
 //!   flipped from a 409 refusal); there is no more reserved numeric range to
 //!   refuse manually targeting.
+//! - [`admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through`]:
+//!   pins `GET /admin/config`'s `addrs.internal` field against
+//!   `animus_cli::internal_addr_from_admin_config`'s own key path — the
+//!   control-add `/admin/config` field issue's wire-level regression (the
+//!   3-arg CLI form's operator-supplied-id path used to read a top-level
+//!   `control` field ADR 0040 PR1 had already removed).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -1343,6 +1349,53 @@ async fn concurrent_omitted_node_adds_mint_distinct_ids_and_both_become_voters()
     timeout(Duration::from_secs(15), second_converged)
         .await
         .unwrap_or_else(|_| panic!("second minted voter {second_id} never converged"));
+
+    for node in nodes {
+        node.shutdown_graceful().await;
+    }
+}
+
+/// Pins the wire shape `animus admin control-add`'s operator-supplied-id
+/// form depends on (the control-add `/admin/config` field issue): the
+/// 3-argument CLI form resolves a new voter's internal control-Raft dial
+/// address by fetching that node's own `GET /admin/config` and reading
+/// `addrs.internal` — mirroring `animus_cli`'s own
+/// `internal_addr_from_admin_config` helper (that crate's own unit tests pin
+/// the extraction logic in isolation; this one pins the real server's JSON
+/// against it, since `animus-cli` is not a dependency of this crate's tests
+/// and cannot be called into directly here). Also asserts the field is
+/// genuinely gone under its old, pre-ADR-0040 name (`control`), so a
+/// regression back to that name — or its resurrection under some other
+/// top-level key — would fail this test rather than pass it silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_config_reports_the_internal_addr_the_cli_resolves_control_add_through() {
+    let dir = support::panic_safe_tempdir();
+    let (nodes, config) = bring_up_combined(1, dir.path()).await;
+    await_bootstrap(&nodes).await;
+    let admin_addr = config.nodes[0].admin;
+
+    let (status, body) = admin(admin_addr, "GET", "/admin/config", None).await;
+    assert_eq!(status, 200, "GET /admin/config failed: {body}");
+
+    // Mirrors `animus_cli::internal_addr_from_admin_config`'s own key path —
+    // see that function's doc for why it reads here, not `body["control"]`.
+    let internal = body["addrs"]["internal"]
+        .as_str()
+        .expect("addrs.internal should be a non-empty host:port string");
+    assert!(
+        !internal.is_empty(),
+        "addrs.internal should be a real dial address, got {internal:?}"
+    );
+    internal
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|e| panic!("addrs.internal {internal:?} should parse as host:port: {e}"));
+
+    // The removed legacy field must actually be gone, not merely
+    // unnecessary — otherwise this regression could pass by coincidence.
+    assert!(
+        body.get("control").is_none(),
+        "the legacy top-level `control` field should not exist any more, found: {body}"
+    );
 
     for node in nodes {
         node.shutdown_graceful().await;

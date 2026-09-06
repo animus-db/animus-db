@@ -140,6 +140,284 @@ async fn bring_up_with_streams_quiesce(
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
+/// Like [`bring_up_with_streams_quiesce`], but pins an explicit `fs:PATH`
+/// [`animusd::BackupStoreConfig`] (roadmap U-07's
+/// `admin_backup_store_reports_reclaim_progress_and_leader_state` needs a
+/// deterministic, per-node-local store to assert object counts against —
+/// the default `Cluster` variant's K-way replication would otherwise spread
+/// a backup's objects across nodes unpredictably for a 3-node test).
+async fn bring_up_with_fs_backup_store(
+    n: usize,
+    dir: &std::path::Path,
+    backup_store_dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams_quiesce_and_backup_store(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
+                animusd::DEFAULT_STREAM_RETENTION,
+                Duration::ZERO,
+                animusd::BackupStoreConfig::Fs(backup_store_dir.join(format!("attempt-{attempt}"))),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
+/// Like [`bring_up`], but pins a fast TTL reaper sweep interval (roadmap
+/// U-07's `admin_ttl_reports_reaper_progress_and_ttl_tables` needs the
+/// reaper to actually reap an already-expired item within the test's own
+/// budget — this codebase's own testing discipline never waits out the
+/// real production sweep interval, `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`,
+/// on the order of a minute; mirrors `tests/dynamo_ttl.rs`'s own
+/// `TEST_TTL_SWEEP_INTERVAL`/`start_single_node_fast_ttl`, generalized to
+/// an `n`-node cluster via `run_node_with_ttl_sweep_interval`, which — like
+/// `bring_up_with_fs_backup_store`'s own `run_node_with_streams_quiesce_
+/// and_backup_store` — already takes a full multi-node `config` + `index`).
+async fn bring_up_with_fast_ttl(
+    n: usize,
+    dir: &std::path::Path,
+    ttl_sweep_interval: Duration,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_ttl_sweep_interval(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                ttl_sweep_interval,
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
+/// Like [`bring_up`], but with DynamoDB Streams enabled and a **generous**
+/// `stream_retention` (roadmap U-07's `admin_gc_reports_segment_janitor_
+/// progress_and_leader_state` needs to prove the segment janitor's own
+/// drop-table cascade — `segment_janitor.rs`'s own "table_dropped" rule,
+/// which reclaims a dropped table's stream-shard rows immediately,
+/// regardless of retention — the same shape `tests/stream_janitor.rs::
+/// drop_table_cascade_converges_via_the_janitor` uses a 600s retention for:
+/// if this test ever passed only because retention itself elapsed rather
+/// than the drop-table rule, a short retention would let it pass for the
+/// wrong reason). Seals almost immediately on any pending byte
+/// (`seal_bytes: 1`, mirroring `tests/stream_janitor.rs::tiny_seal_knobs`)
+/// so a single write reliably produces a sealed shard row for the janitor
+/// to later reclaim.
+async fn bring_up_with_streams(
+    n: usize,
+    dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs {
+                    seal_bytes: 1,
+                    seal_age: Duration::from_secs(3600),
+                },
+                animusd::SegmentStoreConfig::default(),
+                Duration::from_secs(600),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
+/// Like [`bring_up_with_streams`], but pins an explicit `fs:PATH`
+/// [`animusd::SegmentStoreConfig`] instead of the default `Cluster`
+/// variant — `admin_segment_store_reports_shard_placement_and_local_
+/// objects` needs one node with the single-shared-directory opt-in to
+/// prove `GET /admin/segment-store` reports `shards: null` for it (no
+/// per-node replica concept there — see `SegmentStoreHandle::put_sealed`'s
+/// own doc).
+async fn bring_up_with_fs_segment_store(
+    n: usize,
+    dir: &std::path::Path,
+    segment_store_dir: &std::path::Path,
+) -> (Vec<Node>, animusd::ClusterConfig) {
+    for attempt in 0..16 {
+        let addrs = support::free_addrs(n * 6);
+        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
+            .map(|i| animusd::RoleAddrs {
+                id: animusd::config::node_id(i),
+                role: animusd::config::NodeRole::Both,
+                internal: addrs[6 * i],
+                client: addrs[6 * i + 1],
+                dynamo: addrs[6 * i + 2],
+                admin: addrs[6 * i + 3],
+                intra: addrs[6 * i + 4],
+                console: addrs[6 * i + 5],
+                advertise_host: None,
+                tls: None,
+            })
+            .collect();
+        let config = animusd::ClusterConfig {
+            nodes: nodes_cfg,
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        let mut nodes = Vec::new();
+        let mut failed = false;
+        for i in 0..n {
+            match animusd::run_node_with_streams(
+                &config,
+                i,
+                dir.join(format!("node-{attempt}-{i}")),
+                animusd::StorageBackend::default(),
+                animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
+                animusd::StreamSealKnobs {
+                    seal_bytes: 1,
+                    seal_age: Duration::from_secs(3600),
+                },
+                animusd::SegmentStoreConfig::Fs(
+                    segment_store_dir.join(format!("attempt-{attempt}")),
+                ),
+                Duration::from_secs(600),
+            )
+            .await
+            {
+                Ok(node) => nodes.push(node),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return (nodes, config);
+        }
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+}
+
 async fn await_bootstrap(nodes: &[Node]) {
     timeout(Duration::from_secs(20), async {
         loop {
@@ -2062,6 +2340,610 @@ async fn admin_storage_compact_action() {
         )
         .await;
         assert_eq!(s, 404, "compacting an unhosted tablet is refused: {err}");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) end to end on a
+/// real cluster with an `fs:` backup store: create a table, create an
+/// on-demand backup, delete it, and poll (converged-or-timeout) until the
+/// control-plane leader's own route shows the backup janitor having
+/// reclaimed every local object — plus a follower reports `leader: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_backup_store_reports_reclaim_progress_and_leader_state() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let backup_store_dir = dir.path().join("fs-backup-store");
+        let (nodes, _config) =
+            bring_up_with_fs_backup_store(3, dir.path(), &backup_store_dir).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let leader_addr = nodes[leader_idx].admin_addr();
+        let follower_addr = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| n.admin_addr())
+            .expect("a follower exists in a 3-node cluster");
+
+        // ---- baseline: an unconfigured/no-backups-yet leader is honestly
+        //      idle, and reports itself the control leader -------------------
+        let (s, baseline) = admin_get(leader_addr, "/admin/backup-store").await;
+        assert_eq!(s, 200, "GET /admin/backup-store on the leader: {baseline}");
+        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
+        assert_eq!(baseline["store"]["kind"], "fs", "the configured fs: store: {baseline}");
+        assert!(
+            baseline["objects"]["count"].as_u64().is_some(),
+            "objects.count is always present (even zero): {baseline}"
+        );
+        let baseline_count = baseline["objects"]["count"].as_u64().unwrap();
+
+        // ---- a follower never runs the janitor, and says so ----------------
+        let (s, follower_view) = admin_get(follower_addr, "/admin/backup-store").await;
+        assert_eq!(s, 200, "GET /admin/backup-store on a follower: {follower_view}");
+        assert_eq!(
+            follower_view["leader"], false,
+            "a follower reports leader: false: {follower_view}"
+        );
+        assert_eq!(
+            follower_view["janitor"]["phase"], "idle",
+            "a follower's own janitor never advances past idle: {follower_view}"
+        );
+
+        // ---- create a table, write a row, and take an on-demand backup
+        //      through the leader's own admin dynamo proxy -------------------
+        let (s, ct_body) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct_body}");
+        let (s, put_body) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"widgets","Item":{"id":{"S":"w1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put_body}");
+
+        let (s, created) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"CreateBackup","payload":{"TableName":"widgets","BackupName":"nightly"}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateBackup: {created}");
+        let backup_arn = created["BackupDetails"]["BackupArn"]
+            .as_str()
+            .expect("BackupArn")
+            .to_owned();
+
+        // ---- poll to AVAILABLE ----------------------------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, view) = admin_get(leader_addr, "/admin/backups").await;
+                assert_eq!(s, 200);
+                let row = view["backups"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|r| r["backup_id"] == backup_arn));
+                if row.is_some_and(|r| r["status"]["state"] == "AVAILABLE") {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("backup did not become AVAILABLE in 20s");
+
+        // ---- object count on the leader has grown past the baseline --------
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, v) = admin_get(leader_addr, "/admin/backup-store").await;
+                if v["objects"]["count"].as_u64().unwrap_or(0) > baseline_count {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the leader's own object count never grew past baseline after CreateBackup");
+
+        // ---- delete it, then poll converged-or-timeout until the janitor
+        //      has reclaimed it: object count back at baseline (or
+        //      objects_reclaimed > 0), on the LEADER's own route -------------
+        let (s, deleted) = admin(
+            leader_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(&format!(
+                r#"{{"op":"DeleteBackup","payload":{{"BackupArn":"{backup_arn}"}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(s, 200, "DeleteBackup: {deleted}");
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, v) = admin_get(leader_addr, "/admin/backup-store").await;
+                assert_eq!(s, 200, "GET /admin/backup-store: {v}");
+                let count = v["objects"]["count"].as_u64().unwrap_or(u64::MAX);
+                let reclaimed = v["janitor"]["objects_reclaimed"].as_u64().unwrap_or(0);
+                if count <= baseline_count && reclaimed > 0 {
+                    return v;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the backup janitor never reclaimed the deleted backup's objects in 20s");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/ttl` (ADR 0051, roadmap U-07) end to end on a real cluster:
+/// `UpdateTimeToLive` on a table, `PutItem` an already-expired item, and
+/// poll converged-or-timeout until *some* node's own reaper reports it
+/// deleted the row — every node's own `tables` list shows the TTL-enabled
+/// table (the replicated catalog is identical everywhere), and a node
+/// leading none of that table's tablets still answers about its own
+/// (honestly idle) counters rather than erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_ttl_reports_reaper_progress_and_ttl_tables() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) =
+            bring_up_with_fast_ttl(3, dir.path(), Duration::from_millis(200)).await;
+        await_bootstrap(&nodes).await;
+
+        let any_addr = nodes[0].admin_addr();
+
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"widgets","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+
+        let (s, upd) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"UpdateTimeToLive","payload":{"TableName":"widgets","TimeToLiveSpecification":{"Enabled":true,"AttributeName":"expiresAt"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "UpdateTimeToLive: {upd}");
+
+        // ---- poll converged-or-timeout: every node's own catalog view
+        //      lists the TTL-enabled table — under contention, a follower's
+        //      own replicated-Metadata apply can lag briefly behind the
+        //      admin call's own leader-side commit-wait, so a single
+        //      immediate check here is a real (observed) flake, not just a
+        //      theoretical one. Also captures each node's own
+        //      "reaper"/"leader_tablets" fields on the converged pass, used
+        //      by the checks right after (leadership is settled well before
+        //      the catalog write above even committed, since `CreateTable`
+        //      itself blocks on `await_table_serveable`). ------------------
+        let mut leader_tablets_by_node: Vec<u64> = Vec::new();
+        timeout(Duration::from_secs(20), async {
+            loop {
+                leader_tablets_by_node.clear();
+                let mut all_ready = true;
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/ttl").await;
+                    assert_eq!(s, 200, "GET /admin/ttl: {v}");
+                    assert!(v.get("reaper").is_some(), "carries \"reaper\": {v}");
+                    let tables = v["tables"].as_array().expect("tables is an array");
+                    let has_widgets = tables.iter().any(|t| {
+                        t["name"] == "widgets"
+                            && t["attribute"] == "expiresAt"
+                            && t["enabled"] == true
+                    });
+                    if !has_widgets {
+                        all_ready = false;
+                    }
+                    leader_tablets_by_node.push(
+                        v["leader_tablets"]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("carries a numeric \"leader_tablets\": {v}")),
+                    );
+                }
+                if all_ready {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "not every node's own catalog converged to show widgets as \
+             TTL-enabled within 20s",
+        );
+
+        // ---- a node leading none of `widgets`' tablets (RF 3 on a 3-node
+        //      cluster means at least two of the three) still answered with
+        //      its own honest counters above, never an error ----------------
+        assert!(
+            leader_tablets_by_node.contains(&0),
+            "a 3-node, RF-3 cluster's single tablet has exactly one leader — \
+             at least one other node should lead none of it: \
+             {leader_tablets_by_node:?}"
+        );
+
+        // ---- put an already-expired item -----------------------------------
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs()
+            - 3600;
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(&format!(
+                r#"{{"op":"PutItem","payload":{{"TableName":"widgets","Item":{{"id":{{"S":"w1"}},"expiresAt":{{"N":"{past}"}}}}}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- poll converged-or-timeout: some node's own reaper eventually
+        //      deletes it and reports so on its own GET /admin/ttl ----------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/ttl").await;
+                    assert_eq!(s, 200, "GET /admin/ttl: {v}");
+                    if v["reaper"]["deleted_total"].as_u64().unwrap_or(0) >= 1 {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no node's TTL reaper ever reported a delete within 20s");
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07): a real 3-node
+/// cluster with DynamoDB Streams enabled and a generous retention (600s —
+/// see [`bring_up_with_streams`]'s own doc for why: this test's own
+/// reclaim must be driven by the segment janitor's drop-table cascade, not
+/// by retention itself elapsing, or a passing run would prove nothing).
+/// Creates a streamed table, writes one item, waits for it to seal, drops
+/// the table (the janitor's own "table_dropped" rule reclaims a dropped
+/// table's stream-shard rows immediately, regardless of retention — the
+/// same mechanism `tests/stream_janitor.rs::
+/// drop_table_cascade_converges_via_the_janitor` exercises), then polls
+/// converged-or-timeout until the control-plane leader's own route shows
+/// `orphans_deleted_total >= 1`. A follower reports `leader: false` and
+/// stays `idle` throughout, mirroring `admin_backup_store_reports_
+/// reclaim_progress_and_leader_state`'s own follower assertion — this
+/// janitor is control-plane-leader-only exactly like the backup janitor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_gc_reports_segment_janitor_progress_and_leader_state() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+        let leader_addr = nodes[leader_idx].admin_addr();
+        let follower_addr = nodes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != leader_idx)
+            .map(|(_, n)| n.admin_addr())
+            .expect("a follower exists in a 3-node cluster");
+
+        // ---- baseline: an unconfigured/no-drops-yet leader is honestly
+        //      idle, and reports itself the control leader -----------------
+        let (s, baseline) = admin_get(leader_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on the leader: {baseline}");
+        assert_eq!(baseline["leader"], true, "the leader reports itself: {baseline}");
+        assert!(
+            baseline["janitor"]["phase"].is_string(),
+            "janitor.phase is always present: {baseline}"
+        );
+
+        // ---- a follower never runs the janitor, and says so ----------------
+        let (s, follower_view) = admin_get(follower_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_view}");
+        assert_eq!(
+            follower_view["leader"], false,
+            "a follower reports leader: false: {follower_view}"
+        );
+        assert_eq!(
+            follower_view["janitor"]["phase"], "idle",
+            "a follower's own janitor never advances past idle: {follower_view}"
+        );
+
+        // ---- create a streamed table and write one item through the admin
+        //      dynamo proxy on any node (it forwards internally) ------------
+        let any_addr = nodes[0].admin_addr();
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- wait for the write to seal into a catalog row (seal_bytes: 1
+        //      means this should be near-immediate) ---------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if !nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no sealed stream-shard row appeared within 20s");
+        assert!(
+            !nodes[leader_idx].metadata().stream_shards.is_empty(),
+            "test premise: at least one live catalog row exists before the drop"
+        );
+
+        // ---- drop the table: the janitor's own drop-table rule reclaims
+        //      its stream-shard row(s) immediately, regardless of retention --
+        let (s, drop_body) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/drop-table",
+            Some(r#"{"table":"t"}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "drop-table: {drop_body}");
+
+        // ---- poll converged-or-timeout: the leader's own route shows the
+        //      janitor has actually deleted at least one segment object -----
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, v) = admin_get(leader_addr, "/admin/gc").await;
+                assert_eq!(s, 200, "GET /admin/gc: {v}");
+                if v["janitor"]["orphans_deleted_total"].as_u64().unwrap_or(0) >= 1 {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "the control leader's own /admin/gc never reported orphans_deleted_total >= 1 \
+             within 20s",
+        );
+
+        // ---- and the dropped table's own catalog rows are actually gone,
+        //      the same convergence `tests/stream_janitor.rs`'s own
+        //      drop-table-cascade test asserts -------------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stream-shard catalog rows were never cleared after the table drop");
+
+        // ---- a follower still reports leader: false throughout -------------
+        let (s, follower_after) = admin_get(follower_addr, "/admin/gc").await;
+        assert_eq!(s, 200, "GET /admin/gc on a follower: {follower_after}");
+        assert_eq!(
+            follower_after["leader"], false,
+            "a follower still reports leader: false after the drop: {follower_after}"
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07's fourth and
+/// last route): a real 3-node cluster with DynamoDB Streams enabled and the
+/// default `cluster` segment store — creates a streamed table, writes one
+/// item, waits for it to seal into a `stream_shards` catalog row (the
+/// row's own `replicas` recorded by `ClusterSegmentStore::put_replicated`
+/// at seal time), then polls converged-or-timeout until SOME node's own
+/// route shows `local_objects.count >= 1` — proving that node actually
+/// holds a physical copy locally, not merely that the catalog row exists.
+/// Every node is then asserted to report the identical `shards` array (the
+/// replicated catalog is identical everywhere, ADR 0038), and a separate
+/// single-node cluster configured with the `fs` opt-in reports
+/// `shards: null` (no per-node replica concept for a single shared
+/// directory every node already reads).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn admin_segment_store_reports_shard_placement_and_local_objects() {
+    timeout(Duration::from_secs(90), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up_with_streams(3, dir.path()).await;
+        await_bootstrap(&nodes).await;
+
+        let leader_idx = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("a control leader exists after bootstrap");
+
+        // ---- baseline: every node's own route reports the configured
+        //      `cluster` store and an honest (possibly empty) local scan --
+        for node in &nodes {
+            let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+            assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+            assert_eq!(v["store"]["kind"], "cluster", "the configured cluster store: {v}");
+            assert!(
+                v["local_objects"]["count"].as_u64().is_some(),
+                "local_objects.count is always present (even zero): {v}"
+            );
+            assert!(v["shards"].is_array(), "shards is an array for the cluster kind: {v}");
+        }
+
+        // ---- create a streamed table and write one item through the admin
+        //      dynamo proxy on any node (it forwards internally) ------------
+        let any_addr = nodes[0].admin_addr();
+        let (s, ct) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(
+                r#"{"op":"CreateTable","payload":{"TableName":"t","AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],"KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],"StreamSpecification":{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, 200, "CreateTable: {ct}");
+        let (s, put) = admin(
+            any_addr,
+            "POST",
+            "/admin/data/dynamo",
+            Some(r#"{"op":"PutItem","payload":{"TableName":"t","Item":{"id":{"S":"p1"}}}}"#),
+        )
+        .await;
+        assert_eq!(s, 200, "PutItem: {put}");
+
+        // ---- wait for the write to seal into a catalog row (seal_bytes: 1
+        //      means this should be near-immediate) ---------------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if !nodes[leader_idx].metadata().stream_shards.is_empty() {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no sealed stream-shard row appeared within 20s");
+
+        // ---- poll converged-or-timeout: SOME node's own route shows it
+        //      physically holds at least one local object -------------------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+                    assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+                    if v["local_objects"]["count"].as_u64().unwrap_or(0) >= 1 {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no node's own /admin/segment-store ever reported local_objects.count >= 1");
+
+        // ---- every node eventually reports the identical shard placement
+        //      — the replicated catalog is the same everywhere (ADR 0038),
+        //      but each node's own local control Raft applies the
+        //      `SealStreamShard` commit independently, so this is a
+        //      converged-or-timeout poll, never a one-shot snapshot -------
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let mut views = Vec::with_capacity(nodes.len());
+                let mut all_non_empty = true;
+                for node in &nodes {
+                    let (s, v) = admin_get(node.admin_addr(), "/admin/segment-store").await;
+                    assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+                    let shards = v["shards"].clone();
+                    if shards.as_array().is_none_or(|a| a.is_empty()) {
+                        all_non_empty = false;
+                    }
+                    views.push(shards);
+                }
+                if all_non_empty && views.windows(2).all(|w| w[0] == w[1]) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect(
+            "every node never converged on the identical, non-empty shard->replica \
+             placement within 20s",
+        );
+
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `GET /admin/segment-store` on a node configured with the single-shared-
+/// directory `fs` opt-in reports `shards: null` — there is no per-node
+/// replica concept to report when every node already reads the identical
+/// directory (see `SegmentStoreHandle::put_sealed`'s own doc for the
+/// empty-`replicas`/"ask any node" convention this mirrors).
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_segment_store_reports_null_shards_for_the_fs_kind() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let segment_store_dir = dir.path().join("fs-segment-store");
+        let (nodes, _config) =
+            bring_up_with_fs_segment_store(1, dir.path(), &segment_store_dir).await;
+        await_bootstrap(&nodes).await;
+
+        let (s, v) = admin_get(nodes[0].admin_addr(), "/admin/segment-store").await;
+        assert_eq!(s, 200, "GET /admin/segment-store: {v}");
+        assert_eq!(v["store"]["kind"], "fs", "the configured fs: store: {v}");
+        assert!(
+            v["shards"].is_null(),
+            "the fs kind has no per-node placement: {v}"
+        );
+        assert!(
+            v["local_objects"]["count"].as_u64().is_some(),
+            "local_objects.count is still reported for the fs kind: {v}"
+        );
 
         for node in &nodes {
             node.shutdown_graceful().await;

@@ -14,7 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // State assembled each refresh.
-let STATE = { status: null, backups: null, restores: null, nodes: [], peersErr: null };
+let STATE = { status: null, backups: null, restores: null, backupStore: null, gc: null, nodes: [], peersErr: null };
 
 // ---- this node's own role (ADR 0035 PR7) ----
 // `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
@@ -522,6 +522,23 @@ async function loadAll() {
   try { backups = await getJSON(SEED, "/admin/backups"); } catch (e) { /* shown per-panel */ }
   let restores = null;
   try { restores = await getJSON(SEED, "/admin/restores"); } catch (e) { /* shown per-panel */ }
+  // `/admin/backup-store` (docs/roadmap.md U-07): this node's own backup
+  // store config/object counts/janitor progress — a single fetch against
+  // SEED like `backups`/`restores` just above, never a per-node fan-out
+  // (the janitor only ever runs on the control leader; a follower's own
+  // copy is a legitimate, honestly-idle answer, not a gap to paper over
+  // with a fan-out).
+  let backupStore = null;
+  try { backupStore = await getJSON(SEED, "/admin/backup-store"); } catch (e) { /* shown per-panel */ }
+  // `/admin/gc` (docs/roadmap.md U-07): the DynamoDB Streams segment
+  // janitor's own orphan-sweep phase/counters — control-plane-leader-only
+  // exactly like `backup-store` above, so this is a single fetch against
+  // SEED, never a per-node fan-out (see docs/engineering-lessons.md: a
+  // card's fetch shape must match its route's OWN gating, not whichever
+  // shape the most recently added similar route happens to use — this
+  // route is gated like backup-store, not like ttl).
+  let gc = null;
+  try { gc = await getJSON(SEED, "/admin/gc"); } catch (e) { /* shown per-panel */ }
 
   const addrs = (peers.admin_addrs && peers.admin_addrs.length) ? peers.admin_addrs
     : [SEED.replace(/^https?:\/\//, "")];
@@ -548,22 +565,36 @@ async function loadAll() {
       // `raftkv` the same way `metrics` does — `.catch(() => null)` so one
       // unreachable/older node degrades to "no txn view for this node"
       // rather than failing the whole fan-out.
-      const [config, raft, raftkv, txns, health, metrics] = await Promise.all([
+      // `ttl` (docs/roadmap.md U-07) fans out per-node too, unlike
+      // `/admin/backup-store`'s single SEED-only fetch above — the TTL
+      // reaper runs on EVERY node (self-gated per tablet), not just the
+      // control leader, so a per-node fan-out is the only way to see every
+      // node's own reaper activity.
+      // `segmentStore` (`/admin/segment-store`, docs/roadmap.md U-07's
+      // fourth and last route) fans out per-node for the identical reason
+      // `ttl` does — each node reports its own local object count/bytes and
+      // its own `local` flag per shard, which a single SEED-only fetch
+      // could never show for any node but SEED itself.
+      const [config, raft, raftkv, txns, health, metrics, ttl, segmentStore] = await Promise.all([
         getJSON(base, "/admin/config"),
         getJSON(base, "/admin/raft").catch(() => null),
         getJSON(base, "/admin/raftkv").catch(() => null),
         getJSON(base, "/admin/txns").catch(() => null),
         getJSON(base, "/admin/health").catch(() => null),
         getJSON(base, "/admin/metrics").catch(() => null),
+        getJSON(base, "/admin/ttl").catch(() => null),
+        getJSON(base, "/admin/segment-store").catch(() => null),
       ]);
-      Object.assign(node, { config, raft, raftkv, txns, health, metrics, ok: true });
+      Object.assign(node, {
+        config, raft, raftkv, txns, health, metrics, ttl, segmentStore, ok: true,
+      });
     } catch (e) {
       node.error = String(e);
     }
     return node;
   }));
 
-  STATE = { status, backups, restores, nodes, peersErr: STATE.peersErr };
+  STATE = { status, backups, restores, backupStore, gc, nodes, peersErr: STATE.peersErr };
   render();
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }

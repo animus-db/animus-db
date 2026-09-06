@@ -27,9 +27,20 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 
 - `src/crd.rs` — the `AnimusCluster` type (`kube::CustomResource` derive):
   `AnimusClusterSpec`/`AnimusClusterStatus`/`StorageSpec`/
-  `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`. Pure data + a
-  handful of `_or_default()` helpers; no k8s API calls, no logic that needs
-  a live object beyond its own fields.
+  `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`/`TlsSpec`/
+  `S3StoreSpec` (S-04 PR 3, see this file's own S3 section below), and
+  the non-S3 `backup_store`/`segment_store` fields (S-07b, see this
+  file's own Non-S3 stores section below). Pure
+  data + a handful of `_or_default()`/`validate()` helpers; no k8s API
+  calls, no logic that needs a live object beyond its own fields.
+- `src/s3_uri.rs` — a small, deliberately minimal syntax-only check of an
+  `s3://...` store URI (S-04 PR 3): bucket present, `endpoint=` query key
+  present, `http://`/`https://` scheme. **Not** a reimplementation of
+  `animusd::main::parse_s3_uri` (this crate has no dependency on
+  `animusd` — see this file's own note above); see this module's own doc
+  for exactly what it does and does not re-verify. Used by
+  `crd::S3StoreSpec::validate` and `desired::networkpolicy`'s port
+  extraction.
 - `src/desired/` — **pure builder functions**, `(name, ns, spec) -> a typed
   k8s-openapi object`, no cluster access. This is where almost all of this
   crate's tests live:
@@ -46,13 +57,21 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
     it through `Api::namespaced_with`. `dns_names` computes the SAN list:
     every pod's own stable per-ordinal FQDN plus both Services (headless
     internal + client-facing `dynamo`), short and fully-qualified.
+  - `poddisruptionbudget.rs` (S-07c) — the `{name}-pdb`
+    `PodDisruptionBudget` builder: `maxUnavailable` is derived from
+    `spec.nodes`/`spec.controlNodes` and a fixed data-plane replication
+    factor mirror, never a constant and never CRD-overridable — see this
+    file's own "PodDisruptionBudget" section below.
   - `configmap.rs`/`services.rs`/`statefulset.rs`/`networkpolicy.rs` — one
     builder module per child kind. `statefulset.rs` mounts `spec.tls`'s
     resolved `Secret` (ADR 0064 commit 3) read-only at `/etc/animus/tls`,
-    the same mount for either `TlsSpec` shape; `networkpolicy.rs` is
-    unaffected by TLS (its own module doc explains why: TLS is a mode a
-    port's listener can be configured into, not a change to which pods may
-    reach which port).
+    the same mount for either `TlsSpec` shape, and (S-04 PR 3)
+    `spec.s3.credentialsSecretName`'s `Secret` read-only at `/etc/animus/s3`
+    on every pod; `networkpolicy.rs` is unaffected by TLS (its own module
+    doc explains why: TLS is a mode a port's listener can be configured
+    into, not a change to which pods may reach which port) but **is**
+    affected by `spec.s3` (S-04 PR 3) — see this file's own S3 section
+    below for the egress rules it now always adds.
   - `mod.rs` — shared label/name helpers (`common_labels`/
     `selector_labels`/`owner_reference`/`pod_fqdn`/the `*_name` functions)
     every builder module uses, so every child's naming/labeling convention
@@ -78,6 +97,25 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   `None` plain TCP; `crate::controller::reconcile` reads the bytes out of
   `spec.tls`'s resolved `Secret` via `ClusterApi::get_secret` (the
   Kubernetes API, not a mounted file — see the TLS section below for why).
+  This is `AdminClient`, one of two `AdminOps` implementors, selected by
+  `--admin-access direct`; it only works when the operator runs
+  in-cluster. `ProxyAdminClient`, in the same file, is the **default**
+  (`--admin-access proxy`) — see ADR 0060's own dated amendment ("operator
+  admin access through the API server pod proxy") for the full rationale:
+  it parses `admin_base_url`'s own URL shape back apart
+  (`parse_admin_url`) into `(namespace, pod, port, scheme)` and issues the
+  same GET/POST as a Kubernetes API request against the pod-proxy
+  subresource (`/api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
+  {path}`) instead of dialing the pod directly — the one address this
+  works from is the API server, reachable in every deployment shape
+  including out-of-cluster (`scripts/e2e-kind.sh`'s own shape), unlike a
+  pod's headless-`Service` DNS name or pod IP. `RealAdminClient` (an enum,
+  `Direct`/`Proxy`) is what `run()` actually constructs from
+  `AdminAccessMode`, keeping `Context<C, A>` monomorphized against one
+  concrete `A: AdminOps` type regardless of which mode was chosen at
+  startup. Both implementors bound every request with
+  `ADMIN_REQUEST_TIMEOUT` — an unroutable pod fails a reconcile step fast,
+  never hangs it.
 - `src/cluster_api.rs` — `ClusterApi`, the test seam over the `kube::Api`
   calls `controller.rs` performs, plus `RealClusterApi`, its production
   implementor (ADR 0061 rung E1 — see Tests).
@@ -86,13 +124,15 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   (`PatchParams::apply(FIELD_MANAGER).force()`, field manager
   `"animus-operator"`), reads the applied `StatefulSet`'s own
   `status.readyReplicas` to compute `AnimusClusterStatus`, and requeues
-  (~30s on success, 15s on error). The two genuinely stateful pieces that
-  can't be pure functions live here too: the scale-down member-drain
-  sequence (`drain_and_remove_node`, talks to a real pod's admin port) and
-  the `controlNodes`-immutability check (`control_nodes_changed`, reads the
-  previously-applied `ConfigMap` back to recover what was actually applied
-  last time — see its own doc for why that, not a status annotation, is the
-  source of truth).
+  (~30s on success, 15s on error). The genuinely stateful pieces that can't
+  be pure functions live here too: the scale-down member-drain sequence
+  (`drain_and_remove_node`, talks to a real pod's admin port), the
+  `controlNodes`-shrink-rejection check (`previous_applied_control_nodes`,
+  reads the previously-applied `ConfigMap` back to recover what was
+  actually applied last time — see its own doc for why that, not a status
+  annotation, is the source of truth), and, since S-07d, the growth
+  machinery that drives an *increase* forward (`advance_control_growth`
+  and its helpers — see this file's own S-07d section below).
 - `src/main.rs` — two subcommands: `run` (the controller, `kube::Client::
   try_default()` — in-cluster service-account config when running as a pod,
   or the local kubeconfig otherwise) and `crd` (prints the
@@ -108,9 +148,9 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   pushed by `.github/workflows/image.yml`'s `animus-operator` matrix entry
   on the same tag/push rules as `animusd`; `deploy/operator/deployment.yaml`
   references it as a real image, not a placeholder. This doesn't change how
-  `scripts/e2e-kind.sh` runs the controller (still out-of-cluster via
-  `cargo run`, deliberately — see the e2e section below) or how local
-  development works.
+  `scripts/e2e-kind.sh` runs the controller (still out-of-cluster via a
+  `cargo`-built binary, deliberately — see the e2e section below) or how
+  local development works.
 - **BTreeMap-only, same as every other crate (ADR 0003's determinism rule,
   lint-enforced via `clippy.toml`)** — even though this crate has no `Env`
   seam and nothing here is sim-tested (see the next bullet), the workspace
@@ -162,6 +202,20 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   | `--dir` | yes | yes |
   | `--ephemeral` | yes | yes |
   | `--dynamo-auth` | yes | yes |
+  | `--backup-store`/`--segment-store`/`--s3-credentials`/`--allow-insecure-s3` (S-04 PR 3, `spec.s3`) | yes | **no** |
+  | `--backup-store`/`--segment-store` (S-07b, `spec.backupStore`/`spec.segmentStore` — the non-S3 `cluster`/`fs:`/`dir:` forms) | yes | **no** |
+
+  **The S-04 PR 3 row's "no" on the data branch is a pre-existing
+  `animusd` gap, not introduced here**: `run_data_config` (`main.rs`)
+  accepts none of those four flags — see that function's own "same
+  documented gap as `--backup-store`" comment. A data-only pod still
+  mounts `spec.s3.credentialsSecretName`'s `Secret` at `/etc/animus/s3`
+  like every other pod (`desired::statefulset::build` doesn't condition
+  the mount on role), it just never reads it. **S-07b's own row is the
+  identical gap** — `spec.backupStore`/`spec.segmentStore` reach only the
+  combined branch for the same reason, but need no `Secret`/volume at all:
+  a `fs:`/`dir:` path is required to live under `DATA_DIR`, which every
+  pod already has mounted.
 
   **`spec.autoSplitBytes`/`spec.quiesceAfterSecs` are never emitted as CLI
   flags on either branch (S-06)** — both now reach `animusd` through
@@ -202,6 +256,58 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   cluster_config`'s tests for the regression coverage (every `--flag`
   token the script emits is checked against an explicit allowlist of what
   `main.rs` actually accepts).
+- **The `StatefulSet` pod template carries a config-hash restart annotation
+  (`desired::statefulset::CONFIG_HASH_ANNOTATION`, S-07d groundwork,
+  2026-09-06) — hashed from a *restart-relevant projection*, never the raw
+  generated `ConfigMap`.** A mounted `ConfigMap` volume's content updates in
+  place on the kubelet's own sync period, but nothing makes an
+  already-running `animusd` process re-read it — `cluster.json` is a
+  startup-time config file, not hot-reloaded — so a config-affecting spec
+  change (`spec.tls`, `spec.s3`/`backupStore`/`segmentStore`,
+  `spec.dynamoAuthSecretName`, `spec.quiesceAfterSecs`/`autoSplitBytes`, or
+  a `spec.controlNodes` role-split change) used to sit unapplied on running
+  pods until they happened to restart for an unrelated reason. Baking a
+  hash into the pod template turns such a change into a `spec.template`
+  change, which the `StatefulSet` controller rolls exactly like an image
+  bump.
+  **The rule for what goes into the hash: hash exactly what a running pod
+  read once at boot and cannot pick up live — never the node list, its
+  length, or any per-node address/id/`advertise_host`.** The first cut of
+  this (this same commit's original version) hashed the entire generated
+  `ConfigMap` `data` map, which put `cluster.json`'s whole `nodes` array —
+  including every *existing* node's unchanged entry — into the hash; a
+  plain `spec.nodes` scale-up/down (which only appends/removes a trailing
+  `RoleAddrs` entry, per `scale_up_config_append_preserves_existing_
+  entries_byte_for_byte`) therefore rolled every already-running pod for no
+  reason, even though a running `animusd` never rereads that array — it
+  learns of new/changed peers through replicated `Metadata` (ADR 0030
+  self-registration) only. This broke `e2e-kind-tls`: the scale phase's
+  3 → 4 node growth rolled `e2e-0`/`e2e-1`/`e2e-2` out from under the
+  script's own `kubectl port-forward`, failing the post-scale `GetItem`.
+  Fixed by hashing `desired::statefulset::restart_relevant_projection`
+  instead — a small typed struct built straight from `AnimusClusterSpec`
+  (not by string-munging the generated JSON): the `control_nodes`
+  role-split threshold and the full `entrypoint.sh` text (both already
+  independent of `spec.nodes` — `entrypoint_script` takes only `spec`),
+  `cluster_settings` (`cluster_settings_or_none`, the same "empty means
+  absent" rule `build_cluster_config` uses), and whether TLS is wired at
+  all (`spec.tls.is_some()` plus the fixed `tls_section()` mount paths).
+  **A `spec.controlNodes` increase still changes this hash and rolls every
+  pod** — role is purely `ordinal < control_nodes`, so raising the
+  threshold can flip an *existing* ordinal's role even though no node
+  address changed, and that pod needs a restart to pick up its new
+  subcommand/flags; this is exactly the case S-07d's growth flow expects to
+  restart pods for. Hashed with FNV-1a 64 (inline, no new dependency) over
+  the projection's JSON encoding — deliberately **not**
+  `std::collections::hash_map::DefaultHasher`, which carries no
+  cross-Rust-release stability guarantee and would risk rolling every
+  deployed cluster's pods on a routine operator toolchain bump. See
+  `desired::statefulset`'s own module doc and
+  `restart_relevant_projection`'s doc for the full field-by-field in/out
+  list, and `docs/engineering-lessons.md`'s S-07d entries for the general
+  lesson ("a shared `StatefulSet` pod-template annotation restarts every
+  pod — hash only what a running pod cannot pick up live, never the thing
+  that changes on every routine scale").
 - **`control_nodes_changed` reads the *previous* `ConfigMap`'s own applied
   `cluster.json` back to detect an immutable-field change**, rather than a
   status annotation the controller would have to remember to write and keep
@@ -213,6 +319,23 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   of leading `"both"` entries **is** the previous `controlNodes` value) —
   see `desired::cluster_config::build_cluster_config`'s own doc for why that
   invariant holds.
+- **`previous_applied_control_nodes` (S-07d, renamed from
+  `control_nodes_changed`) reads the *previous* `ConfigMap`'s own applied
+  `cluster.json` back**, rather than a status annotation the controller
+  would have to remember to write and keep in sync — the applied
+  `ConfigMap` is already server-side-apply's own durable record of what was
+  actually generated last reconcile, so there is nothing separate to keep
+  consistent. It infers the *previous* `controlNodes` value from a prefix
+  count of `role: "both"` entries in that JSON (role is assigned strictly by
+  `ordinal < control_nodes`, so the count of leading `"both"` entries **is**
+  the previous `controlNodes` value) — see `desired::cluster_config::
+  build_cluster_config`'s own doc for why that invariant holds. Unlike its
+  pre-S-07d self, it no longer compares against the *desired* value at all
+  (hence the rename) — it always reports the prior applied value, changed
+  or not, since both the shrink-rejection check and the growth machinery
+  need it, and growth needs to keep observing it every reconcile while a
+  growth is in flight, not just on the one reconcile where the spec edit
+  first lands.
 - **Scale-down drains highest-ordinal-first, one pod fully removed before
   the next starts**, and stops the whole sequence (setting the
   `DrainFailed` condition, leaving the `StatefulSet`'s replica count
@@ -299,26 +422,320 @@ written carefully and `bash -n`-checked, but never run end to end. Treat a
 first real CI failure on the `e2e-kind-tls` job as this path finding its
 first real bug, not as this note being wrong.
 
+## S3 (S-04 PR 3, closes `docs/roadmap.md`'s S-04)
+
+`AnimusClusterSpec.s3: Option<S3StoreSpec>` (`crd.rs`) mirrors `TlsSpec`'s
+own precedent — a CRD section that only *references* a pre-existing
+`Secret`, never one this operator creates or writes. `backupStore`/
+`segmentStore` are literal `s3://...` URI values (at least one must be
+set); `credentialsSecretName` names a `Secret` holding `access_key_id`/
+`secret_access_key`; `allowInsecureHttp` (default `false`) must be `true`
+for either store URI to set `insecure_http=true`; `egressCidrs` (default
+`["0.0.0.0/0"]`) scopes the generated `NetworkPolicy`'s S3 egress rule.
+`S3StoreSpec::validate` (called from `crate::controller::reconcile`, same
+"no admission webhook in v1" posture as `TlsSpec::validate`) rejects:
+neither store set, an empty `credentialsSecretName`, a URI `crate::
+s3_uri::parse` can't make sense of, or `insecure_http=true` without
+`allowInsecureHttp` — a `S3SpecInvalid` status condition, `spec.s3`
+stripped for the rest of that reconcile, same as an invalid `spec.tls`.
+
+**`crate::s3_uri`, not `animusd`'s own `parse_s3_uri`.** This crate
+doesn't depend on `animusd` (this file's own "does not depend on
+`animusd`" note above), so `S3StoreSpec::validate` and `desired::
+networkpolicy`'s port-extraction both go through a small, deliberately
+narrower syntactic check (`crate::s3_uri::parse`: bucket present,
+`endpoint=` query key present, `http://`/`https://` scheme) — see that
+module's own doc for exactly what it does and does not re-verify. The
+real credential/region/loopback-vs-`--allow-insecure-s3` logic is
+`animusd`'s own, at node startup, unchanged.
+
+Downstream wiring:
+
+- `desired::statefulset::build` mounts `credentialsSecretName`'s `Secret`
+  read-only at `/etc/animus/s3` on **every** pod, combined or data-role
+  alike (the same "one shared Secret, every pod" shape `dynamo-auth`/`tls`
+  already use) — even though only a combined-role pod's own
+  `entrypoint.sh` branch reads it (see the flag-support table above for
+  why: `animusd data --config` accepts no S3-store flags today).
+- `desired::cluster_config::entrypoint_script` adds, **only on the
+  combined branch**: a preamble (before the `exec`) that reads the
+  mounted `Secret`'s two files at container-start time and writes
+  `/tmp/animus-s3-credentials.json` — `{"access_key_id": "<read from the
+  mount>", "secret_access_key_file": "/etc/animus/s3/secret_access_key"}`
+  — followed by `--s3-credentials /tmp/animus-s3-credentials.json`,
+  `--allow-insecure-s3` (when `allowInsecureHttp`), and `--backup-store`/
+  `--segment-store` (each single-quoted via `shell_single_quote` — an
+  `s3://...` URI's own query string contains `&`/`?`, shell-special
+  characters that would otherwise be misinterpreted, `&` in particular
+  backgrounding the `exec`). **The `Secret`'s value never appears in the
+  generated `ConfigMap`** — only a shell command that reads it at
+  container-start time, inside the pod, and a *path* to
+  `secret_access_key`; `access_key_id` gets the identical treatment even
+  though it's the less sensitive of the two.
+- `desired::networkpolicy::build` — see the egress paragraph below.
+
+**Egress, closing the roadmap's own "egress unrestricted by omission"
+line.** The generated `NetworkPolicy` now sets `policyTypes: [Ingress,
+Egress]` unconditionally, with two baseline `Egress` rules on *every*
+cluster (`spec.s3` or not): intra-cluster (this cluster's own pods, the
+`internal`+`intra` ports only) and DNS to `kube-system`'s `kube-dns`/
+CoreDNS pods (UDP+TCP 53 — without this, in-cluster name resolution
+itself breaks the moment egress stops being wide open). A third rule
+is added only when `spec.s3` is set: the configured store URIs'
+`endpoint=` port(s) (deduplicated via `desired::networkpolicy::
+s3_endpoint_ports`; 443/80 default by scheme absent an explicit port),
+scoped to `spec.s3.egressCidrs`. **`NetworkPolicy` cannot express a
+hostname allowlist** — this operator has no way to resolve an endpoint's
+hostname into the right CIDR itself, which is exactly why `egressCidrs`
+exists and defaults open (`["0.0.0.0/0"]`): narrow it to your object
+store's real address range — `deploy/operator/example.yaml`'s commented
+`s3:` section says so inline.
+
+## Non-S3 stores (S-07b, closes `docs/roadmap.md`'s S-07 item b)
+
+`AnimusClusterSpec.backup_store`/`.segment_store: Option<String>` (`crd.rs`)
+are the CRD surface for the *non-S3* forms `spec.s3` above doesn't cover —
+carrying the literal `--backup-store`/`--segment-store` flag value
+verbatim (`"cluster"`, `"fs:<path>"`, `"dir:<path>"`), unlike `S3StoreSpec`
+which is a sub-object. `AnimusClusterSpec::validate_store_spec` (called
+from `crate::controller::reconcile`, same "no admission webhook in v1"
+posture as `TlsSpec`/`S3StoreSpec`'s own `validate`) accepts exactly
+`"cluster"` or `"fs:<path>"` for `backupStore`, and only `"dir:<path>"`
+for `segmentStore` — **`animusd`'s own `--segment-store` has no `"cluster"`
+keyword at all** (`parse_segment_store`'s own doc: omitting the flag is
+the *only* way to select its default), so a literal `"cluster"` there is
+rejected rather than silently remapped to "omit the flag." An `s3://...`
+value in either field is rejected pointing at `spec.s3` instead (only that
+section supplies the credentials an S3 store needs), and setting the same
+store in both `spec.s3` and the matching top-level field is rejected as a
+conflict naming both — a `StoreSpecInvalid` status condition either way,
+`backupStore`/`segmentStore` stripped for the rest of that reconcile.
+
+**Every `fs:`/`dir:` path must live strictly under
+`desired::cluster_config::DATA_DIR`** (`/var/lib/animus`) — the one
+directory every pod already has mounted (a `PersistentVolumeClaim`, or an
+`emptyDir` when `spec.storage.ephemeral` is set), and never `DATA_DIR`
+itself (that's where `animusd --dir` puts the storage engine's own
+on-disk files; a store sharing that exact root would mix its own objects
+in among them). **No new volume or `Secret` for this** — unlike `spec.s3`,
+`cluster`/`fs:`/`dir:` need no credentials, so `desired::statefulset`
+needed no change at all: the pod's already-mounted data volume is
+sufficient.
+
+`desired::cluster_config::entrypoint_script` emits `--backup-store`/
+`--segment-store` from whichever of `spec.s3.{backup,segment}Store` (the
+`s3://...` form, credentials wired as described above) or the plain
+top-level `spec.{backup,segment}Store` is set — the two are mutually
+exclusive per store (enforced by `validate_store_spec` before this
+function ever runs on an invalid combination), so the builder itself just
+takes the first `Some` of the two, `.or()`-chained. Both values are
+`shell_single_quote`d like every other operator-controlled string
+interpolated into the generated `sh` script (`fs:`/`dir:` paths happen not
+to contain shell metacharacters today, but nothing about the type says
+they can't). Reaches only **combined-role pods**, the identical
+pre-existing `animusd` gap `spec.s3` documents in the flag-support table
+above.
+
+**`scripts/e2e-kind.sh`'s `E2E_S3=1` leg is UNVERIFIED in this sandbox**
+— same `CAP_SYS_RESOURCE` reason `E2E_TLS`'s own leg is (see the e2e
+section below): it deploys a single-pod MinIO + Service, creates the
+bucket via a throwaway `minio/mc` pod and the credentials `Secret`,
+applies `spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+with `allowInsecureHttp: true`, then exercises `CreateBackup`/
+`DescribeBackup` over the DynamoDB wire and checks `GET
+/admin/backup-store` reports `"kind":"s3"`. Written carefully and
+`bash -n`-checked, never run end to end anywhere — treat a first real CI
+failure on the `e2e-kind-s3` job as this leg finding its first real bug.
+
+## PodDisruptionBudget (S-07c, closes `docs/roadmap.md`'s S-07 item c and
+this crate's own ADR 0060 deferred-list bullet)
+
+`crate::desired::poddisruptionbudget::build` produces a `{name}-pdb`
+`PodDisruptionBudget` for every `AnimusCluster`, owner-referenced and
+selecting `selector_labels(name)` like every other child, applied
+unconditionally in `apply_children` (after the `NetworkPolicy`, before the
+`StatefulSet`) — a **required** child, not an optional one the way
+`spec.tls.certManager`'s `Certificate` is.
+
+`maxUnavailable` is computed, never a constant and never
+CRD-overridable:
+
+```
+maxUnavailable = min(
+  floor((controlNodes - 1) / 2),                         # control-plane quorum
+  floor((min(nodes, MAX_REPLICATION_FACTOR) - 1) / 2),    # data-plane tablet RF
+)
+```
+
+`MAX_REPLICATION_FACTOR = 3` mirrors `animusd::MAX_REPLICATION_FACTOR`
+(`crates/animusd/src/lib.rs`) by hand as `desired::poddisruptionbudget::
+DATA_PLANE_MAX_REPLICATION_FACTOR` — this crate has no dependency on
+`animusd` (this file's own note above), and there is no `spec`-level
+replication-factor override today, so this is the same manual-sync
+posture `desired::cluster_config`'s `ClusterConfig`/`RoleAddrs` JSON
+mirror already established (grep `crates/animusd/src/lib.rs`'s own
+`MAX_REPLICATION_FACTOR` before touching either side). `nodes`/
+`control_nodes` are each clamped to at least `1` first, so `safe_max_
+unavailable` is a total function that never panics or goes negative even
+on a not-yet-valid spec.
+
+**Degenerate shapes all compute `0` — correctly, not as a bug**:
+`nodes == 1`, `controlNodes == 1`, and `nodes < MAX_REPLICATION_FACTOR`
+each block every voluntary eviction outright, because such a cluster
+cannot survive losing its one live copy of a control-plane or data-plane
+majority. Once `nodes` and `controlNodes` each reach `3` (this operator's
+own default), the value plateaus at `1` for any larger `nodes` — this is
+*why* the builder uses `maxUnavailable` rather than `minAvailable`
+(mutually exclusive on a `PodDisruptionBudgetSpec`): `minAvailable` would
+have to be re-derived as `nodes - maxUnavailable` on every scale event,
+while `maxUnavailable` is scale-invariant across the entire range that
+matters in practice. `apply_children` still re-derives and re-applies it
+every reconcile regardless (the same unconditional-re-apply posture every
+other required child has), always from the **desired** spec (`spec.
+nodes`/`spec.controlNodes`), never the `StatefulSet`'s live replica
+count — a scale-down transition test (`controller::tests`) pins that a
+cluster previously scaled to 5 replicas immediately gets the *new*,
+stricter budget on a reconcile to a smaller `nodes`/`controlNodes`, not
+the stale prior shape's looser one. **One exception since S-07d**: while a
+`controlNodes` growth is still catching up, `apply_children` builds the
+`PodDisruptionBudget` from the live-confirmed *achieved* count instead of
+the full target — see this file's own S-07d section below for why.
+
+**No CRD field was added.** The safe value is already a pure, fully
+determined function of two existing spec fields; an override could only
+loosen it (unsafe, must be rejected), tighten it (already achievable via
+`spec.nodes`/`spec.controlNodes` directly), or disable it outright, which
+would make this the first required child this operator ever stops
+applying once a spec says so — there is no finalizer or deletion path
+(`crate::controller`'s own "no finalizer in v1" doc) for a child that
+used to be desired and no longer is. See ADR 0060's own 2026-09-06
+amendment for the full reasoning, including what a future override would
+need to answer first (its own deletion story) before being added.
+
+`deploy/operator/rbac.yaml` grants the `policy` API group's
+`poddisruptionbudgets` the same full verb set as every other owned kind;
+`run()` watches it via `.owns(Api::<PodDisruptionBudget>::all(..))` like
+the other four typed child kinds.
+
+## Control-voter growth (S-07d, closes `docs/roadmap.md`'s S-07 item d and
+this crate's own ADR 0060 deferred-list bullet)
+
+`spec.controlNodes` is **grow-only**: a decrease is still rejected outright
+(unchanged behavior, renamed condition —
+`crd::CONDITION_CONTROL_NODES_SHRINK_REJECTED`, was `ImmutableFieldChanged`
+via `control_nodes_changed`); an increase is driven forward by the
+controller itself, one voter at a time, automating exactly the ADR 0037
+admin path (`animus admin control-add`) a human operator used to run by
+hand. See ADR 0060's own "Control-voter growth (S-07d, 2026-09-06)"
+amendment for the full design write-up (the live-truth-driven sequence,
+why role-promotion needs a restart, why growth doesn't reopen genesis's
+own "sequential join" rejection, the `SocketAddr` gap and its workaround,
+"retry on the leader" without a leader address hint, the PDB interaction,
+and how a controller restart resumes) — this section is the crate-local
+pointer + the gotchas worth knowing before touching this code.
+
+**The pure decision core**: `next_growth_ordinal(cluster_name, target,
+voters)`/`achieved_control_nodes(cluster_name, target, voters)` in
+`controller.rs` are plain functions of `(name, target, voters)` — no I/O,
+fully unit-tested — turning the control group's own live voter-id set
+(`GET /admin/control/members`'s `"voters"` field, parsed by
+`parse_voters`) into "which ordinal is missing next" / "how many are
+already confirmed". Everything async around them
+(`fetch_control_members`/`discover_control_voters`/
+`ordinal_reports_role_both`/`resolve_control_dial_addr`/
+`add_control_voter`/`advance_control_growth`) is a thin orchestration
+layer exercised through `FakeAdminClient`/`FakeClusterApi` — see Tests
+below.
+
+**Config-hash restart annotation, a separate, independently-reviewable
+groundwork step (its own first commit)**: `desired::statefulset::
+CONFIG_HASH_ANNOTATION` bakes a content hash of the generated config's
+*restart-relevant projection* (everything a pod reads at boot and cannot
+learn live — never the node list, so a `nodes`-only scale never rolls
+pods) into the pod template, turning any config-affecting spec change into a
+`StatefulSet.spec.template` change — the only way to make an already-
+running pod actually notice `cluster.json` changed, since `animusd` only
+reads it at container start. **This restarts every pod on any
+ConfigMap-affecting change, not just a `controlNodes` growth** — `spec.tls`,
+`spec.s3`, `spec.backupStore`/`spec.segmentStore`,
+`spec.dynamoAuthSecretName`, `spec.quiesceAfterSecs`/`spec.autoSplitBytes`
+all silently sat unapplied on already-running pods before this landed;
+now every one of them triggers a real rolling restart too. Not gated
+behind `controlNodes` specifically — there was no clean way to restart
+*only* the newly-promoted ordinals anyway (the pod template is shared
+across every ordinal), so this is the simplest correct mechanism, not a
+narrowly-scoped one.
+
+**`ClusterApi::get_pod_ip` is this crate's first real consumer of the
+`pods: get/list/watch` RBAC grant** `deploy/operator/rbac.yaml` already
+carried (pre-provisioned for "the controller reads pod status/conditions"
+in general, never actually exercised before S-07d) — no RBAC change was
+needed. It reads a promoted ordinal's live `status.podIP` via the
+Kubernetes API, **not a DNS lookup** — seeded via `FakeClusterApi::
+seed_pod_ip` in tests, unlike a raw `tokio::net::lookup_host` call, which
+would bypass the seam entirely and make this untestable without a real
+cluster. See ADR 0060's own "The `SocketAddr` gap" subsection for why this
+lookup exists at all (a real, pre-existing `animusd` admin-API limitation
+this crate works around rather than fixes).
+
+**`FakeAdminClient` (S-07d additions, `fakes.rs`)**: `seed_control_voters`/
+`control_voters()` back `GET /admin/control/members` with a plain
+`BTreeSet<String>` a test can seed and later inspect (grown in place by a
+successful fake `POST .../member/add`, unlike the drain-status queue
+above, which is consumed); `mark_ordinal_ready_both(ordinal)` makes
+`GET /admin/config` report `role: "combined"` for that ordinal
+specifically — `animusd`'s own real `AdminInfo.role` literal (never
+`"both"`, which is `desired::cluster_config::NodeRole::Both`'s unrelated
+spelling on the generated `cluster.json`; a 2026-09-06 fix corrected both
+this fake and `controller::ordinal_reports_role_both`'s own comparison
+after the mismatch made growth wait forever in CI, see this file's own
+S-07d section and ADR 0060's own "2026-09-06 correction" amendment) —
+parsed out of the request URL's own `{name}-{ordinal}.` host prefix via
+`ordinal_from_url`, since every admin call here is already addressed
+per-ordinal that way — and `"data"` for every other; `fail_control_members`
+makes `GET /admin/control/members` fail for every ordinal, exercising
+`advance_control_growth`'s "can't observe live truth" stall-visibility
+path; `fail_add_control_
+member_for_ordinal(ordinal)` makes `POST .../member/add` refuse when
+dialed against that one ordinal's own admin port specifically — the
+retry-a-different-voter test needs a *per-ordinal* failure, not the
+blanket `fail_drain`/`fail_remove` shape the pre-existing scale-down tests
+use.
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
-own `#[cfg(test)] mod tests` (51 tests total as of ADR 0061 rung E1's
-landing): golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
-`ConfigMap` contents (including the no-port-striding invariant and a
-scale-up byte-for-byte-preserves-existing-entries regression), `Service`
-port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable storage
-shape, and `NetworkPolicy` selector/rule structure. **No cluster is
-needed** — every test constructs an `AnimusCluster` via `test_support::
-test_cluster` and asserts on the returned typed object or its JSON, never
-against a live API server.
+own `#[cfg(test)] mod tests` (208 tests total as of the 2026-09-06
+role-literal fix above):
+golden-JSON assertions for the `ClusterConfig`/`entrypoint.sh`
+`ConfigMap` contents (including the no-port-striding invariant, a
+scale-up byte-for-byte-preserves-existing-entries regression, and, since
+S-04 PR 3, the `--s3-credentials`-file-writing preamble/flags, and since
+S-07b, the non-S3 `backupStore`/`segmentStore` flag emission and its
+"whichever of `spec.s3` or the top-level field is set" precedence),
+`Service` port sets, `StatefulSet` probe paths/ports and ephemeral-vs-durable
+storage shape (plus the `spec.s3` `Secret` mount), `NetworkPolicy`
+selector/ingress/egress rule structure (including the S-04 PR 3 egress
+additions: baseline intra+DNS on every cluster, an S3 rule only when
+`spec.s3` is set), and, since S-07c, `PodDisruptionBudget`
+`maxUnavailable` arithmetic covering every degenerate shape (`nodes == 1`,
+`controlNodes == 1`, `nodes < MAX_REPLICATION_FACTOR`, a larger
+`controlNodes` capped by the data-plane term and vice versa, scale
+invariance once past the replication factor) plus a golden-JSON shape
+test. **No cluster is needed** — every test constructs an
+`AnimusCluster` via `test_support::test_cluster` and asserts on the
+returned typed object or its JSON, never against a live API server.
+`s3_uri::tests` covers the standalone URI parser (`src/s3_uri.rs`)
+directly.
 
 - **`src/controller.rs` has its own fake-kube-client harness now** (ADR
   0061 rung E1, `crate::fakes`, `#[cfg(test)]` only). `controller.rs`'s two
   live-cluster boundaries — the `kube::Api` calls and the `AdminClient`
   admin-port HTTP calls — are each behind a small `#[async_trait]` trait
   (`cluster_api::ClusterApi`, `admin_client::AdminOps`); `Context`,
-  `reconcile`, `apply_children`, `control_nodes_changed`, and
-  `drain_and_remove_node` are all generic over both. Production (`run()`)
+  `reconcile`, `apply_children`, `previous_applied_control_nodes`,
+  `drain_and_remove_node`, and, since S-07d, `advance_control_growth`/
+  `add_control_voter` are all generic over both. Production (`run()`)
   wires the real implementors (`RealClusterApi`, `AdminClient`); tests wire
   `fakes::{FakeClusterApi, FakeAdminClient}`, small in-memory
   record-and-serve stores (see their own doc for exactly what they do and
@@ -330,22 +747,56 @@ against a live API server.
   the admin-port client is deliberately not built on `kube::Client`, so a
   `kube`-specific mock would only ever cover half of it).
   `controller::tests` (in `src/controller.rs`) covers: a fresh cluster's
-  reconcile applying all five children in the right order; that an
+  reconcile applying all six children in the right order; that an
   unchanged cluster's reconcile still re-applies every child (pinned as the
   actual, deliberate behavior — `apply_children` never diffs against
   previously-applied state, so this is an idempotent re-apply, not a
-  no-op); `control_nodes_changed` detecting a real change, no change, and
-  "no prior `ConfigMap` yet"; `drain_and_remove_node`'s sequence on both
-  the immediate-success path and the **bounded** never-completes path
-  (`#[tokio::test(start_paused = true)]`'s virtual clock resolves the 120
-  x 5s poll budget without real wall-clock wait); reconcile-level
-  scale-down sequencing, both the highest-ordinal-first happy path and
-  stop-on-first-drain-failure; the immutable-`controlNodes`-change
-  refusal end to end; and, since ADR 0064 commit 3, `spec.tls`: a
-  `Certificate` applied as a sixth child for the `certManager` shape and
+  no-op); `previous_applied_control_nodes` reading the prior applied value
+  (changed or not) and "no prior `ConfigMap` yet"; `drain_and_remove_node`'s
+  sequence on both the immediate-success path and the **bounded**
+  never-completes path (`#[tokio::test(start_paused = true)]`'s virtual
+  clock resolves the 120 x 5s poll budget without real wall-clock wait);
+  reconcile-level scale-down sequencing, both the highest-ordinal-first
+  happy path and stop-on-first-drain-failure; the `controlNodes`-decrease
+  refusal end to end; since S-07d, growth: the pure `next_growth_ordinal`/
+  `achieved_control_nodes`/`parse_voters` functions directly, plus
+  reconcile-level coverage of the config regenerating to the full target
+  immediately, waiting for the promoted pod's `role: "combined"` before
+  adding it (and the PDB using the achieved count meanwhile), a successful
+  add plus the retry-a-different-voter-ordinal path
+  (`fail_add_control_member_for_ordinal`), a stalled-discovery reconcile
+  still recording `ControlNodesGrowing` (`fail_control_members`), growth
+  completion clearing the condition, resuming from live truth after a
+  simulated controller restart
+  (the `ConfigMap`-already-matches-target case the condition exists for),
+  and `controlNodes` above `nodes` still rejected; since ADR 0064 commit 3, `spec.tls`: a
+  `Certificate` applied as a seventh child for the `certManager` shape and
   none for `secretName`; both/neither shapes set rejected with
   `TlsSpecInvalid`; and the scale-down drain sequence reading a seeded
-  `Secret`'s `ca.crt` and dialing `https://` once `spec.tls` is set.
+  `Secret`'s `ca.crt` and dialing `https://` once `spec.tls` is set; and,
+  since S-04 PR 3, `spec.s3`: a valid spec applies the same six children
+  (no seventh child, unlike `spec.tls.certManager`) with the `Secret` mount/
+  entrypoint flags/egress rule all present (`FakeClusterApi::
+  networkpolicy`, a new accessor this PR added alongside the pre-existing
+  `configmap`/`get_statefulset`); each `S3StoreSpec::validate` rejection
+  (neither store set, empty `credentialsSecretName`, malformed URI,
+  `insecure_http` without `allowInsecureHttp`) surfaces `S3SpecInvalid`
+  and strips `spec.s3` for that reconcile; and a cluster with no `spec.s3`
+  still gets the new baseline egress (intra + DNS) with no `s3` volume;
+  and, since S-07b, `spec.backupStore`/`spec.segmentStore`: a valid
+  non-S3 spec applies the same six children with the entrypoint flag
+  present and no S3 credentials wiring; `validate_store_spec` rejections
+  (`segmentStore: "cluster"`, a path outside `DATA_DIR`, a conflict with
+  `spec.s3`'s own store field) surface `StoreSpecInvalid` and strip both
+  fields for that reconcile; and a cluster with neither field set emits
+  no `--backup-store`/`--segment-store` flag at all; and, since S-07c,
+  `PodDisruptionBudget`: applied once per reconcile with an owner
+  reference and a selector matching the *actual* `statefulset::build`
+  output's own pod-template labels (`FakeClusterApi::poddisruptionbudget`,
+  a new accessor this PR added), and a scale-down transition
+  (`nodes: 5` → `nodes: 2, controlNodes: 2`) recomputing `maxUnavailable`
+  from the new desired spec rather than inheriting the prior shape's
+  looser value.
   **What this harness does not prove**: real
   `kube::Api` wire behavior against an actual API server (conflicts,
   admission, watch-driven requeue, real server-side-apply field-ownership
@@ -360,8 +811,11 @@ the script/workflow itself) is the `kind`-cluster-driven end-to-end
 complement `src/controller.rs`'s own unit-test gap above calls for: it
 creates a real `kind` cluster, loads a locally built `animusd` image into
 it, applies the CRD and an `AnimusCluster`, runs the controller **out of
-cluster** (`cargo run -p animus-operator -- run` against the kind
-kubeconfig — in-cluster deployment of the operator's own image, per
+cluster** — `cargo build -p animus-operator` synchronously, then the
+already-compiled binary is `exec`ed directly (`animus-operator run`
+against the kind kubeconfig, not backgrounded via `cargo run` — see
+"Building the operator binary before backgrounding it" below) — in-cluster
+deployment of the operator's own image, per
 `deploy/operator/deployment.yaml`, is exercised in production, not by this
 smoke), waits for the `StatefulSet` to reach 3/3 ready, resolves which specific
 pod `svc/{name}-dynamo` currently routes to (via that Service's own
@@ -369,8 +823,14 @@ pod `svc/{name}-dynamo` currently routes to (via that Service's own
 admin ports (issue #595 — see below), waits for that same pod's own `GET
 /admin/health` to report `200`, then exercises the real DynamoDB wire
 (`CreateTable`/`PutItem`/`GetItem`, asserting the item round-trips), scales
-to 4 nodes and confirms the item still reads back, then deletes the
-`AnimusCluster` and confirms every owned child is garbage-collected. Local
+to 4 nodes and confirms the item still reads back, then (S-07d) grows
+`spec.controlNodes` 3 → 4 (promoting the pod that scale-up just added into
+a real control voter), polls `GET /admin/control/members` for the new
+voter count, re-checks the PDB, re-resolves/re-forwards the serving pod
+(the config-hash-triggered rolling restart may have recycled it — see this
+file's own S-07d section), confirms the item still reads back once more,
+then deletes the `AnimusCluster` and confirms every owned child is
+garbage-collected. Local
 invocation (mirrors the script's own header comment):
 
 ```sh
@@ -385,6 +845,33 @@ TLS-intercepting egress proxy that can't reach Docker Hub's blob CDN (see
 the Dockerfile's own header) — CI and an ordinary developer machine just
 run `docker build -t animusd:e2e .` with `KIND_NODE_IMAGE` unset (kind
 picks its own pinned default).
+
+**Building the operator binary before backgrounding it (issue #661,
+S-07d).** The "run operator out-of-cluster" phase used to background
+`exec cargo run -p animus-operator -- run` directly, with nothing earlier
+in the script warming the build cache — `animus-operator` is the *only*
+`cargo` invocation in the whole script, so `kube-rs`'s dependency tree
+(`rustls`/`hyper`/`k8s-openapi`/`kube-runtime`) compiled from cold right
+there, easily a minute or more. Every line landing in `$OPERATOR_LOG`
+during that window was `cargo`'s own `Compiling ...` chatter — a process
+still compiling is indistinguishable, from the log alone, from one that's
+stuck, which is exactly what made a real bug (see this file's own S-07d
+growth entries and `docs/engineering-lessons.md`'s issue #661 entry on
+`ProdEnv::send_stream`) hard to diagnose from the log alone. The phase now
+runs `cargo build -p animus-operator --bin animus-operator` synchronously
+first (its own output goes straight to the terminal), resolves the
+compiled binary's path the same way cargo itself would
+(`${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/animus-operator`), and
+*then* backgrounds an `exec` of that binary directly. Every line that can
+land in `$OPERATOR_LOG` from this point on is genuine runtime tracing —
+confirmed `EnvFilter::from_default_env()` with `RUST_LOG=info` set does
+correctly enable `animus-operator::controller`'s own `info!` lines (e.g.
+`"reconciling AnimusCluster"`); the missing-tracing-lines symptom was
+never an `EnvFilter`/`fmt::init()` semantics bug. Side benefit: `exec`ing
+the binary directly means `$OPERATOR_PID` (from `$!`) is the real process,
+not a `cargo run` supervisor — `cleanup()`'s pre-existing belt-and-
+suspenders `pkill -f "animus-operator run"` is now clearly redundant
+(kept anyway, harmless).
 
 **Two script-side hardenings for a flake this smoke hit twice with the
 identical signature (issue #595)**, on top of the actual root-cause fix
@@ -419,6 +906,22 @@ section's own `CAP_SYS_RESOURCE` note below), so the TLS additions have
 been written carefully and `bash -n`-checked but have not been run end to
 end anywhere; the first real `e2e-kind-tls` CI run is this path's first
 real test.
+
+**`E2E_S3=1` (S-04 PR 3, CI's own `e2e-kind-s3` job) runs the same smoke
+plus a `spec.s3.backupStore` leg**: deploys a single-pod MinIO + Service
+into the kind cluster (the well-known `minio/minio` image), creates its
+bucket via a throwaway `minio/mc` pod, creates the `access_key_id`/
+`secret_access_key` credentials `Secret`, applies the `AnimusCluster` with
+`spec.s3.backupStore` pointing at `http://minio.<ns>.svc:9000`
+(`allowInsecureHttp: true` — a loopback-to-the-cluster dev target, never a
+real deployment shape), then exercises `CreateBackup`/`DescribeBackup`
+over the DynamoDB wire and checks `GET /admin/backup-store` reports
+`"kind":"s3"`; the plain-TCP path (`E2E_S3` unset) is byte-for-byte
+unchanged. Independent of `E2E_TLS` — either, both, or neither may be set.
+**UNVERIFIED in this repository's sandboxed dev environment**, same
+`CAP_SYS_RESOURCE` reason as `E2E_TLS` above — written carefully and
+`bash -n`-checked but never run end to end anywhere; the first real
+`e2e-kind-s3` CI run is this leg's first real test.
 
 **A sandboxed dev/build host can be structurally unable to run this at
 all — not a bug in this script or the operator.** `kind`'s own control

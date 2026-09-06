@@ -46,6 +46,7 @@ async fn start_cluster_with_tablet_ceilings(
         None,
         None,
         Duration::from_secs(600), // quiescence: irrelevant here, effectively off
+        false,                    // heartbeat batching: irrelevant here, off
         None,
         BackupStoreConfig::default(),
         None,

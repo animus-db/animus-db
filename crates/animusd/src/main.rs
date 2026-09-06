@@ -5,11 +5,11 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
-//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run node I of a cluster (one process)
+//! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
-//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] # run node I as a control-only node (ADR 0035 PR3)
+//! animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # run node I as a control-only node (ADR 0035 PR3)
 //! animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] # run node I as a data-only node (ADR 0035 PR4)
 //! animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--dynamo-auth PATH] # data-only seed/join (ADR 0035 PR5; ADR 0040 PR4 self-minting if --id is omitted)
 //! ```
@@ -99,6 +99,22 @@
 //! change-consumer sweep interval — issue #302 fix) is rejected at parse
 //! time**, since it can reopen the stale-veto quiescence race the fix
 //! closes; see that constant's own doc.
+//!
+//! `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02 PR 2
+//! shipped the mechanism off by default; PR 3, the cutover, flips the
+//! default ON) opts every data-plane CP group into the per-node
+//! [`animus_cp_data::heartbeat_batch::HeartbeatBatcher`], coalescing every
+//! co-hosted group's own bare heartbeat toward the same destination into
+//! one physical wire frame per destination per heartbeat interval instead
+//! of one frame per group. **Defaults ON at `main::DEFAULT_HEARTBEAT_BATCH`
+//! (`true`)** — see that constant's own doc for the evidence behind this
+//! default; `--no-heartbeat-batch` (or `cluster_settings.heartbeat_batch:
+//! false`) restores byte-identical pre-batcher behavior. The flag threads
+//! through the **identical** wrapper chain and reaches the **identical**
+//! set of entry points `--quiesce-after` does — same gaps
+//! (`--cluster-control`/`--cluster-data`, the standalone `control`/`join`
+//! subcommands), same `animusd data --config FILE` route via
+//! `cluster_settings.heartbeat_batch`.
 //!
 //! **`cluster_settings` (S-06)**: a `ClusterConfig` file (`--config FILE`)
 //! may also carry a `cluster_settings` section — the same auto-split/
@@ -250,11 +266,11 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
-    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH] [--quiesce-after SECS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
+    animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral]\n  \
-    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH] [--backup-store cluster|fs:PATH]\n  \
+    animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
     animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]";
 
@@ -373,6 +389,26 @@ async fn run(args: &[String]) -> Result<(), String> {
     // this file's own module doc for the full knob description and
     // `animusd::BackupStoreConfig`'s doc for the durability trade-off.
     let mut backup_store: Option<String> = None;
+    // `--s3-credentials PATH` (S-04 PR 2): the static access-key-id/secret
+    // pair an `s3://...` `--segment-store`/`--backup-store` value needs —
+    // see `S3CredentialsFile`'s own doc for the file shape and
+    // `resolve_s3_credentials` for the `ANIMUS_S3_ACCESS_KEY_ID`/
+    // `ANIMUS_S3_SECRET_ACCESS_KEY` environment-variable fallback this flag
+    // takes precedence over. Absent and no credentials in the environment
+    // either is only an error once an `s3://` store actually needs one.
+    let mut s3_credentials_path: Option<String> = None;
+    // `--allow-insecure-s3` (S-04 PR 2): the explicit opt-in a non-loopback
+    // `insecure_http=true` `s3://` endpoint needs — see `parse_s3_uri`'s own
+    // doc. Never required for a loopback (MinIO/localstack dev) endpoint.
+    let mut allow_insecure_s3 = false;
+    // `--export-s3-endpoint`/`--export-s3-region` (ADR 0068 §2, S-05): this
+    // node's S3 connection parameters for the export **customer**-bucket
+    // store — see `resolve_export_s3`'s own doc. Reaches `--config/--node`
+    // only (a documented gap on `--cluster N`/`--cluster-control`+
+    // `--cluster-data`/`control`/`data`/`join`, mirroring `--segment-store`/
+    // `--backup-store`'s own partial CLI reach).
+    let mut export_s3_endpoint: Option<String> = None;
+    let mut export_s3_region: Option<String> = None;
     // `--quiesce-after SECS` (ADR 0044 phase-1 PR7): opts every data-plane CP
     // group into quiescence once it has had no local activity for this long
     // — `0` disables it entirely. Defaults ON (`DEFAULT_QUIESCE_AFTER_SECS`)
@@ -380,6 +416,18 @@ async fn run(args: &[String]) -> Result<(), String> {
     // own doc for why (a maintainer-reviewable call, flagged there and in
     // the delivery PR body, not a settled operational fact).
     let mut quiesce_after: Option<u64> = None;
+    // `--heartbeat-batch` / `--no-heartbeat-batch` (ADR 0044 phase 2 —
+    // C-02 PR 2 shipped it off by default; PR 3, this cutover, flips the
+    // default ON): opts every data-plane CP group into the per-node
+    // heartbeat batcher. Both are bare boolean flags (no value — the
+    // batcher's own flush cadence is fixed at `RaftCore::
+    // heartbeat_interval`, so there is no companion duration to parse).
+    // `--heartbeat-batch` is now a no-op restating the default, kept for
+    // explicit/scripted invocations and back-compat; `--no-heartbeat-batch`
+    // is the opt-out an operator can still reach if the mechanism ever
+    // needs to be turned off in the field. See `animusd::config::
+    // ClusterSettings::heartbeat_batch`'s own doc for the full mechanism.
+    let mut heartbeat_batch: Option<bool> = None;
     // `--throttle-read-units N` / `--throttle-write-units N` (ADR 0065
     // §5(a), W-08 step 4): the cluster-wide default read/write
     // capacity-units budget applied to any table that has not set its own
@@ -479,9 +527,21 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--backup-store" => {
                 backup_store = Some(parse_next(&mut it, "--backup-store")?);
             }
+            "--s3-credentials" => {
+                s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
+            }
+            "--allow-insecure-s3" => allow_insecure_s3 = true,
+            "--export-s3-endpoint" => {
+                export_s3_endpoint = Some(parse_next(&mut it, "--export-s3-endpoint")?);
+            }
+            "--export-s3-region" => {
+                export_s3_region = Some(parse_next(&mut it, "--export-s3-region")?);
+            }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
+            "--heartbeat-batch" => heartbeat_batch = Some(true),
+            "--no-heartbeat-batch" => heartbeat_batch = Some(false),
             "--throttle-read-units" => {
                 throttle_read_units = Some(parse_next(&mut it, "--throttle-read-units")?);
             }
@@ -521,6 +581,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         auto_split_ops_rate,
         orphan_sweep_after_secs: orphan_sweep_after,
         quiesce_after_secs: quiesce_after,
+        heartbeat_batch,
         stream_seal_bytes,
         stream_seal_age_secs,
         stream_retention_secs,
@@ -538,8 +599,23 @@ async fn run(args: &[String]) -> Result<(), String> {
     let stream_retention = cli_cluster_settings
         .stream_retention_secs
         .map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
-    let segment_store_config = parse_segment_store(segment_store.as_deref())?;
-    let backup_store_config = parse_backup_store(backup_store.as_deref())?;
+    let s3_credentials = resolve_s3_credentials(s3_credentials_path.as_deref())?;
+    let segment_store_config = parse_segment_store(
+        segment_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
+    let backup_store_config = parse_backup_store(
+        backup_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
+    let export_s3_config = resolve_export_s3(
+        export_s3_endpoint.as_deref(),
+        export_s3_region.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
     let quiesce_after = quiesce_after_duration(cli_cluster_settings.quiesce_after_secs);
     validate_quiesce_after(quiesce_after)?;
     let dynamo_auth_flag = dynamo_auth_path
@@ -596,6 +672,7 @@ async fn run(args: &[String]) -> Result<(), String> {
                 backup_store_config,
                 advertise_host,
                 tls_flag,
+                export_s3_config.clone(),
             )
             .await
         }
@@ -621,6 +698,9 @@ async fn run(args: &[String]) -> Result<(), String> {
                 segment_store_config,
                 stream_retention,
                 quiesce_after,
+                cli_cluster_settings
+                    .heartbeat_batch
+                    .unwrap_or(DEFAULT_HEARTBEAT_BATCH),
                 dynamo_auth_flag.map(|c| std::sync::Arc::new(c.credentials)),
                 backup_store_config,
                 advertise_host,
@@ -680,6 +760,34 @@ fn quiesce_after_duration(secs: Option<u64>) -> Duration {
 /// mechanism itself, which is correct at any threshold `> 0`.
 const DEFAULT_QUIESCE_AFTER_SECS: u64 = 5;
 
+/// **Default ON** when `--heartbeat-batch`/`--no-heartbeat-batch` is
+/// omitted and `cluster_settings.heartbeat_batch` is absent from a config
+/// file (ADR 0044 phase 2's cutover, C-02 PR 3) — every data-plane CP group
+/// gets the per-node [`animus_cp_data::heartbeat_batch::HeartbeatBatcher`]
+/// from the moment it is hosted, amortizing every co-hosted group's own
+/// bare heartbeat toward the same destination into one physical wire frame
+/// per destination per `RaftCore::heartbeat_interval` tick. `--no-
+/// heartbeat-batch` (or `cluster_settings.heartbeat_batch: false`) restores
+/// byte-identical pre-batcher behavior — one frame per group per tick — for
+/// an operator who needs the mechanism switch in the field; the mechanism
+/// itself is unchanged from C-02 PR 2, this only flips which behavior a
+/// caller gets with no flag at all.
+///
+/// **Why default-ON rather than staying opt-in**: the mechanism (C-02 PR 2)
+/// and every per-group invariant built on top of it are exercised by a
+/// seed-reproducible `SimEnv` fault-injection corpus at depth
+/// (`crates/animus-cp-data/tests/heartbeat_batch_corpus.rs`,
+/// `ANIMUS_HEARTBEAT_SEEDS`) — frame-vs-logical scaling, election timers/
+/// term/commit index preserved per group under batching, a genuine
+/// partition losing a whole batched frame, a lossy-but-connected link, an
+/// unknown group in a received frame, and leader/follower kill converging —
+/// plus a real-thread `ProdEnv` liveness regression proving the batched
+/// timers hold under real scheduling (`tests/heartbeat_batch_liveness.rs`).
+/// The whole `cargo test --workspace` / `prod-liveness-*` suite set passes
+/// unmodified with batching on by default — no destabilization was found.
+/// See ADR 0044's 2026-09-06 phase-2-cutover amendment for the full record.
+const DEFAULT_HEARTBEAT_BATCH: bool = true;
+
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
 /// [`animusd::StreamSealKnobs::default`]'s own field when omitted.
@@ -718,15 +826,26 @@ fn parse_seed_arg(seed_arg: &str) -> Result<Vec<String>, String> {
 }
 
 /// [`animusd::SegmentStoreConfig`] from the optional `--segment-store` CLI
-/// value: absent selects the default `ClusterSegmentStore`; `dir:PATH` (the
-/// only recognized form) opts into a bare `FsSegmentStore` at `PATH`.
-fn parse_segment_store(value: Option<&str>) -> Result<animusd::SegmentStoreConfig, String> {
+/// value: absent selects the default `ClusterSegmentStore`; `dir:PATH` opts
+/// into a bare `FsSegmentStore` at `PATH`; `s3://bucket[/prefix]?endpoint=...`
+/// (S-04 PR 2) opts into a real S3-compatible bucket — see [`parse_s3_uri`]'s
+/// own doc for the query-key shape and `s3_credentials`/`allow_insecure_s3`
+/// below for how credentials and the plaintext-HTTP gate are resolved.
+fn parse_segment_store(
+    value: Option<&str>,
+    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    allow_insecure_s3: bool,
+) -> Result<animusd::SegmentStoreConfig, String> {
     match value {
         None => Ok(animusd::SegmentStoreConfig::default()),
+        Some(v) if v.starts_with("s3://") => Ok(animusd::SegmentStoreConfig::S3(
+            resolve_s3_store_config(v, s3_credentials, allow_insecure_s3, "--segment-store")?,
+        )),
         Some(v) => match v.strip_prefix("dir:") {
             Some(path) if !path.is_empty() => Ok(animusd::SegmentStoreConfig::Fs(path.into())),
             _ => Err(format!(
-                "--segment-store {v:?}: only `dir:PATH` is recognized"
+                "--segment-store {v:?}: only `dir:PATH` or `s3://bucket[/prefix]?endpoint=...` \
+                 is recognized"
             )),
         },
     }
@@ -735,20 +854,334 @@ fn parse_segment_store(value: Option<&str>) -> Result<animusd::SegmentStoreConfi
 /// [`animusd::BackupStoreConfig`] from the optional `--backup-store` CLI
 /// value (ADR 0059 §1): absent or the literal `cluster` selects the default
 /// K-replicated `ClusterSegmentStore`; `fs:PATH` opts into a bare
-/// `FsSegmentStore` at `PATH` instead — the same two forms
-/// [`parse_segment_store`] accepts, plus the explicit `cluster` keyword the
-/// ADR itself spells the knob with (`--segment-store` has no such keyword —
-/// omitting it is that store's only way to select the default).
-fn parse_backup_store(value: Option<&str>) -> Result<animusd::BackupStoreConfig, String> {
+/// `FsSegmentStore` at `PATH` instead — the same forms [`parse_segment_store`]
+/// accepts (plus the explicit `cluster` keyword the ADR itself spells the
+/// knob with — `--segment-store` has no such keyword, omitting it is that
+/// store's only way to select the default), including `s3://...` (S-04 PR 2,
+/// see [`parse_s3_uri`]).
+fn parse_backup_store(
+    value: Option<&str>,
+    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    allow_insecure_s3: bool,
+) -> Result<animusd::BackupStoreConfig, String> {
     match value {
         None => Ok(animusd::BackupStoreConfig::default()),
         Some("cluster") => Ok(animusd::BackupStoreConfig::Cluster),
+        Some(v) if v.starts_with("s3://") => Ok(animusd::BackupStoreConfig::S3(
+            resolve_s3_store_config(v, s3_credentials, allow_insecure_s3, "--backup-store")?,
+        )),
         Some(v) => match v.strip_prefix("fs:") {
             Some(path) if !path.is_empty() => Ok(animusd::BackupStoreConfig::Fs(path.into())),
             _ => Err(format!(
-                "--backup-store {v:?}: only `cluster` or `fs:PATH` is recognized"
+                "--backup-store {v:?}: only `cluster`, `fs:PATH`, or \
+                 `s3://bucket[/prefix]?endpoint=...` is recognized"
             )),
         },
+    }
+}
+
+/// Parse an `s3://...` URI (already stripped of nothing — `flag_name` is
+/// only used to name the offending flag in an error message) and combine it
+/// with an already-resolved credential into a full [`animusd::S3StoreConfig`]
+/// — shared by [`parse_segment_store`]/[`parse_backup_store`]. A missing
+/// credential is its own distinct error naming both sourcing options, never
+/// silently defaulted or panicked on.
+fn resolve_s3_store_config(
+    v: &str,
+    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    allow_insecure_s3: bool,
+    flag_name: &str,
+) -> Result<animusd::S3StoreConfig, String> {
+    let uri = parse_s3_uri(v, allow_insecure_s3)?;
+    let credentials = s3_credentials.cloned().ok_or_else(|| {
+        format!(
+            "{flag_name} {v:?}: S3 credentials are required — pass --s3-credentials PATH or set \
+             the ANIMUS_S3_ACCESS_KEY_ID/ANIMUS_S3_SECRET_ACCESS_KEY environment variables"
+        )
+    })?;
+    Ok(animusd::S3StoreConfig {
+        bucket: uri.bucket,
+        prefix: uri.prefix,
+        endpoint: uri.endpoint,
+        region: uri.region,
+        insecure_http: uri.insecure_http,
+        credentials,
+    })
+}
+
+/// The parsed (credential-free) shape of an `s3://...` store URI —
+/// `s3://<bucket>[/<prefix>]?endpoint=<scheme://host[:port]>&region=<region>
+/// [&path_style=true][&insecure_http=true]` (the ADR 0059 amendment's own
+/// query-key shape). Query keys, all optional except `endpoint`:
+///
+/// - `endpoint` (**required**) — the S3-compatible endpoint to dial,
+///   `scheme://host[:port]`. Its own `http://`/`https://` prefix must agree
+///   with `insecure_http` (see below) — this store never infers a TLS
+///   decision from a scheme string alone (that inference is exactly what a
+///   `http://` typo silently downgrading a production config to plaintext
+///   would look like), only from an explicit `insecure_http=true`.
+/// - `region` — defaults to `"us-east-1"` if omitted (harmless against a
+///   real AWS bucket only ever addressed path-style, and MinIO/localstack
+///   ignore the region entirely).
+/// - `path_style` — this client only ever addresses path-style
+///   (`animus_s3::client::S3Config`'s own documented scope), so the only
+///   accepted value is `true` (or omit the key entirely); `path_style=false`
+///   (virtual-hosted addressing) is rejected as unimplemented rather than
+///   silently ignored.
+/// - `insecure_http` — `true` allows a plain-HTTP endpoint. Refused outright
+///   unless the endpoint's own host is loopback (`localhost`/`127.0.0.0/8`/
+///   `::1`) **or** the caller also passed `--allow-insecure-s3`
+///   (`allow_insecure_s3`) — see the ADR amendment's own TLS section: a real
+///   deployment's `s3://` config always negotiates TLS, and this gate exists
+///   so a plaintext endpoint reaches production only through an explicit,
+///   deliberate two-flag opt-in, never a copy-pasted dev URI.
+fn parse_s3_uri(v: &str, allow_insecure_s3: bool) -> Result<S3UriParts, String> {
+    let rest = v
+        .strip_prefix("s3://")
+        .ok_or_else(|| format!("{v:?}: not an s3:// URI"))?;
+    let (path_part, query_part) = rest.split_once('?').unwrap_or((rest, ""));
+    let (bucket, prefix) = match path_part.split_once('/') {
+        Some((b, p)) if !p.is_empty() => (b, Some(p.trim_end_matches('/').to_string())),
+        _ => (path_part.trim_end_matches('/'), None),
+    };
+    if bucket.is_empty() {
+        return Err(format!("{v:?}: s3:// URI needs a bucket name"));
+    }
+
+    let mut endpoint: Option<String> = None;
+    let mut region: Option<String> = None;
+    let mut insecure_http = false;
+    for pair in query_part.split('&').filter(|s| !s.is_empty()) {
+        let (key, val) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("{v:?}: malformed query parameter {pair:?} (want key=value)"))?;
+        match key {
+            "endpoint" => endpoint = Some(val.to_string()),
+            "region" => region = Some(val.to_string()),
+            "path_style" => {
+                if val != "true" {
+                    return Err(format!(
+                        "{v:?}: path_style={val:?} is not supported — this client only \
+                         implements path-style S3 addressing (omit the parameter, or pass \
+                         path_style=true)"
+                    ));
+                }
+            }
+            "insecure_http" => insecure_http = val == "true",
+            other => return Err(format!("{v:?}: unknown s3:// query parameter {other:?}")),
+        }
+    }
+
+    let endpoint = endpoint
+        .ok_or_else(|| format!("{v:?}: s3:// URI requires ?endpoint=scheme://host[:port]"))?;
+    let region = region.unwrap_or_else(|| "us-east-1".to_string());
+
+    let endpoint_is_http = endpoint.starts_with("http://");
+    let endpoint_is_https = endpoint.starts_with("https://");
+    if !endpoint_is_http && !endpoint_is_https {
+        return Err(format!(
+            "{v:?}: endpoint {endpoint:?} must start with http:// or https://"
+        ));
+    }
+    if insecure_http && !endpoint_is_http {
+        return Err(format!(
+            "{v:?}: insecure_http=true requires an http:// endpoint (got {endpoint:?})"
+        ));
+    }
+    if !insecure_http && !endpoint_is_https {
+        return Err(format!(
+            "{v:?}: an http:// endpoint requires insecure_http=true (got {endpoint:?})"
+        ));
+    }
+    if insecure_http {
+        let host = endpoint
+            .split_once("://")
+            .map_or(endpoint.as_str(), |(_, h)| h);
+        if !is_loopback_host(host) && !allow_insecure_s3 {
+            return Err(format!(
+                "{v:?}: insecure_http=true against a non-loopback endpoint {endpoint:?} is \
+                 refused unless --allow-insecure-s3 is also given"
+            ));
+        }
+    }
+
+    Ok(S3UriParts {
+        bucket: bucket.to_string(),
+        prefix,
+        endpoint,
+        region,
+        insecure_http,
+    })
+}
+
+/// [`parse_s3_uri`]'s own return shape — see that function's doc.
+struct S3UriParts {
+    bucket: String,
+    prefix: Option<String>,
+    endpoint: String,
+    region: String,
+    insecure_http: bool,
+}
+
+/// Whether `host` (a bare hostname, no scheme, `:port` stripped by the
+/// caller) is loopback — `localhost`, `127.0.0.0/8`, or `::1`. Used only to
+/// gate `insecure_http=true` against a non-loopback endpoint (see
+/// [`parse_s3_uri`]'s own doc); deliberately conservative (a hostname that
+/// merely *resolves* to loopback at connect time, e.g. a `/etc/hosts` alias,
+/// does not match here — the gate is meant to catch an accidental
+/// `s3://prod-bucket?endpoint=http://real-s3-host` copy-paste, not to be a
+/// perfectly precise network-topology check).
+fn is_loopback_host(host: &str) -> bool {
+    let host_only = host.split(':').next().unwrap_or(host);
+    host_only == "localhost" || host_only == "::1" || host_only.starts_with("127.")
+}
+
+/// Resolve `--export-s3-endpoint`/`--export-s3-region` (ADR 0068 §2) into
+/// this node's [`animusd::ExportS3Config`], reusing the identical scheme/
+/// loopback gate [`parse_s3_uri`] already enforces for `--segment-store`/
+/// `--backup-store s3://` endpoints, and the same resolved `s3_credentials`
+/// (`--s3-credentials`/`ANIMUS_S3_ACCESS_KEY_ID`+`ANIMUS_S3_SECRET_ACCESS_KEY`)
+/// both stores already use — see `ExportS3Config`'s own doc for why a
+/// second, independent credential source was rejected. `None` when neither
+/// flag is given (S3 export stays unconfigured on this node, and
+/// `ExportTableToPointInTime` fails with a clear message); both flags must
+/// be given together.
+fn resolve_export_s3(
+    endpoint: Option<&str>,
+    region: Option<&str>,
+    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    allow_insecure_s3: bool,
+) -> Result<Option<animusd::ExportS3Config>, String> {
+    let (endpoint, region) = match (endpoint, region) {
+        (None, None) => return Ok(None),
+        (Some(e), Some(r)) => (e, r),
+        _ => {
+            return Err(
+                "--export-s3-endpoint and --export-s3-region must be given together".into(),
+            );
+        }
+    };
+    let endpoint_is_http = endpoint.starts_with("http://");
+    let endpoint_is_https = endpoint.starts_with("https://");
+    if !endpoint_is_http && !endpoint_is_https {
+        return Err(format!(
+            "--export-s3-endpoint {endpoint:?} must start with http:// or https://"
+        ));
+    }
+    let insecure_http = endpoint_is_http;
+    if insecure_http {
+        let host = endpoint.split_once("://").map_or(endpoint, |(_, h)| h);
+        if !is_loopback_host(host) && !allow_insecure_s3 {
+            return Err(format!(
+                "--export-s3-endpoint {endpoint:?} is http:// against a non-loopback host — \
+                 refused unless --allow-insecure-s3 is also given"
+            ));
+        }
+    }
+    let credentials = s3_credentials.cloned().ok_or_else(|| {
+        "--export-s3-endpoint/--export-s3-region need S3 credentials — pass \
+         --s3-credentials PATH or set ANIMUS_S3_ACCESS_KEY_ID/ANIMUS_S3_SECRET_ACCESS_KEY"
+            .to_string()
+    })?;
+    Ok(Some(animusd::ExportS3Config {
+        endpoint: endpoint.to_string(),
+        region: region.to_string(),
+        insecure_http,
+        credentials,
+    }))
+}
+
+/// One S3 credential (S-04 PR 2): `access_key_id` plus exactly one of
+/// `secret_access_key_file`/`secret_access_key_env` — file/env indirection
+/// only, mirroring ADR 0064's `tls` section's own cert/key-**path**
+/// precedent (never an inline secret in a config file, unlike
+/// `dynamo_auth`'s in-`ClusterConfig` static credential map, which this
+/// deliberately does not follow — see `main.rs`'s own module doc for why
+/// this file is a separate, standalone JSON document rather than a new
+/// `ClusterConfig` field). Loaded from `--s3-credentials PATH`.
+#[derive(serde::Deserialize)]
+struct S3CredentialsFile {
+    access_key_id: String,
+    #[serde(default)]
+    secret_access_key_file: Option<String>,
+    #[serde(default)]
+    secret_access_key_env: Option<String>,
+}
+
+impl S3CredentialsFile {
+    /// Resolve the secret via whichever indirection this file names, then
+    /// build the [`animus_s3::sigv4::Credentials`] pair.
+    ///
+    /// # Errors
+    /// A message naming the missing/conflicting field — never a panic —
+    /// when neither or both of `secret_access_key_file`/
+    /// `secret_access_key_env` are set, the named file can't be read, or the
+    /// named environment variable isn't set.
+    fn resolve(&self) -> Result<animus_s3::sigv4::Credentials, String> {
+        let secret = match (&self.secret_access_key_file, &self.secret_access_key_env) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "--s3-credentials: specify secret_access_key_file or secret_access_key_env, \
+                     not both"
+                        .to_string(),
+                );
+            }
+            (Some(path), None) => std::fs::read_to_string(path)
+                .map_err(|e| format!("reading s3 secret_access_key_file {path}: {e}"))?
+                .trim()
+                .to_string(),
+            (None, Some(var)) => std::env::var(var)
+                .map_err(|_| format!("s3 secret_access_key_env {var:?} is not set"))?,
+            (None, None) => {
+                return Err(
+                    "--s3-credentials: one of secret_access_key_file/secret_access_key_env is \
+                     required"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(animus_s3::sigv4::Credentials::new(
+            self.access_key_id.clone(),
+            secret,
+        ))
+    }
+}
+
+/// Resolve S3 credentials (S-04 PR 2) for `--segment-store`/`--backup-store
+/// s3://...`: a `--s3-credentials PATH` file (see [`S3CredentialsFile`]) if
+/// given, else the `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY`
+/// environment variables, else `None` — meaning "no credentials configured
+/// at all," which is only an error once an `s3://` store actually needs one
+/// (`resolve_s3_store_config`'s own error, not this function's — a process
+/// with neither store set to `s3://` should never fail startup just because
+/// no S3 credentials happen to be configured).
+///
+/// # Errors
+/// The credentials file can't be read/parsed/resolved, or exactly one of
+/// the two `ANIMUS_S3_*` environment variables is set (an unambiguous
+/// operator mistake, not a "missing" case).
+fn resolve_s3_credentials(
+    path: Option<&str>,
+) -> Result<Option<animus_s3::sigv4::Credentials>, String> {
+    if let Some(path) = path {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading --s3-credentials {path}: {e}"))?;
+        let file: S3CredentialsFile = serde_json::from_str(&text)
+            .map_err(|e| format!("parsing --s3-credentials {path}: {e}"))?;
+        return file.resolve().map(Some);
+    }
+    match (
+        std::env::var("ANIMUS_S3_ACCESS_KEY_ID"),
+        std::env::var("ANIMUS_S3_SECRET_ACCESS_KEY"),
+    ) {
+        (Ok(id), Ok(secret)) => Ok(Some(animus_s3::sigv4::Credentials::new(id, secret))),
+        (Err(_), Err(_)) => Ok(None),
+        (Ok(_), Err(_)) => {
+            Err("ANIMUS_S3_ACCESS_KEY_ID is set but ANIMUS_S3_SECRET_ACCESS_KEY is not".to_string())
+        }
+        (Err(_), Ok(_)) => {
+            Err("ANIMUS_S3_SECRET_ACCESS_KEY is set but ANIMUS_S3_ACCESS_KEY_ID is not".to_string())
+        }
     }
 }
 
@@ -940,6 +1373,7 @@ fn resolve_cluster_settings(
     merge_field!(auto_split_ops_rate, "--auto-split-ops-rate");
     merge_field!(orphan_sweep_after_secs, "--orphan-sweep-after");
     merge_field!(quiesce_after_secs, "--quiesce-after");
+    merge_field!(heartbeat_batch, "--heartbeat-batch/--no-heartbeat-batch");
     merge_field!(stream_seal_bytes, "--stream-seal-bytes");
     merge_field!(stream_seal_age_secs, "--stream-seal-age");
     merge_field!(stream_retention_secs, "--stream-retention");
@@ -1002,6 +1436,7 @@ async fn run_single(
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
+    export_s3: Option<animusd::ExportS3Config>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
@@ -1039,6 +1474,7 @@ async fn run_single(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        settings.heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH),
         settings.auto_split_bytes,
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
@@ -1047,6 +1483,7 @@ async fn run_single(
         settings.throttle_write_units,
         settings.tablet_max_read_units,
         settings.tablet_max_write_units,
+        export_s3,
     )
     .await
     .map_err(|e| format!("failed to start node {index}: {e}"))?;
@@ -1106,6 +1543,10 @@ async fn run_control(args: &[String]) -> Result<(), String> {
     // `--cluster N` path does.
     let mut segment_store: Option<String> = None;
     let mut backup_store: Option<String> = None;
+    // `--s3-credentials PATH` / `--allow-insecure-s3` (S-04 PR 2) — see
+    // `run`'s own doc for both.
+    let mut s3_credentials_path: Option<String> = None;
+    let mut allow_insecure_s3 = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1123,11 +1564,24 @@ async fn run_control(args: &[String]) -> Result<(), String> {
             "--backup-store" => {
                 backup_store = Some(parse_next(&mut it, "--backup-store")?);
             }
+            "--s3-credentials" => {
+                s3_credentials_path = Some(parse_next(&mut it, "--s3-credentials")?);
+            }
+            "--allow-insecure-s3" => allow_insecure_s3 = true,
             other => return Err(format!("unknown control argument `{other}`")),
         }
     }
-    let segment_store_config = parse_segment_store(segment_store.as_deref())?;
-    let backup_store_config = parse_backup_store(backup_store.as_deref())?;
+    let s3_credentials = resolve_s3_credentials(s3_credentials_path.as_deref())?;
+    let segment_store_config = parse_segment_store(
+        segment_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
+    let backup_store_config = parse_backup_store(
+        backup_store.as_deref(),
+        s3_credentials.as_ref(),
+        allow_insecure_s3,
+    )?;
     let path = config_path.ok_or("control requires --config FILE")?;
     let index = node.ok_or("control requires --node I")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
@@ -1330,6 +1784,7 @@ async fn run_data_config(
         settings.auto_split_change_rate,
         settings.auto_split_ops_rate,
         quiesce_after,
+        settings.heartbeat_batch.unwrap_or(DEFAULT_HEARTBEAT_BATCH),
         stream_seal_knobs_val,
         // Same documented gap as `--backup-store` (ADR 0059 §1): no
         // `--segment-store` flag reaches `animusd data --config` yet.
@@ -1555,6 +2010,7 @@ async fn run_in_process_cluster(
     segment_store_config: animusd::SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<std::sync::Arc<BTreeMap<String, String>>>,
     backup_store_config: animusd::BackupStoreConfig,
     advertise_host: Option<String>,
@@ -1581,6 +2037,7 @@ async fn run_in_process_cluster(
         auto_split_change_rate,
         auto_split_ops_rate,
         quiesce_after,
+        heartbeat_batch,
         dynamo_auth,
         backup_store_config,
         throttle_read_units,
@@ -1781,7 +2238,7 @@ mod tests {
     #[test]
     fn backup_store_omitted_defaults_to_cluster() {
         assert_eq!(
-            parse_backup_store(None).expect("parses"),
+            parse_backup_store(None, None, false).expect("parses"),
             animusd::BackupStoreConfig::Cluster
         );
     }
@@ -1789,7 +2246,7 @@ mod tests {
     #[test]
     fn backup_store_accepts_the_literal_cluster_keyword() {
         assert_eq!(
-            parse_backup_store(Some("cluster")).expect("parses"),
+            parse_backup_store(Some("cluster"), None, false).expect("parses"),
             animusd::BackupStoreConfig::Cluster
         );
     }
@@ -1797,20 +2254,21 @@ mod tests {
     #[test]
     fn backup_store_accepts_fs_path() {
         assert_eq!(
-            parse_backup_store(Some("fs:/var/lib/animus/backups")).expect("parses"),
+            parse_backup_store(Some("fs:/var/lib/animus/backups"), None, false).expect("parses"),
             animusd::BackupStoreConfig::Fs("/var/lib/animus/backups".into())
         );
     }
 
     #[test]
     fn backup_store_rejects_an_empty_fs_path() {
-        let err = parse_backup_store(Some("fs:")).expect_err("an empty path must be rejected");
+        let err = parse_backup_store(Some("fs:"), None, false)
+            .expect_err("an empty path must be rejected");
         assert!(err.contains("--backup-store"), "{err}");
     }
 
     #[test]
     fn backup_store_rejects_garbage() {
-        let err = parse_backup_store(Some("nonsense"))
+        let err = parse_backup_store(Some("nonsense"), None, false)
             .expect_err("an unrecognized form must be rejected");
         assert!(err.contains("--backup-store"), "{err}");
         assert!(err.contains("nonsense"), "{err}");
@@ -1823,7 +2281,7 @@ mod tests {
         // the literal `cluster` keyword `--segment-store` has no equivalent
         // for) — the two knobs are NOT interchangeable syntax, even though
         // `BackupStoreConfig`/`SegmentStoreConfig` are shaped identically.
-        let err = parse_backup_store(Some("dir:/tmp/x"))
+        let err = parse_backup_store(Some("dir:/tmp/x"), None, false)
             .expect_err("the streams knob's own `dir:PATH` spelling must not be accepted here");
         assert!(err.contains("--backup-store"), "{err}");
     }
@@ -1837,14 +2295,16 @@ mod tests {
         // `SegmentStoreConfig` derives no `PartialEq` (pre-existing, not
         // grown here) — `matches!` instead of `assert_eq!`.
         assert!(matches!(
-            parse_segment_store(None).expect("parses"),
+            parse_segment_store(None, None, false).expect("parses"),
             animusd::SegmentStoreConfig::Cluster
         ));
     }
 
     #[test]
     fn segment_store_accepts_dir_path() {
-        match parse_segment_store(Some("dir:/var/lib/animus/segments")).expect("parses") {
+        match parse_segment_store(Some("dir:/var/lib/animus/segments"), None, false)
+            .expect("parses")
+        {
             animusd::SegmentStoreConfig::Fs(path) => {
                 assert_eq!(path, std::path::PathBuf::from("/var/lib/animus/segments"));
             }
@@ -1854,13 +2314,14 @@ mod tests {
 
     #[test]
     fn segment_store_rejects_an_empty_dir_path() {
-        let err = parse_segment_store(Some("dir:")).expect_err("an empty path must be rejected");
+        let err = parse_segment_store(Some("dir:"), None, false)
+            .expect_err("an empty path must be rejected");
         assert!(err.contains("--segment-store"), "{err}");
     }
 
     #[test]
     fn segment_store_rejects_garbage() {
-        let err = parse_segment_store(Some("nonsense"))
+        let err = parse_segment_store(Some("nonsense"), None, false)
             .expect_err("an unrecognized form must be rejected");
         assert!(err.contains("--segment-store"), "{err}");
     }
@@ -1870,9 +2331,276 @@ mod tests {
         // The converse of `backup_store_rejects_the_segment_store_dir_
         // spelling` above: `--segment-store` has no `cluster` keyword at
         // all (omitting the flag is its only way to select the default).
-        let err = parse_segment_store(Some("cluster"))
+        let err = parse_segment_store(Some("cluster"), None, false)
             .expect_err("`--segment-store` has no `cluster` keyword");
         assert!(err.contains("--segment-store"), "{err}");
+    }
+
+    // --- `s3://` (S-04 PR 2) ---------------------------------------------
+
+    fn test_creds() -> animus_s3::sigv4::Credentials {
+        animus_s3::sigv4::Credentials::new("AKIDTEST", "secret")
+    }
+
+    #[test]
+    fn segment_store_accepts_a_well_formed_s3_uri() {
+        let creds = test_creds();
+        match parse_segment_store(
+            Some("s3://my-bucket/prefix?endpoint=https://s3.example.com&region=us-west-2"),
+            Some(&creds),
+            false,
+        )
+        .expect("parses")
+        {
+            animusd::SegmentStoreConfig::S3(s3) => {
+                assert_eq!(s3.bucket, "my-bucket");
+                assert_eq!(s3.prefix.as_deref(), Some("prefix"));
+                assert_eq!(s3.endpoint, "https://s3.example.com");
+                assert_eq!(s3.region, "us-west-2");
+                assert!(!s3.insecure_http);
+                assert_eq!(s3.credentials, creds);
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_store_s3_with_no_prefix_and_default_region() {
+        let creds = test_creds();
+        match parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com"),
+            Some(&creds),
+            false,
+        )
+        .expect("parses")
+        {
+            animusd::SegmentStoreConfig::S3(s3) => {
+                assert_eq!(s3.bucket, "my-bucket");
+                assert_eq!(s3.prefix, None);
+                assert_eq!(s3.region, "us-east-1");
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_missing_endpoint() {
+        let creds = test_creds();
+        let err = parse_segment_store(Some("s3://my-bucket"), Some(&creds), false)
+            .expect_err("an s3:// URI with no ?endpoint= must be rejected");
+        assert!(err.contains("endpoint"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_missing_bucket() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://?endpoint=https://s3.example.com"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("an s3:// URI with no bucket must be rejected");
+        assert!(err.contains("bucket"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_missing_credentials() {
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com"),
+            None,
+            false,
+        )
+        .expect_err("an s3:// store with no resolvable credentials must be rejected");
+        assert!(err.contains("credentials"), "{err}");
+        assert!(err.contains("--s3-credentials"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_an_http_endpoint_without_insecure_http() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=http://127.0.0.1:9000"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("a plain http:// endpoint needs insecure_http=true");
+        assert!(err.contains("insecure_http"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_accepts_insecure_http_against_loopback() {
+        let creds = test_creds();
+        match parse_segment_store(
+            Some("s3://my-bucket?endpoint=http://127.0.0.1:9000&insecure_http=true"),
+            Some(&creds),
+            false,
+        )
+        .expect("a loopback endpoint needs no --allow-insecure-s3")
+        {
+            animusd::SegmentStoreConfig::S3(s3) => assert!(s3.insecure_http),
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_insecure_http_against_a_non_loopback_host_without_the_allow_flag() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=http://real-s3-host.example.com&insecure_http=true"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("a non-loopback insecure_http endpoint needs --allow-insecure-s3");
+        assert!(err.contains("--allow-insecure-s3"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_accepts_insecure_http_against_a_non_loopback_host_with_the_allow_flag() {
+        let creds = test_creds();
+        let cfg = parse_segment_store(
+            Some("s3://my-bucket?endpoint=http://real-s3-host.example.com&insecure_http=true"),
+            Some(&creds),
+            true,
+        )
+        .expect("--allow-insecure-s3 lifts the loopback restriction");
+        assert!(matches!(cfg, animusd::SegmentStoreConfig::S3(_)));
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_an_https_endpoint_with_insecure_http_true() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com&insecure_http=true"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("insecure_http=true requires an http:// endpoint");
+        assert!(err.contains("http://"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_path_style_false() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com&path_style=false"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("path_style=false is not implemented");
+        assert!(err.contains("path_style"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_an_unknown_query_key() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com&bogus=1"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("an unknown query key must be rejected");
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn backup_store_accepts_a_well_formed_s3_uri() {
+        let creds = test_creds();
+        let cfg = parse_backup_store(
+            Some("s3://backup-bucket/backups?endpoint=https://s3.example.com"),
+            Some(&creds),
+            false,
+        )
+        .expect("parses");
+        assert_eq!(
+            cfg,
+            animusd::BackupStoreConfig::S3(animusd::S3StoreConfig {
+                bucket: "backup-bucket".to_string(),
+                prefix: Some("backups".to_string()),
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                insecure_http: false,
+                credentials: creds,
+            })
+        );
+    }
+
+    #[test]
+    fn backup_store_s3_rejects_missing_credentials() {
+        let err = parse_backup_store(
+            Some("s3://backup-bucket?endpoint=https://s3.example.com"),
+            None,
+            false,
+        )
+        .expect_err("an s3:// backup store with no resolvable credentials must be rejected");
+        assert!(err.contains("--backup-store"), "{err}");
+        assert!(err.contains("credentials"), "{err}");
+    }
+
+    // --- `S3CredentialsFile`/`resolve_s3_credentials` (S-04 PR 2) ---------
+
+    #[test]
+    fn s3_credentials_resolve_via_secret_access_key_file() {
+        let dir = std::env::temp_dir().join(format!("animusd-s3-cred-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let secret_path = dir.join("secret");
+        std::fs::write(&secret_path, "shh\n").expect("write secret file");
+        let file = S3CredentialsFile {
+            access_key_id: "AKID".to_string(),
+            secret_access_key_file: Some(secret_path.to_string_lossy().to_string()),
+            secret_access_key_env: None,
+        };
+        let creds = file.resolve().expect("resolves via file");
+        assert_eq!(creds.access_key_id, "AKID");
+        // The trailing newline in the file is trimmed.
+        assert_eq!(creds, animus_s3::sigv4::Credentials::new("AKID", "shh"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s3_credentials_file_names_the_missing_env_var() {
+        let file = S3CredentialsFile {
+            access_key_id: "AKID".to_string(),
+            secret_access_key_file: None,
+            secret_access_key_env: Some("ANIMUS_S3_CREDS_TEST_DEFINITELY_UNSET".to_string()),
+        };
+        let err = file
+            .resolve()
+            .expect_err("an unset env var must be a named error");
+        assert!(
+            err.contains("ANIMUS_S3_CREDS_TEST_DEFINITELY_UNSET"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn s3_credentials_file_requires_exactly_one_secret_source() {
+        let neither = S3CredentialsFile {
+            access_key_id: "AKID".to_string(),
+            secret_access_key_file: None,
+            secret_access_key_env: None,
+        };
+        assert!(neither.resolve().is_err());
+
+        let both = S3CredentialsFile {
+            access_key_id: "AKID".to_string(),
+            secret_access_key_file: Some("/dev/null".to_string()),
+            secret_access_key_env: Some("SOME_VAR".to_string()),
+        };
+        let err = both
+            .resolve()
+            .expect_err("both sources set must be rejected");
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn resolve_s3_credentials_with_nothing_configured_is_none() {
+        // Only meaningful if the ambient environment doesn't happen to carry
+        // these — true for any sane CI/dev box, and this crate's own test
+        // suite never sets them outside this file's own scoped env tests.
+        if std::env::var("ANIMUS_S3_ACCESS_KEY_ID").is_ok() {
+            return;
+        }
+        assert!(resolve_s3_credentials(None).expect("no error").is_none());
     }
 
     // --- `resolve_cluster_settings` (S-06) --------------------------------

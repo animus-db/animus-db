@@ -10,5 +10,6 @@ pub mod crd;
 pub mod desired;
 #[cfg(test)]
 pub mod fakes;
+pub mod s3_uri;
 
 pub use crd::{AnimusCluster, AnimusClusterSpec, AnimusClusterStatus};

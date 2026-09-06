@@ -57,6 +57,10 @@
 //! - `POST /admin/credentials`         — `{id, secret, policy?, enabled?}` — create/redefine a credential (ADR 0066 §1/§2)
 //! - `POST /admin/credentials/rotate`  — `{id, new_secret, grace_secs}` — rotate a credential's secret with a dual-secret grace window
 //! - `POST /admin/credentials/revoke`  — `{id}` — revoke a credential outright
+//! - `GET  /admin/backup-store`        — this node's configured backup store (redacted), a bounded local object count/bytes, and the backup janitor's own live phase (ADR 0059 §1/§3, roadmap U-07)
+//! - `GET  /admin/ttl`                 — this node's own TTL reaper phase/cursor/counters, every TTL-enabled table, and the tablets this node leads of one (ADR 0051, roadmap U-07)
+//! - `GET  /admin/gc`                  — the DynamoDB Streams segment janitor's own live phase/counters (ADR 0042 §10/ADR 0043 §A9, roadmap U-07)
+//! - `GET  /admin/segment-store`       — this node's configured stream-segment store (redacted), the shard→replica placement it sees (`cluster` kind only), and a bounded local object count/bytes (ADR 0043 §A7b, roadmap U-07)
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -67,6 +71,7 @@ use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::Clock;
+use animus_env::Env;
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_node::host::AdminHost;
@@ -528,6 +533,18 @@ impl AdminHost for ClientCtx {
     }
     async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value) {
         action_revoke_credential(self, body).await
+    }
+    async fn backup_store_view(&self) -> Value {
+        backup_store_view(self).await
+    }
+    async fn ttl_view(&self) -> Value {
+        ttl_view(self)
+    }
+    async fn gc_view(&self) -> Value {
+        gc_view(self)
+    }
+    async fn segment_store_view(&self) -> Value {
+        segment_store_view(self).await
     }
 }
 
@@ -1341,6 +1358,13 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
                 Err(_) => Value::Null,
             }
         }
+        // An `ExportRow` (ADR 0068 §3) — same JSON passthrough convention
+        // as `Backup`/`Restore`/etc. above (no secret to redact — an S3
+        // bucket name/prefix is not a credential).
+        syskv::EntityKind::Export => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
+        // An `ImportRow` (ADR 0068 §6, S-05 PR 2) — the identical
+        // passthrough convention `Export` just above uses.
+        syskv::EntityKind::Import => serde_json::from_slice::<Value>(value).unwrap_or(Value::Null),
     }
 }
 
@@ -1499,6 +1523,274 @@ fn restores_view(ctx: &ClientCtx) -> Value {
         })
         .collect();
     json!({ "restores": restores })
+}
+
+/// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) — the template
+/// the next three U-07 observability routes (`/admin/ttl`, `/admin/gc`,
+/// `/admin/segment-store`) copy.
+///
+/// **Object counts are a live, bounded local scan, not a maintained
+/// counter** — `BackupStoreHandle` tracks no running count/byte total, and
+/// this is a debug-posture route, the same class `/admin/raftkv`'s own
+/// `?exact=1` materializing path already is (see that route's own "a
+/// polled observer must not materialize" doc note) — so a bounded scan is
+/// acceptable here specifically, unlike a route a dashboard polls on a
+/// tight interval by default. `count` is exact (one cheap
+/// [`animus_env::SegmentStore::list`] call, scoped to the whole
+/// `backup/` namespace — never load-bearing for correctness, only for this
+/// view); `bytes` sums each object's length via a **local-only** read
+/// ([`BackupStoreHandle::get_local`], never the cluster-fallback
+/// [`BackupStoreHandle::get_any`] — every id in this scan is already known
+/// to live here), capped at [`BACKUP_STORE_OBJECT_BYTES_SCAN_CAP`] objects;
+/// past that cap, `bytes` covers only the first
+/// `BACKUP_STORE_OBJECT_BYTES_SCAN_CAP` objects and `"truncated": true` says
+/// so — `count` itself is never truncated.
+///
+/// `store` is this node's own configured backup store: kind plus a
+/// credential-safe `location` (`redact_store_location`, `lib.rs` — the
+/// helper every future store-shaped admin view should reuse rather than
+/// re-deriving its own redaction; neither variant this node can be
+/// configured with today actually carries a credential, but the next PR to
+/// add an S3-backed store inherits the safety for free). `janitor` is the
+/// live `animus_node::backup_janitor::JanitorProgress` snapshot
+/// `animus_node::backup_janitor::backup_janitor_loop` maintains on this
+/// node (`ClientCtx::backup_janitor_progress`) — a non-leader's copy simply
+/// stays `Idle` forever, since the loop only ever advances it while
+/// `control_leader()` answers `Some`. `leader` reports this node's own
+/// current control-plane-leader belief (`ctx.control.is_leader()`) — the
+/// exact condition the janitor loop itself gates its whole tick on.
+const BACKUP_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
+
+async fn backup_store_view(ctx: &ClientCtx) -> Value {
+    let store = ctx.admin.backup_store.as_ref().map_or(Value::Null, |v| {
+        json!({
+            "kind": v.kind,
+            "location": v.path.as_deref().map(crate::redact_store_location),
+        })
+    });
+
+    let prefix = format!("{}/", animus_cp_data::backup::BACKUP_NAMESPACE);
+    let objects = match ctx.backup_store.list_local(&prefix).await {
+        Ok(ids) => {
+            let total = ids.len();
+            let truncated = total > BACKUP_STORE_OBJECT_BYTES_SCAN_CAP;
+            let scan = &ids[..total.min(BACKUP_STORE_OBJECT_BYTES_SCAN_CAP)];
+            let mut bytes: u64 = 0;
+            for id in scan {
+                if let Ok(Some(b)) = ctx.backup_store.get_local(id).await {
+                    bytes += b.len() as u64;
+                }
+            }
+            json!({"count": total, "bytes": bytes, "truncated": truncated})
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "admin backup-store: local object list failed");
+            Value::Null
+        }
+    };
+
+    let janitor = ctx.backup_janitor_progress.lock().unwrap().clone();
+
+    json!({
+        "store": store,
+        "objects": objects,
+        "janitor": janitor,
+        "leader": ctx.control.is_leader(),
+    })
+}
+
+/// `GET /admin/ttl` (ADR 0051, roadmap U-07) — the second of U-07's
+/// observability routes, copying `backup_store_view`'s own template above
+/// with one deliberate difference: the TTL reaper runs on **every** node
+/// (self-gated per tablet, `TtlScanHost::led_tablets`), never only on the
+/// control leader — so every node's own `reaper` field is a genuinely live
+/// answer, not a stand-in for "not the leader" the way a follower's own
+/// `janitor` field on `/admin/backup-store` is.
+///
+/// `reaper` is this node's own live
+/// `animus_node::ttl_reaper::TtlReaperProgress` snapshot
+/// (`ClientCtx::ttl_reaper_progress`, published by `ttl_reaper_loop`
+/// through the `TtlReaperProgressHost` impl in `client_ctx_host.rs`) — its
+/// own `cursor` field is already a JSON-safe, hex-truncated projection of
+/// the loop's real driver-local resume key (never raw bytes). `tables` is
+/// every TTL-enabled table in the replicated catalog
+/// (`{name, attribute, enabled}` — `enabled` is always `true` here since a
+/// disabled table carries no `TtlSpec` at all and so never appears,
+/// mirroring `DescribeTimeToLive`'s own `ENABLED`/`TtlSpec::is_some`
+/// convention). `leader_tablets` counts this node's own currently-hosted
+/// tablets (`ctx.edge.hosted_groups()`) that are (a) this node's own
+/// leader and (b) belong to a TTL-enabled table — the tablets this node's
+/// reaper is actually reaping right now, distinct from control-plane
+/// leadership (which the backup janitor's own `leader` field reports).
+fn ttl_view(ctx: &ClientCtx) -> Value {
+    let meta = ctx.effective_metadata();
+    let tables: Vec<Value> = meta
+        .schemas
+        .iter()
+        .filter_map(|(name, schema)| {
+            schema.ttl.as_ref().map(|ttl| {
+                json!({
+                    "name": name,
+                    "attribute": ttl.attribute_name,
+                    "enabled": true,
+                })
+            })
+        })
+        .collect();
+    let leader_tablets = ctx
+        .edge
+        .hosted_groups()
+        .into_iter()
+        .filter(|(tablet, group)| {
+            group.is_leader()
+                && meta
+                    .tablets
+                    .get(tablet)
+                    .and_then(|t| t.table.as_ref())
+                    .is_some_and(|table| meta.table_ttl(table).is_some())
+        })
+        .count();
+    let reaper = ctx.ttl_reaper_progress.lock().unwrap().clone();
+
+    json!({
+        "reaper": reaper,
+        "tables": tables,
+        "leader_tablets": leader_tablets,
+    })
+}
+
+/// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07) — the third of
+/// U-07's four observability routes, copying `backup_store_view`'s own
+/// template above: the DynamoDB Streams **segment janitor**
+/// (`segment_janitor::segment_janitor_loop`) is control-plane-**leader**-
+/// only, exactly like the backup janitor, so this route's own `leader`
+/// field and a follower's honestly-`idle` `janitor` field mean the same
+/// thing here as they do on `/admin/backup-store` — see the lesson recorded
+/// in `docs/engineering-lessons.md` on why this route therefore copies that
+/// route's single-fetch dashboard shape rather than `/admin/ttl`'s
+/// per-node fan-out.
+///
+/// `janitor` is the live `segment_janitor::SegmentJanitorProgress` snapshot
+/// (`ClientCtx::segment_janitor_progress`) — see that type's own doc for
+/// what each phase/counter means; unlike the backup-store and TTL routes,
+/// this progress type lives entirely in `animusd` (`segment_janitor.rs`
+/// never moved to `animus-node`, see that crate's own `CLAUDE.md`), so
+/// there is no capability trait between the loop and this field.
+///
+/// **`dropped_tables_pending` is deliberately omitted**: `MetaCommand::
+/// DropTableTablets` removes a table's tablet rows from the replicated
+/// catalog *synchronously*, at apply time — there is no durable "dropped
+/// table tombstone" row anywhere in `Metadata` for this route to count.
+/// What genuinely stays pending after a drop is each node's own *local*
+/// on-disk reclaim of that tablet's now-orphaned engine files, tracked only
+/// as an ephemeral, per-node diff the tablet-host reconciler (ADR 0024,
+/// `animus_cp_data::host::plan`) recomputes fresh every tick from live
+/// hosted-vs-catalog state — not a replicated count this route (or any
+/// single node) can answer cheaply without a local filesystem scan across
+/// every node in the cluster. See ADR 0024's own doc for that mechanism;
+/// it is a different subsystem from the segment janitor this route
+/// reports on, despite both being colloquially "garbage collection."
+fn gc_view(ctx: &ClientCtx) -> Value {
+    let janitor = ctx.segment_janitor_progress.lock().unwrap().clone();
+    json!({
+        "janitor": janitor,
+        "leader": ctx.control.is_leader(),
+    })
+}
+
+/// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07) — the fourth
+/// and last of U-07's observability routes, copying `backup_store_view`'s
+/// own template (cab41a8) with one addition on top of the store-config/
+/// bounded-local-object-scan shape every earlier U-07 route already
+/// established: the shard→replica **placement** every stream shard was
+/// given, which the route's own name promises and which the roadmap notes
+/// is "already inside `ClusterSegmentStore`" — a shard's replica set is
+/// decided exactly once, at seal time, by
+/// [`animus_cp_data::cluster_segment_store::ClusterSegmentStore::
+/// put_replicated`]'s own placement selection, and recorded durably right
+/// there in [`animus_control::StreamShardRow::replicas`] — so this route
+/// reads that already-agreed record rather than recomputing placement a
+/// second way.
+///
+/// `store` is this node's own configured segment store (same redaction/
+/// control-only-node-absence convention as `backup_store_view`'s `store`
+/// field — see [`crate::AdminInfo::segment_store`]'s own doc). `shards` is
+/// `null` for the single-shared-directory `fs` opt-in — every node already
+/// reads the identical directory there, so there is no per-node replica
+/// concept to report (the exact "empty `replicas`, ask any node" signal
+/// [`crate::SegmentStoreHandle::put_sealed`]'s own doc describes) — and
+/// otherwise one entry per row in the replicated `stream_shards` catalog
+/// (identical on every node, ADR 0038): `shard` rendered via
+/// [`animus_cp_data::segment::shard_id`] (`shardId-<tablet>-<epoch>`, the
+/// same wire id ADR 0042 §2 defines), `replicas` the recorded node ids
+/// (already sorted, `ClusterSegmentStore::put_replicated`'s own doc), and
+/// `local` whether this node's own id is among them. `local_objects` is a
+/// bounded live local scan
+/// ([`crate::SegmentStoreHandle::list_local`]/[`crate::
+/// SegmentStoreHandle::get_local`] — this store's own local building
+/// block, never the cluster-fallback `get_from`/`get_sealed` read path),
+/// mirroring `backup_store_view`'s identical object-count/byte scan (same
+/// cap, same truncation flag). Segment ids carry no fixed top-level
+/// namespace the way a backup object's `backup/` prefix does (`animus_
+/// cp_data::segment::segment_id`'s own doc: `{table}/{label}/{tablet}/
+/// {epoch}/...`), so this scan lists the store's WHOLE local directory —
+/// safe because that directory (`dir.join("segments")`) is already
+/// disjoint from the backup store's own (`dir.join("backups")`), never
+/// mixing the two stores' objects.
+const SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP: usize = 200;
+
+async fn segment_store_view(ctx: &ClientCtx) -> Value {
+    let store = ctx.admin.segment_store.as_ref().map_or(Value::Null, |v| {
+        json!({
+            "kind": v.kind,
+            "location": v.path.as_deref().map(crate::redact_store_location),
+        })
+    });
+    let is_cluster = matches!(ctx.admin.segment_store.as_ref(), Some(v) if v.kind == "cluster");
+
+    let shards = if is_cluster {
+        let meta = ctx.effective_metadata();
+        let self_id = ctx.env.node_id();
+        let rows: Vec<Value> = meta
+            .stream_shards
+            .iter()
+            .map(|((tablet, epoch), row)| {
+                json!({
+                    "shard": animus_cp_data::segment::shard_id(tablet.0, *epoch),
+                    "replicas": row.replicas.iter().map(NodeId::to_string).collect::<Vec<_>>(),
+                    "local": row.replicas.contains(&self_id),
+                })
+            })
+            .collect();
+        Value::Array(rows)
+    } else {
+        Value::Null
+    };
+
+    let local_objects = match ctx.segment_store.list_local("").await {
+        Ok(ids) => {
+            let total = ids.len();
+            let truncated = total > SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP;
+            let scan = &ids[..total.min(SEGMENT_STORE_OBJECT_BYTES_SCAN_CAP)];
+            let mut bytes: u64 = 0;
+            for id in scan {
+                if let Ok(Some(b)) = ctx.segment_store.get_local(id).await {
+                    bytes += b.len() as u64;
+                }
+            }
+            json!({"count": total, "bytes": bytes, "truncated": truncated})
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "admin segment-store: local object list failed");
+            Value::Null
+        }
+    };
+
+    json!({
+        "store": store,
+        "shards": shards,
+        "local_objects": local_objects,
+    })
 }
 
 fn metrics_view(ctx: &ClientCtx) -> Value {

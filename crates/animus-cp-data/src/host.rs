@@ -39,6 +39,7 @@ use animus_env::{Env, Metric, NodeId};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
+use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
 use crate::{RaftKvNode, StorageScope, wal_file};
 
 /// The per-tablet engine seam (ADR 0050, Train B rung 1): every hosted
@@ -846,6 +847,14 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// `None` (the default) is exactly today's behavior: every existing
     /// caller of [`new`](Self::new) is unaffected.
     quiesce_after: Option<Duration>,
+    /// ADR 0044 phase 2 (C-02 PR 2) production wiring: opt every group this
+    /// reconciler hosts *from now on* into the per-node heartbeat batcher —
+    /// see [`enable_heartbeat_batching`](Self::enable_heartbeat_batching).
+    /// `None` (the default) is exactly today's behavior: every existing
+    /// caller of [`new`](Self::new) is unaffected, and every group this
+    /// reconciler hosts ships its own bare heartbeats immediately,
+    /// unbatched, exactly as before this mechanism existed.
+    heartbeat_batcher: Option<HeartbeatBatcher<E>>,
 }
 
 /// Fresh/re-registered-hosting mirror hook — see [`Reconciler`]'s `on_host`
@@ -885,6 +894,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             on_host: Box::new(on_host),
             on_teardown: Box::new(on_teardown),
             quiesce_after: None,
+            heartbeat_batcher: None,
         }
     }
 
@@ -981,6 +991,31 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// via [`RaftKvNode::enable_quiescence`] instead).
     pub fn enable_quiescence(&mut self, after: Duration) {
         self.quiesce_after = Some(after);
+    }
+
+    /// Opt every group this reconciler hosts **from now on** into the
+    /// per-node heartbeat batcher (ADR 0044 phase 2, C-02 PR 2) — mints
+    /// **one** [`HeartbeatBatcher`] for this reconciler's own `env` (so its
+    /// two background tasks are spawned exactly once, shared by every
+    /// group this reconciler hosts, mirroring
+    /// [`enable_quiescence`](Self::enable_quiescence)'s own "opt in once,
+    /// applies from here on" shape) at
+    /// [`DEFAULT_HEARTBEAT_BATCH_INTERVAL`] (the fixed cadence matching
+    /// every group's own `RaftCore::heartbeat_interval`, which nothing in
+    /// this codebase overrides — see that constant's own doc). Call once,
+    /// right after construction and before the first
+    /// [`tick`](Self::tick) — a tablet already in
+    /// [`hosted`](Self::hosted_node) at the time this is called is
+    /// unaffected (no production caller hosts before opting in, so this is
+    /// a non-issue in practice, exactly like `enable_quiescence`'s own
+    /// doc). `animusd`'s `--heartbeat-batch` CLI flag calls this once at
+    /// node start.
+    pub fn enable_heartbeat_batching(&mut self) {
+        self.heartbeat_batcher = Some(HeartbeatBatcher::new(
+            self.env.clone(),
+            DEFAULT_HEARTBEAT_BATCH_INTERVAL,
+            self.env.metrics(),
+        ));
     }
 
     /// The live `RaftKvNode` this reconciler hosts for `tablet`, if any.
@@ -1237,7 +1272,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // witnesses this group's HLC off its engine's own `latest_version()`
         // at construction (the tablet's private engine since ADR 0050 rung 1
         // — its own data is the only history a fresh group must out-version).
-        let node = RaftKvNode::start_hosted(self.env.clone(), config, engine, scope, tablet.0);
+        let node = RaftKvNode::start_hosted_with_batcher(
+            self.env.clone(),
+            config,
+            engine,
+            scope,
+            tablet.0,
+            self.heartbeat_batcher.clone(),
+        );
         // ADR 0044 phase-1 PR4 production wiring: opt every freshly-hosted
         // data-plane group into quiescence if this reconciler has been
         // configured to (see `enable_quiescence`'s doc).
@@ -1438,15 +1480,23 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // waiting out a cold randomized election timeout — see
         // `start_hosted_campaigning`'s own doc for why this is safe.
         let node = if campaign {
-            RaftKvNode::start_hosted_campaigning(
+            RaftKvNode::start_hosted_campaigning_with_batcher(
                 self.env.clone(),
                 voters,
                 engine,
                 scope,
                 child.id.0,
+                self.heartbeat_batcher.clone(),
             )
         } else {
-            RaftKvNode::start_hosted(self.env.clone(), voters, engine, scope, child.id.0)
+            RaftKvNode::start_hosted_with_batcher(
+                self.env.clone(),
+                voters,
+                engine,
+                scope,
+                child.id.0,
+                self.heartbeat_batcher.clone(),
+            )
         };
         if let Some(after) = self.quiesce_after {
             node.enable_quiescence(after);

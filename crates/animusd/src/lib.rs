@@ -100,6 +100,7 @@ mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
 mod http;
+mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
 #[deny(clippy::disallowed_methods)]
@@ -2440,6 +2441,71 @@ pub(crate) struct StoreView {
     pub(crate) path: Option<String>,
 }
 
+/// Redact a store location string for admin-surface rendering (roadmap
+/// U-07) — strips a URI's query string (`?...`) and userinfo (`user:pass@`
+/// between `scheme://` and the host) before it ever reaches a JSON
+/// response. Neither variant [`StoreView`] describes today carries a
+/// credential in its location (a bare local/shared filesystem path), but
+/// this is written now, once, so every future store-shaped admin view
+/// (`GET /admin/segment-store`, roadmap U-07; a future S3-backed
+/// [`BackupStoreConfig`]/[`SegmentStoreConfig`] variant) inherits the same
+/// safety rather than re-deriving its own redaction. A bare path (today's
+/// only case) has no `://`/`@`/`?` and passes through byte-for-byte.
+pub(crate) fn redact_store_location(raw: &str) -> String {
+    let before_query = raw.split('?').next().unwrap_or(raw);
+    let Some(scheme_end) = before_query.find("://") else {
+        return before_query.to_owned();
+    };
+    let host_start = scheme_end + "://".len();
+    let (prefix, rest) = before_query.split_at(host_start);
+    match rest.find('@') {
+        Some(at) => format!("{prefix}{}", &rest[at + 1..]),
+        None => before_query.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod redact_store_location_tests {
+    use super::redact_store_location;
+
+    #[test]
+    fn a_bare_filesystem_path_is_unchanged() {
+        assert_eq!(
+            redact_store_location("/var/lib/animus/backups"),
+            "/var/lib/animus/backups"
+        );
+    }
+
+    #[test]
+    fn a_future_credentialed_uri_loses_its_userinfo_and_query() {
+        assert_eq!(
+            redact_store_location("s3://AKID:SECRET@my-bucket/prefix?X-Amz-Signature=abc"),
+            "s3://my-bucket/prefix"
+        );
+    }
+
+    #[test]
+    fn a_uri_with_no_userinfo_or_query_is_unchanged() {
+        assert_eq!(
+            redact_store_location("s3://my-bucket/prefix"),
+            "s3://my-bucket/prefix"
+        );
+    }
+}
+
+/// Strip a `scheme://` prefix off an `S3StoreConfig::endpoint` for display —
+/// `redact_store_location`'s own job is stripping userinfo/query, not a
+/// scheme, and an S3 store's `StoreView::path` is built as `s3://bucket[/
+/// prefix]@host` (never the endpoint's own `scheme://host` form) so the
+/// rendered location reads like every other store kind's plain
+/// `scheme://host/path` shape while never repeating the endpoint twice.
+fn s3_endpoint_host(endpoint: &str) -> &str {
+    endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, host)| host)
+        .trim_end_matches('/')
+}
+
 impl From<&SegmentStoreConfig> for StoreView {
     fn from(config: &SegmentStoreConfig) -> Self {
         match config {
@@ -2450,6 +2516,10 @@ impl From<&SegmentStoreConfig> for StoreView {
             SegmentStoreConfig::Fs(path) => StoreView {
                 kind: "fs",
                 path: Some(path.display().to_string()),
+            },
+            SegmentStoreConfig::S3(s3) => StoreView {
+                kind: "s3",
+                path: Some(s3_store_location(s3)),
             },
         }
     }
@@ -2466,7 +2536,84 @@ impl From<&BackupStoreConfig> for StoreView {
                 kind: "fs",
                 path: Some(path.display().to_string()),
             },
+            BackupStoreConfig::S3(s3) => StoreView {
+                kind: "s3",
+                path: Some(s3_store_location(s3)),
+            },
         }
+    }
+}
+
+/// `s3://bucket[/prefix]@host` — never a query string, never credentials
+/// (an [`S3StoreConfig`] carries a real [`animus_s3::sigv4::Credentials`],
+/// whose own `Debug` already redacts the secret, but this function never
+/// even reads that field). Passed through [`redact_store_location`] anyway
+/// at every call site, for the same belt-and-suspenders reason every other
+/// store kind's location string is (this string alone carries nothing to
+/// redact, but the call site doesn't need to special-case that).
+fn s3_store_location(s3: &S3StoreConfig) -> String {
+    let host = s3_endpoint_host(&s3.endpoint);
+    match &s3.prefix {
+        Some(prefix) => format!("s3://{}/{prefix}@{host}", s3.bucket),
+        None => format!("s3://{}@{host}", s3.bucket),
+    }
+}
+
+#[cfg(test)]
+mod s3_store_view_tests {
+    use super::{BackupStoreConfig, S3StoreConfig, SegmentStoreConfig, StoreView};
+
+    fn test_s3_config() -> S3StoreConfig {
+        S3StoreConfig {
+            bucket: "my-bucket".to_string(),
+            prefix: Some("prefix".to_string()),
+            endpoint: "https://s3.example.com:9000".to_string(),
+            region: "us-west-2".to_string(),
+            insecure_http: false,
+            credentials: animus_s3::sigv4::Credentials::new("AKIDTEST", "supersecret"),
+        }
+    }
+
+    /// The load-bearing admin-surface assertion (roadmap S-04 PR 2): an
+    /// `S3`-configured store renders `"kind": "s3"` with a location string
+    /// that contains the bucket/prefix/host but never the credential —
+    /// checked against the raw rendered string, not just the parsed
+    /// `StoreView` struct, so a secret leaking through some other field
+    /// would still be caught (mirrors `admin_config_reports_auth_state_
+    /// and_never_serves_the_secret`'s own raw-body-string-search idiom).
+    #[test]
+    fn segment_store_s3_view_reports_kind_s3_with_a_redacted_location() {
+        let cfg = SegmentStoreConfig::S3(test_s3_config());
+        let view = StoreView::from(&cfg);
+        assert_eq!(view.kind, "s3");
+        let location = view.path.expect("s3 store has a location");
+        assert!(location.contains("my-bucket"), "{location}");
+        assert!(location.contains("prefix"), "{location}");
+        assert!(location.contains("s3.example.com"), "{location}");
+        assert!(!location.contains("supersecret"), "{location}");
+        assert!(!location.contains("AKIDTEST"), "{location}");
+    }
+
+    #[test]
+    fn backup_store_s3_view_reports_kind_s3_with_a_redacted_location() {
+        let cfg = BackupStoreConfig::S3(test_s3_config());
+        let view = StoreView::from(&cfg);
+        assert_eq!(view.kind, "s3");
+        let location = view.path.expect("s3 store has a location");
+        assert!(location.contains("my-bucket"), "{location}");
+        assert!(!location.contains("supersecret"), "{location}");
+        assert!(!location.contains("AKIDTEST"), "{location}");
+    }
+
+    #[test]
+    fn s3_store_location_with_no_prefix_omits_the_slash() {
+        let mut cfg = test_s3_config();
+        cfg.prefix = None;
+        let view = StoreView::from(&SegmentStoreConfig::S3(cfg));
+        assert_eq!(
+            view.path.as_deref(),
+            Some("s3://my-bucket@s3.example.com:9000")
+        );
     }
 }
 
@@ -3678,6 +3825,7 @@ fn spawn_common_tail(
     env: ProdEnv,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     tls: Option<TlsMaterial>,
+    export_s3: Option<ExportS3Config>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -3707,6 +3855,16 @@ fn spawn_common_tail(
         data,
         segment_store,
         backup_store,
+        export_store_factory: Arc::new(Mutex::new(default_export_store_factory(export_s3))),
+        backup_janitor_progress: Arc::new(Mutex::new(
+            animus_node::backup_janitor::JanitorProgress::default(),
+        )),
+        ttl_reaper_progress: Arc::new(Mutex::new(
+            animus_node::ttl_reaper::TtlReaperProgress::default(),
+        )),
+        segment_janitor_progress: Arc::new(Mutex::new(
+            segment_janitor::SegmentJanitorProgress::default(),
+        )),
         client_route: Arc::new(Mutex::new(client_route)),
         intra_route: Arc::new(Mutex::new(intra_route)),
         admin: admin_info,
@@ -4012,10 +4170,12 @@ impl BoundNode {
             None,
             None,
             Duration::ZERO,
+            false,
             ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
             None,
             BackupStoreConfig::default(),
             pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+            None,
             None,
             None,
             None,
@@ -4079,6 +4239,20 @@ impl BoundNode {
     /// `None`/`None` (every caller that doesn't expose the knob yet) is
     /// byte-identical to before this pair of parameters existed —
     /// `PAY_PER_REQUEST`, no throttling.
+    ///
+    /// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): opts every
+    /// data-plane group this node's tablet-host reconciler hosts into the
+    /// per-node [`HeartbeatBatcher`](animus_cp_data::heartbeat_batch::
+    /// HeartbeatBatcher) — mirrors `quiesce_after`'s own "additive-default,
+    /// off unless set" shape exactly: `false` (every pre-PR-2 call site) is
+    /// byte-for-byte today's unbatched behavior, one `AppendEntries`
+    /// heartbeat per hosted group per destination per tick.
+    /// `--heartbeat-batch` (`--config FILE --node I` and `--cluster N`)
+    /// threads through here, mirroring `--quiesce-after`'s own reach —
+    /// same documented gaps on `--cluster-control`/`--cluster-data`/
+    /// `join`/`data --seed` (this method's own call sites below hardcode
+    /// `false`, same "not yet wired here" precedent `--quiesce-after`
+    /// already set on those paths).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_growth(
         self,
@@ -4098,6 +4272,7 @@ impl BoundNode {
         auto_split_change_rate: Option<u64>,
         auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
+        heartbeat_batch: bool,
         ttl_sweep_interval: Duration,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
@@ -4106,6 +4281,7 @@ impl BoundNode {
         throttle_write_units: Option<u64>,
         tablet_max_read_units: Option<u64>,
         tablet_max_write_units: Option<u64>,
+        export_s3: Option<ExportS3Config>,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -4302,7 +4478,7 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — a second, independently
         // configured handle alongside `segment_store` above; see
         // `build_backup_store`'s own doc. Plumbing only (Train 1 PR②): no
@@ -4313,7 +4489,7 @@ impl BoundNode {
             ControlHandle::Local(raft.clone()),
             my_id.clone(),
             &backup_store_config,
-        );
+        )?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -4348,6 +4524,7 @@ impl BoundNode {
             self.env.clone(),
             dynamo_auth,
             self.tls,
+            export_s3,
         );
 
         // The per-node **tablet-host reconciler** (ADR 0031 PR4): the single
@@ -4411,6 +4588,16 @@ impl BoundNode {
                  quiescence — see that constant's own doc"
             );
             reconciler.enable_quiescence(quiesce_after);
+        }
+        // ADR 0044 phase 2 (C-02 PR 2) production wiring: opt every
+        // data-plane group this reconciler hosts into the per-node
+        // heartbeat batcher — `--heartbeat-batch` CLI/config flag, off by
+        // default (every existing call site passes `false`, zero behavior
+        // change). Mirrors `enable_quiescence`'s own "opt in once, applies
+        // from here on" shape exactly — see `host::Reconciler::
+        // enable_heartbeat_batching`'s own doc.
+        if heartbeat_batch {
+            reconciler.enable_heartbeat_batching();
         }
 
         // Bootstrap: whichever node is leader registers membership (no data tablet)
@@ -4563,6 +4750,15 @@ impl BoundNode {
             ctx.clone(),
         )));
 
+        // The S3 import driver (ADR 0068 §6, S-05 PR 2): seeds an
+        // `InProgress` import's single `Building` tablet from a customer S3
+        // bucket's DynamoDB JSON export layout, then activates it. Same
+        // "run everywhere, self-gate per tablet on leadership" shape as the
+        // restore driver immediately above (its own module doc calls out
+        // the one structural difference — an arbitrary customer bucket as
+        // the source, not this cluster's own backup store).
+        tasks.push(tokio::spawn(import::import_loop(ctx.clone())));
+
         // The in-place split directed-Placing completion loop (ADR 0062
         // §3): reports a child tablet's own local Raft convergence to the
         // control-plane catalog. Same "run everywhere, self-gate per
@@ -4671,6 +4867,7 @@ impl BoundNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -4723,6 +4920,15 @@ pub struct Node {
     /// listener is never bound there (it hosts no CP-data tablet). See
     /// [`console_addr`](Self::console_addr)'s doc.
     console_addr: Option<SocketAddr>,
+    /// A clone of this node's own [`ExportStoreFactory`] slot (ADR 0068
+    /// §2) — the exact `Arc<Mutex<_>>` `spawn_common_tail` built, shared
+    /// with every clone of this node's `ClientCtx` (one per connection).
+    /// Reached only through [`Node::set_export_store_factory`]; production
+    /// code never reads it directly off `Node` itself. **Shared verbatim
+    /// with `ImportTable`'s own driver (ADR 0068 §6, S-05 PR 2)** — the
+    /// mirror-image data flow reaches the identical customer-bucket store
+    /// through this one factory rather than a second, duplicate seam.
+    export_store_factory: Arc<Mutex<ExportStoreFactory>>,
     /// Test-only: a clone of this node's own [`ClientCtx`] (the exact one
     /// `spawn_common_tail` built and handed to this node's listeners/
     /// background loops), so an in-crate test module can call a
@@ -4950,6 +5156,28 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn ctx_for_test(&self) -> ClientCtx {
         self.test_ctx.clone()
+    }
+
+    /// Test hook (ADR 0068 §2, S-05): replace this node's S3 export
+    /// customer-bucket store factory — e.g. with one built over
+    /// `animus_s3::fake::FakeS3` instead of a real S3 endpoint, with no
+    /// real sockets. **Not `#[cfg(test)]`**, unlike [`ctx_for_test`]
+    /// (Self::ctx_for_test) above: an external `tests/*.rs` integration
+    /// binary links against this crate's plain (non-test-cfg) library, so
+    /// a `cfg(test)`-gated item is invisible there — this is a genuinely
+    /// public, always-compiled hook for exactly that caller. Affects every
+    /// export **and import** (ADR 0068 §6, S-05 PR 2 — the identical seam,
+    /// not a second one) this node drives from the moment this call
+    /// returns: the swap lands in the shared `Arc<Mutex<_>>` every clone of
+    /// this node's `ClientCtx` (one per connection, including ones already
+    /// handed to a spawned listener task) reads through, and both the
+    /// export job and the import driver read the factory fresh at
+    /// export/import start — neither caches it.
+    pub fn set_export_store_factory(&self, factory: ExportStoreFactory) {
+        *self
+            .export_store_factory
+            .lock()
+            .expect("export store factory lock") = factory;
     }
 
     /// Propose a control-plane [`MetaCommand`] on this node's control replica,
@@ -5416,7 +5644,7 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — see `segment_store`'s
         // doc immediately above for why this is provisioned here too.
         let backup_store = build_backup_store(
@@ -5425,7 +5653,7 @@ impl BoundControlNode {
             ControlHandle::Local(raft.clone()),
             self.id.clone(),
             &backup_store_config,
-        );
+        )?;
 
         let (ctx, mut tasks) = spawn_common_tail(
             ControlHandle::Local(raft.clone()),
@@ -5456,6 +5684,10 @@ impl BoundControlNode {
             // 0057) — nothing here would ever read `ClientCtx::dynamo_auth`.
             None,
             self.tls,
+            // A control-only node never binds the dynamo listener, so it
+            // never serves `ExportTableToPointInTime` either — nothing
+            // here would ever call `ClientCtx::export_store_factory`.
+            None,
         );
 
         // Peer-sync loop (ADR 0040 PR1) — a control-only node needs it
@@ -5548,6 +5780,7 @@ impl BoundControlNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: None, // ADR 0052: a control-only node hosts no CP-data tablet.
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -5723,6 +5956,7 @@ impl BoundDataNode {
             None,
             None,
             Duration::ZERO,
+            false,
             None,
             BackupStoreConfig::default(),
             None,
@@ -5756,6 +5990,11 @@ impl BoundDataNode {
     /// reconciler now enables quiescence exactly like [`BoundNode::
     /// start_with_growth`]'s combined-mode reconciler does, same
     /// `Duration::ZERO`-disables/`MIN_QUIESCE_AFTER`-floor contract.
+    ///
+    /// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): the identical
+    /// `--heartbeat-batch` opt-in as [`BoundNode::start_with_growth`]'s own
+    /// knob of the same name — `false` (every pre-PR-2 call site) is
+    /// byte-for-byte today's unbatched behavior.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_data_with_growth(
         self,
@@ -5773,6 +6012,7 @@ impl BoundDataNode {
         auto_split_change_rate: Option<u64>,
         auto_split_ops_rate: Option<u64>,
         quiesce_after: Duration,
+        heartbeat_batch: bool,
         dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
         backup_store_config: BackupStoreConfig,
         throttle_read_units: Option<u64>,
@@ -5867,7 +6107,7 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &segment_store_config,
-        );
+        )?;
         // This node's backup store (ADR 0059 §1) — see `BoundNode::
         // start_with_growth`'s identical construction; `control` here is
         // `ControlHandle::Remote`, which `ControlPlacementView` reads
@@ -5878,7 +6118,7 @@ impl BoundDataNode {
             control.clone(),
             my_id.clone(),
             &backup_store_config,
-        );
+        )?;
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
@@ -5915,6 +6155,12 @@ impl BoundDataNode {
             self.env.clone(),
             dynamo_auth,
             self.tls,
+            // ADR 0068 §2: `--export-s3-endpoint`/`--export-s3-region` do
+            // not yet reach `animusd data` (a documented gap, mirroring
+            // `--segment-store`/`--backup-store`'s own partial CLI reach on
+            // this entry point) — a data-only node's own export factory
+            // stays the "not configured" default until this is wired.
+            None,
         );
 
         // The per-node tablet-host reconciler (ADR 0031 PR4) — identical
@@ -5964,6 +6210,12 @@ impl BoundDataNode {
                  quiescence — see that constant's own doc"
             );
             reconciler.enable_quiescence(quiesce_after);
+        }
+        // ADR 0044 phase 2 (C-02 PR 2): identical `--heartbeat-batch`
+        // opt-in as `BoundNode::start_with_growth`'s own gate above — see
+        // that call site's doc.
+        if heartbeat_batch {
+            reconciler.enable_heartbeat_batching();
         }
 
         // No `bootstrap` — a data-only node holds no control-plane Raft role
@@ -6053,6 +6305,10 @@ impl BoundDataNode {
             ctx.clone(),
         )));
 
+        // The S3 import driver (ADR 0068 §6, S-05 PR 2) — same shape/
+        // reasoning as the restore driver just above.
+        tasks.push(tokio::spawn(import::import_loop(ctx.clone())));
+
         // The in-place split directed-Placing completion loop (ADR 0062
         // §3) — same shape/reasoning as the backup capture/restore drivers
         // just above (per-tablet-leadership-gated, no control-plane-leader
@@ -6093,6 +6349,7 @@ impl BoundDataNode {
             admin_addr: self.admin_addr,
             intra_addr: self.intra_addr,
             console_addr: Some(self.console_addr),
+            export_store_factory: ctx.export_store_factory.clone(),
             #[cfg(test)]
             test_ctx: ctx,
         })
@@ -6447,6 +6704,18 @@ pub const MIN_QUIESCE_AFTER: Duration = index_drain::INDEX_DRAIN_INTERVAL;
 pub(crate) enum SegmentStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// `--segment-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — a
+    /// `Arc<dyn SegmentStore>` rather than a concrete
+    /// `animus_env::S3SegmentStore<T>` for one specific reason: it lets an
+    /// in-crate test build this variant over `animus_s3::fake::FakeS3`
+    /// (`s3_store_tests`, below) with no change to this enum's own shape,
+    /// while production (`build_segment_store`) always constructs the
+    /// concrete `S3SegmentStore<animus_s3::prod::HyperRustlsTransport>`
+    /// instance and stores it here the same way. Like `Fs`, there is no
+    /// per-node replica concept — every node reads the identical bucket —
+    /// so this variant is handled identically to `Fs` in every method
+    /// below.
+    S3(Arc<dyn animus_env::SegmentStore>),
 }
 
 impl SegmentStoreHandle {
@@ -6455,17 +6724,21 @@ impl SegmentStoreHandle {
     /// to record in the `SealStreamShard` catalog row's own `replicas`
     /// field (ADR 0043 §A3 step 3) — the **cluster** store's own sorted
     /// K-replica set, or an **empty** one for the single-directory
-    /// `FsSegmentStore` opt-in: there is no per-node replica concept for a
-    /// store every node already reads the identical physical directory
-    /// through, so an empty `replicas` list is this PR's documented signal
-    /// for "no cluster replica set — ask any node" (the read path, a later
-    /// PR, is what interprets it).
+    /// `FsSegmentStore`/S3 opt-ins: there is no per-node replica concept for
+    /// a store every node already reads the identical physical directory
+    /// (or bucket) through, so an empty `replicas` list is this PR's
+    /// documented signal for "no cluster replica set — ask any node" (the
+    /// read path, a later PR, is what interprets it).
     async fn put_sealed(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
         match self {
             SegmentStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
             SegmentStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            SegmentStoreHandle::S3(s3) => {
+                s3.put(id, bytes).await?;
                 Ok(Vec::new())
             }
         }
@@ -6491,6 +6764,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6509,6 +6783,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 
@@ -6535,7 +6810,7 @@ impl SegmentStoreHandle {
     ) -> std::io::Result<Vec<NodeId>> {
         match self {
             SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
-            SegmentStoreHandle::Fs(_) => Ok(surviving.to_vec()),
+            SegmentStoreHandle::Fs(_) | SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
         }
     }
 
@@ -6554,6 +6829,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().list(prefix).await,
             SegmentStoreHandle::Fs(fs) => fs.list(prefix).await,
+            SegmentStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
 
@@ -6566,6 +6842,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().get(id).await,
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6580,6 +6857,7 @@ impl SegmentStoreHandle {
         match self {
             SegmentStoreHandle::Cluster(c) => c.local().delete(id).await,
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 }
@@ -6621,25 +6899,325 @@ impl animus_cp_data::cluster_segment_store::PlacementView for ControlPlacementVi
     }
 }
 
+/// One `s3://bucket[/prefix]?endpoint=...&region=...[&path_style=true]
+/// [&insecure_http=true]` store target (S-04 PR 2), shared verbatim by both
+/// [`SegmentStoreConfig::S3`] and [`BackupStoreConfig::S3`] — parsed by
+/// `main.rs`'s `parse_s3_uri` and never constructed any other way in
+/// production. **Credentials are never part of the URI** — `main.rs`
+/// resolves them separately (a `--s3-credentials PATH` file or the
+/// `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` env vars, see
+/// that file's own doc) and fills in `credentials` only once resolution
+/// succeeds; a URI naming `s3://` with no credentials resolvable anywhere is
+/// a startup error, never a value with an empty/placeholder credential.
+/// `credentials`' own `Debug` already redacts the secret
+/// (`animus_s3::sigv4::Credentials`), so deriving `Debug` here leaks
+/// nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3StoreConfig {
+    pub bucket: String,
+    /// Key prefix every stored id is joined under (`{prefix}/{id}`) — see
+    /// [`animus_env::S3SegmentStore`]'s own "Object layout" doc. `None` for
+    /// no prefix (`s3://bucket` with no path component).
+    pub prefix: Option<String>,
+    /// `scheme://host[:port]`, no trailing slash — `https://` unless
+    /// `insecure_http` is set, in which case `http://` (see
+    /// [`Self::insecure_http`]'s own doc for the gate).
+    pub endpoint: String,
+    pub region: String,
+    /// Whether this store's transport may dial `endpoint` over plain HTTP.
+    /// `main.rs`'s `parse_s3_uri` only ever sets this `true` when the URI's
+    /// own `insecure_http=true` query key is present **and** either the
+    /// endpoint host is loopback or `--allow-insecure-s3` was also given —
+    /// by the time a value reaches here, that gate has already been
+    /// enforced; this field just remembers the decision for
+    /// `build_segment_store`/`build_backup_store` to act on.
+    pub insecure_http: bool,
+    pub credentials: animus_s3::sigv4::Credentials,
+}
+
 /// `--segment-store` CLI opt-in (ADR 0043 §A7b): the default,
 /// [`SegmentStoreConfig::Cluster`], selects [`SegmentStoreHandle::Cluster`]
 /// (the K-replicated default store, F5's durability mandate);
 /// `Fs(PATH)` (parsed by `main.rs` from `--segment-store dir:PATH`) selects a
 /// bare, single-directory `FsSegmentStore` at `PATH` instead — dev use, or a
 /// directory every node in the cluster mounts at the identical path (NFS or
-/// similar). **The shared-mount caveat**: this opt-in trades away the
+/// similar); `S3(..)` (parsed from `--segment-store s3://bucket/...`, S-04 PR
+/// 2) selects a real S3-compatible bucket instead — see [`S3StoreConfig`]'s
+/// own doc for the URI shape and credential sourcing. **The shared-mount/
+/// external-store caveat**: both non-default opt-ins trade away the
 /// K-replication durability upgrade the *default* store exists to provide
 /// (ADR 0043's whole "the default store must uphold this database's own
-/// durability bar" argument) for needing no cluster wiring at all — the
-/// shared filesystem itself becomes a single point of failure/consistency
-/// this adapter no longer protects against, which is exactly the trade a dev
-/// setup or an operator with its own already-durable shared storage is
-/// choosing to accept.
+/// durability bar" argument) for needing no cluster-internal replication at
+/// all — the shared filesystem or S3 bucket itself becomes the single
+/// consistency/durability boundary this adapter no longer protects against,
+/// which is exactly the trade a dev setup, an operator with its own
+/// already-durable shared storage, or an operator relying on S3's own
+/// durability guarantees is choosing to accept.
 #[derive(Clone, Debug, Default)]
 pub enum SegmentStoreConfig {
     #[default]
     Cluster,
     Fs(PathBuf),
+    S3(S3StoreConfig),
+}
+
+/// Build the `T: Transport` + [`animus_s3::client::S3Config`] pair
+/// [`build_segment_store`]/[`build_backup_store`]'s `S3` arm both need from
+/// an [`S3StoreConfig`] — factored out since the two call sites are
+/// otherwise identical (same transport-construction/credential-forwarding
+/// logic, differing only in which handle enum wraps the result).
+///
+/// # Errors
+/// If installing the `ring` crypto provider fails (only possible if a
+/// *different* provider is already installed process-wide — see
+/// [`animus_s3::prod::HyperRustlsTransport::new`]'s own doc; tolerable
+/// "already installed by this same call" is not an error).
+fn s3_segment_store(
+    s3: &S3StoreConfig,
+) -> std::io::Result<animus_env::S3SegmentStore<animus_s3::prod::HyperRustlsTransport>> {
+    let transport = if s3.insecure_http {
+        animus_s3::prod::HyperRustlsTransport::new_allow_insecure_http()
+    } else {
+        animus_s3::prod::HyperRustlsTransport::new()
+    }
+    .map_err(|e| std::io::Error::other(format!("building S3 transport: {e}")))?;
+    let config = animus_s3::client::S3Config {
+        endpoint: s3.endpoint.clone(),
+        bucket: s3.bucket.clone(),
+        region: s3.region.clone(),
+        credentials: s3.credentials.clone(),
+    };
+    Ok(animus_env::S3SegmentStore::new(
+        transport,
+        config,
+        s3.prefix.clone(),
+    ))
+}
+
+// --- S3 export (ADR 0068, S-05) --------------------------------------------
+
+/// This node's cluster-level S3 connection parameters for the export
+/// **customer**-bucket store (ADR 0068 §2) — `--export-s3-endpoint`/
+/// `--export-s3-region`, reusing the exact same `--s3-credentials`/
+/// `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` credential
+/// resolution `--segment-store`/`--backup-store s3://` already established
+/// (S-04) rather than a second, independent credential source — ADR 0068's
+/// own "pick one, justify" design decision: an export target and this
+/// node's own backup/segment store are conceptually different buckets (a
+/// customer's own bucket vs. this cluster's operational store), but a node
+/// has exactly one S3 identity it authenticates as either way, so a second
+/// credential file/env pair would only add configuration surface with no
+/// real security or operational benefit. **Deliberately holds no
+/// bucket/prefix** — those arrive per-request on the wire
+/// (`ExportTableToPointInTime`'s `S3Bucket`/`S3Prefix`), unlike
+/// [`S3StoreConfig`] (whose bucket is this node's own, fixed at startup).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportS3Config {
+    /// `scheme://host[:port]`, no trailing slash.
+    pub endpoint: String,
+    pub region: String,
+    /// Mirrors [`S3StoreConfig::insecure_http`]'s exact gate — set only when
+    /// `main.rs`'s own loopback-or-`--allow-insecure-s3` check already
+    /// passed.
+    pub insecure_http: bool,
+    pub credentials: animus_s3::sigv4::Credentials,
+}
+
+/// A customer-bucket object-store factory for S3 export (ADR 0068 §2):
+/// given one export request's own `S3Bucket`/`S3Prefix`, builds (or fails to
+/// build) the [`animus_env::SegmentStore`] the leader-driven export job
+/// writes through. **`pub` and test-only-mutable through
+/// [`Node::set_export_store_factory`]** — the production default
+/// ([`default_export_store_factory`]) builds a real
+/// `S3SegmentStore<HyperRustlsTransport>` from this node's [`ExportS3Config`]
+/// (or a clear "not configured" error when the node has none); tests inject
+/// one built over `animus_s3::fake::FakeS3` instead, with no real sockets.
+pub type ExportStoreFactory = Arc<
+    dyn Fn(&str, Option<&str>) -> std::io::Result<Arc<dyn animus_env::SegmentStore>> + Send + Sync,
+>;
+
+/// Build this node's production [`ExportStoreFactory`] from its own
+/// (possibly absent) [`ExportS3Config`] — `spawn_common_tail`'s own
+/// construction point, and the one function [`Node::set_export_store_factory`]
+/// exists to let a test override wholesale. `None` produces a factory that
+/// always fails with a clear, wire-surfaceable message (`animusd::dynamo`'s
+/// `create_export` maps it to `ValidationException`) rather than a panic —
+/// a node with no `--export-s3-endpoint`/`--export-s3-region` configured
+/// simply cannot serve `ExportTableToPointInTime` yet.
+fn default_export_store_factory(export_s3: Option<ExportS3Config>) -> ExportStoreFactory {
+    Arc::new(move |bucket: &str, prefix: Option<&str>| {
+        let Some(cfg) = export_s3.as_ref() else {
+            return Err(std::io::Error::other(
+                "S3 export is not configured on this node (missing \
+                 --export-s3-endpoint/--export-s3-region)",
+            ));
+        };
+        let s3 = S3StoreConfig {
+            bucket: bucket.to_owned(),
+            prefix: prefix.map(str::to_owned),
+            endpoint: cfg.endpoint.clone(),
+            region: cfg.region.clone(),
+            insecure_http: cfg.insecure_http,
+            credentials: cfg.credentials.clone(),
+        };
+        let store: Arc<dyn animus_env::SegmentStore> = Arc::new(s3_segment_store(&s3)?);
+        Ok(store)
+    })
+}
+
+/// S-04 PR 2's own end-to-end proof that `SegmentStoreHandle::S3`/
+/// `BackupStoreHandle::S3` are wired correctly, **without any real
+/// sockets**: an in-crate `#[cfg(test)] mod` (needs `BackupStoreHandle`'s
+/// own `pub(crate)` visibility — no external `tests/*.rs` file can reach it,
+/// the identical reason `simenv_client_ctx_tests`/`s3_store_view_tests`
+/// above live here too) that builds a real `BackupStoreHandle::S3`/
+/// `SegmentStoreHandle::S3` directly over `animus_s3::fake::FakeS3` (a
+/// signature-verifying in-memory S3 double, `animus-s3`'s own `fake`
+/// feature — see this crate's `Cargo.toml`) instead of production's real
+/// `s3_segment_store`/`animus_s3::prod::HyperRustlsTransport` construction
+/// path, then drives every method the production capture driver
+/// (`backup_capture.rs`'s `put`), the backup janitor (`backup_janitor.rs`'s
+/// `list_local`/`get_local`/`delete_local`), and the `/admin/backup-store`/
+/// `/admin/segment-store` routes (`admin.rs`'s own `list_local`/`get_local`
+/// calls on the same handle) actually call.
+///
+/// **Scope decision, stated plainly**: this does not stand up a full
+/// running `Node` with an injected transport and drive `CreateBackup`/
+/// `DeleteBackup` over the real DynamoDB wire — doing that would need
+/// either widening `BackupStoreHandle`'s visibility to `pub` (a public-API
+/// change beyond this PR's own scope) or a second, parallel node-
+/// construction entry point that accepts a pre-built handle instead of a
+/// `BackupStoreConfig` (a materially larger change to `spawn_common_tail`'s
+/// own call chain). This test instead proves the identical operations at
+/// the layer directly below the wire — the same `BackupStoreHandle`
+/// methods `backup_capture.rs`/`backup_janitor.rs`/`admin.rs` call, with
+/// the store itself indistinguishable from what those callers see in
+/// production apart from which `Transport` backs it — which is what this
+/// PR's own wiring actually needs proven; a live-node e2e over a fake HTTP
+/// listener is a reasonable follow-up, not required for this PR's own
+/// correctness claim.
+#[cfg(test)]
+mod s3_store_handle_tests {
+    use animus_s3::client::S3Config;
+    use animus_s3::fake::FakeS3;
+    use animus_s3::sigv4::Credentials;
+
+    use super::{BackupStoreHandle, SegmentStoreHandle};
+
+    fn fake_config() -> S3Config {
+        S3Config {
+            endpoint: "http://fake.example:9000".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Credentials::new("AKIDTEST", "secret"),
+        }
+    }
+
+    fn fake_backup_store() -> BackupStoreHandle {
+        let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
+        BackupStoreHandle::S3(std::sync::Arc::new(animus_env::S3SegmentStore::new(
+            fake,
+            fake_config(),
+            Some("backup".to_string()),
+        )))
+    }
+
+    fn fake_segment_store() -> SegmentStoreHandle {
+        let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
+        SegmentStoreHandle::S3(std::sync::Arc::new(animus_env::S3SegmentStore::new(
+            fake,
+            fake_config(),
+            Some("segments".to_string()),
+        )))
+    }
+
+    /// The `BackupStoreHandle::S3` round trip a real `CreateBackup` drives:
+    /// `put` (the capture driver's own primitive), `list_local`/`get_local`
+    /// (the `/admin/backup-store` route's object-count/byte scan and the
+    /// janitor's own reclaim-candidate discovery), then `delete_local` (the
+    /// janitor's own reclaim step) — proving the object is genuinely gone
+    /// afterward, mirroring a real `DeleteBackup` → janitor reclaim.
+    #[tokio::test]
+    async fn backup_store_s3_put_list_get_delete_round_trip() {
+        let store = fake_backup_store();
+        let replicas = store
+            .put("backup/b-1/manifest", b"manifest-bytes")
+            .await
+            .expect("put");
+        // The S3/Fs variants both record no per-node replica set — "ask any
+        // node" — exactly like `put_sealed`'s own doc documents.
+        assert!(replicas.is_empty());
+
+        let listed = store.list_local("backup/").await.expect("list_local");
+        assert_eq!(listed, vec!["backup/b-1/manifest".to_string()]);
+
+        let bytes = store
+            .get_local("backup/b-1/manifest")
+            .await
+            .expect("get_local")
+            .expect("object present");
+        assert_eq!(bytes, b"manifest-bytes");
+
+        // get_any (the restore driver's own "ask any node" read) must agree.
+        let via_get_any = store
+            .get_any("backup/b-1/manifest")
+            .await
+            .expect("get_any")
+            .expect("object present");
+        assert_eq!(via_get_any, b"manifest-bytes");
+
+        store
+            .delete_local("backup/b-1/manifest")
+            .await
+            .expect("delete_local");
+        let after_delete = store.list_local("backup/").await.expect("list_local");
+        assert!(
+            after_delete.is_empty(),
+            "reclaimed object must be gone: {after_delete:?}"
+        );
+        assert_eq!(
+            store
+                .get_local("backup/b-1/manifest")
+                .await
+                .expect("get_local after delete"),
+            None
+        );
+    }
+
+    /// The `SegmentStoreHandle::S3` sibling round trip — `put_sealed`/
+    /// `list_local`/`get_local`/`delete_local`, the exact methods the
+    /// stream sealer and segment janitor call.
+    #[tokio::test]
+    async fn segment_store_s3_put_sealed_list_get_delete_round_trip() {
+        let store = fake_segment_store();
+        let replicas = store
+            .put_sealed("table/label/1/0/attempt-a", b"segment-bytes")
+            .await
+            .expect("put_sealed");
+        assert!(replicas.is_empty());
+
+        let listed = store.list_local("table/").await.expect("list_local");
+        assert_eq!(listed, vec!["table/label/1/0/attempt-a".to_string()]);
+
+        let bytes = store
+            .get_local("table/label/1/0/attempt-a")
+            .await
+            .expect("get_local")
+            .expect("object present");
+        assert_eq!(bytes, b"segment-bytes");
+
+        store
+            .delete_local("table/label/1/0/attempt-a")
+            .await
+            .expect("delete_local");
+        assert!(
+            store
+                .list_local("table/")
+                .await
+                .expect("list_local")
+                .is_empty()
+        );
+    }
 }
 
 /// Build (and, for the cluster variant, **start**) this node's
@@ -6648,14 +7226,19 @@ pub enum SegmentStoreConfig {
 /// cluster variant's per-node local `FsSegmentStore` building block roots at
 /// `dir.join("segments")`, a sibling of the `internal/` subdirectory
 /// `ProdEnv::bind` already owns.
+///
+/// # Errors
+/// Only the `S3` variant can fail (see [`s3_segment_store`]'s own doc) —
+/// `Cluster`/`Fs` are infallible today, but the whole function is `Result`
+/// so a caller doesn't need to know which variant might fail.
 fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &SegmentStoreConfig,
-) -> SegmentStoreHandle {
-    match config {
+) -> std::io::Result<SegmentStoreHandle> {
+    Ok(match config {
         SegmentStoreConfig::Cluster => {
             let local = FsSegmentStore::new(dir.join("segments"));
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
@@ -6670,7 +7253,8 @@ fn build_segment_store(
             )
         }
         SegmentStoreConfig::Fs(path) => SegmentStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-    }
+        SegmentStoreConfig::S3(s3) => SegmentStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+    })
 }
 
 /// This node's **backup** [`SegmentStore`](animus_env::SegmentStore) handle
@@ -6703,6 +7287,10 @@ fn build_segment_store(
 pub(crate) enum BackupStoreHandle {
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, FsSegmentStore>),
     Fs(FsSegmentStore),
+    /// `--backup-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — see
+    /// [`SegmentStoreHandle::S3`]'s doc for why this holds a
+    /// `Arc<dyn SegmentStore>` rather than a concrete type.
+    S3(Arc<dyn animus_env::SegmentStore>),
 }
 
 impl BackupStoreHandle {
@@ -6717,6 +7305,10 @@ impl BackupStoreHandle {
             BackupStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
+                Ok(Vec::new())
+            }
+            BackupStoreHandle::S3(s3) => {
+                s3.put(id, bytes).await?;
                 Ok(Vec::new())
             }
         }
@@ -6737,6 +7329,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6758,6 +7351,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.get(id).await,
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 
@@ -6772,6 +7366,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
     }
 
@@ -6791,6 +7386,7 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+            BackupStoreHandle::S3(s3) => s3.list(prefix).await,
         }
     }
 
@@ -6803,6 +7399,23 @@ impl BackupStoreHandle {
         match self {
             BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            BackupStoreHandle::S3(s3) => s3.delete(id).await,
+        }
+    }
+
+    /// Fetch a backup object's bytes from **this node's own local** backup
+    /// directory only (roadmap U-07's `GET /admin/backup-store` object-byte
+    /// scan) — the `get` sibling of [`list_local`](Self::list_local)/
+    /// [`delete_local`](Self::delete_local): every id that route sums bytes
+    /// over already came from this node's own `list_local`, so there is no
+    /// reason to fall through to [`get_any`](Self::get_any)'s cluster-wide
+    /// "ask any node" walk for an id already known to live here.
+    pub(crate) async fn get_local(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+        use animus_env::SegmentStore;
+        match self {
+            BackupStoreHandle::Cluster(c) => c.local().get(id).await,
+            BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
     }
 }
@@ -6825,15 +7438,17 @@ impl BackupStoreHandle {
 /// **The default (`Cluster`) does not survive a whole-cluster loss** — it
 /// replicates within the same cluster the backups protect data *from*
 /// (operator/application mistakes), not from a total cluster failure.
-/// `fs:PATH` pointed at separately backed-up or replicated storage — and,
-/// later, an S3 backend (ADR 0059's own named follow-up) — is the actual
-/// disaster-recovery story. Stated here once, plainly, per the ADR's own
-/// instruction that this must not be left to be discovered the hard way.
+/// `fs:PATH` pointed at separately backed-up or replicated storage, or (ADR
+/// 0059's own named follow-up, S-04 PR 2) a real S3 bucket via `S3(..)` —
+/// see [`S3StoreConfig`]'s own doc — is the actual disaster-recovery story.
+/// Stated here once, plainly, per the ADR's own instruction that this must
+/// not be left to be discovered the hard way.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum BackupStoreConfig {
     #[default]
     Cluster,
     Fs(PathBuf),
+    S3(S3StoreConfig),
 }
 
 /// Build (and, for the cluster variant, **start**) this node's
@@ -6844,15 +7459,21 @@ pub enum BackupStoreConfig {
 /// store's own local directory even though the two stores' object
 /// namespaces are already disjoint (`animus_cp_data::backup`'s own module
 /// doc), the same belt-and-suspenders posture ADR 0059 §1 takes for the
-/// namespace split itself.
+/// namespace split itself. A distinct S3 bucket isn't required for the same
+/// reason (disjoint key namespaces already keep `S3StoreConfig`'s own
+/// `prefix` unambiguous even if an operator pointed both stores at the same
+/// bucket) — but the same belt-and-suspenders posture applies equally.
+///
+/// # Errors
+/// See [`build_segment_store`]'s own doc — only the `S3` variant can fail.
 fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
     control: ControlHandle,
     self_id: NodeId,
     config: &BackupStoreConfig,
-) -> BackupStoreHandle {
-    match config {
+) -> std::io::Result<BackupStoreHandle> {
+    Ok(match config {
         BackupStoreConfig::Cluster => {
             let local = FsSegmentStore::new(dir.join("backups"));
             let placement: Arc<dyn animus_cp_data::cluster_segment_store::PlacementView> =
@@ -6867,7 +7488,8 @@ fn build_backup_store(
             )
         }
         BackupStoreConfig::Fs(path) => BackupStoreHandle::Fs(FsSegmentStore::new(path.clone())),
-    }
+        BackupStoreConfig::S3(s3) => BackupStoreHandle::S3(Arc::new(s3_segment_store(s3)?)),
+    })
 }
 
 /// A per-tablet EWMA-smoothed rate sample — the shared storage shape behind
@@ -7848,6 +8470,60 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// control-only one (W-10)** — see `segment_store`'s doc above for why
     /// this lives here rather than inside [`DataRole`].
     pub(crate) backup_store: BackupStoreHandle,
+    /// The S3 export **customer**-bucket store factory (ADR 0068 §2) — see
+    /// [`ExportStoreFactory`]'s own doc. `Arc<Mutex<_>>`, not a bare
+    /// `ExportStoreFactory`, so [`Node::set_export_store_factory`] can
+    /// replace it in place and have every clone of this `ClientCtx`
+    /// (one per connection) observe the swap — the same sharing shape
+    /// `client_route`/`intra_route` use, just for a factory instead of a map.
+    pub(crate) export_store_factory: Arc<Mutex<ExportStoreFactory>>,
+    /// The on-demand backup janitor's own live progress (roadmap U-07,
+    /// ADR 0059 §3) — `animus_node::backup_janitor::backup_janitor_loop`
+    /// publishes into this through `ClientCtx`'s
+    /// [`animus_node::host::BackupJanitorProgressHost`] impl
+    /// (`client_ctx_host.rs`) at each phase transition; `GET
+    /// /admin/backup-store` reads it back out. **Provisioned on every node
+    /// shape**, mirroring `backup_store`'s own rationale above, even though
+    /// the loop itself only ever advances it while this node believes it
+    /// leads the control plane — a non-leader's copy simply stays at its
+    /// default `Idle` state forever, which is the correct thing for that
+    /// node to report. Plain `std::sync::Mutex`, matching
+    /// `metrics_history`'s own precedent: every access is a short
+    /// lock/mutate/drop, never held across an `.await`.
+    pub(crate) backup_janitor_progress: Arc<Mutex<animus_node::backup_janitor::JanitorProgress>>,
+    /// The TTL reaper's own live progress (roadmap U-07, ADR 0051) —
+    /// `animus_node::ttl_reaper::ttl_reaper_loop` publishes into this
+    /// through `ClientCtx`'s
+    /// [`animus_node::host::TtlReaperProgressHost`] impl
+    /// (`client_ctx_host.rs`) at each phase transition; `GET /admin/ttl`
+    /// reads it back out. **Provisioned on every node shape**, mirroring
+    /// `backup_janitor_progress`'s own rationale above — but unlike that
+    /// field, every node's own copy is a genuinely live answer: the TTL
+    /// reaper runs on *every* node (self-gated per tablet on
+    /// `TtlScanHost::led_tablets`), never only on the control leader.
+    /// Plain `std::sync::Mutex`, matching `metrics_history`'s own
+    /// precedent: every access is a short lock/mutate/drop, never held
+    /// across an `.await`.
+    pub(crate) ttl_reaper_progress: Arc<Mutex<animus_node::ttl_reaper::TtlReaperProgress>>,
+    /// The DynamoDB Streams segment janitor's own live progress (roadmap
+    /// U-07, ADR 0042 §10/ADR 0043 §A9) — `segment_janitor::
+    /// segment_janitor_loop`/`segment_janitor_tick` mutate this directly
+    /// at each phase transition; `GET /admin/gc` reads it back out.
+    /// **Unlike `backup_janitor_progress`/`ttl_reaper_progress` above, no
+    /// capability trait sits between the loop and this field** —
+    /// `segment_janitor.rs` never moved to `animus-node` (see that crate's
+    /// own `CLAUDE.md`, rung C2's "segment_janitor did NOT move" entry:
+    /// its replica-repair phase is real placement/membership
+    /// orchestration, not a value one narrow capability method can
+    /// capture), so the loop already holds a genuine `&ClientCtx` and
+    /// mutates this `Mutex` directly. **Provisioned on every node shape**,
+    /// mirroring `backup_janitor_progress`'s own rationale — the janitor,
+    /// like the backup janitor, only ever runs while this node believes it
+    /// leads the control plane, so a non-leader's copy simply stays at its
+    /// default `Idle` state forever. Plain `std::sync::Mutex`, matching
+    /// `metrics_history`'s own precedent: every access is a short
+    /// lock/mutate/drop, never held across an `.await`.
+    pub(crate) segment_janitor_progress: Arc<Mutex<segment_janitor::SegmentJanitorProgress>>,
     /// CP-group routing table: each CP group member id (`raftkv_id`, `300+i`) → the
     /// **client API** address of its hosting node (ADR 0017 #3b). Lets a node that
     /// received a CP op but doesn't host the group leader **forward** the request to
@@ -9669,6 +10345,15 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
+    /// [`Reconciler::enable_heartbeat_batching`]'s doc.
+    fn enable_heartbeat_batching(&mut self) {
+        match self {
+            CpReconciler::Lsm(r) => r.enable_heartbeat_batching(),
+            CpReconciler::Mem(r) => r.enable_heartbeat_batching(),
+        }
+    }
+
     /// ADR 0058 Train 2 rung 4 layer 1 — see [`Reconciler::fork_wake`]'s doc.
     async fn fork_wake(&self) {
         match self {
@@ -11225,6 +11910,7 @@ pub async fn start_cluster_with(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11263,6 +11949,7 @@ pub async fn start_cluster_with_auto_split_bytes(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11298,6 +11985,7 @@ pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11340,6 +12028,7 @@ pub async fn start_cluster_with_streams(
         None,
         None,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11380,6 +12069,7 @@ pub async fn start_cluster_with_growth(
         auto_split_change_rate,
         auto_split_ops_rate,
         Duration::ZERO,
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11419,6 +12109,12 @@ pub async fn start_cluster_with_quiesce_after(
         None,
         None,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower,
+        // test-only wrapper (predates ADR 0044 phase 2 and, per this
+        // function's own doc, already didn't expose the streams/change-rate
+        // knobs `start_cluster_with_growth_and_quiesce_after` does) — a
+        // caller wanting batching-on calls that sibling directly instead.
+        false,
         None,
         BackupStoreConfig::default(),
         None,
@@ -11456,6 +12152,11 @@ pub async fn start_cluster_with_quiesce_after(
 /// `PAY_PER_REQUEST`, byte-identical to before this pair of parameters
 /// existed.
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2) opts every node in the
+/// in-process cluster into the per-node heartbeat batcher — `--cluster N`'s
+/// `--heartbeat-batch` CLI flag threads through here; `false` (every other
+/// wrapper above) is byte-for-byte today's unbatched behavior.
+///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
@@ -11470,6 +12171,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
@@ -11488,6 +12190,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
         auto_split_change_rate,
         auto_split_ops_rate,
         quiesce_after,
+        heartbeat_batch,
         dynamo_auth,
         backup_store_config,
         throttle_read_units,
@@ -11510,6 +12213,7 @@ async fn start_cluster_inner(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     backup_store_config: BackupStoreConfig,
     throttle_read_units: Option<u64>,
@@ -11587,6 +12291,7 @@ async fn start_cluster_inner(
                 auto_split_change_rate,
                 auto_split_ops_rate,
                 quiesce_after,
+                heartbeat_batch,
                 // `--cluster N` has no ttl-sweep-interval knob of its own
                 // yet (mirrors `stream_retention`'s own layered-stack
                 // precedent for a not-yet-CLI-exposed knob) — production
@@ -11600,6 +12305,11 @@ async fn start_cluster_inner(
                 throttle_write_units,
                 tablet_max_read_units,
                 tablet_max_write_units,
+                // ADR 0068 §2: `--export-s3-endpoint`/`--export-s3-region`
+                // do not yet reach `--cluster N` (a documented gap) — use
+                // `Node::set_export_store_factory` to inject a test store
+                // on a node started this way.
+                None,
             )
             .await?;
         nodes.push(node);
@@ -11862,6 +12572,8 @@ pub async fn start_split_cluster_with_growth(
                 // same documented gap `run`'s own module doc names (S-06
                 // scoped only the three real deployment paths).
                 Duration::ZERO,
+                // `--heartbeat-batch` has the identical documented gap here.
+                false,
                 dynamo_auth.clone(),
                 BackupStoreConfig::default(),
                 None,
@@ -11997,12 +12709,18 @@ pub async fn run_node_with_streams_and_quiesce_after(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower,
+        // test/convenience-only wrapper (mirrors `--auto-split-*`'s own
+        // "not exposed here" gap two lines down) — a caller wanting
+        // batching-on calls `run_node_with_cluster_settings` directly.
+        false,
         None,
         None,
         None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
         None,
         None,
         None,
@@ -12045,12 +12763,14 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
         segment_store_config,
         stream_retention,
         Duration::ZERO,
+        false,
         None,
         None,
         None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         BackupStoreConfig::default(),
         pitr_snapshot_cadence,
+        None,
         None,
         None,
         None,
@@ -12094,12 +12814,18 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        // `--heartbeat-batch` doesn't thread through this narrower wrapper
+        // either (mirrors this file's own precedent above) — a caller
+        // wanting batching-on calls `run_node_with_cluster_settings`
+        // directly.
+        false,
         None,
         None,
         None,
         ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
         backup_store_config,
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
         None,
         None,
         None,
@@ -12128,6 +12854,12 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// caller too. `None`/`None` (every other call site) is byte-identical to
 /// before this pair of parameters existed.
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): `--config FILE --node
+/// I`'s `--heartbeat-batch` CLI/`cluster_settings.heartbeat_batch` config
+/// flag — `false` (every other call site) is byte-for-byte today's
+/// unbatched behavior. `main.rs`'s `run_single` is this function's real
+/// caller, mirroring `quiesce_after`'s own reach exactly.
+///
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
@@ -12141,6 +12873,7 @@ pub async fn run_node_with_cluster_settings(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
@@ -12149,6 +12882,7 @@ pub async fn run_node_with_cluster_settings(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
 ) -> std::io::Result<Node> {
     run_node_with_streams_quiesce_and_ttl_sweep_interval(
         config,
@@ -12160,6 +12894,7 @@ pub async fn run_node_with_cluster_settings(
         segment_store_config,
         stream_retention,
         quiesce_after,
+        heartbeat_batch,
         auto_split_bytes,
         auto_split_change_rate,
         auto_split_ops_rate,
@@ -12170,6 +12905,7 @@ pub async fn run_node_with_cluster_settings(
         throttle_write_units,
         tablet_max_read_units,
         tablet_max_write_units,
+        export_s3,
     )
     .await
 }
@@ -12214,6 +12950,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     segment_store_config: SegmentStoreConfig,
     stream_retention: Duration,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     auto_split_bytes: Option<u64>,
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
@@ -12224,6 +12961,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     throttle_write_units: Option<u64>,
     tablet_max_read_units: Option<u64>,
     tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -12291,6 +13029,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             auto_split_change_rate,
             auto_split_ops_rate,
             quiesce_after,
+            heartbeat_batch,
             ttl_sweep_interval,
             dynamo_auth,
             backup_store_config,
@@ -12299,6 +13038,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
             throttle_write_units,
             tablet_max_read_units,
             tablet_max_write_units,
+            export_s3,
         )
         .await
 }
@@ -12330,12 +13070,14 @@ pub async fn run_node_with_ttl_sweep_interval(
         SegmentStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
         Duration::ZERO,
+        false,
         None,
         None,
         None,
         ttl_sweep_interval,
         BackupStoreConfig::default(),
         pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
         None,
         None,
         None,
@@ -12528,6 +13270,7 @@ pub async fn run_node_data(
         None,
         None,
         Duration::ZERO,
+        false,
         StreamSealKnobs::default(),
         SegmentStoreConfig::default(),
         None,
@@ -12569,6 +13312,7 @@ pub async fn run_node_data_with_streams(
         None,
         None,
         Duration::ZERO,
+        false,
         stream_seal_knobs,
         segment_store_config,
         None,
@@ -12603,6 +13347,13 @@ pub async fn run_node_data_with_streams(
 /// the identical gap `auto_split_bytes`/`quiesce_after` already document
 /// above).
 ///
+/// `heartbeat_batch` (ADR 0044 phase 2, C-02 PR 2): `animusd data --config`'s
+/// only route to the per-node heartbeat batcher, the same
+/// `cluster_settings.heartbeat_batch` config-file section
+/// `run_node_with_cluster_settings`'s own combined-mode twin reads —
+/// `false` (every other call site) is byte-for-byte today's unbatched
+/// behavior.
+///
 /// # Errors
 /// As [`run_node_data`].
 #[allow(clippy::too_many_arguments)]
@@ -12615,6 +13366,7 @@ pub async fn run_node_data_with_cluster_settings(
     auto_split_change_rate: Option<u64>,
     auto_split_ops_rate: Option<u64>,
     quiesce_after: Duration,
+    heartbeat_batch: bool,
     stream_seal_knobs: StreamSealKnobs,
     segment_store_config: SegmentStoreConfig,
     throttle_read_units: Option<u64>,
@@ -12708,6 +13460,7 @@ pub async fn run_node_data_with_cluster_settings(
             auto_split_change_rate,
             auto_split_ops_rate,
             quiesce_after,
+            heartbeat_batch,
             dynamo_auth,
             // Same documented gap for `--backup-store` (ADR 0059 §1): no
             // CLI flag reaches `animusd data --config` yet, so this always
@@ -13289,6 +14042,8 @@ async fn finish_data_join(
             // `join`/`data --seed` (S-06 scoped only the three real
             // `--config`/`--node`-shaped deployment paths).
             Duration::ZERO,
+            // `--heartbeat-batch` has the identical documented gap here.
+            false,
             dynamo_auth,
             // Same documented gap for `--backup-store` as `run_node_data`.
             BackupStoreConfig::default(),
@@ -15459,6 +16214,16 @@ mod simenv_client_ctx_tests {
             // real store or `ProdEnv` is needed just to satisfy the field.
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
             admin,
@@ -15803,6 +16568,16 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
             // Node A never forwards outward in this test — empty routes.
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(BTreeMap::new())),
@@ -15863,6 +16638,16 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            backup_janitor_progress: Arc::new(Mutex::new(
+                animus_node::backup_janitor::JanitorProgress::default(),
+            )),
+            ttl_reaper_progress: Arc::new(Mutex::new(
+                animus_node::ttl_reaper::TtlReaperProgress::default(),
+            )),
+            segment_janitor_progress: Arc::new(Mutex::new(
+                segment_janitor::SegmentJanitorProgress::default(),
+            )),
             client_route: Arc::new(Mutex::new(BTreeMap::new())),
             intra_route: Arc::new(Mutex::new(intra_route_b)),
             admin: admin_b,

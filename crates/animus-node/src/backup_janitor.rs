@@ -28,6 +28,19 @@
 //! This loop has **no retention clock** — an `Available` backup is
 //! reclaimed only by an explicit `DeleteBackup` (landing here `Expired`) or
 //! a completion-aggregator `FailBackup`.
+//!
+//! ## Progress reporting (roadmap U-07)
+//!
+//! [`JanitorProgress`] is a small, `Env`-free snapshot of this loop's own
+//! state — phase, last tick, and cumulative counters — published through
+//! [`crate::host::BackupJanitorProgressHost`] at each phase transition
+//! below. `animusd::ClientCtx` backs it with an `Arc<Mutex<JanitorProgress>>`
+//! (`std::sync::Mutex`, matching every other short lock/mutate/drop shared
+//! diagnostic state in that crate — never held across an `.await`), read by
+//! `GET /admin/backup-store`. Every timestamp is [`animus_env::Env::now`]-
+//! derived, never a wall clock (ADR 0003) — this loop, and its progress
+//! snapshot, stay meaningful under `SimEnv` too, even though nothing reads
+//! it there today.
 
 use std::time::Duration;
 
@@ -35,10 +48,54 @@ use animus_control::BackupStatus;
 use animus_cp_data::backup as backup_codec;
 use animus_env::Env;
 
-use crate::host::{BackupObjectStore, ControlLeaderHost};
+use crate::host::{BackupJanitorProgressHost, BackupObjectStore, ControlLeaderHost};
 
 /// This loop's tick cadence.
 pub const BACKUP_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
+
+/// One phase of the backup janitor's own tick (roadmap U-07) — rendered on
+/// `GET /admin/backup-store`. See the module doc's "Reclaim is local-only"
+/// section for what each non-idle phase actually does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JanitorPhase {
+    /// Not currently the control leader, or nothing needs reclaiming as of
+    /// the last tick.
+    #[default]
+    Idle,
+    /// Listing/deleting a backup's own local objects.
+    Reclaiming,
+    /// Every local object for a backup is gone; proposing `DeleteBackup` to
+    /// finalize (remove) its catalog row.
+    RemovingRow,
+}
+
+/// A snapshot of the backup janitor's own progress (roadmap U-07) — see the
+/// "Progress reporting" section of the module doc for how this is
+/// published and consumed. Every counter is cumulative (never reset) for
+/// as long as the host process lives; `Default` is the correct initial
+/// state for a node that has never (yet) been the control leader.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JanitorProgress {
+    /// This tick's phase — see [`JanitorPhase`].
+    pub phase: JanitorPhase,
+    /// `env.now()` at the start of this loop's most recently observed
+    /// tick, in milliseconds — `None` before the first tick has ever run
+    /// (or on a node that has never been the control leader).
+    pub last_tick_at_ms: Option<u64>,
+    /// Cumulative count of backup rows this janitor has looked at across
+    /// every tick since this node became control leader.
+    pub backups_seen: u64,
+    /// Cumulative count of local objects reclaimed (deleted) across every
+    /// tick since this node became control leader.
+    pub objects_reclaimed: u64,
+    /// The most recent list/delete error observed, if any — cleared once a
+    /// full tick completes with no error.
+    pub last_error: Option<String>,
+    /// The backup id this janitor is (or was, as of the last tick) actively
+    /// reclaiming — `None` when idle.
+    pub current_backup_id: Option<String>,
+}
 
 /// The control-plane-leader-only background loop (ADR 0059 §3) — see the
 /// module doc for the documented control-only-leader / local-only-reclaim
@@ -46,23 +103,31 @@ pub const BACKUP_JANITOR_INTERVAL: Duration = Duration::from_millis(200);
 pub async fn backup_janitor_loop<E, H>(env: E, host: H)
 where
     E: Env,
-    H: ControlLeaderHost<E> + BackupObjectStore,
+    H: ControlLeaderHost<E> + BackupObjectStore + BackupJanitorProgressHost,
 {
     loop {
         env.sleep(BACKUP_JANITOR_INTERVAL).await;
+        let now_ms = env.now().0 / 1_000_000;
         let Some(leader) = host.control_leader() else {
+            // Not (or no longer) the control leader — report idle rather
+            // than leaving a stale, possibly-mid-reclaim phase behind.
+            host.update_backup_janitor_progress(&mut |p| {
+                p.phase = JanitorPhase::Idle;
+                p.last_tick_at_ms = Some(now_ms);
+                p.current_backup_id = None;
+            });
             continue;
         };
-        backup_janitor_tick(&host, &leader).await;
+        backup_janitor_tick(&host, &leader, now_ms).await;
     }
 }
 
 /// One tick's whole decision — see the module doc's "Reclaim is local-only"
 /// section.
-async fn backup_janitor_tick<E, H>(host: &H, leader: &animus_control::RaftNode<E>)
+async fn backup_janitor_tick<E, H>(host: &H, leader: &animus_control::RaftNode<E>, now_ms: u64)
 where
     E: Env,
-    H: BackupObjectStore,
+    H: BackupObjectStore + BackupJanitorProgressHost,
 {
     let meta = leader.metadata();
     let to_reclaim: Vec<String> = meta
@@ -77,9 +142,24 @@ where
         .map(|(id, _)| id.clone())
         .collect();
     if to_reclaim.is_empty() {
+        host.update_backup_janitor_progress(&mut |p| {
+            p.phase = JanitorPhase::Idle;
+            p.last_tick_at_ms = Some(now_ms);
+            p.current_backup_id = None;
+            p.last_error = None;
+        });
         return;
     }
+    host.update_backup_janitor_progress(&mut |p| {
+        p.last_tick_at_ms = Some(now_ms);
+        p.backups_seen = p.backups_seen.saturating_add(to_reclaim.len() as u64);
+    });
+    let mut tick_error: Option<String> = None;
     for backup_id in to_reclaim {
+        host.update_backup_janitor_progress(&mut |p| {
+            p.phase = JanitorPhase::Reclaiming;
+            p.current_backup_id = Some(backup_id.clone());
+        });
         let prefix = backup_codec::backup_prefix(&backup_id);
         let ids = match host.backup_list_local(&prefix).await {
             None => return, // control-only leader — see the module doc's gap
@@ -90,6 +170,7 @@ where
                     error = %e,
                     "backup janitor: local object list failed, retrying next tick"
                 );
+                tick_error = Some(e.to_string());
                 continue;
             }
         };
@@ -97,7 +178,11 @@ where
         for id in &ids {
             match host.backup_delete_local(id).await {
                 None => return, // control-only leader
-                Some(Ok(())) => {}
+                Some(Ok(())) => {
+                    host.update_backup_janitor_progress(&mut |p| {
+                        p.objects_reclaimed = p.objects_reclaimed.saturating_add(1);
+                    });
+                }
                 Some(Err(e)) => {
                     tracing::warn!(
                         backup_id,
@@ -105,6 +190,7 @@ where
                         error = %e,
                         "backup janitor: local object delete failed, retrying next tick"
                     );
+                    tick_error = Some(e.to_string());
                     all_deleted = false;
                 }
             }
@@ -112,8 +198,16 @@ where
         if !all_deleted {
             continue; // leave the row for the next tick's retry
         }
+        host.update_backup_janitor_progress(&mut |p| {
+            p.phase = JanitorPhase::RemovingRow;
+        });
         let _ = leader.propose(animus_control::MetaCommand::DeleteBackup { backup_id });
     }
+    host.update_backup_janitor_progress(&mut |p| {
+        p.phase = JanitorPhase::Idle;
+        p.current_backup_id = None;
+        p.last_error = tick_error.clone();
+    });
 }
 
 #[cfg(test)]
@@ -131,13 +225,19 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::host::BackupObjectStore;
+    use crate::host::{BackupJanitorProgressHost, BackupObjectStore};
 
     /// A synthetic [`BackupObjectStore`] — a plain in-memory object map, no
     /// real filesystem. `control_only` toggles the `None`-everywhere gap
-    /// this loop documents for a control-only leader.
+    /// this loop documents for a control-only leader. Also backs
+    /// [`BackupJanitorProgressHost`] with its own `JanitorProgress` slot, so
+    /// this double can drive and observe the progress-reporting mechanism
+    /// too (roadmap U-07).
     #[derive(Clone, Default)]
-    struct FakeBackupStore(Arc<Mutex<BTreeMap<String, Vec<u8>>>>);
+    struct FakeBackupStore(
+        Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+        Arc<Mutex<JanitorProgress>>,
+    );
 
     impl FakeBackupStore {
         fn put_raw(&self, id: &str, bytes: &[u8]) {
@@ -145,6 +245,15 @@ mod tests {
         }
         fn has(&self, id: &str) -> bool {
             self.0.lock().unwrap().contains_key(id)
+        }
+        fn progress(&self) -> JanitorProgress {
+            self.1.lock().unwrap().clone()
+        }
+    }
+
+    impl BackupJanitorProgressHost for FakeBackupStore {
+        fn update_backup_janitor_progress(&self, update: &mut dyn FnMut(&mut JanitorProgress)) {
+            update(&mut self.1.lock().unwrap());
         }
     }
 
@@ -205,6 +314,15 @@ mod tests {
             _id: &str,
         ) -> Option<std::io::Result<()>> {
             None
+        }
+    }
+
+    impl BackupJanitorProgressHost for ControlOnlyStore {
+        fn update_backup_janitor_progress(&self, _update: &mut dyn FnMut(&mut JanitorProgress)) {
+            // A control-only leader has nowhere to publish progress in
+            // production either (no `ClientCtx` field is reachable from a
+            // pure `RaftNode` context) — a no-op here, matching every other
+            // method on this test double.
         }
     }
 
@@ -280,7 +398,7 @@ mod tests {
 
         let env = node.env().clone();
         let (host, leader) = (store.clone(), node.clone());
-        env.spawn_task(async move { backup_janitor_tick(&host, &leader).await });
+        env.spawn_task(async move { backup_janitor_tick(&host, &leader, 0).await });
         sim.run_for(Duration::from_millis(50));
 
         assert!(!store.has(&manifest_id), "seed={seed}");
@@ -289,6 +407,17 @@ mod tests {
             node.metadata().backup(backup_id).is_none(),
             "the row must be finalized (removed) once every local object is gone (seed={seed})"
         );
+
+        // Roadmap U-07: the progress snapshot reflects the whole tick —
+        // ended idle, both local objects counted as reclaimed, one backup
+        // seen, no error, and the just-finished backup's own id cleared.
+        let progress = store.progress();
+        assert_eq!(progress.phase, JanitorPhase::Idle, "seed={seed}");
+        assert_eq!(progress.backups_seen, 1, "seed={seed}");
+        assert_eq!(progress.objects_reclaimed, 2, "seed={seed}");
+        assert_eq!(progress.last_error, None, "seed={seed}");
+        assert_eq!(progress.current_backup_id, None, "seed={seed}");
+        assert_eq!(progress.last_tick_at_ms, Some(0), "seed={seed}");
     }
 
     /// A backup with no locally-held objects at all (this node never held a
@@ -312,7 +441,7 @@ mod tests {
         let store = FakeBackupStore::default(); // deliberately empty
         let env = node.env().clone();
         let (host, leader) = (store, node.clone());
-        env.spawn_task(async move { backup_janitor_tick(&host, &leader).await });
+        env.spawn_task(async move { backup_janitor_tick(&host, &leader, 0).await });
         sim.run_for(Duration::from_millis(50));
 
         assert!(
@@ -346,7 +475,7 @@ mod tests {
 
         let env = node.env().clone();
         let (host, leader) = (store.clone(), node.clone());
-        env.spawn_task(async move { backup_janitor_tick(&host, &leader).await });
+        env.spawn_task(async move { backup_janitor_tick(&host, &leader, 0).await });
         sim.run_for(Duration::from_millis(50));
 
         assert!(!store.has(&this_manifest), "seed={seed}");
@@ -378,7 +507,7 @@ mod tests {
         let env = node.env().clone();
         let leader = node.clone();
         env.spawn_task(async move {
-            backup_janitor_tick(&ControlOnlyStore, &leader).await;
+            backup_janitor_tick(&ControlOnlyStore, &leader, 0).await;
         });
         sim.run_for(Duration::from_millis(50));
 

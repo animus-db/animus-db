@@ -520,6 +520,88 @@ sub-rungs below shipped.
   needed the four new arms too — the trait has no default methods, so a
   missing impl is a compile error here, not a silent gap.
 
+  **`AdminHost` gained a fifth method, `backup_store_view`, for roadmap
+  U-07 (2026-09-06)**: `GET /admin/backup-store` — added the identical way
+  (one method, the exact `Value` the route produces); `impl AdminHost for
+  ClientCtx` in `animusd::admin` delegates to that file's own
+  `backup_store_view` function. This is also the rung that added
+  **`host::BackupJanitorProgressHost`**, a small, non-`async` sibling of
+  `host`'s other capability traits: one method,
+  `update_backup_janitor_progress(&self, update: &mut dyn FnMut(&mut
+  backup_janitor::JanitorProgress))`, that
+  `backup_janitor::backup_janitor_loop`/`backup_janitor_tick` call at each
+  phase transition. Not `async_trait` — every implementation is a plain
+  synchronous lock/mutate/drop (`animusd::ClientCtx`'s is a
+  `std::sync::Mutex`), so there is nothing here for an async boundary to
+  buy; a `&mut dyn FnMut` parameter (rather than a generic `F: FnOnce`)
+  keeps the trait itself free of a type parameter while still letting a
+  caller mutate several fields in one lock acquisition. `backup_janitor`'s
+  own new `JanitorProgress`/`JanitorPhase` types (phase, last tick,
+  cumulative `backups_seen`/`objects_reclaimed`, the last error, and the
+  backup id currently being worked) are plain `serde`-derived data with no
+  `Env`/`ClientCtx` dependency, so this module needed no new visibility
+  widening to publish them. `admin::tests::FakeHost` and `dispatch`'s
+  routing table both needed the one new arm too.
+
+  **`AdminHost` gained a sixth method, `ttl_view`, for roadmap U-07's
+  second route (2026-09-06)**: `GET /admin/ttl` — added the identical way
+  again; `impl AdminHost for ClientCtx` in `animusd::admin` delegates to
+  that file's own `ttl_view` function. This rung also added
+  **`host::TtlReaperProgressHost`**, the `TtlScanHost`-driven sibling of
+  `BackupJanitorProgressHost` (same shape: one method,
+  `update_ttl_reaper_progress(&self, update: &mut dyn FnMut(&mut
+  ttl_reaper::TtlReaperProgress))`, not `async_trait`, called by
+  `ttl_reaper::ttl_reaper_loop`/`ttl_sweep_one_tablet` at each phase
+  transition). **The one deliberate difference from
+  `BackupJanitorProgressHost`**: the TTL reaper is not control-plane-
+  leader-gated — it runs on every node, self-gated per tablet
+  (`TtlScanHost::led_tablets`) — so every node's own `TtlReaperProgress` is
+  a genuinely live, independently meaningful answer, never a stand-in for
+  "not the leader" the way a non-leader's `JanitorProgress` is.
+  `ttl_reaper`'s own new `TtlReaperProgress`/`TtlReaperPhase`/
+  `TtlReaperCursor` types (phase, last tick, a JSON-safe hex-truncated
+  resume-cursor projection — never raw key bytes — and cumulative
+  deleted/expired-seen/tables-with-TTL counters) are plain `serde`-derived
+  data with no `Env`/`ClientCtx` dependency, so no new visibility widening
+  was needed to publish them. `admin::tests::FakeHost` and `dispatch`'s
+  routing table both needed the one new arm too;
+  `tests/ttl_reaper_sim.rs`'s existing synthetic `FakeTtlHost` gained the
+  new trait impl plus progress assertions on its existing scenarios.
+
+  **`AdminHost` gained a seventh method, `gc_view`, for roadmap U-07's
+  third route (2026-09-06)**: `GET /admin/gc` — added the identical way
+  again (`impl AdminHost for ClientCtx` in `animusd::admin` delegates to
+  that file's own `gc_view` function); `admin::tests::FakeHost` and
+  `dispatch`'s routing table both needed the one new arm too. **This is
+  the one route so far with no matching capability trait added here at
+  all** — the segment janitor it reports on
+  (`animusd::segment_janitor.rs`) never moved to this crate in rung C2
+  (see that rung's own "segment_janitor did NOT move" entry, above): its
+  replica-repair phase is real placement/membership orchestration, not a
+  value one narrow capability method can capture. Its new progress type,
+  `animusd::segment_janitor::SegmentJanitorProgress`, is therefore an
+  `animusd`-local type this crate never names — the loop already holds a
+  genuine `&ClientCtx` (it always did; it never left `animusd`) and
+  mutates `ClientCtx::segment_janitor_progress` directly, so there was
+  nothing for a `BackupJanitorProgressHost`-shaped trait to buy here.
+  `gc_view` itself is otherwise identical in shape to `backup_store_view`/
+  `ttl_view`: one method, returning the exact `Value` the route produces.
+
+  **`AdminHost` gained an eighth and last method, `segment_store_view`, for
+  roadmap U-07's fourth and closing route (2026-09-06)**: `GET
+  /admin/segment-store` — added the identical way again (`impl AdminHost
+  for ClientCtx` in `animusd::admin` delegates to that file's own
+  `segment_store_view` function); `admin::tests::FakeHost` and
+  `dispatch`'s routing table both needed the one new arm too. Unlike
+  `gc_view`, this route needed no new `animusd`-local progress type at
+  all — it reports a durable catalog fact (`Metadata::stream_shards`'s own
+  `replicas` field, itself populated once, at seal time, by
+  `animus_cp_data::cluster_segment_store::ClusterSegmentStore::
+  put_replicated`'s own placement selection) plus a bounded live local
+  object scan, never a loop's own phase (that is `gc_view`'s job). This
+  closes docs/roadmap.md's whole U-07 section — every one of its four
+  routes has now landed.
+
   **A testing gotcha this rung's own dispatch tests needed a real fix
   for, not just a workaround**: this crate has no `tokio` dependency at
   all (not even in `[dev-dependencies]`), so `#[tokio::test]` isn't an

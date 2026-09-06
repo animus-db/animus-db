@@ -90,6 +90,27 @@ pub trait BackupObjectStore: Send + Sync {
     async fn backup_delete_at(&self, replicas: &[NodeId], id: &str) -> Option<io::Result<()>>;
 }
 
+/// The on-demand backup janitor's own progress-reporting capability
+/// (roadmap U-07) — lets [`crate::backup_janitor::backup_janitor_loop`]
+/// publish its current phase/counters to a shared, admin-readable slot
+/// without dragging any admin-surface type into this crate. Not
+/// `async` — every implementation is a short, synchronous lock/mutate/drop
+/// (see [`crate::backup_janitor::JanitorProgress`]'s own doc), so there is
+/// nothing here for `async_trait` to buy.
+///
+/// `animusd::ClientCtx` backs this with an
+/// `Arc<std::sync::Mutex<JanitorProgress>>`, mirroring `metrics_history`'s
+/// own "plain `std::sync::Mutex` is fine, nothing here holds it across an
+/// `.await`" precedent in that crate.
+pub trait BackupJanitorProgressHost: Send + Sync {
+    /// Apply `update` to the shared
+    /// [`crate::backup_janitor::JanitorProgress`] under a short-held lock.
+    fn update_backup_janitor_progress(
+        &self,
+        update: &mut dyn FnMut(&mut crate::backup_janitor::JanitorProgress),
+    );
+}
+
 /// The TTL reaper's own narrow slice: a `Metadata` read, which tablets this
 /// node leads, a pure local non-waking scan, and the one conditional-delete
 /// write the reaper ever performs — see `ttl_reaper`'s module doc for the
@@ -143,6 +164,31 @@ pub trait TtlScanHost {
         attribute: &str,
         expected: AttributeValue,
     ) -> Result<bool, String>;
+}
+
+/// The TTL reaper's own progress-reporting capability (roadmap U-07) — the
+/// `TtlScanHost`-driven sibling of [`BackupJanitorProgressHost`]: lets
+/// [`crate::ttl_reaper::ttl_reaper_loop`] publish its own phase/cursor/
+/// counters to a shared, admin-readable slot without dragging any
+/// admin-surface type into this crate. Not `async` for the identical reason
+/// `BackupJanitorProgressHost` isn't — every implementation is a short,
+/// synchronous lock/mutate/drop (see [`crate::ttl_reaper::TtlReaperProgress`]'s
+/// own doc), so there is nothing here for `async_trait` to buy.
+///
+/// `animusd::ClientCtx` backs this with an
+/// `Arc<std::sync::Mutex<TtlReaperProgress>>`, the identical
+/// `BackupJanitorProgressHost`/`metrics_history` precedent — **unlike** the
+/// backup janitor (control-plane-leader-only, so only one node's progress
+/// is ever meaningful), the TTL reaper runs on *every* node, self-gated
+/// per tablet, so every node's own progress is a genuine, independently
+/// meaningful answer.
+pub trait TtlReaperProgressHost: Send + Sync {
+    /// Apply `update` to the shared
+    /// [`crate::ttl_reaper::TtlReaperProgress`] under a short-held lock.
+    fn update_ttl_reaper_progress(
+        &self,
+        update: &mut dyn FnMut(&mut crate::ttl_reaper::TtlReaperProgress),
+    );
 }
 
 /// A synchronous call/await RPC to another node's client API (ADR 0061 rung
@@ -344,4 +390,49 @@ pub trait AdminHost: Send + Sync {
     /// `POST /admin/credentials/revoke` (ADR 0066 §2) — revoke a credential
     /// outright.
     async fn action_revoke_credential(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07) — this
+    /// node's own configured backup store (redacted), a bounded live scan
+    /// of its local object count/bytes, the backup janitor's own live
+    /// [`crate::backup_janitor::JanitorProgress`], and whether this node is
+    /// currently the control-plane leader (the janitor only ever runs
+    /// there). The template the next three U-07 observability routes
+    /// (`/admin/ttl`, `/admin/gc`, `/admin/segment-store`) copy.
+    async fn backup_store_view(&self) -> Value;
+    /// `GET /admin/ttl` (ADR 0051, roadmap U-07) — this node's own live
+    /// [`crate::ttl_reaper::TtlReaperProgress`] (unlike the backup janitor,
+    /// the TTL reaper runs on *every* node, self-gated per tablet, so
+    /// every node answers about its own reaper, never a control-leader-
+    /// only view), every TTL-enabled table in the replicated catalog
+    /// (`{name, attribute, enabled}`), and how many tablets this node
+    /// currently leads of a TTL-enabled table.
+    async fn ttl_view(&self) -> Value;
+    /// `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07) — the
+    /// third of U-07's four observability routes: the DynamoDB Streams
+    /// **segment janitor**'s own live phase/counters (a control-plane-
+    /// leader-only loop, exactly like the backup janitor above — a
+    /// follower's own view simply stays `idle` forever) plus whether this
+    /// node currently believes it is the control-plane leader. Unlike
+    /// `backup_store_view`/`ttl_view`, the janitor's own progress type
+    /// (`animusd::segment_janitor::SegmentJanitorProgress`) lives entirely
+    /// in `animusd` — `segment_janitor.rs` never moved to this crate
+    /// (see this crate's own `CLAUDE.md`, rung C2's "segment_janitor did
+    /// NOT move" entry: its replica-repair phase is real placement/
+    /// membership orchestration, not a value one narrow capability method
+    /// can capture), so there is no new type to name here at all, only
+    /// this one more `Value`-returning route method.
+    async fn gc_view(&self) -> Value;
+    /// `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07) — the
+    /// fourth and last of U-07's observability routes: this node's own
+    /// configured DynamoDB Streams segment store (redacted, same
+    /// convention as `backup_store_view`'s `store` field), the
+    /// shard→replica placement it currently sees for the `cluster` store
+    /// kind (`null` for the single-shared-directory `fs` opt-in, which has
+    /// no per-node replica concept), and a bounded live scan of this
+    /// node's own local object count/bytes. Unlike `backup_store_view`'s
+    /// `objects`/`ttl_view`'s `reaper`, this route publishes no janitor/
+    /// reaper progress of its own — the segment janitor's progress is
+    /// already `gc_view`'s job, and the placement this route reports is a
+    /// durable catalog fact (`Metadata::stream_shards`), not a live loop's
+    /// phase.
+    async fn segment_store_view(&self) -> Value;
 }

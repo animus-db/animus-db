@@ -446,6 +446,47 @@ pub struct Metadata {
     /// pre-ADR-0066 snapshots loading (empty map).
     #[serde(default)]
     pub credentials: BTreeMap<AccessKeyId, CredentialRow>,
+    /// The **S3 export catalog** (ADR 0068, S-05): every
+    /// `ExportTableToPointInTime` ever begun, keyed by [`ExportId`] — an
+    /// opaque, freshly-minted identity, the identical "never a name"
+    /// discipline [`backups`](Self::backups) already uses and for the
+    /// same reason (an export's source table can be dropped and recreated
+    /// without poisoning an in-flight or completed export row). Mutated
+    /// only through [`MetaCommand::BeginExport`] (mints a row),
+    /// [`MetaCommand::CompleteExport`]/[`MetaCommand::FailExport`]
+    /// (terminal transitions). Unlike [`backups`](Self::backups), there is
+    /// no delete/reclaim command — DynamoDB's own `ExportTableToPointInTime`
+    /// has no `DeleteExport` API either; an export row (and the data it
+    /// describes) lives in the *customer's* own S3 bucket forever, subject
+    /// to that bucket's own lifecycle policy, not this catalog's. Never
+    /// touched by `DropTableSchema`/`DropTableTablets`, for the identical
+    /// "outlives the source table" reason `backups` documents.
+    /// `#[serde(default)]` keeps pre-export snapshots loading (empty map).
+    #[serde(default)]
+    pub exports: BTreeMap<ExportId, ExportRow>,
+    /// The **S3 import catalog** (ADR 0068, S-05 PR 2): every `ImportTable`
+    /// ever begun, keyed by [`ImportId`] — the import's own ARN (`<TableArn
+    /// of the freshly-created target>/import/<id>`, [`crate::schema`] has no
+    /// ARN builder — that lives in `animus_dynamo::wire::import_arn`), the
+    /// identical "the id itself is the wire ARN" discipline
+    /// [`exports`](Self::exports) already uses. Mutated only through
+    /// [`MetaCommand::BeginImport`] (creates the target schema's tablet in
+    /// [`animus_tablet::TabletState::Building`] and mints a row),
+    /// [`MetaCommand::CompleteImport`]/[`MetaCommand::FailImport`]
+    /// (terminal transitions). Like [`exports`](Self::exports) there is no
+    /// delete/reclaim command — DynamoDB's `ImportTable` has no
+    /// `DeleteImport` API either, and an import row is a small, permanent
+    /// record of "this table was imported from here." Unlike a restore's
+    /// row, **a failed import's target table is not left behind** — the
+    /// import job (`animusd::dynamo`) drops it through the ordinary
+    /// `DropTableSchema`/`DropTableTablets` path once `FailImport` commits,
+    /// matching real DynamoDB's own "a failed `ImportTable` rolls back the
+    /// table it was creating" contract — but the catalog row describing the
+    /// attempt survives regardless, the same "outlives what it describes"
+    /// discipline `backups`/`exports` already have. `#[serde(default)]`
+    /// keeps pre-import snapshots loading (empty map).
+    #[serde(default)]
+    pub imports: BTreeMap<ImportId, ImportRow>,
 }
 
 /// Gives [`Metadata::stream_shards`] a `serde_json`-safe wire shape — see
@@ -978,6 +1019,272 @@ pub struct BackupRow {
     /// pre-existing snapshot/fixture that predates this field.
     #[serde(default)]
     pub total_bytes: u64,
+}
+
+/// An export's opaque catalog identity (ADR 0068 §3) — an ARN-shaped string
+/// at the wire (`<TableArn>/export/<id>`), freshly minted per
+/// `ExportTableToPointInTime` request. Mirrors [`BackupId`]'s own "never a
+/// table name" discipline exactly.
+pub type ExportId = String;
+
+/// The wire-facing export format (ADR 0068 §1) — only
+/// [`DynamoDbJson`](Self::DynamoDbJson) is ever actually produced; `Ion` is
+/// accepted here purely for shape fidelity with DynamoDB's own
+/// `ExportFormat` enum — the wire edge (`animusd::dynamo`) rejects an `ION`
+/// request with `ValidationException` before ever proposing
+/// [`MetaCommand::BeginExport`], so this state machine never observes it in
+/// practice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportFormat {
+    /// DynamoDB JSON: one `{"Item": {...}}` object per line, gzip-chunked
+    /// (ADR 0068 §1) — the only format this adapter implements.
+    DynamoDbJson,
+    /// Amazon Ion — accepted at the wire type level, never implemented;
+    /// see this type's own doc.
+    Ion,
+}
+
+/// The wire-facing export type (ADR 0068 §1) — only
+/// [`Full`](Self::Full) is implemented; `Incremental` is accepted here for
+/// the identical shape-fidelity reason [`ExportFormat::Ion`] is, and is
+/// rejected at the wire edge with `ValidationException` before ever
+/// proposing [`MetaCommand::BeginExport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportType {
+    /// A full point-in-time export of every item in the table — the only
+    /// export type this adapter implements.
+    Full,
+    /// An incremental export of changes since a prior export — accepted at
+    /// the wire type level, never implemented; see this type's own doc.
+    Incremental,
+}
+
+/// An export catalog row's lifecycle status (ADR 0068 §3) — DynamoDB's own
+/// three-value `ExportStatus` (`IN_PROGRESS`/`COMPLETED`/`FAILED`), with no
+/// fourth reclaim-pending state the way [`BackupStatus`] has: an export row
+/// is never deleted (see [`Metadata::exports`]'s own doc for why).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportStatus {
+    /// The export job (`animusd`'s leader-driven export driver) is still
+    /// running.
+    InProgress,
+    /// Terminal success: the manifest is durably written to the customer's
+    /// S3 bucket (`ExportRow::export_manifest` is `Some`).
+    Completed,
+    /// Terminal failure. `reason` is diagnostic only, never interpreted by
+    /// this state machine.
+    Failed {
+        /// A human-readable failure reason.
+        reason: String,
+    },
+}
+
+/// An export catalog row (`Metadata::exports`, ADR 0068 §3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRow {
+    /// The source table this export was taken from (data only — the
+    /// catalog is keyed by [`ExportId`], never by this name).
+    pub table: TableName,
+    /// The source table's synthetic ARN (`animus_dynamo::wire::table_arn`)
+    /// at request time — echoed back verbatim on `DescribeExport`.
+    pub table_arn: String,
+    /// The customer-owned destination S3 bucket name.
+    pub s3_bucket: String,
+    /// The optional key prefix inside `s3_bucket` every object this export
+    /// writes is rooted under.
+    pub s3_prefix: Option<String>,
+    /// The requested export format — always [`ExportFormat::DynamoDbJson`]
+    /// in practice (see that type's own doc).
+    pub format: ExportFormat,
+    /// The requested export type — always [`ExportType::Full`] in practice
+    /// (see that type's own doc).
+    pub export_type: ExportType,
+    /// The requested `ExportTime`, in epoch **milliseconds** (`None` means
+    /// "the current committed state," captured through the same
+    /// read-through-intent-resolution path a plain `Scan` uses — ADR 0068
+    /// §1). `Some` means a consistent per-tablet snapshot as of this
+    /// instant, served from the PITR machinery, and only accepted when it
+    /// falls inside the source table's own PITR restore window.
+    pub export_time_ms: Option<u64>,
+    /// The client-supplied `ClientToken` (ADR 0068 §5), if given — recorded
+    /// so a retried `ExportTableToPointInTime` call with the same token
+    /// resolves back to this same row instead of minting a second export.
+    pub client_token: Option<String>,
+    /// This row's lifecycle status.
+    pub status: ExportStatus,
+    /// Wall-clock start time, stamped at **propose** time by the
+    /// wire-serving node (`env.wall_now()`, the ADR 0051 discipline — the
+    /// pure state machine has no clock).
+    pub created_wall_ms: u64,
+    /// Wall-clock completion time (success or failure), stamped by the
+    /// export driver at propose time — `None` while
+    /// [`InProgress`](ExportStatus::InProgress).
+    pub completed_wall_ms: Option<u64>,
+    /// The total number of items written to the export, frozen once by
+    /// [`MetaCommand::CompleteExport`]'s own apply arm.
+    pub item_count: u64,
+    /// The total billed (uncompressed) size of the exported data in bytes,
+    /// frozen once by [`MetaCommand::CompleteExport`]'s own apply arm.
+    pub billed_size_bytes: u64,
+    /// The S3 key of this export's `manifest-summary.json` object, set once
+    /// by [`MetaCommand::CompleteExport`]'s own apply arm — `None` until
+    /// then.
+    pub export_manifest: Option<String>,
+}
+
+/// An import's opaque catalog identity as an ARN (ADR 0068 §6, S-05 PR 2) —
+/// `<TableArn>/import/<id>`, [`ExportId`]'s identical "the id itself is the
+/// wire ARN" shape (`animus_dynamo::wire::import_arn`).
+pub type ImportId = String;
+
+/// `ImportTable`'s `InputFormat` (ADR 0068 §6) — only
+/// [`DynamoDbJson`](Self::DynamoDbJson) is implemented; `Ion`/`Csv` are
+/// modeled for wire shape fidelity only, and are rejected with a
+/// `ValidationException` at wire-decode time before ever reaching this
+/// state machine (the identical `ExportFormat::Ion` discipline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputFormat {
+    /// DynamoDB JSON: one `{"Item": {...}}` object per line — this
+    /// adapter's own export layout, and real AWS's identical one. The only
+    /// format this adapter can import.
+    DynamoDbJson,
+    /// Amazon Ion — accepted at the wire type level, never implemented.
+    Ion,
+    /// CSV — accepted at the wire type level, never implemented.
+    Csv,
+}
+
+/// `ImportTable`'s `InputCompressionType` (ADR 0068 §6) — `Gzip`/`None` are
+/// both implemented (the data files this adapter's own export writes are
+/// always `Gzip`, but real AWS export tooling can also produce uncompressed
+/// `NONE` output); `Zstd` is modeled for wire shape fidelity only and
+/// rejected at wire-decode time, matching [`InputFormat::Ion`]/[`InputFormat::
+/// Csv`]'s treatment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputCompressionType {
+    /// Gzip-compressed data files (`.json.gz`) — this adapter's own export
+    /// layout's default.
+    Gzip,
+    /// Uncompressed data files.
+    None,
+    /// Zstandard — accepted at the wire type level, never implemented.
+    Zstd,
+}
+
+/// An import catalog row's lifecycle status (ADR 0068 §6) — a narrower
+/// three-value set than real DynamoDB's own five (`IN_PROGRESS`/
+/// `COMPLETED`/`CANCELLING`/`CANCELLED`/`FAILED`): **cancellation is a named
+/// residual, not implemented** (ADR 0068's PR 2 as-built note) — this
+/// adapter never produces `CANCELLING`/`CANCELLED`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportStatus {
+    /// The import job (`animusd`'s leader-driven, per-tablet import driver)
+    /// is still reading the customer bucket and seeding the target table's
+    /// tablet, which stays in [`animus_tablet::TabletState::Building`] —
+    /// unroutable to an ordinary client write or read — for the whole
+    /// duration.
+    InProgress,
+    /// Terminal success: every data file has been read and seeded, and the
+    /// target table's tablet has been activated.
+    Completed,
+    /// Terminal failure. `reason` is diagnostic only, never interpreted by
+    /// this state machine. **Unlike a failed restore, the target table
+    /// itself is not left behind** — the import job drops it through the
+    /// ordinary `DropTableSchema`/`DropTableTablets` path once this commits
+    /// (real DynamoDB's own "a failed `ImportTable` rolls back the table"
+    /// contract); this row (and the counts it freezes) survives regardless.
+    Failed {
+        /// A human-readable failure reason.
+        reason: String,
+    },
+}
+
+/// An import catalog row (`Metadata::imports`, ADR 0068 §6, S-05 PR 2).
+/// Modeled directly on [`ExportRow`]'s shape for the request-echo half, and
+/// on [`RestoreRow`]'s shape for the target-table-provisioning half (a
+/// single [`animus_tablet::TabletState::Building`] destination tablet,
+/// GSIs resolved but declared only at [`MetaCommand::CompleteImport`]
+/// time).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRow {
+    /// The freshly-created target table this import populates.
+    pub target_table: TableName,
+    /// The target table's synthetic ARN, minted at the same moment as
+    /// `target_table`'s schema — echoed back verbatim on `DescribeImport`.
+    pub target_table_arn: String,
+    /// A synthetic per-table identity (real DynamoDB mints a `TableId`
+    /// GUID at every `CreateTable`; this adapter has never needed one
+    /// before `ImportTableDescription`'s own echoed `TableId` field asked
+    /// for one) — a fresh random hex string, diagnostic only, never
+    /// interpreted by this state machine or used to look anything up.
+    pub table_id: String,
+    /// The customer-owned source S3 bucket name.
+    pub s3_bucket: String,
+    /// The optional key prefix inside `s3_bucket` this import reads from
+    /// (either the export's own root, or a shallower prefix the job must
+    /// search under `AWSDynamoDB/*/manifest-summary.json` — ADR 0068 §6).
+    pub s3_prefix: Option<String>,
+    /// The requested input format — always [`InputFormat::DynamoDbJson`] in
+    /// practice (see that type's own doc).
+    pub input_format: InputFormat,
+    /// The requested input compression — [`InputCompressionType::Zstd`]
+    /// never reaches this state machine (see that type's own doc).
+    pub input_compression: InputCompressionType,
+    /// The target table's base key schema (no indexes/stream/ttl — the
+    /// identical stripped shape [`RestoreRow`]'s own provisioning uses),
+    /// already committed via a preceding `MetaCommand::CreateTableSchema`
+    /// before this row is minted.
+    pub base_schema: TableSchema,
+    /// The declared `(AttributeName, AttributeType)` pairs from the
+    /// request's own `TableCreationParameters.AttributeDefinitions` —
+    /// carried here purely so `DescribeImport`'s echoed
+    /// `TableCreationParameters` can render real declared types rather than
+    /// re-deriving a placeholder.
+    pub key_types: Vec<(String, String)>,
+    /// This import's own resolved GSI plan (ADR 0068 §6, mirroring
+    /// [`RestoreRow::gsi_defs`]'s identical "recorded now, declared only at
+    /// completion" reasoning): declaring these before the tablet is seeded
+    /// would let the backfill seeder observe an empty range, mark it
+    /// backfilled, and then silently miss every row this import seeds
+    /// afterward.
+    pub gsi_defs: Vec<IndexDef>,
+    /// The target table's requested provisioned throughput, if any —
+    /// already baked into the catalog schema by the wire handler's own
+    /// `CreateTableSchema` proposal; carried here again purely for
+    /// `DescribeImport`'s echoed `TableCreationParameters.BillingMode`/
+    /// `ProvisionedThroughput`.
+    pub throughput: Option<ProvisionedThroughput>,
+    /// The single destination tablet this import seeds (mirrors
+    /// [`RestoreRow::tablet`] exactly — one tablet over the whole ring,
+    /// `Building` until [`MetaCommand::CompleteImport`] activates it).
+    pub tablet: TabletId,
+    /// The client-supplied `ClientToken`, if given — recorded so a retried
+    /// `ImportTable` call with the same token resolves back to this same
+    /// row instead of minting a second import.
+    pub client_token: Option<String>,
+    /// This row's lifecycle status.
+    pub status: ImportStatus,
+    /// Wall-clock start time, stamped at **propose** time by the
+    /// wire-serving node (`env.wall_now()`, ADR 0051's discipline).
+    pub created_wall_ms: u64,
+    /// Wall-clock completion time (success or failure), stamped by the
+    /// import driver at propose time — `None` while
+    /// [`InProgress`](ImportStatus::InProgress).
+    pub completed_wall_ms: Option<u64>,
+    /// The total number of items read from the source data files
+    /// (including any that failed key-schema validation), frozen once by
+    /// [`MetaCommand::CompleteImport`]/[`MetaCommand::FailImport`]'s own
+    /// apply arm.
+    pub processed_item_count: u64,
+    /// The total number of items actually seeded into the target table
+    /// (`processed_item_count` minus `error_count`), frozen the same way.
+    pub imported_item_count: u64,
+    /// The total number of items skipped for failing key-schema validation
+    /// (ADR 0068 §6's documented cap), frozen the same way.
+    pub error_count: u64,
+    /// The total (compressed, as read off the customer bucket) size of the
+    /// processed data files in bytes, frozen the same way.
+    pub processed_size_bytes: u64,
 }
 
 /// A DynamoDB SigV4 access key id (ADR 0066) — the credential catalog's key,
@@ -2117,6 +2424,70 @@ pub enum MetaCommand {
         /// The backup to mark for reclaim.
         backup_id: BackupId,
     },
+    /// Begin an S3 export (ADR 0068 §3): mints an
+    /// [`ExportStatus::InProgress`] catalog row at `export_id`. Rejected if
+    /// `export_id` already names a row (a fresh id is minted per request,
+    /// so there is nothing to CAS against — first-committer-wins, the
+    /// identical shape [`BeginBackup`](Self::BeginBackup) already uses) or
+    /// if `table` has no schema. The wire edge (`animusd::dynamo`) is
+    /// responsible for `ClientToken` idempotency (resolving a repeated
+    /// token back to the same `export_id` before ever proposing this) —
+    /// this apply arm itself performs no token lookup.
+    BeginExport {
+        /// The freshly-minted, never-reused export identity (an ARN-shaped
+        /// string at the wire, ADR 0068 §3).
+        export_id: ExportId,
+        /// The source table to export.
+        table: TableName,
+        /// The source table's synthetic ARN at request time.
+        table_arn: String,
+        /// The destination S3 bucket.
+        s3_bucket: String,
+        /// The optional destination S3 key prefix.
+        s3_prefix: Option<String>,
+        /// The requested export format.
+        format: ExportFormat,
+        /// The requested export type.
+        export_type: ExportType,
+        /// The requested `ExportTime` in epoch milliseconds, if given.
+        export_time_ms: Option<u64>,
+        /// The client-supplied `ClientToken`, if given.
+        client_token: Option<String>,
+        /// Stamped at PROPOSE time by the wire-serving node
+        /// (`env.wall_now()`, ADR 0051's discipline) — the pure state
+        /// machine has no clock.
+        created_wall_ms: u64,
+    },
+    /// Complete an export (ADR 0068 §3) once the leader-driven export job
+    /// has finished writing every data file and the manifest to the
+    /// customer's S3 bucket. Rejected if `export_id` is unknown or not
+    /// [`InProgress`](ExportStatus::InProgress). Flips the row to
+    /// [`ExportStatus::Completed`] — DynamoDB's own terminal export status.
+    CompleteExport {
+        /// The export to complete.
+        export_id: ExportId,
+        /// The total number of items written.
+        item_count: u64,
+        /// The total billed (uncompressed) size in bytes.
+        billed_size_bytes: u64,
+        /// The S3 key of the written `manifest-summary.json` object.
+        export_manifest: String,
+        /// Stamped at PROPOSE time by the export driver (`env.wall_now()`).
+        completed_wall_ms: u64,
+    },
+    /// Fail an export (ADR 0068 §3) — any driver-observed failure. Rejected
+    /// if `export_id` is unknown, or if the row is already
+    /// [`Completed`](ExportStatus::Completed) (a completed export cannot
+    /// subsequently "fail"). Idempotent: a no-op if the row is already
+    /// `Failed` with the identical `reason`.
+    FailExport {
+        /// The export to fail.
+        export_id: ExportId,
+        /// A human-readable failure reason.
+        reason: String,
+        /// Stamped at PROPOSE time by the export driver (`env.wall_now()`).
+        completed_wall_ms: u64,
+    },
     /// Begin a restore (ADR 0059 §7, Train 2): mints a fresh
     /// [`RestoreRow`] in [`RestoreStatus::Seeding`] plus this restore's
     /// single `Building` tablet, bound to `target_table` (whose schema must
@@ -2183,6 +2554,120 @@ pub enum MetaCommand {
         restore_id: RestoreId,
         /// A human-readable failure reason.
         reason: String,
+    },
+    /// Begin an S3 import (ADR 0068 §6, S-05 PR 2): mints an
+    /// [`ImportStatus::InProgress`] catalog row at `import_id`, plus this
+    /// import's single `Building` destination tablet, bound to
+    /// `target_table` (whose schema — and, when the request declares any,
+    /// LSIs — must already exist: the wire handler proposes
+    /// `CreateTableSchema` first, the identical ordering
+    /// [`BeginRestore`](Self::BeginRestore) already requires). Rejected if
+    /// `import_id` already names a row (first-committer-wins, a fresh id is
+    /// minted per request — the identical shape [`BeginExport`](
+    /// Self::BeginExport)/[`BeginRestore`](Self::BeginRestore) already use)
+    /// or if `tablet` already exists or sits below the monotonic allocator
+    /// floor (the [`BeginRestore`](Self::BeginRestore) seatbelt). The wire
+    /// edge is responsible for `ClientToken` idempotency and for the
+    /// `ImportConflictException` checks (an existing table of that name, or
+    /// an import already running for it) — this apply arm performs neither.
+    #[allow(clippy::too_many_arguments)] // mirrors every other multi-field Begin* command
+    BeginImport {
+        /// The freshly-minted, never-reused import identity (an ARN-shaped
+        /// string at the wire, ADR 0068 §6).
+        import_id: ImportId,
+        /// The freshly-created target table.
+        target_table: TableName,
+        /// The target table's synthetic ARN.
+        target_table_arn: String,
+        /// A synthetic per-table identity — see [`ImportRow::table_id`]'s
+        /// own doc.
+        table_id: String,
+        /// The source S3 bucket.
+        s3_bucket: String,
+        /// The optional source S3 key prefix.
+        s3_prefix: Option<String>,
+        /// The requested input format.
+        input_format: InputFormat,
+        /// The requested input compression.
+        input_compression: InputCompressionType,
+        /// The target table's base key schema (no indexes/stream/ttl),
+        /// already committed via a preceding `CreateTableSchema`. Boxed —
+        /// `TableSchema` is by far this variant's largest field, and
+        /// clippy's `large_enum_variant` flags the whole `MetaCommand`
+        /// enum growing to fit it inline (every other variant stays small).
+        base_schema: Box<TableSchema>,
+        /// The declared `(AttributeName, AttributeType)` pairs, recorded
+        /// for `DescribeImport`'s own echo.
+        key_types: Vec<(String, String)>,
+        /// The GSI definitions to create once this import completes — see
+        /// [`ImportRow::gsi_defs`]'s own doc.
+        gsi_defs: Vec<IndexDef>,
+        /// The target table's requested provisioned throughput, if any.
+        throughput: Option<ProvisionedThroughput>,
+        /// This import's single destination tablet id (caller-allocated).
+        tablet: TabletId,
+        /// The destination tablet's initial replica set.
+        replicas: Vec<NodeId>,
+        /// The client-supplied `ClientToken`, if given.
+        client_token: Option<String>,
+        /// Stamped at PROPOSE time by the wire-serving node
+        /// (`env.wall_now()`, ADR 0051's discipline) — the pure state
+        /// machine has no clock.
+        created_wall_ms: u64,
+    },
+    /// Complete an import (ADR 0068 §6) once the leader-driven import job
+    /// has finished seeding every readable item into the destination
+    /// tablet. Activates the tablet (`Building` → `Active`, epoch bumped —
+    /// the identical [`CompleteRestore`](Self::CompleteRestore) shape) and
+    /// flips the row to [`ImportStatus::Completed`], freezing the final
+    /// counts. Rejected if `import_id` is unknown, not currently
+    /// [`InProgress`](ImportStatus::InProgress), or its tablet is not
+    /// `Building`.
+    CompleteImport {
+        /// The import to complete.
+        import_id: ImportId,
+        /// The total number of items read from the source data files.
+        processed_item_count: u64,
+        /// The total number of items actually seeded.
+        imported_item_count: u64,
+        /// The total number of items skipped for failing key-schema
+        /// validation.
+        error_count: u64,
+        /// The total (compressed) size of the processed data files in
+        /// bytes.
+        processed_size_bytes: u64,
+        /// Stamped at PROPOSE time by the import driver (`env.wall_now()`).
+        completed_wall_ms: u64,
+    },
+    /// Fail an import (ADR 0068 §6) — any driver-observed failure (an
+    /// unreadable/malformed manifest, an S3 fault, or too many malformed
+    /// items past the documented cap). Rejected if `import_id` is unknown,
+    /// or if the row is already [`Completed`](ImportStatus::Completed).
+    /// Idempotent: a no-op if the row is already `Failed` with the
+    /// identical `reason`. **Deliberately leaves the tablet `Building`
+    /// forever, exactly like [`FailRestore`](Self::FailRestore)** — this
+    /// apply arm never touches the tablet map itself; the import job
+    /// (`animusd::dynamo`) is responsible for then dropping the target
+    /// table through the ordinary `DropTableSchema`/`DropTableTablets`
+    /// path (see [`ImportStatus::Failed`]'s own doc for why that is a
+    /// separate, best-effort step rather than folded into this command).
+    FailImport {
+        /// The import to fail.
+        import_id: ImportId,
+        /// A human-readable failure reason.
+        reason: String,
+        /// The total number of items read before the failure.
+        processed_item_count: u64,
+        /// The total number of items actually seeded before the failure.
+        imported_item_count: u64,
+        /// The total number of items skipped for failing key-schema
+        /// validation before the failure.
+        error_count: u64,
+        /// The total (compressed) size of the processed data files in
+        /// bytes before the failure.
+        processed_size_bytes: u64,
+        /// Stamped at PROPOSE time by the import driver (`env.wall_now()`).
+        completed_wall_ms: u64,
     },
     /// Create or redefine a credential (ADR 0066 §1/§2): mints a fresh
     /// [`CredentialRow`] at `id`, or replaces an existing one — the
@@ -3329,6 +3814,89 @@ impl Metadata {
                     }
                 }
             }
+            MetaCommand::BeginExport {
+                export_id,
+                table,
+                table_arn,
+                s3_bucket,
+                s3_prefix,
+                format,
+                export_type,
+                export_time_ms,
+                client_token,
+                created_wall_ms,
+            } => {
+                if self.exports.contains_key(export_id) {
+                    return ApplyOutcome::Rejected("export id already exists");
+                }
+                if !self.has_table_schema(table) {
+                    return ApplyOutcome::Rejected("no such table schema");
+                }
+                self.exports.insert(
+                    export_id.clone(),
+                    ExportRow {
+                        table: table.clone(),
+                        table_arn: table_arn.clone(),
+                        s3_bucket: s3_bucket.clone(),
+                        s3_prefix: s3_prefix.clone(),
+                        format: *format,
+                        export_type: *export_type,
+                        export_time_ms: *export_time_ms,
+                        client_token: client_token.clone(),
+                        status: ExportStatus::InProgress,
+                        created_wall_ms: *created_wall_ms,
+                        completed_wall_ms: None,
+                        item_count: 0,
+                        billed_size_bytes: 0,
+                        export_manifest: None,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::CompleteExport {
+                export_id,
+                item_count,
+                billed_size_bytes,
+                export_manifest,
+                completed_wall_ms,
+            } => {
+                let Some(row) = self.exports.get_mut(export_id) else {
+                    return ApplyOutcome::Rejected("no such export");
+                };
+                if !matches!(row.status, ExportStatus::InProgress) {
+                    return ApplyOutcome::Rejected("export is not InProgress");
+                }
+                row.status = ExportStatus::Completed;
+                row.item_count = *item_count;
+                row.billed_size_bytes = *billed_size_bytes;
+                row.export_manifest = Some(export_manifest.clone());
+                row.completed_wall_ms = Some(*completed_wall_ms);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FailExport {
+                export_id,
+                reason,
+                completed_wall_ms,
+            } => {
+                let Some(row) = self.exports.get_mut(export_id) else {
+                    return ApplyOutcome::Rejected("no such export");
+                };
+                match &row.status {
+                    ExportStatus::Failed { reason: existing } if existing == reason => {
+                        ApplyOutcome::NoOp
+                    }
+                    ExportStatus::InProgress | ExportStatus::Failed { .. } => {
+                        row.status = ExportStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        row.completed_wall_ms = Some(*completed_wall_ms);
+                        ApplyOutcome::Applied
+                    }
+                    ExportStatus::Completed => {
+                        ApplyOutcome::Rejected("export is not in a failable state")
+                    }
+                }
+            }
             MetaCommand::BeginRestore {
                 restore_id,
                 backup_id,
@@ -3411,6 +3979,138 @@ impl Metadata {
                         ApplyOutcome::Applied
                     }
                     RestoreStatus::Done => ApplyOutcome::Rejected("restore already completed"),
+                }
+            }
+            MetaCommand::BeginImport {
+                import_id,
+                target_table,
+                target_table_arn,
+                table_id,
+                s3_bucket,
+                s3_prefix,
+                input_format,
+                input_compression,
+                base_schema,
+                key_types,
+                gsi_defs,
+                throughput,
+                tablet,
+                replicas,
+                client_token,
+                created_wall_ms,
+            } => {
+                if self.imports.contains_key(import_id) {
+                    return ApplyOutcome::Rejected("import id already exists");
+                }
+                if self.tablets.contains_key(tablet) {
+                    return ApplyOutcome::Rejected("tablet already exists");
+                }
+                // Same monotonic-allocator floor as `BeginRestore`/
+                // `CreateTablet`/`BeginSplitInPlace`.
+                if tablet.0 < self.next_free_tablet_id().0 {
+                    return ApplyOutcome::Rejected("tablet id below the monotonic allocator");
+                }
+                let mut t = Tablet::with_table(
+                    *tablet,
+                    Some(target_table.clone()),
+                    KeyRange::whole(),
+                    replicas.clone(),
+                );
+                t.state = TabletState::Building;
+                self.tablets.insert(*tablet, t);
+                self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
+                self.imports.insert(
+                    import_id.clone(),
+                    ImportRow {
+                        target_table: target_table.clone(),
+                        target_table_arn: target_table_arn.clone(),
+                        table_id: table_id.clone(),
+                        s3_bucket: s3_bucket.clone(),
+                        s3_prefix: s3_prefix.clone(),
+                        input_format: *input_format,
+                        input_compression: *input_compression,
+                        base_schema: base_schema.as_ref().clone(),
+                        key_types: key_types.clone(),
+                        gsi_defs: gsi_defs.clone(),
+                        throughput: *throughput,
+                        tablet: *tablet,
+                        client_token: client_token.clone(),
+                        status: ImportStatus::InProgress,
+                        created_wall_ms: *created_wall_ms,
+                        completed_wall_ms: None,
+                        processed_item_count: 0,
+                        imported_item_count: 0,
+                        error_count: 0,
+                        processed_size_bytes: 0,
+                    },
+                );
+                ApplyOutcome::Applied
+            }
+            MetaCommand::CompleteImport {
+                import_id,
+                processed_item_count,
+                imported_item_count,
+                error_count,
+                processed_size_bytes,
+                completed_wall_ms,
+            } => {
+                let Some(row) = self.imports.get(import_id) else {
+                    return ApplyOutcome::Rejected("no such import");
+                };
+                if !matches!(row.status, ImportStatus::InProgress) {
+                    return ApplyOutcome::Rejected("import is not InProgress");
+                }
+                let tablet_id = row.tablet;
+                let Some(t) = self.tablets.get_mut(&tablet_id) else {
+                    return ApplyOutcome::Rejected("import's tablet no longer exists");
+                };
+                if t.state != TabletState::Building {
+                    return ApplyOutcome::Rejected("import's tablet is not Building");
+                }
+                t.state = TabletState::Active;
+                t.epoch = t.epoch.next();
+                let row = self
+                    .imports
+                    .get_mut(import_id)
+                    .expect("checked present above");
+                row.status = ImportStatus::Completed;
+                row.processed_item_count = *processed_item_count;
+                row.imported_item_count = *imported_item_count;
+                row.error_count = *error_count;
+                row.processed_size_bytes = *processed_size_bytes;
+                row.completed_wall_ms = Some(*completed_wall_ms);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FailImport {
+                import_id,
+                reason,
+                processed_item_count,
+                imported_item_count,
+                error_count,
+                processed_size_bytes,
+                completed_wall_ms,
+            } => {
+                let Some(row) = self.imports.get_mut(import_id) else {
+                    return ApplyOutcome::Rejected("no such import");
+                };
+                match &row.status {
+                    ImportStatus::Failed { reason: existing } if existing == reason => {
+                        ApplyOutcome::NoOp
+                    }
+                    ImportStatus::InProgress | ImportStatus::Failed { .. } => {
+                        row.status = ImportStatus::Failed {
+                            reason: reason.clone(),
+                        };
+                        row.processed_item_count = *processed_item_count;
+                        row.imported_item_count = *imported_item_count;
+                        row.error_count = *error_count;
+                        row.processed_size_bytes = *processed_size_bytes;
+                        row.completed_wall_ms = Some(*completed_wall_ms);
+                        ApplyOutcome::Applied
+                    }
+                    ImportStatus::Completed => {
+                        ApplyOutcome::Rejected("import is not in a failable state")
+                    }
                 }
             }
             MetaCommand::PutCredential {
@@ -4804,11 +5504,61 @@ impl Metadata {
         self.backups.get(backup_id)
     }
 
+    /// The export catalog row for `export_id`, if any (ADR 0068 §3). A read
+    /// accessor for the wire edge (`DescribeExport`/`ListExports`).
+    #[must_use]
+    pub fn export(&self, export_id: &str) -> Option<&ExportRow> {
+        self.exports.get(export_id)
+    }
+
+    /// Find an in-flight or completed export for `table` carrying exactly
+    /// `client_token` (ADR 0068 §5's idempotency contract) — the wire edge's
+    /// own `ExportTableToPointInTime` retry-resolution lookup, so a
+    /// repeated call with the same token resolves back to the same export
+    /// id rather than minting a second export. Returns the first match in
+    /// `ExportId` order (stable, since `client_token` collisions across
+    /// distinct tables/tokens are not expected in practice).
+    #[must_use]
+    pub fn export_by_client_token(&self, table: &str, client_token: &str) -> Option<&ExportId> {
+        self.exports
+            .iter()
+            .find(|(_, row)| {
+                row.table == table && row.client_token.as_deref() == Some(client_token)
+            })
+            .map(|(id, _)| id)
+    }
+
     /// The restore catalog row for `restore_id`, if any (ADR 0059 §7). A
     /// read accessor for the restore driver and observability surfaces.
     #[must_use]
     pub fn restore(&self, restore_id: &str) -> Option<&RestoreRow> {
         self.restores.get(restore_id)
+    }
+
+    /// The import catalog row for `import_id`, if any (ADR 0068 §6). A read
+    /// accessor for the import driver and the wire edge
+    /// (`DescribeImport`/`ListImports`).
+    #[must_use]
+    pub fn import(&self, import_id: &str) -> Option<&ImportRow> {
+        self.imports.get(import_id)
+    }
+
+    /// Find an in-flight or completed import carrying exactly
+    /// `client_token` — the wire edge's own `ImportTable` retry-resolution
+    /// lookup, so a repeated call with the same token resolves back to the
+    /// same import id rather than minting a second one. Unlike
+    /// [`export_by_client_token`](Self::export_by_client_token), not
+    /// scoped by table: an `ImportTable` retry names the SAME
+    /// `TableCreationParameters.TableName` by construction (a distinct
+    /// name would collide with the just-created target table's own schema
+    /// before the token lookup ever mattered), so a bare token match is
+    /// enough. Returns the first match in `ImportId` order.
+    #[must_use]
+    pub fn import_by_client_token(&self, client_token: &str) -> Option<&ImportId> {
+        self.imports
+            .iter()
+            .find(|(_, row)| row.client_token.as_deref() == Some(client_token))
+            .map(|(id, _)| id)
     }
 
     /// `backup_id`'s own per-tablet completion records (ADR 0059 §3/§4) —
@@ -5316,6 +6066,196 @@ mod tests {
         );
         // Untouched by the rejected collision.
         assert_eq!(m.backup("backup-1").unwrap().table, "users");
+    }
+
+    fn begin_export_command(export_id: &str, table: &str) -> MetaCommand {
+        MetaCommand::BeginExport {
+            export_id: export_id.to_owned(),
+            table: table.to_owned(),
+            table_arn: format!("arn:aws:dynamodb:animus:0:table/{table}"),
+            s3_bucket: "bucket".to_owned(),
+            s3_prefix: None,
+            format: ExportFormat::DynamoDbJson,
+            export_type: ExportType::Full,
+            export_time_ms: None,
+            client_token: None,
+            created_wall_ms: 1000,
+        }
+    }
+
+    /// `BeginExport` (ADR 0068 §3): rejected against an unknown table
+    /// schema; mints a fresh [`ExportStatus::InProgress`] row otherwise; a
+    /// second `BeginExport` for the same id is rejected outright, even
+    /// against a different table (a fresh id is minted per request, so
+    /// there is nothing to legitimately retry against).
+    #[test]
+    fn begin_export_apply_arm() {
+        let mut m = Metadata::default();
+
+        assert_eq!(
+            m.apply(&begin_export_command("export-1", "ghost")),
+            ApplyOutcome::Rejected("no such table schema")
+        );
+
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(
+            m.apply(&begin_export_command("export-1", "users")),
+            ApplyOutcome::Applied
+        );
+        let row = m.export("export-1").expect("row present");
+        assert_eq!(row.table, "users");
+        assert_eq!(row.status, ExportStatus::InProgress);
+        assert_eq!(row.created_wall_ms, 1000);
+        assert_eq!(row.completed_wall_ms, None);
+        assert_eq!(row.item_count, 0);
+        assert_eq!(row.billed_size_bytes, 0);
+        assert_eq!(row.export_manifest, None);
+
+        // A second table, ready for a would-be collision.
+        table_with_one_tablet(&mut m, "orders", TabletId(2));
+        assert_eq!(
+            m.apply(&begin_export_command("export-1", "orders")),
+            ApplyOutcome::Rejected("export id already exists")
+        );
+        // Untouched by the rejected collision.
+        assert_eq!(m.export("export-1").unwrap().table, "users");
+    }
+
+    /// `CompleteExport`/`FailExport` (ADR 0068 §3): both reject an unknown
+    /// export id; `CompleteExport` rejects a non-`InProgress` row;
+    /// `CompleteExport` freezes `item_count`/`billed_size_bytes`/
+    /// `export_manifest`/`completed_wall_ms` exactly once; `FailExport` is
+    /// idempotent on an identical repeat, rejects a genuinely differing
+    /// repeat's own would-be double-fail once already `Failed` with a
+    /// different reason (transitions instead), and rejects outright once
+    /// `Completed`.
+    #[test]
+    fn complete_and_fail_export_apply_arms() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteExport {
+                export_id: "export-1".to_owned(),
+                item_count: 1,
+                billed_size_bytes: 1,
+                export_manifest: "m.json".to_owned(),
+                completed_wall_ms: 2000,
+            }),
+            ApplyOutcome::Rejected("no such export")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailExport {
+                export_id: "export-1".to_owned(),
+                reason: "boom".to_owned(),
+                completed_wall_ms: 2000,
+            }),
+            ApplyOutcome::Rejected("no such export")
+        );
+
+        m.apply(&begin_export_command("export-1", "users"));
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteExport {
+                export_id: "export-1".to_owned(),
+                item_count: 42,
+                billed_size_bytes: 4096,
+                export_manifest: "manifest-summary.json".to_owned(),
+                completed_wall_ms: 2000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.export("export-1").unwrap();
+        assert_eq!(row.status, ExportStatus::Completed);
+        assert_eq!(row.item_count, 42);
+        assert_eq!(row.billed_size_bytes, 4096);
+        assert_eq!(
+            row.export_manifest.as_deref(),
+            Some("manifest-summary.json")
+        );
+        assert_eq!(row.completed_wall_ms, Some(2000));
+
+        // A completed export cannot subsequently be completed or failed.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteExport {
+                export_id: "export-1".to_owned(),
+                item_count: 1,
+                billed_size_bytes: 1,
+                export_manifest: "other.json".to_owned(),
+                completed_wall_ms: 3000,
+            }),
+            ApplyOutcome::Rejected("export is not InProgress")
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailExport {
+                export_id: "export-1".to_owned(),
+                reason: "too late".to_owned(),
+                completed_wall_ms: 3000,
+            }),
+            ApplyOutcome::Rejected("export is not in a failable state")
+        );
+
+        // A fresh export that fails, then repeats identically (idempotent),
+        // then fails with a different reason (a real transition).
+        table_with_one_tablet(&mut m, "orders", TabletId(2));
+        m.apply(&begin_export_command("export-2", "orders"));
+        assert_eq!(
+            m.apply(&MetaCommand::FailExport {
+                export_id: "export-2".to_owned(),
+                reason: "no space".to_owned(),
+                completed_wall_ms: 5000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailExport {
+                export_id: "export-2".to_owned(),
+                reason: "no space".to_owned(),
+                completed_wall_ms: 5000,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailExport {
+                export_id: "export-2".to_owned(),
+                reason: "disk full".to_owned(),
+                completed_wall_ms: 6000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.export("export-2").unwrap().status,
+            ExportStatus::Failed {
+                reason: "disk full".to_owned()
+            }
+        );
+    }
+
+    /// `Metadata::export_by_client_token` (ADR 0068 §5): resolves the
+    /// idempotency lookup the wire edge uses before minting a fresh export
+    /// for a repeated `ClientToken`.
+    #[test]
+    fn export_by_client_token_resolves_a_matching_row() {
+        let mut m = Metadata::default();
+        table_with_one_tablet(&mut m, "users", TabletId(1));
+        assert_eq!(m.export_by_client_token("users", "tok-1"), None);
+        m.apply(&MetaCommand::BeginExport {
+            export_id: "export-1".to_owned(),
+            table: "users".to_owned(),
+            table_arn: "arn:aws:dynamodb:animus:0:table/users".to_owned(),
+            s3_bucket: "bucket".to_owned(),
+            s3_prefix: None,
+            format: ExportFormat::DynamoDbJson,
+            export_type: ExportType::Full,
+            export_time_ms: None,
+            client_token: Some("tok-1".to_owned()),
+            created_wall_ms: 1000,
+        });
+        assert_eq!(
+            m.export_by_client_token("users", "tok-1"),
+            Some(&"export-1".to_owned())
+        );
+        assert_eq!(m.export_by_client_token("users", "tok-2"), None);
+        assert_eq!(m.export_by_client_token("orders", "tok-1"), None);
     }
 
     /// `RecordBackupTabletComplete` (ADR 0059 §3/§4): rejected against an
@@ -6029,6 +6969,291 @@ mod tests {
                 reason: "stuck again".to_owned(),
             }),
             ApplyOutcome::Applied
+        );
+    }
+
+    // --- ADR 0068 §6, S-05 PR 2: the import catalog -----------------------
+
+    fn begin_import_command(import_id: &str, target_table: &str, tablet: TabletId) -> MetaCommand {
+        MetaCommand::BeginImport {
+            import_id: import_id.to_owned(),
+            target_table: target_table.to_owned(),
+            target_table_arn: format!("arn:aws:dynamodb:animus:0:table/{target_table}"),
+            table_id: "table-id-1".to_owned(),
+            s3_bucket: "bucket".to_owned(),
+            s3_prefix: None,
+            input_format: InputFormat::DynamoDbJson,
+            input_compression: InputCompressionType::Gzip,
+            base_schema: Box::new(TableSchema::simple("id", ColumnType::String)),
+            key_types: vec![("id".to_owned(), "S".to_owned())],
+            gsi_defs: Vec::new(),
+            throughput: None,
+            tablet,
+            replicas: vec![nid(1)],
+            client_token: None,
+            created_wall_ms: 1000,
+        }
+    }
+
+    /// `BeginImport` (ADR 0068 §6): mints exactly one fresh `Building`
+    /// tablet over the whole ring, scoped to the target table, plus an
+    /// `InProgress` import row — rejected on a duplicate import id, a
+    /// colliding tablet id, or a tablet id below the monotonic allocator
+    /// floor. Unlike `BeginRestore`, the target table's own schema is
+    /// created by THIS command's caller (the wire handler) before
+    /// proposing, exactly as tested here.
+    #[test]
+    fn begin_import_apply_arm() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "imported".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&begin_import_command("import-1", "imported", TabletId(5))),
+            ApplyOutcome::Applied
+        );
+        let row = m.import("import-1").expect("row present");
+        assert_eq!(row.target_table, "imported");
+        assert_eq!(row.tablet, TabletId(5));
+        assert_eq!(row.status, ImportStatus::InProgress);
+        assert_eq!(row.created_wall_ms, 1000);
+        assert_eq!(row.completed_wall_ms, None);
+        assert_eq!(row.processed_item_count, 0);
+        assert_eq!(row.imported_item_count, 0);
+        assert_eq!(row.error_count, 0);
+        assert_eq!(row.processed_size_bytes, 0);
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Building);
+        assert_eq!(tablet.range, KeyRange::whole());
+        assert_eq!(tablet.table.as_deref(), Some("imported"));
+        assert!(!tablet.is_routable());
+
+        // A second `BeginImport` at the same import id is rejected outright,
+        // even naming a different (also-fresh) tablet.
+        assert_eq!(
+            m.apply(&begin_import_command("import-1", "imported2", TabletId(6))),
+            ApplyOutcome::Rejected("import id already exists")
+        );
+
+        // A colliding tablet id.
+        assert_eq!(
+            m.apply(&begin_import_command("import-2", "imported2", TabletId(5))),
+            ApplyOutcome::Rejected("tablet already exists")
+        );
+
+        // Below the monotonic allocator floor.
+        assert_eq!(
+            m.apply(&begin_import_command("import-3", "imported3", TabletId(0))),
+            ApplyOutcome::Rejected("tablet id below the monotonic allocator")
+        );
+    }
+
+    /// `CompleteImport`/`FailImport` (ADR 0068 §6): completion activates the
+    /// tablet, freezes the final counts, and flips the row `Completed`;
+    /// failure leaves the tablet `Building` (never served) and flips the
+    /// row `Failed`, freezing the counts observed so far. Both reject a
+    /// terminal-contradicting call, and `FailImport` is idempotent on an
+    /// identical repeat but transitions on a genuinely differing one.
+    #[test]
+    fn complete_and_fail_import_apply_arms() {
+        let mut m = Metadata::default();
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTableSchema {
+                table: "imported".to_owned(),
+                schema: TableSchema::simple("id", ColumnType::String),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&begin_import_command("import-1", "imported", TabletId(5))),
+            ApplyOutcome::Applied
+        );
+
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteImport {
+                import_id: "ghost".to_owned(),
+                processed_item_count: 1,
+                imported_item_count: 1,
+                error_count: 0,
+                processed_size_bytes: 10,
+                completed_wall_ms: 2000,
+            }),
+            ApplyOutcome::Rejected("no such import")
+        );
+
+        let before_epoch = m.tablets[&TabletId(5)].epoch;
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteImport {
+                import_id: "import-1".to_owned(),
+                processed_item_count: 42,
+                imported_item_count: 40,
+                error_count: 2,
+                processed_size_bytes: 4096,
+                completed_wall_ms: 2000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.import("import-1").unwrap();
+        assert_eq!(row.status, ImportStatus::Completed);
+        assert_eq!(row.processed_item_count, 42);
+        assert_eq!(row.imported_item_count, 40);
+        assert_eq!(row.error_count, 2);
+        assert_eq!(row.processed_size_bytes, 4096);
+        assert_eq!(row.completed_wall_ms, Some(2000));
+        let tablet = &m.tablets[&TabletId(5)];
+        assert_eq!(tablet.state, TabletState::Active);
+        assert!(tablet.is_routable());
+        assert!(tablet.epoch > before_epoch);
+
+        // Already `Completed` — a second completion is rejected.
+        assert_eq!(
+            m.apply(&MetaCommand::CompleteImport {
+                import_id: "import-1".to_owned(),
+                processed_item_count: 1,
+                imported_item_count: 1,
+                error_count: 0,
+                processed_size_bytes: 1,
+                completed_wall_ms: 3000,
+            }),
+            ApplyOutcome::Rejected("import is not InProgress")
+        );
+        // ...and `FailImport` cannot contradict a completed import either.
+        assert_eq!(
+            m.apply(&MetaCommand::FailImport {
+                import_id: "import-1".to_owned(),
+                reason: "too late".to_owned(),
+                processed_item_count: 0,
+                imported_item_count: 0,
+                error_count: 0,
+                processed_size_bytes: 0,
+                completed_wall_ms: 3000,
+            }),
+            ApplyOutcome::Rejected("import is not in a failable state")
+        );
+
+        // A second, independent import that fails instead: the tablet stays
+        // `Building` (never served, but cleanly droppable).
+        assert_eq!(
+            m.apply(&begin_import_command("import-2", "imported2", TabletId(6))),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            m.apply(&MetaCommand::FailImport {
+                import_id: "import-2".to_owned(),
+                reason: "bucket unreachable".to_owned(),
+                processed_item_count: 5,
+                imported_item_count: 3,
+                error_count: 2,
+                processed_size_bytes: 512,
+                completed_wall_ms: 5000,
+            }),
+            ApplyOutcome::Applied
+        );
+        let row = m.import("import-2").unwrap();
+        assert_eq!(
+            row.status,
+            ImportStatus::Failed {
+                reason: "bucket unreachable".to_owned()
+            }
+        );
+        assert_eq!(row.processed_item_count, 5);
+        assert_eq!(row.imported_item_count, 3);
+        assert_eq!(row.error_count, 2);
+        assert_eq!(m.tablets[&TabletId(6)].state, TabletState::Building);
+        // Idempotent on an identical repeat.
+        assert_eq!(
+            m.apply(&MetaCommand::FailImport {
+                import_id: "import-2".to_owned(),
+                reason: "bucket unreachable".to_owned(),
+                processed_item_count: 5,
+                imported_item_count: 3,
+                error_count: 2,
+                processed_size_bytes: 512,
+                completed_wall_ms: 5000,
+            }),
+            ApplyOutcome::NoOp
+        );
+        // A genuinely differing reason still transitions.
+        assert_eq!(
+            m.apply(&MetaCommand::FailImport {
+                import_id: "import-2".to_owned(),
+                reason: "bucket unreachable, again".to_owned(),
+                processed_item_count: 6,
+                imported_item_count: 3,
+                error_count: 3,
+                processed_size_bytes: 600,
+                completed_wall_ms: 6000,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.import("import-2").unwrap().error_count, 3);
+    }
+
+    /// `Metadata::import_by_client_token` (ADR 0068 §6): resolves the
+    /// idempotency lookup the wire edge uses before minting a fresh import
+    /// for a repeated `ClientToken` — unlike export's version, not scoped
+    /// by table (see that accessor's own doc for why).
+    #[test]
+    fn import_by_client_token_resolves_a_matching_row() {
+        let mut m = Metadata::default();
+        assert_eq!(m.import_by_client_token("tok-1"), None);
+        m.apply(&MetaCommand::CreateTableSchema {
+            table: "imported".to_owned(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        });
+        let mut cmd = begin_import_command("import-1", "imported", TabletId(5));
+        if let MetaCommand::BeginImport { client_token, .. } = &mut cmd {
+            *client_token = Some("tok-1".to_owned());
+        }
+        m.apply(&cmd);
+        assert_eq!(
+            m.import_by_client_token("tok-1"),
+            Some(&"import-1".to_owned())
+        );
+        assert_eq!(m.import_by_client_token("tok-2"), None);
+    }
+
+    /// ADR 0024/ADR 0068 §6's carve-out (the identical one `backups`/
+    /// `exports` already have): `DropTableSchema`/`DropTableTablets` must
+    /// NOT touch the import catalog — an import row (with its frozen
+    /// counts) survives a drop of its OWN target table, e.g. once the
+    /// import job's own failure-cleanup drops it.
+    #[test]
+    fn import_catalog_survives_a_table_drop() {
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::CreateTableSchema {
+            table: "imported".to_owned(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        });
+        m.apply(&begin_import_command("import-1", "imported", TabletId(5)));
+        m.apply(&MetaCommand::FailImport {
+            import_id: "import-1".to_owned(),
+            reason: "boom".to_owned(),
+            processed_item_count: 1,
+            imported_item_count: 0,
+            error_count: 1,
+            processed_size_bytes: 1,
+            completed_wall_ms: 2000,
+        });
+        m.apply(&MetaCommand::DropTableSchema {
+            table: "imported".to_owned(),
+        });
+        m.apply(&MetaCommand::DropTableTablets {
+            table: "imported".to_owned(),
+        });
+        assert!(!m.has_table_schema("imported"));
+        assert!(m.tablets_for_table("imported").next().is_none());
+        let row = m.import("import-1").expect("import row survives the drop");
+        assert_eq!(
+            row.status,
+            ImportStatus::Failed {
+                reason: "boom".to_owned()
+            }
         );
     }
 

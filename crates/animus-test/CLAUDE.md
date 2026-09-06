@@ -54,6 +54,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | K seed variants per secondary-index backfill fault-injection cell (ADR 0045) |
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
+| `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | K seed variants per S3 export/import fault-injection cell (ADR 0068, S-05 PR 3) |
 | `ANIMUS_SHRINK=1` | off | minimize a failed corpus scenario's parameters to a small reproducing case (ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | override the minimizer's check-count budget |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | a corpus's own replay entry point (e.g. `raftkv_shrink_replay`) re-runs this minimized case and asserts it still fails |
@@ -965,3 +966,92 @@ retrievable from git history.)
   `engines()` map per child" isolation workaround. Held clean at
   `ANIMUS_PITR_SEEDS=300` (release, ~2.6s) with no regression to any other
   cell in the file.
+
+### Elle-adjacent, but not Elle: the S3 export/import fault corpus (ADR 0068, S-05 PR 3)
+
+- `export_import_fault_corpus.rs` — the identical layering fix `backup_
+  fault_corpus.rs`/`pitr_fault_corpus.rs` set for the S3 export job
+  (`animusd::dynamo::run_export_job`/`run_export_job_inner`) and the S3
+  import driver (`animusd::import::import_tick`/`import_loop`), both
+  `animusd`-only: a self-contained reimplementation of both functions' exact
+  algorithms directly over `RaftKvNode`, a bare `Metadata`, and
+  `animus-sim`'s `SimSegmentStore` standing in for the customer's own S3
+  bucket (the identical `SegmentStore` trait a real `S3SegmentStore`
+  implements). **All six catalog commands
+  (`BeginExport`/`CompleteExport`/`FailExport`/`BeginImport`/
+  `CompleteImport`/`FailImport`) are real `Metadata::apply` calls, never
+  reimplemented** — their own apply arms in `animus-control` decide every
+  acceptance/rejection/idempotency rule. The import mirror's own item→row
+  derivation calls the REAL, pure `animus_item::derive_kind_writes` (the
+  identical core `animusd::dynamo::kind_writes_for_item` wraps in
+  production) rather than a third copy of that logic, and every seeded
+  value is re-wrapped via the REAL `animus_cp_data::backup::
+  encode_restored_value` before merging — the identical corrupt-engine-value
+  hazard `backup_fault_corpus.rs`'s own restore-tick mirror closes (found
+  live while building this corpus: an unwrapped raw stored-item value fed
+  straight to `SeedBatch` panics `animus-cp-data`'s own intent-envelope
+  decoder the instant anything reads it back — this repo's usual
+  "instructive precedent" note applies: had this corpus reused that
+  restore-mirror precedent from the start instead of writing the seed path
+  fresh, the mistake would never have shipped even transiently).
+- **Verification is direct decode-and-diff, mirroring `backup_fault_
+  corpus.rs`'s own technique**: a completed export's `manifest-summary.json`
+  + `manifest-files.json` + every referenced `data/*.json.gz` object are
+  decoded through the REAL `animus_dynamo::wire::decode_item` decoder and
+  diffed against an independently-tracked model of the source table's
+  committed state at each tablet's own pin point (exact set equality, a
+  hard `assert!` against any key ever decoded twice across tablets); a
+  completed import's destination tablet is read back through the REAL
+  `animus_item::decode_stored_item` this file's own writers used to write
+  the source in the first place.
+- **Frozen named cells**: `export_happy_path_across_two_tablets` (two real
+  tablets, exact content match, `manifest-files.json` proven to list
+  exactly the data objects present); `export_under_concurrent_writes` (a
+  genuinely staged, never-resolved transaction intent plus post-pin writes,
+  neither ever surfacing in the export); `export_with_bucket_faults_
+  converges_or_fails_cleanly` (an ack-lost `put` fault — production's export
+  job has NO retry of its own, unlike the on-demand backup capture driver,
+  so this cell proves the real, documented consequence: either a fully
+  correct `COMPLETED`, or a cleanly `FAILED` row with its counts frozen at
+  their never-set defaults and no `manifest-summary.json` ever written —
+  never a torn `COMPLETED`); `export_leader_kill_mid_job_leaves_row_in_
+  progress` (ADR 0068 §9's residual #1, pinned directly: a crash after the
+  first of two tablets leaves the row `InProgress` forever with no
+  `manifest-summary.json`, proven against a genuine partial job, not a
+  no-op); `import_happy_path_round_trip` (a full export → import round
+  trip, `Building` → `Active` transition, exact
+  `ProcessedItemCount`/`ImportedItemCount`/`ErrorCount`);
+  `import_of_hand_written_none_compressed_layout` (an input shape this
+  adapter's own export job never produces, but real DynamoDB export tooling
+  can); `import_with_malformed_items_counted_in_error_count` (a missing key
+  attribute and a wrong-declared-type key attribute, both skipped and
+  counted, the rest imported); `import_with_bucket_faults_converges_to_the_
+  same_content` (a transient unavailability window — unlike export, every
+  store fault here is retryable, `import_tick`'s own uniform treatment — the
+  identical seed with the fault cleared converges to byte-identical final
+  table content); `import_failure_rolls_back_the_target_table` (past
+  `MAX_MALFORMED_ITEMS`, `FailImport` fires and the half-created target
+  table's schema AND tablet are both rolled back through the ordinary
+  `DropTableSchema`/`DropTableTablets` path, matching real DynamoDB's own
+  "a failed `ImportTable` rolls back the table" contract);
+  `import_leader_kill_mid_job_stuck_timeout_fails` (ADR 0068 §6/§9's
+  residual #3, pinned directly: a permanently unreachable bucket stays
+  `InProgress` until virtual time — `env.now()` throughout, never a real
+  clock — crosses the 600s stuck timeout, proven NOT to fire early either);
+  and `catalog_invariants_random_interleavings` (a bare-`Metadata` property
+  test, no tablets needed: randomized `Begin`/`Complete`/`Fail`
+  interleavings across several concurrent exports/imports proving ids are
+  never reused, a terminal row never re-accepts a second `Complete`, a
+  row's frozen counts never drift after its own one terminal command, and
+  `ListExports`/`ListImports`' pagination/`TableArn`-filtering — via the
+  REAL `animus_dynamo::wire::paginate_export_summaries`/
+  `paginate_import_summaries` — reproduce the full catalog exactly).
+  Depth knob `ANIMUS_EXPORT_IMPORT_SEEDS` (default 1 = the frozen cells,
+  ~1.2s; held green at `=8` in ~10s — each cell well under a second at
+  depth 1).
+- **No production bug found.** Building this corpus's own import-seeding
+  path did surface a corpus-harness-only mistake (the missing
+  `encode_restored_value` re-wrap, above) — a mirror bug, not a defect in
+  `animusd::import`/`animus-cp-data` themselves, caught immediately by the
+  very first depth-1 run (`decode_envelope`'s own "unknown envelope tag"
+  panic), never shipped as a false-negative-green corpus.

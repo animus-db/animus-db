@@ -66,6 +66,7 @@ mod ceiling;
 pub mod cluster_segment_store;
 mod codec;
 pub mod cursor;
+pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
 mod seal;
@@ -74,6 +75,7 @@ mod split;
 mod ts_cache;
 mod txn;
 
+use heartbeat_batch::{HeartbeatBatcher, HeartbeatPending};
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
 pub use txn::{
@@ -1170,6 +1172,15 @@ pub(crate) enum KvWire {
     /// of these confirms the prober is still leader as of now (a newer leader would
     /// require a quorum to have moved to a higher term, which would *not* ack).
     ReadProbeAck { term: u64, epoch: u64 },
+    /// One physical **batched-heartbeat frame** (ADR 0044 phase 2,
+    /// [`heartbeat_batch`]): every entry is `(destination-local group
+    /// stream id, that group's own already-built bare `RaftMsg::
+    /// AppendEntries`)`. Sent only on the reserved
+    /// [`heartbeat_batch::HEARTBEAT_BATCH_STREAM`], never on any group's
+    /// own stream, and only by [`heartbeat_batch::HeartbeatBatcher`]'s own
+    /// flush task — see that module's doc for the full sender/receiver
+    /// design.
+    HeartbeatBatch(Vec<(u64, RaftMsg<KvCommand>)>),
 }
 
 /// How long a [`linearizable_get`](RaftKvNode::linearizable_get) waits for a quorum
@@ -2069,6 +2080,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            None,
         )
     }
 
@@ -2086,6 +2098,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             scope,
             PRIMARY_STREAM,
             false,
+            None,
         )
     }
 
@@ -2106,7 +2119,31 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, false)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, false, None)
+    }
+
+    /// Like [`start_hosted`](Self::start_hosted), but every bare (no-entries)
+    /// heartbeat this group's own `tick()` would otherwise ship immediately
+    /// is instead handed to `batcher` (ADR 0044 phase 2) — coalesced with
+    /// every other group `batcher` also serves, into one physical wire
+    /// frame per destination per flush, rather than one frame per group.
+    /// `None` is byte-for-byte [`start_hosted`](Self::start_hosted) (the
+    /// production default for PR 2 — off unless a caller opts in);
+    /// `host::Reconciler::enable_heartbeat_batching` is the production
+    /// call site that passes `Some`. See [`heartbeat_batch`]'s module doc
+    /// for the full design.
+    pub fn start_hosted_with_batcher(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, false, batcher,
+        )
     }
 
     /// Like [`start_hosted`](Self::start_hosted), but this replica
@@ -2154,7 +2191,27 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         stream: u64,
     ) -> Self {
         let metrics = env.metrics();
-        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, true)
+        Self::start_inner(env, all_nodes, storage, metrics, scope, stream, true, None)
+    }
+
+    /// Like [`start_hosted_campaigning`](Self::start_hosted_campaigning),
+    /// with the identical `batcher` opt-in
+    /// [`start_hosted_with_batcher`](Self::start_hosted_with_batcher)
+    /// documents — the `host::Reconciler`'s own materialize-split-child
+    /// path uses this one when both heartbeat batching and the
+    /// deterministic-first-leader campaign are enabled together.
+    pub fn start_hosted_campaigning_with_batcher(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        batcher: Option<HeartbeatBatcher<E>>,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env, all_nodes, storage, metrics, scope, stream, true, batcher,
+        )
     }
 
     /// Like [`start`](Self::start), but records into the supplied `metrics` handle
@@ -2175,9 +2232,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             StorageScope::whole(),
             PRIMARY_STREAM,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         env: E,
         all_nodes: Vec<NodeId>,
@@ -2186,6 +2245,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         scope: StorageScope,
         stream: u64,
         campaign_immediately: bool,
+        heartbeat_batcher: Option<HeartbeatBatcher<E>>,
     ) -> Self {
         // ADR 0041 §3: callers hand in the tablet's **parent** scope
         // (`escape(table)` + this tablet's range); the group owns one sibling
@@ -2324,6 +2384,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             external_quiesce_veto_fresh_through,
             campaign_immediately,
             voter_history,
+            heartbeat_batcher,
         }));
         node
     }
@@ -8851,6 +8912,11 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// loop can record the initial (post-recovery) config and every later
     /// distinct one it adopts.
     voter_history: Arc<Mutex<VoterHistory>>,
+    /// ADR 0044 phase 2 (C-02 PR 2): `Some` opts this group's own bare
+    /// (no-entries) heartbeats into the per-node batcher instead of
+    /// shipping immediately — see [`heartbeat_batch`]'s module doc. `None`
+    /// (every pre-PR-2 constructor) is byte-for-byte today's behavior.
+    heartbeat_batcher: Option<HeartbeatBatcher<E>>,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -8980,7 +9046,18 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         external_quiesce_veto_fresh_through,
         campaign_immediately,
         voter_history,
+        heartbeat_batcher,
     } = st;
+
+    // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
+    // the per-node batcher (if attached) so its demux task can deliver a
+    // received batched heartbeat here — see `heartbeat_batch`'s module doc.
+    // `None` (every pre-PR-2 caller) skips this entirely, so `heartbeat_arm`
+    // below stays a `Pending` future forever and this loop's behavior is
+    // byte-for-byte unchanged.
+    let heartbeat_inbox = heartbeat_batcher
+        .as_ref()
+        .map(|b| b.register_hosted(stream));
 
     let wal = wal_file(stream);
     let bytes = env.read(&wal).await.unwrap_or_default();
@@ -9226,6 +9303,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 fut.await;
             }
             gated.clear();
+            // ADR 0044 phase 2 (C-02 PR 2): unregister before this group's
+            // own inbox is dropped, so a batch frame that arrives for this
+            // now-releasing group is dropped-and-counted by the demux task
+            // instead of pushed into a queue nothing will ever drain again.
+            if let Some(batcher) = &heartbeat_batcher {
+                batcher.unregister_hosted(stream);
+            }
             stopped.store(true, Ordering::SeqCst);
             return;
         }
@@ -9370,12 +9454,23 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             },
             recv_or_timer,
         );
-        let stepped = select(
+        let stepped_inner = select(
             ProposePending {
                 signal: &propose_signal,
             },
             wake_or_recv_or_timer,
         );
+        // ADR 0044 phase 2 (C-02 PR 2): a demuxed batched heartbeat for
+        // THIS group, if the per-node batcher is attached — races alongside
+        // every other wakeup source. `None` (`heartbeat_inbox` unset, the
+        // batcher not attached) makes this arm a `Pending` future forever,
+        // so `select` never resolves it and this loop's behavior is
+        // byte-for-byte today's when batching is off.
+        let heartbeat_arm = match heartbeat_inbox.as_deref() {
+            Some(inbox) => Either::Left(HeartbeatPending::new(inbox)),
+            None => Either::Right(std::future::pending::<RaftMsg<KvCommand>>()),
+        };
+        let stepped = select(heartbeat_arm, stepped_inner);
         // The persist arm is polled first, so a landed round releases its acks
         // ahead of taking on more work.
         let persist_arm = PersistArm::new(&persist, persist_fut.as_mut(), gated.min_round());
@@ -9388,7 +9483,37 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     own_round_done = wake == PersistWake::OwnRoundDone;
                     (Vec::new(), None)
                 }
-                Either::Right((stepped, _)) => match stepped {
+                // ADR 0044 phase 2 (C-02 PR 2): a demuxed batched heartbeat
+                // arrived for this group. Handled through **exactly** the
+                // same path an ordinary wire-arrived `KvWire::Raft` message
+                // takes below (witness, `core.handle`, gate) — see
+                // `heartbeat_batch`'s module doc for why `from` is taken
+                // from the message's own embedded `leader` field rather
+                // than any wire envelope.
+                Either::Right((Either::Left((msg, _)), _)) => {
+                    let entropy = env.next_u64();
+                    let from = match &msg {
+                        RaftMsg::AppendEntries { leader, .. } => leader.clone(),
+                        other => unreachable!(
+                            "HeartbeatBatcher only ever demuxes bare AppendEntries \
+                             heartbeats, got {other:?}"
+                        ),
+                    };
+                    witness_append_entries(&hlc, &msg, env.now());
+                    let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
+                        let mut c = core.lock().expect("raftkv core poisoned");
+                        let outs = c.handle(from, msg, env.now(), entropy);
+                        (outs, persist.gate(c.has_unflushed_wal()))
+                    };
+                    (
+                        raft_outs
+                            .into_iter()
+                            .map(|(to, m)| (to, KvWire::Raft(m)))
+                            .collect(),
+                        gate,
+                    )
+                }
+                Either::Right((Either::Right((stepped, _)), _)) => match stepped {
                     // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
                     Either::Left(((), _)) => {
                         let (raft_outs, gate) = {
@@ -9478,6 +9603,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                                 }
                                 (Vec::new(), None)
                             }
+                            // ADR 0044 phase 2: `HeartbeatBatch` only ever
+                            // rides the reserved `HEARTBEAT_BATCH_STREAM`,
+                            // decoded solely by `heartbeat_batch::
+                            // demux_loop` — never a group's own `stream`.
+                            // Unreachable in production (nothing ever sends
+                            // one here), but the match must stay exhaustive;
+                            // logged and dropped like any other
+                            // unexpected-on-this-stream payload.
+                            Ok(KvWire::HeartbeatBatch(_)) => {
+                                tracing::warn!(
+                                    "unexpected KvWire::HeartbeatBatch on a per-group stream, \
+                                     dropped"
+                                );
+                                (Vec::new(), None)
+                            }
                             Err(err) => {
                                 tracing::warn!(?err, "undecodable raftkv message dropped");
                                 (Vec::new(), None)
@@ -9490,6 +9630,41 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                             let mut c = core.lock().expect("raftkv core poisoned");
                             let outs = c.tick(env.now(), entropy);
                             (outs, persist.gate(c.has_unflushed_wal()))
+                        };
+                        // ADR 0044 phase 2 (C-02 PR 2): a bare (no-entries)
+                        // `AppendEntries` from THIS branch — `tick()`'s own
+                        // heartbeat send — is handed to the per-node batcher
+                        // instead of the ordinary immediate pipeline, when
+                        // one is attached. Nothing else `tick()` can emit
+                        // (a non-empty `AppendEntries` still replicating a
+                        // lagging peer, `TimeoutNow`, or the quiesce
+                        // message) is ever batched — only this one shape,
+                        // and only from this one call site (`replicate_now`'s
+                        // wake-on-propose output is never filtered, so ADR
+                        // 0017's single-write latency is untouched). See
+                        // `heartbeat_batch`'s module doc for the full
+                        // rationale, including why this keeps
+                        // `Metric::CpAppendEntriesSent` counting the
+                        // logical per-group heartbeat unchanged (recorded
+                        // inside `HeartbeatBatcher::register` itself, since
+                        // a batched message never reaches
+                        // `record_kv_outbound`'s own `outs` scan below).
+                        let raft_outs = match &heartbeat_batcher {
+                            Some(batcher) => {
+                                let mut rest = Vec::with_capacity(raft_outs.len());
+                                for (to, msg) in raft_outs {
+                                    match &msg {
+                                        RaftMsg::AppendEntries { entries, .. }
+                                            if entries.is_empty() =>
+                                        {
+                                            batcher.register(to, stream, msg);
+                                        }
+                                        _ => rest.push((to, msg)),
+                                    }
+                                }
+                                rest
+                            }
+                            None => raft_outs,
                         };
                         (
                             raft_outs
@@ -10299,6 +10474,15 @@ fn ships_before_durable(wire: &KvWire) -> bool {
     match wire {
         KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
         KvWire::Raft(msg) => persist_round::ships_before_durable(msg),
+        // ADR 0044 phase 2: `HeartbeatBatch` never reaches this function —
+        // it never enters a group's own `outs` list (`heartbeat_batch::
+        // HeartbeatBatcher`'s flush task ships it directly via
+        // `env.send_stream`, bypassing this crate's per-group durability
+        // gate entirely, exactly like a bare heartbeat always did before
+        // batching existed). `true` here is the value consistent with that
+        // — a batched heartbeat is unconditionally immediate, same as the
+        // `AppendEntries` it replaces — kept only for match exhaustiveness.
+        KvWire::HeartbeatBatch(_) => true,
     }
 }
 

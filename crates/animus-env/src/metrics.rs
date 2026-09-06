@@ -693,12 +693,38 @@ pub enum Metric {
     /// the table's own `ProvisionedThroughput` and the cluster's per-tablet
     /// capacity ceilings.
     AutoSplitMinTablets,
+
+    // --- Per-node heartbeat batching (ADR 0044 phase 2, C-02 PR 2) ---
+    // Appended after the throughput-derived-minimum-tablet-count variant
+    // above; every earlier variant's slot and the text-export order stay
+    // stable. Recorded by `animus-cp-data`'s `HeartbeatBatcher` — see that
+    // module's own doc. `CpAppendEntriesSent` keeps its pre-existing
+    // meaning ("one per logical per-group heartbeat/replication
+    // `AppendEntries`") unchanged by the batcher: a batched bare heartbeat
+    // is still counted there, at the point it is handed to the batcher
+    // instead of `env.send_stream` directly, so the pre-batcher and
+    // post-batcher corpora read the identical counter for "how many
+    // logical heartbeats were sent." These two are the batcher's own,
+    // physical-frame-level observability.
+    /// One physical batched-heartbeat frame (`KvWire::HeartbeatBatch`,
+    /// carrying one or more co-hosted groups' own bare heartbeats to the
+    /// same destination node) was sent on the reserved heartbeat-batch
+    /// stream. Flat in the number of co-hosted groups sharing a
+    /// destination — what the amortization win is measured against.
+    CpHeartbeatFramesSent,
+    /// A received batched-heartbeat frame named a group (stream/tablet id)
+    /// this node does not currently host — dropped, never delivered,
+    /// never a panic. Should stay at (or near) zero in steady state; a
+    /// sustained nonzero rate points at a stale/racing hosting transition
+    /// (a group released or not-yet-hosted at the instant a peer's frame
+    /// arrived) worth investigating, not a hard fault on its own.
+    CpHeartbeatDemuxDropped,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 89] = [
+    pub const ALL: [Metric; 91] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -788,6 +814,8 @@ impl Metric {
         Metric::AuthDenied,
         Metric::AuthUnknownKey,
         Metric::AutoSplitMinTablets,
+        Metric::CpHeartbeatFramesSent,
+        Metric::CpHeartbeatDemuxDropped,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -884,6 +912,8 @@ impl Metric {
             Metric::AuthDenied => "auth_denied",
             Metric::AuthUnknownKey => "auth_unknown_key",
             Metric::AutoSplitMinTablets => "auto_split_min_tablets",
+            Metric::CpHeartbeatFramesSent => "cp_heartbeat_frames_sent",
+            Metric::CpHeartbeatDemuxDropped => "cp_heartbeat_demux_dropped",
         }
     }
 

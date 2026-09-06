@@ -13,7 +13,12 @@
 use animus_control::{Metadata, RaftNode};
 use animus_dynamo::AttributeValue;
 use animus_env::{NodeId, ProdEnv};
-use animus_node::host::{BackupObjectStore, ControlLeaderHost, TtlScanHost};
+use animus_node::backup_janitor::JanitorProgress;
+use animus_node::host::{
+    BackupJanitorProgressHost, BackupObjectStore, ControlLeaderHost, TtlReaperProgressHost,
+    TtlScanHost,
+};
+use animus_node::ttl_reaper::TtlReaperProgress;
 use animus_tablet::TabletId;
 use async_trait::async_trait;
 
@@ -50,6 +55,31 @@ impl BackupObjectStore for ClientCtx {
 
     async fn backup_delete_at(&self, replicas: &[NodeId], id: &str) -> Option<std::io::Result<()>> {
         Some(self.backup_store.delete(replicas, id).await)
+    }
+}
+
+/// Roadmap U-07: `ClientCtx::backup_janitor_progress` is the shared
+/// `Arc<Mutex<JanitorProgress>>` `animus_node::backup_janitor::
+/// backup_janitor_loop` publishes into via this trait, and `GET
+/// /admin/backup-store` reads back out — see that field's own doc.
+impl BackupJanitorProgressHost for ClientCtx {
+    fn update_backup_janitor_progress(&self, update: &mut dyn FnMut(&mut JanitorProgress)) {
+        let mut guard = self.backup_janitor_progress.lock().unwrap();
+        update(&mut guard);
+    }
+}
+
+/// Roadmap U-07: `ClientCtx::ttl_reaper_progress` is the shared
+/// `Arc<Mutex<TtlReaperProgress>>` `animus_node::ttl_reaper::
+/// ttl_reaper_loop` publishes into via this trait, and `GET /admin/ttl`
+/// reads back out — see that field's own doc. Unlike
+/// `BackupJanitorProgressHost` above, every node's own copy is a genuine
+/// live answer (the reaper runs everywhere, self-gated per tablet), never
+/// a stand-in for "not the leader."
+impl TtlReaperProgressHost for ClientCtx {
+    fn update_ttl_reaper_progress(&self, update: &mut dyn FnMut(&mut TtlReaperProgress)) {
+        let mut guard = self.ttl_reaper_progress.lock().unwrap();
+        update(&mut guard);
     }
 }
 

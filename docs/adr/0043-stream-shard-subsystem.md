@@ -956,3 +956,97 @@ corpus-deep nightly):
    the whole scenario space, assert every acknowledged write is recoverable
    from either hot Raft state or a committed, K-replicated segment — never
    from neither.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/gc`)
+
+A new observability route, `GET /admin/gc`, surfaces the segment janitor's
+(§A9) own live phase/counters — the third of docs/roadmap.md's U-07 batch,
+copying `GET /admin/backup-store`'s own template (that route's own ADR 0020
+as-built note, and ADR 0059's matching amendment, are the fuller design
+write-ups; this amendment records only that the route lives in this
+subsystem's territory too). The janitor
+(`animusd::segment_janitor::segment_janitor_loop`/`segment_janitor_tick`)
+now publishes a small `SegmentJanitorProgress` snapshot — phase
+(`idle`/`listing`/`waiting_retention`/`deleting`/`sweeping`, mirroring this
+loop's own two-phase-retention/repair/orphan-reap structure), last tick,
+cumulative objects-seen/objects-deleted counters (spanning BOTH phase 1b's
+expired-row reclaims and phase 3's proven-orphan reap — one combined
+"objects this janitor has ever deleted" total), rows still pending
+retention, the configured retention window, and the last observed error —
+at each phase transition, directly into a `ClientCtx::
+segment_janitor_progress: Arc<std::sync::Mutex<..>>` field. No change to
+the janitor's own reclaim decisions anywhere in this amendment — only
+instrumentation layered on top of the existing phases §A9 already
+documents.
+
+**This is the one U-07 route whose progress type never crosses into
+`animus-node`** — unlike the backup janitor/TTL reaper (ADR 0061 rung C2),
+`segment_janitor.rs` was deliberately left in `animusd` (see that rung's
+own "segment_janitor did NOT move" reasoning: its replica-repair phase is
+real placement/membership orchestration, not a capability one narrow trait
+method can express) — so `SegmentJanitorProgress`/`SegmentJanitorPhase` are
+`animusd`-local types, and no `BackupJanitorProgressHost`-shaped capability
+trait was needed to publish them; the loop already held a genuine
+`&ClientCtx` to mutate directly. `animus_node::host::AdminHost` still
+gained one more route-dispatch method, `gc_view`, for the same reason
+every other admin route does — but it returns a plain `Value`, naming no
+new type across the crate boundary.
+
+`reap_orphans` (§A3's own orphan-reap phase) now returns `(seen: u64,
+deleted: u64, last_error: Option<String>)` instead of nothing — its two
+in-crate regression tests (`segment_janitor::orphan_reap_tests`) were
+extended to assert on these counts directly, strengthening (not just
+preserving) their existing coverage.
+
+See ADR 0020's own matching 2026-09-06 as-built note for the full route
+design (the exact JSON shape, the dashboard card, and why
+`dropped_tables_pending` — a different subsystem entirely, ADR 0024's
+drop-table GC — was deliberately not added) and the test references.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/segment-store`)
+
+A second new observability route, `GET /admin/segment-store`, closes
+docs/roadmap.md's whole U-07 batch — the fourth and last of its four
+routes, copying `GET /admin/backup-store`'s own template a third time
+(that route's own ADR 0020 as-built note, and this section's own sibling
+above for `GET /admin/gc`, are the fuller write-ups this amendment does
+not repeat). Unlike `/admin/gc`, this route's territory is §A7b
+(`ClusterSegmentStore`'s own placement machinery), not §A9 (the janitor).
+
+**What it reports that no other route does**: for the default `cluster`
+segment-store kind, the shard→replica **placement** every sealed stream
+shard was given — read straight off `Metadata::stream_shards`'s own
+`StreamShardRow::replicas` field, itself populated once, at seal time, by
+`ClusterSegmentStore::put_replicated`'s own placement selection (§A7b
+above) — never recomputed a second way. `null` for the single-shared-
+directory `fs` opt-in, which has no per-node replica concept at all (the
+`put_sealed`/`get_sealed` "empty `replicas`, ask any node" convention
+§A7b's own K-replication section already documents). Alongside it, a
+bounded live local-object scan mirroring `/admin/backup-store`'s own
+`objects` field exactly, but over the store's WHOLE local directory rather
+than a namespace prefix — a segment id has no fixed top-level namespace
+the way a backup object's `backup/` prefix does (§ above,
+`{table}/{label}/{tablet}/{epoch}/...`), and this is safe only because the
+segment store's own local directory (`dir.join("segments")`) is already
+physically disjoint from the backup store's (`dir.join("backups")`).
+
+No new capability trait, and no new per-loop progress type: this route
+publishes a durable catalog fact plus a local scan, never a janitor's own
+phase (that is already `GET /admin/gc`'s job) — `animus_node::host::
+AdminHost` gained one more route-dispatch method, `segment_store_view`,
+the same "one method per route" shape every other route already uses.
+
+Wired through the identical conventional stack every U-07 route uses: a
+match arm in `crates/animus-node/src/admin.rs`'s dispatch table, the
+`AdminHost::segment_store_view` method (`crates/animus-node/src/host.rs`)
+and its `FakeHost` stub/dispatch test, a handler in
+`crates/animusd/src/admin.rs`, `animus admin segment-store <admin-addr>`
+(`animus-cli`), and a new read-only "Segment store" card on the Storage
+tab (`dashboard_storage.js`'s `#seg-store-card`/`#seg-store-body`, beside
+the TTL reaper and GC cards) — fed from `dashboard_core.js`'s existing
+PER-NODE `loadAll()` fan-out, like `/admin/ttl`, since this route's own
+`local_objects`/`local` fields are genuinely per-node facts.
+
+See ADR 0020's own matching 2026-09-06 as-built note for the full route
+design (the exact JSON shape, the placement/local-scan reasoning, and the
+dashboard card) and the test references.

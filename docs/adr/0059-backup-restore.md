@@ -1328,3 +1328,274 @@ row — see its own updated doc).
   call sites — the atomicity is the point, and a "self-healing sweep" is a
   tell that the two-command design's own gap was already known to be real,
   not merely theoretical.
+
+## As-built amendment (2026-09-06, roadmap U-07 — `GET /admin/backup-store`)
+
+A new observability route, `GET /admin/backup-store`, surfaces this
+subsystem's own store config, a bounded live object-count/byte scan, and
+the on-demand backup janitor's (§3) own live phase/counters — the first of
+docs/roadmap.md's U-07 batch, chosen deliberately as the template the
+other three (`/admin/ttl`, `/admin/gc`, `/admin/segment-store`) copy. The
+janitor loop (`animus_node::backup_janitor::backup_janitor_loop`) now
+publishes a small `JanitorProgress` snapshot (phase, last tick, cumulative
+`backups_seen`/`objects_reclaimed`, the last error, the backup id currently
+being worked) through a new capability trait,
+`animus_node::host::BackupJanitorProgressHost`, into an
+`Arc<std::sync::Mutex<JanitorProgress>>` `ClientCtx` holds — no change to
+the janitor's own reclaim decisions, only instrumentation layered on top of
+each existing phase transition. See ADR 0020's own matching as-built note
+for the full route design (redaction, the bounded-scan rationale, and the
+test references) — this amendment exists only to record that the route
+lives in this subsystem's own territory too.
+
+## Amendment (2026-09-06): S-04 — S3 `SegmentStore` backend — design
+
+`docs/roadmap.md`'s S-04 picks up exactly the follow-up this ADR's
+"Why this reuses `SegmentStore`, not a new store" section and §1's "The S3
+backend is a future trait-swap" paragraph deferred. This amendment records
+the three-PR plan and the design decisions PR 1 (`animus-s3`, merged
+alongside this amendment) already had to make; it does not change anything
+about capture, the catalog, or restore — exactly the promise §1 made.
+
+### The three-PR plan
+
+1. **Client** (this PR) — a new crate, `animus-s3`: a pure AWS Signature
+   Version 4 request signer and a minimal `put`/`get`/`delete`/`head`/
+   `list_objects_v2` S3 client generic over an explicit `Transport` seam.
+   No `SegmentStore` impl, no `s3:` URI, no `animus-env` dependency —
+   `crates/animus-s3/CLAUDE.md` has the full design write-up. Ships alone
+   because it's independently testable (an in-process fake transport with
+   real signature verification) and independently reviewable (the signing
+   math is its own concern, separate from how a `SegmentStore` wraps it).
+2. **Backend + wiring** (not yet started) — `S3SegmentStore` implementing
+   `animus_env::SegmentStore` over `animus_s3::client::S3Client` (the
+   `prod::HyperRustlsTransport` in production, `fake::FakeS3` under
+   `assert_segment_store_contract`), plus `s3://bucket/optional/prefix`
+   URIs on both `--segment-store` and `--backup-store`. This is where
+   `env.wall_now()` enters (`animus-s3`'s own `S3Client` methods take
+   `now_epoch_ms` as a parameter — see that crate's CLAUDE.md — so the
+   wrapper's only new "impure" surface is reading the clock once per call
+   and threading a retry loop around transient transport failures,
+   `SegmentStore`'s own layering decision per its trait doc).
+3. **Operator egress + credentials** (not yet started) — `animus-operator`
+   restricts/documents egress in `desired/networkpolicy.rs` (today ingress-
+   only, egress unrestricted by omission — §1's own "deliberate, narrowly-
+   scoped exception" framing) for exactly the object-storage endpoint, plus
+   a credential `Secret` the CRD references (mirroring `spec.tls`'s
+   pre-existing/cert-manager `Secret` precedent, ADR 0064) rather than
+   inlining a secret into the generated `ConfigMap`.
+
+### Object layout
+
+One S3 bucket, optionally scoped by a key prefix (`s3://bucket[/prefix]`).
+`SegmentStore`'s existing namespace convention maps onto S3 keys 1:1, with
+no reshaping: an id `{table}/{label}/{tablet}/{epoch}/{attempt-suffix}`
+(stream segments, ADR 0043 §A3) or `backup/{backup_id}/...` (this ADR's own
+§1) becomes the S3 object key `[prefix/]{table}/{label}/{tablet}/{epoch}/
+{attempt-suffix}` — S3's own `/`-delimited key namespace already matches
+the shape `SegmentStore::list`'s prefix filter expects, so `list(prefix)`
+is a direct `ListObjectsV2 {Prefix: "[prefix/]" + prefix}` call, no
+translation layer.
+
+### Consistency assumptions
+
+S3 (and every credible S3-compatible target: MinIO, localstack) has been
+strongly (read-after-write) consistent for both new-object PUTs and
+overwrite PUTs since 2020 — this backend assumes that, not S3's old
+2006-era eventual-consistency model, matching `SegmentStore`'s own
+write-once/read-after-put contract (ADR 0043 §A7) exactly: a `put` that
+returns success is immediately visible to a `get`/`head` on any node. Two
+narrower assumptions this backend does add, both already true of every
+`SegmentStore` implementor's `list`: it is **debug/sweep-only, never
+load-bearing for a read** (a reader/sweep resolves an object's id from the
+replicated catalog, never from a `list` result), and it must **paginate**
+rather than assume one page — `ListObjectsV2`'s own 1000-key page cap is a
+hard S3 API limit `animus_s3::client::S3Client::list_objects_v2`'s
+`continuation` parameter already threads through (PR 1); the `SegmentStore`
+wrapper (PR 2) is responsible for looping pages, never truncating silently.
+
+### Credential sourcing
+
+Static access-key-id + secret-access-key, from node config or an
+environment variable — the identical posture ADR 0057's `dynamo_auth`
+static credential map already established for this codebase (`SecretKey`-
+shaped redaction, never logged, never returned by `/admin/*`; see
+`animus_s3::sigv4::Credentials`'s own redacting `Debug`, PR 1). **Instance-
+role/IMDS credential resolution is explicitly out of scope** — it would add
+a second, EC2-specific credential-discovery code path this codebase has no
+other reason to carry, and every target this backend needs to support
+today (real S3 with a bucket-scoped IAM user, MinIO, localstack) works with
+static credentials. Revisit only if a deployment genuinely requires it.
+
+### Region and endpoint
+
+**Path-style addressing with an explicit, required endpoint** (PR 1's
+`S3Config::endpoint`) — not virtual-hosted-style, and not "derive the
+endpoint from the region" the way the official AWS SDKs default to. This
+is deliberate, not a shortcut: an explicit endpoint is what makes MinIO and
+localstack work at all (they have no `s3.<region>.amazonaws.com`-shaped
+DNS name), and it costs nothing against real AWS S3, which accepts
+path-style addressing for any bucket. Virtual-hosted-style stays a
+documented, unimplemented option (`crates/animus-s3/CLAUDE.md`) for a
+later PR if a real deployment ever needs it (e.g. a proxy that only
+recognizes the virtual-hosted form).
+
+### TLS
+
+Reuses the rustls trust stack ADR 0064 established for this codebase (the
+`ring` crypto provider, the same "no back-compat, no bespoke abstraction
+per crate unless the trait shape genuinely doesn't fit" posture) — PR 1's
+`animus_s3::prod::HyperRustlsTransport` builds its `RootCertStore` from
+`rustls-native-certs` (the platform trust bundle) rather than ADR 0064's
+own explicit-PEM-file `TlsConfig`, since this is an *outbound* client
+verifying a well-known public/operator-supplied CA, not a peer-to-peer
+mutual-TLS handshake with no ambient trust root to lean on. A plain
+`http://` endpoint is allowed only via an explicit, opt-in transport
+constructor (`HyperRustlsTransport::new_allow_insecure_http`) — never
+inferred from the endpoint string itself — reserved for a loopback MinIO
+dev/test target; a real deployment's `s3://` config always negotiates TLS.
+
+### Testing
+
+- **Signing**: pure known-answer tests against AWS's own published
+  `aws-sig-v4-test-suite` vectors (the same suite ADR 0057 vendors for the
+  DynamoDB verifier), plus a dev-dependency-only proof that this crate's
+  copied HMAC signing-key chain and `animus_dynamo::sigv4`'s
+  independently-implemented one agree byte-for-byte on identical inputs
+  (`crates/animus-s3/tests/sigv4_chain_matches_dynamo.rs` — the one place
+  `animus-s3` names `animus-dynamo` at all, and only in
+  `[dev-dependencies]`; see that crate's `CLAUDE.md` for why the chain was
+  copied rather than depended on).
+- **Contract**: an in-process fake S3 (`animus_s3::fake::FakeS3`) with real
+  SigV4 signature verification, exercising the client end to end with no
+  sockets (PR 1). PR 2 runs `animus_env::test_support::
+  assert_segment_store_contract` against an `S3SegmentStore` built on this
+  same fake, exactly like `FsSegmentStore`'s own contract test does today.
+- **Opt-in real endpoint**: a `prod`-feature-gated test that skips (prints
+  a line, does nothing) unless `ANIMUS_S3_TEST_ENDPOINT` is set — so the
+  workspace gates stay green with no MinIO/localstack infrastructure, but a
+  session with one available can drive a real round trip. Never `#[ignore]`
+  — see `crates/animus-s3/CLAUDE.md`'s Testing section for the exact
+  environment variables and a MinIO invocation.
+
+None of this changes capture, the catalog, or restore (§1's own promise) —
+PR 2, when it lands, is a pure trait-swap: an operator who configures
+`--backup-store s3://bucket/prefix` gets a backup pipeline identical in
+every other respect to one configured with `fs:PATH` or the default
+`cluster`.
+
+### As-built (2026-09-06): PR 2 — `S3SegmentStore` and `s3:` URIs
+
+PR 2 landed as designed above, with the following as-built specifics:
+
+- **Where it lives**: `animus_env::S3SegmentStore<T: animus_s3::client::
+  Transport>` (`crates/animus-env/src/s3_store.rs`), gated behind the same
+  `prod` Cargo feature as `FsSegmentStore` — `animus-env` may depend on
+  `animus-s3` after all (the dev-dependency `animus-s3` → `animus-dynamo`
+  edge PR 1's own `CLAUDE.md` flagged as needing confirmation is a
+  `[dev-dependencies]`-only edge of `animus-s3`, never built when
+  `animus-s3` is used as a plain library dependency, so no cycle exists).
+  Generic over `T: Transport` rather than concretely typed to
+  `HyperRustlsTransport` specifically so the same store type is exercised
+  against `animus_s3::fake::FakeS3` in tests and the real transport in
+  production, with no second implementation of the write-once/list logic.
+- **Object layout**: exactly as designed — `[prefix/]{id}` verbatim, no
+  escaping (every character a production id can contain is already a
+  literal-safe S3 key byte, and `animus_s3::client::S3Client` percent-
+  encodes the wire/signing forms independently and exactly once already).
+- **Write-once**: enforced with a `GET`-then-compare-then-`PUT` (real S3 has
+  no built-in conditional "put only if absent" this client sends), matching
+  `FsSegmentStore::put`'s own local read-then-compare-then-write shape
+  exactly — an identical-content re-put skips the network `PUT` entirely; a
+  differing-content re-put is a hard `Err` with the stored bytes untouched.
+- **Retry**: a small, fixed, non-configurable bounded retry (3 attempts,
+  linear 100ms/attempt backoff) on a transport failure or a `5xx` — never on
+  a `4xx` or `NotFound`/`AccessDenied`. Since this store is not `Env`-generic
+  (mirrors `FsSegmentStore`'s own concrete shape), the backoff sleep is a
+  plain `tokio::time::sleep` under a module-level `#[allow(clippy::
+  disallowed_methods)]`, the identical justification `animus-env`'s own
+  `prod.rs` module carries.
+- **Config surface, as built**: `s3://<bucket>[/<prefix>]?endpoint=<scheme://
+  host[:port]>&region=<region>[&path_style=true][&insecure_http=true]` on
+  both `--segment-store`/`--backup-store` (`animusd::S3StoreConfig`,
+  `main.rs`'s `parse_s3_uri`). `endpoint`'s own `http://`/`https://` prefix
+  must agree with `insecure_http` (an `http://` endpoint always needs
+  `insecure_http=true`, and vice versa) — this deliberately never infers a
+  TLS decision from the scheme string alone, only from the explicit query
+  key, so a `http://` typo can't silently downgrade a production config.
+  `insecure_http=true` against a non-loopback host is refused unless
+  `--allow-insecure-s3` is also given. `path_style=false` (virtual-hosted
+  addressing) is rejected as unimplemented rather than silently ignored,
+  since the underlying client only ever addresses path-style.
+- **Credentials, as built**: deliberately **not** a new `ClusterConfig`
+  field — this codebase's own history with adding a `ClusterConfig` field
+  (documented in `crates/animusd/CLAUDE.md`'s `config.rs` entry: each of
+  `dynamo_auth`/`cluster_settings` triggered a ~55-60-call-site `error
+  [E0063]` fan-out across every `ClusterConfig { .. }` literal) made that
+  the wrong shape for a feature whose own design already calls for static,
+  file/env-sourced credentials with no cluster-wide semantics of their own.
+  Instead: a standalone `--s3-credentials PATH` JSON file (`{"access_key_id":
+  "...", "secret_access_key_file": "..."}` or `{"access_key_id": "...",
+  "secret_access_key_env": "VAR"}, exactly one of the two secret sources),
+  mirroring ADR 0064's own `tls` section's cert/key-**path** precedent
+  (never an inline secret) more closely than `dynamo_auth`'s in-`ClusterConfig`
+  static map — falling back to the `ANIMUS_S3_ACCESS_KEY_ID`/
+  `ANIMUS_S3_SECRET_ACCESS_KEY` environment variables when the flag is
+  omitted. A missing credential is a startup error naming the field/flag,
+  never a panic; an `s3://` store configured with no credential resolvable
+  anywhere is also a startup error, naming both sourcing options.
+- **The insecure-HTTP gate, as built**: `parse_s3_uri` performs the whole
+  gate at parse time (loopback-host check via a conservative literal
+  `localhost`/`127.0.0.0/8`/`::1` match, never a DNS resolution), not at
+  store-construction time — a config that will be refused is refused before
+  any other startup work happens.
+- **Testing, as built**: `assert_segment_store_contract` against
+  `S3SegmentStore<animus_s3::fake::FakeS3>` (`animus-env`'s own
+  `s3_store::tests`, `cargo test -p animus-env --all-features`) is the
+  load-bearing, no-network proof — plus a pagination-specific test proving
+  the store's own `list` loop follows `next_continuation_token` across more
+  than one page. The opt-in real-endpoint counterpart
+  (`crates/animus-env/tests/s3_segment_store_minio.rs`) mirrors PR 1's own
+  `ANIMUS_S3_TEST_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`
+  environment variables exactly, driving the same contract assertion
+  instead of raw client calls. `animusd`'s own end-to-end proof is an
+  in-crate test (`s3_store_handle_tests`, `lib.rs`, needing
+  `BackupStoreHandle`/`SegmentStoreHandle`'s `pub(crate)` visibility) that
+  builds a real `BackupStoreHandle::S3`/`SegmentStoreHandle::S3` directly
+  over `animus_s3::fake::FakeS3` and drives the exact `put`/`put_sealed`/
+  `list_local`/`get_local`/`get_any`/`delete_local` methods the capture
+  driver, backup janitor, and `/admin/backup-store`/`/admin/segment-store`
+  routes call in production — **deliberately not** a full running `Node`
+  with an injected transport driving `CreateBackup` over the real DynamoDB
+  wire, which would need either widening `BackupStoreHandle` to `pub` (a
+  public-API change beyond this PR's scope) or a second, parallel
+  node-construction entry point; a live-node fake-transport e2e is a
+  reasonable follow-up, not required for this PR's own correctness claim.
+  `main.rs`'s own `parse_segment_store`/`parse_backup_store` unit tests
+  cover the URI-shape/credential/insecure-http-gate matrix directly.
+- **Admin surface**: `GET /admin/segment-store`/`GET /admin/backup-store`
+  render `"kind": "s3"` with a `location` of `s3://bucket[/prefix]@host`
+  (host only — no query string, no credentials) via the pre-existing
+  `StoreView`/`redact_store_location` machinery — no new admin-side code
+  beyond the `S3` arm of `StoreView`'s two `From` impls, since both routes
+  already project through that one type.
+- **PR 3 (operator egress + credential secret)** remains, unchanged in
+  scope from the plan above.
+
+### As-built (2026-09-06): PR 3 — operator egress + credential secret (closes S-04)
+
+PR 3 landed as designed, closing `docs/roadmap.md`'s S-04 item entirely
+(all three PRs now done — see that file's own maintenance rule: the S-04
+section is removed from the roadmap in the same change). The full
+as-built account lives in [ADR 0060](0060-kubernetes-operator.md)'s own
+"Amendment (2026-09-06): S-04 PR 3" (`animus-operator`'s crate, not this
+one) — this note only records the piece that touches this ADR's own
+scope: `AnimusClusterSpec.s3`'s two store fields are the identical
+`s3://...` URI shape this ADR's PR 2 amendment specified for
+`--backup-store`/`--segment-store`, unchanged; the operator only *routes*
+that string onto the flag (plus a generated `--s3-credentials` file
+pointing at a mounted `Secret`) rather than reinterpreting it. Nothing
+about capture, the catalog, restore, or the `S3SegmentStore`/`S3StoreConfig`
+shapes PR 2 built changed to accommodate this — the operator is a pure
+consumer of the same command-line contract every other deployment shape
+(bare-metal `--config FILE --node I`, `animusd control`) already used.

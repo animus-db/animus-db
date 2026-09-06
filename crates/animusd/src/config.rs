@@ -216,10 +216,11 @@ impl TlsSection {
 ///   the control-plane **leader** (the segment janitor's own gate) — a
 ///   data-only node's `ControlHandle` is always `Remote`, so it never runs
 ///   that loop and ignores the field too.
-/// - The other ten fields (`auto_split_bytes`, `auto_split_change_rate`,
-///   `auto_split_ops_rate`, `quiesce_after_secs`, `stream_seal_bytes`,
-///   `stream_seal_age_secs`, `throttle_read_units`, `throttle_write_units`,
-///   `tablet_max_read_units`, `tablet_max_write_units`)
+/// - The other eleven fields (`auto_split_bytes`, `auto_split_change_rate`,
+///   `auto_split_ops_rate`, `quiesce_after_secs`, `heartbeat_batch`,
+///   `stream_seal_bytes`, `stream_seal_age_secs`, `throttle_read_units`,
+///   `throttle_write_units`, `tablet_max_read_units`,
+///   `tablet_max_write_units`)
 ///   apply to any data-hosting node (combined or data-only).
 ///
 /// A CLI flag naming the same knob **and** a config file's `cluster_
@@ -255,6 +256,22 @@ pub struct ClusterSettings {
     /// disables quiescence entirely.
     #[serde(default)]
     pub quiesce_after_secs: Option<u64>,
+    /// `--heartbeat-batch`/`--no-heartbeat-batch` (ADR 0044 phase 2 — C-02
+    /// PR 2 shipped it off by default; PR 3, the cutover, flips the default
+    /// ON): opts every data-plane CP group this node hosts into the
+    /// per-node heartbeat batcher (`animus_cp_data::heartbeat_batch::
+    /// HeartbeatBatcher`) — coalesces every co-hosted group's own bare Raft
+    /// heartbeat toward the same destination node into one physical wire
+    /// frame per `RaftCore::heartbeat_interval` tick instead of one frame
+    /// per group. `None` (this field absent from a config file) resolves to
+    /// `main::DEFAULT_HEARTBEAT_BATCH` (`true`) — batching ON, today's
+    /// default; an explicit `false` (or `--no-heartbeat-batch`) restores
+    /// byte-for-byte the pre-batcher unbatched behavior, the mechanism
+    /// switch an operator can still reach in the field. Plain boolean, no
+    /// tunable interval — the batcher's own flush cadence always matches
+    /// `RaftCore::heartbeat_interval`, see that constant's own doc.
+    #[serde(default)]
+    pub heartbeat_batch: Option<bool>,
     /// `--stream-seal-bytes B` (ADR 0042 §13): the DynamoDB Streams
     /// sealer's size trigger.
     #[serde(default)]
@@ -751,6 +768,7 @@ mod tests {
             auto_split_ops_rate: Some(200),
             orphan_sweep_after_secs: Some(120),
             quiesce_after_secs: Some(10),
+            heartbeat_batch: Some(true),
             stream_seal_bytes: Some(4_194_304),
             stream_seal_age_secs: Some(3600),
             stream_retention_secs: Some(86_400),
@@ -779,6 +797,7 @@ mod tests {
             .expect("a present section parses even with only one field set");
         assert_eq!(settings.auto_split_bytes, Some(2_000_000));
         assert_eq!(settings.quiesce_after_secs, None);
+        assert_eq!(settings.heartbeat_batch, None);
         assert_eq!(settings.orphan_sweep_after_secs, None);
         assert_eq!(settings.stream_seal_bytes, None);
         assert_eq!(settings.stream_seal_age_secs, None);

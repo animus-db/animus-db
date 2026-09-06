@@ -421,12 +421,11 @@ describes, never auto-retrying with `force`. Add's body needs the new
 voter's own internal control-Raft address, not just its id (`animus admin
 control-add`'s own CLI form resolves that by fetching the new node's
 `/admin/config` first — see `crates/animusd/CLAUDE.md`'s `dashboard_node.js`
-entry for a pre-existing bug found while confirming this: that CLI helper
-reads a `cfg["control"]` field `/admin/config` hasn't served under that
-name since the ADR 0040 PR1 identity merge, so the 3-argument
-operator-supplied-id form of `control-add` currently always fails —
-reported, not fixed here, since it's a `animus-cli`-only defect this
-slice's own scope doesn't touch), so this panel asks the operator for the
+entry for a bug found while confirming this and fixed 2026-09-06: that CLI
+helper used to read a `cfg["control"]` field `/admin/config` hadn't served
+under that name since the ADR 0040 PR1 identity merge, so the 3-argument
+operator-supplied-id form of `control-add` always failed — now reads
+`addrs.internal` instead), so this panel asks the operator for the
 address directly rather than attempting a cross-origin fetch of another
 node's admin port. There is **no separate `grow` route** to wire — `animus
 admin control-grow` is a purely client-side loop of the same
@@ -437,6 +436,314 @@ section** — every bullet across all five PRs has now landed. See
 `crates/animusd/CLAUDE.md`'s `dashboard_node.js` entry for the full
 mechanism and `tests/dashboard_endpoint.rs::
 dashboard_u05_control_member_actions` for the regression.
+
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/backup-store`
+
+The first of U-07's four new observability routes, and its own named
+template: `GET /admin/backup-store` (ADR 0059 §1/§3) surfaces this node's
+own configured backup store (kind + a credential-safe `location`), a
+bounded live scan of its local backup-object count/bytes, the on-demand
+backup janitor's own live phase/counters (a new
+`animus_node::backup_janitor::JanitorProgress`, published by
+`backup_janitor_loop` through a new narrow capability trait,
+`animus_node::host::BackupJanitorProgressHost`, into an
+`Arc<std::sync::Mutex<JanitorProgress>>` on `ClientCtx` — the same "plain
+`std::sync::Mutex`, short lock/mutate/drop, never held across an `.await`"
+shape `metrics_history` already uses), and whether this node currently
+believes it is the control-plane leader — the janitor only ever runs
+there, so a follower's own `janitor` field simply stays `Idle` forever, an
+honest answer rather than a gap.
+
+**Object counts are a live, bounded scan, not a maintained counter**
+(`BackupStoreHandle` tracks no running count/byte total today): `count` is
+one cheap `SegmentStore::list` call over the whole `backup/` namespace;
+`bytes` sums each object's length via a new `BackupStoreHandle::get_local`
+(local-only — every id already came from this node's own `list_local`, so
+there is no reason to fall through to the cluster-wide `get_any`), capped
+at 200 objects with `"truncated": true` reported past the cap. This is the
+identical "a polled observer must not materialize" judgment call this
+file's own 2026-08-19 amendment made for `/admin/raftkv` — acceptable here
+specifically because this route has no cheap alternative and nothing polls
+it on a tight interval by default.
+
+Wired through the full conventional stack: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+backup_store_view` method (`crates/animus-node/src/host.rs`) and its
+`FakeHost` stub/dispatch test, a handler in `crates/animusd/src/admin.rs`,
+`animus admin backup-store <admin-addr>` (`animus-cli`), and a new
+read-only "Backup store" card on the Backups tab
+(`dashboard_backups.js`/`dashboard.html`, fed from the tab's existing
+`loadAll()` poll — no new timer). A small new helper,
+`redact_store_location` (`crates/animusd/src/lib.rs`), strips a URI's
+userinfo and query string before a store location ever reaches this JSON —
+written now, once, so a future S3-backed store variant (and the next three
+U-07 routes) inherit the same safety rather than each re-deriving their
+own redaction; neither store variant this node can be configured with
+today actually carries a credential, so this is defense-in-depth, not a
+fix for an existing leak.
+
+Regression: `tests/admin_endpoint.rs::
+admin_backup_store_reports_reclaim_progress_and_leader_state` (a real
+3-node cluster with an `fs:` backup store — create a table, take an
+on-demand backup, delete it, and poll converged-or-timeout until the
+control-plane leader's own route shows the janitor's object count back at
+baseline with `objects_reclaimed > 0`; a follower reports `leader: false`
+and stays `Idle`), `tests/dashboard_endpoint.rs::
+dashboard_u07_backup_store_card`, and `animus_node::backup_janitor::tests`'
+own progress-reporting assertions.
+
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/ttl`
+
+The second of U-07's four observability routes, copying `/admin/backup-
+store`'s own template (above) with one deliberate difference: the TTL
+reaper (ADR 0051) runs on **every** node, self-gated per tablet
+(`TtlScanHost::led_tablets`), never only on the control leader — so every
+node's own `reaper` field is a genuinely live answer, never a stand-in for
+"not the leader" the way a follower's `janitor` field on `/admin/backup-
+store` is.
+
+`GET /admin/ttl` returns `{reaper: TtlReaperProgress, tables: [{name,
+attribute, enabled}...], leader_tablets: N}`. `reaper` is a new
+`animus_node::ttl_reaper::TtlReaperProgress` — `phase`
+(`idle`/`scanning`/`deleting`, mirroring the loop's real per-tablet control
+flow), `last_tick_at_ms`, a `cursor` (the reaper's own driver-local resume
+position: table + tablet id + a hex-encoded, `TTL_REAPER_CURSOR_KEY_CAP`
+(24-byte)-truncated resume key — **never** the raw key bytes),
+`deleted_last_tick`/`deleted_total`, `expired_seen_total`,
+`tables_with_ttl`, and `last_error` — published at each phase transition
+through a new capability trait mirroring `BackupJanitorProgressHost`
+exactly, `animus_node::host::TtlReaperProgressHost`, into
+`ClientCtx::ttl_reaper_progress: Arc<std::sync::Mutex<TtlReaperProgress>>`
+(provisioned on every node shape, `client_ctx_host.rs`). `tables` is every
+TTL-enabled table in the replicated catalog (a disabled table carries no
+`TtlSpec` at all and so never appears — `enabled` is therefore always
+`true` here, kept as a field for shape symmetry and future extension, not
+because a `false` case exists today). `leader_tablets` counts this node's
+own currently-hosted tablets that are (a) this node's own Raft leader and
+(b) belong to a TTL-enabled table — the tablets this node's reaper is
+*actually* reaping right now, a **per-tablet** fact distinct from the
+control-plane leadership `/admin/backup-store`'s own `leader` field
+reports.
+
+Wired through the identical conventional stack `/admin/backup-store`
+established: a match arm in `crates/animus-node/src/admin.rs`'s dispatch
+table, the `AdminHost::ttl_view` method (`crates/animus-node/src/host.rs`)
+and its `FakeHost` stub/dispatch test, a handler in
+`crates/animusd/src/admin.rs`, and `animus admin ttl-reaper <admin-addr>`
+(`animus-cli`) — named `ttl-reaper`, not the bare `ttl` its route would
+suggest, since roadmap U-08(ii) plans a `ttl` *dynamo-proxy* wrapper
+(`UpdateTimeToLive`/`DescribeTimeToLive` via `/admin/data/dynamo`) in the
+same `admin_request` subcommand namespace and this GET arm must not claim
+that name first. Renders on the **Storage** tab (`dashboard_storage.js`'s
+new "TTL reaper" card, `#ttl-card`/`#ttl-body`) rather than Backups — this
+route's per-node semantics (every node answers about its own reaper) don't
+fit the Backups tab's existing "one shared answer" fetch shape, so
+`dashboard_core.js`'s existing **per-node** `loadAll()` fan-out
+(`STATE.nodes[*].ttl`) feeds it instead of a second single-fetch-against-
+SEED call.
+
+Regression: `tests/admin_endpoint.rs::
+admin_ttl_reports_reaper_progress_and_ttl_tables` (a real 3-node cluster —
+`UpdateTimeToLive` on a table, `PutItem` an already-expired item, and poll
+converged-or-timeout until some node's own route shows `deleted_total >=
+1`; every node's own `tables` list carries the TTL-enabled table since the
+catalog replicates everywhere; a node leading none of that table's
+tablets still answers its own honest counters rather than erroring),
+`tests/dashboard_endpoint.rs::dashboard_u07_ttl_reaper_card`, and
+`animus_node`'s `tests/ttl_reaper_sim.rs` (extended with progress
+assertions on the existing `SimEnv`-driven reap/no-op scenarios).
+
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/gc`
+
+The third of U-07's four observability routes, copying `/admin/backup-
+store`'s own template again: the DynamoDB Streams **segment janitor**
+(ADR 0042 §10/ADR 0043 §A9, `crates/animusd/src/segment_janitor.rs`) is
+control-plane-**leader**-only, exactly like the backup janitor — a
+follower's own `janitor` field simply stays `idle` forever, an honest
+answer rather than a gap — so this route reuses `/admin/backup-store`'s
+own single-fetch dashboard shape, not `/admin/ttl`'s per-node fan-out (see
+`docs/engineering-lessons.md`'s matching U-07 lesson: a card's fetch shape
+must match its route's own gating, not whichever shape the most recently
+added similar route happens to use).
+
+**Unlike `/admin/backup-store`/`/admin/ttl`, the progress type behind this
+route never left `animusd` at all** — `segment_janitor.rs` did not move to
+`animus-node` in ADR 0061's rung C2 (that crate's own `CLAUDE.md` has the
+reasoning: its replica-repair phase is real placement/membership
+orchestration, not a value one narrow capability method can capture), so
+`segment_janitor_loop`/`segment_janitor_tick` already hold a genuine
+`&ClientCtx` and mutate `ClientCtx::segment_janitor_progress` directly — no
+`BackupJanitorProgressHost`/`TtlReaperProgressHost`-shaped capability trait
+was needed. `animus_node::host::AdminHost` still gained one more method,
+`gc_view`, for the route dispatch itself (the identical "one method per
+route, returning the exact JSON the route produces" shape every other
+`AdminHost` method uses) — but it names no new type, since
+`SegmentJanitorProgress`/`SegmentJanitorPhase` are `animusd`-local.
+
+`GET /admin/gc` returns `{janitor: SegmentJanitorProgress, leader: bool}`.
+`janitor.phase` is one of `idle`/`listing`/`waiting_retention`/`deleting`/
+`sweeping`, reflecting the loop's real per-tick structure (phase 1a's scan
+for due rows, phase 1b's object-delete/row-removal sweep, phase 3's orphan
+reap — phase 2's replica repair publishes no phase of its own, since it
+already has independent counters on `/admin/metrics`,
+`stream_repairs_total`/`stream_repair_backlog`). `orphans_seen_total`/
+`orphans_deleted_total`/`deleted_last_tick` count every segment object this
+janitor has ever deleted across BOTH cleanup paths — phase 1b's
+expired-row object deletes (including a dropped table's own immediately-due
+rows) and phase 3's proven-orphan deletes — the general "objects reclaimed
+because nothing references them any more" total the route's own name
+promises, not narrowly phase 3's own `reap_orphans` sub-routine alone.
+`pending_orphans` counts live rows still waiting on retention;
+`retention_ms` is this loop's own configured retention window;
+`last_error` is the most recent list/delete failure, if any.
+
+**`dropped_tables_pending` (which the task considered) is deliberately
+omitted.** `MetaCommand::DropTableTablets` removes a table's tablet rows
+from the replicated catalog *synchronously*, at apply time (ADR 0024) —
+there is no durable "dropped table tombstone" row anywhere in `Metadata`
+for a route to count. What genuinely stays pending after a drop is each
+node's own *local* on-disk reclaim of that tablet's now-orphaned engine
+files, recomputed fresh every tick as an ephemeral per-node diff by the
+tablet-host reconciler (`animus_cp_data::host::plan`) — not a replicated
+count any single node can answer cheaply without a local filesystem scan
+across every node in the cluster. This is a different subsystem from the
+segment janitor this route reports on, despite both being colloquially
+"garbage collection" — see this file's own `gc_view` doc comment
+(`crates/animusd/src/admin.rs`) for the fuller account.
+
+Wired through the identical conventional stack `/admin/backup-store`/
+`/admin/ttl` established: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+gc_view` method (`crates/animus-node/src/host.rs`) and its `FakeHost`
+stub/dispatch test, a handler in `crates/animusd/src/admin.rs`, and
+`animus admin gc <admin-addr>` (`animus-cli`). Renders on the **Storage**
+tab (`dashboard_storage.js`'s new "GC (stream segment janitor)" card,
+`#gc-card`/`#gc-body`) beside the TTL reaper card — this janitor sweeps
+DynamoDB Streams segment objects/catalog rows (`stream_shards`,
+`SegmentStoreHandle`), a different store/subsystem from the on-demand
+backup store the Backups tab's own card covers, and "storage janitor
+diagnostics" is exactly the Storage tab's existing theme.
+
+Regression: `tests/admin_endpoint.rs::
+admin_gc_reports_segment_janitor_progress_and_leader_state` (a real 3-node
+cluster with DynamoDB Streams enabled and a generous 600s retention —
+proving the reclaim is driven by the janitor's drop-table cascade, not by
+retention itself elapsing — create a streamed table, write one item, wait
+for it to seal, drop the table, and poll converged-or-timeout until the
+control-plane leader's own route shows `orphans_deleted_total >= 1`; a
+follower reports `leader: false` and stays `idle` throughout),
+`tests/dashboard_endpoint.rs::dashboard_u07_gc_card`, and
+`segment_janitor::orphan_reap_tests`' own extended progress-count
+assertions.
+
+## As-built (2026-09-06, roadmap U-07) — `GET /admin/segment-store`
+
+The fourth and last of U-07's observability routes, copying `/admin/
+backup-store`'s own template a third time: `GET /admin/segment-store`
+(ADR 0043 §A7b) surfaces this node's own configured DynamoDB Streams
+segment store (kind + a credential-safe `location`, `redact_store_
+location`'s own second reuse), the **shard→replica placement** every
+sealed stream shard was given, and a bounded live scan of this node's own
+local object count/bytes. **This closes docs/roadmap.md's whole U-07
+section** — every one of its four bullets has now landed; see ADR 0043's
+own matching amendment for why the shard-placement half of this route
+lives in that ADR's territory rather than this one's.
+
+**The one genuinely new idea this route adds over its three siblings**:
+a shard's replica set is decided exactly once, at seal time, by
+`ClusterSegmentStore::put_replicated`'s own placement selection, and
+recorded durably right there in `Metadata::stream_shards`'s own
+`StreamShardRow::replicas` field — so this route reads that already-agreed
+record (identical on every node, ADR 0038) rather than recomputing
+placement a second way. `shards` is an array of `{shard, replicas, local}`
+— `shard` rendered via `animus_cp_data::segment::shard_id` (`shardId-
+<tablet>-<epoch>`, ADR 0042 §2's own wire id), `replicas` the recorded
+node ids, `local` whether this node's own id is among them — for the
+default `cluster` store kind; `null` for the single-shared-directory `fs`
+opt-in, which has no per-node replica concept at all (every node already
+reads the identical directory — the same "empty `replicas`, ask any node"
+signal `SegmentStoreHandle::put_sealed`'s own doc already documents for
+that variant).
+
+`local_objects` is the identical bounded-scan shape `/admin/backup-store`'s
+own `objects` field uses (`SegmentStoreHandle::list_local`/`get_local`,
+capped at 200 objects with `truncated: true` past the cap) — but scans the
+WHOLE local segment directory rather than a namespace prefix, since a
+segment id carries no fixed top-level namespace the way a backup object's
+`backup/` prefix does; this is safe because the segment store's own local
+directory (`dir.join("segments")`) is already disjoint from the backup
+store's (`dir.join("backups")`).
+
+**Unlike `/admin/backup-store`/`/admin/gc`, this route publishes no
+janitor/reaper progress of its own** — the segment janitor's own progress
+is already `GET /admin/gc`'s job; this route reports a durable catalog
+fact (placement) and a live local scan (object count/bytes), never a
+loop's phase. Wired through the full conventional stack: a match arm in
+`crates/animus-node/src/admin.rs`'s dispatch table, the `AdminHost::
+segment_store_view` method (`crates/animus-node/src/host.rs`) and its
+`FakeHost` stub/dispatch test, a handler in `crates/animusd/src/admin.rs`,
+`animus admin segment-store <admin-addr>` (`animus-cli`), and a new
+read-only "Segment store" card on the **Storage** tab
+(`dashboard_storage.js`/`dashboard.html`, `#seg-store-card`/
+`#seg-store-body`) beside the TTL reaper and GC cards. **Fed from
+`dashboard_core.js`'s existing PER-NODE `loadAll()` fan-out
+(`STATE.nodes[*].segmentStore`), not a single SEED-only fetch** — like
+`/admin/ttl` and unlike `/admin/backup-store`/`/admin/gc` — because this
+route's own `local_objects`/`local` fields are genuinely per-node facts
+(the lesson recorded when `/admin/ttl` landed: a card's fetch shape must
+match its route's own gating, not whichever shape the most recently added
+similar route happens to use).
+
+Regression: `tests/admin_endpoint.rs::
+admin_segment_store_reports_shard_placement_and_local_objects` (a real
+3-node cluster with the default `cluster` segment store — create a
+streamed table, write, wait for the write to seal, poll converged-or-
+timeout until some node's own route shows `local_objects.count >= 1`, then
+poll converged-or-timeout until every node reports the identical,
+non-empty shard→replica placement) and `admin_segment_store_reports_null_
+shards_for_the_fs_kind` (a single node configured with the `fs:` opt-in
+reports `shards: null`), plus `tests/dashboard_endpoint.rs::
+dashboard_u07_segment_store_card`.
+
+## As-built (2026-09-06, roadmap U-08(ii)) — dynamo-proxy CLI wrappers, closing U-08
+
+The last piece of CLI parity: six `animus admin` subcommands
+(`backup-create`, `backup-delete`, `restore`, `pitr-enable`/`pitr-disable`,
+`ttl`, `stream`) over the pre-existing `POST /admin/data/dynamo` proxy
+(this ADR's own Surface section) — no new route, and no change to
+`animusd::admin::action_data_dynamo`'s allow-list (it has none beyond the
+bare-name Streams-vs-item disambiguation, and none of these six ops are
+Streams ops). Each is a thin `admin_request` arm building `{op, payload}`
+from the exact DynamoDB operation shape the dashboard already sends for
+the identical action (`CreateBackup`/`DeleteBackup`/
+`RestoreTableFromBackup`/`UpdateContinuousBackups` from
+`dashboard_backups.js`, `UpdateTimeToLive`/`UpdateTable{
+StreamSpecification}` from `dashboard_browser.js`) — the CLI and the
+dashboard are now two clients of one already-proven wire contract, not two
+independently-invented ones. `ttl` (bare) was reserved for this by
+U-07's own `ttl-reaper` GET arm, which claimed the diagnostic name instead
+so this wrapper could take the natural one; `stream`'s view-type argument
+is validated client-side against DynamoDB's four real `StreamViewType`s
+(or the literal `off` to disable) so a typo is a plain CLI error rather
+than a round trip that comes back a wire-level `ValidationException`.
+**This closes docs/roadmap.md's whole U-08 section** — both (i)'s flat GET
+arms and (ii)'s dynamo-proxy wrappers have now landed.
+
+Coverage is `admin_request`'s own unit tests (happy path, a
+missing-argument error, and the `--disable`/`off` variants) for all six —
+per this crate's own `docs/roadmap.md` §4 convention ("CLI arg parsing is
+unit-tested via `admin_request`; nothing opens a socket"), since `animusd`
+has no dependency on `animus-cli` at all and so cannot drive the real
+binary end to end; the `/admin/data/dynamo` route and the six underlying
+DynamoDB operations already have their own real-cluster coverage
+elsewhere (`dynamo_backup.rs`/`dynamo_restore.rs`/
+`dynamo_pitr_restore.rs`/`dynamo_ttl.rs`/`dynamo_streams.rs`,
+`dashboard_endpoint.rs`'s U-02/U-04 cases), unrelated to this CLI crate.
+This does not by itself close ADR 0061 rung C-04's E2 (`animus-cli`
+argument/dispatch coverage) — several pre-existing one-shot arms
+(`drain`/`drain-status`/`remove`/`reconfigure`/`flush`/`compact`/
+`stream-grow`) still have no `admin_request` unit test of their own; see
+`docs/roadmap.md`'s matching note.
 
 ### Follow-up work
 

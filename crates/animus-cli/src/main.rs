@@ -149,7 +149,7 @@ async fn maybe_tls_connect(
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
-    peers|txns|backups|restores|control-members|storage-control <admin-addr>\n    \
+    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
@@ -172,7 +172,20 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     control-add <leader-admin-addr> <node-id> <new-node-admin-addr>         (operator-supplied id)\n    \
     control-remove <leader-admin-addr> <node-id> [--force]\n    \
     control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>...]\n    \
-    control-transfer <leader-admin-addr> <node-id>";
+    control-transfer <leader-admin-addr> <node-id>\n    \
+    backup-create <admin-addr> <table> <backup-name>\n    \
+    backup-delete <admin-addr> <backup-arn>\n    \
+    restore <admin-addr> <backup-arn> <target-table>\n    \
+    pitr-enable|pitr-disable <admin-addr> <table>\n    \
+    ttl <admin-addr> <table> <attribute> [--disable]\n    \
+    stream <admin-addr> <table> <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>\n    \
+    export-create <admin-addr> <table-arn> <s3-bucket> [s3-prefix]\n    \
+    export-describe <admin-addr> <export-arn>\n    \
+    export-list <admin-addr> [table-arn]\n    \
+    import-create <admin-addr> <table> <s3-bucket> [s3-prefix] [--gzip|--none] \
+    --pk name:TYPE [--sk name:TYPE]\n    \
+    import-describe <admin-addr> <import-arn>\n    \
+    import-list <admin-addr> [table-arn]";
 
 async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Result<(), String> {
     let cmd = args.first().map(String::as_str).ok_or("missing command")?;
@@ -322,6 +335,27 @@ fn admin_request(
         "txns" => ("GET", "/admin/txns".into(), None),
         "backups" => ("GET", "/admin/backups".into(), None),
         "restores" => ("GET", "/admin/restores".into(), None),
+        // `GET /admin/backup-store` (ADR 0059 §1/§3, roadmap U-07): store
+        // config, object counts, and the backup janitor's own live phase.
+        "backup-store" => ("GET", "/admin/backup-store".into(), None),
+        // `GET /admin/ttl` (ADR 0051, roadmap U-07): the TTL reaper's own
+        // live phase/cursor/counters plus every TTL-enabled table. Named
+        // `ttl-reaper`, not the bare `ttl` its route would suggest —
+        // roadmap U-08(ii) plans a `ttl` *dynamo-proxy* wrapper
+        // (`UpdateTimeToLive`/`DescribeTimeToLive` via `/admin/data/
+        // dynamo`) in this same subcommand namespace, and this GET arm
+        // must not claim that name first.
+        "ttl-reaper" => ("GET", "/admin/ttl".into(), None),
+        // `GET /admin/gc` (ADR 0042 §10/ADR 0043 §A9, roadmap U-07): the
+        // DynamoDB Streams segment janitor's own live orphan-sweep phase
+        // and counters (control-plane-leader-only, exactly like
+        // `backup-store` above).
+        "gc" => ("GET", "/admin/gc".into(), None),
+        // `GET /admin/segment-store` (ADR 0043 §A7b, roadmap U-07): this
+        // node's own configured stream-segment store, the shard→replica
+        // placement it sees (`cluster` kind only), and a bounded local
+        // object count/bytes.
+        "segment-store" => ("GET", "/admin/segment-store".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
@@ -492,6 +526,239 @@ fn admin_request(
             let id = arg(2).ok_or("credentials-revoke needs <id>")?;
             let body = serde_json::json!({"id": id}).to_string();
             ("POST", "/admin/credentials/revoke".into(), Some(body))
+        }
+        // Dynamo-proxy wrappers (roadmap U-08(ii)): each is a thin POST to
+        // `/admin/data/dynamo` (`{op, payload}`, ADR 0021) reusing the exact
+        // wire shapes `animusd`'s own dashboard already sends for these same
+        // actions (`dashboard_backups.js`/`dashboard_browser.js`) — no new
+        // route and no proxy allow-list change (`animusd::admin::
+        // action_data_dynamo` has none beyond the bare-name Streams-vs-item
+        // disambiguation, and none of these six ops are Streams ops).
+        "backup-create" => {
+            let table = arg(2).ok_or("backup-create needs <table>")?;
+            let name = arg(3).ok_or("backup-create needs <backup-name>")?;
+            let body = serde_json::json!({
+                "op": "CreateBackup",
+                "payload": {"TableName": table, "BackupName": name},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "backup-delete" => {
+            let arn = arg(2).ok_or("backup-delete needs <backup-arn>")?;
+            let body = serde_json::json!({
+                "op": "DeleteBackup",
+                "payload": {"BackupArn": arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "restore" => {
+            let arn = arg(2).ok_or("restore needs <backup-arn>")?;
+            let target = arg(3).ok_or("restore needs <target-table>")?;
+            let body = serde_json::json!({
+                "op": "RestoreTableFromBackup",
+                "payload": {"TargetTableName": target, "BackupArn": arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `pitr-enable`/`pitr-disable` share one arm — both build the
+        // identical `UpdateContinuousBackups` shape, differing only in the
+        // boolean (mirroring the dashboard's own `togglePitr`).
+        "pitr-enable" | "pitr-disable" => {
+            let table = arg(2).ok_or_else(|| format!("{sub} needs <table>"))?;
+            let enabled = sub == "pitr-enable";
+            let body = serde_json::json!({
+                "op": "UpdateContinuousBackups",
+                "payload": {
+                    "TableName": table,
+                    "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": enabled},
+                },
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `ttl` (bare — `ttl-reaper` above claimed the diagnostic GET's own
+        // name for exactly this reason): enables by default; `--disable`
+        // (a fourth, positional-flag arg, mirroring `--force`/
+        // `--force-control-remove` elsewhere in this file) disables. AWS
+        // requires `AttributeName` on a disable call too (naming the
+        // attribute being disabled), so this CLI form takes it either way
+        // rather than trying to look up the current one over a second round
+        // trip.
+        "ttl" => {
+            let table = arg(2).ok_or("ttl needs <table>")?;
+            let attr = arg(3).ok_or("ttl needs <attribute>")?;
+            let disable = arg(4) == Some("--disable");
+            let body = serde_json::json!({
+                "op": "UpdateTimeToLive",
+                "payload": {
+                    "TableName": table,
+                    "TimeToLiveSpecification": {"Enabled": !disable, "AttributeName": attr},
+                },
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // `stream`: `off` disables (no `StreamViewType` — mirrors the
+        // dashboard's own `disableStream`); any of DynamoDB's four real view
+        // types enables/changes it. Validated client-side so a typo becomes
+        // a clear CLI error instead of a wire-level `ValidationException`.
+        "stream" => {
+            let table = arg(2).ok_or("stream needs <table>")?;
+            let view = arg(3)
+                .ok_or("stream needs <NEW_IMAGE|OLD_IMAGE|NEW_AND_OLD_IMAGES|KEYS_ONLY|off>")?;
+            let spec = if view == "off" {
+                serde_json::json!({"StreamEnabled": false})
+            } else {
+                const VIEW_TYPES: &[&str] =
+                    &["NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES", "KEYS_ONLY"];
+                if !VIEW_TYPES.contains(&view) {
+                    return Err(format!(
+                        "stream view type must be one of NEW_IMAGE|OLD_IMAGE|\
+                         NEW_AND_OLD_IMAGES|KEYS_ONLY|off, got `{view}`"
+                    ));
+                }
+                serde_json::json!({"StreamEnabled": true, "StreamViewType": view})
+            };
+            let body = serde_json::json!({
+                "op": "UpdateTable",
+                "payload": {"TableName": table, "StreamSpecification": spec},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // S3 export (ADR 0068, S-05) — same dynamo-proxy-wrapper shape as
+        // the backup/restore/PITR/TTL/stream group above:
+        // `export-create` takes the source table's own ARN directly (this
+        // adapter's own convention: `arn:aws:dynamodb:animus:0:table/
+        // <name>`, printed by `DescribeTable`/`CreateTable`), never a bare
+        // table name — matching real AWS's own
+        // `aws dynamodb export-table-to-point-in-time --table-arn` shape,
+        // and sidestepping ARN construction here (this crate has no
+        // `animus-dynamo` dependency to build one with).
+        "export-create" => {
+            let table_arn = arg(2).ok_or("export-create needs <table-arn>")?;
+            let bucket = arg(3).ok_or("export-create needs <s3-bucket>")?;
+            let mut payload = serde_json::json!({"TableArn": table_arn, "S3Bucket": bucket});
+            if let Some(prefix) = arg(4) {
+                payload["S3Prefix"] = serde_json::Value::String(prefix.to_string());
+            }
+            let body = serde_json::json!({
+                "op": "ExportTableToPointInTime",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "export-describe" => {
+            let export_arn = arg(2).ok_or("export-describe needs <export-arn>")?;
+            let body = serde_json::json!({
+                "op": "DescribeExport",
+                "payload": {"ExportArn": export_arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "export-list" => {
+            let mut payload = serde_json::Map::new();
+            if let Some(table_arn) = arg(2) {
+                payload.insert(
+                    "TableArn".to_string(),
+                    serde_json::Value::String(table_arn.to_string()),
+                );
+            }
+            let body = serde_json::json!({
+                "op": "ListExports",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        // S3 import (ADR 0068 §6, S-05 PR 2) — the mirror-image trio of the
+        // export group above, over `ImportTable`/`DescribeImport`/
+        // `ListImports`. `import-create` takes a bare **table name** (not
+        // an ARN, unlike `export-create`) since the target table does not
+        // exist yet — there is no ARN to name it by until this call
+        // creates it — and builds a minimal `TableCreationParameters` from
+        // `--pk NAME:TYPE`/`--sk NAME:TYPE` (no GSI/throughput flags yet;
+        // this wrapper covers the common single-key-schema case, matching
+        // `export-create`'s own "common case, not every field" scope note).
+        "import-create" => {
+            let table = arg(2).ok_or("import-create needs <table>")?;
+            let bucket = arg(3).ok_or("import-create needs <s3-bucket>")?;
+            // `[<prefix>]` is positional (mirrors `export-create`), but
+            // this subcommand also has bare flags after it — an arg
+            // starting with `--` here means the prefix was omitted.
+            let prefix = arg(4).filter(|a| !a.starts_with("--"));
+            let gzip = !args.iter().any(|a| a == "--none");
+            let pk = flag_value(args, "--pk")
+                .ok_or("import-create needs --pk NAME:TYPE (e.g. --pk id:S)")?;
+            let (pk_name, pk_type) = pk
+                .split_once(':')
+                .ok_or("--pk must be NAME:TYPE (e.g. id:S)")?;
+            let mut attribute_definitions = vec![serde_json::json!({
+                "AttributeName": pk_name, "AttributeType": pk_type,
+            })];
+            let mut key_schema = vec![serde_json::json!({
+                "AttributeName": pk_name, "KeyType": "HASH",
+            })];
+            if let Some(sk) = flag_value(args, "--sk") {
+                let (sk_name, sk_type) = sk
+                    .split_once(':')
+                    .ok_or("--sk must be NAME:TYPE (e.g. ts:N)")?;
+                attribute_definitions.push(serde_json::json!({
+                    "AttributeName": sk_name, "AttributeType": sk_type,
+                }));
+                key_schema.push(serde_json::json!({
+                    "AttributeName": sk_name, "KeyType": "RANGE",
+                }));
+            }
+            let mut source = serde_json::json!({"S3Bucket": bucket});
+            if let Some(prefix) = prefix {
+                source["S3KeyPrefix"] = serde_json::Value::String(prefix.to_string());
+            }
+            let payload = serde_json::json!({
+                "S3BucketSource": source,
+                "InputFormat": "DYNAMODB_JSON",
+                "InputCompressionType": if gzip { "GZIP" } else { "NONE" },
+                "TableCreationParameters": {
+                    "TableName": table,
+                    "AttributeDefinitions": attribute_definitions,
+                    "KeySchema": key_schema,
+                },
+            });
+            let body = serde_json::json!({
+                "op": "ImportTable",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "import-describe" => {
+            let import_arn = arg(2).ok_or("import-describe needs <import-arn>")?;
+            let body = serde_json::json!({
+                "op": "DescribeImport",
+                "payload": {"ImportArn": import_arn},
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
+        }
+        "import-list" => {
+            let mut payload = serde_json::Map::new();
+            if let Some(table_arn) = arg(2) {
+                payload.insert(
+                    "TableArn".to_string(),
+                    serde_json::Value::String(table_arn.to_string()),
+                );
+            }
+            let body = serde_json::json!({
+                "op": "ListImports",
+                "payload": payload,
+            })
+            .to_string();
+            ("POST", "/admin/data/dynamo".into(), Some(body))
         }
         other => return Err(format!("unknown admin subcommand `{other}`")),
     })
@@ -717,6 +984,28 @@ async fn run_decommission(
     Ok(())
 }
 
+/// Pulls the new voter's internal control-Raft dial address out of a `GET
+/// /admin/config` response body (`animusd::admin::config_view`'s JSON
+/// shape). Since ADR 0040 PR1 merged the old top-level `control`/`raftkv`
+/// address pair into one `addrs.internal` field, that is the key path to
+/// read — **not** a top-level `control` field, which no longer exists at
+/// all (see `run_control_add`'s own doc for the incident this fixes: that
+/// stale read had silently broken the operator-supplied-id form of
+/// `control-add` since the ADR 0040 PR1 rename, with nothing exercising the
+/// path to catch it). Factored out as a pure, unit-testable function
+/// specifically so this key path can be pinned against a captured real
+/// response shape without opening a socket.
+fn internal_addr_from_admin_config(cfg: &serde_json::Value) -> Result<String, String> {
+    cfg["addrs"]["internal"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "the new node's /admin/config has no `addrs.internal` address \
+             (is it a control-role or combined-mode node?)"
+                .to_string()
+        })
+}
+
 /// `animus admin control-add <leader-admin-addr> <node-id> <new-node-admin-addr>`
 /// (ADR 0037 PR3, the **operator-supplied-id** form — see [`run_admin`]'s
 /// arity dispatch and [`run_control_add_allocated`] for the allocator-minted
@@ -726,7 +1015,8 @@ async fn run_decommission(
 /// wire payload actually wants. This resolves the difference itself: a `GET
 /// /admin/config` against the new node's own admin port doubles as the
 /// "confirm it's up" liveness check the runbook wants and yields its
-/// `control` address, which then goes into the add request to the **leader**.
+/// internal address (via [`internal_addr_from_admin_config`]), which then
+/// goes into the add request to the **leader**.
 /// Finally polls the **new node's own** `/admin/control/members` until it
 /// reports itself a voter — mirroring `run_decommission`'s
 /// poll-to-convergence shape (bounded, no fixed sleep-and-hope).
@@ -745,10 +1035,8 @@ async fn run_control_add(
     }
     let cfg: serde_json::Value = serde_json::from_str(&resp)
         .map_err(|e| format!("malformed /admin/config response: {e}"))?;
-    let control_addr = cfg["control"].as_str().ok_or(
-        "the new node's /admin/config has no `control` address \
-         (is it a control-role or combined-mode node?)",
-    )?;
+    let control_addr = internal_addr_from_admin_config(&cfg)?;
+    let control_addr = control_addr.as_str();
 
     let body = serde_json::json!({"node": node, "addr": control_addr}).to_string();
     let (status, resp) = http_call(
@@ -1093,6 +1381,10 @@ mod tests {
             ("txns", "/admin/txns"),
             ("backups", "/admin/backups"),
             ("restores", "/admin/restores"),
+            ("backup-store", "/admin/backup-store"),
+            ("ttl-reaper", "/admin/ttl"),
+            ("gc", "/admin/gc"),
+            ("segment-store", "/admin/segment-store"),
             ("control-members", "/admin/control/members"),
             ("storage-control", "/admin/storage/control"),
         ];
@@ -1193,6 +1485,59 @@ mod tests {
     #[test]
     fn control_transfer_needs_a_node_id() {
         assert!(admin_request("control-transfer", &args(&[])).is_err());
+    }
+
+    /// Regression for the control-add `/admin/config` field issue: the old
+    /// code read a top-level `control` field, removed by ADR 0040 PR1's
+    /// `control`/`raftkv` → `addrs.internal` merge. A response carrying
+    /// *only* the legacy shape must fail with a clear error, not silently
+    /// resolve to nothing/panic.
+    #[test]
+    fn internal_addr_from_admin_config_rejects_the_removed_legacy_shape() {
+        let legacy = serde_json::json!({"control": "127.0.0.1:9001"});
+        let err = internal_addr_from_admin_config(&legacy)
+            .expect_err("a `control`-only body must not resolve — that field is gone");
+        assert!(
+            err.contains("addrs.internal"),
+            "error should name the field it actually looked for: {err}"
+        );
+    }
+
+    /// The current real shape (`animusd::admin::config_view`, ADR 0040
+    /// PR1): `addrs.internal` is where the new voter's internal
+    /// control-Raft dial address actually lives. Captured field-for-field
+    /// from that function's own `json!({ .. })` literal (a subset — only
+    /// the fields this helper's key path touches need be present).
+    #[test]
+    fn internal_addr_from_admin_config_reads_the_current_shape() {
+        let current = serde_json::json!({
+            "role": "combined",
+            "node_id": "n0",
+            "control_ids": ["n0"],
+            "addrs": {
+                "internal": "127.0.0.1:9001",
+                "client": "127.0.0.1:9002",
+                "dynamo": "127.0.0.1:9003",
+                "admin": "127.0.0.1:9004",
+            },
+            "peers": {},
+        });
+        assert_eq!(
+            internal_addr_from_admin_config(&current).unwrap(),
+            "127.0.0.1:9001"
+        );
+    }
+
+    /// `AdminInfo::internal_addr` is modeled as `Option<SocketAddr>`
+    /// (`animusd::lib.rs`'s own doc: `None` only for a node with no internal
+    /// role at all, which "doesn't occur in practice") — so `addrs.internal`
+    /// can in principle serialize as JSON `null`, not just be absent or a
+    /// string. Must be treated the same as "no address available", never as
+    /// a literal `"null"` string.
+    #[test]
+    fn internal_addr_from_admin_config_rejects_a_null_internal_addr() {
+        let no_internal = serde_json::json!({"addrs": {"internal": null}});
+        assert!(internal_addr_from_admin_config(&no_internal).is_err());
     }
 
     #[test]
@@ -1336,6 +1681,372 @@ mod tests {
         assert_eq!(method, "POST");
         assert_eq!(path, "/admin/credentials/revoke");
         assert_eq!(body, Some(r#"{"id":"AKID1"}"#.to_string()));
+    }
+
+    // --- Dynamo-proxy wrappers (roadmap U-08(ii)) -------------------------
+
+    #[test]
+    fn backup_create_posts_the_real_create_backup_shape() {
+        let (method, path, body) =
+            admin_request("backup-create", &args(&["orders", "nightly-1"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "CreateBackup");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TableName": "orders", "BackupName": "nightly-1"})
+        );
+    }
+
+    #[test]
+    fn backup_create_needs_table_and_name() {
+        assert!(admin_request("backup-create", &args(&[])).is_err());
+        assert!(admin_request("backup-create", &args(&["orders"])).is_err());
+    }
+
+    #[test]
+    fn backup_delete_posts_the_real_delete_backup_shape() {
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/01234";
+        let (method, path, body) = admin_request("backup-delete", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DeleteBackup");
+        assert_eq!(v["payload"], serde_json::json!({"BackupArn": arn}));
+    }
+
+    #[test]
+    fn backup_delete_needs_a_backup_arn() {
+        assert!(admin_request("backup-delete", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn restore_posts_the_real_restore_table_from_backup_shape() {
+        let arn = "arn:aws:dynamodb:us-east-1:000000000000:table/orders/backup/01234";
+        let (method, path, body) =
+            admin_request("restore", &args(&[arn, "orders-restored"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "RestoreTableFromBackup");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TargetTableName": "orders-restored", "BackupArn": arn})
+        );
+    }
+
+    #[test]
+    fn restore_needs_backup_arn_and_target_table() {
+        assert!(admin_request("restore", &args(&[])).is_err());
+        assert!(admin_request("restore", &args(&["arn:aws:..."])).is_err());
+    }
+
+    #[test]
+    fn pitr_enable_posts_update_continuous_backups_true() {
+        let (method, path, body) = admin_request("pitr-enable", &args(&["orders"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateContinuousBackups");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": true},
+            })
+        );
+    }
+
+    #[test]
+    fn pitr_disable_posts_update_continuous_backups_false() {
+        let (_, _, body) = admin_request("pitr-disable", &args(&["orders"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"]["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn pitr_enable_and_disable_need_a_table() {
+        assert!(admin_request("pitr-enable", &args(&[])).is_err());
+        assert!(admin_request("pitr-disable", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn ttl_enable_posts_update_time_to_live_true() {
+        let (method, path, body) = admin_request("ttl", &args(&["orders", "expiresAt"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateTimeToLive");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "expiresAt"},
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_disable_flag_posts_enabled_false_with_the_same_attribute() {
+        let (_, _, body) =
+            admin_request("ttl", &args(&["orders", "expiresAt", "--disable"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "TimeToLiveSpecification": {"Enabled": false, "AttributeName": "expiresAt"},
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_needs_table_and_attribute() {
+        assert!(admin_request("ttl", &args(&[])).is_err());
+        assert!(admin_request("ttl", &args(&["orders"])).is_err());
+    }
+
+    #[test]
+    fn stream_enable_posts_update_table_with_stream_specification() {
+        let (method, path, body) =
+            admin_request("stream", &args(&["orders", "NEW_AND_OLD_IMAGES"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "UpdateTable");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+            })
+        );
+    }
+
+    #[test]
+    fn stream_off_disables_with_no_view_type() {
+        let (_, _, body) = admin_request("stream", &args(&["orders", "off"])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableName": "orders",
+                "StreamSpecification": {"StreamEnabled": false},
+            })
+        );
+    }
+
+    #[test]
+    fn stream_rejects_an_unknown_view_type() {
+        let err = admin_request("stream", &args(&["orders", "NOT_A_REAL_VIEW"]))
+            .expect_err("an invalid view type must be rejected client-side");
+        assert!(err.contains("NOT_A_REAL_VIEW"), "{err}");
+    }
+
+    #[test]
+    fn stream_needs_table_and_view_type() {
+        assert!(admin_request("stream", &args(&[])).is_err());
+        assert!(admin_request("stream", &args(&["orders"])).is_err());
+    }
+
+    // --- S3 export (ADR 0068, S-05) ---------------------------------------
+
+    #[test]
+    fn export_create_posts_the_real_export_table_shape() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (method, path, body) =
+            admin_request("export-create", &args(&[table_arn, "my-bucket"])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ExportTableToPointInTime");
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({"TableArn": table_arn, "S3Bucket": "my-bucket"})
+        );
+    }
+
+    #[test]
+    fn export_create_includes_an_optional_s3_prefix() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request(
+            "export-create",
+            &args(&[table_arn, "my-bucket", "exports/orders"]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"],
+            serde_json::json!({
+                "TableArn": table_arn,
+                "S3Bucket": "my-bucket",
+                "S3Prefix": "exports/orders",
+            })
+        );
+    }
+
+    #[test]
+    fn export_create_needs_table_arn_and_bucket() {
+        assert!(admin_request("export-create", &args(&[])).is_err());
+        assert!(
+            admin_request(
+                "export-create",
+                &args(&["arn:aws:dynamodb:animus:0:table/orders"])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn export_describe_posts_the_real_describe_export_shape() {
+        let arn = "arn:aws:dynamodb:animus:0:table/orders/export/01234";
+        let (method, path, body) = admin_request("export-describe", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DescribeExport");
+        assert_eq!(v["payload"], serde_json::json!({"ExportArn": arn}));
+    }
+
+    #[test]
+    fn export_describe_needs_an_export_arn() {
+        assert!(admin_request("export-describe", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn export_list_with_no_filter_posts_an_empty_payload() {
+        let (method, path, body) = admin_request("export-list", &args(&[])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ListExports");
+        assert_eq!(v["payload"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn export_list_with_a_table_arn_filters_by_it() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request("export-list", &args(&[table_arn])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["payload"], serde_json::json!({"TableArn": table_arn}));
+    }
+
+    // --- S3 import (ADR 0068 §6, S-05 PR 2) --------------------------------
+
+    #[test]
+    fn import_create_posts_the_real_import_table_shape() {
+        let (method, path, body) = admin_request(
+            "import-create",
+            &args(&["orders", "my-bucket", "--pk", "id:S"]),
+        )
+        .unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ImportTable");
+        assert_eq!(v["payload"]["S3BucketSource"]["S3Bucket"], "my-bucket");
+        assert!(v["payload"]["S3BucketSource"].get("S3KeyPrefix").is_none());
+        assert_eq!(v["payload"]["InputFormat"], "DYNAMODB_JSON");
+        assert_eq!(v["payload"]["InputCompressionType"], "GZIP");
+        assert_eq!(
+            v["payload"]["TableCreationParameters"],
+            serde_json::json!({
+                "TableName": "orders",
+                "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            })
+        );
+    }
+
+    #[test]
+    fn import_create_includes_an_optional_prefix_and_sort_key_and_none_compression() {
+        let (_, _, body) = admin_request(
+            "import-create",
+            &args(&[
+                "orders",
+                "my-bucket",
+                "exports/orders",
+                "--none",
+                "--pk",
+                "id:S",
+                "--sk",
+                "ts:N",
+            ]),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"]["S3BucketSource"]["S3KeyPrefix"],
+            "exports/orders"
+        );
+        assert_eq!(v["payload"]["InputCompressionType"], "NONE");
+        assert_eq!(
+            v["payload"]["TableCreationParameters"],
+            serde_json::json!({
+                "TableName": "orders",
+                "AttributeDefinitions": [
+                    {"AttributeName": "id", "AttributeType": "S"},
+                    {"AttributeName": "ts", "AttributeType": "N"},
+                ],
+                "KeySchema": [
+                    {"AttributeName": "id", "KeyType": "HASH"},
+                    {"AttributeName": "ts", "KeyType": "RANGE"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn import_create_needs_table_bucket_and_pk() {
+        assert!(admin_request("import-create", &args(&[])).is_err());
+        assert!(admin_request("import-create", &args(&["orders"])).is_err());
+        assert!(admin_request("import-create", &args(&["orders", "my-bucket"])).is_err());
+        assert!(
+            admin_request(
+                "import-create",
+                &args(&["orders", "my-bucket", "--pk", "id"])
+            )
+            .is_err(),
+            "a malformed --pk (no `:TYPE`) must be rejected"
+        );
+    }
+
+    #[test]
+    fn import_describe_posts_the_real_describe_import_shape() {
+        let arn = "arn:aws:dynamodb:animus:0:table/orders/import/01234";
+        let (method, path, body) = admin_request("import-describe", &args(&[arn])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "DescribeImport");
+        assert_eq!(v["payload"], serde_json::json!({"ImportArn": arn}));
+    }
+
+    #[test]
+    fn import_describe_needs_an_import_arn() {
+        assert!(admin_request("import-describe", &args(&[])).is_err());
+    }
+
+    #[test]
+    fn import_list_with_no_filter_posts_an_empty_payload() {
+        let (method, path, body) = admin_request("import-list", &args(&[])).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/admin/data/dynamo");
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["op"], "ListImports");
+        assert_eq!(v["payload"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn import_list_with_a_table_arn_filters_by_it() {
+        let table_arn = "arn:aws:dynamodb:animus:0:table/orders";
+        let (_, _, body) = admin_request("import-list", &args(&[table_arn])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["payload"], serde_json::json!({"TableArn": table_arn}));
     }
 
     #[test]

@@ -4098,6 +4098,37 @@ debugging anything that feels like it might have happened before.
   report a configuration that doesn't include itself, this early?) that
   catches a stale/duplicate signal elsewhere in this log applies to a
   freshly-added observer's very first report too.
+- **A `SimEnv`-driven "batching OFF" control needs to inject its metrics
+  handle the same way the "batching ON" cell does — reaching for the
+  co-hosted-with-batcher shape for the unbatched proof gives zero traffic
+  everywhere, not a compile error (ADR 0044 phase 2, C-02 PR 3 cutover).**
+  `RaftKvNode::start_hosted_with_batcher(env, .., None)` (the batcher-off
+  variant) still calls `env.metrics()` internally exactly like `start_
+  hosted` always has — under `SimEnv` that's the shared no-op handle
+  (`animus_env::Env::metrics`'s own default) unless the caller injects a
+  recording one, and there is no "co-hosted on shared node ids AND
+  injectable metrics AND no batcher" constructor to reach for. The first
+  draft of `heartbeat_batch_corpus.rs`'s new explicit opt-out cell copied
+  cell (a)'s co-hosted/fixed-leader shape verbatim, just passing `None`
+  for the batcher — it compiled clean, ran in well under a second, and
+  reported `low=0 high=0 ratio=NaN` (every counter genuinely zero, not a
+  logic bug in the assertion). The fix was going back to PR 1's own
+  independent-`Simulator`-per-group shape (`RaftKvNode::start_with_
+  metrics`, which forces `PRIMARY_STREAM` but *does* take an explicit
+  handle) for the unbatched case specifically — batching has nothing to
+  amortize across independent worlds anyway, so losing the co-hosted shape
+  costs nothing there. **General form**: when a `SimEnv` fixture family has
+  two "record traffic" constructors — one co-hosted-with-injectable-
+  metrics-but-only-via-a-companion-mechanism (here, the batcher), one
+  independent-worlds-with-injectable-metrics-directly — swapping a
+  parameter from `Some` to `None` on the first can silently strip the
+  metrics injection along with the feature being turned off, since the
+  handle was piggybacking on the very mechanism now disabled. A `low=0
+  high=0` (or any all-zero) result from a `SimEnv` metrics assertion is a
+  fixture-wiring bug to suspect immediately, not a "maybe nothing
+  happened" — a genuinely idle group over a multi-second window still
+  ticks its Raft heartbeat and produces nonzero traffic; zero-across-the-
+  board means the recording path itself never wired up.
 
 ### Code patterns
 - **A retryable-shaped error (the house `"; retry"` suffix) surviving string
@@ -18263,3 +18294,1492 @@ the language boundary. Reported as a pre-existing `animus-cli` bug, not
 fixed here — out of this slice's own scope, and it does not block the
 dashboard's own Add control, which asks the operator for the address
 directly rather than reproducing the CLI's now-broken shortcut.
+
+**Fixed 2026-09-06** (the control-add `/admin/config` field issue):
+`run_control_add`'s extraction moved into a small pure helper,
+`internal_addr_from_admin_config`, reading `cfg["addrs"]["internal"]`
+instead — unit-tested against both the current shape and the removed
+legacy `{"control": ..}`-only shape (the latter must now error, not
+silently resolve). `crates/animusd/tests/control_membership_admin.rs`
+gained a real-cluster regression pinning `/admin/config`'s actual wire
+shape against that same key path, closing the "no test in this workspace
+ever exercised that code path" gap this entry originally named. This is
+the concrete instance the general lesson above already generalizes from —
+no new lesson to add here beyond it now having a regression on both
+sides of the JSON boundary (a pure-function unit test for the extraction,
+a real-server test for the shape it extracts from).
+
+## A trait method taking `&mut dyn FnMut(&mut T)` still forces every captured value to be `Clone`, even when the closure only ever runs once (docs/roadmap.md U-07, `GET /admin/backup-store`)
+
+Publishing a background loop's own progress into a shared, admin-readable
+slot (`animus_node::backup_janitor`'s new `JanitorProgress`) needed a way
+for that loop — generic over a host trait, not `ClientCtx` itself — to
+mutate the shared value under a short-held lock without the trait
+depending on `async_trait` for a purely synchronous operation. The natural
+signature is `fn update_backup_janitor_progress(&self, update: &mut dyn
+FnMut(&mut JanitorProgress))`: a trait-object closure parameter avoids
+adding a generic type parameter to the trait itself (which would have
+forced every caller to spell it out) while still letting a caller mutate
+several fields in one lock acquisition.
+
+The gotcha: `dyn FnMut`, unlike a generic `F: FnOnce`, cannot be satisfied
+by a closure that *moves* a captured value out of itself — even at a call
+site that only ever invokes the closure once. `host.update_backup_janitor_
+progress(&mut |p| { p.last_error = tick_error; })` (moving a local
+`Option<String>` into the field) is `error[E0507]: cannot move out of
+tick_error, a captured variable in an FnMut closure` — `FnMut` closures
+must remain callable repeatedly by the trait's own contract, regardless of
+how the one real call site happens to use them, so the compiler refuses a
+move-out capture unconditionally. The fix is a plain `.clone()` at the
+capture site (`p.last_error = tick_error.clone();`) — cheap here (a small
+`Option<String>`, called at most a few times per tick), but worth knowing
+before reaching for `&mut dyn FnMut` as the "avoid a generic on the trait"
+default: if the mutation needs to move an expensive owned value in, either
+accept the clone, switch the trait method itself to take the value
+directly (`fn set_last_error(&self, err: Option<String>)`) instead of a
+closure, or make the trait method generic over `F: FnOnce` (losing
+`dyn`-safety, harmless here since nothing calls this trait through a `dyn`
+reference) and pass ownership through a `Box<dyn FnOnce>` if a boxed
+closure is unavoidable.
+
+## A dashboard card's fetch shape must match its route's OWN gating, not the previous route's precedent (docs/roadmap.md U-07, `GET /admin/ttl`)
+
+`GET /admin/backup-store` (the first U-07 route) is control-plane-leader-
+gated — the backup janitor only ever runs on the current control leader,
+so every other node's own `JanitorProgress` is honestly `Idle` forever.
+`dashboard_core.js::loadAll()` correctly fetches it once against `SEED`
+(this console's own node), the same "one shared, cluster-wide answer"
+shape `backups`/`restores` already use, with a comment explaining exactly
+why a per-node fan-out would be pointless there.
+
+`GET /admin/ttl` (the second route, this PR) is a different shape
+entirely: the TTL reaper runs on **every** node, self-gated per tablet
+(`TtlScanHost::led_tablets`), so each node's own `TtlReaperProgress` is a
+genuinely different, independently meaningful answer — which tablets it
+leads, what it has deleted, its own resume cursor. Copying the first
+route's SEED-only fetch here would have been the wrong precedent to
+follow: the card would have silently shown only the console's own node's
+reaper activity as if it spoke for the whole cluster, with no error and no
+signal that anything was missing (`loadAll()`'s `.catch(() => null)`
+degrades gracefully per node, but a single SEED fetch has no such
+per-node granularity to degrade *into* in the first place). The fix was to
+add `/admin/ttl` to the *existing per-node* `Promise.all` array
+(`dashboard_core.js`'s own `nodes.map(async (addr) => {...})` fan-out that
+already fetches `config`/`raft`/`raftkv`/`txns`/`health`/`metrics` per
+node) rather than a second single fetch, and to render one row per
+reachable node instead of one shared card.
+
+The generalizable rule: before wiring a new admin route's data into the
+dashboard, check that route's own **gating** (control-plane-leader-only,
+per-tablet-leader-only, or genuinely node-local/always-answered) against
+whichever *fetch shape* — single SEED fetch vs. per-node fan-out — the
+most recently added, superficially similar route happens to use. The two
+remaining U-07 routes this PR's own commit didn't touch make the same
+choice differently again: `/admin/gc` (`segment_janitor_loop`) is
+control-plane-leader-only like the backup janitor, so it wants the SEED-
+only shape; `/admin/segment-store` (placement per shard, already inside
+`ClusterSegmentStore`) is genuinely per-node local state, so it wants the
+per-node fan-out shape like this one. Never assume the previous PR's own
+`STATE.<field>` idiom is the template to copy — re-derive the fetch shape
+from the route's own semantics every time.
+
+## A background loop deliberately left out of a lower crate needs no capability trait at all for new admin instrumentation — it already holds the real host (docs/roadmap.md U-07, `GET /admin/gc`)
+
+The first two U-07 routes (`/admin/backup-store`, `/admin/ttl`) each
+needed a small capability trait (`BackupJanitorProgressHost`/
+`TtlReaperProgressHost`, `animus_node::host`) purely because the loop
+publishing the progress had *already* moved to `animus-node` (ADR 0061
+rung C2) and therefore no longer held a concrete `animusd::ClientCtx` to
+mutate directly — the trait exists solely to let a lower, `E`-generic
+crate write into a field on a struct it cannot name. It would have been
+easy to assume the third route needed the identical shape, since the
+first two both established it and the task briefing described all "leaf
+background loops" as roughly interchangeable.
+
+`segment_janitor.rs`, though, is the one loop rung C2 explicitly left in
+`animusd` (documented in that crate's own `CLAUDE.md`, and in
+`animus-node/CLAUDE.md`'s "segment_janitor did NOT move" entry) — its
+replica-repair phase is real placement/membership orchestration over live
+cluster membership, not a value one narrow I/O-delegation method can
+express, so forcing the move would have meant either dragging real
+decision logic into the lower crate or building a capability trait wide
+enough to expose it anyway (the exact "contorted trait" failure mode ADR
+0061 warns against). Because it never moved, `segment_janitor_loop`/
+`segment_janitor_tick` already take a genuine `&ClientCtx`/`ClientCtx` by
+value — the *simplest* thing here was not to copy the two-crate
+capability-trait pattern at all, but to add the progress type as a plain
+`animusd`-local struct and mutate `ClientCtx::segment_janitor_progress`
+directly, with the `AdminHost::gc_view` method (still added in
+`animus-node`, since the dispatch table itself lives there) as the only
+place a lower crate needed to know anything about this route at all.
+
+The generalizable rule: when a task briefing describes several sibling
+mechanisms as needing "the same treatment," check each one's own actual
+location/scope before assuming the pattern that worked for the first two
+also fits the third — a loop that was deliberately, documentedly *not*
+moved in an earlier refactor is exactly the kind of exception that a
+template-copying pass will otherwise paper over with unnecessary
+indirection. The fix that turned out simplest also turned out to be less
+code, not more — a sign the extra trait would have been the wrong call
+had it been added anyway.
+
+## A roadmap bullet's own cited ADR/mechanism can be wrong — verify against the code before writing docs that repeat it (docs/roadmap.md U-07, `GET /admin/gc`)
+
+`docs/roadmap.md`'s own U-07 bullet for this route read "orphan-sweep
+phase from `segment_janitor_loop` (ADR 0024/0040)" — and the task briefing
+built on top of that citation, describing "GC internals" as living in ADR
+0024 (drop-table data GC) and ADR 0040 (self-minted node identities).
+Neither ADR mentions `segment_janitor.rs`, the segment janitor, or DynamoDB
+Streams orphan reaping anywhere — ADR 0040 is about node-id minting and
+registration-CAS membership, unrelated in subject entirely, and ADR 0024
+covers a genuinely different GC mechanism (the tablet-host reconciler's
+`Reclaim` action over dropped tables' *local engine files*, no admin-
+surfaced counter anywhere). The segment janitor this route actually
+instruments is documented in ADR 0042 §10 (the orphan-reap amendment) and
+ADR 0043 §A9 (the janitor loop itself, `crates/animusd/CLAUDE.md`'s own
+`segment_janitor.rs` entry, `docs/streams-notes.md`) — confirmed by
+grepping the ADR corpus for "segment janitor" / "segment_janitor" before
+writing a single line of the as-built note, which is what caught the
+mismatch.
+
+Two field-level consequences followed from taking the citation at face
+value having been avoided: the as-built notes went into ADR 0020 (route
+table) and ADR 0043 (the janitor's own doc), not ADR 0024/0040 where the
+roadmap bullet's citation would have pointed; and `dropped_tables_pending`
+— a field the task considered adding to this route, reasonably assuming
+"GC" meant the ADR-0024 drop-table mechanism the roadmap bullet named —
+was correctly recognized as belonging to a *different* subsystem with no
+cheap replicated counter to surface, rather than mistakenly wired to
+`stream_shards` data that has nothing to do with dropped-table tombstones.
+`docs/roadmap.md`'s own bullet was corrected in the same change (see this
+PR's U-07 entry) rather than left to keep misleading the next reader.
+
+The generalizable rule: a roadmap/task-brief ADR citation is planning
+prose, not verified fact — it can drift from the code the moment the
+feature it describes gets implemented under a different ADR than whoever
+wrote the roadmap entry assumed, and nothing re-checks a citation once
+it's written down. Grep the actual mechanism's own module/doc comments for
+which ADR it cites BEFORE trusting a task brief's or roadmap's citation of
+the same mechanism, especially when the citation is being asked to anchor
+new documentation of your own — propagating a wrong citation into a new
+as-built note makes the mistake harder to unwind later, not easier.
+
+## "The replicated catalog is identical everywhere" is a converged fact, not an instantaneous one — comparing it across nodes right after a write still needs its own poll (docs/roadmap.md U-07, `GET /admin/segment-store`)
+
+`GET /admin/segment-store`'s own regression test creates a streamed table,
+writes an item, waits for the write to seal into a `Metadata::
+stream_shards` row, then asserts every node's own `/admin/segment-store`
+response carries the identical `shards` array — true in the converged
+state, since `Metadata` is Raft-replicated (ADR 0038) and every combined
+node in the test runs its own full local control `RaftCore`. The first
+draft of this assertion read every node's view **once**, in a single pass,
+immediately after confirming (on the LEADER's own metadata) that the row
+existed — and failed intermittently: one follower's own `effective_
+metadata()` (`control.metadata_cached()`, a purely local read with no
+network round trip) still showed `stream_shards` empty, because that
+replica's own log hadn't yet applied the `SealStreamShard` entry the
+leader had already committed and applied moments earlier. The node in
+question had, in the same instant, already received and stored the
+segment's physical *bytes* (`ClusterSegmentStore::put_replicated` pushes
+data directly to its chosen replicas over the network, independently of
+the metadata proposal that records the placement) — so `local_objects.
+count` was already `1` there while `shards` was still `[]`: two different
+facts about the same event, propagating on two different channels
+(direct replication vs. Raft-committed metadata), at two different
+speeds.
+
+The fix was not to change what the route reports (both facts are
+correctly, independently true at the instant each was read) but to change
+how the TEST compares them: a `timeout(..)` loop re-fetching every node's
+view on each iteration and only returning once every node's `shards`
+array is simultaneously non-empty AND pairwise equal — the same
+converged-or-timeout idiom this codebase already uses for the leader's
+own commit visibility, applied here to a cross-node **comparison**
+instead of a single node's own state.
+
+The generalizable rule: "every node mirrors the identical replicated
+`Metadata`" is a true statement about the CONVERGED cluster, never a
+promise that two nodes read at the same wall-clock instant already agree
+— especially when a test's own setup step confirms a fact on one node
+(the leader) and then immediately fans out to read every node including
+followers whose local apply has its own independent lag. Any assertion of
+the form "node A's view equals node B's view" needs the identical
+converged-or-timeout discipline this codebase already applies to "did my
+own write show up yet" — a bare one-shot snapshot comparison across
+nodes is exactly as flaky as a bare one-shot snapshot of a single node's
+own eventual state, for the same underlying reason.
+
+## A pure request signer must encode from RAW input exactly once per purpose, never re-encode an already-encoded string (S-04 PR 1, `animus-s3`)
+
+Building `animus-s3`'s SigV4 signer/client, the first draft percent-encoded
+an S3 object key at the client's own call site (`format!("/{bucket}/{}",
+encode_key_path(key))`, building a wire-ready path up front) and then
+handed that already-escaped string to `sigv4::RequestToSign::uri`, which
+the canonical-request builder (`canonical_uri_s3`) percent-encodes AGAIN
+internally. A key containing a space would sign against `%2520` (the `%`
+of a real `%20` re-escaped) while the actual wire path sent `%20` —
+guaranteed signature mismatch for any key needing escaping at all,
+silently correct only for keys made entirely of unreserved characters
+(exactly the case every early hand-written test happened to use). The
+identical bug existed for the query string half (a hand-built,
+already-percent-encoded query string handed to a function whose contract
+is "raw in, canonical out"). Caught by adding one test with a key
+containing a space, `+`, and parentheses (`a_key_containing_special_
+characters_round_trips` in `crates/animus-s3/tests/client_fake.rs`) — no
+existing test exercised anything but alphanumeric keys.
+
+**The fix, and the general rule**: thread the RAW (unescaped) string all
+the way from construction (`client::S3Client`'s own methods) to the
+signer's input type, and derive each of the two representations that
+actually need percent-encoding — the wire URI/query, and the signed
+canonical form — **independently, by calling the encoding function once
+each on the same raw input**, never by feeding one encoded output into the
+other's encoder. This composes correctly by construction (the function is
+pure and deterministic, so two independent calls on the same input always
+agree) and needs no "is this string already encoded?" bookkeeping anywhere.
+The mirror-image version of the same bug shows up on a **verifier** (this
+crate's own `fake::FakeS3`, which receives an already-canonical wire
+URI/query and must reconstruct the canonical form to check a signature
+against): the fix there is `percent_decode` once, recovering a raw string,
+before handing it to the same canonicalization function real signing uses
+— never re-canonicalizing the wire bytes directly. Any code that both
+signs/builds a request AND independently reconstructs/verifies one (which
+describes every SigV4 signer-plus-verifier pair, and generalizes to any
+"canonicalize a string for one purpose, transmit a related-but-different
+representation of it for another" design) should state, in one place,
+which representation ("raw" vs. "canonical") each function's input/output
+contract expects — and grep every call site for a mismatch before trusting
+a test suite that happens to only exercise inputs where the bug is
+invisible (plain ASCII, no reserved characters).
+
+## Don't hardcode an external "known answer" test value you cannot independently verify — a wrong memorized constant is a worse oracle than no test at all (S-04 PR 1, `animus-s3`)
+
+The task brief for `animus-s3`'s SigV4 signer named a specific known-answer
+case to include: AWS's own published S3 "GetObject" SigV4 worked example
+(`GET /test.txt`, access key `AKIAIOSFODNN7EXAMPLE`), with a specific
+expected final `Signature` value. Reconstructing the exact request that
+example signs from memory alone (no network access in this sandbox, no
+vendored copy of that specific worked example anywhere in the local
+toolchain or registry cache) — several independently plausible
+byte-for-byte reconstructions (with/without a `Range` header, with/without
+`x-amz-content-sha256` in the signed-header set) — none reproduced the
+stated signature, even though the same HMAC chain independently reproduces
+every vendored `aws-sig-v4-test-suite` vector byte-for-byte (proving the
+*algorithm* is correct) and independently reproduces the worked example's
+own commonly-quoted intermediate `StringToSign` hash. The conclusion: the
+exact canonical request bytes for that specific example were misremembered
+somewhere in the reconstruction, not that the code was wrong — but there
+was no way to tell which, without an authoritative source to check against.
+
+**The decision made instead of guessing**: drop the hardcoded external
+constant rather than ship a test asserting a value that cannot be
+independently verified in the environment building it. Pinning a
+plausible-but-unverified memorized value as a "known answer" regression
+test is actively worse than not having one — a future mismatch would say
+nothing about whether the *code* regressed, only whether the *test's own
+memorized oracle* was ever right in the first place, and a lucky
+coincidental match would prove nothing either. The test that shipped
+instead checks what's actually self-verifiable without an external
+oracle: the request's own `SignedHeaders` shape, and that the signer's own
+output round-trips through the same crate's own independent verifier
+function — plus a cross-crate equivalence test against `animus_dynamo`'s
+already-shipped, independently-implemented SigV4 chain (which *is*
+verified, against the vendored AWS test suite, in that crate's own test
+suite). Both are documented in place as deliberate, with the reasoning for
+why, rather than silently substituting a weaker test with no explanation.
+
+**General form**: when a task brief hands you a specific external
+"known-good" value to test against and you cannot independently verify the
+exact input that produces it (no network access, no vendored fixture, no
+authoritative local copy) — reconstructing it from memory and asserting
+equality anyway is a coin flip dressed as a regression test. Verify what
+you can with tools you actually have (vendored fixtures, independently-
+reimplemented cross-checks, self-consistency round-trips), state plainly
+what you could not verify and why, and let the person who can reach a
+network/the authoritative source fill in the one assertion you couldn't
+make honestly.
+
+## A `#[cfg(any(test, feature = "X"))]` module is invisible to an integration test without a self dev-dependency enabling that feature
+
+`animus-s3`'s in-process fake transport (`fake.rs`) is gated
+`#[cfg(any(test, feature = "fake"))]` — the intent being "always available
+to this crate's own tests, and to anyone else's tests via an explicit
+feature." That gate alone does NOT make `fake` visible to an integration
+test under `tests/`: `#[cfg(test)]` is only active for the crate's own
+lib/bin compiled *as a test binary* (`cargo test`'s unittest target); an
+integration test in `tests/` links against the crate's plain,
+non-`cfg(test)` `rlib` — the same one a normal downstream dependent would
+get. Without the `fake` feature explicitly on, `tests/client_fake.rs` got
+`error[E0432]: unresolved import` with `note: found an item that was
+configured out`, even though `cargo test -p animus-s3` (no `--features`)
+was clearly running "this crate's own tests."
+
+**The fix**: add the crate as its own `[dev-dependencies]` entry with the
+feature turned on (`animus-s3 = { path = ".", features = ["fake"] }`) —
+Cargo's standard, documented idiom for "this optional/test-only module
+should be available to every test target of this crate without requiring
+`--features` on the command line." Cargo's newer feature resolver unifies
+a package's dev-dependency features into the build specifically when
+building dev targets (tests/benches/examples) in the same invocation, so a
+plain `cargo build -p foo` (no test targets) still doesn't pull the
+feature in — exactly the boundary this crate wants (`prod`/`fake` off by
+default for a plain library consumer, on automatically the moment any test
+target of the crate itself is built).
+
+## A handle enum's variant should hold a trait object, not a concrete generic type, when only production needs the concrete type (S-04 PR 2, `animusd`)
+
+`SegmentStoreHandle`/`BackupStoreHandle` (`animusd::lib.rs`) each gained a
+third variant for the new S3-backed store (ADR 0059's 2026-09-06
+amendment). The store itself, `animus_env::S3SegmentStore<T: animus_s3::
+client::Transport>`, is generic over its transport specifically so it can
+be tested against `animus_s3::fake::FakeS3` (no sockets) while production
+uses `animus_s3::prod::HyperRustlsTransport` — the identical shape
+`animus_s3::client::S3Client<T>` itself already uses (S-04 PR 1). The
+naive way to add the variant would be `S3(animus_env::S3SegmentStore
+<animus_s3::prod::HyperRustlsTransport>)` — concretely typed, mirroring
+how `Cluster`/`Fs` are concretely typed today. That would have made an
+in-crate test wanting to exercise the `S3` variant over `FakeS3` impossible
+without also making the *enum itself* generic over a transport type
+parameter — a much bigger, more invasive change purely to serve a test.
+
+**The fix**: `S3(Arc<dyn animus_env::SegmentStore>)` — a trait object.
+`SegmentStore` is already `#[async_trait]` (boxes its futures), so it's
+dyn-compatible for free; `Arc` makes the variant cheaply `Clone` regardless
+of which concrete transport backs it. Production still constructs the
+concrete `S3SegmentStore<HyperRustlsTransport>` and stores it behind the
+same `Arc<dyn ..>` coercion; a test builds the identical variant over
+`S3SegmentStore<FakeS3>` with zero changes to either enum's shape, and
+every other match arm in both `impl` blocks treats `S3` exactly like `Fs`
+(no per-node replica concept) without ever needing to know or care which
+concrete transport is underneath. **General form**: when a handle enum's
+variant wraps a value that is generic purely so it can be swapped for a
+test double, and the enum's own consumers never need to be generic over
+that same parameter, a trait object at the variant boundary buys the
+testability without forcing genericity onto everything that touches the
+enum — reach for this before genericizing an enum (or a struct built
+around one) that has no other reason to carry a type parameter.
+
+## Avoid a new `ClusterConfig` field for a knob whose ADR already specifies "static, file/env-sourced" scope — the `error[E0063]` fan-out cost isn't worth paying twice (S-04 PR 2, `animusd`)
+
+This crate's own history already names the cost of adding a field to
+`ClusterConfig`: `dynamo_auth` and `cluster_settings` each triggered a
+compiler-enumerated ~55-60-call-site `error[E0063]: missing field` fan-out
+across every `ClusterConfig { .. }` struct literal in `src/`+`tests/`
+(`crates/animusd/CLAUDE.md`'s `config.rs` entry has the blow-by-blow). S-04
+PR 2 needed a place for S3 credentials to live and could have followed
+`dynamo_auth`'s own precedent (an `Option<S3CredentialsConfig>` field on
+`ClusterConfig`, populated from a config file's own section or a CLI flag
+merged in with a "one way, not both" conflict check) — but the ADR
+amendment this PR implements had already specified the credential-sourcing
+posture in full: static access-key-id/secret pair, from a config file or
+environment variable, mirroring ADR 0057's own `dynamo_auth` static map.
+Nothing about that posture needs `ClusterConfig`'s own per-node array
+shape or its "one config file describes the whole cluster" semantics — a
+set of S3 credentials is either process-global or, at most, per-invocation,
+never something a `ClusterConfig`'s per-node `nodes[]` entries need to vary
+independently.
+
+**The decision**: skip `ClusterConfig` entirely. `--s3-credentials PATH`
+names a **standalone** JSON file (`main.rs::S3CredentialsFile`), parsed and
+resolved independently of any `ClusterConfig` load, with an environment-
+variable fallback when the flag is omitted. This is a deliberate departure
+from the `dynamo_auth` precedent this codebase would otherwise reach for
+by pattern-matching — worth stating explicitly, since "make it look like
+the existing similar feature" is usually the right instinct and was
+wrong here specifically because the *scope* of the two features differs
+(a per-cluster credential *map*, keyed by access key id, genuinely
+benefits from living in the cluster-wide config a `dynamo_auth` section
+already is; a single static credential *pair* for one external system
+does not). **General form**: before reaching for an existing sibling
+feature's storage shape as a template, check whether its own scope
+(per-node vs. per-cluster vs. per-process) actually matches the new
+feature's — matching the pattern when the scope differs just imports that
+pattern's own cost (here, a `ClusterConfig` field's mechanical fan-out) for
+no benefit, and a real ADR that already specifies a narrower scope is
+license to use a narrower, cheaper mechanism instead.
+
+## `df -h /` reading near-zero and every Bash call failing with "the temp filesystem is full" can be the SAME root cause, not two problems
+
+Mid-session, every `Bash` tool call started failing with "Command output
+was lost: the temp filesystem at /tmp/claude-0/.../tasks is full (0MB
+free)" — including a bare `echo done > file`, which made it look like the
+harness's own tmpfs (unrelated to the repo) had filled up independently of
+anything this session was doing. It hadn't: `df -h /` (once a command
+finally got through) showed the **root filesystem itself** at 140K free —
+the harness's task-output tmpfs and `/home/user/animus-db/target` share the
+same underlying disk, so a 28GB `target/debug/deps` (accumulated across a
+long session's worth of `cargo build`/`test` invocations, many of them
+recompiling the same crates under slightly different feature combinations
+and leaving old-hash duplicate `.rlib`/test-binary artifacts behind) had
+quietly starved the whole filesystem, harness tmp included.
+
+**The fix**: exactly the prune this repo's own task instructions already
+describe for this situation — group `target/debug/deps/*` by basename
+(strip the trailing `-<16 hex>` build-hash suffix) and delete every file
+in a group except the newest by mtime, which recovered 17GB here. **The
+lesson worth generalizing**: when a sandboxed harness's own bookkeeping
+(temp files, output capture, anything **not** the actual task) starts
+failing with a space/quota-shaped error, check the *whole* filesystem's
+free space before assuming the harness's own storage is a separate,
+unrelated resource — on a single-disk sandbox it usually isn't, and the
+real fix lives in the repo's build output, not in anything the harness
+itself controls.
+
+## A `NetworkPolicy` with no `Egress` in `policyTypes` leaves egress completely open, regardless of what an `egress:` list would say
+
+Writing S-04 PR 3's egress rules for `animus-operator`'s generated
+`NetworkPolicy` (`desired/networkpolicy.rs`) was a reminder that
+Kubernetes `NetworkPolicy` semantics are per-*direction*, not per-object:
+a policy that never names `Egress` in `spec.policyTypes` is a no-op for
+egress traffic on that pod selector, full stop — it doesn't matter whether
+`spec.egress` is present, empty, or omitted, and it doesn't matter how
+restrictive `spec.ingress` is. This repo's own operator had exactly that
+shape for a long time (`policyTypes: [Ingress]` only, since the policy was
+originally written before egress was ever a concern), which is precisely
+what `docs/roadmap.md`'s S-04 item flagged as "egress unrestricted by
+omission." **The generalizable check**: when adding an egress rule to an
+existing `NetworkPolicy` builder (here or anywhere else), verify
+`policyTypes` names `Egress` in the same change — a rule appended to
+`spec.egress` alone silently does nothing if that list update is missed,
+and nothing in the API server, `kubectl apply`, or a type-checked
+`k8s-openapi` struct catches the omission; only a real cluster (or reading
+the NetworkPolicy semantics doc closely) reveals it.
+
+## Reading a JSON response's actual field nesting from source beats inferring it from a route's own doc-comment summary
+
+Writing S-04 PR 3's (unverified, no-`kind`-available-sandbox) e2e leg, the
+task brief said to check `GET /admin/backup-store` for `"kind": "s3"`. The
+route's own doc comment says exactly that phrase ("`store` is this node's
+own configured backup store: kind plus a credential-safe `location`"), and
+it would have been easy to write `jq -r '.kind'` straight from that
+sentence. The actual handler (`admin.rs::backup_store_view`) nests it
+one level down: the top-level response is `{"store": {"kind": ...,
+"location": ...}, "objects": ..., "janitor": ..., "leader": ...}`, so the
+correct query is `.store.kind`, not `.kind`. **General form**: for any
+script or test that asserts on a JSON wire/admin response shape, read the
+actual serializer/handler function, not just its module doc comment or a
+task description's paraphrase of it — a doc comment describes intent and
+can (correctly) omit the wrapper object it's nested inside, and a
+paraphrase one level removed from the code compounds that gap. This
+matters more, not less, when the assertion can't be run in this sandbox
+(no `kind`) — there is no test failure to catch the mistake before it
+reaches a real CI run.
+
+## A CRD-generated shell script must single-quote every operator-controlled string value that becomes a command-line argument
+
+`animus-operator`'s `entrypoint.sh` generator (`desired::cluster_config::
+entrypoint_script`) started passing `s3://...` URIs (`spec.s3.backupStore`/
+`segmentStore`, S-04 PR 3) as literal `--backup-store`/`--segment-store`
+arguments in the generated POSIX `sh` script. An S3 URI's own query string
+always contains `&` (separating query parameters) and usually `?`/`=` —
+every one of `&`, `?` unquoted in `sh` is either a metacharacter (`&`
+backgrounds the preceding command entirely, silently turning `exec
+animusd ... --backup-store s3://bucket?a=1&b=2` into two separate
+commands) or at minimum a portability risk. Every other flag value this
+generator already emitted (paths, ports) happened to be safe unquoted, so
+this was the first flag value here that actually needed it. **General
+form**: any generator that interpolates a user- or spec-controlled string
+into a shell script (not just this one) must single-quote (with the
+standard `'...'` → `'\''` embedded-quote escape) every such value at the
+point of interpolation, not just the values that are "obviously" URLs or
+paths — the generator has no way to know in advance which future field
+will be the first one containing a shell metacharacter, and getting this
+wrong doesn't fail at generation time, only at container start, in a
+place `bash -n` (syntax-only) also won't catch since `&` is syntactically
+valid shell, just semantically wrong here.
+
+## A committed generated manifest is only as current as the last hand run of its generator — pin it with a test that regenerates and compares (`deploy/operator/crd.yaml`, S-04 PR 3, 2026-09-06)
+
+`deploy/operator/crd.yaml` is what `scripts/e2e-kind.sh` and every operator
+user apply to a real API server, and it is *generated* from the Rust spec
+type by `animus-operator crd`. S-04 PR 3 added `spec.s3` to
+`AnimusClusterSpec`, added the field to the e2e's sample cluster, ran every
+Rust gate green — and the first real `kind` run failed at `kubectl apply`
+with `strict decoding error: unknown field "spec.s3"`, because nobody had
+re-run the generator and nothing checked. The unit tests could not catch it:
+they exercise the Rust type, never the committed YAML, and the only consumer
+of the YAML is an e2e that cannot run in this sandbox. **Rule**: any file
+that is checked in *and* generated from code gets a test that regenerates
+it in-process and asserts byte equality with the committed copy (here
+`crates/animus-operator/tests/crd_manifest_pinned.rs`), with the refresh
+command in the assertion message — so a spec change fails `cargo test`
+locally, not the one CI job that needs a cluster. The general form: the
+gate that guards a generated artifact must live in the same gate set as
+the change that invalidates it.
+## A `#[cfg(test)]`-gated field or method is invisible to an external `tests/*.rs` integration binary — a test-only injection point needs a genuinely `pub` hook
+
+Building S-05 PR 1's `dynamo_export.rs` e2e suite, the natural instinct was
+to reuse the crate's existing `#[cfg(test)] test_ctx` pattern (`animusd`'s
+`Node` already carries one, gated behind `#[cfg(test)]`, for other
+in-crate test needs) to inject a fake S3 store factory into a running
+`Node`. That doesn't work for a file under `tests/`: each file there
+compiles as its own separate integration-test crate linked against the
+*library* crate built without `--cfg test` (only the harness binary itself
+gets `cfg(test)`), so any item gated `#[cfg(test)]` in the library simply
+doesn't exist from an integration test's point of view — not a visibility
+error, a "no such field" compile error that looks like a typo until you
+remember the two are different compilation units. The fix was a genuinely
+public, always-compiled method whose only real-world purpose is a test
+injection point: `Node::set_export_store_factory(&self, factory:
+ExportStoreFactory)`, storing the factory behind `Arc<Mutex<..>>` so
+swapping it in place is visible to every already-cloned per-connection
+`ClientCtx` sharing that `Arc`. **General form**: when a `tests/*.rs` file
+needs to inject or override library-internal state, `#[cfg(test)]` is not
+available to you at all — the hook must be unconditionally compiled (and
+named/documented as a test-only knob in its own doc comment so a reader
+doesn't mistake it for a real runtime feature), not merely `pub(crate)`
+widened.
+
+## `FakeS3` is not internally `Arc`-shared — sharing one fake bucket across several independently-constructed store handles needs an external `Arc` plus a thin `Transport`-wrapping newtype
+
+`animus_s3::fake::FakeS3` holds its object state behind plain (non-`Arc`)
+interior mutability, so two separately-constructed `S3SegmentStore`
+instances built from two separate `FakeS3::new()` calls see two disjoint
+buckets — fine for a single-store test, wrong for S-05 PR 1's
+`dynamo_export.rs`, which needed every node in a 3-node cluster (each
+building its own `SegmentStoreHandle::S3`-shaped store via its own
+`ExportStoreFactory` call) plus the test's own verification reads to all
+observe the *same* bucket. The fix: wrap one `Arc<FakeS3>` the test owns in
+a local newtype (`SharedFakeS3(Arc<FakeS3>)`) implementing
+`animus_s3::client::Transport` by delegating `send()` to the inner
+`Arc`'s own `send()`, then hand a cheap clone of that newtype to every
+`S3SegmentStore` constructed anywhere in the test (one per node's factory
+call, plus a standalone one for the test's own `get_object` verification
+helper). **General form**: a fake/in-memory backend used to simulate a
+shared remote resource across multiple independently-constructed client
+handles needs either the fake itself to be internally `Arc`-shared, or the
+test to hold the one real `Arc` and thread clones of a thin wrapper into
+every handle — check which shape a fake actually has before assuming
+"construct one per caller" gives you the shared-state semantics the real
+remote service would.
+
+## A driver whose every fault is "retry forever" turns a test-fixture mismatch into a silent hang, not a clear failure (ADR 0068 §6, S-05 PR 2 import driver)
+
+Building `dynamo_import.rs`'s real-item test cases (a full export→import
+round trip; a hand-written data file with two malformed items), both
+initially failed with nothing more informative than "import did not reach
+a terminal state in 30s" — no error body, no rejected request, just a row
+stuck `IN_PROGRESS` forever. The instinct at that point is to suspect the
+production code (the new `import.rs` driver, freshly written and never
+proven against a real multi-item payload). It wasn't: the bug was in the
+*test*'s own `import_table()` helper, which built an `ImportTable` request
+with no `InputCompressionType` field at all — decoding to this adapter's
+own default, `NONE` — while the paired fixture helper
+(`write_hand_export`/a real `ExportTableToPointInTime` call) always wrote
+`GZIP`-compressed data. The driver received real gzip bytes, tried to
+treat them as plain UTF-8 text (per the request's own, wrongly-defaulted
+compression), got binary garbage, logged `"data file is not utf8"` at
+`WARN`, and — correctly, by this driver's own design (see the module doc:
+every I/O/content-shape fault here is deliberately *retryable*, since a
+customer bucket can be transiently unreachable or still finishing a write)
+— just tried again next tick, forever, with no forward progress and no
+terminal state to report. The fix was two lines in the test file (default
+the shared helper to `GZIP`, matching what its own paired fixture always
+produces); nothing in `import.rs` itself was wrong.
+
+**Diagnosis, not just the fix**: the failure looked identical to a real
+production bug from the outside (a hung poll, a generic timeout panic) —
+distinguishing "test fixture mismatch" from "driver bug" needed actually
+reading the driver's own log output, which required a temporary
+`tracing_subscriber::fmt().with_env_filter("debug").try_init()` at the top
+of the *specific failing test* (this workspace's test binaries carry no
+default subscriber) and re-running that one test alone with `--nocapture`
+— the moment the same `WARN` line printed once per tick, the root cause
+was obvious. **General form**: (1) a background driver built on the
+"every fault is retryable, only a bounded few are terminal" philosophy
+(the same shape `backup_restore.rs`'s restore driver, and now
+`import.rs`, both use) makes a stuck `IN_PROGRESS`/`Seeding`/`Creating`
+row the *symptom* for an entire class of distinct root causes — content
+mismatch, a wrong prefix, a transient store fault, a genuine driver bug —
+so "it's stuck" alone is never enough signal to start editing production
+code; reach for the driver's own `tracing` output on the *one* failing
+test first. (2) When a test brings up a fixture through one helper and
+issues the request that consumes it through a second, sibling helper, the
+two must agree on every field that changes interpretation (here:
+compression) — a shared default in one helper is only safe if every
+caller of the *other* helper is guaranteed to match it; consider a single
+helper that builds both, or an explicit parameter, once more than one
+fixture shape (`GZIP` vs `NONE`) is in play.
+
+## A `Copy`-carrying `MetaCommand` variant added to a large enum needs its own biggest field boxed up front, not discovered via `clippy::large_enum_variant` (ADR 0068 §6, S-05 PR 2)
+
+Adding `MetaCommand::BeginImport` (mirroring `BeginRestore`'s own shape,
+plus a full `TableCreationParameters`-derived schema) pushed `MetaCommand`'s
+in-memory size past clippy's `large_enum_variant` threshold: every other
+variant stays small, so the *whole enum* — sized to its largest member,
+Rust's ordinary tagged-union layout — grew to fit this one, at a real
+per-value cost paid by every `MetaCommand` anywhere in the system,
+including the thousands that are `NoOp`/`CasTabletReplicas`/etc. The fix
+(boxing the schema field, `base_schema: Box<TableSchema>`) is mechanical
+once found, but finding it required a `cargo clippy --all-targets
+--all-features` pass — a plain `cargo build`/`cargo test` never surfaces
+this lint at all, so a large new variant landing between clippy runs would
+have shipped its size-bloat undetected until CI. **General form**: when
+adding a variant to an already-large, already-established enum
+(`MetaCommand`, `Operation`, `ClientRequest`, any command/message enum
+with many small variants) and the new variant carries a whole nested
+struct (a schema, a plan, a manifest) rather than a handful of scalars,
+run clippy on it *before* considering the shape done — box the field
+`clippy::large_enum_variant` names as the outlier immediately, rather than
+letting review or CI catch it later. A closely related trap in the same
+change: cloning an `Option<T>` field where `T: Copy` (`clippy::
+clone_on_copy`) compiles and passes every test, so it's easy to write by
+habit (matching the `.clone()` every *non-`Copy`* sibling field in the same
+struct literal needs) and never notice — clippy catches it, but only if
+run.
+
+## A `Building`-minted tablet has no self-heal path — an empty initial replica set is permanent, not merely under-replicated (`dynamo_import.rs` CI flake, `prod-liveness-animusd` shard 3/4, 2026-09-06)
+
+A single flaky CI run (`import_skips_malformed_items_and_counts_them`
+timing out its 30s "import did not reach a terminal state" poll, on a
+2-vCPU shard running four `animusd` integration-test binaries
+concurrently) turned out to have nothing to do with the import driver
+(`import.rs`) a prior read-only analysis had suspected — a hypothesized
+"no propose-side patience causes duplicate `SeedBatch`/`CompleteImport`
+re-proposes" shape, the issue #268 amplification family. That shape would
+still show the driver *doing* something every tick (malformed-item decode
+debug lines, at minimum, since decoding runs before any propose); the
+actual failure showed the driver doing **nothing at all** for the full 30s
+— `import_loop`'s "not hosted here yet" branch fired on every single
+200ms tick from the first to the last, never once transitioning.
+
+**Reproduction**: a foreground loop of the standalone `dynamo_import` test
+binary (`cargo build -p animusd --test dynamo_import`, then `timeout 45
+target/debug/deps/dynamo_import-* --exact
+import_skips_malformed_items_and_counts_them` repeated 50-150×) run
+alongside three sibling `animusd` integration-test binaries
+(`dynamo_txn`/`dynamo_streams`/`streams_e2e`) looping continuously in the
+background on the same 4-core host — reproduced at a ~5-9% rate (4-7
+failures per 50-100 iterations), matching the described CI shard's
+contention shape closely enough to trust. Zero reproductions running the
+same test alone.
+
+**Diagnosis**: this workspace's test binaries carry no default `tracing`
+subscriber, so a `--nocapture` run of even a failing test showed nothing
+by default — the general lesson this doc already has an entry for
+("reach for the driver's own tracing output on the *one* failing test
+first"), but this investigation needed one step further: since the
+failure signature (zero driver activity, not "stuck retrying") pointed
+*upstream* of `import.rs` entirely, the useful instrumentation wasn't in
+the suspected driver at all. `tracing::debug!` added to
+`tablet_host_reconciler_loop`'s own per-tick view (temporary, reverted
+before commit) confirmed the destination tablet's `Metadata` row read
+`replicas: []` for the tablet's entire recorded lifetime; a second,
+`tracing::debug!` added to `dynamo::finish_import_kickoff`'s own member
+snapshot (also temporary, reverted) caught the exact moment: `members =
+[("n0", Down)]` — the single node's own control-plane failure detector
+(ADR 0012) had marked it `Down` (a false positive from a delayed
+self-heartbeat under real CPU contention — the "SimEnv proves logic,
+ProdEnv proves real-thread liveness" class of bug, not reproducible any
+other way) at the exact instant `finish_import_kickoff` filtered
+`Metadata.members` to `Active` for its replica pick, netting zero
+candidates.
+
+**Why this is permanent, not merely slow to recover**: `ClientCtx::
+provision_tablet`'s identical "first `min(N, MAX_REPLICATION_FACTOR)`
+`Active` members" replica pick (`schema.rs`) already has a guard for
+exactly this race — `if !replicas.is_empty() && ...` — added for the
+issue #268-era hardening. It works there because `CreateTablet` mints an
+`Active` tablet: even an under-shot initial replica set is later grown by
+`reconcile_placement`'s ordinary policy-driven self-heal
+(`SetTabletPolicy` + `CasTabletReplicas`, `animus-control/src/meta.rs`).
+`finish_import_kickoff` (ADR 0068 §6, S-05 PR 2) copied the *selection*
+but not the *guard* — and worse, `reconcile_placement` only repairs a
+tablet whose `state == TabletState::Active`
+(`crates/animus-control/src/meta.rs`, `reconcile_placement`'s own filter,
+predating this feature) — `BeginImport` mints its destination tablet
+`Building`, and it stays `Building` for its entire seeding lifetime by
+design (only `CompleteImport` activates it). A `Building` tablet with an
+empty replica set can therefore never self-heal by any existing mechanism:
+`plan_join_host`'s `replicas.contains(&base_id)` check trivially fails for
+every node against `[]`, so no reconciler on any node ever hosts it, the
+tablet can never seed, and it can never reach the `Active` state that
+would make it eligible for repair in the first place — a structural dead
+end, not a slow recovery. The reproduction bore this out exactly: every
+failing run showed the identical "not hosted" tick firing for the *entire*
+30-second window with no recovery, not an occasional slow one that
+eventually succeeded.
+
+**Fix** (`crates/animusd/src/dynamo.rs`, `finish_import_kickoff`): wait,
+bounded by the function's own existing per-attempt `SCHEMA_COMMIT_TIMEOUT`,
+for at least one `Active` member before computing `replicas`; skip
+proposing `BeginImport` (mint a fresh id, retry) if the wait still ends
+empty. The same guard shape `provision_tablet` already uses, applied to
+the one call site that had regressed the lesson. Proven: the identical
+50-150-iteration contention loop, 0 failures across 250+ post-fix
+iterations (versus a consistent 5-9% failure rate pre-fix); `cargo test -p
+animusd --test dynamo_import` green ×3.
+
+**Twin defect, confirmed but NOT fixed here (own PR, per this repo's
+incidental-bug convention)**: `dynamo::finish_restore_kickoff`
+(`RestoreTableFromBackup`'s kickoff, same file) has the byte-for-byte
+identical unguarded replica computation feeding the byte-for-byte
+identical `Building`-state freeze (`BeginRestore` mints its own
+destination tablet `Building` too) — not yet observed failing live, but
+the code shape is proven vulnerable to the identical race by this
+investigation and should get the identical fix.
+
+**Update (issue #657, 2026-09-06): fixed.** `finish_restore_kickoff` now
+calls the identical `await_active_metadata_for_new_tablet` wait/retry
+helper `finish_import_kickoff` was refactored to use (the two loops had
+become byte-for-byte identical, so this fix factored them into one shared
+function rather than pasting a second copy) — both kickoffs wait, bounded
+by their own per-attempt `SCHEMA_COMMIT_TIMEOUT`, for at least one `Active`
+member before computing `replicas` via the shared
+`active_replicas_for_new_tablet`, and both skip their propose (retrying
+with a fresh id) if the wait still ends empty. Since `finish_restore_kickoff`
+is shared by both `RestoreTableFromBackup` and `RestoreTableToPointInTime`,
+fixing the one function closes the gap for both wire entry points at once.
+Regression is a `Metadata`-only pin (`active_replicas_tests`'s
+`restore_kickoff_shares_the_import_kickoffs_selection`/
+`restore_kickoff_sees_no_replicas_when_every_member_is_down`), the same
+"pure selection is unit-testable, the async wait/retry shape itself is
+real-thread-liveness-only and stays untested" split this entry's own fix
+already established — no new general lesson beyond what this entry already
+records, since it's the identical mechanism applied to the identical twin.
+Issue #657's second half (`backup_restore.rs`'s own missing propose-side
+patience/confirm-timeout logging, described two paragraphs below) is
+unrelated to this kickoff-guard half and remains open in its own PR.
+
+**A separate, real defect family found along the way while chasing the
+original (wrong) hypothesis, also NOT fixed here**: `backup_restore.rs`'s
+restore driver (`propose_local`, confirming a `SeedBatch` propose by
+applied index; `complete_restore`, discarding its own `CompleteRestore`
+propose's accepted/rejected result) has zero propose-side patience and
+zero logging on a bare confirm-timeout or discarded-reject — the exact
+issue #268 retry-amplification shape `ClientCtx::provision_tablet` was
+hardened against, inherited unmodified by `import.rs`'s own `propose_
+local`/`complete_import` when that driver was built from `backup_
+restore.rs`'s template (ADR 0068 §6 PR 2's own doc says as much: "mirrors
+[`backup_restore::propose_local`]"). This investigation added `tracing::
+warn!` to `import.rs`'s own confirm-timeout branch (kept, since a silent
+`NoProgress` is indistinguishable from "driver never ticked at all" — this
+bug's own signature — without it); `backup_restore.rs`'s identical branches
+(`propose_local` around its `while ... { sleep }` loop's fallthrough,
+`complete_restore`'s `let _ = ctx.propose_schema(...)`) still have none.
+Neither the amplification itself nor the missing logging is fixed in
+`backup_restore.rs` here.
+
+**General form**: (1) **A newly-minted tablet's placement state, not just
+its replica count, decides whether it can ever self-heal.** A tablet
+minted `Active` (however under-replicated) is reachable by the ordinary
+policy-driven convergence machinery; a tablet minted `Building` (or any
+other non-`Active` state `reconcile_placement` excludes) is not, and never
+will be until something *else* first gets it hosted and active — which an
+empty replica set structurally prevents. Any new hand-rolled "pick N
+`Active` members" replica selection feeding a `Building`-minting (or
+otherwise placement-frozen) `MetaCommand` needs its own non-empty guard;
+it cannot borrow `reconcile_placement`'s eventual repair the way an
+`Active`-minting one can. Grep for the pattern (`NodeStatus::Active` +
+`.truncate(MAX_REPLICATION_FACTOR)` or similar) before adding a new
+propose site that mints a tablet in any state other than the default
+`Active`. (2) **A background driver's fully-silent no-progress path makes
+two very different bugs look identical from the outside**: "the driver is
+retrying forever, wastefully" (issue #268's shape — visible if instrumented,
+since something proposes repeatedly) and "the driver never got to run a
+single real tick" (this bug's shape — invisible even instrumented, if the
+instrumentation lives only in the driver itself, since the driver's own
+tracing never fires). Distinguishing them needs tracing at the tick's own
+entry gate (hosted? leader?), not just inside the tick body — see this
+doc's existing "reach for the driver's own tracing output" entry, extended:
+when a "stuck, no logs at all" symptom doesn't even show a driver's own
+per-item logging that should be unconditional (decoding, in this case),
+suspect a failure to ever reach the driver at all, not a retry loop within
+it.
+
+## Pruning stale duplicate `target/debug/deps` binaries under `if disk < 4 GB` must never run while a build using that same target directory is in flight
+
+A workspace build (`cargo build --workspace --all-targets`) ran the target
+directory down to ~300 MB free mid-build; the documented mitigation
+("prune stale duplicate test binaries in `target/debug/deps`, newest per
+basename only") was applied *while that same build was still running*,
+filtering candidates by "not modified in the last 20 seconds" to avoid
+touching anything the active build might still be writing. This was not
+enough: cargo had already **finished** producing several dependency
+`.rlib` files earlier in the build (their mtimes were long past the
+20-second window) but had not yet reached the later link steps that
+`open()` them — deleting the "stale" duplicate copy of one such rlib is
+indistinguishable, from mtime alone, from deleting a genuinely-orphaned
+one, and the running build's own linker immediately failed with `cannot
+open .../libserde_json-*.rlib: No such file or directory` for several
+targets, wasting that portion of the build. **General form**: an mtime
+threshold answers "was this file recently *written*," never "is this file
+still *needed*" — a file a build produced minutes ago can still be read
+minutes later, at a link step far downstream of its own compile step; a
+running build's target directory is not a safe pruning target *at all*
+while that build is in flight, however old the candidate files look. The
+correct sequence is: let the build finish or fail on its own, prune
+afterward, then retry the build — never prune concurrently with the build
+whose own output directory is being pruned. (The retry after this
+particular incident succeeded once free space was restored, so no lasting
+harm — but the same race with a less patient CI timeout could have turned
+one disk-pressure warning into a build failure needing a second attempt
+regardless.)
+## A restored/imported value must go back through the SAME envelope-wrap primitive its store's read side expects, every time this pattern is repeated (ADR 0068, S-05 PR 3 `SimEnv` corpus)
+
+Building `export_import_fault_corpus.rs`'s import-side mirror
+(`import_tick_mirror`, standing in for `animusd::import::import_tick`), the
+first draft pushed `animus_item::derive_kind_writes`'s raw stored-item
+bytes straight into `KvCommand::SeedBatch` — every derived write was a
+byte-identical shape to what production's own driver derives, but without
+production's own trailing step: `backup_codec::encode_restored_value`,
+which re-wraps a physical value in the 1-byte transaction envelope tag
+`animus-cp-data`'s apply path expects every merged value to carry
+(`Envelope::Committed`/`Intent`, `crates/animus-cp-data/src/txn.rs`).
+`SeedBatch`'s own merge writes the bytes it's given verbatim, with no
+validation — so the corpus didn't get a "wrong content" failure, it got a
+"corrupt engine value" panic the very next time *anything* read the row
+back (`decode_envelope`'s `unknown envelope tag N`), on the very first
+depth-1 run, every seed.
+
+**This is the second time this exact hazard has been hit and fixed in this
+same file family** — `backup_fault_corpus.rs`'s own restore-tick mirror
+(`crates/animus-test/tests/backup_fault_corpus.rs`) already documents
+finding and fixing it for the on-demand-backup restore path (ADR 0059 §7),
+with its own doc comment naming `encode_restored_value`'s call as
+load-bearing precisely for this reason. The import mirror didn't reuse
+that lesson because its seed-derivation path (`derive_kind_writes`, a
+different producer than backup's own captured-physical-bytes path) was
+written fresh rather than adapted from the restore-tick precedent sitting
+in a sibling file in the same crate.
+
+**General form**: any code that constructs a `SeedRow`/calls
+`propose_seed_batch` — present or future, in production or in a corpus
+mirror — must re-wrap every value through `encode_restored_value` (or
+whatever the current envelope-wrap primitive is named) before merging,
+regardless of where the value came from (a captured physical byte string,
+or freshly derived from decoded item content). `SeedBatch`'s own contract
+gives no structural guarantee here — nothing type-checks a raw value
+against an enveloped one, since both are `Option<Vec<u8>>` — so grep every
+`propose_seed_batch`/`SeedRow` construction site when adding a new one, the
+same "grep every gating match site" discipline this repo's root `CLAUDE.md`
+already states for a replicated/forwarded command enum gaining a variant.
+The failure mode when this is missed is maximally loud (an immediate hard
+panic on first read, not a silent wrong value), which is exactly why it
+was caught before the corpus was ever committed rather than shipping as a
+false-negative-green test — but "loud when reached" is not the same as
+"reached promptly": a producer whose own path happens not to be read back
+in the same test run would have shipped silently broken until something
+else finally decoded the row.
+
+## Two CLI flags that look like a matched pair can have asymmetric grammars — verify each one's own parser, not the sibling's doc comment (S-07b, `--backup-store`/`--segment-store`)
+
+Adding `animus-operator`'s CRD surface for `animusd`'s non-S3
+`--backup-store`/`--segment-store` flags (S-07b), the natural assumption
+from reading `--backup-store cluster|fs:PATH` was that `--segment-store`
+would accept the identical `cluster|dir:PATH` shape — the two flags are
+documented side by side, configure the same kind of thing (a
+`SegmentStore`-shaped trait object), and `parse_backup_store`'s own doc
+comment even says `fs:`/`dir:` are "the same forms `parse_segment_store`
+accepts." Reading `parse_segment_store`'s actual `match` arms
+(`crates/animusd/src/main.rs`) showed otherwise: it has no `"cluster"` arm
+at all — `None` (omitting the flag) is the *only* way to select its
+default, and a literal `"cluster"` value falls through to the `dir:`
+match arm and gets rejected as malformed. `parse_backup_store`'s own doc
+comment names this precisely as one thing `--segment-store` does
+differently, but it would have been easy to skip re-reading that comment
+because "the same forms" reads as symmetry at a glance. The CRD's
+`AnimusClusterSpec::validate_store_spec` had to encode this asymmetry
+explicitly — `segmentStore: "cluster"` is a rejected value, not silently
+accepted or remapped to "omit the field" — otherwise a spec written by
+analogy with `backupStore: "cluster"` would pass CRD validation and then
+fail at pod startup when `animusd`'s own parser rejected the flag.
+**General form**: when building a second, independent syntax-checking
+layer over an existing CLI parser (this crate deliberately doesn't depend
+on `animusd`, so it re-implements a narrower check of the same grammar —
+see `crd::S3StoreSpec::validate`'s identical posture for the `s3://` form),
+never infer one flag's accepted-values grammar from a sibling flag's
+`match` arms or from a comment describing them as parallel — read that
+flag's own parser function directly, arm by arm. Two CLI options that look
+like a matched pair from their names and shared doc prose can still differ
+in exactly the one place that matters (which literal keywords each
+accepts), and the mismatch only surfaces as a runtime rejection at
+container start, never a compile error or a CRD-validation failure, unless
+the second layer's own test suite explicitly pins the asymmetric case (see
+`crd::tests::store_spec_rejects_segment_store_cluster_literal`).
+
+## A full-object JSON golden test against a `k8s-openapi` typed resource must include `apiVersion`/`kind` — its `Serialize` impl always injects them (S-07c, `PodDisruptionBudget`)
+
+Writing `desired::poddisruptionbudget`'s golden shape test by copying the
+existing full-object JSON-golden pattern from `desired::cluster_config`'s
+`three_node_golden_config` (`serde_json::to_value(&built)` compared
+against a `serde_json::json!{...}` literal via `assert_eq!`), the first
+run failed on a diff that had nothing to do with the field under test:
+the serialized value carried `"apiVersion": "policy/v1"` and `"kind":
+"PodDisruptionBudget"` that the hand-written `expected` literal never
+mentioned. `cluster_config`'s own golden test never hits this because
+`ClusterConfig` is a hand-rolled, `#[derive(Serialize)]` plain struct with
+no such fields — it was the wrong precedent to copy from for a test that,
+this time, serializes an actual `k8s-openapi` top-level resource type
+(`PodDisruptionBudget`, `NetworkPolicy`, `StatefulSet`, …) rather than a
+crate-local mirror type. Every `k8s-openapi` resource implementing
+`Resource` hand-writes its own `Serialize` (not `#[derive(Serialize)]`)
+specifically to always emit `apiVersion`/`kind` from
+`<Self as Resource>::{API_VERSION,KIND}` ahead of `metadata`/`spec`/
+`status` — this is why every *other* builder test in this crate
+(`networkpolicy.rs`, `statefulset.rs`, `services.rs`) asserts on individual
+typed fields (`np.spec.unwrap().ingress`, …) rather than a full
+`serde_json::to_value` diff: doing so sidesteps this entirely, at the cost
+of not pinning the object's complete shape in one place.
+
+**General form**: before writing a full-object JSON/YAML golden test
+against any `k8s-openapi` (or other library-owned, hand-serialized)
+top-level type, either (a) check that type's own `Serialize` impl for
+extra always-emitted fields the value's own Rust struct doesn't obviously
+suggest (`apiVersion`/`kind` here; a real API server also injects fields
+like `metadata.creationTimestamp` on `Deserialize` that a locally-built,
+never-sent object simply won't carry, so those don't bite a *build-side*
+golden test the way `apiVersion`/`kind` do), or (b) follow this crate's
+own dominant pattern instead — assert on the specific typed fields under
+test, not the whole serialized object — which is both immune to this
+class of surprise and, per `crates/animus-operator/CLAUDE.md`'s own
+"pure builder" design, usually what the test actually needs to pin.
+
+## A shared `StatefulSet` pod-template annotation restarts *every* pod — hash only what a running pod cannot pick up live, never what changes on every routine scale (S-07d, the `animusdb.io/config-hash` annotation)
+
+S-07d's groundwork (`desired::statefulset::CONFIG_HASH_ANNOTATION`) bakes a
+content hash of the generated cluster config into the `StatefulSet`'s pod
+template so an already-running `animusd` — which reads `cluster.json`
+once at container start and never again — actually gets restarted when a
+config-affecting spec change (`spec.tls`, `spec.s3`/`backupStore`/
+`segmentStore`, `spec.controlNodes`, …) needs it to. The mechanism is
+correct, but its *first* version hashed the raw generated `ConfigMap`
+`data` map wholesale — every key, including `cluster.json`'s full `nodes`
+array. That array grows/shrinks on a plain `spec.nodes` scale (one
+`RoleAddrs` entry appended or removed, every *existing* entry untouched
+per `cluster_config`'s own `scale_up_config_append_preserves_existing_
+entries_byte_for_byte` invariant), so a routine scale-up changed the hash
+and rolled *every already-running pod* — not just the new one — even
+though nothing about their own boot-time config changed: a running
+`animusd` never rereads the node list at all, it learns of new/changed
+peers only through replicated `Metadata` (ADR 0030 self-registration).
+This shipped straight through review because every *unit* test for the
+annotation (`config_hash_is_stable_for_an_unchanged_spec`,
+`config_hash_changes_when_control_nodes_changes`) held `spec.nodes`
+constant — nothing pinned the "nodes-only scale must be a no-op for this
+hash" property, so nothing caught it locally. It surfaced only in
+`e2e-kind-tls`'s scale phase (3 → 4 nodes): the unwanted rollout evicted
+`e2e-0`/`e2e-1`/`e2e-2` out from under the script's own `kubectl
+port-forward` mid-check, failing the post-scale `GetItem` with a "lost
+connection to pod" — a CI-only failure with no local repro until the
+scale step was actually exercised against a real `StatefulSet` controller.
+
+The fix (same day) replaced "hash the whole `ConfigMap`" with "hash a
+typed *restart-relevant projection*" built straight from
+`AnimusClusterSpec` (`desired::statefulset::restart_relevant_projection`):
+the `control_nodes` role-split threshold, the full `entrypoint.sh` text
+(already node-count-independent — `entrypoint_script` takes only `spec`),
+the `cluster_settings` section, and whether TLS is wired — explicitly
+never `spec.nodes`, node count, or any per-node id/address/
+`advertise_host`. Regression coverage added the property the first
+version lacked directly: `config_hash_is_unchanged_by_a_nodes_only_
+scale_{up,down}` (3 ↔ 4 nodes, mirroring the exact e2e scenario) alongside
+the existing "changes when it should" cases, and
+`config_hash_pinned_for_a_fixed_fixture` pins the hash *value* so a future
+change to the hash function or the projection's field set shows up as an
+explicit, reviewable diff rather than silently rolling every deployed
+cluster's pods on the next release. The hash itself also moved off
+`std::collections::hash_map::DefaultHasher` to an inline FNV-1a 64 for the
+same "no silent bit-pattern change" reason — `DefaultHasher` carries no
+cross-Rust-release stability guarantee, so an operator rebuilt with a
+newer toolchain could roll every cluster's pods for no operator-visible
+reason.
+
+**General form**: a hash (or any other single scalar) baked into a shared
+`StatefulSet`/`Deployment` pod template to force a restart necessarily
+restarts *every* replica on *any* input change — there is one pod
+template, not one per pod. Before hashing "the generated config" wholesale,
+ask specifically which of its fields a running process actually rereads
+live vs. only at boot, and — separately — which of its fields change on
+inputs that have nothing to do with an individual pod's own boot-time
+config (a node/replica count is the recurring example: it changes on
+every routine scale, and an already-running process in a
+self-registering/gossip-style cluster typically never needs to know about
+it from a config file at all). Anything in the second category has no
+business in the hash, no matter how naturally it falls out of "just hash
+the whole generated artifact" — and the regression test that would have
+caught it is specifically "hold the scale-sensitive input constant across
+its own natural range and assert the hash doesn't move," not just
+"assert the hash changes when it obviously should."
+
+## An out-of-cluster Kubernetes controller cannot reach a pod's own network address at all — an e2e that never exercises that code path proves nothing about it (`animus-operator`, admin-port reachability groundwork)
+
+`scripts/e2e-kind.sh` runs the operator **out-of-cluster**
+(`cargo run -p animus-operator -- run` against the runner's local
+kubeconfig) — the documented local-iteration shape, not a shortcut taken
+only in CI. From there, neither a pod's headless-`Service` DNS name
+(`<pod>.<svc>.<ns>.svc.cluster.local`) nor its `10.244.x.x` pod IP is
+routable: both addresses live on the cluster's own pod network, which a
+process outside the cluster (a laptop, a CI runner) has no route to at
+all — not a firewall rule to punch through, an address space that simply
+isn't reachable from outside. `crate::admin_client::drain_and_remove_node`
+(the scale-down member-drain sequence) dials exactly one of those two
+addresses directly, and had done so since it was first written — the bug
+was there from day one, just never triggered, because the e2e smoke never
+forced a scale-down. It surfaced only once a second admin-port consumer
+(S-07d's `spec.controlNodes` growth sequence) needed the *same* dial
+during its own e2e leg and got "could not reach any control ordinal" on
+every attempt.
+
+**General form**: for a controller/agent that can run either in-cluster or
+out-of-cluster (a deliberately supported local-iteration mode, not just a
+dev convenience), any code path that dials a workload's own pod-network
+address — not the Kubernetes API server itself — is untested by an
+in-cluster-only assumption baked into review, and an e2e suite that
+*always* happens to run the same way (always out-of-cluster, say) proves
+that path never at all rather than proving it works. The fix here was
+structural, not a network-plumbing workaround: reach the pod through the
+Kubernetes API server's **pod-proxy subresource** (`GET`/`POST
+/api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy{path}`) instead
+of dialing it directly — the API server is the one address a Kubernetes
+client reaches identically in every deployment shape, so routing through
+it (rather than adding a second, direct-dial-repair mechanism) closes the
+gap for every current and future admin-port consumer at once, the same
+"structural fix over a self-repair loop" preference ADR 0060's own Part 1
+(stable pod DNS names over IP-repair polling) already established. See
+ADR 0060's "operator admin access through the API server pod proxy"
+amendment for the full design, and `crates/animus-operator/CLAUDE.md`'s
+`admin_client.rs` entry for the mechanism. The narrower, second lesson:
+when a fake test double (`crate::fakes::FakeAdminClient`) sits *below* the
+`AdminOps` trait boundary rather than mocking a real socket, changing how
+a real implementor reaches its target (direct dial vs. API-server proxy)
+needs no change to the fake or to any test built on it at all — the seam
+was drawn at exactly the right altitude for this kind of transport swap.
+## `Network::send`'s "fire-and-forget" contract was a lie in `ProdEnv`: one unreachable peer's unbounded `TcpStream::connect` starved every OTHER peer queued behind it in the same dispatch loop — the network-path twin of issue #279 (S-07d growth e2e, PR #661, issue #661)
+
+The third `kind` e2e failure on all three legs (plain TCP, TLS, S3) of
+PR #661's `spec.controlNodes` growth: `storage.ephemeral: true` means an
+`EmptyDir`-backed pod restart wipes both WAL and engine, so when the
+StatefulSet's config-hash roll (the sibling entry above) reached an
+*already-established* control voter (not the brand-new one growth had
+just added), that ordinal came back with an empty persisted store and — per
+`RaftNode::start_with_orphan_sweep_after`'s existing, previously-proven-safe
+"empty persisted storage ⇒ treat as a genesis bootstrap participant" rule
+(ADR 0060's "Why growth doesn't need genesis's own sequential join
+answer") — rejoined as a fresh, term-0 follower with an empty log. That
+part is *safe*: pre-vote's log-up-to-date check means a fresh rejoiner can
+never win a real election against the established group's far-ahead log,
+proven by three new `SimEnv` cells in
+`crates/animus-control/tests/wiped_voter_rejoin.rs` (wiped *leader*,
+wiped *follower*, and a no-growth control) — all three converge to a
+single leader and a committing write within a handful of election
+timeouts, seed-reproducible, no protocol change needed. So the Raft
+*logic* was never the bug, and `SimEnv` correctly had nothing to say about
+it — this is exactly the class of hazard `SimEnv` cannot reach at all (no
+real sockets, no OS TCP timers), matching this crate's own "`SimEnv`
+proves logic and ordering, not real-thread liveness" rule.
+
+The real bug was one layer down, in `ProdEnv::send_stream`
+(`crates/animus-env/src/prod.rs`): every outbound Raft message dispatch —
+`animus-control`/`animus-cp-data`'s own `drive()` loop — does `for (to,
+msg) in outs { env.send(to, bytes).await; }`, **sequentially, one peer at
+a time, in the single driver task**. `send_stream`'s connect+write ran
+*inline* on that same `.await`, with **no timeout at all** on the
+`TcpStream::connect`. The moment a peer's address is silently
+unreachable — no RST, no ICMP, packets just dropped, exactly what a
+recreated pod's collapsed old network endpoint looks like to a sender
+still holding a pooled connection to its previous incarnation — that
+`connect`/write rides the OS's own multi-minute TCP retry timeout. Since
+the dispatch loop is sequential and single-tasked, that one bad peer
+blocked delivery to *every other* peer queued behind it in the same
+round: whichever node was leader (the incident's own evidence: "possibly
+the control leader") stopped heartbeating 0/1/3 too, they timed out and
+re-elected, and the *new* leader hit the exact same peer on its very next
+heartbeat round and stalled the same way — a leaderless livelock that
+lasted 60+ seconds, `/admin/health`'s `leader_within` failing on every
+node including the two the roll never touched, killing them via their own
+liveness probe. `Network`'s own doc already documented `send`/
+`send_stream` as "fire-and-forget: never report delivery" — the
+*contract* was right, the `ProdEnv` implementation just didn't honor it.
+
+**Fix** (`ProdEnv::send_stream`): spawn the connect+write onto its own
+task (`self.spawn(...)`, so it is tracked by the same `AbortHandle` list
+`shutdown`/`shutdown_and_wait` already drain) instead of running it inline
+on the caller's `.await`, and additionally bound it with a
+`SEND_TIMEOUT` (2s — generous relative to `heartbeat_interval`/
+`election_base`, far below the OS's multi-minute default). Both halves
+matter: the spawn decouples the *caller* (and every other peer's own
+dispatch) from this one peer's fate; the timeout bounds the spawned
+task's own lifetime so a black-holed peer can't accumulate unbounded
+pending connections forever. Regression:
+`crates/animus-env/src/prod.rs`'s
+`a_send_to_an_unreachable_peer_does_not_delay_a_live_peers_delivery` —
+points a peer entry at the reserved/unrouted `10.255.255.1` (confirmed by
+direct probe to hang rather than fail fast in this sandbox, modelling a
+real black hole without needing actual internet access) and asserts a
+`send` to it, followed immediately by a `send` to a live peer, both
+return within 1s and the live peer's frame still arrives. Verified this
+actually catches the regression by reverting just the `send_stream` body
+and re-running: the unfixed version hangs past a 20s bash timeout.
+
+**General form**: a trait doc's stated contract ("fire-and-forget",
+"never blocks", "best-effort") is not automatically upheld by every
+implementation — check the *implementation*, not just the trait doc,
+whenever that implementation does real, unbounded I/O (a `TcpStream::
+connect` with no timeout is the classic offender; DNS resolution is
+another). And: **a caller that sequentially `.await`s a "fire-and-forget"
+call to N different peers in one task has silently made all N peers'
+liveness depend on each other** — the fix belongs in the callee (make the
+call actually non-blocking/bounded), not in asking every such caller to
+remember to spawn or add its own per-call timeout. This is the network
+twin of issue #279 (slow `fsync` inside the same driver loop starving
+heartbeats) — same shape of bug, same fix idiom (bound it, or run it off
+the loop's own critical path), different I/O.
+
+## A background `cargo run` folds the ENTIRE build into the diagnostic log it is meant to make useful — build synchronously first, then exec the already-compiled binary (S-07d, `scripts/e2e-kind.sh` operator log, issue #661)
+
+Companion finding to the entry above, surfaced investigating the same
+incident: the out-of-cluster operator's log
+(`scripts/e2e-kind.sh`'s `$OPERATOR_LOG`) was reported to contain "only
+cargo output and zero tracing lines" even with `RUST_LOG=info` exported —
+suspicious, since `EnvFilter::from_default_env()` with `RUST_LOG=info`
+set does correctly enable `info!` output (confirmed directly: reading
+`tracing-subscriber` 0.3.23's own source, `from_default_env()`'s default
+directive is `LevelFilter::ERROR` *only when the env var is absent*; with
+it set to `info` every `info!`/`warn!` in `animus-operator::controller`,
+including its own `"reconciling AnimusCluster"` `info!` line, passes the
+filter as expected — reproduced directly against the built binary). The
+real mechanism was mundane and had nothing to do with the filter: the
+script's `phase "run operator out-of-cluster"` block backgrounded `exec
+cargo run -p animus-operator -- run` directly, with **nothing earlier in
+the script warming the build cache** — `animus-operator` is the *only*
+`cargo` invocation in the whole script, so `kube-rs`'s heavy dependency
+tree (`rustls`/`hyper`/`k8s-openapi`/`kube-runtime` and friends) compiles
+for the first time exactly at this point, measured here at 40-50s even
+with several of those crates already warm from other builds in the same
+session — genuinely cold, on a slower or more contended CI box, easily
+several minutes. Every line that landed in `$OPERATOR_LOG` during that
+window was `cargo`'s own `Compiling ...` chatter; a process that is
+*still compiling* is indistinguishable, from the log alone, from one that
+is stuck.
+
+**Fix**: split the phase in two — `cargo build -p animus-operator --bin
+animus-operator` runs synchronously (its own output goes straight to the
+terminal, not into `$OPERATOR_LOG`) *before* anything is backgrounded;
+the background phase then `exec`s the already-compiled binary directly
+(`$CARGO_TARGET_DIR/debug/animus-operator`, resolved the same way `cargo`
+itself would) instead of `cargo run`. Every line that can ever land in
+`$OPERATOR_LOG` is now genuine runtime tracing output. Side benefit: this
+also removes the `cargo run`-as-supervisor indirection `cleanup()`'s own
+comment had already had to work around with a belt-and-suspenders `pkill`
+(kept, now clearly redundant, since `kill "$OPERATOR_PID"` reaches the
+real process directly).
+
+**General form**: backgrounding `cargo run` (rather than a pre-built
+binary) folds build time into whatever log/timeout budget the *run* was
+supposed to get — indistinguishable from a hang unless you already know
+to discount it. Any script that (a) backgrounds a `cargo run` and (b)
+treats its stdout/stderr as a liveness signal should build first,
+synchronously, and run the resulting binary directly.
+
+## Attribute a CI flake before redesigning around it — loop the test under a *yielding* contention source at the change and at its parent, and compare rates (PR #666, `split_placing_two_replica_diff_e2e`)
+
+`ProdEnv::send_stream`'s head-of-line fix (#666) spawns one task per send
+and so no longer preserves per-destination FIFO between back-to-back
+sends. When `two_of_three_replica_diff_placing_target_converges_end_to_
+end` failed on that PR's `prod-liveness` shard, the tempting story was
+"reordering broke placement convergence". Measuring first showed
+otherwise: 6/60 failures at the fix, 5/60 at its parent, with the same
+four failure shapes on both sides (issue #670). The design that would
+have "fixed" it — a per-destination bounded queue drained by one task —
+is a legitimate future improvement but was not the cause, and building
+it on that story would have hidden a pre-existing, contention-sensitive
+test behind an unrelated change.
+
+Two method points: (1) the `Network` seam's own contract already permits
+reordering and Raft/snapshot chunking tolerates it (`raft.rs`'s
+"reordered/duplicate chunk is ignored and re-driven"), so a reordering
+hypothesis needs evidence, not plausibility; (2) a non-yielding CPU spin
+loop is the wrong "pressure": it starves the test's own tokio runtime so
+hard that an unrelated bootstrap assertion fires first. Use a real,
+yielding contention source (another integration-test binary looping on
+the same pinned cores) to reach the code path under test.
+## A strictly-typed admin-API address field (`SocketAddr`) silently forecloses Kubernetes-native automation over it — check the field's own type, not just its wire shape (S-07d, `POST /admin/control/member/add`)
+
+Automating ADR 0037's control-voter-growth admin path from
+`animus-operator` (S-07d) hit a real, pre-existing gap only visible once
+an actual Kubernetes call site needed it: `POST /admin/control/
+member/add`'s request body (`admin::AddControlMemberReq`) types `addr` as
+`std::net::SocketAddr`, which `serde`'s `FromStr`-backed deserialization
+can only ever parse from a literal IP:port — never a DNS name. That is
+exactly the wrong shape for a Kubernetes pod, whose only *stable* identity
+across a restart is its per-ordinal DNS name (`RoleAddrs::
+advertise_host`); its IP is not stable at all. Every *other* address
+surface this same codebase already built for exactly this reason
+(`RoleAddrs`/`ClientResponse::JoinInfo`/`ProdEnv::merge_peer`/`set_peers`)
+is deliberately string-typed — `member/add`'s own `addr` field is the one
+outlier, because it was built for the bare-metal CLI's `animus admin
+control-add`, where a literal IP is exactly right (that deployment shape
+binds real host IPs, never `0.0.0.0`). Nothing about `member/add`'s own
+*doc comment* or its *wire shape* (a plain JSON string either way) hints
+at this — only reading the actual Rust field type on the server side
+(`SocketAddr`, not `String`) reveals it, and only because a Kubernetes
+call site's own address is a hostname.
+
+The workaround landed (`resolve_control_dial_addr`, reading the pod's live
+`status.podIP` via the Kubernetes API rather than resolving the hostname
+via DNS) is deliberately narrow and self-healing (the promoted node's own
+startup self-registration republishes its real, hostname-based address
+moments later — see ADR 0060's S-07d amendment for the full account), but
+it is a workaround, not a fix — the real fix (accepting a `String` addr
+the way `ProdEnv::merge_peer` already does) belongs in `animusd`, out of
+`animus-operator`'s own scope (that crate has no dependency on `animusd`).
+
+**General form**: before wiring a new automated caller (an operator, a
+controller, any Kubernetes-native client) against an *existing* admin/RPC
+API that predates that caller's own deployment shape, check every address
+field's actual Rust type on the server side, not just its JSON shape or
+its doc comment — a `SocketAddr` (or any other strictly-typed, IP-only
+field) is a signal the API was designed for a deployment shape where a
+literal IP is stable, which a Kubernetes pod's is not. Grep for the type,
+don't infer it from the wire.
+
+## A `Local` control/consensus handle's own "not leader" refusal carries no retry-able address — only a `Remote` mirror's does (S-07d, `POST /admin/control/member/add`)
+
+Designing S-07d's "retry a `member/add` call against the leader when the
+first-tried voter refuses" step, the natural instinct (mirroring a human
+operator's own runbook, or the admin dashboard's "not leader" message,
+which *does* carry a `leader_addr_hint`) was to parse an address out of
+the refusal and retry against it. That hint is populated from
+`ControlHandle::leader_addr_hint()`, which is **always `None` for
+`Local`** — a genuine control-plane voter has no separate notion of "the
+leader's own address" the way a `Remote` data-only node's mirror does
+(that method's own doc: "always `None` for `Local` — a genuine control
+voter has no separate notion of the leader's client address; callers that
+need one resolve it via `ClientCtx::route_addr` on `leader()`'s id").
+Every pod `member/add` is ever called against in this design (any
+already-confirmed voter ordinal) is genuinely `Local` — so the retry
+target this design needed simply has no address-hint mechanism available
+at all, despite one existing (and working) elsewhere in the same admin
+surface for a different node role.
+
+The fix that shipped (`add_control_voter`: try every already-confirmed
+voter ordinal in turn, stopping at the first 2xx, relying on the call's
+own documented idempotence to make trying the "wrong" ones first free) is
+simpler than address-hint parsing would have been anyway, but the lesson
+is the general one: **an admin/RPC action's "who do I retry against"
+answer can differ by which *role* is refusing** — a `Remote` mirror and a
+`Local` voter can both return the identical-looking "not leader" error
+text/shape while only one of them can name a next hop. Check the actual
+handle variant an automated caller will hit (not just the human-facing
+error message shape) before designing a retry strategy around an address
+hint.
+
+## A shared `StatefulSet` pod-template annotation restarts every pod, not just the ordinal a spec change was meant for — the pod template has no per-ordinal slot (S-07d, config-hash restart mechanism)
+
+S-07d needed *some* already-running pod to notice a `ConfigMap` content
+change and restart (role-promotion for control-voter growth is decided in
+`entrypoint.sh` at container start, never hot-reloaded) — the standard
+Kubernetes idiom for this is a content-hash annotation on the pod
+template, which turns a `ConfigMap` change into a `StatefulSet.spec.
+template` change the `StatefulSet` controller rolls out like any other
+pod-template edit. The point worth recording: **there is exactly one pod
+template per `StatefulSet`, shared by every ordinal** — an annotation
+placed there cannot be scoped to "just the ordinal(s) that actually need
+to restart." Adding this mechanism for `controlNodes` growth specifically
+therefore also restarts every *other* pod on *every* config-affecting
+spec change this operator already had (`spec.tls`, `spec.s3`, `spec.
+backupStore`/`segmentStore`, `spec.dynamoAuthSecretName`, `spec.
+quiesceAfterSecs`/`autoSplitBytes`; a `nodes`-only scale is deliberately
+*not* one of them — see the sibling entry on hashing only what a pod
+reads at boot) — fields that, before this change,
+silently sat unapplied on an already-running pod until it happened to
+restart for an unrelated reason. That silent-no-op behavior was arguably
+a latent bug in every one of those features' own delivery, only now
+surfaced (and fixed, as a side effect) by a mechanism built for a
+different field entirely.
+
+**General form**: a per-pod-template annotation/env-var/volume is a
+whole-`StatefulSet`-scoped lever, not a per-ordinal one — if a design
+needs to affect *only* certain ordinals (the way S-07d's own role
+promotion conceptually only needed to touch the newly-promoted ones), the
+pod template itself cannot express that; either accept the
+whole-set-restarts cost (as this change did, since there is no clean way
+to avoid it while every ordinal still shares one template) or reach for a
+mechanism that genuinely varies per-pod (e.g. a per-ordinal `ConfigMap`/
+`Secret`, or an `initContainer` reading its own ordinal at start) — never
+assume a template-level annotation change stays scoped to "the pods that
+actually needed it."
+
+## A fake that mirrors a hand-typed literal instead of the producer's own output makes a whole test suite self-consistently wrong — pin fakes to the real serializer's literal, and cross-check any two vocabularies that look alike (S-07d, `GET /admin/config` `role`)
+
+S-07d's growth loop gated "has the promoted pod restarted into a
+control-capable role?" on `GET /admin/config`'s `role` field equalling
+`"both"`. That literal is real — but it is `desired::cluster_config::
+NodeRole::Both`, the generated `cluster.json`'s per-ordinal dispatch
+vocabulary, a different document produced by this operator. `animusd`'s
+own admin view emits `"control"`/`"data"`/`"combined"` (pinned by
+`crates/animusd/tests/dashboard_endpoint.rs`). The comparison could never
+match, so `member/add` was never issued and every `kind` e2e leg timed
+out waiting for the fourth voter — while all 190+ operator unit tests
+passed, because `crate::fakes::FakeAdminClient`'s `/admin/config` stub
+had been written from the same wrong assumption. A fake that agrees with
+the code under test proves nothing about the producer it stands in for.
+
+**General form**: when a consumer matches on a literal another component
+emits, (1) copy the literal from the producer's serializer or the
+producer's own pinned test, never retype it from memory or from a
+similarly-named enum in the consumer's crate; (2) add one consumer test
+that uses an independent double carrying the producer's exact literal,
+separate from the shared fake, so the fake and the matcher cannot drift
+together; (3) when two vocabularies describe the same concept
+(`NodeRole::Both` vs `role: "combined"`), document the pair at the
+match site. The tell that this class of bug is present: unit suite green,
+integration/e2e stalls with "waiting for X" forever and no error, because
+the gate is a silent `false`, not a failure.
+## Observe a multi-group-per-node metric under `SimEnv` by sharing one `MetricsHandle` across several independent `Simulator` worlds — not by adding a production constructor an investigation-only PR shouldn't ship (ADR 0044 phase 2, C-02 PR 1)
+
+`SimEnv::metrics()` is `MetricsHandle::noop()` by design (`animus_env::
+Env::metrics`'s own default) — a component that wants to record into a
+test-readable sink under simulation has to be handed a recording
+`MetricsHandle` directly instead (`RaftKvNode::start_with_metrics` exists
+purely for this). But the *realistic* production shape for "several
+tablet groups sharing one node" is `RaftKvNode::start_hosted` (an explicit
+`stream = tablet_id`, ADR 0026), and there is no constructor that takes
+**both** an explicit `stream` (for co-hosting on one set of node ids) and
+an injectable `MetricsHandle` (for `SimEnv` observability) — only one or
+the other. Adding one would be a small, safe, additive-only change (the
+exact category `start_with_metrics` itself already is), but it is still a
+`src/` change, and the task at hand (a map/investigation-only PR, ADR 0044
+phase 2's C-02 PR 1) was explicitly scoped to "no production behaviour
+change."
+
+The fix needed no production code at all: `MetricsHandle` is a plain
+shared counter sink (cheap `Clone`, atomics underneath) — nothing ties it
+to one `Simulator`/`SimEnv` world. Standing up `G` **independent**
+`Simulator`s (each hosting one ordinary 3-node group via the existing
+`start_with_metrics`, each forced onto `PRIMARY_STREAM` since it can't take
+a `stream` argument) but handing every one of them the **same** three
+`MetricsHandle`s (index-aligned by node id) makes their combined counters
+read exactly as if all `G` groups were co-hosted on one real node's shared
+`env.metrics()` sink — because from the metric sink's point of view, that
+is indistinguishable from what actually happened. This produced a real,
+green, seed-reproducible baseline test
+(`crates/animus-cp-data/tests/heartbeat_cost.rs`) proving heartbeat traffic
+scales with hosted-group count today, using only pre-existing test
+infrastructure combined in a new way, with zero `src/` changes.
+
+**General form**: when a task's scope forbids a production change but the
+*realistic* fixture for what you want to observe needs one (a constructor
+that doesn't exist yet, a knob that isn't wired), check whether the thing
+you actually need to observe (here: an aggregate counter) is decoupled
+enough from the thing the missing constructor would provide (here: which
+`Simulator` world a group physically lives in) that sharing the
+observable object across several *separately* fixture-able instances gets
+you the same measurement without the code change. Don't reach for the
+missing constructor as the only path — ask what invariant the measurement
+actually depends on, and whether a simpler composition of existing pieces
+already satisfies it.
+
+## A hard-wrapped `+`/`-`/digit-`.` landing at the start of a doc-comment line is a markdown list marker, not prose — clippy's `doc_lazy_continuation` cascades errors onto every following line (ADR 0044 phase 2, C-02 PR 2)
+
+This repo's own long-form doc-comment style hard-wraps prose at roughly
+column 80, sometimes splitting a hyphenated or `+`-joined phrase across
+the line boundary (e.g. "...a second buffering\n/// + timer layer..."). A
+markdown line that starts (after the `///`/`//!` prefix) with `+ `, `- `,
+`* `, or `N. ` is a **list item marker** to pulldown_cmark regardless of
+authorial intent — the wrap in this case landed `+ timer layer purely for
+the...` at the start of its own raw source line, which rustdoc's markdown
+parser reads as opening a new bulleted list right there. `clippy::
+doc_lazy_continuation` (part of `-D warnings`) then flags **every
+subsequent line up to the next blank line** as "doc list item without
+indentation" — nine separate errors from one accidental wrap, none of
+which point at the actual `+` that caused it (the errors start on the
+line *after*). `cargo build`/`cargo test` don't run clippy, so this is
+invisible until the actual `-D warnings` gate — a genuinely confusing
+first read, since the flagged lines look like ordinary prose with nothing
+wrong.
+
+**Fix**: reflow the paragraph so no line begins with a markdown list/
+emphasis-adjacent character after word-wrapping — moving the `+`-joined
+phrase (or dash, or an ordinal like "1.") off the line start is enough;
+no `#[allow]` needed, and none should be reached for here, since the
+underlying text isn't actually a list and an allow would just suppress a
+real (if minor) rendering defect in the shipped rustdoc output too.
+
+**General form**: when `-D warnings` reports a `doc_lazy_continuation`
+error on a line that reads as unremarkable prose, don't inspect that
+line — inspect the line(s) *before* it (back to the last blank doc-comment
+line) for one that starts with `+`/`-`/`*`/a bare number followed by `.`
+or `)` purely as an artifact of hard-wrapping. Any hand-wrapped prose
+convention that can split a `word + word`/`word - word` phrase across a
+line boundary is exposed to this; it is cheap to avoid by keeping such a
+joiner on the same line as at least one of its operands.
+
+## A corpus scenario summing a metric across every physical node conflates "more work per node" with "more nodes doing work" — force a deterministic leader when the claim is about one node's own scaling (ADR 0044 phase 2, C-02 PR 2)
+
+The heartbeat-batcher corpus's first draft measured amortization by
+hosting `count` independent 3-node groups (random election per group, the
+same 3 physical node ids reused across groups) and asserting the summed
+`CpHeartbeatFramesSent` across all three `MetricsHandle`s stayed
+"flat-ish" as `count` grew from 1 to 5. It didn't: the ratio came in at
+~3.0, not ~1.0. The batcher was working correctly — the *test* was
+measuring the wrong thing. With only 1 group, exactly one of the three
+physical nodes is ever a leader, so the summed metric reflects one node's
+own traffic. With 5 independently, randomly elected groups spread across
+the same 3 physical nodes, it becomes overwhelmingly likely that **all
+three** physical nodes end up leading at least one group — so the summed
+metric now reflects up to three nodes' own traffic, each amortizing
+correctly on its own, but the sum across nodes naturally scales with the
+number of nodes-that-lead-something (bounded by the physical node count),
+not with the group count directly. The claim under test — "one node
+leading many groups sends a flat number of physical frames" — was never
+actually isolated from a second, unrelated variable — "how many of the
+3 physical nodes happen to lead *something* as group count grows."
+
+**Fix**: force every group's leadership onto the *same* physical node
+before comparing group counts, using the crate's own pre-existing
+deterministic-first-leader mechanism (`RaftKvNode::
+start_hosted_campaigning[_with_batcher]` — built for the in-place-split
+fork's own "campaign immediately, don't wait out a randomized election
+timeout" need, and directly reusable here for the identical property: one
+specific replica reliably wins) — then read only that one physical node's
+own `MetricsHandle`, never a sum across all of them. With the confound
+removed, the same experiment reproducibly gives frame-ratio ≈ 1.00 against
+logical-ratio ≈ 5.00, exactly the amortization claim being tested.
+
+**General form**: a corpus that sums a per-node metric across N physical
+nodes to test a claim about "one node's own behavior as some load
+parameter grows" is only valid if leadership/work assignment across those
+N nodes is held fixed across the compared runs. If the system under test
+elects/assigns work non-deterministically, growing the load parameter can
+independently grow the number of participating nodes too, and a summed
+metric cannot tell the two effects apart — either pin the assignment
+deterministically (as here) or measure and control for the actual
+participant count directly, never assume "more load, same node set."
+
+## A partition test's own "sibling group is untouched" assertion is only true when the two groups' leaders provably sit on different physical nodes (ADR 0044 phase 2, C-02 PR 2)
+
+A related corpus scenario partitioned one group's leader node away from
+its followers and asserted a second, co-hosted sibling group (sharing the
+same 3 physical node ids, on a different `stream`) stayed completely
+unaffected — same leader, same term. With natural random election for
+both groups, this intermittently failed with `leader_index` finding *two*
+leaders in the sibling group: the partition, applied at the **node** level
+(`sim.partition(node_a, node_b)` — every stream between those two node
+ids, not just the tablet under test), silently also isolated the sibling
+group's own leader whenever that leader happened to land on the same
+physical node as the first group's leader (a real, if not overwhelmingly
+likely, coincidence across two independent elections on the same 3-node
+id set) — and the sibling group then legitimately re-elected too, leaving
+its old (now-partitioned, frozen-belief) leader still reporting
+`is_leader() == true` alongside a genuinely new one.
+
+**Fix**: the same deterministic-first-leader mechanism as the previous
+entry, applied to force the two groups' leaders onto two *different*
+physical node indices (`hosted_group_fixed_leader(.., 0)` and
+`hosted_group_fixed_leader(.., 1)`) — making "the sibling shares no
+partitioned pair" a structural guarantee instead of a per-seed coin flip,
+so the test proves the property it was written to prove on every run,
+not just the runs where the elections happened to land favorably.
+
+**General form**: a fault-injection test whose fault is addressed at a
+coarser granularity than the unit under test (a node-level partition when
+the claim is about one group's own traffic) must account for every OTHER
+unit sharing that same coarser address — either force their assignment
+apart deterministically so the fault provably can't reach them, or make
+the assertion itself branch on whether the coincidence occurred (proving
+the correct, different property in each case) rather than assuming the
+coincidence never happens. A corpus running at depth (many seeds) will
+eventually hit the coincidence even when its author's first few manual
+runs didn't.

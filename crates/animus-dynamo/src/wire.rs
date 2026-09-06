@@ -571,6 +571,32 @@ pub struct TransactGet {
     pub projection: Option<Projection>,
 }
 
+/// `ImportTable`'s `TableCreationParameters` (ADR 0068 §6, S-05 PR 2): the
+/// same shape [`Operation::CreateTable`] decodes (`KeySchema`/
+/// `AttributeDefinitions`/`GlobalSecondaryIndexes`/`BillingMode`+
+/// `ProvisionedThroughput`, via the identical decode helpers
+/// [`decode_key_schema`]/[`decode_attribute_types`]/[`decode_indexes`]/
+/// [`decode_create_table_throughput`]/[`check_attribute_definitions`]), minus
+/// `StreamSpecification` (real AWS's own `TableCreationParameters` has no
+/// stream field — an imported table starts unstreamed, exactly like a
+/// restored one) and minus `LocalSecondaryIndexes` (real AWS's own
+/// `TableCreationParameters` object has no such field either — rejected at
+/// decode time if present, [`decode_table_creation_parameters`]'s own doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCreationParameters {
+    /// The new table's name.
+    pub table_name: String,
+    /// The new table's key schema.
+    pub schema: TableSchema,
+    /// The declared `(AttributeName, AttributeType)` pairs.
+    pub key_types: Vec<(String, String)>,
+    /// The new table's declared GSIs (never LSIs — see this struct's own
+    /// doc).
+    pub indexes: Vec<SecondaryIndex>,
+    /// The new table's requested provisioned throughput, if any.
+    pub throughput: Option<ProvisionedThroughput>,
+}
+
 /// A decoded DynamoDB wire operation (the supported subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
@@ -1016,6 +1042,105 @@ pub enum Operation {
         /// Target table name.
         table: String,
     },
+    /// `ExportTableToPointInTime` (ADR 0068, S-05): begin a leader-driven
+    /// export of `table`'s current committed state (or, when `export_time_ms`
+    /// is given, a consistent snapshot as of that instant, served through
+    /// the PITR machinery) into the customer's own S3 bucket, in DynamoDB's
+    /// JSON export layout. `animusd` validates the table exists
+    /// (`TableNotFoundException`), resolves `ClientToken` idempotency, and
+    /// mints a fresh opaque export identity. **`ExportFormat`/`ExportType`
+    /// are validated at decode time, not carried here**: any value other
+    /// than the defaults (`DYNAMODB_JSON`/`FULL_EXPORT`) is a decode-time
+    /// `ValidationException` (`ION`/`INCREMENTAL_EXPORT` are documented,
+    /// unimplemented — ADR 0068 §1), so by the time this variant exists the
+    /// format/type are always the ones this adapter actually produces.
+    ExportTableToPointInTime {
+        /// Source table name, recovered from `TableArn` by [`parse_table_arn`].
+        table: String,
+        /// The source table's ARN as decoded from the request (echoed back
+        /// verbatim on `DescribeExport`).
+        table_arn: String,
+        /// The destination S3 bucket.
+        s3_bucket: String,
+        /// The optional destination S3 key prefix.
+        s3_prefix: Option<String>,
+        /// The requested `ExportTime`, in epoch milliseconds (AWS's own
+        /// `Timestamp`, epoch seconds on the wire) — `None` means "the
+        /// current committed state."
+        export_time_ms: Option<u64>,
+        /// The client-supplied idempotency token, if given.
+        client_token: Option<String>,
+    },
+    /// `DescribeExport` (ADR 0068 §3): a pure read of one export's catalog
+    /// row by its ARN.
+    DescribeExport {
+        /// The export's ARN (this adapter's own opaque catalog identity).
+        export_arn: String,
+    },
+    /// `ListExports` (ADR 0068 §3): paginated export summaries in
+    /// ascending-ARN order (the replicated catalog's own `BTreeMap` order),
+    /// optionally filtered by source table ARN.
+    ListExports {
+        /// Filter to exports of this source table ARN only, if given.
+        table_arn: Option<String>,
+        /// Max summaries to return this page (`None` = the default of 100;
+        /// any value is capped at 100, matching real DynamoDB).
+        max_results: Option<usize>,
+        /// Pagination cursor: list only exports whose ARN sorts strictly
+        /// after this one (this adapter's own opaque `NextToken`, unlike
+        /// AWS's own base64 blob — never parsed as anything but "an export
+        /// ARN to resume after").
+        next_token: Option<String>,
+    },
+    /// `ImportTable` (ADR 0068 §6, S-05 PR 2): begin a leader-driven import
+    /// of a customer-owned S3 bucket's DynamoDB JSON export layout (this
+    /// adapter's own export layout, ADR 0068 §7, or real AWS's identical
+    /// one) into a **brand-new** table, created from
+    /// `table_creation_params`. **`InputFormat`/`S3SseAlgorithm`/
+    /// `S3SseKmsKeyId`/`InputFormatOptions` are validated at decode time,
+    /// not carried here**: any `InputFormat` other than `DYNAMODB_JSON`
+    /// (`ION`/`CSV`) and any `InputCompressionType` other than
+    /// `GZIP`/`NONE` (`ZSTD`) are documented-unimplemented, rejected with a
+    /// `ValidationException` before this variant is ever built (ADR 0068
+    /// §6) — so by the time this variant exists, format is always
+    /// `DYNAMODB_JSON` (not even carried, since there is nothing left to
+    /// distinguish) and compression is always one of the two implemented
+    /// values. `S3BucketOwner` is accepted and ignored, the identical ADR
+    /// 0068 §1 note `ExportTableToPointInTime` already documents (no
+    /// cross-account concept in this adapter).
+    ImportTable {
+        /// The source S3 bucket.
+        s3_bucket: String,
+        /// The optional source S3 key prefix.
+        s3_prefix: Option<String>,
+        /// The requested (already-validated) input compression.
+        input_compression: animus_control::InputCompressionType,
+        /// The new table's own creation parameters.
+        table_creation_params: TableCreationParameters,
+        /// The client-supplied idempotency token, if given.
+        client_token: Option<String>,
+    },
+    /// `DescribeImport` (ADR 0068 §6): a pure read of one import's catalog
+    /// row by its ARN.
+    DescribeImport {
+        /// The import's ARN (this adapter's own opaque catalog identity).
+        import_arn: String,
+    },
+    /// `ListImports` (ADR 0068 §6): paginated import summaries in
+    /// ascending-ARN order (the replicated catalog's own `BTreeMap` order),
+    /// optionally filtered by target table ARN.
+    ListImports {
+        /// Filter to imports targeting this table ARN only, if given.
+        table_arn: Option<String>,
+        /// Max summaries to return this page (`None` = the default of 100;
+        /// any value is capped at 100, matching real DynamoDB's own
+        /// `PageSize` contract).
+        page_size: Option<usize>,
+        /// Pagination cursor: list only imports whose ARN sorts strictly
+        /// after this one (this adapter's own opaque `NextToken`, the
+        /// identical [`ListExports`](Self::ListExports) convention).
+        next_token: Option<String>,
+    },
     /// `TagResource` (roadmap W-06): add or overwrite tags on a table,
     /// addressed by its [`table_arn`] (`ResourceArn` on the wire, decoded
     /// and validated as a table ARN — malformed shape or a stream/backup
@@ -1109,6 +1234,7 @@ impl Operation {
             | Operation::UpdateContinuousBackups { table, .. }
             | Operation::DescribeContinuousBackups { table, .. }
             | Operation::CreateBackup { table, .. }
+            | Operation::ExportTableToPointInTime { table, .. }
             | Operation::TagResource { table, .. }
             | Operation::UntagResource { table, .. }
             | Operation::ListTagsOfResource { table, .. } => Some(table),
@@ -1121,6 +1247,14 @@ impl Operation {
             | Operation::RestoreTableToPointInTime {
                 target_table_name, ..
             } => Some(target_table_name),
+            // `ImportTable` targets its brand-new table, named inside its
+            // own `TableCreationParameters` — the identical "the table
+            // about to exist" reasoning `RestoreTableFromBackup` above
+            // already has.
+            Operation::ImportTable {
+                table_creation_params,
+                ..
+            } => Some(&table_creation_params.table_name),
             Operation::BatchWriteItem { .. }
             | Operation::BatchGetItem { .. }
             | Operation::TransactWriteItems { .. }
@@ -1134,6 +1268,15 @@ impl Operation {
             | Operation::DescribeBackup { .. }
             | Operation::ListBackups { .. }
             | Operation::DeleteBackup { .. }
+            // `DescribeExport`/`ListExports` mirror `DescribeBackup`/
+            // `ListBackups`' identical "addressed by ARN/optional filter,
+            // never a single target table" shape (ADR 0068 §3).
+            | Operation::DescribeExport { .. }
+            | Operation::ListExports { .. }
+            // `DescribeImport`/`ListImports` mirror `DescribeExport`/
+            // `ListExports`' identical shape (ADR 0068 §6).
+            | Operation::DescribeImport { .. }
+            | Operation::ListImports { .. }
             // `DescribeLimits`/`DescribeEndpoints` (roadmap W-06) address no
             // table at all — an account-wide static read and a pure
             // node-address read, respectively.
@@ -1588,6 +1731,16 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         "DeleteBackup" => Ok(Operation::DeleteBackup {
             backup_arn: backup_arn_field(obj)?,
         }),
+        "ExportTableToPointInTime" => decode_export_table_to_point_in_time(obj),
+        "DescribeExport" => Ok(Operation::DescribeExport {
+            export_arn: export_arn_field(obj)?,
+        }),
+        "ListExports" => decode_list_exports(obj),
+        "ImportTable" => decode_import_table(obj),
+        "DescribeImport" => Ok(Operation::DescribeImport {
+            import_arn: import_arn_field(obj)?,
+        }),
+        "ListImports" => decode_list_imports(obj),
         "RestoreTableFromBackup" => decode_restore_table_from_backup(obj),
         "RestoreTableToPointInTime" => decode_restore_table_to_point_in_time(obj),
         "TagResource" => decode_tag_resource(obj),
@@ -1751,6 +1904,308 @@ fn decode_list_backups(obj: &Map<String, Value>) -> Result<Operation, WireError>
         time_range_lower_bound_ms,
         time_range_upper_bound_ms,
         backup_type,
+    })
+}
+
+/// Decode an `ExportTableToPointInTime` body (ADR 0068 §1): `TableArn` +
+/// `S3Bucket`, an optional `S3Prefix`/`ExportTime`/`ClientToken`, and the
+/// two closed-set fields this adapter only accepts one value of each —
+/// `ExportFormat` (default `DYNAMODB_JSON`; `ION` is a decode-time
+/// `ValidationException`, documented unimplemented) and `ExportType`
+/// (default `FULL_EXPORT`; `INCREMENTAL_EXPORT` is likewise rejected).
+/// `S3BucketOwner`/`S3SseAlgorithm`/`S3SseKmsKeyId` are accepted and
+/// ignored (ADR 0068 §1's documented note) — this adapter neither verifies
+/// bucket ownership nor applies server-side encryption of its own.
+fn decode_export_table_to_point_in_time(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table_arn = obj
+        .get("TableArn")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `TableArn`"))?
+        .to_owned();
+    let table = parse_table_arn(&table_arn)
+        .ok_or_else(|| {
+            WireError::validation(format!("`TableArn` is not a table ARN: {table_arn}"))
+        })?
+        .to_owned();
+    let s3_bucket = obj
+        .get("S3Bucket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("missing string field `S3Bucket`"))?
+        .to_owned();
+    let s3_prefix = match obj.get("S3Prefix") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`S3Prefix` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    match obj.get("ExportFormat") {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| WireError::validation("`ExportFormat` must be a string"))?;
+            match s {
+                "DYNAMODB_JSON" => {}
+                "ION" => {
+                    return Err(WireError::validation(
+                        "`ExportFormat`: `ION` is not implemented — only `DYNAMODB_JSON` exports \
+                         are supported",
+                    ));
+                }
+                other => {
+                    return Err(WireError::validation(format!(
+                        "unknown `ExportFormat` `{other}`"
+                    )));
+                }
+            }
+        }
+    }
+    match obj.get("ExportType") {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| WireError::validation("`ExportType` must be a string"))?;
+            match s {
+                "FULL_EXPORT" => {}
+                "INCREMENTAL_EXPORT" => {
+                    return Err(WireError::validation(
+                        "`ExportType`: `INCREMENTAL_EXPORT` is not implemented — only \
+                         `FULL_EXPORT` exports are supported",
+                    ));
+                }
+                other => {
+                    return Err(WireError::validation(format!(
+                        "unknown `ExportType` `{other}`"
+                    )));
+                }
+            }
+        }
+    }
+    let export_time_ms = decode_backup_timestamp_ms(obj, "ExportTime")?;
+    let client_token = match obj.get("ClientToken") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`ClientToken` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    Ok(Operation::ExportTableToPointInTime {
+        table,
+        table_arn,
+        s3_bucket,
+        s3_prefix,
+        export_time_ms,
+        client_token,
+    })
+}
+
+fn export_arn_field(obj: &Map<String, Value>) -> Result<String, WireError> {
+    obj.get("ExportArn")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| WireError::validation("missing string field `ExportArn`"))
+}
+
+/// Decode a `ListExports` body: an optional `TableArn` filter, `MaxResults`
+/// (the shared `Limit` contract, [`decode_limit`] reused under its real
+/// wire name here), and `NextToken`.
+fn decode_list_exports(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table_arn = obj
+        .get("TableArn")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let max_results =
+        match obj.get("MaxResults") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                WireError::validation("`MaxResults` must be a non-negative integer")
+            })? as usize),
+        };
+    let next_token = match obj.get("NextToken") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`NextToken` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    Ok(Operation::ListExports {
+        table_arn,
+        max_results,
+        next_token,
+    })
+}
+
+/// Decode an `ImportTable` body (ADR 0068 §6): `S3BucketSource` +
+/// `TableCreationParameters`, an optional `ClientToken`, and the two
+/// closed-set fields this adapter only accepts a subset of values for —
+/// `InputFormat` (only `DYNAMODB_JSON`; `ION`/`CSV` are decode-time
+/// `ValidationException`s, documented unimplemented) and
+/// `InputCompressionType` (`GZIP`/`NONE`; `ZSTD` likewise rejected).
+/// `S3BucketOwner`/`InputFormatOptions`/`SSESpecification` are accepted and
+/// ignored (ADR 0068 §1's identical documented note for
+/// `ExportTableToPointInTime`).
+fn decode_import_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let source = obj
+        .get("S3BucketSource")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `S3BucketSource`"))?;
+    let s3_bucket = source
+        .get("S3Bucket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WireError::validation("`S3BucketSource` missing `S3Bucket`"))?
+        .to_owned();
+    let s3_prefix = match source.get("S3KeyPrefix") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`S3KeyPrefix` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    match obj.get("InputFormat") {
+        None => {
+            return Err(WireError::validation("missing string field `InputFormat`"));
+        }
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| WireError::validation("`InputFormat` must be a string"))?;
+            match s {
+                "DYNAMODB_JSON" => {}
+                "ION" | "CSV" => {
+                    return Err(WireError::validation(format!(
+                        "`InputFormat`: `{s}` is not implemented — only `DYNAMODB_JSON` imports \
+                         are supported"
+                    )));
+                }
+                other => {
+                    return Err(WireError::validation(format!(
+                        "unknown `InputFormat` `{other}`"
+                    )));
+                }
+            }
+        }
+    }
+    let input_compression = match obj.get("InputCompressionType") {
+        None | Some(Value::Null) => animus_control::InputCompressionType::None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| WireError::validation("`InputCompressionType` must be a string"))?;
+            match s {
+                "GZIP" => animus_control::InputCompressionType::Gzip,
+                "NONE" => animus_control::InputCompressionType::None,
+                "ZSTD" => {
+                    return Err(WireError::validation(
+                        "`InputCompressionType`: `ZSTD` is not implemented — only `GZIP`/`NONE` \
+                         imports are supported",
+                    ));
+                }
+                other => {
+                    return Err(WireError::validation(format!(
+                        "unknown `InputCompressionType` `{other}`"
+                    )));
+                }
+            }
+        }
+    };
+    let table_creation_params = decode_table_creation_parameters(obj)?;
+    let client_token = match obj.get("ClientToken") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`ClientToken` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    Ok(Operation::ImportTable {
+        s3_bucket,
+        s3_prefix,
+        input_compression,
+        table_creation_params,
+        client_token,
+    })
+}
+
+/// Decode `ImportTable`'s `TableCreationParameters` object — the identical
+/// `KeySchema`/`AttributeDefinitions`/`GlobalSecondaryIndexes`/
+/// `BillingMode`+`ProvisionedThroughput` decode `CreateTable` itself uses
+/// ([`decode_key_schema`]/[`decode_attribute_types`]/[`decode_indexes`]/
+/// [`decode_create_table_throughput`]/[`check_attribute_definitions`]), but
+/// rejecting a `LocalSecondaryIndexes` key outright — real AWS's own
+/// `TableCreationParameters` object has no such field (see
+/// [`TableCreationParameters`]'s own doc).
+fn decode_table_creation_parameters(
+    obj: &Map<String, Value>,
+) -> Result<TableCreationParameters, WireError> {
+    let params = obj
+        .get("TableCreationParameters")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WireError::validation("missing object field `TableCreationParameters`"))?;
+    let table_name = table_name(params)?;
+    if params.contains_key("LocalSecondaryIndexes") {
+        return Err(WireError::validation(
+            "`TableCreationParameters` does not support `LocalSecondaryIndexes`",
+        ));
+    }
+    let schema = decode_key_schema(params)?;
+    let key_types = decode_attribute_types(params);
+    let indexes = decode_indexes(params)?;
+    check_attribute_definitions(
+        &create_table_required_key_attributes(&schema, &indexes),
+        &key_types,
+    )?;
+    let throughput = decode_create_table_throughput(params)?;
+    Ok(TableCreationParameters {
+        table_name,
+        schema,
+        key_types,
+        indexes,
+        throughput,
+    })
+}
+
+fn import_arn_field(obj: &Map<String, Value>) -> Result<String, WireError> {
+    obj.get("ImportArn")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| WireError::validation("missing string field `ImportArn`"))
+}
+
+/// Decode a `ListImports` body: an optional `TableArn` filter,
+/// `PageSize` (the shared `Limit` contract, [`decode_limit`] not reused
+/// here since AWS's own `ListImports` field name is `PageSize`, not
+/// `MaxResults`/`Limit` — decoded identically otherwise), and `NextToken`.
+fn decode_list_imports(obj: &Map<String, Value>) -> Result<Operation, WireError> {
+    let table_arn = obj
+        .get("TableArn")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let page_size = match obj.get("PageSize") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .ok_or_else(|| WireError::validation("`PageSize` must be a non-negative integer"))?
+                as usize,
+        ),
+    };
+    let next_token = match obj.get("NextToken") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| WireError::validation("`NextToken` must be a string"))?
+                .to_owned(),
+        ),
+    };
+    Ok(Operation::ListImports {
+        table_arn,
+        page_size,
+        next_token,
     })
 }
 
@@ -4870,6 +5325,33 @@ pub fn backup_arn(table: &str, backup_id: &str) -> String {
     format!("arn:aws:dynamodb:animus:0:table/{table}/backup/{backup_id}")
 }
 
+/// An export's opaque catalog identity as an ARN (ADR 0068 §3):
+/// `<TableArn>/export/<id>` — [`backup_arn`]'s identical shape and
+/// convention, with `.../export/<id>` in place of `.../backup/<id>`.
+/// `export_id` is minted by the caller (`animusd::dynamo::create_export`, a
+/// fresh random suffix) — **this whole string, not just `export_id`, is the
+/// catalog's own opaque `ExportId` key**, so an export is looked up
+/// directly by this value with no ARN parsing anywhere in this adapter.
+#[must_use]
+pub fn export_arn(table: &str, export_id: &str) -> String {
+    format!("{}/export/{export_id}", table_arn(table))
+}
+
+/// An import's opaque catalog identity as an ARN (ADR 0068 §6, S-05 PR 2):
+/// `<TableArn>/import/<id>` — [`export_arn`]'s identical shape and
+/// convention, with `.../import/<id>` in place of `.../export/<id>`.
+/// `import_id` is minted by the caller (`animusd::dynamo::create_import`, a
+/// fresh random suffix) — **this whole string, not just `import_id`, is the
+/// catalog's own opaque `ImportId` key**, so an import is looked up
+/// directly by this value with no ARN parsing anywhere in this adapter.
+/// **`table` here is the freshly-created TARGET table**, not a pre-existing
+/// source (mirrors [`export_arn`]'s own use, but for the opposite
+/// direction of data flow).
+#[must_use]
+pub fn import_arn(table: &str, import_id: &str) -> String {
+    format!("{}/import/{import_id}", table_arn(table))
+}
+
 /// The synthetic ARN this adapter surfaces for a **table itself** (roadmap
 /// W-06 — `TagResource`/`UntagResource`/`ListTagsOfResource`'s
 /// `ResourceArn`, and this adapter's own `TableArn`): `arn:aws:dynamodb:
@@ -5358,6 +5840,431 @@ pub fn create_backup_response(details: &BackupDetails) -> String {
         Value::Object(backup_details_object(details)),
     );
     serde_json::to_string(&Value::Object(obj)).expect("create-backup response serializes")
+}
+
+// --- S3 export (ADR 0068, S-05) --------------------------------------------
+
+/// An export's `ExportDescription` (ADR 0068 §3) — DynamoDB's shared shape
+/// for `ExportTableToPointInTime`'s response and `DescribeExport`/
+/// `ListExports`' own detail. Built by `animusd::dynamo` from the
+/// replicated catalog (`animus_control::ExportRow`), which this pure crate
+/// never reads directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportDetails {
+    /// This export's ARN — also the catalog's own opaque identity
+    /// ([`export_arn`]'s doc).
+    pub export_arn: String,
+    /// The source table's ARN, echoed back verbatim.
+    pub table_arn: String,
+    /// `"IN_PROGRESS"` | `"COMPLETED"` | `"FAILED"`.
+    pub status: &'static str,
+    /// The destination S3 bucket.
+    pub s3_bucket: String,
+    /// The destination S3 key prefix, if any.
+    pub s3_prefix: Option<String>,
+    /// The client-supplied `ClientToken`, if any.
+    pub client_token: Option<String>,
+    /// Wall-clock start time in epoch milliseconds.
+    pub start_wall_ms: u64,
+    /// Wall-clock completion time in epoch milliseconds, once terminal.
+    pub end_wall_ms: Option<u64>,
+    /// The requested `ExportTime` in epoch milliseconds, if given.
+    pub export_time_ms: Option<u64>,
+    /// Total items written so far (frozen once `COMPLETED`).
+    pub item_count: u64,
+    /// Total billed (uncompressed) size in bytes (frozen once `COMPLETED`).
+    pub billed_size_bytes: u64,
+    /// The written `manifest-summary.json` object's S3 key, once
+    /// `COMPLETED`.
+    pub export_manifest: Option<String>,
+    /// A failure code, once `FAILED`.
+    pub failure_code: Option<String>,
+    /// A human-readable failure message, once `FAILED`.
+    pub failure_message: Option<String>,
+}
+
+fn export_details_object(d: &ExportDetails) -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("ExportArn".into(), Value::String(d.export_arn.clone()));
+    obj.insert("TableArn".into(), Value::String(d.table_arn.clone()));
+    obj.insert("ExportStatus".into(), Value::String(d.status.into()));
+    obj.insert("ExportFormat".into(), Value::String("DYNAMODB_JSON".into()));
+    obj.insert("ExportType".into(), Value::String("FULL_EXPORT".into()));
+    obj.insert("S3Bucket".into(), Value::String(d.s3_bucket.clone()));
+    if let Some(prefix) = &d.s3_prefix {
+        obj.insert("S3Prefix".into(), Value::String(prefix.clone()));
+    }
+    if let Some(token) = &d.client_token {
+        obj.insert("ClientToken".into(), Value::String(token.clone()));
+    }
+    obj.insert("StartTime".into(), wall_ms_timestamp(d.start_wall_ms));
+    if let Some(end_ms) = d.end_wall_ms {
+        obj.insert("EndTime".into(), wall_ms_timestamp(end_ms));
+    }
+    if let Some(export_time_ms) = d.export_time_ms {
+        obj.insert("ExportTime".into(), wall_ms_timestamp(export_time_ms));
+    }
+    obj.insert(
+        "ItemCount".into(),
+        Value::Number(serde_json::Number::from(d.item_count)),
+    );
+    obj.insert(
+        "BilledSizeBytes".into(),
+        Value::Number(serde_json::Number::from(d.billed_size_bytes)),
+    );
+    if let Some(manifest) = &d.export_manifest {
+        obj.insert("ExportManifest".into(), Value::String(manifest.clone()));
+    }
+    if let Some(code) = &d.failure_code {
+        obj.insert("FailureCode".into(), Value::String(code.clone()));
+    }
+    if let Some(message) = &d.failure_message {
+        obj.insert("FailureMessage".into(), Value::String(message.clone()));
+    }
+    obj
+}
+
+/// The JSON body for a successful `ExportTableToPointInTime` or
+/// `DescribeExport` (ADR 0068 §3) — both respond with the identical
+/// `ExportDescription` shape: `{"ExportDescription": {..}}`.
+#[must_use]
+pub fn export_description_response(details: &ExportDetails) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "ExportDescription".into(),
+        Value::Object(export_details_object(details)),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("export-description response serializes")
+}
+
+/// One `ListExports` candidate: an export's ARN and status/type only (AWS's
+/// real `ExportSummary` carries no other fields). `animusd::dynamo` builds
+/// this list from the replicated catalog (`Metadata::exports`, whose
+/// `BTreeMap<ExportId, _>` iteration order is already the
+/// ARN-lexicographic order [`paginate_export_summaries`] relies on, since
+/// an `ExportId` **is** its own ARN, [`export_arn`]'s doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportSummary {
+    /// This export's ARN.
+    pub export_arn: String,
+    /// `"IN_PROGRESS"` | `"COMPLETED"` | `"FAILED"`.
+    pub status: &'static str,
+}
+
+/// The default and cap for `ListExports`'s `MaxResults`, matching real
+/// DynamoDB.
+pub const LIST_EXPORTS_MAX_RESULTS: usize = 100;
+
+/// Paginate an already-ARN-sorted candidate list per `ListExports`'s
+/// contract — [`paginate_backup_summaries`]'s identical shape.
+#[must_use]
+pub fn paginate_export_summaries(
+    summaries: &[ExportSummary],
+    exclusive_start_export_arn: Option<&str>,
+    max_results: Option<usize>,
+) -> (Vec<ExportSummary>, Option<String>) {
+    let limit = max_results
+        .unwrap_or(LIST_EXPORTS_MAX_RESULTS)
+        .clamp(1, LIST_EXPORTS_MAX_RESULTS);
+    let start = exclusive_start_export_arn
+        .map(|arn| summaries.partition_point(|s| s.export_arn.as_str() <= arn))
+        .unwrap_or(0);
+    let remaining = &summaries[start..];
+    let truncated = remaining.len() > limit;
+    let page = remaining[..remaining.len().min(limit)].to_vec();
+    let next_token = truncated
+        .then(|| page.last().map(|s| s.export_arn.clone()))
+        .flatten();
+    (page, next_token)
+}
+
+/// The JSON body for a successful `ListExports`: `{"ExportSummaries":
+/// [{"ExportArn": .., "ExportStatus": .., "ExportType": "FULL_EXPORT"}],
+/// "NextToken": ".."}` (the latter present only when the listing was
+/// truncated).
+#[must_use]
+pub fn list_exports_response(page: &[ExportSummary], next_token: Option<&str>) -> String {
+    let summaries: Vec<Value> = page
+        .iter()
+        .map(|s| {
+            let mut e = Map::new();
+            e.insert("ExportArn".into(), Value::String(s.export_arn.clone()));
+            e.insert("ExportStatus".into(), Value::String(s.status.into()));
+            e.insert("ExportType".into(), Value::String("FULL_EXPORT".into()));
+            Value::Object(e)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("ExportSummaries".into(), Value::Array(summaries));
+    if let Some(token) = next_token {
+        obj.insert("NextToken".into(), Value::String(token.to_owned()));
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("list-exports response serializes")
+}
+
+// --- S3 import (ADR 0068 §6, S-05 PR 2) ------------------------------------
+
+/// An import's `ImportTableDescription` (ADR 0068 §6) — DynamoDB's shared
+/// shape for `ImportTable`'s response and `DescribeImport`/`ListImports`'
+/// own detail. Built by `animusd::dynamo` from the replicated catalog
+/// (`animus_control::ImportRow`), which this pure crate never reads
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportDetails {
+    /// This import's ARN — also the catalog's own opaque identity
+    /// ([`import_arn`]'s doc).
+    pub import_arn: String,
+    /// The freshly-created target table's ARN.
+    pub table_arn: String,
+    /// A synthetic per-table identity (`animus_control::ImportRow::
+    /// table_id`'s own doc).
+    pub table_id: String,
+    /// `"IN_PROGRESS"` | `"COMPLETED"` | `"FAILED"` (never `"CANCELLING"`/
+    /// `"CANCELLED"` — cancellation is a named, undelivered residual).
+    pub status: &'static str,
+    /// The source S3 bucket.
+    pub s3_bucket: String,
+    /// The source S3 key prefix, if any.
+    pub s3_prefix: Option<String>,
+    /// `"GZIP"` | `"NONE"`.
+    pub input_compression: &'static str,
+    /// The target table's own creation parameters, echoed back.
+    pub table_creation_params: TableCreationParameters,
+    /// The client-supplied `ClientToken`, if any.
+    pub client_token: Option<String>,
+    /// Wall-clock start time in epoch milliseconds.
+    pub start_wall_ms: u64,
+    /// Wall-clock completion time in epoch milliseconds, once terminal.
+    pub end_wall_ms: Option<u64>,
+    /// Total items read from the source data files so far (frozen once
+    /// terminal).
+    pub processed_item_count: u64,
+    /// Total items actually seeded so far (frozen once terminal).
+    pub imported_item_count: u64,
+    /// Total items skipped for failing key-schema validation (frozen once
+    /// terminal).
+    pub error_count: u64,
+    /// Total (compressed, as read) size of the processed data files in
+    /// bytes (frozen once terminal).
+    pub processed_size_bytes: u64,
+    /// A failure code, once `FAILED`.
+    pub failure_code: Option<String>,
+    /// A human-readable failure message, once `FAILED`.
+    pub failure_message: Option<String>,
+}
+
+/// The echoed `TableCreationParameters` object — the identical
+/// `KeySchema`/`AttributeDefinitions`/`GlobalSecondaryIndexes`/
+/// `BillingMode`+`ProvisionedThroughput` shape [`table_description_object`]
+/// renders for a real table, reusing its own [`attribute_definitions`]/
+/// [`key_schema_entry`]/[`index_desc`] building blocks — every echoed GSI
+/// renders `Active` (this echo describes the request, not live catalog
+/// state; `animusd::dynamo::describe_import`/`list_imports` never call this
+/// for anything but the original request's own already-committed shape).
+fn table_creation_parameters_object(params: &TableCreationParameters) -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("TableName".into(), Value::String(params.table_name.clone()));
+    let mut key_schema = vec![key_schema_entry(&params.schema.partition_key, "HASH")];
+    if let Some(sk) = &params.schema.sort_key {
+        key_schema.push(key_schema_entry(sk, "RANGE"));
+    }
+    obj.insert("KeySchema".into(), Value::Array(key_schema));
+    obj.insert(
+        "AttributeDefinitions".into(),
+        Value::Array(attribute_definitions(
+            &params.schema,
+            &params.key_types,
+            &params.indexes,
+        )),
+    );
+    if !params.indexes.is_empty() {
+        let gsis: Vec<Value> = params
+            .indexes
+            .iter()
+            .filter_map(|index| match index {
+                SecondaryIndex::Global(g) => {
+                    let mut ks = vec![key_schema_entry(&g.key_attribute, "HASH")];
+                    if let Some(sort) = &g.sort_attribute {
+                        ks.push(key_schema_entry(sort, "RANGE"));
+                    }
+                    Some(index_desc(&g.name, ks, IndexStatus::Active))
+                }
+                // Unreachable in practice — `decode_table_creation_parameters`
+                // rejects `LocalSecondaryIndexes` outright — but matched
+                // explicitly rather than `unreachable!()`, the same
+                // defense-in-depth every apply-time seatbelt in this
+                // workspace prefers.
+                SecondaryIndex::Local(_) => None,
+            })
+            .collect();
+        if !gsis.is_empty() {
+            obj.insert("GlobalSecondaryIndexes".into(), Value::Array(gsis));
+        }
+    }
+    match &params.throughput {
+        Some(t) => {
+            obj.insert(
+                "BillingMode".into(),
+                Value::String("PROVISIONED".to_owned()),
+            );
+            obj.insert(
+                "ProvisionedThroughput".into(),
+                Value::Object(provisioned_throughput_description_object(
+                    t.read_units,
+                    t.write_units,
+                )),
+            );
+        }
+        None => {
+            obj.insert(
+                "BillingMode".into(),
+                Value::String("PAY_PER_REQUEST".to_owned()),
+            );
+        }
+    }
+    obj
+}
+
+fn import_details_object(d: &ImportDetails) -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("ImportArn".into(), Value::String(d.import_arn.clone()));
+    obj.insert("ImportStatus".into(), Value::String(d.status.into()));
+    obj.insert("TableArn".into(), Value::String(d.table_arn.clone()));
+    obj.insert("TableId".into(), Value::String(d.table_id.clone()));
+    let mut source = Map::new();
+    source.insert("S3Bucket".into(), Value::String(d.s3_bucket.clone()));
+    if let Some(prefix) = &d.s3_prefix {
+        source.insert("S3KeyPrefix".into(), Value::String(prefix.clone()));
+    }
+    obj.insert("S3BucketSource".into(), Value::Object(source));
+    obj.insert("InputFormat".into(), Value::String("DYNAMODB_JSON".into()));
+    obj.insert(
+        "InputCompressionType".into(),
+        Value::String(d.input_compression.into()),
+    );
+    obj.insert(
+        "TableCreationParameters".into(),
+        Value::Object(table_creation_parameters_object(&d.table_creation_params)),
+    );
+    if let Some(token) = &d.client_token {
+        obj.insert("ClientToken".into(), Value::String(token.clone()));
+    }
+    obj.insert("StartTime".into(), wall_ms_timestamp(d.start_wall_ms));
+    if let Some(end_ms) = d.end_wall_ms {
+        obj.insert("EndTime".into(), wall_ms_timestamp(end_ms));
+    }
+    obj.insert(
+        "ProcessedItemCount".into(),
+        Value::Number(serde_json::Number::from(d.processed_item_count)),
+    );
+    obj.insert(
+        "ImportedItemCount".into(),
+        Value::Number(serde_json::Number::from(d.imported_item_count)),
+    );
+    obj.insert(
+        "ErrorCount".into(),
+        Value::Number(serde_json::Number::from(d.error_count)),
+    );
+    obj.insert(
+        "ProcessedSizeBytes".into(),
+        Value::Number(serde_json::Number::from(d.processed_size_bytes)),
+    );
+    if let Some(code) = &d.failure_code {
+        obj.insert("FailureCode".into(), Value::String(code.clone()));
+    }
+    if let Some(message) = &d.failure_message {
+        obj.insert("FailureMessage".into(), Value::String(message.clone()));
+    }
+    obj
+}
+
+/// The JSON body for a successful `ImportTable` or `DescribeImport` (ADR
+/// 0068 §6) — both respond with the identical `ImportTableDescription`
+/// shape: `{"ImportTableDescription": {..}}`.
+#[must_use]
+pub fn import_description_response(details: &ImportDetails) -> String {
+    let mut obj = Map::new();
+    obj.insert(
+        "ImportTableDescription".into(),
+        Value::Object(import_details_object(details)),
+    );
+    serde_json::to_string(&Value::Object(obj)).expect("import-description response serializes")
+}
+
+/// One `ListImports` candidate — AWS's real `ImportSummary` shape:
+/// ARN/status/table ARN/format/start+end time. `animusd::dynamo` builds
+/// this list from the replicated catalog (`Metadata::imports`, whose
+/// `BTreeMap<ImportId, _>` iteration order is already the ARN-lexicographic
+/// order [`paginate_import_summaries`] relies on, since an `ImportId` **is**
+/// its own ARN, [`import_arn`]'s doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// This import's ARN.
+    pub import_arn: String,
+    /// `"IN_PROGRESS"` | `"COMPLETED"` | `"FAILED"`.
+    pub status: &'static str,
+    /// The target table's ARN.
+    pub table_arn: String,
+    /// Wall-clock start time in epoch milliseconds.
+    pub start_wall_ms: u64,
+    /// Wall-clock completion time in epoch milliseconds, once terminal.
+    pub end_wall_ms: Option<u64>,
+}
+
+/// The default and cap for `ListImports`'s `PageSize`, matching real
+/// DynamoDB.
+pub const LIST_IMPORTS_MAX_RESULTS: usize = 100;
+
+/// Paginate an already-ARN-sorted candidate list per `ListImports`'s
+/// contract — [`paginate_export_summaries`]'s identical shape.
+#[must_use]
+pub fn paginate_import_summaries(
+    summaries: &[ImportSummary],
+    exclusive_start_import_arn: Option<&str>,
+    page_size: Option<usize>,
+) -> (Vec<ImportSummary>, Option<String>) {
+    let limit = page_size
+        .unwrap_or(LIST_IMPORTS_MAX_RESULTS)
+        .clamp(1, LIST_IMPORTS_MAX_RESULTS);
+    let start = exclusive_start_import_arn
+        .map(|arn| summaries.partition_point(|s| s.import_arn.as_str() <= arn))
+        .unwrap_or(0);
+    let remaining = &summaries[start..];
+    let truncated = remaining.len() > limit;
+    let page = remaining[..remaining.len().min(limit)].to_vec();
+    let next_token = truncated
+        .then(|| page.last().map(|s| s.import_arn.clone()))
+        .flatten();
+    (page, next_token)
+}
+
+/// The JSON body for a successful `ListImports`: `{"ImportSummaryList":
+/// [{"ImportArn": .., "ImportStatus": .., "TableArn": .., "InputFormat":
+/// "DYNAMODB_JSON", "StartTime": .., "EndTime": ..}], "NextToken": ".."}`
+/// (the latter present only when the listing was truncated).
+#[must_use]
+pub fn list_imports_response(page: &[ImportSummary], next_token: Option<&str>) -> String {
+    let summaries: Vec<Value> = page
+        .iter()
+        .map(|s| {
+            let mut e = Map::new();
+            e.insert("ImportArn".into(), Value::String(s.import_arn.clone()));
+            e.insert("ImportStatus".into(), Value::String(s.status.into()));
+            e.insert("TableArn".into(), Value::String(s.table_arn.clone()));
+            e.insert("InputFormat".into(), Value::String("DYNAMODB_JSON".into()));
+            e.insert("StartTime".into(), wall_ms_timestamp(s.start_wall_ms));
+            if let Some(end_ms) = s.end_wall_ms {
+                e.insert("EndTime".into(), wall_ms_timestamp(end_ms));
+            }
+            Value::Object(e)
+        })
+        .collect();
+    let mut obj = Map::new();
+    obj.insert("ImportSummaryList".into(), Value::Array(summaries));
+    if let Some(token) = next_token {
+        obj.insert("NextToken".into(), Value::String(token.to_owned()));
+    }
+    serde_json::to_string(&Value::Object(obj)).expect("list-imports response serializes")
 }
 
 /// One index entry inside `SourceTableFeatureDetails` — name + key schema
@@ -9438,6 +10345,465 @@ mod tests {
     fn list_backups_response_omits_cursor_when_untruncated() {
         let body = list_backups_response(&[], None);
         assert!(!body.contains("LastEvaluatedBackupArn"));
+    }
+
+    fn sample_export_details() -> ExportDetails {
+        ExportDetails {
+            export_arn: "arn:aws:dynamodb:animus:0:table/orders/export/abc".to_owned(),
+            table_arn: "arn:aws:dynamodb:animus:0:table/orders".to_owned(),
+            status: "COMPLETED",
+            s3_bucket: "my-bucket".to_owned(),
+            s3_prefix: Some("exports".to_owned()),
+            client_token: Some("tok-1".to_owned()),
+            start_wall_ms: 1_723_000_000_500,
+            end_wall_ms: Some(1_723_000_010_000),
+            export_time_ms: None,
+            item_count: 42,
+            billed_size_bytes: 4096,
+            export_manifest: Some("AWSDynamoDB/abc/manifest-summary.json".to_owned()),
+            failure_code: None,
+            failure_message: None,
+        }
+    }
+
+    #[test]
+    fn export_description_response_shape() {
+        let body = export_description_response(&sample_export_details());
+        assert!(body.contains("\"ExportDescription\""));
+        assert!(
+            body.contains("\"ExportArn\":\"arn:aws:dynamodb:animus:0:table/orders/export/abc\"")
+        );
+        assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
+        assert!(body.contains("\"ExportStatus\":\"COMPLETED\""));
+        assert!(body.contains("\"ExportFormat\":\"DYNAMODB_JSON\""));
+        assert!(body.contains("\"ExportType\":\"FULL_EXPORT\""));
+        assert!(body.contains("\"S3Bucket\":\"my-bucket\""));
+        assert!(body.contains("\"S3Prefix\":\"exports\""));
+        assert!(body.contains("\"ClientToken\":\"tok-1\""));
+        assert!(body.contains("\"ItemCount\":42"));
+        assert!(body.contains("\"BilledSizeBytes\":4096"));
+        assert!(body.contains("\"ExportManifest\":\"AWSDynamoDB/abc/manifest-summary.json\""));
+        assert!(!body.contains("FailureCode"));
+        assert!(!body.contains("FailureMessage"));
+    }
+
+    #[test]
+    fn export_description_response_renders_failure_fields_when_failed() {
+        let mut details = sample_export_details();
+        details.status = "FAILED";
+        details.export_manifest = None;
+        details.failure_code = Some("ClientError".to_owned());
+        details.failure_message = Some("bucket not writable".to_owned());
+        let body = export_description_response(&details);
+        assert!(body.contains("\"ExportStatus\":\"FAILED\""));
+        assert!(body.contains("\"FailureCode\":\"ClientError\""));
+        assert!(body.contains("\"FailureMessage\":\"bucket not writable\""));
+        assert!(!body.contains("ExportManifest"));
+    }
+
+    #[test]
+    fn list_exports_response_shape() {
+        let all = vec![ExportSummary {
+            export_arn: "arn:aws:dynamodb:animus:0:table/orders/export/1".to_owned(),
+            status: "IN_PROGRESS",
+        }];
+        let body = list_exports_response(
+            &all,
+            Some("arn:aws:dynamodb:animus:0:table/orders/export/1"),
+        );
+        assert!(body.contains("\"ExportSummaries\""));
+        assert!(body.contains("\"ExportArn\":\"arn:aws:dynamodb:animus:0:table/orders/export/1\""));
+        assert!(body.contains("\"ExportStatus\":\"IN_PROGRESS\""));
+        assert!(body.contains("\"NextToken\":\"arn:aws:dynamodb:animus:0:table/orders/export/1\""));
+    }
+
+    #[test]
+    fn list_exports_response_omits_next_token_when_untruncated() {
+        let body = list_exports_response(&[], None);
+        assert!(!body.contains("NextToken"));
+    }
+
+    #[test]
+    fn paginate_export_summaries_caps_and_paginates() {
+        let all: Vec<ExportSummary> = (0..3)
+            .map(|i| ExportSummary {
+                export_arn: format!("arn:aws:dynamodb:animus:0:table/t/export/{i}"),
+                status: "COMPLETED",
+            })
+            .collect();
+        let (page, next) = paginate_export_summaries(&all, None, Some(2));
+        assert_eq!(page.len(), 2);
+        assert_eq!(next.as_deref(), Some(all[1].export_arn.as_str()));
+        let (page2, next2) = paginate_export_summaries(&all, next.as_deref(), Some(2));
+        assert_eq!(page2.len(), 1);
+        assert_eq!(next2, None);
+    }
+
+    #[test]
+    fn decode_export_table_to_point_in_time_rejects_ion_and_incremental() {
+        let body = r#"{"TableArn":"arn:aws:dynamodb:animus:0:table/t",
+                        "S3Bucket":"b","ExportFormat":"ION"}"#;
+        let err = decode_request(
+            "DynamoDB_20120810.ExportTableToPointInTime",
+            body.as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("ION"));
+
+        let body = r#"{"TableArn":"arn:aws:dynamodb:animus:0:table/t",
+                        "S3Bucket":"b","ExportType":"INCREMENTAL_EXPORT"}"#;
+        let err = decode_request(
+            "DynamoDB_20120810.ExportTableToPointInTime",
+            body.as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("INCREMENTAL_EXPORT"));
+    }
+
+    #[test]
+    fn decode_export_table_to_point_in_time_accepts_the_default_shape() {
+        let body = r#"{"TableArn":"arn:aws:dynamodb:animus:0:table/orders",
+                        "S3Bucket":"b","S3Prefix":"pre","ClientToken":"tok"}"#;
+        match decode_request(
+            "DynamoDB_20120810.ExportTableToPointInTime",
+            body.as_bytes(),
+        )
+        .unwrap()
+        {
+            Operation::ExportTableToPointInTime {
+                table,
+                table_arn,
+                s3_bucket,
+                s3_prefix,
+                export_time_ms,
+                client_token,
+            } => {
+                assert_eq!(table, "orders");
+                assert_eq!(table_arn, "arn:aws:dynamodb:animus:0:table/orders");
+                assert_eq!(s3_bucket, "b");
+                assert_eq!(s3_prefix.as_deref(), Some("pre"));
+                assert_eq!(export_time_ms, None);
+                assert_eq!(client_token.as_deref(), Some("tok"));
+            }
+            other => panic!("expected ExportTableToPointInTime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_export_table_to_point_in_time_rejects_a_non_table_arn() {
+        let body = r#"{"TableArn":"arn:aws:dynamodb:animus:0:table/t/stream/L",
+                        "S3Bucket":"b"}"#;
+        let err = decode_request(
+            "DynamoDB_20120810.ExportTableToPointInTime",
+            body.as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+    }
+
+    #[test]
+    fn decode_describe_export_requires_export_arn() {
+        let err = decode_request("DynamoDB_20120810.DescribeExport", b"{}").unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        match decode_request(
+            "DynamoDB_20120810.DescribeExport",
+            br#"{"ExportArn":"arn:aws:dynamodb:animus:0:table/t/export/1"}"#,
+        )
+        .unwrap()
+        {
+            Operation::DescribeExport { export_arn } => {
+                assert_eq!(export_arn, "arn:aws:dynamodb:animus:0:table/t/export/1");
+            }
+            other => panic!("expected DescribeExport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_list_exports_defaults() {
+        match decode_request("DynamoDB_20120810.ListExports", b"{}").unwrap() {
+            Operation::ListExports {
+                table_arn,
+                max_results,
+                next_token,
+            } => {
+                assert_eq!(table_arn, None);
+                assert_eq!(max_results, None);
+                assert_eq!(next_token, None);
+            }
+            other => panic!("expected ListExports, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_arn_shape() {
+        assert_eq!(
+            export_arn("orders", "abc"),
+            "arn:aws:dynamodb:animus:0:table/orders/export/abc"
+        );
+    }
+
+    // --- S3 import (ADR 0068 §6, S-05 PR 2) --------------------------------
+
+    fn sample_import_table_creation_params() -> String {
+        r#"{"TableName":"orders",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#
+            .to_owned()
+    }
+
+    #[test]
+    fn decode_import_table_accepts_the_default_shape() {
+        let body = format!(
+            r#"{{"S3BucketSource":{{"S3Bucket":"b","S3KeyPrefix":"pre"}},
+                "InputFormat":"DYNAMODB_JSON",
+                "InputCompressionType":"GZIP",
+                "ClientToken":"tok",
+                "TableCreationParameters":{}}}"#,
+            sample_import_table_creation_params()
+        );
+        match decode_request("DynamoDB_20120810.ImportTable", body.as_bytes()).unwrap() {
+            Operation::ImportTable {
+                s3_bucket,
+                s3_prefix,
+                input_compression,
+                table_creation_params,
+                client_token,
+            } => {
+                assert_eq!(s3_bucket, "b");
+                assert_eq!(s3_prefix.as_deref(), Some("pre"));
+                assert_eq!(
+                    input_compression,
+                    animus_control::InputCompressionType::Gzip
+                );
+                assert_eq!(table_creation_params.table_name, "orders");
+                assert_eq!(table_creation_params.schema.partition_key, "id");
+                assert_eq!(client_token.as_deref(), Some("tok"));
+            }
+            other => panic!("expected ImportTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_import_table_defaults_compression_to_none() {
+        let body = format!(
+            r#"{{"S3BucketSource":{{"S3Bucket":"b"}},
+                "InputFormat":"DYNAMODB_JSON",
+                "TableCreationParameters":{}}}"#,
+            sample_import_table_creation_params()
+        );
+        match decode_request("DynamoDB_20120810.ImportTable", body.as_bytes()).unwrap() {
+            Operation::ImportTable {
+                input_compression, ..
+            } => {
+                assert_eq!(
+                    input_compression,
+                    animus_control::InputCompressionType::None
+                );
+            }
+            other => panic!("expected ImportTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_import_table_rejects_unsupported_format_and_compression() {
+        let body = format!(
+            r#"{{"S3BucketSource":{{"S3Bucket":"b"}},
+                "InputFormat":"ION",
+                "TableCreationParameters":{}}}"#,
+            sample_import_table_creation_params()
+        );
+        let err = decode_request("DynamoDB_20120810.ImportTable", body.as_bytes()).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("ION"));
+
+        let body = format!(
+            r#"{{"S3BucketSource":{{"S3Bucket":"b"}},
+                "InputFormat":"DYNAMODB_JSON",
+                "InputCompressionType":"ZSTD",
+                "TableCreationParameters":{}}}"#,
+            sample_import_table_creation_params()
+        );
+        let err = decode_request("DynamoDB_20120810.ImportTable", body.as_bytes()).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("ZSTD"));
+    }
+
+    #[test]
+    fn decode_import_table_rejects_local_secondary_indexes() {
+        let body = r#"{"S3BucketSource":{"S3Bucket":"b"},
+            "InputFormat":"DYNAMODB_JSON",
+            "TableCreationParameters":{
+                "TableName":"orders",
+                "AttributeDefinitions":[
+                    {"AttributeName":"id","AttributeType":"S"},
+                    {"AttributeName":"sk","AttributeType":"S"},
+                    {"AttributeName":"alt","AttributeType":"S"}
+                ],
+                "KeySchema":[
+                    {"AttributeName":"id","KeyType":"HASH"},
+                    {"AttributeName":"sk","KeyType":"RANGE"}
+                ],
+                "LocalSecondaryIndexes":[{
+                    "IndexName":"by-alt",
+                    "KeySchema":[
+                        {"AttributeName":"id","KeyType":"HASH"},
+                        {"AttributeName":"alt","KeyType":"RANGE"}
+                    ]
+                }]
+            }}"#;
+        let err = decode_request("DynamoDB_20120810.ImportTable", body.as_bytes()).unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        assert!(err.message.contains("LocalSecondaryIndexes"));
+    }
+
+    #[test]
+    fn decode_describe_import_requires_import_arn() {
+        let err = decode_request("DynamoDB_20120810.DescribeImport", b"{}").unwrap_err();
+        assert_eq!(err.code, "ValidationException");
+        match decode_request(
+            "DynamoDB_20120810.DescribeImport",
+            br#"{"ImportArn":"arn:aws:dynamodb:animus:0:table/t/import/1"}"#,
+        )
+        .unwrap()
+        {
+            Operation::DescribeImport { import_arn } => {
+                assert_eq!(import_arn, "arn:aws:dynamodb:animus:0:table/t/import/1");
+            }
+            other => panic!("expected DescribeImport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_list_imports_defaults() {
+        match decode_request("DynamoDB_20120810.ListImports", b"{}").unwrap() {
+            Operation::ListImports {
+                table_arn,
+                page_size,
+                next_token,
+            } => {
+                assert_eq!(table_arn, None);
+                assert_eq!(page_size, None);
+                assert_eq!(next_token, None);
+            }
+            other => panic!("expected ListImports, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_arn_shape() {
+        assert_eq!(
+            import_arn("orders", "abc"),
+            "arn:aws:dynamodb:animus:0:table/orders/import/abc"
+        );
+    }
+
+    fn sample_import_details() -> ImportDetails {
+        ImportDetails {
+            import_arn: "arn:aws:dynamodb:animus:0:table/orders/import/abc".to_owned(),
+            table_arn: "arn:aws:dynamodb:animus:0:table/orders".to_owned(),
+            table_id: "table-id-1".to_owned(),
+            status: "COMPLETED",
+            s3_bucket: "my-bucket".to_owned(),
+            s3_prefix: Some("exports".to_owned()),
+            input_compression: "GZIP",
+            table_creation_params: TableCreationParameters {
+                table_name: "orders".to_owned(),
+                schema: TableSchema::simple("id"),
+                key_types: vec![("id".to_owned(), "S".to_owned())],
+                indexes: Vec::new(),
+                throughput: None,
+            },
+            client_token: Some("tok-1".to_owned()),
+            start_wall_ms: 1_723_000_000_500,
+            end_wall_ms: Some(1_723_000_010_000),
+            processed_item_count: 42,
+            imported_item_count: 40,
+            error_count: 2,
+            processed_size_bytes: 4096,
+            failure_code: None,
+            failure_message: None,
+        }
+    }
+
+    #[test]
+    fn import_description_response_shape() {
+        let body = import_description_response(&sample_import_details());
+        assert!(body.contains("\"ImportTableDescription\""));
+        assert!(
+            body.contains("\"ImportArn\":\"arn:aws:dynamodb:animus:0:table/orders/import/abc\"")
+        );
+        assert!(body.contains("\"ImportStatus\":\"COMPLETED\""));
+        assert!(body.contains("\"TableArn\":\"arn:aws:dynamodb:animus:0:table/orders\""));
+        assert!(body.contains("\"TableId\":\"table-id-1\""));
+        assert!(body.contains("\"S3Bucket\":\"my-bucket\""));
+        assert!(body.contains("\"S3KeyPrefix\":\"exports\""));
+        assert!(body.contains("\"InputFormat\":\"DYNAMODB_JSON\""));
+        assert!(body.contains("\"InputCompressionType\":\"GZIP\""));
+        assert!(body.contains("\"TableCreationParameters\""));
+        assert!(body.contains("\"ProcessedItemCount\":42"));
+        assert!(body.contains("\"ImportedItemCount\":40"));
+        assert!(body.contains("\"ErrorCount\":2"));
+        assert!(body.contains("\"ProcessedSizeBytes\":4096"));
+        assert!(!body.contains("FailureCode"));
+        assert!(!body.contains("FailureMessage"));
+    }
+
+    #[test]
+    fn import_description_response_renders_failure_fields_when_failed() {
+        let mut details = sample_import_details();
+        details.status = "FAILED";
+        details.failure_code = Some("ImportFailed".to_owned());
+        details.failure_message = Some("bucket not readable".to_owned());
+        let body = import_description_response(&details);
+        assert!(body.contains("\"ImportStatus\":\"FAILED\""));
+        assert!(body.contains("\"FailureCode\":\"ImportFailed\""));
+        assert!(body.contains("\"FailureMessage\":\"bucket not readable\""));
+    }
+
+    #[test]
+    fn list_imports_response_shape() {
+        let all = vec![ImportSummary {
+            import_arn: "arn:aws:dynamodb:animus:0:table/orders/import/1".to_owned(),
+            status: "IN_PROGRESS",
+            table_arn: "arn:aws:dynamodb:animus:0:table/orders".to_owned(),
+            start_wall_ms: 1000,
+            end_wall_ms: None,
+        }];
+        let body = list_imports_response(
+            &all,
+            Some("arn:aws:dynamodb:animus:0:table/orders/import/1"),
+        );
+        assert!(body.contains("\"ImportSummaryList\""));
+        assert!(body.contains("\"ImportArn\":\"arn:aws:dynamodb:animus:0:table/orders/import/1\""));
+        assert!(body.contains("\"ImportStatus\":\"IN_PROGRESS\""));
+        assert!(body.contains("\"NextToken\":\"arn:aws:dynamodb:animus:0:table/orders/import/1\""));
+    }
+
+    #[test]
+    fn list_imports_response_omits_next_token_when_untruncated() {
+        let body = list_imports_response(&[], None);
+        assert!(!body.contains("NextToken"));
+    }
+
+    #[test]
+    fn paginate_import_summaries_caps_and_paginates() {
+        let all: Vec<ImportSummary> = (0..3)
+            .map(|i| ImportSummary {
+                import_arn: format!("arn:aws:dynamodb:animus:0:table/t/import/{i}"),
+                status: "COMPLETED",
+                table_arn: "arn:aws:dynamodb:animus:0:table/t".to_owned(),
+                start_wall_ms: 1000,
+                end_wall_ms: Some(2000),
+            })
+            .collect();
+        let (page, next) = paginate_import_summaries(&all, None, Some(2));
+        assert_eq!(page.len(), 2);
+        assert_eq!(next.as_deref(), Some(all[1].import_arn.as_str()));
+        let (page2, next2) = paginate_import_summaries(&all, next.as_deref(), Some(2));
+        assert_eq!(page2.len(), 1);
+        assert_eq!(next2, None);
     }
 
     /// `Select` is inferred when absent: a projection implies

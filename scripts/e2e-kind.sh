@@ -7,15 +7,45 @@
 # actually schedules a real 3-node AnimusDB cluster that bootstraps, serves
 # the DynamoDB wire, and survives a scale-up.
 #
-# The operator itself runs OUT of the kind cluster for this smoke (`cargo run
-# -p animus-operator -- run`, talking to the kind cluster's own API server via
-# a scoped kubeconfig) — in-cluster deployment of the operator's own container
+# The operator itself runs OUT of the kind cluster for this smoke (built with
+# `cargo build -p animus-operator`, then run directly — `animus-operator
+# run` — against the kind cluster's own API server via a scoped kubeconfig)
+# — in-cluster deployment of the operator's own container
 # image (`deploy/operator/deployment.yaml`) is exercised in production, not
 # here; this script only proves the reconcile logic against a real API
 # server + real kubelets/kube-controller-manager, which is the part no unit
 # test can reach.
 #
 # Assumes: docker, kind, kubectl on PATH, and a docker daemon reachable.
+#
+# S-07b: the AnimusCluster manifest always sets `spec.segmentStore:
+# dir:<data-mount>/segments` (the non-S3 store CRD surface), and the plain
+# path checks `GET /admin/segment-store` reports `store.kind: "fs"` right
+# after the pod readiness wait — no separate CI job, no gating env var,
+# since a `dir:` path needs no external dependency the way MinIO (E2E_S3)
+# or cert-manager (E2E_TLS) do. `segmentStore`, not `backupStore`, so this
+# composes with the pre-existing E2E_S3=1 leg below (which sets
+# `spec.s3.backupStore` — the two backup-store fields together would be a
+# rejected conflict).
+#
+# S-07c: the operator applies a `{name}-pdb` PodDisruptionBudget for every
+# cluster now (`crate::desired::poddisruptionbudget`), with `maxUnavailable`
+# derived from `nodes`/`controlNodes` rather than a constant. This manifest's
+# own 3-node/3-controlNodes shape computes exactly 1
+# (floor((3-1)/2) for both the control-plane and RF-capped data-plane
+# terms) — checked once right after the initial 3/3-ready wait, and again
+# after the scale-up to 4 nodes below (pinning that the value is
+# scale-invariant once nodes/controlNodes each reach the replication
+# factor, see ADR 0060's own "Amendment (2026-09-06): S-07c" section).
+#
+# S-07d: right after the nodes:3->4 scale-up, `spec.controlNodes` is grown
+# 3 -> 4 too (promoting the already-Ready ordinal-3 pod the scale-up just
+# added into a real control voter via the operator's own ADR 0037
+# `control/member/add` automation), polling `GET /admin/control/members`
+# for the new voter count, re-checking the PDB, and re-resolving/re-
+# forwarding the serving pod (the config-hash-triggered rolling restart may
+# have recycled it) before a final GetItem proves the wire still serves.
+# See ADR 0060's own "Control-voter growth (S-07d, 2026-09-06)" section.
 #
 # Issue #595: this smoke flaked twice with the identical signature — the
 # first `CreateTable` (issued once, immediately after the statefulset
@@ -63,6 +93,27 @@
 #                       end anywhere yet. Treat a first real CI failure here
 #                       as "the TLS e2e found its first bug," not as this
 #                       comment lying.
+#   E2E_S3           - "1" adds an S-04 PR 3 leg on top of the plain-TCP
+#                       path (mutually independent of E2E_TLS — either, both,
+#                       or neither may be set): deploys a single-pod MinIO
+#                       (the well-known `minio/minio` image) + Service into
+#                       the kind cluster, creates its bucket via a throwaway
+#                       `minio/mc` pod, creates the `access_key_id`/
+#                       `secret_access_key` credentials Secret
+#                       `spec.s3.credentialsSecretName` names, applies the
+#                       AnimusCluster with `spec.s3.backupStore` pointing at
+#                       `http://minio.<ns>.svc:9000` (`allowInsecureHttp:
+#                       true` — a loopback-to-the-cluster MinIO dev target,
+#                       never a real deployment shape), then exercises
+#                       `CreateBackup`/`DescribeBackup` over the DynamoDB
+#                       wire and checks `GET /admin/backup-store` reports
+#                       `"kind":"s3"`. Default "0" (unset) leaves the smoke
+#                       byte-for-byte unchanged. UNVERIFIED in this sandbox,
+#                       same `CAP_SYS_RESOURCE` reason `E2E_TLS` is above —
+#                       written carefully and `bash -n`-checked, never run
+#                       end to end anywhere; treat a first real CI failure
+#                       on the `e2e-kind-s3` job as this leg finding its
+#                       first real bug.
 #
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
 # always tears down the kind cluster and background processes it started,
@@ -75,10 +126,24 @@ KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 E2E_TLS="${E2E_TLS:-0}"
 CERT_MANAGER_VERSION="v1.16.2"
 CLUSTER_ISSUER_NAME="e2e-selfsigned"
+E2E_S3="${E2E_S3:-0}"
+MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+MINIO_MC_IMAGE="${MINIO_MC_IMAGE:-minio/mc:latest}"
+# Throwaway kind-cluster-local credentials — never anything real, and never
+# reused outside this one ephemeral cluster's lifetime.
+MINIO_ACCESS_KEY="e2eaccesskey"
+MINIO_SECRET_KEY="e2esecretkey123"
+S3_BUCKET="e2e-backups"
+S3_CREDS_SECRET_NAME="e2e-s3-creds"
 
 CLUSTER_NAME="animus-e2e"
 NAMESPACE="animus-e2e"
 AC_NAME="e2e"
+# S-07b: the pod's own data volume mount path — must match
+# crates/animus-operator/src/desired/cluster_config.rs's DATA_DIR constant.
+# spec.segmentStore's dir:<path> below is required (AnimusClusterSpec::
+# validate_store_spec) to live under this exact prefix.
+DATA_MOUNT_DIR="/var/lib/animus"
 DYNAMO_LOCAL_PORT="18100"
 DYNAMO_REMOTE_PORT="14002" # base_port(14000) + PORT_DYNAMO(2), the CRD's own default base port.
 ADMIN_LOCAL_PORT="18101"
@@ -179,9 +244,12 @@ cleanup() {
     if [ -n "$OPERATOR_PID" ]; then
         kill "$OPERATOR_PID" >/dev/null 2>&1 || true
         wait "$OPERATOR_PID" 2>/dev/null || true
-        # `cargo run` execs the built binary as a child process it should
-        # forward signals to, but be belt-and-suspenders about a stray
-        # survivor rather than leak a background `animus-operator run`.
+        # `$OPERATOR_PID` is the already-built binary's own PID directly
+        # (execed in place of a `cargo run` supervisor — see the "run
+        # operator out-of-cluster" phase's own doc), so the `kill` above
+        # already reaches the real process; kept as belt-and-suspenders
+        # against a stray survivor rather than leak a background
+        # `animus-operator run`.
         pkill -9 -f "target/[^ ]*/animus-operator run" >/dev/null 2>&1 || true
     fi
     if [ "$KIND_CLUSTER_UP" = "true" ]; then
@@ -280,6 +348,22 @@ admin_health_ready() {
     [ "$code" = "200" ]
 }
 
+# S-07d: the number of control voters the group itself currently reports —
+# `GET /admin/control/members` is served by any node (`admin.rs`'s own
+# doc), so this can be polled through whichever pod the dynamo port-forward
+# currently targets, control-role or not.
+control_voters_count() {
+    curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/control/members" 2>/dev/null \
+        | jq -r '(.voters // []) | length' 2>/dev/null || echo 0
+}
+
+control_voters_equals() {
+    local want="$1" got
+    got="$(control_voters_count)"
+    [ -n "$got" ] && [ "$got" -eq "$want" ]
+}
+
 dynamo_call() {
     # dynamo_call TARGET BODY -> prints "STATUS\nRESPONSE_BODY"
     local target="$1" body="$2"
@@ -356,6 +440,77 @@ EOF
         kind: ClusterIssuer"
 fi
 
+S3_SPEC_YAML=""
+if [ "$E2E_S3" = "1" ]; then
+    phase "deploy MinIO (S-04 PR 3)"
+    kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: minio}
+  template:
+    metadata:
+      labels: {app: minio}
+    spec:
+      containers:
+        - name: minio
+          image: ${MINIO_IMAGE}
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "${MINIO_ACCESS_KEY}"
+            - name: MINIO_ROOT_PASSWORD
+              value: "${MINIO_SECRET_KEY}"
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: 9000}
+            periodSeconds: 2
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: ${NAMESPACE}
+spec:
+  selector: {app: minio}
+  ports:
+    - port: 9000
+      targetPort: 9000
+EOF
+    kubectl -n "$NAMESPACE" rollout status deployment/minio --timeout=120s
+
+    phase "create the MinIO bucket"
+    # A throwaway in-cluster `minio/mc` pod is the simplest way to reach the
+    # ClusterIP Service without a port-forward of its own — real S3/MinIO
+    # never auto-creates a bucket on first PUT, so this has to happen before
+    # any backup capture can succeed.
+    kubectl run mc-mb --rm -i --restart=Never -n "$NAMESPACE" \
+        --image="$MINIO_MC_IMAGE" --command -- \
+        sh -c "mc alias set local http://minio.${NAMESPACE}.svc:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} && mc mb local/${S3_BUCKET}"
+
+    phase "create the S3 credentials Secret"
+    # access_key_id/secret_access_key are the two keys crate::desired::
+    # statefulset::build mounts at /etc/animus/s3 and entrypoint.sh reads at
+    # container-start time (crate::desired::cluster_config::
+    # entrypoint_script) — never written into the ConfigMap/cluster.json.
+    kubectl create secret generic "$S3_CREDS_SECRET_NAME" -n "$NAMESPACE" \
+        --from-literal=access_key_id="$MINIO_ACCESS_KEY" \
+        --from-literal=secret_access_key="$MINIO_SECRET_KEY" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    S3_SPEC_YAML="  s3:
+    backupStore: \"s3://${S3_BUCKET}?endpoint=http://minio.${NAMESPACE}.svc:9000&insecure_http=true\"
+    credentialsSecretName: ${S3_CREDS_SECRET_NAME}
+    allowInsecureHttp: true"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -369,26 +524,75 @@ spec:
   controlNodes: 3
   storage:
     ephemeral: true
+  # S-07b: the non-S3 store CRD surface, exercised unconditionally (not
+  # gated on E2E_S3) — segmentStore rather than backupStore specifically so
+  # this composes with the E2E_S3=1 leg below, which already sets
+  # spec.s3.backupStore (spec.backupStore/spec.s3.backupStore both set is a
+  # rejected conflict; segmentStore has no such overlap here).
+  segmentStore: "dir:${DATA_MOUNT_DIR}/segments"
 ${TLS_SPEC_YAML}
+${S3_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
 
-phase "run operator out-of-cluster"
+phase "build operator (out-of-cluster)"
 (
     cd "$REPO_ROOT"
     # A caller-provided CARGO_TARGET_DIR is respected; otherwise cargo's own
     # default applies. Incremental compilation and debuginfo are off — a
     # smoke run never reuses this build, so smaller/faster wins.
     export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+    cargo build -p animus-operator --bin animus-operator
+)
+# Resolve the just-built binary's path the same way cargo itself would
+# (`$CARGO_TARGET_DIR/debug/animus-operator`, or `target/debug/animus-operator`
+# under the repo root when that env var is unset — cargo's own default).
+OPERATOR_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/animus-operator"
+[ -x "$OPERATOR_BIN" ] || {
+    log "FATAL: expected operator binary at ${OPERATOR_BIN} after the build above"
+    exit 1
+}
+
+phase "run operator out-of-cluster"
+# Built synchronously above (not `cargo run` backgrounded directly): kube-rs's
+# own dependency tree (rustls/hyper/k8s-openapi and friends) is compiled here
+# for the very first time in this script, nothing else warms the cache first,
+# and a cold build of it is easily minutes long. `cargo run` in the
+# background used to fold that entire compile into `$OPERATOR_LOG` itself —
+# every reconcile/growth `info!`/`warn!` this script's diagnostics rely on
+# ("operator log (tail 200): ...") could genuinely not have been logged yet
+# by the time anything went looking, making a merely-still-compiling process
+# indistinguishable from a stuck one. Building first, then execing the
+# already-compiled binary directly, means every line that ever lands in
+# `$OPERATOR_LOG` is real runtime tracing output, and — as a side benefit —
+# removes the `cargo run` supervisor indirection `cleanup()`'s own comment
+# above already had to work around with a belt-and-suspenders `pkill`.
+(
     export KUBECONFIG="$KIND_KUBECONFIG"
-    exec cargo run -p animus-operator -- run
+    # `animus-operator run`'s `tracing_subscriber::fmt::init()` uses
+    # `EnvFilter::from_default_env()`, which defaults to ERROR-only when
+    # `RUST_LOG` is unset — every `reconcile`/growth `info!`/`warn!` this
+    # script's own diagnostics rely on was silently dropped, making a stuck
+    # reconcile indistinguishable from a hung process. `RUST_LOG=info`
+    # surfaces both without `kube`/`hyper`'s own `debug`-level noise. (This
+    # alone does not make the log useful if the operator hasn't started
+    # running yet — see the "build first" comment above.)
+    export RUST_LOG=info
+    exec "$OPERATOR_BIN" run
 ) >"$OPERATOR_LOG" 2>&1 &
 OPERATOR_PID=$!
 log "operator running as PID ${OPERATOR_PID}, logging to ${OPERATOR_LOG}"
 
 phase "wait for 3/3 ready replicas"
 wait_for "statefulset readyReplicas==3" 300 5 -- sts_ready_equals 3
+
+phase "check the quorum-derived PodDisruptionBudget (S-07c)"
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable=1 \
+for nodes=3/controlNodes=3, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1"
 
 if [ "$E2E_TLS" = "1" ]; then
     phase "wait for the cert-manager Certificate to be issued"
@@ -455,6 +659,13 @@ phase "wait for that pod's own readiness (GET /admin/health == 200)"
 # not a replacement for it.
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
+phase "check GET /admin/segment-store reports the S-07b dir: store (kind: fs)"
+RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+    "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/segment-store")"
+KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
+[ "$KIND" = "fs" ] || fail "GET /admin/segment-store did not report store.kind \"fs\": ${RESULT}"
+log "admin/segment-store reports store.kind=fs (spec.segmentStore: dir:${DATA_MOUNT_DIR}/segments)"
+
 phase "exercise DynamoDB wire: CreateTable"
 # Issue #595: a bounded converged-or-timeout retry, scoped narrowly to the
 # one transient failure this issue is about (the control-plane commit-wait
@@ -517,6 +728,17 @@ phase "scale AnimusCluster to 4 nodes"
 kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"nodes":4}}'
 wait_for "statefulset readyReplicas==4" 300 5 -- sts_ready_equals 4
 
+phase "check the PodDisruptionBudget is scale-invariant after scale-up (S-07c)"
+# controlNodes stays 3 here (this scale-up only touches spec.nodes) and the
+# data-plane replication factor is already plateaued at 3 nodes, so
+# maxUnavailable must still be 1 — not recomputed to something larger just
+# because nodes grew.
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable to \
+stay 1 after scaling to 4 nodes, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb still reports maxUnavailable=1 after scale-up"
+
 phase "GetItem still returns the item after scale-up"
 RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \
     '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
@@ -526,6 +748,100 @@ BODY="$(dynamo_body "$RESULT")"
 NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
 [ "$NOTE" = "hello from e2e" ] || fail "post-scale GetItem did not round-trip the item: ${BODY}"
 log "post-scale GetItem ok"
+
+# S-07d: grow spec.controlNodes 3 -> 4, promoting the already-Ready,
+# already-Data-role ordinal-3 pod (added by the nodes:3->4 scale-up above)
+# into a real control voter — chosen over a fresh 3->5 growth (which would
+# need an *additional* spec.nodes scale-up first, provisioning and waiting
+# on a brand-new pod/PVC on top of the voter-add sequence itself) so this
+# leg's own runtime stays reasonable: it's the smallest possible one-voter
+# growth step, reusing a pod this script already waited on.
+phase "grow spec.controlNodes from 3 to 4 (S-07d)"
+kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"controlNodes":4}}'
+# The generated ConfigMap's role split flips immediately, which (via the
+# S-07d config-hash pod-template annotation) triggers a StatefulSet rolling
+# restart of *every* pod, not just ordinal 3 (the annotation is shared
+# across the whole pod template) — highest ordinal first, one at a time,
+# same as any other pod-template change. `GET /admin/control/members` is
+# served by any node (`admin.rs`'s own doc), so this can still be polled
+# through the pre-growth port-forward while that restart is in flight.
+wait_for "control group reports 4 voters" 300 5 -- control_voters_equals 4
+log "control group now reports 4 voters"
+
+phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
+# nodes=4/controlNodes=4 now: the control-plane term is floor((4-1)/2)=1,
+# still capped at the same value by the RF-plateaued data-plane term
+# (floor((min(4,3)-1)/2)=1) — the point of this check is that the operator
+# recomputed maxUnavailable from the *achieved* controlNodes (4), not that
+# the number itself moved.
+PDB_MAX_UNAVAIL="$(kubectl get pdb "${AC_NAME}-pdb" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.maxUnavailable}' 2>/dev/null || true)"
+[ "$PDB_MAX_UNAVAIL" = "1" ] || fail "expected PodDisruptionBudget ${AC_NAME}-pdb maxUnavailable=1 \
+after growing controlNodes to 4, got ${PDB_MAX_UNAVAIL:-<empty>}"
+log "PodDisruptionBudget ${AC_NAME}-pdb reports maxUnavailable=1 after growth"
+
+# The rolling restart above may well have recycled the exact pod this
+# script's port-forward targets (a `kubectl port-forward pod/...` dies the
+# moment that specific pod is deleted/recreated) — re-resolve and
+# re-forward the same way the original "resolve which pod .../wait for
+# readiness" phases did, rather than trusting the pre-growth forward is
+# still alive.
+phase "re-resolve and re-forward the serving pod after controlNodes growth"
+if [ -n "$PORT_FORWARD_PID" ]; then
+    kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+    wait "$PORT_FORWARD_PID" 2>/dev/null || true
+    PORT_FORWARD_PID=""
+fi
+wait_for "svc/${AC_NAME}-dynamo has a resolved endpoint" 30 1 -- has_dynamo_endpoint
+DYNAMO_POD="$(dynamo_endpoint_pod)"
+[ -n "$DYNAMO_POD" ] || fail "could not resolve a pod backing svc/${AC_NAME}-dynamo after growth"
+log "svc/${AC_NAME}-dynamo now routes to pod ${DYNAMO_POD}"
+kubectl port-forward "pod/${DYNAMO_POD}" -n "$NAMESPACE" \
+    "${DYNAMO_LOCAL_PORT}:${DYNAMO_REMOTE_PORT}" "${ADMIN_LOCAL_PORT}:${ADMIN_REMOTE_PORT}" \
+    >"$PORT_FORWARD_LOG" 2>&1 &
+PORT_FORWARD_PID=$!
+wait_for "dynamo port-forward listening" 30 1 -- port_forward_ready
+wait_for "admin port-forward listening" 30 1 -- admin_port_forward_ready
+wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
+
+phase "GetItem still returns the item after controlNodes growth"
+RESULT="$(dynamo_call "DynamoDB_20120810.GetItem" \
+    '{"TableName":"E2EItems","Key":{"id":{"S":"widget-1"}},"ConsistentRead":true}')"
+STATUS="$(dynamo_status "$RESULT")"
+BODY="$(dynamo_body "$RESULT")"
+[ "$STATUS" = "200" ] || fail "post-growth GetItem failed: status=${STATUS} body=${BODY}"
+NOTE="$(jq -r '.Item.note.S // empty' <<<"$BODY")"
+[ "$NOTE" = "hello from e2e" ] || fail "post-growth GetItem did not round-trip the item: ${BODY}"
+log "post-growth GetItem ok — controlNodes growth left the DynamoDB wire serving"
+
+if [ "$E2E_S3" = "1" ]; then
+    phase "exercise DynamoDB wire: CreateBackup (S-04 PR 3, S3 backup store)"
+    RESULT="$(dynamo_call "DynamoDB_20120810.CreateBackup" \
+        '{"TableName":"E2EItems","BackupName":"e2e-s3-backup"}')"
+    STATUS="$(dynamo_status "$RESULT")"
+    BODY="$(dynamo_body "$RESULT")"
+    [ "$STATUS" = "200" ] || fail "CreateBackup failed: status=${STATUS} body=${BODY}"
+    BACKUP_ARN="$(jq -r '.BackupDetails.BackupArn // empty' <<<"$BODY")"
+    [ -n "$BACKUP_ARN" ] || fail "CreateBackup response missing BackupDetails.BackupArn: ${BODY}"
+    log "CreateBackup ok — ${BACKUP_ARN}"
+
+    phase "exercise DynamoDB wire: DescribeBackup"
+    RESULT="$(dynamo_call "DynamoDB_20120810.DescribeBackup" \
+        "$(jq -n --arg arn "$BACKUP_ARN" '{BackupArn: $arn}')")"
+    STATUS="$(dynamo_status "$RESULT")"
+    BODY="$(dynamo_body "$RESULT")"
+    [ "$STATUS" = "200" ] || fail "DescribeBackup failed: status=${STATUS} body=${BODY}"
+    DESCRIBED_ARN="$(jq -r '.BackupDescription.BackupDetails.BackupArn // empty' <<<"$BODY")"
+    [ "$DESCRIBED_ARN" = "$BACKUP_ARN" ] || fail "DescribeBackup returned a different BackupArn: ${BODY}"
+    log "DescribeBackup ok"
+
+    phase "check GET /admin/backup-store reports kind: s3"
+    RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/backup-store")"
+    KIND="$(jq -r '.store.kind // empty' <<<"$RESULT")"
+    [ "$KIND" = "s3" ] || fail "GET /admin/backup-store did not report store.kind \"s3\": ${RESULT}"
+    log "admin/backup-store reports store.kind=s3 (${RESULT})"
+fi
 
 phase "delete AnimusCluster and verify GC"
 kubectl delete animuscluster "$AC_NAME" -n "$NAMESPACE"

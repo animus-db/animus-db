@@ -209,6 +209,86 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
   `run_control_add`'s own operator-supplied form is unchanged except that
   the id is now re-validated via `NodeId::propose` and the old
   "`ALLOC_ID_BASE`-range" refusal is gone (no ranges exist anymore).
+- **Dynamo-proxy wrappers** (roadmap U-08(ii)): `backup-create`/
+  `backup-delete`/`restore`/`pitr-enable`/`pitr-disable`/`ttl`/`stream` are
+  the last flat mutating group — each a thin `POST /admin/data/dynamo
+  {op, payload}` (ADR 0021), reusing the exact wire shapes the dashboard
+  already sends for these same actions (`dashboard_backups.js`'s
+  `createBackup`/`deleteBackup`/`restoreBackup`/`togglePitr`,
+  `dashboard_browser.js`'s `enableTtl`/`disableTtl`/the stream row's
+  enable/disable calls) rather than inventing a second wire contract for
+  the same six DynamoDB operations:
+
+  ```
+  backup-create <admin-addr> <table> <backup-name>       # CreateBackup
+  backup-delete <admin-addr> <backup-arn>                # DeleteBackup
+  restore <admin-addr> <backup-arn> <target-table>        # RestoreTableFromBackup
+  pitr-enable|pitr-disable <admin-addr> <table>           # UpdateContinuousBackups
+  ttl <admin-addr> <table> <attribute> [--disable]        # UpdateTimeToLive
+  stream <admin-addr> <table> <VIEW_TYPE|off>             # UpdateTable{StreamSpecification}
+  ```
+
+  `ttl` (bare) was deliberately left unclaimed by `ttl-reaper`'s own GET
+  route (see that arm's own comment in `admin_request`) for exactly this
+  wrapper. `stream`'s `<VIEW_TYPE>` is one of DynamoDB's four real
+  `StreamViewType`s (`NEW_IMAGE`/`OLD_IMAGE`/`NEW_AND_OLD_IMAGES`/
+  `KEYS_ONLY`) or the literal `off` to disable — validated client-side
+  (an unknown view type is a plain CLI error, not a round trip that comes
+  back a wire-level `ValidationException`). None of these six ops needed
+  a proxy allow-list change — `animusd::admin::action_data_dynamo` has
+  none beyond the bare-name Streams-vs-item disambiguation, and none of
+  these are Streams ops. `admin_request`'s own unit tests cover the happy
+  path, a missing-argument error, and the `--disable`/`off` variants for
+  every one of the six.
+- **`export-create`/`export-describe`/`export-list` (ADR 0068, S-05 PR 1)**
+  join the same dynamo-proxy group, one more `POST /admin/data/dynamo
+  {op, payload}` triple over the new `ExportTableToPointInTime`/
+  `DescribeExport`/`ListExports` wire operations:
+
+  ```
+  export-create <admin-addr> <table-arn> <s3-bucket> [s3-prefix]   # ExportTableToPointInTime
+  export-describe <admin-addr> <export-arn>                        # DescribeExport
+  export-list <admin-addr> [table-arn]                             # ListExports
+  ```
+
+  `export-create` takes a table **ARN**, not a bare table name, matching
+  the real `ExportTableToPointInTime` wire shape (`animus_dynamo::wire::
+  table_arn` mints one from a bare name if a caller has only that);
+  `s3-prefix` is optional, omitted from the payload entirely when absent
+  rather than sent as an empty string. No `ExportTime`/`ClientToken`
+  flags yet — this wrapper covers the common case (a fresh export to a
+  customer bucket, no idempotency token needed for a one-shot CLI
+  invocation). Like the six wrappers above, no proxy allow-list change was
+  needed (none of these three are Streams ops), and `admin_request`'s own
+  unit tests cover the happy path, the optional-prefix omission, and a
+  missing-argument error for all three.
+- **`import-create`/`import-describe`/`import-list` (ADR 0068 §6, S-05 PR
+  2)** are the mirror-image trio, over `ImportTable`/`DescribeImport`/
+  `ListImports`:
+
+  ```
+  import-create <admin-addr> <table> <s3-bucket> [s3-prefix] [--gzip|--none] \
+      --pk name:TYPE [--sk name:TYPE]                                # ImportTable
+  import-describe <admin-addr> <import-arn>                          # DescribeImport
+  import-list <admin-addr> [table-arn]                               # ListImports
+  ```
+
+  **`import-create` takes a bare table *name*, not an ARN** (unlike
+  `export-create`) — the target table does not exist yet at call time, so
+  there is no ARN to name it by until this call creates it. `--pk
+  name:TYPE` is required (this wrapper builds a minimal single-hash-key
+  `TableCreationParameters`; no GSI/throughput flags yet — the common
+  case, matching `export-create`'s own "covers the common case" scope);
+  `--sk name:TYPE` adds a composite sort key. `[s3-prefix]` is positional
+  like `export-create`'s, disambiguated from the flags that follow it by
+  checking for a leading `--` (an arg starting with `--` at that position
+  means the prefix was omitted, not supplied as `"--gzip"` or similar).
+  Compression defaults to `GZIP` (this adapter's own export job — and
+  real AWS's own export tooling — always gzips); `--none` requests
+  `InputCompressionType: "NONE"`. `admin_request`'s own unit tests cover
+  the happy path (with and without a sort key/prefix/`--none`), the
+  missing-`<table>`/`<s3-bucket>`/`--pk` errors, and a malformed `--pk`
+  (no `:TYPE`).
 - **`control-remove ... [--force]` (ADR 0037 hardening PR2, PR #136, the quorum-guard
   liveness fix)**: the server now refuses a removal that would leave fewer
   than a majority of the *resulting* voters reachable (per
@@ -232,7 +312,19 @@ behavior have no tests of their own here; they're covered end-to-end by
 (`tests/decommission.rs` among others). `main.rs` does carry a `#[cfg(test)]`
 module (`cargo test -p animus-cli`) for `admin_request` — the pure
 `(subcommand, args) -> (method, path, body)` step of `run_admin`'s flat GET
-dispatch — and its `flag_value` helper; it opens no sockets. Also
+**and POST** dispatch (every mutating one-shot route, including the U-08(ii)
+dynamo-proxy wrappers above, builds its request through this same function)
+— and its `flag_value` helper; it opens no sockets. No `animusd`
+integration test exercises the real `animus` binary end to end — `animusd`
+has no dependency on `animus-cli` at all (`tests/control_membership_admin.rs`
+mirrors `internal_addr_from_admin_config`'s key path rather than calling
+it) — so these parser-level unit tests are this crate's only coverage of
+the six new wrappers; the underlying `/admin/data/dynamo` route itself is
+exercised by `animusd`'s existing dashboard-action tests
+(`dashboard_endpoint.rs`'s U-02/U-04 cases) and the DynamoDB wire suites
+those ops already have (`dynamo_backup.rs`, `dynamo_restore.rs`,
+`dynamo_pitr_restore.rs`, `dynamo_ttl.rs`, `dynamo_streams.rs`), unrelated
+to this crate. Also
 `extract_tls_ca` (found anywhere in args / absent / trailing with no
 value) and `build_tls_connector` (rejects a missing file and a file with
 no certificates) — pure/local-filesystem-only, no socket, no live TLS

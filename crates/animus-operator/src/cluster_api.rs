@@ -15,8 +15,9 @@
 //! seam.
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client};
@@ -43,6 +44,16 @@ pub trait ClusterApi: Send + Sync {
     /// Server-side-apply `np`.
     async fn apply_networkpolicy(&self, ns: &str, np: &NetworkPolicy)
     -> Result<(), ReconcileError>;
+    /// Server-side-apply `pdb` (S-07c) — the quorum-derived
+    /// `PodDisruptionBudget`, applied unconditionally on every reconcile
+    /// like every other required child (never optional the way `spec.tls.
+    /// certManager`'s `Certificate` is — see `desired::poddisruptionbudget`'s
+    /// own module doc for why there is no toggle for this one).
+    async fn apply_poddisruptionbudget(
+        &self,
+        ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError>;
     /// Server-side-apply `sts`, returning the object the API server stored
     /// (its `status.readyReplicas` is what `finish_reconcile` computes
     /// `AnimusClusterStatus.phase` from).
@@ -87,6 +98,16 @@ pub trait ClusterApi: Send + Sync {
     /// `Secret` for the admin client's TLS connector (`crate::controller`'s
     /// scale-down drain sequence).
     async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError>;
+    /// The live `status.podIP` of the `Pod` named `pod_name` (`crate::
+    /// desired::pod_name`), or `None` if the pod doesn't exist or has no IP
+    /// yet — S-07d's one-time control-voter `member/add` dial address for a
+    /// newly-promoted ordinal (see `crate::controller`'s growth machinery
+    /// doc for why this reads the Kubernetes API rather than resolving the
+    /// pod's stable DNS name: a `SocketAddr`, not a hostname, is what the
+    /// admin API's `member/add` body needs, and reading the API directly is
+    /// both more testable and more immediately authoritative than a DNS
+    /// lookup).
+    async fn get_pod_ip(&self, ns: &str, pod_name: &str) -> Result<Option<String>, ReconcileError>;
 }
 
 /// The production [`ClusterApi`]: every method is exactly the `kube::Api`
@@ -136,6 +157,21 @@ impl ClusterApi for RealClusterApi {
                 np.metadata.name.as_deref().unwrap(),
                 &apply_params(),
                 &Patch::Apply(np),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_poddisruptionbudget(
+        &self,
+        ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError> {
+        Api::<PodDisruptionBudget>::namespaced(self.client.clone(), ns)
+            .patch(
+                pdb.metadata.name.as_deref().unwrap(),
+                &apply_params(),
+                &Patch::Apply(pdb),
             )
             .await?;
         Ok(())
@@ -213,5 +249,13 @@ impl ClusterApi for RealClusterApi {
         Ok(Api::<Secret>::namespaced(self.client.clone(), ns)
             .get_opt(name)
             .await?)
+    }
+
+    async fn get_pod_ip(&self, ns: &str, pod_name: &str) -> Result<Option<String>, ReconcileError> {
+        Ok(Api::<Pod>::namespaced(self.client.clone(), ns)
+            .get_opt(pod_name)
+            .await?
+            .and_then(|p| p.status)
+            .and_then(|s| s.pod_ip))
     }
 }

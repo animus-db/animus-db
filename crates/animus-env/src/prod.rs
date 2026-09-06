@@ -565,7 +565,7 @@ impl Network for ProdEnv {
         };
         // Fire-and-forget semantics: a transport error is the network dropping
         // the message, not an error to the caller (see `Network::send`).
-        let from = &self.inner.node_id;
+        let from = self.inner.node_id.clone();
         // Grab (or create) this address's connection slot. The map lock is a
         // `StdMutex` and must not be held across an `.await` — clone the
         // per-address `Arc` out and drop the guard before any I/O.
@@ -573,18 +573,33 @@ impl Network for ProdEnv {
             let mut conns = self.inner.conns.lock().expect("conns poisoned");
             Arc::clone(conns.entry(addr.clone()).or_default())
         };
-        if let Err(err) = send_frame_pooled(
-            &slot,
-            &addr,
-            from,
-            stream,
-            &payload,
-            self.inner.tls.as_ref(),
-        )
-        .await
-        {
-            tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
-        }
+        let tls = self.inner.tls.clone();
+        // Issue #661: run the actual connect+write on its own task, bounded by
+        // `SEND_TIMEOUT`, instead of inline on this `.await` — see
+        // `SEND_TIMEOUT`'s own doc for why a caller (most importantly a Raft
+        // driver's own outbound-dispatch loop, which awaits one peer at a time)
+        // must never be made to depend on this *particular* peer's own
+        // reachability: a raw `TcpStream::connect`/write against a silently
+        // unreachable address (no RST — e.g. a Kubernetes pod's collapsed
+        // network endpoint after a hard restart) can otherwise ride the OS's
+        // own multi-minute TCP retry timeout, during which every other peer
+        // queued behind it in the same loop gets nothing at all.
+        self.spawn(Box::pin(async move {
+            match tokio::time::timeout(
+                SEND_TIMEOUT,
+                send_frame_pooled(&slot, &addr, &from, stream, &payload, tls.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(to = %to, %addr, "send timed out (dropped)");
+                }
+            }
+        }));
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
@@ -630,6 +645,35 @@ async fn wait_all_finished(handles: &[tokio::task::AbortHandle]) {
 /// of an election timeout, not linger backed off while peers time out
 /// waiting to reach this node.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Bound on one outbound frame's whole connect+write ([`send_frame_pooled`],
+/// including its one-shot reconnect) — issue #661.
+///
+/// `Network::send`/`send_stream` are documented fire-and-forget (see that
+/// trait's own doc): the caller must never be made to depend on the
+/// destination's own reachability. Before this bound existed,
+/// `send_stream`'s connect+write ran inline on the caller's own `.await`
+/// with no timeout at all, so a peer that was silently unreachable — no RST,
+/// no ICMP, just dropped packets, exactly what a hard-killed Kubernetes
+/// pod's collapsed network endpoint looks like to a sender that had a
+/// connection cached to its old IP — rode the OS's own TCP SYN-retry /
+/// retransmission timeout, commonly a minute or more. That is invisible on
+/// any inline caller that dispatches to several peers **in the same task**,
+/// most importantly a Raft driver's own outbound-message loop
+/// (`animus-control`/`animus-cp-data`'s `drive`, which `.await`s
+/// `env.send(..)` once per peer, sequentially): a single unreachable peer
+/// stalled delivery to *every other* peer queued behind it in that same
+/// dispatch round, starving the whole node's heartbeat/AppendEntries/vote
+/// traffic — the network-path twin of issue #279's slow-fsync livelock, and
+/// (unlike #279) invisible to `SimEnv`, which has no real sockets and no OS
+/// TCP retry timers. `send_stream` now spawns the connect+write onto its own
+/// task (see its own doc) *and* bounds it here, so both the caller and every
+/// other peer's own dispatch are decoupled from this one peer's fate.
+/// Generous relative to `heartbeat_interval`/`election_base` (a merely-slow-
+/// but-live peer must never look like a timeout) yet far below the OS's own
+/// multi-minute default — see `docs/engineering-lessons.md`'s matching
+/// entry for the incident this closes.
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Spawn the accept loop for `listener` — one reader task per inbound connection,
 /// each demuxing length-prefixed frames into a fresh inbox channel. Returns the
@@ -1467,6 +1511,60 @@ mod tests {
             "stream Y must receive exactly its own N frames — isolated from \
              stream X's concurrent traffic to the same (from, to) pair"
         );
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Issue #661 (the S-07d kind-e2e control-plane outage root cause): a
+    /// peer whose address is silently unreachable — no RST, no ICMP, packets
+    /// just dropped, modelled here with the reserved/unrouted
+    /// `10.255.255.1` (a real black hole in this sandbox: a bare
+    /// `TcpStream::connect` to it does not fail within several seconds,
+    /// confirmed by probing it directly before writing this test) — must
+    /// never delay delivery to a *different*, live peer sequenced right
+    /// after it in the same caller, the way a Raft driver's own
+    /// outbound-dispatch loop sequences `env.send(..).await` once per peer
+    /// in one task. Before the `send_stream` fix this regresses, both sends
+    /// ran inline on the caller's own `.await`, so the black-holed send
+    /// would have stalled the whole loop for the OS's own multi-minute TCP
+    /// retry timeout before the live peer ever saw its frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_to_an_unreachable_peer_does_not_delay_a_live_peers_delivery() {
+        use crate::Network;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let (a, b, _b_addr) = bound_pair(&dir_a, &dir_b).await;
+        // A reserved, unrouted address: connecting to it hangs rather than
+        // failing fast (see this test's own doc) — exactly the "old pod IP,
+        // now a collapsed endpoint" shape the incident hit.
+        a.merge_peer(nid(2), "10.255.255.1:1".to_string());
+
+        let before = Instant::now();
+        // Mirrors `RaftNode`'s own driver loop: dispatch to the unreachable
+        // peer first, then the live one, both sequentially `.await`ed in this
+        // one task.
+        a.send(nid(2), b"never-arrives".to_vec()).await;
+        a.send(nid(1), b"still-prompt".to_vec()).await;
+        let dispatch_elapsed = before.elapsed();
+        assert!(
+            dispatch_elapsed < Duration::from_secs(1),
+            "both sends (to the black-holed peer, then the live one) must return \
+             promptly — took {dispatch_elapsed:?}. A regression here means \
+             `send_stream` is back to running its connect+write inline instead \
+             of spawned (issue #661)."
+        );
+
+        let env = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .expect(
+                "live peer's frame must still arrive well within SEND_TIMEOUT, \
+                     unblocked by the unreachable peer queued ahead of it",
+            );
+        assert_eq!(env.payload, b"still-prompt");
 
         a.shutdown();
         b.shutdown();

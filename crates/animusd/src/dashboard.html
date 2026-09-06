@@ -332,6 +332,18 @@
 
     <section id="storage">
       <div class="view-head"><h1>Storage</h1></div>
+      <div class="card scroll" id="ttl-card" style="margin-bottom:14px">
+        <h2>TTL reaper</h2>
+        <div id="ttl-body"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card" id="gc-card" style="margin-bottom:14px">
+        <h2>GC (stream segment janitor)</h2>
+        <div id="gc-body"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card scroll" id="seg-store-card" style="margin-bottom:14px">
+        <h2>Segment store</h2>
+        <div id="seg-store-body"><div class="empty">loading…</div></div>
+      </div>
       <div class="row" style="margin-bottom:10px">
         <label>control node</label><select id="ctl-node"></select>
         <button id="ctl-load">Load</button>
@@ -402,6 +414,10 @@
         </div>
       </div>
       <div class="row" style="margin-bottom:6px"><span class="muted" id="bk-action-msg"></span></div>
+      <div class="card" id="bk-store-card" style="margin-bottom:14px">
+        <h2>Backup store</h2>
+        <div id="bk-store-body"><div class="empty">loading…</div></div>
+      </div>
       <div class="card scroll" style="margin-bottom:14px">
         <h2>Backups</h2>
         <div id="bk-list-body"><div class="empty">loading…</div></div>

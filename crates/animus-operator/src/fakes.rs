@@ -10,12 +10,13 @@
 //! resourceVersion/conflict semantics, admission, or watch events — it is a
 //! same-process record-and-serve store, not `kube`'s own wire protocol.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetStatus};
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::core::DynamicObject;
 use serde_json::Value;
 
@@ -30,6 +31,7 @@ pub enum AppliedKind {
     ConfigMap,
     Service,
     NetworkPolicy,
+    PodDisruptionBudget,
     StatefulSet,
     Certificate,
 }
@@ -46,6 +48,9 @@ pub struct FakeClusterApi {
     statefulsets: Mutex<BTreeMap<String, StatefulSet>>,
     status_patches: Mutex<Vec<AnimusClusterStatus>>,
     secrets: Mutex<BTreeMap<String, Secret>>,
+    networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
+    poddisruptionbudgets: Mutex<BTreeMap<String, PodDisruptionBudget>>,
+    pod_ips: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeClusterApi {
@@ -118,6 +123,35 @@ impl FakeClusterApi {
             .unwrap()
             .insert(name.to_string(), secret);
     }
+
+    /// The `NetworkPolicy` currently stored under `name` (the most recently
+    /// applied one) — used to assert on the generated egress rules from a
+    /// `reconcile`-level test (S-04 PR 3), the same way `configmap`/
+    /// `get_statefulset` let a test inspect other applied children.
+    #[must_use]
+    pub fn networkpolicy(&self, name: &str) -> Option<NetworkPolicy> {
+        self.networkpolicies.lock().unwrap().get(name).cloned()
+    }
+
+    /// The `PodDisruptionBudget` currently stored under `name` (the most
+    /// recently applied one) — used to assert on the computed
+    /// `maxUnavailable`/selector from a `reconcile`-level test (S-07c),
+    /// the same way `configmap`/`networkpolicy` let a test inspect other
+    /// applied children.
+    #[must_use]
+    pub fn poddisruptionbudget(&self, name: &str) -> Option<PodDisruptionBudget> {
+        self.poddisruptionbudgets.lock().unwrap().get(name).cloned()
+    }
+
+    /// Seed a pod's `status.podIP` (S-07d) — used to drive the control-voter
+    /// growth step's dial-address resolution (`crate::controller::
+    /// resolve_control_dial_addr`).
+    pub fn seed_pod_ip(&self, pod_name: &str, ip: &str) {
+        self.pod_ips
+            .lock()
+            .unwrap()
+            .insert(pod_name.to_string(), ip.to_string());
+    }
 }
 
 #[async_trait::async_trait]
@@ -150,7 +184,28 @@ impl ClusterApi for FakeClusterApi {
         self.applies
             .lock()
             .unwrap()
-            .push((AppliedKind::NetworkPolicy, name));
+            .push((AppliedKind::NetworkPolicy, name.clone()));
+        self.networkpolicies
+            .lock()
+            .unwrap()
+            .insert(name, np.clone());
+        Ok(())
+    }
+
+    async fn apply_poddisruptionbudget(
+        &self,
+        _ns: &str,
+        pdb: &PodDisruptionBudget,
+    ) -> Result<(), ReconcileError> {
+        let name = pdb.metadata.name.clone().unwrap();
+        self.applies
+            .lock()
+            .unwrap()
+            .push((AppliedKind::PodDisruptionBudget, name.clone()));
+        self.poddisruptionbudgets
+            .lock()
+            .unwrap()
+            .insert(name, pdb.clone());
         Ok(())
     }
 
@@ -220,6 +275,14 @@ impl ClusterApi for FakeClusterApi {
     async fn get_secret(&self, _ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
         Ok(self.secrets.lock().unwrap().get(name).cloned())
     }
+
+    async fn get_pod_ip(
+        &self,
+        _ns: &str,
+        pod_name: &str,
+    ) -> Result<Option<String>, ReconcileError> {
+        Ok(self.pod_ips.lock().unwrap().get(pod_name).cloned())
+    }
 }
 
 /// An in-memory [`AdminOps`]: records every call (method + url, in call
@@ -237,6 +300,35 @@ pub struct FakeAdminClient {
     drain_status_responses: Mutex<VecDeque<Value>>,
     fail_drain: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    /// S-07d: the control group's own live voter-id set — `GET
+    /// /admin/control/members` always answers straight from this (never
+    /// queued/consumed, unlike `drain_status_responses` above, since a test
+    /// wants to seed a starting shape and then watch it grow as
+    /// `POST .../member/add` calls land on it).
+    control_voters: Mutex<BTreeSet<String>>,
+    /// S-07d: which ordinals' `GET /admin/config` reports role `"combined"`
+    /// (`animusd`'s own literal for a node running both roles —
+    /// `AdminInfo.role`, pinned by `crates/animusd/tests/dashboard_
+    /// endpoint.rs`'s own `config_view["role"] == "combined"` assertion;
+    /// **never** `"both"`, which is an unrelated field on the generated
+    /// `cluster.json` — see `controller::ordinal_reports_role_both`'s own
+    /// doc) — parsed out of the request URL's own `{name}-{ordinal}.` host
+    /// prefix (`ordinal_from_url`), since every admin call this crate makes
+    /// is already addressed per-ordinal that way. Field/method names here
+    /// keep the `_both`/`ready_both` spelling (the CRD-facing concept, "this
+    /// ordinal now runs both roles") deliberately — only the JSON literal
+    /// they emit had to match `animusd`'s real one.
+    ready_both_ordinals: Mutex<BTreeSet<i32>>,
+    /// S-07d: which voter-ordinal admin ports refuse
+    /// `POST .../admin/control/member/add` — lets a test exercise
+    /// `add_control_voter`'s "try the next already-confirmed voter" retry
+    /// without needing a real leader/follower distinction in the fake.
+    fail_control_member_add_ordinals: Mutex<BTreeSet<i32>>,
+    /// S-07d: make every `GET .../admin/control/members` call fail — lets a
+    /// test exercise `advance_control_growth`'s "can't observe live truth
+    /// this reconcile" diagnosability path (every ordinal 0..target
+    /// unreachable) without needing a real network partition.
+    fail_control_members: Mutex<bool>,
 }
 
 impl FakeAdminClient {
@@ -272,6 +364,60 @@ impl FakeAdminClient {
     pub fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// Seed the control group's own starting voter-id set (S-07d) — `GET
+    /// /admin/control/members` answers from this until a
+    /// `POST .../member/add` call grows it.
+    pub fn seed_control_voters<I: IntoIterator<Item = String>>(&self, voters: I) {
+        *self.control_voters.lock().unwrap() = voters.into_iter().collect();
+    }
+
+    /// The control group's own live voter-id set right now (S-07d) — lets a
+    /// test assert on what growth actually landed without re-deriving it
+    /// from `calls()`.
+    #[must_use]
+    pub fn control_voters(&self) -> BTreeSet<String> {
+        self.control_voters.lock().unwrap().clone()
+    }
+
+    /// Mark ordinal `ordinal` as having restarted into combined mode — its
+    /// `GET /admin/config` reports `role: "combined"` (`animusd`'s real
+    /// literal, not `"both"`) from this point on; every other ordinal
+    /// defaults to `"data"` (S-07d).
+    pub fn mark_ordinal_ready_both(&self, ordinal: i32) {
+        self.ready_both_ordinals.lock().unwrap().insert(ordinal);
+    }
+
+    /// Make `POST .../admin/control/member/add` fail specifically when
+    /// dialed against voter ordinal `ordinal`'s own admin port (S-07d) —
+    /// the growth step's own equivalent of `fail_drain`, scoped per-ordinal
+    /// so a test can exercise the "try the next voter" retry.
+    pub fn fail_add_control_member_for_ordinal(&self, ordinal: i32) {
+        self.fail_control_member_add_ordinals
+            .lock()
+            .unwrap()
+            .insert(ordinal);
+    }
+
+    /// Make every future `GET .../admin/control/members` call fail (S-07d)
+    /// — every ordinal in `0..target` refuses/times out, the
+    /// "can't observe live truth this reconcile" branch of
+    /// `advance_control_growth`.
+    pub fn fail_control_members(&self) {
+        *self.fail_control_members.lock().unwrap() = true;
+    }
+}
+
+/// Pulls `{ordinal}` out of a `{name}-{ordinal}.{name}-internal....` admin
+/// URL host (`crate::desired::pod_fqdn`'s own shape, which every admin call
+/// this crate makes is addressed through) — S-07d's `FakeAdminClient` uses
+/// this to answer `GET /admin/config` per-ordinal without a caller having
+/// to pass the ordinal in separately.
+fn ordinal_from_url(url: &str) -> Option<i32> {
+    let host = url.split("://").nth(1)?.split(['/', ':']).next()?;
+    let first_label = host.split('.').next()?;
+    let (_, ordinal) = first_label.rsplit_once('-')?;
+    ordinal.parse().ok()
 }
 
 #[async_trait::async_trait]
@@ -279,13 +425,30 @@ impl AdminOps for FakeAdminClient {
     async fn post_json(
         &self,
         url: &str,
-        _body: &Value,
+        body: &Value,
         _ca_pem: Option<&[u8]>,
     ) -> Result<Value, String> {
         self.calls
             .lock()
             .unwrap()
             .push(("POST".to_string(), url.to_string()));
+        if url.contains("/admin/control/member/add") {
+            let target_ordinal = ordinal_from_url(url);
+            if target_ordinal.is_some_and(|o| {
+                self.fail_control_member_add_ordinals
+                    .lock()
+                    .unwrap()
+                    .contains(&o)
+            }) {
+                return Err("control/member/add failed (fake)".to_string());
+            }
+            let node = body["node"]
+                .as_str()
+                .ok_or("fake control/member/add: request body has no `node`")?
+                .to_string();
+            self.control_voters.lock().unwrap().insert(node.clone());
+            return Ok(serde_json::json!({"ok": true, "node": node}));
+        }
         if url.contains("/admin/member/remove") {
             if *self.fail_remove.lock().unwrap() {
                 return Err("remove failed (fake)".to_string());
@@ -301,6 +464,27 @@ impl AdminOps for FakeAdminClient {
             .lock()
             .unwrap()
             .push(("GET".to_string(), url.to_string()));
+        if url.contains("/admin/control/members") {
+            if *self.fail_control_members.lock().unwrap() {
+                return Err("control/members unreachable (fake)".to_string());
+            }
+            let voters: Vec<String> = self
+                .control_voters
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            return Ok(serde_json::json!({ "voters": voters }));
+        }
+        if url.contains("/admin/config") {
+            let ordinal = ordinal_from_url(url);
+            let ready =
+                ordinal.is_some_and(|o| self.ready_both_ordinals.lock().unwrap().contains(&o));
+            // "combined", never "both" — the real `animusd` literal
+            // (`AdminInfo.role`), see `ready_both_ordinals`'s own doc.
+            return Ok(serde_json::json!({ "role": if ready { "combined" } else { "data" } }));
+        }
         let mut queue = self.drain_status_responses.lock().unwrap();
         if queue.len() > 1 {
             Ok(queue.pop_front().unwrap())
