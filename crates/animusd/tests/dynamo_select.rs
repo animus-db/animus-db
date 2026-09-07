@@ -1,18 +1,15 @@
-//! End-to-end test of `Query`/`Scan`'s `Select` over the real DynamoDB
-//! JSON/HTTP wire.
+//! End-to-end test of `Query`'s `Select: COUNT` against a **GSI** over the
+//! real DynamoDB JSON/HTTP wire — the index leaf reaches the same `Select`
+//! builder as the base table.
 //!
-//! `Select` was previously not decoded at all, so `Select: COUNT` — "how many
-//! match, don't send them" — silently returned every item. That is both the
-//! wrong response shape and an unbounded payload for a request whose whole
-//! point is to avoid one.
+//! **ADR 0061 rung D3 PR 3a moved six of this file's seven tests to
+//! `SimCluster`** (`crates/animusd/src/sim_cluster_dynamo_select.rs`) — the
+//! base-table `Query`/`Scan` `COUNT`/`SPECIFIC_ATTRIBUTES`/validation tests;
+//! see that module's own doc. **Only `count_select_applies_to_a_gsi_query`
+//! stays here**: it reads a materialized GSI row, which `SimCluster` cannot
+//! produce (no `index_drain::change_consumer_loop`).
 //!
-//! The load-bearing property is that `COUNT` changes only what is *returned*,
-//! never what is *read*: a filter still runs, `Limit` still caps what is
-//! examined, and a truncated `COUNT` page still carries a `LastEvaluatedKey`.
-//! So `Count` is the matches on this page, not of the whole query — a client
-//! wanting a total must still page to exhaustion.
-//!
-//! Real time/sockets, so every assertion polls with generous timeouts.
+//! Real time/sockets, so this assertion polls with generous timeouts.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -119,35 +116,6 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
-/// Extract the raw `LastEvaluatedKey` JSON object verbatim from a `Query`
-/// response body — brace-matched, since it can be an arbitrary
-/// AttributeValue map shape (a base cursor is `{pk,sk}`; a GSI cursor also
-/// carries the index's own hash/sort attributes; an LSI cursor the index's
-/// alt-sort attribute — see `dynamo_index_scan.rs`'s identical helper).
-/// `None` when the page wasn't truncated.
-fn extract_last_evaluated_key(body: &str) -> Option<String> {
-    let marker = "\"LastEvaluatedKey\":";
-    let start = body.find(marker)? + marker.len();
-    let bytes = body.as_bytes();
-    if bytes.get(start) != Some(&b'{') {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(body[start..start + i + 1].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Stand up a 3-node cluster with one table (`events`, composite key
 /// `pk`/`sk`) carrying a hash-only GSI (`by-cat`, hash `cat`) and an LSI
 /// (`by-score`, alt-sort `score`) — six items, all in base partition
@@ -220,222 +188,6 @@ fn field(body: &str, name: &str) -> Option<i64> {
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
-}
-
-/// The headline fix: `Select: COUNT` returns counts and **no** `Items`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn count_select_returns_counts_without_items() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
-        // just-written rows, which the eventual wire default is not
-        // guaranteed to reflect yet.
-        r#"{"TableName":"events","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "Select":"COUNT"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "COUNT query failed: {body}");
-    assert!(
-        !body.contains("\"Items\""),
-        "COUNT must not carry an Items array: {body}"
-    );
-    assert_eq!(field(&body, "Count"), Some(6), "{body}");
-    assert_eq!(field(&body, "ScannedCount"), Some(6), "{body}");
-    // The items really are absent, not merely an empty array.
-    assert!(!body.contains("\"a0\""), "no item payload leaked: {body}");
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `COUNT` still runs the filter — `Count` is matches, `ScannedCount` is
-/// what was examined. If the filter were skipped the two would be equal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn count_select_still_applies_the_filter() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
-        // just-written rows, which the eventual wire default is not
-        // guaranteed to reflect yet.
-        r#"{"TableName":"events","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p",
-            "FilterExpression":"parity = :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}},
-            "Select":"COUNT"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "filtered COUNT failed: {body}");
-    assert!(!body.contains("\"Items\""), "{body}");
-    assert_eq!(field(&body, "Count"), Some(3), "three even items: {body}");
-    assert_eq!(
-        field(&body, "ScannedCount"),
-        Some(6),
-        "all six were examined: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// A truncated `COUNT` page still paginates: `Limit` caps what is examined
-/// and the cursor lets the caller keep counting. This is what makes `Count`
-/// a per-page number rather than a total.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn count_select_paginates_and_sums_to_the_whole_partition() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let mut total = 0i64;
-    let mut cursor: Option<String> = None;
-    let mut pages = 0usize;
-    loop {
-        pages += 1;
-        assert!(pages < 20, "COUNT pagination did not terminate");
-        let esk = match &cursor {
-            Some(c) => format!(",\"ExclusiveStartKey\":{c}"),
-            None => String::new(),
-        };
-        let req = format!(
-            // `ConsistentRead: true` (ADR 0055): this walk rotates across
-            // nodes, and the wire default is now served from whichever replica
-            // the receiving node holds — consecutive pages would otherwise
-            // sample different, independently-lagging views. The strong read
-            // still exercises the forwarded path the rotation exists to cover.
-            r#"{{"TableName":"events","ConsistentRead":true,
-                 "KeyConditionExpression":"pk = :p",
-                 "ExpressionAttributeValues":{{":p":{{"S":"p1"}}}},
-                 "Select":"COUNT","Limit":2{esk}}}"#
-        );
-        let (status, body) =
-            dynamo_retry(addrs[pages % addrs.len()], "DynamoDB_20120810.Query", &req).await;
-        assert_eq!(status, 200, "COUNT page failed: {body}");
-        assert!(!body.contains("\"Items\""), "still no Items: {body}");
-        total += field(&body, "Count").unwrap_or_default();
-        match extract_last_evaluated_key(&body) {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    assert_eq!(total, 6, "the pages sum to the whole partition");
-    assert!(pages > 1, "the walk really was paginated ({pages} pages)");
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `Select: COUNT` reaches `Scan` through the same decode path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn count_select_applies_to_scan() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[2],
-        "DynamoDB_20120810.Scan",
-        // ConsistentRead: true (ADR 0055, #603): asserts on the test's own
-        // just-written rows, which the eventual wire default is not
-        // guaranteed to reflect yet.
-        r#"{"TableName":"events","ConsistentRead":true,"Select":"COUNT"}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "COUNT scan failed: {body}");
-    assert!(!body.contains("\"Items\""), "{body}");
-    assert!(
-        field(&body, "Count").unwrap_or_default() >= 6,
-        "the scan counted the table: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// `SPECIFIC_ATTRIBUTES` alongside a projection is accepted and returns
-/// exactly the projected attributes — the value that must keep working.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn specific_attributes_returns_the_projection() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        // ConsistentRead: true (ADR 0055, #603): the Limit:1 assertion needs
-        // to actually see one of the test's own just-written rows, which the
-        // eventual wire default is not guaranteed to reflect yet.
-        r#"{"TableName":"events","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ProjectionExpression":"sk","Select":"SPECIFIC_ATTRIBUTES","Limit":1}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "SPECIFIC_ATTRIBUTES failed: {body}");
-    assert!(body.contains("\"sk\""), "the projected attribute: {body}");
-    assert!(
-        !body.contains("\"parity\""),
-        "an unprojected attribute must not appear: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// The validations DynamoDB performs, which this adapter previously accepted
-/// silently. Each must be a 400 `ValidationException`, not a 500 and not a
-/// success.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn contradictory_select_requests_are_rejected() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    async fn reject(addr: SocketAddr, body: &str) {
-        let (status, resp) = dynamo(addr, "DynamoDB_20120810.Query", body).await;
-        assert_eq!(status, 400, "expected a validation error, got: {resp}");
-        assert!(
-            resp.contains("ValidationException"),
-            "expected ValidationException: {resp}"
-        );
-    }
-    let at = addrs[0];
-
-    // SPECIFIC_ATTRIBUTES naming nothing.
-    reject(
-        at,
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "Select":"SPECIFIC_ATTRIBUTES"}"#,
-    )
-    .await;
-    // A projection contradicting COUNT.
-    reject(
-        at,
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ProjectionExpression":"sk","Select":"COUNT"}"#,
-    )
-    .await;
-    // ALL_PROJECTED_ATTRIBUTES with no index to project.
-    reject(
-        at,
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "Select":"ALL_PROJECTED_ATTRIBUTES"}"#,
-    )
-    .await;
-    // An unknown value.
-    reject(
-        at,
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "Select":"EVERYTHING"}"#,
-    )
-    .await;
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
 }
 
 /// `COUNT` on a GSI query — the index leaf reaches the same builder.

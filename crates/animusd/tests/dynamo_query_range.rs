@@ -1,18 +1,19 @@
-//! End-to-end tests for `KeyConditionExpression` sort-key **range**
-//! comparators (`<`, `<=`, `>`, `>=`, issue #373) over real DynamoDB
-//! JSON/HTTP — base table, GSI, and LSI, plus the type-mismatch validation
-//! and `ScanIndexForward`'s numeric ordering for `N` sort keys (ADR 0063).
-//! Mirrors
-//! `dynamo_predicate_bugs.rs`/`dynamo_documents.rs`: a 3-node in-process
-//! cluster driven by the actual DynamoDB JSON protocol over hand-written
-//! HTTP/1.1. Real time/sockets, so it polls with generous timeouts.
+//! End-to-end test for `KeyConditionExpression` sort-key **range**
+//! comparators (`<`, `<=`, `>`, `>=`, issue #373) over a **composite GSI**'s
+//! own `N` sort attribute, over real DynamoDB JSON/HTTP.
+//!
+//! **ADR 0061 rung D3 PR 3a moved this file's other four tests to
+//! `SimCluster`** (`crates/animusd/src/sim_cluster_dynamo_query_range.rs`)
+//! — the base-table, type-mismatch-validation, LSI, and `ScanIndexForward`
+//! numeric-ordering tests; see that module's own doc. **Only
+//! `gsi_range_queries_over_mixed_digit_count_n_sort_keys` stays here**: it
+//! reads a materialized GSI row, which `SimCluster` cannot produce (no
+//! `index_drain::change_consumer_loop`).
 //!
 //! The fixture's sort keys are deliberately **mixed digit counts and
 //! signs** (`-10`, `-2`, `1`, `5`, `9`, `10`, `15`, `20`, `100`) — the exact
 //! shape a byte-lexicographic compare gets wrong (`"9" > "15"` as text) and
-//! issue #373 was filed over. A range comparator that only worked on
-//! same-width positive numbers would pass a lazier fixture and still be
-//! broken in production.
+//! issue #373 was filed over.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -200,81 +201,6 @@ fn sk_values(body: &str) -> Vec<String> {
     out
 }
 
-/// Every range comparator, over the base table, against the mixed-digit-count
-/// and mixed-sign fixture — the direct end-to-end regression for issue #373's
-/// original filter bug plus its four new operators.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn base_table_range_queries_over_mixed_digit_count_n_sort_keys() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    async fn query(addr: SocketAddr, op: &str, v: &str) -> Vec<String> {
-        let body = format!(
-            r#"{{"TableName":"readings","ConsistentRead":true,
-                 "KeyConditionExpression":"pk = :p AND sk {op} :v",
-                 "ExpressionAttributeValues":{{":p":{{"S":"p1"}},":v":{{"N":"{v}"}}}}}}"#
-        );
-        // A read that verifies a preceding write must ask for
-        // `ConsistentRead: true` (ADR 0055) — the wire default is
-        // eventually consistent, so an unqualified read here would be a
-        // race, not a correctness assertion.
-        let (status, body) = dynamo_retry(addr, "DynamoDB_20120810.Query", &body).await;
-        assert_eq!(status, 200, "sk {op} {v} failed: {body}");
-        sk_values(&body)
-    }
-
-    // `>`: 9 is NOT `> 9`, but 10/15/20/100 are — a byte compare would wrongly
-    // exclude the multi-digit values (or include "9" itself).
-    assert_eq!(
-        query(addrs[1], ">", "9").await,
-        vec!["10", "100", "15", "20"],
-        "strictly greater than 9, numerically"
-    );
-    // `>=`: same set plus 9 itself.
-    assert_eq!(
-        query(addrs[1], ">=", "9").await,
-        vec!["10", "100", "15", "20", "9"]
-    );
-    // `<`: negative and small positives below the multi-digit 10 boundary —
-    // proves negatives aren't treated as "greater" by a stray minus-sign byte.
-    assert_eq!(
-        query(addrs[1], "<", "10").await,
-        vec!["-10", "-2", "1", "5", "9"]
-    );
-    // `<=` at a negative bound.
-    assert_eq!(query(addrs[1], "<=", "-2").await, vec!["-10", "-2"]);
-
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// A sort-key condition operand whose type disagrees with the table's
-/// declared sort-key `AttributeType` is a `ValidationException` — the new
-/// `validate_sort_condition_type` check, mirroring how `validate_key_
-/// condition_names` already rejects a wrong attribute *name*.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn range_operand_type_mismatch_is_rejected() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings",
-            "KeyConditionExpression":"pk = :p AND sk > :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"9"}}}"#,
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "an S operand against a declared-N sort key must be rejected: {body}"
-    );
-    assert!(body.contains("ValidationException"), "{body}");
-
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
 /// The same range comparators over a **composite GSI**'s own `N` sort
 /// attribute (`value`) — a second, independent native range scan
 /// (`run_gsi_query`), eventually consistent by DynamoDB's own contract, so
@@ -308,94 +234,6 @@ async fn gsi_range_queries_over_mixed_digit_count_n_sort_keys() {
     // own `sk` attribute directly — no need to re-derive it from `value`.
     let values: Vec<String> = sk_values(&body);
     assert_eq!(values, vec!["-10", "-2"]);
-
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// The same range comparators over a **composite LSI**'s own `N` alt-sort
-/// attribute (`alt`) — an LSI row commits atomically with its base row (ADR
-/// 0041 §2), so unlike the GSI case this is strongly consistent and needs no
-/// polling; a plain immediate assertion suffices.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lsi_range_queries_over_mixed_digit_count_n_sort_keys() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p AND alt >= :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"N":"10"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "LSI range query failed: {body}");
-    // The LSI defaults to `ALL` projection too, so `sk` is present directly.
-    let values: Vec<String> = sk_values(&body);
-    assert_eq!(values, vec!["10", "100", "15", "20"]);
-
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// **`ScanIndexForward` is numeric order for an `N` sort key (ADR 0063)**:
-/// the stored key encodes `N` through the order-preserving `numkey` codec
-/// (`AttributeValue::key_bytes`), so a `Query`'s returned order agrees with
-/// DynamoDB's own numeric ordering across mixed digit counts, negatives, and
-/// decimals — not the byte-ordered-text order the old, unfixed encoding
-/// produced. This is a deliberately separate partition (`pk = "ord"`), so
-/// the ordering assertions below aren't entangled with the membership
-/// assertions the other tests already cover.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_index_forward_orders_n_sort_keys_numerically() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    // Mixed digit counts, negatives, and a decimal — every shape a raw
-    // byte-text compare would have gotten wrong.
-    let values = ["-10", "-5", "0", "2", "10", "100", "2.5"];
-    for sk in values {
-        let (status, body) = dynamo_retry(
-            addrs[0],
-            "DynamoDB_20120810.PutItem",
-            &format!(
-                r#"{{"TableName":"readings","Item":{{"pk":{{"S":"ord"}},"sk":{{"N":"{sk}"}}}}}}"#
-            ),
-        )
-        .await;
-        assert_eq!(status, 200, "PutItem(sk={sk}) failed: {body}");
-    }
-
-    let (status, asc) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","ConsistentRead":true,"ScanIndexForward":true,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"ord"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "ascending query failed: {asc}");
-    assert_eq!(
-        sk_order(&asc),
-        vec!["-10", "-5", "0", "2", "2.5", "10", "100"],
-        "ScanIndexForward:true returns ascending numeric order: {asc}"
-    );
-
-    let (status, desc) = dynamo_retry(
-        addrs[2],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","ConsistentRead":true,"ScanIndexForward":false,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"ord"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "descending query failed: {desc}");
-    assert_eq!(
-        sk_order(&desc),
-        vec!["100", "10", "2.5", "2", "0", "-5", "-10"],
-        "ScanIndexForward:false returns descending numeric order: {desc}"
-    );
 
     for n in nodes {
         n.shutdown_graceful().await;

@@ -391,11 +391,39 @@ the still-true paragraph after the table.
   background loop and tablet-forking reconciler, neither of which
   `SimCluster` has (it hand-hosts tablets, ADR 0061 rung D1's own design
   choice), so it is real-thread-liveness-shaped, not base-table-DDL-shaped.
-  D3's remaining classes (GSI/LSI-touching, `UpdateTable`'s stream/index
-  changes, Transact, PartiQL, Streams, TTL, admin/console/dashboard HTTP,
-  TLS, SigV4, restart-durability, wall-clock timing) and D4 (deterministic
-  coverage for auto-split/GC/join/backup-janitor), plus a real `SimCluster`
-  `Reconciler` (the gap just above), remain open.
+  **PR 3a landed 2026-09-07**: GSI/LSI `Query`/`Scan` dispatch through
+  `SimCluster`, plus `CreateTable` with a declared GSI/LSI. Eight functions
+  (`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/
+  `run_gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_
+  examine_one`) widened to `<E, R>` — their only `ProdEnv`-binding was the
+  concrete `&ClientCtx` parameter, every callee already generic;
+  `dispatch_item_op`'s `Query`/`Scan` arms now route a named index through
+  them instead of rejecting it, and `dispatch_table_op`'s `CreateTable` arm
+  drops its GSI/LSI rejection (`create_table`/`index_to_control` already
+  mint a declared index `Active` generically, nothing to backfill at create
+  time; a stream declaration is still rejected). 42 new tests across nine
+  `sim_cluster_dynamo_*` sibling modules — base/LSI `Query`/`Scan` filter,
+  pagination, range comparators, `ScanIndexForward`, `Select`,
+  `ConsistentRead` fidelity, consumed-capacity, item-collection-metrics —
+  converted from `dynamo_query_filter.rs`/`dynamo_query_pagination.rs`/
+  `dynamo_query_range.rs`/`dynamo_scan_index_forward.rs`/`dynamo_
+  consistent_read.rs`/`dynamo_select.rs`/`dynamo_consumed_capacity.rs`/
+  `dynamo_item_collection_metrics.rs`/`dynamo_indexes.rs`. **A GSI row is
+  still never materialized under `SimCluster`** (no `index_drain::
+  change_consumer_loop`), pinned by a new regression
+  (`sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_the_
+  fixture_until_the_drain_generalizes`); every GSI-data test named above
+  stays on `ProdEnv`, and `cross_index_cursor_mismatch_is_rejected`'s own
+  `SimCluster` version drops one of its four sub-cases for the identical
+  underlying reason one level earlier (`run_gsi_query`'s own empty-page
+  gate fires before cursor validation and is unconditionally true here) —
+  see ADR 0061's 2026-09-07 "D3 PR 3a" amendment and `crates/animusd/
+  CLAUDE.md`'s Tests section.
+  D3's remaining classes (`UpdateTable`'s stream/index changes, Transact,
+  PartiQL, Streams, TTL, admin/console/dashboard HTTP, TLS, SigV4,
+  restart-durability, wall-clock timing) and D4 (deterministic coverage for
+  auto-split/GC/join/backup-janitor), plus a real `SimCluster` `Reconciler`
+  and a generalized GSI drain (the gaps just above), remain open.
 - **E1 landed 2026-09-04** (`ClusterApi`/`AdminOps` seams in
   `animus-operator`, fake-driven `controller::tests`; ADR 0061's
   2026-09-04 amendment). **E2 landed 2026-09-07**: the seven pre-existing

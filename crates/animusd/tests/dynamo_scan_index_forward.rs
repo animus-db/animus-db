@@ -1,20 +1,17 @@
 //! End-to-end test of `Query`'s `ScanIndexForward` over the real DynamoDB
-//! JSON/HTTP wire — the descending read, and the fact that pagination
-//! inverts with it.
+//! JSON/HTTP wire, against a **GSI** — the descending read, and its
+//! `ScanIndexForward` numeric ordering (ADR 0063).
 //!
-//! Descending is not a post-hoc reversal of an ascending page: `Limit` has to
-//! keep the *highest* rows of the range rather than the lowest, or "the latest
-//! N" — the single most common reason to ask for it — returns the oldest N
-//! instead. So the direction is pushed all the way down to the tablet's own
-//! read (`RaftKvNode::linearizable_scan_rev`), which is also what keeps a
-//! descending page's network payload bounded by `Limit` when the read is
-//! forwarded to another node.
+//! **ADR 0061 rung D3 PR 3a moved six of this file's eight tests to
+//! `SimCluster`** (`crates/animusd/src/sim_cluster_dynamo_scan_index_
+//! forward.rs`) — the base-table and LSI descending/pagination/filter
+//! tests, and the LSI numeric-ordering test; see that module's own doc.
+//! **`descending_applies_to_a_gsi_query` and `gsi_scan_index_forward_
+//! orders_n_sort_keys_numerically` stay here**: both read a materialized
+//! GSI row, which `SimCluster` cannot produce (no `index_drain::
+//! change_consumer_loop`).
 //!
-//! Pagination inverts too: `LastEvaluatedKey` becomes the *lowest* key of the
-//! page and the next page resumes strictly below it, so the walk must still
-//! visit every item exactly once.
-//!
-//! Real time/sockets, so every assertion polls with generous timeouts.
+//! Real time/sockets, so these assertions poll with generous timeouts.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -121,35 +118,6 @@ async fn await_gsi_query(addr: SocketAddr, body: &str, accept: impl Fn(&str) -> 
     }
 }
 
-/// Extract the raw `LastEvaluatedKey` JSON object verbatim from a `Query`
-/// response body — brace-matched, since it can be an arbitrary
-/// AttributeValue map shape (a base cursor is `{pk,sk}`; a GSI cursor also
-/// carries the index's own hash/sort attributes; an LSI cursor the index's
-/// alt-sort attribute — see `dynamo_index_scan.rs`'s identical helper).
-/// `None` when the page wasn't truncated.
-fn extract_last_evaluated_key(body: &str) -> Option<String> {
-    let marker = "\"LastEvaluatedKey\":";
-    let start = body.find(marker)? + marker.len();
-    let bytes = body.as_bytes();
-    if bytes.get(start) != Some(&b'{') {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(body[start..start + i + 1].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Stand up a 3-node cluster with one table (`events`, composite key
 /// `pk`/`sk`) carrying a hash-only GSI (`by-cat`, hash `cat`) and an LSI
 /// (`by-score`, alt-sort `score`) — six items, all in base partition
@@ -211,24 +179,6 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, Vec<SocketAddr>) {
         assert_eq!(status, 200, "PutItem(a{i}) failed: {body}");
     }
     (dir, nodes, addrs)
-}
-
-/// Read `"Count"` / `"ScannedCount"` out of a response body.
-fn counts(body: &str) -> (usize, usize) {
-    let read = |field: &str| -> usize {
-        let marker = format!("\"{field}\":");
-        let at = body
-            .find(&marker)
-            .unwrap_or_else(|| panic!("no {field} in {body}"))
-            + marker.len();
-        body[at..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .unwrap_or_else(|_| panic!("unparsable {field} in {body}"))
-    };
-    (read("Count"), read("ScannedCount"))
 }
 
 /// The order of `sk`s in a response body, by first appearance.
@@ -338,135 +288,6 @@ fn n_values_numeric_sorted(body: &str, field: &str) -> Vec<String> {
     out
 }
 
-/// `ScanIndexForward: false` returns the partition highest-sort-key first.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn descending_query_returns_the_partition_in_reverse_sort_order() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    // Both reads verify writes, so both ask for `ConsistentRead: true`
-    // (ADR 0055): the wire default is served from whichever replica the
-    // receiving node holds — read-your-writes deliberately does not hold —
-    // and the descending read below deliberately targets a different node,
-    // so an unqualified pair can miss the most recent write on either leg.
-    let (status, asc) = dynamo_retry(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ConsistentRead":true}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "ascending query failed: {asc}");
-    assert_eq!(
-        sk_order(&asc),
-        vec!["a0", "a1", "a2", "a3", "a4", "a5"],
-        "ascending is the default: {asc}"
-    );
-
-    let (status, desc) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"events","KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ConsistentRead":true,
-            "ScanIndexForward":false}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "descending query failed: {desc}");
-    assert_eq!(
-        sk_order(&desc),
-        vec!["a5", "a4", "a3", "a2", "a1", "a0"],
-        "ScanIndexForward:false reverses the sort order: {desc}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// The reason descending exists: `Limit` must keep the **highest** rows, not
-/// the lowest reversed. "The latest 2" is the canonical DynamoDB idiom, and
-/// getting this backwards would silently return the *oldest* 2.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_descending_limit_keeps_the_highest_rows() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[2],
-        "DynamoDB_20120810.Query",
-        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
-        // just-written rows.
-        r#"{"TableName":"events","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ScanIndexForward":false,"Limit":2}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "descending limited query failed: {body}");
-    assert_eq!(
-        sk_order(&body),
-        vec!["a5", "a4"],
-        "the latest two, highest first: {body}"
-    );
-    assert!(
-        !body.contains("\"a0\""),
-        "the oldest item must not appear: {body}"
-    );
-    assert!(
-        extract_last_evaluated_key(&body).is_some(),
-        "a truncated descending page carries a cursor: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Descending pagination walks the whole partition exactly once, in order,
-/// with no duplicate and no gap — the cursor inversion working end to end.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn descending_pagination_visits_every_item_exactly_once() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let mut seen: Vec<String> = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut pages = 0usize;
-    loop {
-        pages += 1;
-        assert!(pages < 20, "descending pagination did not terminate");
-        let esk = match &cursor {
-            Some(c) => format!(",\"ExclusiveStartKey\":{c}"),
-            None => String::new(),
-        };
-        let body = format!(
-            r#"{{"TableName":"events","KeyConditionExpression":"pk = :p",
-                "ExpressionAttributeValues":{{":p":{{"S":"p1"}}}},
-                "ConsistentRead":true,
-                "ScanIndexForward":false,"Limit":2{esk}}}"#
-        );
-        // Round-robin the nodes so the forwarded descending read is exercised
-        // too, not just the one that happens to lead the tablet. That rotation
-        // is why the body above asks for `ConsistentRead: true` (ADR 0055):
-        // the wire default is now served from whichever replica the receiving
-        // node holds, so consecutive pages would otherwise sample different,
-        // independently-lagging views.
-        let (status, resp) =
-            dynamo_retry(addrs[pages % addrs.len()], "DynamoDB_20120810.Query", &body).await;
-        assert_eq!(status, 200, "descending page failed: {resp}");
-        seen.extend(sk_order(&resp));
-        match extract_last_evaluated_key(&resp) {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    assert_eq!(
-        seen,
-        vec!["a5", "a4", "a3", "a2", "a1", "a0"],
-        "the descending walk yields every item once, in order"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
 /// Descending reaches a **GSI** query, whose rows live in their own hidden
 /// table. Materialized asynchronously, so this converges-or-times-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -487,65 +308,6 @@ async fn descending_applies_to_a_gsi_query() {
         order,
         vec!["a5", "a4", "a3", "a2", "a1", "a0"],
         "GSI descending order: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// ...and an **LSI** query, which reads the base tablet's `KIND_LSI` scope
-/// through a different pagination primitive than the base/GSI path. This is
-/// the case that would silently ignore the flag if the kind-scoped read had
-/// not been made direction-aware too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn descending_applies_to_an_lsi_query() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let body = await_gsi_query(
-        addrs[1],
-        r#"{"TableName":"events","IndexName":"by-score",
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}},
-            "ScanIndexForward":false}"#,
-        |got| sk_order(got).len() == 6,
-    )
-    .await;
-    // The LSI is sorted by `score` (s0..s5), which here tracks `sk` order.
-    assert_eq!(
-        sk_order(&body),
-        vec!["a5", "a4", "a3", "a2", "a1", "a0"],
-        "LSI descending order: {body}"
-    );
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// Descending composes with a `FilterExpression`: the filter still runs after
-/// `Limit`, so a descending page can be short and still carry a cursor.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn descending_composes_with_a_filter() {
-    let (_dir, nodes, addrs) = setup().await;
-
-    let (status, body) = dynamo_retry(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        // ConsistentRead: true (ADR 0055, #604): asserts on the test's own
-        // just-written rows.
-        r#"{"TableName":"events","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p",
-            "FilterExpression":"parity = :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"S":"even"}},
-            "ScanIndexForward":false,"Limit":2}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "descending filtered query failed: {body}");
-    // Evaluates a5 and a4 (the top two), of which only a4 is even.
-    assert_eq!(counts(&body), (1, 2), "one kept of two evaluated: {body}");
-    assert_eq!(sk_order(&body), vec!["a4"], "a4 is the even one: {body}");
-    assert!(
-        extract_last_evaluated_key(&body).is_some(),
-        "short descending filtered page still carries a cursor: {body}"
     );
     for n in nodes {
         n.shutdown_graceful().await;
@@ -637,98 +399,6 @@ async fn gsi_scan_index_forward_orders_n_sort_keys_numerically() {
         n_values_numeric_sorted(&ge, "value"),
         vec!["10", "100"],
         "GSI value >= 10: {ge}"
-    );
-
-    for n in nodes {
-        n.shutdown_graceful().await;
-    }
-}
-
-/// **LSI `ScanIndexForward` is numeric order for an `N` alt-sort key (ADR
-/// 0063)** — the LSI's own twin of the GSI test above
-/// (`index::lsi_row_key`/`parse_lsi_row_key`), strongly consistent so no
-/// polling is needed (mirrors `descending_applies_to_an_lsi_query`'s own
-/// rationale).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lsi_scan_index_forward_orders_n_sort_keys_numerically() {
-    let (_dir, nodes, addrs) = setup_n_sort_keys().await;
-
-    let (status, asc) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "ScanIndexForward":true,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "ascending LSI query failed: {asc}");
-    assert_eq!(
-        n_order(&asc, "alt"),
-        vec!["-10", "-5", "0", "0.5", "2", "10", "100"],
-        "LSI ScanIndexForward:true ascending numeric order: {asc}"
-    );
-
-    let (status, desc) = dynamo_retry(
-        addrs[2],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "ScanIndexForward":false,
-            "KeyConditionExpression":"pk = :p",
-            "ExpressionAttributeValues":{":p":{"S":"p1"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "descending LSI query failed: {desc}");
-    assert_eq!(
-        n_order(&desc, "alt"),
-        vec!["100", "10", "2", "0.5", "0", "-5", "-10"],
-        "LSI ScanIndexForward:false descending numeric order: {desc}"
-    );
-
-    // BETWEEN, <, >= against the LSI's own `N` alt-sort attribute.
-    let (status, body) = dynamo_retry(
-        addrs[0],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p AND alt BETWEEN :lo AND :hi",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":lo":{"N":"-5"},":hi":{"N":"2"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "LSI BETWEEN failed: {body}");
-    assert_eq!(
-        n_values_numeric_sorted(&body, "alt"),
-        vec!["-5", "0", "0.5", "2"],
-        "LSI alt BETWEEN -5 AND 2: {body}"
-    );
-
-    let (status, body) = dynamo_retry(
-        addrs[1],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p AND alt < :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"N":"0"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "LSI < failed: {body}");
-    assert_eq!(
-        n_values_numeric_sorted(&body, "alt"),
-        vec!["-10", "-5"],
-        "LSI alt < 0: {body}"
-    );
-
-    let (status, body) = dynamo_retry(
-        addrs[2],
-        "DynamoDB_20120810.Query",
-        r#"{"TableName":"readings","IndexName":"by-alt","ConsistentRead":true,
-            "KeyConditionExpression":"pk = :p AND alt >= :v",
-            "ExpressionAttributeValues":{":p":{"S":"p1"},":v":{"N":"10"}}}"#,
-    )
-    .await;
-    assert_eq!(status, 200, "LSI >= failed: {body}");
-    assert_eq!(
-        n_values_numeric_sorted(&body, "alt"),
-        vec!["10", "100"],
-        "LSI alt >= 10: {body}"
     );
 
     for n in nodes {

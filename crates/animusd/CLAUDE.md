@@ -5798,6 +5798,24 @@ path (see the bullet above) and a real `DataRole` (`sim_cluster_dynamo.rs`,
 D2 PR 1, gave every node a real one — `data: None` was this rung's own
 original shape, not the current one).
 
+**A GSI's own hidden table is never materialized under this fixture, at
+any depth (ADR 0061 rung D3 PR 3a)** — `create_table` proposes a declared
+index's `CreateTableIndex` schema-catalog entry (since PR 3a, base table or
+not — see the D3 PR 3a note below), but the hidden `<base>$<index>` table's
+own tablet is minted lazily, the first time `index_drain::change_consumer_
+loop` (the GSI drain background loop) actually drains a row into it.
+`SimCluster` never spawns that loop (this section's own "hand-hosted, not
+reconciler-hosted" bullet), so `run_gsi_query`/`run_gsi_scan`'s own
+`!meta.has_table_tablet(&index_table)` gate is unconditionally true here —
+not "the rows are stale," but "the table doesn't exist yet, forever." A GSI
+`Query`/`Scan` therefore always reads back `Count: 0` under `SimCluster`,
+pinned by `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
+the_fixture_until_the_drain_generalizes`. An LSI is unaffected — its rows
+are written synchronously in the same Raft entry as the base row (ADR 0041
+§2), so `SimCluster`'s hand-hosted/wire-provisioned tablets serve it
+immediately. Closing this gap (a widened `drain_tablet` plus a fixture
+`drain_gsi` helper) is named but not attempted as of PR 3a — a future rung.
+
 ### `sim_cluster_corpus`: the SimCluster cycles/durability corpus (ADR 0061 rung D1 step 3)
 
 `crates/animusd/src/sim_cluster_corpus.rs` (`#[cfg(test)] mod
@@ -6236,6 +6254,40 @@ CP-data tablet group) — `SimCluster` hand-hosts tablets (no real
 `animus_cp_data::host::Reconciler`, no live auto-split loop), so this test
 has no sim analog regardless of how far `dispatch_table_op` widens; a
 D4-shaped gap, not a D3 one.
+
+**PR 3a (ADR 0061 rung D3 PR 3a) landed 2026-09-07**: GSI/LSI `Query`/
+`Scan` dispatch through `SimCluster`, plus `CreateTable` with a declared
+GSI/LSI — the D2 PR 1 residual `dispatch_item_op`'s own doc named
+(`run_index_query`/`run_gsi_query`/`run_lsi_query`/`run_index_scan`/`run_
+gsi_scan`/`run_lsi_scan`/`paginated_kind_examine`/`paginated_kind_examine_
+one`, all eight now `<E, R>`-generic) and the D3 PR 2a residual
+(`dispatch_table_op`'s `CreateTable` arm no longer rejects a declared
+index — only a stream declaration is rejected now). `dispatch_item_op`'s
+`Query`/`Scan` arms route a named index through `run_index_query`/`run_
+index_scan` instead of `unsupported_by_generic_dispatch`, mirroring `run_
+query`/`run_scan`'s own dispatch exactly; `run_operation`'s own arms stay
+untouched, still calling the full concrete `run_query`/`run_scan` (the D2
+lesson repeated a third time). 42 new tests across nine sibling modules —
+`sim_cluster_dynamo_query_filter`/`_query_pagination`/`_query_range`/
+`_scan_index_forward`/`_consistent_read`/`_select`/`_consumed_capacity`/
+`_item_collection_metrics`/`_indexes` — converted from `dynamo_query_
+filter.rs`/`dynamo_query_pagination.rs`/`dynamo_query_range.rs`/`dynamo_
+scan_index_forward.rs`/`dynamo_consistent_read.rs` (deleted whole)/`dynamo_
+select.rs`/`dynamo_consumed_capacity.rs` (deleted whole)/`dynamo_item_
+collection_metrics.rs` (deleted whole)/`dynamo_indexes.rs`. **A real
+`SimCluster` capability gap this PR's own investigation surfaced (see this
+crate's own `SimCluster` section, above, for the full account)**: a GSI's
+own hidden table is never materialized at all under this fixture — no
+`index_drain::change_consumer_loop` ever runs, so `run_gsi_query`/`run_gsi_
+scan`'s own `!meta.has_table_tablet` gate is unconditionally true here —
+pinned by `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
+the_fixture_until_the_drain_generalizes`; every GSI-*data* test therefore
+stays on `ProdEnv`, and `cross_index_cursor_mismatch_is_rejected`'s
+`SimCluster` version drops one of its four sub-cases for the identical
+underlying reason one level earlier (the empty-page gate fires before the
+`ExclusiveStartKey`'s own shape is ever checked). **No other new fixture
+bugs found**. `cargo test -p animusd --lib`: 294 passed (252 before, +42,
+zero regressions, ~110s wall, 3 ignored throughout).
 
 The restart tests run both incarnations in the same runtime,
 calling `Node::shutdown()` between them. In-crate `#[cfg(test)] mod`s
