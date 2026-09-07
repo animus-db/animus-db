@@ -1001,27 +1001,32 @@ fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
 /// through the exact same handlers production uses, from inside
 /// `SimCluster` (`sim_cluster_dynamo.rs`).
 ///
-/// **Covers exactly eight operations**: `PutItem`, `DeleteItem`, `GetItem`,
+/// **Covers exactly ten operations**: `PutItem`, `DeleteItem`, `GetItem`,
 /// `BatchGetItem`, `Query`/`Scan` — **since ADR 0061 rung D3 PR 3a, over a
 /// GSI/LSI as well as the base table**, dispatching to [`run_index_query`]/
 /// [`run_index_scan`] (themselves now generic, see their own docs) exactly
 /// the way the concrete [`run_query`]/[`run_scan`] already did — `UpdateItem`,
-/// and `BatchWriteItem`. **A GSI `Query`/`Scan` under `SimCluster` reads as
-/// empty** until a future rung generalizes `index_drain::change_consumer_
-/// loop` (the only thing that ever materializes a GSI's own hidden-table
-/// rows) — `SimCluster` never spawns it, so `run_gsi_query`/`run_gsi_scan`'s
-/// own "no tablet yet ⇒ empty" gate is what answers every GSI read here; an
-/// LSI is unaffected (its rows are written synchronously in the same Raft
-/// entry as the base row, ADR 0041 §2). See
-/// `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_the_
-/// fixture_until_the_drain_generalizes` for the pinned regression that
-/// documents this boundary (and should flip red the day it closes). Every
-/// other [`Operation`] variant — `TransactWriteItems`/`TransactGetItems` (their
-/// `ClientRequestToken` idempotency preflight auto-provisions the internal
-/// idempotency table via `ClientCtx::propose_schema`, whose relayed path
-/// under a genuine multi-voter `SimEnv` control quorum has never been
-/// proven end-to-end — ADR 0061 rung D1's own "what remains unexercised"
-/// note), `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
+/// `BatchWriteItem`, and — **since ADR 0061 rung F, C-06 PR 3** —
+/// `TransactWriteItems`/`TransactGetItems`, calling the identical
+/// [`run_transact`]/[`run_transact_get`] `run_operation`'s own arms call
+/// (both already `<E, R>`-generic since C-06 PR 2; this rung is purely the
+/// routing half — see either function's own doc). **A GSI `Query`/`Scan`
+/// under `SimCluster` reads as empty** until a future rung generalizes
+/// `index_drain::change_consumer_loop` (the only thing that ever
+/// materializes a GSI's own hidden-table rows) — `SimCluster` never spawns
+/// it, so `run_gsi_query`/`run_gsi_scan`'s own "no tablet yet ⇒ empty" gate
+/// is what answers every GSI read here; an LSI is unaffected (its rows are
+/// written synchronously in the same Raft entry as the base row, ADR 0041
+/// §2). See `sim_cluster_dynamo_table_ops.rs::gsi_query_reads_empty_under_
+/// the_fixture_until_the_drain_generalizes` for the pinned regression that
+/// documents this boundary (and should flip red the day it closes). The
+/// internal idempotency table `TransactWriteItems`' `ClientRequestToken`
+/// preflight needs (`ClientCtx::propose_schema` auto-provisioning it) is
+/// now genuinely exercised under `SimCluster` too, including the two-
+/// concurrent-first-callers bootstrap race — see
+/// `sim_cluster_dynamo_transact.rs`'s own doc for what this rung proved.
+/// Every other [`Operation`] variant —
+/// `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
 /// (PartiQL — no new logic of their own, but they'd need every operation
 /// they can lower onto, i.e. all of the above, generic first), and every
 /// DDL/backup/export/import operation (genuinely `ProdEnv`-only: a real
@@ -1570,6 +1575,19 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             }
             Ok(wire::batch_write_response(&unprocessed))
         }
+        // ADR 0061 rung F, C-06 PR 3: `run_transact`/`run_transact_get`
+        // were widened to `<E, R>` by PR 2 (see either function's own
+        // doc) — this is the routing half, the identical call shape
+        // `run_operation`'s own `TransactWriteItems`/`TransactGetItems`
+        // arms use, `principal` threaded through for the same per-table
+        // authz check. `run_operation` itself is untouched — it still
+        // calls these two functions directly, monomorphized at `E =
+        // ProdEnv, R = AnimusdRelayClient`, so production behavior is
+        // unchanged.
+        Operation::TransactWriteItems { actions, token } => {
+            run_transact(ctx, principal, meta, &actions, token.as_deref()).await
+        }
+        Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
         _ => Err(unsupported_by_generic_dispatch("this operation")),
     }
 }
@@ -1699,7 +1717,7 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
 /// proxy shape (an unrestricted `Principal`, no SigV4 gate in front of it —
 /// this fixture has no SigV4 listener to gate through in the first place).
 ///
-/// The eight operations [`dispatch_item_op`] covers, plus (ADR 0061 rung D3
+/// The ten operations [`dispatch_item_op`] covers, plus (ADR 0061 rung D3
 /// PR 2a/2b) the five base-table DDL operations [`dispatch_table_op`]
 /// covers, succeed; every other well-formed operation decodes fine and fails with
 /// [`unsupported_by_generic_dispatch`]'s `InternalServerError` — see either

@@ -1646,6 +1646,105 @@ impl SimCluster {
         self.controls[leader].propose(command)
     }
 
+    /// Stage (prepare) ONE write of a raw plain 2PC transaction against
+    /// `table`, issued from `node`'s own coordinator — and, deliberately,
+    /// never decides or resolves it (ADR 0061 rung F, C-06 PR 3). This is
+    /// this fixture's own way of expressing "the coordinator crashed right
+    /// after prepare," mirroring `cp_txn.rs`'s own `prepare_via_any_node`
+    /// idiom (see that test file's own doc for why driving the internal
+    /// prepare step directly and simply never sending decide/resolve is the
+    /// cleanest way to express a vanished coordinator over a real cluster)
+    /// — but via a direct in-process `ClientCtx::txn_prepare` call, which
+    /// already resolves/forwards to the correct tablet leader internally,
+    /// rather than a hand-rolled per-node wire retry loop.
+    ///
+    /// `anchor` is `None` for the very first write of a transaction (which
+    /// mints the anchor record) and `Some((txn_id, record_key,
+    /// record_table))` — this call's own returned triple — for every
+    /// subsequent participant. `participant_spans` is meaningful only for
+    /// the anchor call (`anchor: None`) — every OTHER participant's own
+    /// `(table, span)` pair, exactly what `ClientCtx::cp_txn`'s own anchor
+    /// stage builds (see that method's doc): omitting it (an empty `Vec`)
+    /// leaves the anchor's own record unaware of any participant, so
+    /// in-doubt recovery's `all_staged` check can only ever verify the
+    /// anchor's own keys — a caller staging more than one participant must
+    /// pass every later participant's own `(table, key)` here, one entry
+    /// per key, each covering exactly that key
+    /// (`KeyRange::new(key.clone(), Some(key-with-a-trailing-0-byte)`,
+    /// `cp_txn`'s own per-key span shape). Ignored (and safe to leave
+    /// empty) for a participant call (`anchor: Some(..)`), which never
+    /// creates a record to populate. Panics if the stage did not fully
+    /// apply (`StageOutcome::Staged`, the only outcome any of this rung's
+    /// own scenarios should ever see — none of these calls carry a
+    /// condition to fail) or did not complete within [`OP_BUDGET`], both
+    /// fixture-setup bugs, not a legitimate scenario outcome.
+    pub(crate) fn txn_prepare_only(
+        &mut self,
+        node: u64,
+        table: &str,
+        anchor: Option<(animus_cp_data::TxnId, Vec<u8>, String)>,
+        participant_spans: Vec<(String, KeyRange)>,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> (animus_cp_data::TxnId, Vec<u8>, String) {
+        let ctx = self.shared.ctx(node);
+        let table = table.to_owned();
+        let outcome = self.spawn_and_capture(node, async move {
+            ctx.txn_prepare(
+                &table,
+                anchor,
+                vec![animus_cp_data::TxnWrite::plain(key, value)],
+                Vec::new(),
+                participant_spans,
+                Vec::new(),
+            )
+            .await
+        });
+        match outcome {
+            Some(Ok((
+                txn_id,
+                record_key,
+                record_table,
+                _ts,
+                animus_cp_data::StageOutcome::Staged,
+            ))) => (txn_id, record_key, record_table),
+            Some(Ok((.., other))) => {
+                panic!("txn_prepare_only: stage did not fully apply: {other:?}")
+            }
+            Some(Err(e)) => panic!("txn_prepare_only: stage failed: {e:?}"),
+            None => panic!("txn_prepare_only on node {node} did not complete within {OP_BUDGET:?}"),
+        }
+    }
+
+    /// A **raw, routed** read of `key` (arbitrary physical bytes) in
+    /// `table`, issued from `node`'s own `ClientCtx` — [`SimClusterHandle::
+    /// get`]'s sibling for a caller (like [`SimCluster::txn_prepare_only`])
+    /// that already has the exact physical key bytes in hand, skipping
+    /// `item_key`'s pk/sk `AttributeValue` encoding entirely — the raw
+    /// plain-KV read `cp_txn.rs`'s own `ClientRequest::Get` uses.
+    pub(crate) fn raw_get(
+        &mut self,
+        node: u64,
+        table: &str,
+        key: Vec<u8>,
+        consistent: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let ctx = self.shared.ctx(node);
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            match ctx.cp_get(&table, key, !consistent).await {
+                ClientResponse::Value(v) => Ok(v),
+                ClientResponse::Error(e) => Err(e),
+                other => Err(format!("unexpected get response: {other:?}")),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "raw_get on node {node} did not complete within {OP_BUDGET:?}"
+            ))
+        })
+    }
+
     /// Move control-plane leadership to `target` (ADR 0061 rung D4 PR 5) —
     /// `RaftCore::transfer_leadership`'s own real handoff (ADR 0029/0037),
     /// not a `crash`/`restart`-driven forced re-election: the current

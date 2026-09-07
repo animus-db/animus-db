@@ -17896,6 +17896,24 @@ mod sim_cluster_backup_janitor;
 #[cfg(test)]
 mod sim_cluster_growth;
 
+/// ADR 0061 rung F (C-06 PR 3): deterministic `SimCluster` coverage for
+/// `TransactWriteItems`/`TransactGetItems`, reachable through the generic
+/// dispatch core for the first time — `dynamo::dispatch_item_op` gained two
+/// match arms calling `run_transact`/`run_transact_get` (both already
+/// `<E, R>`-generic since C-06 PR 2), routing every wire transaction issued
+/// through `SimClusterHandle::dynamo` the exact way `run_operation`'s own
+/// production arms do. See this module's own doc for the seven scenarios
+/// (a commit across two tables including a `ConditionCheck`, a condition
+/// failure's `CancellationReasons`, `ClientRequestToken` idempotency, a
+/// `TransactGetItems` snapshot against a concurrent writer, forwarding from
+/// a node hosting no replica of either table, the internal idempotency-
+/// table bootstrap race between two concurrent first callers, and a
+/// coordinator that never finished past the prepare phase recovering
+/// atomically) and `crates/animusd/CLAUDE.md`'s matching entry for the full
+/// account, including what stayed on `ProdEnv` and why.
+#[cfg(test)]
+mod sim_cluster_dynamo_transact;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
