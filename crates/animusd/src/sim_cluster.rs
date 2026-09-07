@@ -707,6 +707,14 @@ pub(crate) struct SimCluster {
     /// own [`SimCluster::restart`] method despite the shared name — see
     /// that method's own doc).
     crashed: BTreeSet<u64>,
+    /// ADR 0061 rung D4 PR 2: the auto-split trigger thresholds this
+    /// cluster is opted into, if any — `None` (the default every existing
+    /// scenario gets) means `auto_split_loop` is never spawned at all.
+    /// Stored so [`SimCluster::restart`] can respawn the loop with the
+    /// SAME configuration a restarted node's `Simulator::stop` just
+    /// dropped, mirroring how it already respawns `heartbeat_loop`/the
+    /// reconciler. Set via [`SimCluster::set_auto_split_thresholds`].
+    auto_split: Option<AutoSplitThresholds>,
 }
 
 impl SimCluster {
@@ -932,6 +940,7 @@ impl SimCluster {
             shared: SimClusterHandle::new(ctxs),
             engines,
             crashed: BTreeSet::new(),
+            auto_split: None,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -1255,6 +1264,16 @@ impl SimCluster {
         self.shared.leader_index_of(tablet)
     }
 
+    /// ADR 0061 rung D4 PR 2: whether `node`'s own local `CpGroup` handle
+    /// for `tablet` currently believes IT leads — the exact fact
+    /// `auto_split_loop`'s own `ctx.edge.cp_leader(tablet)` gate is built
+    /// on (a `None` there is this same predicate answering `false`). A thin
+    /// public wrapper over `SimClusterHandle::is_leader_local`, which
+    /// [`SimCluster::leader_index_of`] already uses internally.
+    pub(crate) fn is_leader_local(&self, node: u64, tablet: TabletId) -> bool {
+        self.shared.is_leader_local(node, tablet)
+    }
+
     /// `node`'s own view of the replicated control-plane `Metadata` —
     /// `ClientCtx::effective_metadata`'s exact read, so a caller can
     /// assert on tablet placement / schema visibility per node.
@@ -1281,6 +1300,35 @@ impl SimCluster {
     /// same as the production registry.
     pub(crate) fn storage(&self, node: u64, tablet: TabletId) -> MemoryEngine {
         self.engines[node as usize].engine(tablet)
+    }
+
+    /// ADR 0061 rung D4 PR 2: opt this cluster into the auto-split trigger
+    /// — spawns [`auto_split_loop`] on EVERY node, right now (mirroring
+    /// [`SimCluster::new`]'s own `heartbeat_loop` spawn, D4 PR 1, exactly
+    /// — a loop spawned this way starts sleeping for `AUTO_SPLIT_INTERVAL`
+    /// immediately, so calling this before or after any writes is
+    /// equally fine). **OFF by default** — every scenario that never
+    /// calls this pays nothing extra: no loop is spawned, so there is
+    /// nothing to poll and nothing to skip. `thresholds` is stored (this
+    /// struct's own `auto_split` field) so a later [`SimCluster::restart`]
+    /// respawns the identical configuration on the restarted node — its
+    /// `Simulator::stop` drops every task the node owned, including this
+    /// one, exactly like `heartbeat_loop`/the reconciler loop.
+    pub(crate) fn set_auto_split_thresholds(&mut self, thresholds: AutoSplitThresholds) {
+        self.auto_split = Some(thresholds);
+        for node in 0..self.nodes as u64 {
+            self.spawn_auto_split(node, thresholds);
+        }
+    }
+
+    /// Spawn one [`auto_split_loop`] task on `node`'s own env, closed over
+    /// a fresh clone of `node`'s own current `ClientCtx` — the identical
+    /// "clone the ctx, spawn on its own env" shape [`SimCluster::restart`]
+    /// already uses for `heartbeat_loop`.
+    fn spawn_auto_split(&self, node: u64, thresholds: AutoSplitThresholds) {
+        let ctx = self.shared.ctx(node);
+        let env = ctx.env.clone();
+        env.spawn_task(auto_split_loop(ctx, thresholds));
     }
 
     /// ADR 0065 §5(b): `node`'s own current `ClientCtx::
@@ -1660,6 +1708,54 @@ impl SimCluster {
         }
     }
 
+    /// ADR 0061 rung D4 PR 2: drive one pass of `index_drain::
+    /// inplace_split_driver_tick` — the propose of `MetaCommand::
+    /// CutoverSplit` — for every currently-`Splitting` tablet `node`
+    /// leads. This fixture never spawns `index_drain::change_consumer_loop`
+    /// itself (see [`SimClusterHandle::recompute_any_table_throughput_all`]'s
+    /// own doc for the identical reason — no production loop this fixture
+    /// runs would otherwise ever propose the cutover, so the fork made by
+    /// the real `host::Reconciler` (already running here since D4 PR 1)
+    /// would stall forever in `Splitting`), so a caller polls this
+    /// alongside [`SimCluster::run_for`] until convergence (two `Active`
+    /// children, no `Splitting` parent) — mirroring [`SimCluster::
+    /// drain_gsi`]'s own manual-drive shape exactly, one node/pass at a
+    /// time. Widened `index_drain::{inplace_split_driver_tick,
+    /// gsi_caught_up}` to `<E: Env, R: RelayClient>`/`<E: Env>`
+    /// (previously concrete `ProdEnv` only) to make this possible — every
+    /// callee they use was already generic (rung C5 step 3b). A no-op
+    /// (`Ok(())` immediately) on a node that leads no `Splitting` tablet,
+    /// so calling this on every node every poll tick is cheap. Panics on a
+    /// genuine driver error or a timeout, exactly like `drain_gsi`.
+    pub(crate) fn drive_inplace_split_cutover(&mut self, node: u64) {
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                if !group.is_leader() {
+                    continue;
+                }
+                let splitting = meta
+                    .tablets
+                    .get(&tablet)
+                    .is_some_and(|t| t.state == TabletState::Splitting);
+                if !splitting {
+                    continue;
+                }
+                index_drain::inplace_split_driver_tick(&ctx, &meta, tablet, &group).await?;
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drive_inplace_split_cutover(node={node}) failed: {e}"),
+            None => panic!(
+                "drive_inplace_split_cutover(node={node}) did not complete within {OP_BUDGET:?}"
+            ),
+        }
+    }
+
     /// Crash `node`: its tasks stay alive but muted (no sends land, its
     /// inbox is cleared) — `Simulator::crash`'s own contract. Use
     /// [`SimCluster::restart`] instead for a true process restart (a
@@ -1743,6 +1839,16 @@ impl SimCluster {
 
         self.controls[node as usize] = fresh_control;
         self.shared.set_ctx(node, ctx);
+
+        // ADR 0061 rung D4 PR 2: `Simulator::stop` above dropped this
+        // node's own `auto_split_loop` task along with everything else it
+        // owned, exactly like `heartbeat_loop` — respawn it with the SAME
+        // configuration if this cluster ever opted in (`self.auto_split`
+        // is `None` for every scenario that never called
+        // `set_auto_split_thresholds`, so this is a no-op there).
+        if let Some(thresholds) = self.auto_split {
+            self.spawn_auto_split(node, thresholds);
+        }
     }
 
     /// Symmetrically partition `a` and `b` (`Simulator::partition_pair`).

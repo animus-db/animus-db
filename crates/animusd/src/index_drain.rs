@@ -819,6 +819,18 @@ const SPLIT_DRIVER_SEAL_RETRIES: u32 = 5;
 /// (re-issued every tick until the parent vanishes from the map; the
 /// control-plane epoch/state CAS makes a duplicate reject cleanly).
 ///
+/// **`<E: Env, R: RelayClient>`-generic and `pub(crate)` since ADR 0061 rung
+/// D4 PR 2** (previously concrete `ClientCtx`/`CpGroup`, i.e. `ProdEnv`
+/// only) — every callee below (`seal_now`/`pitr_seal_now`/`drain_tablet`,
+/// `ClientCtx::propose_schema`) was already generic (rung C5 step 3b/
+/// `schema.rs`'s own widening); only this function and its private sibling
+/// [`gsi_caught_up`] still named `ProdEnv` concretely. Widened so
+/// `SimCluster` (`sim_cluster.rs`) can drive the in-place split cutover
+/// directly — this fixture never spawns [`change_consumer_loop`] itself (no
+/// behavior change to the one production caller, `change_consumer_loop`'s
+/// own concrete `ClientCtx`, which still infers `E = ProdEnv, R =
+/// AnimusdRelayClient` at its call site unchanged).
+///
 /// **Idempotent across crash/re-lead by construction, with NO driver-local
 /// state at all**: every step here is a fresh read off durable/replicated
 /// state — `pending_split()`, the change log, the GSI cursor, the backfill
@@ -826,11 +838,11 @@ const SPLIT_DRIVER_SEAL_RETRIES: u32 = 5;
 /// long-running one would have, on its very first tick. (The copy-based
 /// endgame's own `SplitBuild` driver state, which this doc used to contrast
 /// against, was deleted in the copy-split-deletion endgame's Layer B1.)
-async fn inplace_split_driver_tick(
-    ctx: &ClientCtx,
+pub(crate) async fn inplace_split_driver_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
 ) -> Result<(), String> {
     let Some(parent) = meta.tablets.get(&tablet) else {
         return Ok(()); // stale view; nothing to do
@@ -1161,7 +1173,7 @@ pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
 /// the query. `true` on no pending records at all (nothing to catch up to),
 /// matching the veto's own pre-existing "only gate when something is
 /// actually pending" rule.
-async fn gsi_caught_up(group: &CpGroup) -> bool {
+async fn gsi_caught_up<E: Env>(group: &CpGroup<E>) -> bool {
     let max_pending = group
         .pending_changes()
         .await

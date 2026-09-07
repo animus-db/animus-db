@@ -11526,11 +11526,21 @@ const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
 /// sources such as a manual split racing this loop) — harmless: the epoch CAS
 /// lets exactly one win, and the loser just tries again (or backs off) next
 /// tick.
-async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
-    let mut last_triggered: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+async fn auto_split_loop<E: Env, R: RelayClient>(
+    ctx: ClientCtx<E, R>,
+    thresholds: AutoSplitThresholds,
+) {
+    // ADR 0061 rung D4 PR 2: `Nanos` (the `Env` seam's own clock reading,
+    // ADR 0003), not `tokio::time::Instant` — this loop must be drivable
+    // under `SimEnv` (`SimCluster`'s own deterministic virtual clock) as
+    // well as `ProdEnv`'s real one. `Nanos` has no `Add<Duration>` (see
+    // `ceiling.rs`'s own `saturating_add`/`duration_since` shape this
+    // mirrors), so an "elapsed since" check becomes `ctx.env.now()
+    // .duration_since(recorded)` rather than `recorded.elapsed()`.
+    let mut last_triggered: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
-    let mut last_counted: BTreeMap<TabletId, tokio::time::Instant> = BTreeMap::new();
+    let mut last_counted: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     // ADR 0067 (W-08b): the fourth arm's own ceilings are always "on" (a
     // production default, never `None`), so unlike the three fields below
     // this can't be used to decide whether the loop has anything to do at
@@ -11541,7 +11551,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
         || thresholds.change_rate.is_some()
         || thresholds.ops_rate.is_some();
     loop {
-        tokio::time::sleep(AUTO_SPLIT_INTERVAL).await;
+        ctx.env.sleep(AUTO_SPLIT_INTERVAL).await;
 
         // ADR 0067 (W-08b): when NOTHING at all is configured — no byte/
         // change-rate/ops-rate threshold, and no table anywhere in this
@@ -11578,7 +11588,8 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             .map(|(&id, _)| id)
             .collect();
         for tablet in tablets {
-            if matches!(last_triggered.get(&tablet), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+            if matches!(last_triggered.get(&tablet), Some(&at)
+                if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
             {
                 continue;
             }
@@ -11610,7 +11621,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // have a byte estimate — `approx_bytes` works on any backend).
             let due_confirm = last_counted
                 .get(&tablet)
-                .is_none_or(|at| at.elapsed() >= AUTO_SPLIT_COOLDOWN);
+                .is_none_or(|&at| ctx.env.now().duration_since(at) >= AUTO_SPLIT_COOLDOWN);
             let byte_hot = match thresholds.bytes {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,
@@ -11638,7 +11649,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // Materialize once: the authoritative byte total and (if over
             // threshold) the split key both come from the same snapshot.
             let pairs = leader.local_pairs().await;
-            last_counted.insert(tablet, tokio::time::Instant::now());
+            last_counted.insert(tablet, ctx.env.now());
             let key_count = pairs.len();
             let over_byte_threshold = thresholds.bytes.is_some_and(|t| {
                 let total_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
@@ -11680,7 +11691,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // for that expected, already-metered outcome (it would
             // otherwise fire every single cooldown, forever, for a tablet
             // that structurally cannot split).
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
             let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
             match &response {
@@ -11743,9 +11754,10 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
             // wakes it (ADR 0048 fork F); the propose this trigger makes
             // if one is chosen lets the CP-data host reconciler un-quiesce
             // it exactly as any other split would.
-            let mut best: Option<(TabletId, u128, CpGroup)> = None;
+            let mut best: Option<(TabletId, u128, CpGroup<E>)> = None;
             for id in tablet_ids {
-                if matches!(last_triggered.get(&id), Some(at) if at.elapsed() < AUTO_SPLIT_COOLDOWN)
+                if matches!(last_triggered.get(&id), Some(&at)
+                    if ctx.env.now().duration_since(at) < AUTO_SPLIT_COOLDOWN)
                 {
                     continue;
                 }
@@ -11794,7 +11806,7 @@ async fn auto_split_loop(ctx: ClientCtx, thresholds: AutoSplitThresholds) {
                     None => continue,
                 }
             };
-            last_triggered.insert(tablet, tokio::time::Instant::now());
+            last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!(
                 "auto_split_min_tablets",
                 tablet = tablet.0,
@@ -17833,6 +17845,23 @@ mod sim_cluster_dynamo_schema;
 /// investigation found and reports (not fixed here, out of scope).
 #[cfg(test)]
 mod sim_cluster_dynamo_drop_table;
+
+/// ADR 0061 rung D4 PR 2 (C-04 D4): deterministic `SimCluster` coverage for
+/// the auto-split BYTE trigger (ADR 0034) — `auto_split_loop` (`lib.rs`)
+/// widened to `<E: Env, R: RelayClient>`/`Nanos`-keyed (previously concrete
+/// `ProdEnv`/`tokio::time::Instant`), `SimCluster::
+/// set_auto_split_thresholds` the new opt-in knob (defaulted OFF, mirroring
+/// D4 PR 1's `heartbeat_loop` spawn), and `index_drain::{
+/// inplace_split_driver_tick, gsi_caught_up}` also widened so `SimCluster::
+/// drive_inplace_split_cutover` can manually drive the fork's own
+/// `MetaCommand::CutoverSplit` — this fixture never spawns `index_drain::
+/// change_consumer_loop` itself. See this module's own doc for the five
+/// scenarios (byte-threshold crossing, staying below it, a regrown child
+/// forking again, a leadership move mid-window, a crashed-and-restarted
+/// replica converging via the issue #722 fix) and `crates/animusd/
+/// CLAUDE.md`'s matching entry for the full account.
+#[cfg(test)]
+mod sim_cluster_auto_split;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
