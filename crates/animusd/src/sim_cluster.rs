@@ -1267,6 +1267,22 @@ impl SimCluster {
         self.shared.hosted_tablets(node)
     }
 
+    /// `tablet`'s own private engine on node `node` (ADR 0050 rung 1) —
+    /// get-or-create through the SAME [`MemoryTabletEngines`] registry the
+    /// node's own `Reconciler` opens from (ADR 0061 rung D4 PR 1, C-04 D4
+    /// PR 3), mirroring `animus-cp-data/tests/reconciler_corpus.rs::
+    /// Cluster::storage`'s own convention exactly: a reclaimed tablet's
+    /// engine reads back **empty** (a fresh, just-recreated `MemoryEngine`),
+    /// which is what a drop-table GC assertion actually wants to see — the
+    /// real proof that `HostAction::Reclaim`'s teardown deleted the
+    /// tablet's own data, not merely a `Metadata`/hosted-set bookkeeping
+    /// check. `node` may host no replica of `tablet` at all (or never has)
+    /// — this still returns a valid, empty engine rather than panicking,
+    /// same as the production registry.
+    pub(crate) fn storage(&self, node: u64, tablet: TabletId) -> MemoryEngine {
+        self.engines[node as usize].engine(tablet)
+    }
+
     /// ADR 0065 §5(b): `node`'s own current `ClientCtx::
     /// any_table_throughput` flag — a relaxed load, matching the flag's
     /// own real-request read. Test-only accessor proving the flag's

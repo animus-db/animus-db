@@ -17735,6 +17735,19 @@ mod sim_cluster_dynamo_documents;
 #[cfg(test)]
 mod sim_cluster_dynamo_schema;
 
+/// ADR 0061 rung D4 PR 3 (C-04 D4): deterministic `SimCluster` coverage for
+/// the dropped-table GC reclaim (ADR 0024) — driven through the real
+/// `DeleteTable` wire operation (`dynamo::dispatch_table_op` →
+/// `ClientCtx::drop_table`, already `<E, R>`-generic, no new widening
+/// needed this rung) against every node's own real `host::Reconciler`
+/// (ADR 0061 rung D4 PR 1). A driver-plus-assertions PR, not new
+/// mechanism — see this module's own doc for the five scenarios, the
+/// physical-reclaim observable (`SimCluster::storage`, new this rung), and
+/// a real, previously-uncharacterized reclaim gap its own scenario-4
+/// investigation found and reports (not fixed here, out of scope).
+#[cfg(test)]
+mod sim_cluster_dynamo_drop_table;
+
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,
 /// `docs/engineering-lessons.md`'s matching entry): a stage blocked by
