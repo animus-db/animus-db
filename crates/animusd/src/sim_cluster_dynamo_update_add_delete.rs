@@ -1,15 +1,20 @@
 //! `SimCluster`-driven end-to-end tests for `UpdateExpression`'s `ADD` and
-//! `DELETE` clauses (ADR 0061 rung D3 PR 1) — replaces seven of the eight
-//! tests in the real-socket `ProdEnv` binary
-//! `crates/animusd/tests/dynamo_update_add_delete.rs`. Driven through
-//! `SimCluster::dynamo`/`dynamo_concurrent` — see `sim_cluster_dynamo.rs`'s
-//! own module doc for the shared generic core.
+//! `DELETE` clauses (ADR 0061 rung D3 PR 1) — replaces all eight tests in
+//! the real-socket `ProdEnv` binary
+//! `crates/animusd/tests/dynamo_update_add_delete.rs`, which is now empty
+//! and deleted. Driven through `SimCluster::dynamo`/`dynamo_concurrent` —
+//! see `sim_cluster_dynamo.rs`'s own module doc for the shared generic
+//! core.
 //!
-//! **`an_add_that_changes_an_indexed_attribute_reindexes` stays on
-//! `ProdEnv`, left in the original file** — it queries a GSI
-//! (`IndexName":"by-cat"`), and GSI/LSI `Query`/`Scan` are not yet reached
-//! by `dynamo::dispatch_item_op` (ADR 0061 rung D2 PR 2's own residual
-//! list for GSI/LSI query dispatch — see that PR's module doc).
+//! **`an_add_that_changes_an_indexed_attribute_reindexes` moved here in
+//! PR 3b (ADR 0061 rung D3)** — it used to stay on `ProdEnv` because it
+//! queries a GSI, and `SimCluster` never materialized one; `[SimCluster::
+//! drain_gsi]` (this rung's own fixture helper, `sim_cluster.rs`) closes
+//! that gap by draining the table's own hidden GSI table on demand, so this
+//! test now drains twice — once to establish the pre-update baseline (`a0`
+//! indexed under `cat = X`), once after the `ADD`-driven reindex (`a0`
+//! indexed under `cat = Y`, and no longer under `X`) — rather than polling
+//! a background loop this fixture never runs.
 //!
 //! Numeric `ADD` is the adapter's only **non-idempotent** write; the
 //! contended-write tests here are the ones that measured 431 (a stale
@@ -21,6 +26,8 @@
 
 use std::time::Duration;
 
+use animus_tablet::TabletId;
+
 use super::sim_cluster::SimCluster;
 
 fn env_seed(default: u64) -> u64 {
@@ -28,6 +35,20 @@ fn env_seed(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — **not**
+/// `SimCluster::tablet_of`, which only knows about a *hand-hosted* table
+/// (`setup`'s own table); `setup_indexed`'s table is created through the
+/// real DynamoDB wire, so it never gets a `tablet_of` entry.
+fn first_tablet(cluster: &SimCluster, table: &str) -> TabletId {
+    cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("{table} has no tablet"))
+        .0
+        .to_owned()
 }
 
 fn setup(seed: u64) -> SimCluster {
@@ -392,5 +413,128 @@ fn a_mismatched_add_is_rejected() {
     assert!(
         got.contains(r#""cat":{"S":"X"}"#),
         "cat is unchanged (seed={seed}): {got}"
+    );
+}
+
+/// [`setup`]'s own indexed sibling — a **wire**-declared GSI (`by-cat`,
+/// hash-only) atop the same composite `(pk, sk)` table, so
+/// [`SimCluster::drain_gsi`] has a real hidden table to drain. Unlike
+/// `setup`, this table must be created through the wire
+/// (`SimCluster::create_table` hand-hosts a bare schema with no index
+/// declared at all) — mirrors `dynamo_update_add_delete.rs::setup`.
+fn setup_indexed(seed: u64) -> SimCluster {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.CreateTable",
+        br#"{"TableName":"events","AttributeDefinitions":[{"AttributeName":"cat","AttributeType":"S"},{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                         {"AttributeName":"sk","KeyType":"RANGE"}],
+            "GlobalSecondaryIndexes":[
+                {"IndexName":"by-cat",
+                 "KeySchema":[{"AttributeName":"cat","KeyType":"HASH"}],
+                 "Projection":{"ProjectionType":"ALL"}}]}"#,
+    );
+    assert_eq!(status, 200, "CreateTable failed (seed={seed}): {body}");
+
+    let (status, resp) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.PutItem",
+        br#"{"TableName":"events","Item":{
+            "pk":{"S":"p1"},"sk":{"S":"a0"},"cat":{"S":"X"}}}"#,
+    );
+    assert_eq!(status, 200, "seed PutItem(a0) failed (seed={seed}): {resp}");
+    cluster
+}
+
+/// The risk this rung carries: an `ADD` that changes a **GSI-indexed**
+/// attribute must re-index the row, exactly as a `SET` would. Mirrors
+/// `dynamo_update_add_delete.rs::an_add_that_changes_an_indexed_attribute_
+/// reindexes`, but drives [`SimCluster::drain_gsi`] on demand instead of
+/// polling a background loop `SimCluster` never spawns — see this file's
+/// own module doc for the full account.
+#[test]
+fn an_add_that_changes_an_indexed_attribute_reindexes() {
+    let seed = env_seed(0xADD0_0008);
+    let mut cluster = setup_indexed(seed);
+    let tablet = first_tablet(&cluster, "events");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("events tablet has a leader");
+
+    // Drain the pre-update baseline: a0 indexed under cat = X.
+    cluster.drain_gsi(leader, "events");
+    let (status, before) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "ExpressionAttributeValues":{":c":{"S":"X"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "baseline GSI query failed (seed={seed}): {before}"
+    );
+    assert!(
+        before.contains("\"a0\""),
+        "a0 must start out indexed under X (seed={seed}): {before}"
+    );
+
+    // `cat` is the GSI hash attribute. Move a0 out of partition X by setting
+    // it to Y, via SET, combined with an ADD on an unrelated set attribute —
+    // establishing the exact shape the original `ProdEnv` test covers.
+    let (status, moved) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.UpdateItem",
+        br#"{"TableName":"events","Key":{"pk":{"S":"p1"},"sk":{"S":"a0"}},
+            "UpdateExpression":"SET cat = :y ADD tags :t",
+            "ExpressionAttributeValues":{":y":{"S":"Y"},":t":{"SS":["new"]}},
+            "ReturnValues":"ALL_NEW"}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "combined SET+ADD failed (seed={seed}): {moved}"
+    );
+    assert!(
+        moved.contains(r#""new""#),
+        "the ADD applied (seed={seed}): {moved}"
+    );
+
+    // Drain again: the GSI must now show a0 under Y, and no longer under X.
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("events tablet still has a leader");
+    cluster.drain_gsi(leader, "events");
+
+    let (status, after_y) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "ExpressionAttributeValues":{":c":{"S":"Y"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "post-update GSI query failed (seed={seed}): {after_y}"
+    );
+    assert!(
+        after_y.contains("\"a0\""),
+        "the GSI followed the update to Y (seed={seed}): {after_y}"
+    );
+
+    let (status, after_x) = cluster.dynamo(
+        1,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "ExpressionAttributeValues":{":c":{"S":"X"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "stale-X GSI query failed (seed={seed}): {after_x}"
+    );
+    assert!(
+        !after_x.contains("\"a0\""),
+        "a0 must no longer be indexed under X (seed={seed}): {after_x}"
     );
 }

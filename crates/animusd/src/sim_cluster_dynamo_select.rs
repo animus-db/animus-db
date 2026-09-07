@@ -1,20 +1,26 @@
 //! `SimCluster`-driven end-to-end tests of `Query`/`Scan`'s `Select` (ADR
-//! 0061 rung D3 PR 3a, C-04 D3) — driven through the now-generic
+//! 0061 rung D3 PR 3a/3b, C-04 D3) — driven through the now-generic
 //! [`crate::dynamo::run_index_query`]/[`crate::dynamo::run_index_scan`]
 //! (`Select` is decoded ahead of index dispatch, so a base `Query`/`Scan`
 //! test needs neither).
 //!
-//! Replaces six of `crates/animusd/tests/dynamo_select.rs`'s seven tests:
-//! `count_select_returns_counts_without_items`, `count_select_still_
+//! **PR 3a** replaced six of `crates/animusd/tests/dynamo_select.rs`'s seven
+//! tests: `count_select_returns_counts_without_items`, `count_select_still_
 //! applies_the_filter`, `count_select_paginates_and_sums_to_the_whole_
 //! partition`, `count_select_applies_to_scan`, `specific_attributes_
-//! returns_the_projection`, `contradictory_select_requests_are_rejected`.
-//! **`count_select_applies_to_a_gsi_query` stays on `ProdEnv`** — it reads a
-//! materialized GSI row, which `SimCluster` cannot produce (see
-//! `sim_cluster_dynamo_query_filter.rs`'s own module doc for the boundary).
+//! returns_the_projection`, `contradictory_select_requests_are_rejected`,
+//! leaving `count_select_applies_to_a_gsi_query` on `ProdEnv` — it reads a
+//! materialized GSI row, which `SimCluster` could not produce at the time.
+//!
+//! **PR 3b converts the seventh and last test too**: `[SimCluster::
+//! drain_gsi]` (`sim_cluster.rs`) closes that gap. This file (and
+//! `crates/animusd/tests/dynamo_select.rs`, now empty) is therefore fully
+//! converted.
 //!
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
+
+use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 
@@ -23,6 +29,40 @@ fn env_seed(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
+/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
+/// `SimCluster::tablet_of` doesn't work here.
+fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
+    cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("{table} has no tablet"))
+        .0
+        .to_owned()
+}
+
+/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
+/// number of attempts — mirrors `sim_cluster_dynamo_query_filter.rs`'s own
+/// `await_gsi_query`.
+fn await_gsi_query(
+    cluster: &mut SimCluster,
+    node: u64,
+    body: &str,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..80 {
+        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
+        if status == 200 && accept(&resp) {
+            return resp;
+        }
+        last = resp;
+        cluster.run_for(Duration::from_millis(100));
+    }
+    panic!("gsi query never converged (last saw: {last})");
 }
 
 /// A 3-node cluster with table `events` (composite `pk`/`sk`), a hash-only
@@ -276,4 +316,32 @@ fn contradictory_select_requests_are_rejected() {
             "ExpressionAttributeValues":{":p":{"S":"p1"}},
             "Select":"EVERYTHING"}"#,
     );
+}
+
+/// `COUNT` on a GSI query — the index leaf reaches the same builder.
+/// Mirrors `dynamo_select.rs::count_select_applies_to_a_gsi_query`.
+#[test]
+fn count_select_applies_to_a_gsi_query() {
+    let seed = env_seed(0xE4C5_0007);
+    let mut cluster = setup(seed);
+    let tablet = first_tablet(&cluster, "events");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("events tablet has a leader");
+    cluster.drain_gsi(leader, "events");
+
+    let body = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"events","IndexName":"by-cat",
+            "KeyConditionExpression":"cat = :c",
+            "ExpressionAttributeValues":{":c":{"S":"X"}},
+            "Select":"COUNT"}"#,
+        |got| field(got, "Count") == Some(6),
+    );
+    assert!(
+        !body.contains("\"Items\""),
+        "GSI COUNT has no Items (seed={seed}): {body}"
+    );
+    assert_eq!(field(&body, "Count"), Some(6), "seed={seed}: {body}");
 }

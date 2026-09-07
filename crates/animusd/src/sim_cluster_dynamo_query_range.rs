@@ -1,17 +1,21 @@
 //! `SimCluster`-driven end-to-end tests for `KeyConditionExpression` sort-key
 //! range comparators (`<`, `<=`, `>`, `>=`, issue #373) and `ScanIndexForward`
 //! numeric ordering (ADR 0063), over the base table and an LSI (ADR 0061 rung
-//! D3 PR 3a, C-04 D3) — driven through the now-generic [`crate::dynamo::
-//! run_index_query`]/[`crate::dynamo::run_lsi_query`].
+//! D3 PR 3a/3b, C-04 D3) — driven through the now-generic [`crate::dynamo::
+//! run_index_query`]/[`crate::dynamo::run_lsi_query`]/[`crate::dynamo::
+//! run_gsi_query`].
 //!
-//! Replaces four of `crates/animusd/tests/dynamo_query_range.rs`'s five
-//! tests: `base_table_range_queries_over_mixed_digit_count_n_sort_keys`,
+//! **PR 3a** replaced four of `crates/animusd/tests/dynamo_query_range.rs`'s
+//! five tests: `base_table_range_queries_over_mixed_digit_count_n_sort_keys`,
 //! `range_operand_type_mismatch_is_rejected`, `lsi_range_queries_over_mixed_
 //! digit_count_n_sort_keys`, `scan_index_forward_orders_n_sort_keys_
-//! numerically`. **`gsi_range_queries_over_mixed_digit_count_n_sort_keys`
-//! stays on `ProdEnv`** — it reads a materialized GSI row, which `SimCluster`
-//! cannot produce (see `sim_cluster_dynamo_query_filter.rs`'s own module doc
-//! for the boundary).
+//! numerically`, leaving `gsi_range_queries_over_mixed_digit_count_n_sort_
+//! keys` on `ProdEnv` — it reads a materialized GSI row, which `SimCluster`
+//! could not produce at the time.
+//!
+//! **PR 3b converts the fifth and last test too**: `[SimCluster::drain_gsi]`
+//! (`sim_cluster.rs`) closes that gap. This file (and `crates/animusd/tests/
+//! dynamo_query_range.rs`, now empty) is therefore fully converted.
 //!
 //! Fixture: sort keys deliberately mixed digit counts and signs (`-10`,
 //! `-2`, `1`, `5`, `9`, `10`, `15`, `20`, `100`) — the exact shape a
@@ -20,6 +24,8 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
+use std::time::Duration;
+
 use super::sim_cluster::SimCluster;
 
 fn env_seed(default: u64) -> u64 {
@@ -27,6 +33,27 @@ fn env_seed(default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
+/// number of attempts — mirrors `sim_cluster_dynamo_query_filter.rs`'s own
+/// `await_gsi_query`.
+fn await_gsi_query(
+    cluster: &mut SimCluster,
+    node: u64,
+    body: &str,
+    accept: impl Fn(&str) -> bool,
+) -> String {
+    let mut last = String::new();
+    for _ in 0..80 {
+        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
+        if status == 200 && accept(&resp) {
+            return resp;
+        }
+        last = resp;
+        cluster.run_for(Duration::from_millis(100));
+    }
+    panic!("gsi query never converged (last saw: {last})");
 }
 
 /// A 3-node cluster with table `readings` (composite `pk`/`sk`, `sk`
@@ -205,4 +232,58 @@ fn scan_index_forward_orders_n_sort_keys_numerically() {
         vec!["100", "10", "2.5", "2", "0", "-5", "-10"],
         "ScanIndexForward:false returns descending numeric order: {desc}"
     );
+}
+
+/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
+/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
+/// `SimCluster::tablet_of` doesn't work here (this file's `setup` creates
+/// its table through the real wire, not the hand-hosted bypass).
+fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
+    cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("{table} has no tablet"))
+        .0
+        .to_owned()
+}
+
+/// The same range comparators over a **composite GSI**'s own `N` sort
+/// attribute (`value`) — a second, independent native range scan
+/// (`run_gsi_query`), materialized on demand via `[SimCluster::drain_gsi]`.
+/// Mirrors `dynamo_query_range.rs::gsi_range_queries_over_mixed_digit_
+/// count_n_sort_keys`.
+#[test]
+fn gsi_range_queries_over_mixed_digit_count_n_sort_keys() {
+    let seed = env_seed(0xE4C3_0005);
+    let mut cluster = setup(seed);
+    let tablet = first_tablet(&cluster, "readings");
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("readings tablet has a leader");
+    cluster.drain_gsi(leader, "readings");
+
+    let body = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value > :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"9"}}}"#,
+        |b| b.contains("\"Count\":4"),
+    );
+    // The GSI's projection is `ALL`, so the returned item still carries its
+    // own `sk` attribute directly — no need to re-derive it from `value`.
+    let values: Vec<String> = sk_values(&body);
+    assert_eq!(values, vec!["10", "100", "15", "20"], "seed={seed}: {body}");
+
+    let body = await_gsi_query(
+        &mut cluster,
+        1,
+        r#"{"TableName":"readings","IndexName":"by-device-value",
+            "KeyConditionExpression":"device = :d AND value <= :v",
+            "ExpressionAttributeValues":{":d":{"S":"d1"},":v":{"N":"-2"}}}"#,
+        |b| b.contains("\"Count\":2"),
+    );
+    let values: Vec<String> = sk_values(&body);
+    assert_eq!(values, vec!["-10", "-2"], "seed={seed}: {body}");
 }

@@ -17713,9 +17713,27 @@ mod sim_cluster_dynamo_item_collection_metrics;
 /// generality — a no-index `Scan` already ran through `dispatch_item_op`).
 /// Replaces two of `crates/animusd/tests/dynamo_indexes.rs`'s three tests;
 /// `gsi_write_then_query` stays in that file untouched (D2 PR 1's own
-/// real-socket proof of `run_operation`'s independent path).
+/// real-socket proof of `run_operation`'s independent path) — PR 3b adds a
+/// sim twin of it here without deleting the original.
 #[cfg(test)]
 mod sim_cluster_dynamo_indexes;
+
+/// ADR 0061 rung D3 PR 3b: document/set attribute types, projection
+/// expressions, `ReturnValues`, multiple + composite GSIs alongside an LSI,
+/// and `N`-typed partition-key routing — driven through `[SimCluster::
+/// drain_gsi]` for the GSI half. Replaces all three of `crates/animusd/
+/// tests/dynamo_documents.rs`'s tests.
+#[cfg(test)]
+mod sim_cluster_dynamo_documents;
+
+/// ADR 0061 rung D3 PR 3b: a `CreateTable`-declared GSI's definition
+/// replicates cluster-wide and a second node (which never itself handled
+/// the `CreateTable`) resolves a `Query` against it once `[SimCluster::
+/// drain_gsi]` has materialized the hidden table. Replaces one of
+/// `crates/animusd/tests/dynamo_schema.rs`'s three tests; the restart proof
+/// and `extended_surface` stay on `ProdEnv`.
+#[cfg(test)]
+mod sim_cluster_dynamo_schema;
 
 /// Regression for the issue #298 residual confirmed live under the
 /// un-pinned `SplitMode::InPlace` proof soak (ADR 0018's matching amendment,

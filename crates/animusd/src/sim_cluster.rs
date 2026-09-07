@@ -455,10 +455,26 @@ impl SimClusterHandle {
     /// The node id currently hosting `tablet`'s own leader replica, if any
     /// one of its known replicas believes it leads — [`SimCluster::
     /// leader_index_of`]'s handle-callable twin.
+    ///
+    /// **Scans every node id, not just [`Self::replicas_of`]'s own
+    /// bookkeeping** (ADR 0061 rung D3 PR 3b) — `replicas_of` only ever
+    /// knows about a table `SimCluster::create_table_with_replication`
+    /// hand-hosted (the one call site that populates `self.tablets`); a
+    /// **wire**-provisioned table (`ClientCtx::provision_tablet`, reached
+    /// through `dynamo::dispatch_table_op`'s own `CreateTable` arm) never
+    /// gets an entry there at all, so the old `replicas_of`-scoped scan
+    /// always came up empty for one — found live converting `SimCluster::
+    /// drain_gsi`'s own callers, every one of which creates its table
+    /// through the real wire (`cluster.dynamo(.., "..CreateTable", ..)`),
+    /// not `create_table_with_replication`. Scanning every node is strictly
+    /// more general and no less correct for a hand-hosted table either:
+    /// `is_leader_local` already answers `false` for any node hosting no
+    /// replica of `tablet` at all (`ClusterEdgeState::local_cp` returns
+    /// `None` there), so a non-replica node was always going to be skipped
+    /// regardless of which set this loop iterates.
     pub(crate) fn leader_index_of(&self, tablet: TabletId) -> Option<u64> {
-        self.replicas_of(tablet)
-            .into_iter()
-            .find(|&n| self.is_leader_local(n, tablet))
+        let count = self.ctxs.lock().expect("ctxs poisoned").len() as u64;
+        (0..count).find(|&n| self.is_leader_local(n, tablet))
     }
 
     /// `node`'s own view of the replicated control-plane `Metadata`.
@@ -1399,6 +1415,118 @@ impl SimCluster {
                 })
             })
             .collect()
+    }
+
+    /// Drain pending GSI writes for `table`'s tablets that `node` leads
+    /// (ADR 0061 rung D3 PR 3b) — a test-only stand-in for `index_drain::
+    /// change_consumer_loop`'s GSI-drain arm, which this fixture never
+    /// spawns at all (see the module doc's own "hand-hosted, not
+    /// reconciler-hosted" bullet). Closes the gap named in
+    /// `sim_cluster_dynamo_table_ops.rs`'s former `gsi_query_reads_empty_
+    /// under_the_fixture_until_the_drain_generalizes` (now a positive
+    /// assertion — see that module's own doc): before this method existed,
+    /// a GSI's own hidden `<base>$<index>` table was never materialized
+    /// under `SimCluster` at all, so a GSI `Query`/`Scan` always read back
+    /// `Count: 0`.
+    ///
+    /// Replicates `change_consumer_loop`'s own per-led-tablet guard
+    /// sequence **by hand**, not by calling into the loop itself (this
+    /// fixture drives one tick's worth of work synchronously rather than
+    /// spawning the real background loop, which polls forever and has
+    /// nothing else — quiescence, the seal/trim arms, the backfill seeder —
+    /// this method has any use for):
+    ///
+    /// - **Leader check**: only a tablet `node`'s own edge both hosts *and*
+    ///   currently leads is drained (`group.is_leader()`) — an unled or
+    ///   unhosted tablet of `table` is silently skipped, mirroring the
+    ///   production loop's own `if !group.is_leader() { continue }`.
+    /// - **Hidden-table skip**: refuses outright (`debug_assert!`-free,
+    ///   just a no-op return) if `table` is itself a GSI's own hidden
+    ///   `<base>$<index>` table (`is_index_table_name`), mirroring the
+    ///   production loop's identical guard — "a hidden index table holds
+    ///   index rows; it has no indexes of its own, and must never recurse
+    ///   into maintaining any." No caller of this method is expected to
+    ///   ever pass one, but the guard costs nothing to keep for parity.
+    /// - **`is_quiesced()`/`Building`-child skips are NOT replicated here —
+    ///   they are unreachable under this fixture.** `SimCluster` never
+    ///   calls `RaftKvNode::enable_quiescence` (quiescence stays
+    ///   permanently off for every group this fixture hosts — see
+    ///   `CpGroup::is_quiesced`'s own doc: it answers `false` until
+    ///   quiescence is explicitly enabled), and this fixture never splits a
+    ///   tablet (no `TabletState::Building` row is ever minted here — see
+    ///   the module doc's own "hand-hosted, not reconciler-hosted" bullet:
+    ///   every tablet this fixture ever hosts is minted straight to
+    ///   `Active`). Both of the production loop's own skips are therefore
+    ///   dead code in this harness; a future rung that gives `SimCluster`
+    ///   real quiescence or splitting would need to add them back here too.
+    ///
+    /// `gsis` is computed exactly as `change_consumer_loop` does:
+    /// `meta.table_indexes(table)` filtered to `IndexKind::Global` with
+    /// status `Creating` or `Active` (a `Deleting` index is excluded,
+    /// matching production — this loop must stop touching an index being
+    /// torn down).
+    ///
+    /// Calls [`index_drain::drain_tablet`] once per matching tablet, then
+    /// drives the simulator up to [`OP_BUDGET`] so every resulting
+    /// `cp_kind_write_raw` call (the GSI row writes/deletes and the
+    /// trailing cursor write) actually commits before this call returns —
+    /// `drain_tablet` itself already awaits each of those to completion
+    /// internally, so this is [`SimCluster::spawn_and_capture`]'s own
+    /// bounded-wait shape, not a fixed sleep.
+    ///
+    /// **A table's tablets can have different leaders.** This fixture never
+    /// splits a table into more than one tablet today (a table minted by
+    /// [`SimCluster::create_table_with_replication`] always has exactly
+    /// one), so there is only ever one tablet to drain in practice — but
+    /// this method does not assume that: it only touches tablets `node`
+    /// itself leads, so a caller with a multi-tablet table should call this
+    /// once per node that leads one of that table's tablets (find each via
+    /// [`SimCluster::leader_index_of`]), not expect one call to reach every
+    /// tablet regardless of who leads it.
+    ///
+    /// Panics on a genuine drain failure (a `String` error out of
+    /// `drain_tablet`) or on not completing within `OP_BUDGET` — both are
+    /// fixture-setup bugs a converted test should never see, unlike
+    /// `put`/`get`/`scan`/`dynamo`'s own `Result`/status-code returns,
+    /// which exist because *those* are the very outcomes several scenarios
+    /// deliberately provoke.
+    pub(crate) fn drain_gsi(&mut self, node: u64, table: &str) {
+        let table_owned = table.to_owned();
+        let handle = self.shared.clone();
+        let outcome: Option<Result<(), String>> = self.spawn_and_capture(node, async move {
+            let ctx = handle.ctx(node);
+            let meta = ctx.effective_metadata();
+            if animus_dynamo::is_index_table_name(&table_owned) {
+                return Ok(());
+            }
+            let gsis: Vec<animus_control::IndexDef> = meta
+                .table_indexes(&table_owned)
+                .iter()
+                .filter(|i| {
+                    i.kind == animus_control::IndexKind::Global
+                        && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
+                })
+                .cloned()
+                .collect();
+            for (tablet, group) in ctx.edge.hosted_groups() {
+                let led_here = meta
+                    .tablets
+                    .get(&tablet)
+                    .is_some_and(|t| t.table.as_deref() == Some(table_owned.as_str()));
+                if !led_here || !group.is_leader() {
+                    continue;
+                }
+                index_drain::drain_tablet(&ctx, &meta, &table_owned, &group, &gsis).await?;
+            }
+            Ok(())
+        });
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("drain_gsi(node={node}, table={table}) failed: {e}"),
+            None => panic!(
+                "drain_gsi(node={node}, table={table}) did not complete within {OP_BUDGET:?}"
+            ),
+        }
     }
 
     /// Crash `node`: its tasks stay alive but muted (no sends land, its

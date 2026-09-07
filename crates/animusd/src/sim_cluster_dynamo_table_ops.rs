@@ -665,27 +665,31 @@ fn reconciler_hazard_fires_deterministically_when_node_count_exceeds_replication
     );
 }
 
-/// ADR 0061 rung D3 PR 3a's own documented boundary: `dispatch_item_op`'s
-/// `Query`/`Scan` arms now dispatch a named index through the generic
-/// `run_index_query`/`run_index_scan` (see that function's own doc), but a
-/// **GSI** row is materialized only by `index_drain::change_consumer_loop` —
-/// a background loop `SimCluster` never spawns (`sim_cluster.rs`'s own
-/// module doc: "hand-hosted, not reconciler-hosted", and no drain-equivalent
-/// watcher exists either). A `CreateTable`-declared GSI is accepted (this
-/// rung also lifted `dispatch_table_op`'s own `!indexes.is_empty()`
-/// rejection), and a write reaches it fine — but a `Query` against it reads
-/// as **empty**, forever, under this fixture: `run_gsi_query`'s own
-/// `!meta.has_table_tablet(&index_table)` gate answers `Ok(empty)` before
-/// ever touching a tablet that no watcher here will ever host.
+/// ADR 0061 rung D3 PR 3a documented a boundary here (`dispatch_item_op`'s
+/// `Query`/`Scan` arms dispatch a named index through the generic
+/// `run_index_query`/`run_index_scan`, but a **GSI** row used to be
+/// materialized only by `index_drain::change_consumer_loop` — a background
+/// loop `SimCluster` never spawns) and named this test
+/// `gsi_query_reads_empty_under_the_fixture_until_the_drain_generalizes`,
+/// pinning the pre-PR-3b empty-`Count` outcome as a deliberate placeholder
+/// for the day the drain generalized. **PR 3b is that day**: `[SimCluster::
+/// drain_gsi]` (`sim_cluster.rs`) is a test-only stand-in for
+/// `change_consumer_loop`'s own GSI-drain arm, so this test is flipped to
+/// the positive assertion it was always meant to become, and renamed to
+/// match — a `PutItem` followed by `drain_gsi` followed by a `Query` now
+/// returns the row.
 ///
-/// This is a **positive** regression pinning today's boundary, not a
-/// "must never happen" one — it exists so that PR 3b (a widened
-/// `drain_tablet` plus a fixture `drain_gsi` helper, per that rung's own
-/// brief) turns this assertion **false** the day it lands: when it does,
-/// this test should be deleted (or inverted) in the same change that adds
-/// real `SimCluster` GSI coverage, not left quietly stale.
+/// Also confirms the hidden index table actually got a tablet
+/// (`Metadata::has_table_tablet`, PR 3a's own empty-page gate) — the fact
+/// that used to make every GSI query here read as an unconditional empty
+/// `200` regardless of anything else about the request, including a
+/// malformed cursor. With a real tablet behind it, that gate no longer
+/// masks whatever a query's own cursor-shape/condition validation would
+/// otherwise catch — see `sim_cluster_dynamo_query_pagination.rs::
+/// cross_index_cursor_mismatch_is_rejected`, which PR 3b restored a fourth
+/// sub-case to for exactly this reason.
 #[test]
-fn gsi_query_reads_empty_under_the_fixture_until_the_drain_generalizes() {
+fn gsi_query_materializes_rows_after_a_drain() {
     let seed = env_seed(0xE4AD_0001);
     let mut cluster = SimCluster::new(seed, 1, 1);
 
@@ -711,6 +715,8 @@ fn gsi_query_reads_empty_under_the_fixture_until_the_drain_generalizes() {
     );
     assert_eq!(status, 200, "PutItem failed: {body} (seed={seed})");
 
+    // Before the drain: the hidden index table has no tablet yet, and the
+    // query reads as an honest, gate-driven empty page.
     let (status, body) = cluster.dynamo(
         0,
         "DynamoDB_20120810.Query",
@@ -724,7 +730,47 @@ fn gsi_query_reads_empty_under_the_fixture_until_the_drain_generalizes() {
     );
     assert!(
         body.contains("\"Count\":0"),
-        "GSI query must read as empty under SimCluster until PR 3b generalizes \
-         the drain — got: {body} (seed={seed})"
+        "before any drain, a GSI query reads empty: {body} (seed={seed})"
+    );
+    let hidden_table = animus_dynamo::index_table_name("users", "by-email");
+    assert!(
+        !cluster.metadata(0).has_table_tablet(&hidden_table),
+        "the hidden index table must have no tablet before the first drain \
+         (seed={seed})"
+    );
+
+    let meta0 = cluster.metadata(0);
+    let (tablet, _) = meta0
+        .tablets_for_table("users")
+        .next()
+        .unwrap_or_else(|| panic!("users has no tablet (seed={seed})"));
+    let tablet = *tablet;
+    drop(meta0);
+    let leader = cluster
+        .leader_index_of(tablet)
+        .expect("users tablet has a leader");
+    cluster.drain_gsi(leader, "users");
+
+    assert!(
+        cluster.metadata(0).has_table_tablet(&hidden_table),
+        "the hidden index table must have a tablet after the drain \
+         (seed={seed})"
+    );
+
+    let (status, body) = cluster.dynamo(
+        0,
+        "DynamoDB_20120810.Query",
+        br#"{"TableName":"users","IndexName":"by-email",
+            "KeyConditionExpression":"email = :e",
+            "ExpressionAttributeValues":{":e":{"S":"a@x"}}}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "GSI query after the drain must not error: {body} (seed={seed})"
+    );
+    assert!(
+        body.contains("\"Count\":1") && body.contains("\"u1\""),
+        "after the drain, the GSI query returns the materialized row: \
+         {body} (seed={seed})"
     );
 }

@@ -1034,11 +1034,11 @@ async fn inplace_split_driver_tick(
 
 /// Reconcile every dirty item of one tablet not yet covered by the "gsi"
 /// cursor, then advance that cursor to the highest HLC this pass covers.
-async fn drain_tablet(
-    ctx: &ClientCtx,
+pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     gsis: &[IndexDef],
 ) -> Result<(), String> {
     // The ADR 0042 §7 min-over-rows watermark: `None` on a cold tablet (no
@@ -1235,11 +1235,11 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
 /// original design, this no longer deletes the change records that triggered
 /// it — see the module doc and [`drain_tablet`]'s trailing cursor write for
 /// the ADR 0042 replacement, and [`trim_janitor`] for the actual deletion.
-async fn reconcile_partition(
-    ctx: &ClientCtx,
+async fn reconcile_partition<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     gsis: &[IndexDef],
     fp_key: &[u8],
 ) -> Result<(), String> {
