@@ -2162,6 +2162,8 @@ impl SimCluster {
                 "txn_resolve_participant on node {node} did not complete within {OP_BUDGET:?}"
             ))
         })
+    }
+
     /// Run several DynamoDB wire requests **concurrently** (ADR 0061 rung
     /// D3 PR 1 — the shared fixture helper every converted `ProdEnv`
     /// `tokio::spawn`-raced-writers test now uses), each `(node, target,
