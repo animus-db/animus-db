@@ -595,3 +595,29 @@ from wave 2's own findings: #590 (the operator still emits the deleted
 `--split-mode` flag) and #591 (a `control_only` relay-budget flake). The flaky-test issues
 (#280, #298, #418, #447, #539) are correctness work under the green
 invariant, not roadmap items, and take precedence over any wave.
+
+---
+
+**Addendum, 2026-09-07 (C-04 D4 PR 3 landed)**: dropped-table GC (ADR 0024)
+now has deterministic `SimCluster` coverage —
+`crates/animusd/src/sim_cluster_dynamo_drop_table.rs`, driven through the
+real `DeleteTable` wire operation (already `<E, R>`-generic since D3 PR 2a,
+no new widening needed). Four of five scenarios converge cleanly (base
+table, GSI cascade, create-then-immediately-drop race, drop off a
+rebalanced replica set); the fifth (a node crashed while hosting the table,
+restarted after the drop) found a real, previously-uncharacterized reclaim
+gap — `host::Reconciler::gather_facts` derives every fact solely from
+`Metadata`'s current tablet map, so a node offline across a drop's whole
+commit-and-converge window can never rediscover, and therefore never
+reclaims, its own leftover tablet engine on restart. Kept as one
+`#[ignore]`d regression rather than fixed (out of this PR's own
+driver-plus-assertions scope); see ADR 0061's matching 2026-09-07 "D4 PR 3"
+amendment for the full account and `crates/animusd/CLAUDE.md`'s SimCluster
+section for the pointer. `crates/animusd/tests/drop_table_gc.rs` and
+`drop_table_index_cascade.rs` stay whole and unconverted — every test in
+both interleaves real-disk WAL-file assertions with metadata/hosting
+convergence in one body, which this fixture's `MemoryEngine` tier cannot
+stand in for. What remains open for D4 (PRs 2, 4, 5, unchanged): auto-split
+needs `auto_split_loop`'s own `tokio::time` conversion; join/growth needs
+an add-node capability; the backup janitor needs `client_ctx_host.rs`'s
+impls widened.

@@ -6692,3 +6692,35 @@ finding: fork-first's own post-cutover directed-Placing completion loop
 also failed to reach `done` within a 240s budget in 2/3 runs under the
 same load, despite one of those two already having live replicas matching
 its target.
+
+## Appendix — SimCluster drop-table GC coverage (ADR 0061 rung D4 PR 3, 2026-09-07)
+
+`sim_cluster_dynamo_drop_table.rs` is the deterministic `SimCluster`
+coverage for dropped-table GC (ADR 0024), driven through the real
+`DeleteTable` wire operation against every node's own real
+`animus_cp_data::host::Reconciler` (D4 PR 1) — a driver-plus-assertions
+PR, no `host.rs` changes. `SimCluster::storage(node, tablet) ->
+MemoryEngine` (new this rung, mirroring `animus-cp-data/tests/
+reconciler_corpus.rs::Cluster::storage`'s own "reads back empty"
+convention) is the physical-reclaim observable: a reclaimed tablet's
+engine, read back through the same `MemoryTabletEngines` registry the
+node's reconciler opens from, is a fresh, empty one. Four of five
+scenarios converge (base table, GSI cascade via `SimCluster::drain_gsi`,
+create-then-immediately-drop, drop off a rebalanced replica set); the
+fifth found a real gap — a node crashed while hosting a table, restarted
+only after the drop has already converged elsewhere, never reclaims its
+own leftover tablet engine, because `host::Reconciler::gather_facts`
+derives every fact solely from tablets `Metadata` *currently* names, and
+the dropped tablet is synchronously absent from it by the time the fresh
+post-restart `LocalState` ever gets a first look — see ADR 0061's
+matching 2026-09-07 "D4 PR 3" amendment for the full mechanism and the
+seeds it was confirmed at. Kept as one `#[ignore]`d regression
+(`scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_
+engine`) rather than fixed here — a real fix would need a new
+probe-existing-local-engines-not-in-Metadata capability on `EngineFactory`
+and both its implementors, genuine new mechanism out of this PR's own
+scope. `crates/animusd/tests/drop_table_gc.rs`/`drop_table_index_
+cascade.rs` were left whole, unconverted — every test in both interleaves
+real-disk `LsmEngine` WAL-file assertions with metadata/hosting
+convergence in one body, a shape this fixture's `MemoryEngine` tier
+cannot stand in for.

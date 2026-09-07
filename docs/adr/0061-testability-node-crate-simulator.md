@@ -2592,3 +2592,128 @@ test, per the repo's convention on incidental discoveries. No further
 crate-splitting of `animus-node` until its seams settle. No replacement of
 the `ProdEnv` integration tests that prove real-thread liveness — ADR 0003's
 guarantee is `SimEnv`-only and that boundary is deliberate.
+
+#### 2026-09-07 amendment — D4 PR 3 landed: deterministic `SimCluster` coverage for dropped-table GC, and a real reclaim gap found (not fixed)
+
+D4 PR 3 is a driver-plus-assertions PR over the reconciler D4 PR 1 already
+wired in — no code in `animus-cp-data`/`host.rs` changed. New module:
+`crates/animusd/src/sim_cluster_dynamo_drop_table.rs`.
+
+**Driver: the real wire, `DeleteTable`.** `dynamo::dispatch_table_op`'s
+`DeleteTable` arm already calls `delete_table` → `ClientCtx::drop_table`
+(`schema.rs`), which was already `<E: Env, R: RelayClient>`-generic since
+D3 PR 2a — unlike several earlier D3/D4 rungs, this PR needed **zero** new
+generic surface. Every scenario issues a real `DynamoDB_20120810.
+DeleteTable` request via `SimCluster::dynamo`.
+
+**A new observable, `SimCluster::storage(node, tablet) -> MemoryEngine`**
+(mirroring `animus-cp-data/tests/reconciler_corpus.rs::Cluster::storage`'s
+own "reads back empty" convention exactly — `MemoryTabletEngines::engine`
+get-or-creates, so a reclaimed tablet's engine is a fresh, empty one) is
+the actual physical-reclaim proof this PR adds beyond what `sim_cluster_
+dynamo_table_ops.rs::delete_table_removes_it_and_a_repeat_delete_is_not_
+found` already covered (metadata absence only). Three observables checked
+together, converged-or-timeout: `Metadata::has_table_tablet` false on
+every node, `SimCluster::hosted_tablets` no longer names the tablet on any
+node, and `storage(node, tablet).entries()` empty on every node that ever
+held a replica — plus a fourth, one-shot check that a fresh `CreateTable`
+with the same name mints a NEW tablet id (ids never reused) and serves.
+
+**Five scenarios, four of which converge cleanly**: (1) drop after writes,
+base table, 3 nodes, 6 seeds total (1 pinned + 5 looped); (2) drop with a
+declared GSI (materialized via `SimCluster::drain_gsi`, D3 PR 3b) —
+`ClientCtx::drop_table`'s ADR 0041 §5 cascade reclaims the hidden
+`<base>$<index>` table's own tablet too, proven with the identical three
+observables against the hidden table; (3) `DeleteTable` issued
+**immediately** after `CreateTable` returns, no intervening `run_for` at
+all — the Host-vs-Reclaim race, asserting `reconciler_corpus.rs::
+assert_idempotent`'s own discipline (converged *state*, never action
+counts: a replica whose reconciler hasn't ticked even once before the
+tablet vanishes from `Metadata` simply never hosts it, which reaches the
+identical reclaimed end state as hosting-then-tearing-down); (5) a 4-node
+cluster (`sim_cluster_dynamo_table_ops.rs::every_node_hosts_exactly_its_
+replica_set_after_rebalance`'s own fixture shape) where the dropped
+table's tablet was rebalanced onto a replica set different from the one
+`CreateTable` first picked — reclaim correctly keys off `Metadata`'s
+**current** replica set (`[n1,n2,n3]`), never the stale creation-time
+snapshot (`[n0,n1,n2]`), and node 0 (already vacated by the ordinary ADR
+0029 removed-replica GC before the drop was even issued) needs nothing
+reclaimed from it.
+
+**Scenario 4 — "a node crashed during the drop, restarted, converges" —
+does NOT converge, and this is a real, previously-uncharacterized reclaim
+gap, not a fixture bug.** `host::Reconciler::gather_facts` derives every
+fact **exclusively** from the tablets currently named in `Metadata`
+(`view.tablets.iter()`, both for the already-hosted branch and the
+join-candidate branch) plus this reconciler's own in-process `LocalState`.
+`DropTableTablets` removes a table's tablet rows from `Metadata`
+**synchronously** at apply (ADR 0024) — so a node whose whole process is
+down across the drop-and-`Metadata`-converges window comes back with (a) a
+brand-new, empty `LocalState` (nothing persists it across a real restart —
+see `crates/animusd/CLAUDE.md`'s drop-table-GC entry: "there is no more
+durable `cp-hosted` marker... a restart just re-discovers every tablet to
+host from replicated `Metadata`") and (b) a `Metadata` that already,
+synchronously, never names the dropped tablet at all by the time this
+node's reconciler first ticks — so `gather_facts` produces **no fact
+whatsoever** for that tablet id, `plan()` never places it in `next.
+hosted`, and `HostAction::Reclaim` (which only ever fires for a tablet
+this reconciler's own `LocalState` currently claims) can never target it.
+The tablet's own private engine — genuinely populated with real data
+written before the crash — is a permanent, silent leak. Not a
+`SimCluster`-fixture artifact: `gather_facts`'s scoping is unconditional,
+and the real `LsmEngine` backend's `LsmTabletFactory::probe`/`destroy`
+(`lib.rs`) is only ever called for tablet ids `gather_facts` already
+decided to ask about — the identical mechanism, real disk included.
+`docs/adr/0024-drop-table-data-gc.md`'s own text (lines 94-99) describes
+the *pre-`host::Reconciler`* per-tablet-marker design's guarantee here — a
+durable per-node marker forced a re-host attempt first, so a node that
+missed a drop would re-host from its own marker, THEN discover (and
+reclaim) the drop once its control replica caught up. That marker is gone
+(ADR 0050); nothing replaced its restart-time "ask about what I used to
+host, not just what `Metadata` currently says" role in the reconciler
+rewrite.
+
+Confirmed empirically, not just by static analysis: first written as a
+POSITIVE convergence assertion (crash a non-leader replica hosting the
+table, issue `DeleteTable` from a live node, restart the crashed node once
+the drop has committed), it reliably failed at every one of 6 seeds tried
+(`0xE4AF_0004`, `0xE4AF_4000..=0xE4AF_4004`) — never once converging within
+a 15s virtual-time budget, while the metadata/hosted-set observables
+(purged/re-derived independent of `gather_facts` entirely) converged fine.
+Kept as ONE `#[ignore]`d regression,
+`scenario_4_a_node_crashed_during_the_drop_and_restarted_leaks_its_engine`
+— a green test asserting convergence would misleadingly read as an
+accepted contract, and root `CLAUDE.md`'s green-is-an-invariant rule is
+exactly why a genuine gap can't be asserted around; fixing `host::
+Reconciler` itself is out of this PR's own "driver plus assertions, not
+new mechanism" scope (a probe-and-reclaim-orphans mechanism would need a
+new `EngineFactory::list()`-shaped capability across the trait and both
+production implementors — real new mechanism, not this PR's job). Filed
+here for a maintainer to pick up as its own follow-up PR.
+
+**Production signature count: zero** (the `SimCluster::storage` accessor
+is the only new surface, entirely test-fixture-internal — `pub(crate)` in
+`sim_cluster.rs`, no `animus-cp-data`/`animus-control` change).
+
+**`crates/animusd/tests/drop_table_gc.rs` and `drop_table_index_cascade.rs`
+stay whole, unconverted** — every test in both files interleaves real-disk
+`tablet_wal_present` (raw `LsmEngine` WAL-file-on-disk) assertions with
+metadata/hosting-convergence ones in a single test body (including a real
+process restart across the drop in `drop_table_gc.rs`'s own first test —
+exactly the `LsmEngine`-durability shape `SimCluster`'s `MemoryEngine` tier
+cannot stand in for), so per this PR's own "convert only the metadata/
+hosting half, leave a mixed test whole" instruction, commit B removes
+nothing from either file.
+
+**Gates**: `cargo fmt --all --check` (clean); `cargo clippy -p animusd
+--all-targets --all-features -- -D warnings` (clean, zero new warnings);
+`cargo build -p animusd --all-targets` (green); `cargo test -p animusd
+--lib` — 307 before → 315 after (+8 new passing, 0 removed, 0
+regressions; ignored 3 → 4), ~121s wall (within noise of the 307-test
+baseline); `cargo test -p animusd --test drop_table_gc --test
+drop_table_index_cascade` (3 passed, unchanged, both before and after —
+nothing was trimmed); `cargo test -p animus-cp-data --test
+reconciler_corpus` (4 passed, unchanged, untouched by this PR);
+`ANIMUS_SEED` replay confirmed deterministic for scenario 1
+(`drop_after_writes_reclaims_base_table`) and scenario 5
+(`drop_reclaims_off_the_rebalanced_replica_set`); `Cargo.lock` unchanged.
