@@ -1478,6 +1478,25 @@ every tick, flooding the log with hundreds of entries — the first draft of
 property it meant to. `CreateTableSchema` is inert: nothing in the driver
 reacts to it.
 
+**A second test-design gotcha (issue #741)**: any `prod_liveness.rs`/
+`tests/*.rs` poll of `RaftNode::snapshot_index()` (or any other property
+gated on the ADR 0038 apply task's own progress) must be **progress-gated,
+not deadline-gated** — see `docs/engineering-lessons.md`'s DRIVER_APPLIED
+entries for the general rule and this crate's own issue #741 entry for the
+instance that caught it here. `snapshot_index()` only advances when the
+apply task (`meta_apply_and_compact`) compacts, gated on **its own**
+`engine_applied_index` crossing `SNAPSHOT_THRESHOLD` — a task the
+consensus loop deliberately never waits on, so its forward progress has no
+contention-independent latency bound. `large_metadata_catch_up_stays_live`
+flaked on CI (`prod-liveness-scattered`) with one replica's
+`engine_applied_index` frozen for a flat 30s deadline while its sibling's
+inched forward — poll `engine_applied_index()` for forward progress
+(fail only once it genuinely stalls for a generous idle window with the
+target still unmet, plus a much larger overall backstop as a livelock
+guard), never a flat wall-clock deadline, the same shape
+`animusd/tests/support::poll_until_or_stalled` already uses for this
+exact class of property one crate over.
+
 ### The control-plane machinery fault-injection corpus (`tests/control_corpus.rs`)
 
 The seed-depth counterpart to this crate's ~30 fixed-single-seed acceptance
