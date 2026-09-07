@@ -83,6 +83,46 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 
+      # Build into the local daemon first so the image can be started
+      # before anything is published. The push step below is a cache hit
+      # on the same layers, so this costs seconds, not a second build.
+      - name: Build (load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          load: true
+          tags: animus-smoke:${{ matrix.target }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+
+      # The binary must actually start inside its runtime stage. This is
+      # what catches a builder/runtime glibc skew (a `rust:<ver>` builder
+      # on a newer Debian than the `bookworm-slim` runtime): the loader
+      # then fails with `version GLIBC_x.y not found` before main runs, so
+      # a real usage line or CRD document on the output proves the binary
+      # loaded and ran our code, whatever the exit status of the argument
+      # used to get it there.
+      - name: Smoke-start the image
+        run: |
+          set -euo pipefail
+          # The argument's own exit status is irrelevant (`animusd --help`
+          # is an unknown flag that prints the usage and exits non-zero),
+          # so capture the output first instead of piping under pipefail.
+          case "${{ matrix.target }}" in
+            runtime)
+              out="$(docker run --rm animus-smoke:runtime --help 2>&1 || true)"
+              grep -q '^usage:' <<<"$out" \
+                || { echo "animusd did not print its usage line:"; printf '%s\n' "$out" | head -5; exit 1; }
+              ;;
+            runtime-operator)
+              out="$(docker run --rm animus-smoke:runtime-operator crd 2>&1 || true)"
+              grep -q 'kind: CustomResourceDefinition' <<<"$out" \
+                || { echo "animus-operator did not print its CRD:"; printf '%s\n' "$out" | head -5; exit 1; }
+              ;;
+          esac
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
