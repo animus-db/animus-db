@@ -118,6 +118,12 @@ A hand-rolled HTTP/1.1 server (reuse `dynamo.rs`'s request parser and
 | `GET /admin/metrics` | The aggregated `MetricSnapshot` as JSON (counters + leader gauge) — the structured sibling of `/metrics` | `metrics_text`'s snapshot logic, emitted as JSON |
 | `GET /admin/health` | Liveness/readiness: is the control node up, does it know a leader, is the local CP group past its first apply | derived |
 
+> **Amended (2026-09-07, issue #710):** `/admin/health` is readiness
+> **only** now — see the row below and this file's own 2026-09-07
+> amendment section. The row above is the original design record.
+
+| `GET /admin/live` | Liveness only: `200` whenever this admin server can answer at all, independent of control-leader knowledge, tablet hosting, or role (added 2026-09-07, issue #710) | derived |
+
 Tablet-scoped storage routes target the `CpGroup`'s engine for that tablet; a
 node that does not host the tablet returns 404 with a hint (the route is
 node-local debug, not cluster-wide — you scrape each node, like `/metrics`).
@@ -315,6 +321,66 @@ consumer keeps reading the raw, immediately-corrected belief.
 Regression: `animus-control/tests/leader_within_hysteresis.rs` (a one-sided
 partition inside the grace, then held past it, across 12 seeds). See
 `docs/engineering-lessons.md`'s matching entry for the general lesson.
+
+## Amendment (2026-09-07, issue #710) — liveness and readiness split: `GET /admin/live`
+
+The previous amendment (issue #595, above) fixed `/admin/health`'s
+readiness signal so a transient one-sided delay no longer flips it to
+`503`. It did not fix a different problem with the **same route**:
+`animus-operator`'s `desired::statefulset::build` pointed **both** the
+`readinessProbe` and the `livenessProbe` at `GET /admin/health`
+(ADR 0060). Readiness legitimately depends on control-plane state — don't
+route client traffic to a node with no known leader. Liveness must not: a
+pod recreated by the config-hash rolling restart, or a fresh
+`spec.controlNodes` growth pod, has **no** control leader until
+`animus-operator`'s own `advance_control_growth` (`controller.rs`) adds it
+as a voter, which happens at most once per 30s reconcile and only after
+the pod's admin port reports `role: "combined"`. A healthy,
+correctly-joining pod can sit past a `livenessProbe`'s failure window
+(`initialDelaySeconds: 30`, `periodSeconds: 10`, `failureThreshold: 6` — an
+80s-and-counting window) with `/admin/health` still legitimately `503`.
+Gating liveness on it turned an ordinary join into a kubelet `SIGTERM` of
+a healthy process; the restarted process re-joins, hits the same window
+again, and the pod cycles (`CrashLoopBackOff`, each cycle paced by the
+liveness thresholds) — evidence: e2e-kind run 34104780977 job
+101687188395, `restarts=0→6` at ~80s intervals, each killed instance's own
+`--previous` logs reading `"node 3/4 up (CP) ... ready"` immediately
+followed by a clean `shutting down` / exit 0 (never a crash —
+`wait_for_ctrl_c` is `animusd`'s only exit-0 path, so every one of these
+was `SIGTERM`-driven, not an application fault). Issue #705 is the prior
+investigation that surfaced this exact restart-storm symptom (three clean
+exits over ~4 minutes on a freshly-promoted combined-role pod) without
+pinning down the `SIGTERM`'s source; #710 is the root cause and this fix.
+
+**Fix**: `animusd::admin` gains `GET /admin/live` (see the route table
+above) — unconditionally `200` whenever the admin server is up enough to
+answer, with **no** dependency on control-leader knowledge, tablet
+hosting, or node role. It carries `control_leader_recent` in the body as a
+pure diagnostic, mirroring `/admin/health`'s own field, but that field
+never affects the status code. `animus-operator`'s
+`desired::statefulset::admin_probe` takes an explicit `path` argument;
+`readinessProbe` keeps `/admin/health`, `livenessProbe` moves to
+`/admin/live`. The liveness thresholds themselves are unchanged — this is
+a route fix, not a timing fix; a genuinely wedged process (one that stops
+answering the admin port at all) still fails `/admin/live` and still gets
+restarted, exactly as a liveness probe should.
+
+**General lesson** (also recorded in `docs/engineering-lessons.md`): a
+Kubernetes `livenessProbe` must never gate on a distributed-consensus
+signal that a healthy, correctly-behaving process cannot satisfy alone (an
+election, a quorum, a leader). Liveness exists to catch a genuinely wedged
+process; the kubelet's only response to a liveness failure is a hard
+restart, which cannot fix "no quorum yet" and actively makes it worse by
+resetting the join. Only readiness (or a `startupProbe`) may depend on
+such a signal.
+
+Regression: `crates/animusd/tests/admin_endpoint.rs`'s
+`admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503` (a
+lone voter of a 3-voter config, which can never elect, so its `/admin/health`
+settles to `503` while `/admin/live` stays `200` throughout) and
+`crates/animus-operator/src/desired/statefulset.rs`'s
+`probes_target_admin_health_and_admin_live_on_admin_port` (the two probes'
+paths must differ).
 
 ## As-built (2026-09-05, roadmap U-05) — `POST /admin/control/transfer`
 
